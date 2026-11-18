@@ -425,6 +425,8 @@ pub(crate) struct Theme<'a> {
 pub(crate) struct Themes {
     selected: Option<Id>,
     pub(crate) apply_font: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    use_base_cursor_style: bool,
     edited: Vec<StoredTheme>,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_custom_id: Option<u64>,
@@ -448,7 +450,23 @@ impl Themes {
     pub(crate) fn select(&mut self, id: Option<Id>) {
         if id.is_none_or(|id| self.find(id).is_some()) {
             self.selected = id;
+            self.use_base_cursor_style = false;
         }
+    }
+
+    pub(crate) fn select_java_default(&mut self, id: Id) {
+        self.select(Some(id));
+        self.use_base_cursor_style = self.selected == Some(id);
+    }
+
+    pub(crate) fn terminal_scheme(&self, base_cursor_style: Option<CursorStyle>) -> Option<Scheme> {
+        self.appearance().map(|mut scheme| {
+            if self.use_base_cursor_style {
+                scheme.cursor_style =
+                    base_cursor_style.unwrap_or_else(|| Scheme::default().cursor_style);
+            }
+            scheme
+        })
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = Theme<'_>> {
@@ -620,7 +638,7 @@ impl Themes {
                 agent_panel_colors: Default::default(),
             });
         }
-        self.selected = Some(id);
+        self.select(Some(id));
         Ok(id)
     }
 
@@ -635,7 +653,7 @@ impl Themes {
         }
         self.edited.retain(|theme| theme.id != id);
         if self.selected == Some(id) {
-            self.selected = Some(Id::BuiltIn(Preset::Default));
+            self.select(Some(Id::BuiltIn(Preset::Default)));
         }
     }
 
@@ -655,10 +673,16 @@ impl Themes {
                     && valid_name(&theme.name)
                     && (MIN_TERMINAL_FONT..=MAX_TERMINAL_FONT).contains(&theme.scheme.font_size)
                     && theme.java.as_ref().is_none_or(|java| {
-                        !theme.id.built_in() && java.valid() && java_ids.insert(java.id.as_str())
+                        java.valid()
+                            && java_ids.insert(java.id.as_str())
+                            && match theme.id {
+                                Id::BuiltIn(preset) => preset.java_id() == java.id,
+                                Id::Custom(_) => Preset::from_java_id(&java.id).is_none(),
+                            }
                     })
             })
             && self.selected.is_none_or(|id| self.find(id).is_some())
+            && (!self.use_base_cursor_style || self.selected.is_some())
             && self
                 .last_custom_id
                 .is_none_or(|id| id != 0 && id >= self.highest_custom_id())

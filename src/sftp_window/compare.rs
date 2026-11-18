@@ -96,9 +96,9 @@ impl View {
         Self::Folders(folders::View::new(review))
     }
 
-    pub(super) fn view(&self) -> Element<'_, WindowMessage> {
+    pub(super) fn view(&self, ai_font_size: u8) -> Element<'_, WindowMessage> {
         match self {
-            Self::Files(view) => view.view(),
+            Self::Files(view) => view.view(ai_font_size),
             Self::FolderSetup(setup) => setup.view(),
             Self::Folders(view) => view.view(),
             Self::CopySetup(setup) => setup.view(),
@@ -628,7 +628,7 @@ impl FileView {
         (self.source.sources(), self.notice.as_deref(), self.stale)
     }
 
-    fn view(&self) -> Element<'_, Message> {
+    fn view(&self, ai_font_size: u8) -> Element<'_, Message> {
         if let Some(panel) = &self.ai {
             return panel
                 .view(
@@ -637,6 +637,7 @@ impl FileView {
                     self.refresh.is_some(),
                     self.stale,
                     self.notice.as_deref(),
+                    ai_font_size,
                 )
                 .map(|event| Message::Ai(self.ticket, event));
         }
@@ -717,6 +718,20 @@ impl SftpWindow {
         };
         if view.ticket != ticket {
             return ai::Update::None;
+        }
+        if let ai::Event::SetFontSize(size) = event {
+            if view.ai.is_none()
+                || !(ai::MIN_FONT_SIZE..=ai::MAX_FONT_SIZE).contains(&size)
+                || size == self.comparison_ai_font_size
+            {
+                return ai::Update::None;
+            }
+            self.comparison_ai_font_size = size;
+            return if self.incognito() {
+                ai::Update::None
+            } else {
+                ai::Update::SaveFontSize(size)
+            };
         }
         if let ai::Event::Refreshed(refresh, result) = event {
             view.finish_refresh(

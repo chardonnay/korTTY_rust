@@ -8,8 +8,9 @@ fn standalone_startup_uses_fixed_then_remembered_geometry_and_dashboard_independ
         height: 525.0,
         position: SavedPosition::new(25.0, 35.0),
     };
-    lifecycle.last.set_placement(previous, true);
-    lifecycle.last.dashboard_visible = true;
+    let last = lifecycle.last.get_or_insert_default();
+    last.set_placement(previous, true);
+    last.dashboard_visible = true;
     let mut preferences = StartupPreferences::default();
     assert_eq!(lifecycle.startup(preferences), (previous, true, true));
 
@@ -38,6 +39,99 @@ fn standalone_startup_uses_fixed_then_remembered_geometry_and_dashboard_independ
 }
 
 #[test]
+fn java_startup_restores_remembered_bounds_and_dashboard_as_native_fallbacks() {
+    use crate::workspace::{
+        backup_data::{merge_java_window_settings, portable_java_preferences},
+        tab_titles::WindowSettings,
+    };
+
+    let imported = portable_java_preferences(
+        br#"<globalSettings>
+            <lastWindowGeometry>
+                <x>-1230</x><y>70</y><width>5000</width><height>800</height>
+                <maximized>true</maximized><fullScreen>true</fullScreen>
+            </lastWindowGeometry>
+            <dashboardVisible>true</dashboardVisible>
+        </globalSettings>"#,
+        None,
+    )
+    .unwrap();
+    assert_eq!((imported.count, imported.omitted), (6, 0));
+    let incoming = imported.contents.unwrap();
+    let merged = merge_java_window_settings(None, &incoming, &Default::default())
+        .unwrap()
+        .unwrap();
+    let mut preferences = WindowSettings::decode(&merged).unwrap().startup;
+    let mut lifecycle = Lifecycle::default();
+    let (placement, maximized, dashboard) = lifecycle.startup(preferences);
+    assert_eq!((placement.width, placement.height), (5000.0, 800.0));
+    assert_eq!(placement.position, SavedPosition::new(-1230.0, 70.0));
+    assert!(maximized && dashboard);
+
+    let native = WindowPlacement {
+        width: 920.0,
+        height: 640.0,
+        position: None,
+    };
+    lifecycle
+        .last
+        .get_or_insert_default()
+        .set_placement(native, false);
+    assert_eq!(lifecycle.startup(preferences), (native, false, false));
+    preferences.use_fixed_geometry = true;
+    assert_eq!(
+        lifecycle.startup(preferences),
+        (preferences.fixed.placement(), false, false)
+    );
+
+    let local = br#"{"startup":{"remember_geometry":false,"remember_dashboard":false}}"#;
+    let merged = merge_java_window_settings(Some(local), &incoming, &Default::default())
+        .unwrap()
+        .unwrap();
+    let preferences = WindowSettings::decode(&merged).unwrap().startup;
+    let (placement, maximized, dashboard) = Lifecycle::default().startup(preferences);
+    assert_eq!(
+        (placement.width, placement.height),
+        (DEFAULT_WINDOW.width, DEFAULT_WINDOW.height)
+    );
+    assert!(!maximized && !dashboard);
+    assert!(
+        merge_java_window_settings(Some(&merged), &incoming, &Default::default())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn closing_a_hidden_dashboard_overrides_the_imported_value_even_without_saved_geometry() {
+    let mut workspace = Workspace::default();
+    let (id, _) = workspace.open_window(false);
+    let preferences = StartupPreferences {
+        java_dashboard_visible: Some(true),
+        use_fixed_geometry: true,
+        ..StartupPreferences::default()
+    };
+    let mut lifecycle = Lifecycle {
+        persistence: Some(Persistence {
+            written: None,
+            deadline: None,
+        }),
+        ..Lifecycle::default()
+    };
+    let window = &workspace.windows[&id];
+    assert!(lifecycle.startup(preferences).2);
+    lifecycle.capture(window, preferences, true);
+    let native = lifecycle.unsaved().unwrap();
+    assert!(!native.dashboard_visible);
+    assert!(native.placement().is_none());
+    let reloaded: LastWindow =
+        serde_json::from_slice(&serde_json::to_vec(&native).unwrap()).unwrap();
+    assert_eq!(reloaded, native);
+    lifecycle.last = Some(reloaded);
+    assert!(!lifecycle.startup(preferences).2);
+}
+
+#[test]
 fn standalone_close_remembers_dashboard_without_replacing_bounds_in_fixed_or_fullscreen_mode() {
     let mut workspace = Workspace::default();
     let (id, _) = workspace.open_window(false);
@@ -48,7 +142,11 @@ fn standalone_close_remembers_dashboard_without_replacing_bounds_in_fixed_or_ful
         height: 680.0,
         position: None,
     };
-    workspace.lifecycle.last.set_placement(prior, true);
+    workspace
+        .lifecycle
+        .last
+        .get_or_insert_default()
+        .set_placement(prior, true);
 
     window.geometry.recordable = true;
     let preferences = StartupPreferences {
@@ -56,9 +154,10 @@ fn standalone_close_remembers_dashboard_without_replacing_bounds_in_fixed_or_ful
         ..StartupPreferences::default()
     };
     workspace.lifecycle.capture(window, preferences, true);
-    assert_eq!(workspace.lifecycle.last.placement(), Some(prior));
-    assert!(workspace.lifecycle.last.maximized);
-    assert!(workspace.lifecycle.last.dashboard_visible);
+    let last = workspace.lifecycle.last.unwrap();
+    assert_eq!(last.placement(), Some(prior));
+    assert!(last.maximized);
+    assert!(last.dashboard_visible);
 
     let revision = window
         .geometry
@@ -72,7 +171,7 @@ fn standalone_close_remembers_dashboard_without_replacing_bounds_in_fixed_or_ful
     workspace
         .lifecycle
         .capture(window, StartupPreferences::default(), true);
-    assert_eq!(workspace.lifecycle.last.placement(), Some(prior));
+    assert_eq!(workspace.lifecycle.last.unwrap().placement(), Some(prior));
 }
 
 #[test]
@@ -84,7 +183,11 @@ fn saved_window_geometry_does_not_replace_global_last_window_bounds() {
         height: 680.0,
         position: None,
     };
-    workspace.lifecycle.last.set_placement(prior, true);
+    workspace
+        .lifecycle
+        .last
+        .get_or_insert_default()
+        .set_placement(prior, true);
 
     let window = workspace.windows.get_mut(&id).unwrap();
     window.geometry.recordable = true;
@@ -95,8 +198,9 @@ fn saved_window_geometry_does_not_replace_global_last_window_bounds() {
     workspace
         .lifecycle
         .capture(window, StartupPreferences::default(), true);
-    assert_eq!(workspace.lifecycle.last.placement(), Some(prior));
-    assert!(workspace.lifecycle.last.maximized);
+    let last = workspace.lifecycle.last.unwrap();
+    assert_eq!(last.placement(), Some(prior));
+    assert!(last.maximized);
 }
 
 const PRIMARY: WorkArea = WorkArea {

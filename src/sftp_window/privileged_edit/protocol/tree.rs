@@ -27,6 +27,8 @@ pub(crate) struct TreeUpload {
     roots: [String; 2],
     size: u64,
     source_proof: [u8; 32],
+    receiver_receipt: bool,
+    create_root: bool,
 }
 
 struct ReviewedEntry {
@@ -116,9 +118,20 @@ impl TreeUpload {
             roots,
             size,
             source_proof: hasher.finalize().as_ref().try_into().expect("SHA-256 size"),
+            receiver_receipt: false,
+            create_root: false,
         };
         plan.verify(&allowed)?;
         Ok(plan)
+    }
+
+    pub(crate) fn request_receiver_receipt(&mut self) {
+        self.receiver_receipt = true;
+    }
+
+    pub(crate) fn request_root_creation(&mut self) {
+        self.request_receiver_receipt();
+        self.create_root = true;
     }
 
     fn verify(&self, allowed: &impl Fn() -> bool) -> Result<(), Failure> {

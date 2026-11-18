@@ -279,7 +279,11 @@ impl SchedulerWindow {
             )
             .map_err(|error| error.to_string())?;
             (
-                SaveApproval::Standing(approval),
+                if approved.sudo == SudoMode::Disabled {
+                    SaveApproval::Standing(approval)
+                } else {
+                    SaveApproval::RecurringTree(approval, !approved.replace_changed)
+                },
                 "Recurring folder copy approved. Save the job to keep the approval.",
             )
         } else {
@@ -336,10 +340,22 @@ impl SchedulerWindow {
                 };
                 let occurrence = self.scheduler.active_firing_occurrence(request)?;
                 let admission = standing::Admission::new(firing, job, request, occurrence).ok()?;
-                let approval = self
-                    .sync_store
-                    .load_standing(&request.job, copy.approval.as_deref(), subject.scope, now)
-                    .ok()?;
+                let approval = if subject.sudo == SudoMode::Disabled {
+                    self.sync_store
+                        .load_standing(&request.job, copy.approval.as_deref(), subject.scope, now)
+                        .ok()?
+                } else {
+                    self.sync_store
+                        .load_tree(
+                            &request.job,
+                            copy.approval.as_deref(),
+                            subject.scope,
+                            now,
+                            Some(&admission),
+                        )
+                        .ok()?
+                        .approval
+                };
                 if !approval.active_at(request.started_at) {
                     return None;
                 }
@@ -609,6 +625,15 @@ impl DraftReview {
         match result {
             Ok(review) => {
                 let standing = pending.subject.standing.is_some();
+                if pending.subject.sudo != SudoMode::Disabled
+                    && let Some(settings) = pending.subject.standing
+                    && !settings.limits.allows(
+                        review.preview.paths.len() + review.preview.replacements.len(),
+                        review.preview.bytes,
+                    )
+                {
+                    return Some("The protected folder preview exceeds the recurring action or payload limits. Adjust the limits and compare again.".into());
+                }
                 if standing != review.standing_roots.is_some()
                     || !pending.subject.replace_changed && !review.preview.replacements.is_empty()
                 {
@@ -688,6 +713,9 @@ impl DraftReview {
         if !privileged && matches!(subject.direction, Direction::Download) {
             details = details.push(text("New local files and folders use normal destination permissions and inherited access. New files use their local write time.").size(12));
         }
+        if privileged && standing.is_some() && !subject.replace_changed {
+            details = details.push(text("The first claimed firing creates the entire private receiver at this reviewed absent name. Later firings merge into that exact receiver and can replace eligible files while retaining originals. An uncertain first publication requires a new review; an independently created destination is never adopted automatically.").size(12));
+        }
         if privileged && subject.replace_changed {
             let access = match subject.direction {
                 Direction::Upload => {
@@ -757,7 +785,11 @@ impl DraftReview {
                     "The approval covers future eligible source content under these folder roots. It allows creation of missing regular files and folders only."
                 }).size(12))
                 .push(subject.calendar.then(|| text("The calendar window selects due times. A queued or overdue run can start later while the approval is active.").size(12)))
-                .push(text("Each admitted automatic attempt uses one allowance, including a failed connection or an empty copy plan.").size(12));
+                .push(text(if privileged {
+                    "Each claimed publication attempt uses one allowance. An unconfirmed attempt blocks later automatic copies until the receiver is reviewed again."
+                } else {
+                    "Each admitted automatic attempt uses one allowance, including a failed connection or an empty copy plan."
+                }).size(12));
         } else if privileged {
             details = details
                 .push(

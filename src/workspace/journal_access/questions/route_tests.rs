@@ -20,6 +20,99 @@ fn dispatch(workspace: &mut Workspace, id: window::Id, event: Message) -> Task<D
     workspace.update(Desktop::SessionJournal(id, JournalMessage::Question(event)))
 }
 
+#[test]
+fn journal_semantic_preference_drives_cross_journal_preparation_with_local_fallback() {
+    let _exclusive = exclusive_run();
+    let scratch = crate::snippets::tests::Profile::new();
+    let journals = scratch.0.join("journals");
+    let source = journals.join("build");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("journal.xml"), r#"<session-journal formatVersion="1" id="semantic-fixture"><meta><title>Build failure</title><endedAt>2026-10-01T08:01:00Z</endedAt></meta><entries><entry><id>note</id><kind>USER_NOTE</kind><title>Build failure</title><text>Build failure DB_PASSWORD=fixture-private-value</text></entry></entries></session-journal>"#).unwrap();
+    let (endpoint, _) = listener();
+    let address = endpoint.local_addr().unwrap();
+    let mut workspace = Workspace::default();
+    workspace.window_settings.session_journal.directory = journals.to_str().unwrap().into();
+    workspace.window_settings.journal_ai.enabled = true;
+    workspace.window_settings.journal_ai.endpoint = address.to_string();
+    workspace.window_settings.journal_ai.model = "fixture".into();
+    let (owner, _) = workspace.open_window(false);
+    let task = workspace.update(Desktop::SessionJournal(owner, JournalMessage::Open));
+    drain(&mut workspace, task);
+    let manager = *workspace
+        .journals
+        .iter()
+        .find_map(|(id, surface)| matches!(surface.mode, Mode::Manager(_)).then_some(id))
+        .unwrap();
+    let configure = |workspace: &mut Workspace, enabled, embedding| {
+        workspace.set_test_ai_configuration(
+            serde_json::from_value(json!({
+                "general": {"journal_semantic_search": enabled},
+                "java_journal_semantic_search": true,
+                "local": {"endpoint": address.to_string(), "embedding": embedding},
+            }))
+            .unwrap(),
+        );
+        let _ = dispatch(workspace, manager, Message::Open);
+        let _ = dispatch(
+            workspace,
+            manager,
+            Message::Edit("Where was the build failure?".into()),
+        );
+    };
+    configure(&mut workspace, false, "fixture");
+    let task = dispatch(&mut workspace, manager, Message::Prepare);
+    drain(&mut workspace, task);
+    assert!(matches!(
+        workspace.journal_questions.dialogs[&manager].stage,
+        Stage::Ranking(ref ranking) if ranking.candidates.len() == 1
+    ));
+    assert_eq!(endpoint.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+    configure(&mut workspace, true, "");
+    let task = dispatch(&mut workspace, manager, Message::Prepare);
+    drain(&mut workspace, task);
+    assert!(matches!(
+        workspace.journal_questions.dialogs[&manager].stage,
+        Stage::Review(_, None)
+    ));
+    assert_eq!(endpoint.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+    configure(&mut workspace, true, "fixture");
+    let stale = dispatch(&mut workspace, manager, Message::Prepare);
+    configure(&mut workspace, false, "fixture");
+    drain(&mut workspace, stale);
+    assert!(matches!(
+        workspace.journal_questions.dialogs[&manager].stage,
+        Stage::Question
+    ));
+    assert_eq!(endpoint.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+    let server_endpoint = endpoint.try_clone().unwrap();
+    let server = thread::spawn(move || {
+        let mut stream = accept(&server_endpoint);
+        let body = wire_request(&mut stream, "POST /api/embed HTTP/1.1");
+        let body = String::from_utf8(body).unwrap();
+        assert!(!body.contains("fixture-private-value"));
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let inputs = value["input"].as_array().unwrap();
+        assert_eq!(
+            inputs.len(),
+            2,
+            "the question and one new card share one embedding batch"
+        );
+        let reply = json!({"embeddings": vec![[1, 0]; inputs.len()]}).to_string();
+        stream
+            .get_mut()
+            .write_all(fixture_http_response("200 OK", "", &reply).as_bytes())
+            .unwrap();
+    });
+    configure(&mut workspace, true, "fixture");
+    let task = dispatch(&mut workspace, manager, Message::Prepare);
+    drain(&mut workspace, task);
+    server.join().unwrap();
+    let review = prepared(&workspace, manager);
+    assert!(!review.embedding_fallback);
+    assert!(!review.review.citations.is_empty());
+    assert_eq!(endpoint.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+}
+
 fn drain(workspace: &mut Workspace, task: Task<Desktop>) {
     let mut pending = vec![task];
     while let Some(task) = pending.pop() {
@@ -245,7 +338,7 @@ fn check_https_review(model: &str, model_label: &str) {
     workspace.set_test_ai_configuration(Configuration::load_fixture_from(&root).unwrap());
     let secret = r#"sensitive "quoted" journal vault value"#;
     let path = root.join("test-vault.bin");
-    let mut vault = Vault::create(&path, b"journal-question-fixture").unwrap();
+    let mut vault = Vault::create(&path, &crate::vault_window::test_vault_password()[..]).unwrap();
     vault
         .save(
             CredentialInput {
@@ -365,7 +458,8 @@ fn journal_question_https_revokes_prepared_review_on_vault_lock_and_saved_route_
     let saved = Configuration::load_fixture_from(&root).unwrap();
     workspace.set_test_ai_configuration(saved.clone());
     let vault_path = root.join("test-vault.bin");
-    let vault = Vault::create(&vault_path, b"journal-revocation-fixture").unwrap();
+    let vault =
+        Vault::create(&vault_path, &crate::vault_window::test_vault_password()[..]).unwrap();
     workspace.vault = Some(crate::vault_window::VaultWindow::with_unlocked_fixture(
         vault_path, vault,
     ));
@@ -510,7 +604,7 @@ fn journal_question_cli_reviews_exact_masked_files_for_single_and_cross_journal_
     workspace.set_test_ai_configuration(Configuration::load_fixture_from(&root).unwrap());
 
     let path = root.join("test-vault.bin");
-    let mut vault = Vault::create(&path, b"journal-question-cli-fixture").unwrap();
+    let mut vault = Vault::create(&path, &crate::vault_window::test_vault_password()[..]).unwrap();
     vault
         .save(
             CredentialInput {

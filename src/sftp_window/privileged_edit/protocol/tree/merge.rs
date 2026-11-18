@@ -21,15 +21,23 @@ pub(crate) fn preview_tree_upload_merge(
     plan: &TreeUpload,
     auth: Auth,
     allowed: impl Fn() -> bool + Send + Sync + 'static,
-) -> Result<Preview, Failure> {
+) -> Result<(Preview, Option<[u8; 32]>), Failure> {
     let allowed: Permit = Arc::new(allowed);
-    let mut exchange = Exchange::begin(opener, root, plan, auth, &allowed, true)?;
+    let mut exchange = Exchange::begin(
+        opener,
+        root,
+        plan,
+        auth,
+        &allowed,
+        true,
+        plan.receiver_receipt,
+    )?;
     exchange
         .helper
         .finish(&|| !allowed())
         .map_err(|_| Failure::Failed)?;
     plan.verify(&|| allowed())?;
-    exchange.preview(plan)
+    Ok((exchange.preview(plan)?, exchange.review.receiver))
 }
 
 pub(crate) fn upload_tree_merge(
@@ -38,20 +46,37 @@ pub(crate) fn upload_tree_merge(
     plan: &TreeUpload,
     auth: Auth,
     allowed: impl Fn() -> bool + Send + Sync + 'static,
-    claim: impl FnOnce([u8; 32]) -> Result<(), Failure>,
+    claim: impl FnOnce(super::super::MergeClaim) -> Result<(), Failure>,
     publication_allowed: impl Fn() -> bool,
 ) -> Result<MergeReport, Failure> {
     let allowed: Permit = Arc::new(allowed);
-    let mut exchange = Exchange::begin(opener, root, plan, auth, &allowed, false)?;
+    let mut exchange = Exchange::begin(
+        opener,
+        root,
+        plan,
+        auth,
+        &allowed,
+        false,
+        plan.receiver_receipt,
+    )?;
     plan.verify(&|| allowed())?;
-    claim(plan.proof(&digest_hex(&exchange.review.fingerprint)?)?)?;
+    let preview = exchange.preview(plan)?;
+    claim(super::super::MergeClaim::from_preview(
+        &preview,
+        exchange.review.receiver,
+    ))?;
     let prefix = exchange.transfer(plan, &allowed)?;
     plan.verify(&|| allowed())?;
 
     let mut report = MergeReport::default();
     for group_index in 0..exchange.groups.len() {
-        let index = exchange.groups[group_index][0];
-        let replace = matches!(exchange.review.changes[index], Change::Replace { .. });
+        let index = if exchange.request.create_root {
+            0
+        } else {
+            exchange.groups[group_index][0]
+        };
+        let replace = !exchange.request.create_root
+            && matches!(exchange.review.changes[index], Change::Replace { .. });
         let result = exchange.publish(index, &prefix, &allowed, &publication_allowed);
         if replace && matches!(result, Ok(()) | Err(Failure::Uncertain)) {
             report.recovery_prefix.get_or_insert_with(|| prefix.clone());
@@ -64,7 +89,7 @@ pub(crate) fn upload_tree_merge(
         if replace {
             report.replaced += 1;
         } else {
-            report.created += group.len();
+            report.created += group.len() + usize::from(exchange.request.create_root);
         }
         report.bytes += group
             .iter()
@@ -75,12 +100,23 @@ pub(crate) fn upload_tree_merge(
 
     let deadline = Instant::now() + DECISION_TIMEOUT;
     let stopped = || Instant::now() >= deadline;
-    if !matches!(
-        wire::read(exchange.helper.reader(&stopped)),
-        Ok(Reply::Complete)
-    ) || exchange.helper.finish(&stopped).is_err()
-    {
+    let confirmed = match wire::read(exchange.helper.reader(&stopped)) {
+        Ok(Reply::Complete { receiver })
+            if if exchange.request.create_root {
+                receiver.is_some_and(|value| value != [0; 32])
+                    && receiver != exchange.review.receiver
+            } else {
+                receiver == exchange.review.receiver
+            } =>
+        {
+            Some(receiver)
+        }
+        _ => None,
+    };
+    if confirmed.is_none() || exchange.helper.finish(&stopped).is_err() {
         report.error = Some(Failure::Uncertain);
+    } else {
+        report.receiver = confirmed.flatten();
     }
     Ok(report)
 }
@@ -100,6 +136,7 @@ impl Exchange {
         auth: Auth,
         allowed: &Permit,
         review_only: bool,
+        receiver_receipt: bool,
     ) -> Result<Self, Failure> {
         let request = Request {
             root: root.to_owned(),
@@ -112,6 +149,8 @@ impl Exchange {
                 })
                 .collect(),
             review_only,
+            receiver_receipt,
+            create_root: plan.create_root,
         };
         let ExecOpener::Direct(opener) = opener else {
             return Err(Failure::Blocked);
@@ -152,6 +191,9 @@ impl Exchange {
             replacements: Vec::new(),
             bytes: 0,
         };
+        if self.request.create_root {
+            preview.paths.push((true, "Receiver root".into()));
+        }
         for (entry, change) in plan.entries.iter().zip(&self.review.changes) {
             let path = entry.relative.review_label();
             match change {
@@ -219,7 +261,8 @@ impl Exchange {
         let stopped = || !waiting();
         let mut reply = wire::read(self.helper.reader(&stopped)).map_err(|_| Failure::Uncertain)?;
         let mut authorized = true;
-        if matches!(self.review.changes[index], Change::Replace { .. }) {
+        if !self.request.create_root && matches!(self.review.changes[index], Change::Replace { .. })
+        {
             let destination = self.request.destination(&self.request.entries[index]);
             match reply {
                 Reply::Quarantined {

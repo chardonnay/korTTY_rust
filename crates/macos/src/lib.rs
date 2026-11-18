@@ -26,6 +26,7 @@ mod owned_dialog;
 mod power;
 mod status_item;
 mod tab_drag;
+pub mod text_drop;
 mod window_chrome;
 pub use application_menu::{
     ApplicationMenu, ApplicationMenuEntry, JobMenuRow, OpenRecentMenuRow,

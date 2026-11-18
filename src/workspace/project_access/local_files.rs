@@ -296,6 +296,10 @@ impl Workspace {
                     return Task::none();
                 }
             };
+            state.configure_hidden_entries(
+                self.window_settings.sftp_show_hidden_local.unwrap_or(true),
+                self.window_settings.sftp_show_hidden_remote.unwrap_or(true),
+            );
             super::super::sftp_access::configure_sftp_preferences(
                 &mut state,
                 &self.window_settings,
@@ -750,8 +754,9 @@ impl Workspace {
     }
 
     pub(in crate::workspace) fn project_file_needs_close(&self, id: window::Id) -> bool {
-        self.sftp.get(&id).is_some_and(|state| state.transfer_running() || state.external_edit_active())
-            || self.project_files.get(&id).is_some_and(
+        self.sftp.get(&id).is_some_and(|state| {
+            state.transfer_running() || state.deletion_running() || state.external_edit_active()
+        }) || self.project_files.get(&id).is_some_and(
             |tab| matches!(&tab.content, Content::Editor(editor) if editor.needs_close_decision()),
         )
     }

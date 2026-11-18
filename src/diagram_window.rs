@@ -16,6 +16,7 @@ use kortty_diagram::{
 };
 
 mod ai;
+pub(crate) mod appearance;
 pub(crate) use ai::AnalysisFlowchartRequest;
 
 const MAX_PREVIEW_DIMENSION: f32 = 4096.0;
@@ -24,6 +25,8 @@ const MAX_PREVIEW_PIXELS: f32 = 8_000_000.0;
 #[derive(Debug, Clone)]
 pub enum Message {
     Close,
+    AnalysisOptions(bool),
+    SnippetAppearance(appearance::Edit),
     Edit(text_editor::Action),
     Render,
     SetMode(SourceMode),
@@ -74,6 +77,13 @@ pub struct Chart {
 }
 
 impl Chart {
+    fn apply_direction(&mut self, direction: Direction) {
+        if self.diagram.kind() != DiagramKind::Sequence && self.diagram.direction() != direction {
+            self.diagram.set_direction(direction);
+            self.scene = Arc::new(self.diagram.layout());
+        }
+    }
+
     fn local(diagram: Diagram) -> Self {
         let scene = Arc::new(diagram.layout());
         Self {
@@ -143,6 +153,11 @@ pub struct DiagramWindow {
     scale_factor: f32,
     scale: Option<f32>,
     theme: Theme,
+    snippet_layout: Option<Direction>,
+    snippet_appearance: Option<appearance::Preferences>,
+    snippet_background_draft: Option<String>,
+    system_dark: bool,
+    background: Option<[u8; 3]>,
     mode: SourceMode,
     pointer: Option<Point>,
     revision: u64,
@@ -201,6 +216,11 @@ impl DiagramWindow {
             scale_factor: 2.0,
             scale: None,
             theme: Theme::Dark,
+            snippet_layout: None,
+            snippet_appearance: None,
+            snippet_background_draft: None,
+            system_dark: false,
+            background: None,
             mode: SourceMode::Mermaid,
             pointer: None,
             revision: 0,
@@ -253,6 +273,54 @@ impl DiagramWindow {
         self.accept_render(self.revision, Ok(Arc::new(chart)));
     }
 
+    pub(crate) fn snippet_layout(&self) -> Option<Direction> {
+        self.snippet_layout
+    }
+
+    pub(crate) fn can_change_direction(&self) -> bool {
+        !self.snippet_saving
+            && self
+                .chart
+                .as_ref()
+                .is_some_and(|chart| chart.diagram.kind() != DiagramKind::Sequence)
+    }
+
+    pub(crate) fn configure_snippet_layout(&mut self, direction: Direction) {
+        if self.snippet_layout == Some(direction) {
+            return;
+        }
+        self.snippet_layout = Some(direction);
+        if let Some(chart) = &mut self.chart {
+            Arc::make_mut(chart).apply_direction(direction);
+            self.pointer = None;
+            self.scale = None;
+            self.refresh_scene();
+        }
+    }
+
+    pub(crate) fn configure_snippet_appearance(
+        &mut self,
+        appearance: appearance::Preferences,
+        system_dark: bool,
+    ) {
+        self.snippet_appearance = Some(appearance);
+        self.system_dark = system_dark;
+        let (theme, background) = appearance.colors(system_dark);
+        if (theme, background) != (self.theme, self.background) {
+            self.theme = theme;
+            self.background = background;
+            self.refresh_svg();
+        }
+    }
+
+    pub(crate) fn edit_snippet_appearance(
+        &mut self,
+        edit: appearance::Edit,
+    ) -> Option<appearance::Preferences> {
+        self.snippet_appearance?
+            .edit(self.system_dark, &mut self.snippet_background_draft, edit)
+    }
+
     pub(crate) fn configure_ai(
         &mut self,
         allowed: bool,
@@ -293,6 +361,7 @@ impl DiagramWindow {
             return Task::none();
         }
         match message {
+            Message::AnalysisOptions(_) | Message::SnippetAppearance(_) => {}
             Message::Close => {}
             Message::Edit(action) if (self.saved || self.snippet.is_some()) && action.is_edit() => {
             }
@@ -435,7 +504,7 @@ impl DiagramWindow {
                     return widget::operation::focus(self.editor_id.clone());
                 }
             }
-            Message::ToggleTheme => {
+            Message::ToggleTheme if self.snippet_appearance.is_none() => {
                 self.theme = if self.theme == Theme::Dark {
                     Theme::Light
                 } else {
@@ -443,6 +512,7 @@ impl DiagramWindow {
                 };
                 self.refresh_svg();
             }
+            Message::ToggleTheme => {}
             Message::ToggleDirection => {
                 if let Some(mut chart) = self.chart.take() {
                     self.clear_preview();
@@ -453,8 +523,7 @@ impl DiagramWindow {
                             Direction::TopToBottom => Direction::LeftToRight,
                             Direction::LeftToRight => Direction::TopToBottom,
                         };
-                        chart_data.diagram.set_direction(direction);
-                        chart_data.scene = Arc::new(chart_data.diagram.layout());
+                        chart_data.apply_direction(direction);
                         Message::Rendered(revision, Ok(chart))
                     });
                 }
@@ -474,9 +543,10 @@ impl DiagramWindow {
                     let path = PathBuf::from(self.path.trim());
                     let scene = Arc::clone(scene);
                     let theme = self.theme;
+                    let background = self.background;
                     return Task::future(async move {
                         Message::Exported(
-                            export(&path, &scene, theme, format)
+                            export_with_background(&path, &scene, theme, background, format)
                                 .map(|()| path)
                                 .map_err(|error| error.to_string()),
                         )
@@ -505,7 +575,12 @@ impl DiagramWindow {
         Task::none()
     }
 
-    pub fn view(&self, content_theme: iced::Theme) -> Element<'_, Message> {
+    pub fn view(
+        &self,
+        content_theme: iced::Theme,
+        analysis_options: Option<bool>,
+    ) -> Element<'_, Message> {
+        let show_toolbar = analysis_options.unwrap_or(true);
         let toolbar = if self.saved {
             row![
                 text(
@@ -577,15 +652,18 @@ impl DiagramWindow {
                 button("+").on_press(Message::Zoom(1.25)).into(),
                 button("Fit").on_press(Message::Fit).into(),
                 text(format!("{:.0}%", self.zoom() * 100.0)).into(),
-                button(if self.theme == Theme::Dark {
-                    "Light"
-                } else {
-                    "Dark"
-                })
-                .on_press(Message::ToggleTheme)
-                .into(),
-                button("Copy Mermaid").on_press(Message::CopyMermaid).into(),
             ]);
+            if self.snippet_appearance.is_none() {
+                toolbar = toolbar.push(
+                    button(if self.theme == Theme::Dark {
+                        "Light"
+                    } else {
+                        "Dark"
+                    })
+                    .on_press(Message::ToggleTheme),
+                );
+            }
+            toolbar = toolbar.push(button("Copy Mermaid").on_press(Message::CopyMermaid));
         }
         let editor = text_editor(&self.content)
             .id(self.editor_id.clone())
@@ -603,9 +681,27 @@ impl DiagramWindow {
             .height(Length::Fill)
             .on_action(Message::Edit)
             .key_binding(diagram_key_binding);
-        let mut contents = column![toolbar.width(Length::Fill).wrap()]
-            .spacing(8)
-            .padding(10);
+        let mut contents = column![].spacing(8).padding(10);
+        if let Some(expanded) = analysis_options {
+            contents = contents.push(
+                button(if expanded {
+                    "Hide diagram options"
+                } else {
+                    "Diagram options"
+                })
+                .on_press(Message::AnalysisOptions(!expanded)),
+            );
+        }
+        if show_toolbar {
+            contents = contents.push(toolbar.width(Length::Fill).wrap());
+            if let Some(appearance) = self.snippet_appearance {
+                contents = contents.push(
+                    appearance
+                        .controls(self.system_dark, self.snippet_background_draft.as_deref())
+                        .map(Message::SnippetAppearance),
+                );
+            }
+        }
         if let Some(draft) = &self.snippet {
             contents = contents.push(
                 row![
@@ -630,7 +726,7 @@ impl DiagramWindow {
             ]
             .spacing(10),
         );
-        if self.scene.is_some() {
+        if show_toolbar && self.scene.is_some() {
             contents = contents.push(
                 row![
                     text_input("Absolute export path", &self.path).on_input(Message::SetPath),
@@ -729,7 +825,10 @@ impl DiagramWindow {
             return;
         }
         match result {
-            Ok(chart) => {
+            Ok(mut chart) => {
+                if let Some(direction) = self.snippet_layout {
+                    Arc::make_mut(&mut chart).apply_direction(direction);
+                }
                 self.status = chart.fallback.then(|| match chart.fallback_reason() {
                     Some(reason) => format!("Showing the locally generated flowchart. {reason}."),
                     None => {
@@ -750,10 +849,13 @@ impl DiagramWindow {
     }
 
     fn refresh_svg(&mut self) {
-        self.svg = self
-            .scene
-            .as_ref()
-            .map(|scene| svg::Handle::from_memory(scene.to_svg(self.theme).into_bytes()));
+        self.svg = self.scene.as_ref().map(|scene| {
+            svg::Handle::from_memory(
+                scene
+                    .to_svg_with_background(self.theme, self.background)
+                    .into_bytes(),
+            )
+        });
     }
 
     fn clear_preview(&mut self) {
@@ -874,9 +976,21 @@ fn diagram_key_binding(event: text_editor::KeyPress) -> Option<text_editor::Bind
 }
 
 pub(crate) fn export(path: &Path, scene: &Scene, theme: Theme, format: Format) -> io::Result<()> {
+    export_with_background(path, scene, theme, None, format)
+}
+
+fn export_with_background(
+    path: &Path,
+    scene: &Scene,
+    theme: Theme,
+    background: Option<[u8; 3]>,
+    format: Format,
+) -> io::Result<()> {
     let bytes = match format {
-        Format::Svg => scene.to_svg(theme).into_bytes(),
-        Format::Png => scene.to_png(theme, 1).map_err(io::Error::other)?,
+        Format::Svg => scene.to_svg_with_background(theme, background).into_bytes(),
+        Format::Png => scene
+            .to_png_with_background(theme, 1, background)
+            .map_err(io::Error::other)?,
     };
     write_export(path, &bytes)
 }
@@ -1032,5 +1146,26 @@ mod tests {
         let height = bounds.height as f32 * window.zoom() * window.scale_factor;
         assert!(width.max(height).round() <= MAX_PREVIEW_DIMENSION);
         assert!(width * height <= MAX_PREVIEW_PIXELS + 1.0);
+    }
+
+    #[test]
+    fn snippet_direction_applies_again_when_a_saved_chart_is_replaced() {
+        let chart = || Chart::local(parse_mermaid("flowchart TD\na[One] --> b[Two]").unwrap());
+        let mut window = DiagramWindow::with_saved_chart(Size::new(800.0, 500.0), None, chart());
+        window.configure_snippet_layout(Direction::LeftToRight);
+        assert_eq!(
+            window.chart.as_ref().unwrap().diagram.direction(),
+            Direction::LeftToRight
+        );
+        window.replace_saved_chart(None, chart());
+        assert_eq!(
+            window.chart.as_ref().unwrap().diagram.direction(),
+            Direction::LeftToRight
+        );
+        let standalone = DiagramWindow::with_saved_chart(Size::new(800.0, 500.0), None, chart());
+        assert_eq!(
+            standalone.chart.as_ref().unwrap().diagram.direction(),
+            Direction::TopToBottom
+        );
     }
 }

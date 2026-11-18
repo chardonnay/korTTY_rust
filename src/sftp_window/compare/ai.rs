@@ -121,6 +121,7 @@ impl fmt::Display for Preset {
 pub enum Event {
     Open(Mode),
     BackToComparison,
+    SetFontSize(u8),
     Choose(ProfileId),
     Preset(Preset),
     Instruction(String),
@@ -156,10 +157,15 @@ impl fmt::Debug for Event {
 
 pub(crate) enum Update {
     None,
+    SaveFontSize(u8),
     Task(Task<Event>),
     Draft(Arc<str>),
     Snippet(Arc<str>),
 }
+
+pub(crate) const DEFAULT_FONT_SIZE: u8 = 13;
+pub(crate) const MIN_FONT_SIZE: u8 = 9;
+pub(crate) const MAX_FONT_SIZE: u8 = 32;
 
 pub(crate) struct Scope<'a> {
     pub(crate) config: Option<Arc<Configuration>>,
@@ -835,13 +841,28 @@ impl Panel {
         refreshing: bool,
         stale: bool,
         notice: Option<&'a str>,
+        font_size: u8,
     ) -> Element<'a, Event> {
         let selected = self
             .choices
             .iter()
             .find(|choice| Some(choice.id) == self.choice)
             .cloned();
-        let mut body = column![text(self.mode.title()).size(19)].spacing(8);
+        let font = f32::from(font_size);
+        let mut body = column![
+            text(self.mode.title()).size(19),
+            row![
+                button("A−").on_press_maybe(
+                    (font_size > MIN_FONT_SIZE).then_some(Event::SetFontSize(font_size - 1))
+                ),
+                text(format!("{font_size} pt")),
+                button("A+").on_press_maybe(
+                    (font_size < MAX_FONT_SIZE).then_some(Event::SetFontSize(font_size + 1))
+                ),
+            ]
+            .spacing(6),
+        ]
+        .spacing(8);
         if let Some(notice) = notice {
             body = body.push(text(notice));
         }
@@ -867,6 +888,7 @@ impl Panel {
                 body = body.push(pick_list(presets, Some(selected), Event::Preset));
                 body = body.push(
                     text_input("Question or instructions", &self.instruction)
+                        .size(font)
                         .on_input(Event::Instruction),
                 );
                 body = body.push(
@@ -939,13 +961,18 @@ impl Panel {
                         );
                         if *show_reasoning {
                             response = response.push(
-                                text(&preview.reasoning).wrapping(text::Wrapping::WordOrGlyph),
+                                text(&preview.reasoning)
+                                    .size(font)
+                                    .wrapping(text::Wrapping::WordOrGlyph),
                             );
                         }
                     }
                     if !preview.answer.is_empty() {
-                        response = response
-                            .push(text(&preview.answer).wrapping(text::Wrapping::WordOrGlyph));
+                        response = response.push(
+                            text(&preview.answer)
+                                .size(font)
+                                .wrapping(text::Wrapping::WordOrGlyph),
+                        );
                     }
                     body = body.push(scrollable(response).height(Length::Fill));
                 }
@@ -960,12 +987,16 @@ impl Panel {
             } => {
                 if !outcome.answer.is_empty() {
                     body = body.push(
-                        scrollable(text(&outcome.answer).wrapping(text::Wrapping::WordOrGlyph))
-                            .height(if preview.is_some() {
-                                Length::Fixed(100.0)
-                            } else {
-                                Length::Fill
-                            }),
+                        scrollable(
+                            text(&outcome.answer)
+                                .size(font)
+                                .wrapping(text::Wrapping::WordOrGlyph),
+                        )
+                        .height(if preview.is_some() {
+                            Length::Fixed(100.0)
+                        } else {
+                            Length::Fill
+                        }),
                     );
                 }
                 if let Some(preview) = preview {

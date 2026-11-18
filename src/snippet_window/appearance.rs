@@ -19,6 +19,10 @@ pub(crate) struct Preferences {
     pub(crate) cursor_style: Option<caret::Shape>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) cursor_color: Option<Rgb>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) line_numbers: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) word_wrap: Option<bool>,
 }
 
 impl Preferences {

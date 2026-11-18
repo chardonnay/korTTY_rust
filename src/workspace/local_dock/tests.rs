@@ -44,6 +44,100 @@ fn read_into(browser: &mut Browser, path: &Path, navigation: Navigation) {
 }
 
 #[test]
+fn native_local_dock_reopens_a_remembered_path_and_falls_back_when_removed() -> io::Result<()> {
+    let scratch = Scratch::new()?;
+    let root = fs::canonicalize(&scratch.0)?;
+    let home = root.join("Home");
+    #[cfg(target_os = "linux")]
+    let visited = {
+        use std::os::unix::ffi::OsStringExt as _;
+        root.join(OsString::from_vec(b"visited-\xff".to_vec()))
+    };
+    #[cfg(not(target_os = "linux"))]
+    let visited = root.join("訪問");
+    fs::create_dir(&home)?;
+    fs::create_dir(&visited)?;
+    let mut browser = Browser::new(false);
+    read_into(&mut browser, &visited, Navigation::Visit);
+    let mut preference = Preference::default();
+    assert!(preference.remember_root(browser.current_path().unwrap()));
+    assert!(!preference.remember_root(&visited));
+    let path = root.join("dock.json");
+    profile::save_atomic(&path, &serde_json::to_vec(&preference)?)?;
+    let restored = Preference::read(&path)?;
+    assert_eq!(restored, preference);
+    let last = restored.last_root.as_deref().map(Path::new);
+    assert_eq!(
+        initial_directory(last, Some(&home))?.path,
+        Location::Local(visited.clone())
+    );
+
+    fs::remove_dir(&visited)?;
+    assert_eq!(
+        initial_directory(last, Some(&home))?.path,
+        Location::Local(home)
+    );
+    assert!(!preference.remember_root(Path::new("relative")));
+    assert_eq!(preference.last_root.as_deref(), Some(visited.as_os_str()));
+    Ok(())
+}
+
+#[test]
+fn java_local_file_browser_defaults_preserve_native_choices_and_exclude_the_source_path()
+-> io::Result<()> {
+    use crate::workspace::{
+        backup_data::{merge_java_window_settings, portable_java_preferences},
+        tab_titles::WindowSettings,
+    };
+
+    let imported = portable_java_preferences(
+        br#"<globalSettings>
+            <fileBrowserPosition> RIGHT </fileBrowserPosition>
+            <fileBrowserWidth>515.3</fileBrowserWidth>
+            <fileBrowserShowHidden>true</fileBrowserShowHidden>
+            <fileBrowserLastRoot>/java-host/private-root</fileBrowserLastRoot>
+        </globalSettings>"#,
+        None,
+    )?;
+    assert_eq!((imported.count, imported.omitted), (3, 1));
+    let incoming = imported.contents.unwrap();
+    assert!(!str::from_utf8(&incoming).unwrap().contains("private-root"));
+    let restored = merge_java_window_settings(None, &incoming, &Default::default())?.unwrap();
+    let settings = WindowSettings::decode(&restored)?.java_local_dock;
+    let initial = Preference::with_java_defaults(None, settings);
+    assert_eq!(
+        (initial.side(), initial.width, initial.show_hidden()),
+        (Some(Side::Right), 515.0, true)
+    );
+    let mut workspace = Workspace {
+        local_dock: initial,
+        ..Workspace::default()
+    };
+    let (id, _) = workspace.open_window(false);
+    assert!(workspace.windows[&id].local_files.show_hidden);
+
+    let scratch = Scratch::new()?;
+    let path = scratch.0.join("dock.json");
+    fs::write(&path, br#"{"side":"left","width":480.5}"#)?;
+    let legacy = Preference::with_java_defaults(Some(Preference::read(&path)?), settings);
+    assert_eq!(
+        (legacy.side(), legacy.width, legacy.show_hidden()),
+        (Some(Side::Left), 480.5, true)
+    );
+    fs::write(
+        &path,
+        serde_json::to_vec(&Preference {
+            show_hidden: Some(false),
+            ..legacy
+        })?,
+    )?;
+    let native = Preference::with_java_defaults(Some(Preference::read(&path)?), settings);
+    assert!(!native.show_hidden());
+    assert!(merge_java_window_settings(Some(&restored), &incoming, &Default::default())?.is_none());
+    Ok(())
+}
+
+#[test]
 fn real_entries_keep_native_paths_and_failed_navigation_keeps_history() -> io::Result<()> {
     let scratch = Scratch::new()?;
     let root = fs::canonicalize(&scratch.0)?;
@@ -104,6 +198,8 @@ fn persisted_preference_is_bounded_and_preserves_width_on_a_small_window() -> io
     let preference = Preference {
         side: Some(Side::Right),
         width: 700.0,
+        show_hidden: None,
+        last_root: None,
     };
     profile::save_atomic(&path, &serde_json::to_vec(&preference)?)?;
     assert_eq!(Preference::read(&path)?, preference);
@@ -216,6 +312,8 @@ fn dock_side_and_native_scale_map_tab_drag_coordinates() {
     let mut preference = Preference {
         side: Some(Side::Left),
         width: 380.0,
+        show_hidden: None,
+        last_root: None,
     };
     let (x, width) = preference.tab_drop_coordinates(1000.0, 1000.0, 2000.0);
     assert!((x - 224.0).abs() < 0.001);

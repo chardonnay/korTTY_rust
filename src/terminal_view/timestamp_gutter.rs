@@ -412,6 +412,7 @@ mod tests {
         for visible in [false, true] {
             let terminal = super::super::view(super::super::TerminalView {
                 session,
+                stream_generation: 1,
                 frame: &frame,
                 font_size: 14,
                 font: Font::MONOSPACE,

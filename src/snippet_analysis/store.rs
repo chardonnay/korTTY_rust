@@ -16,12 +16,13 @@ use super::model::{
 use crate::clipboard_policy::ClipboardPolicy;
 use crate::private_files::{Directory, FileStamp, require_single_link};
 use crate::session_journal::export_output::valid_component;
-use crate::snippets::SnippetId;
+use crate::snippets::{Library, SnippetId};
 
 const DIRECTORY_NAME: &str = "snippet-analyses";
 const LOCK_NAME: &str = ".history.lock";
 const SCHEMA_VERSION: u32 = 1;
-const RETENTION: usize = 5;
+pub(crate) const DEFAULT_HISTORY_LIMIT: u8 = 5;
+pub(crate) const HISTORY_LIMITS: std::ops::RangeInclusive<u8> = 1..=20;
 const MAX_RECORDS: usize = 128;
 const MAX_APPLY_RUNS: usize = 8;
 const MAX_APPLY_RECOVERIES: usize = 4;
@@ -30,6 +31,12 @@ const MAX_FILE_BYTES: usize = 12 * MAX_CONTENT_BYTES;
 const CONTENT_BUDGET: usize = MAX_FILE_BYTES / 2;
 // Keep some space for finding and provenance metadata even with heavy JSON escaping.
 const ENCODED_CONTENT_BUDGET: usize = MAX_FILE_BYTES - 8 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RetentionPreview {
+    pub(crate) reports: usize,
+    pub(crate) subjects: usize,
+}
 
 pub(crate) mod java;
 mod modularization;
@@ -97,6 +104,49 @@ impl Store {
         read(&directory, &file_name(subject)?, subject).map(|(history, _)| history)
     }
 
+    pub(crate) fn has_history(&self, subject: Subject) -> io::Result<bool> {
+        match self.directory(false) {
+            Ok(directory) => directory.has_entry(&file_name(subject)?),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn preview_retention(
+        &self,
+        library: &Library,
+        limit: u8,
+        still_current: impl Fn() -> bool,
+    ) -> io::Result<RetentionPreview> {
+        let mut preview = RetentionPreview::default();
+        let directory = match self.directory(false) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(preview),
+            Err(error) => return Err(error),
+        };
+        let subjects = library
+            .entries()
+            .iter()
+            .map(|snippet| Subject::Snippet(snippet.id()))
+            .chain(
+                library
+                    .folders()
+                    .iter()
+                    .map(|folder| Subject::Folder(folder.id)),
+            );
+        for subject in subjects {
+            require_current(&still_current)?;
+            let (history, _) = read(&directory, &file_name(subject)?, subject)?;
+            let removals = retention_removals(&history.records, None, limit).len();
+            if removals != 0 {
+                preview.reports += removals;
+                preview.subjects += 1;
+            }
+        }
+        require_current(still_current)?;
+        Ok(preview)
+    }
+
     #[cfg(test)]
     pub(crate) fn append(&self, subject: Subject, record: Record) -> io::Result<History> {
         self.append_while(subject, record, || true)
@@ -109,7 +159,7 @@ impl Store {
         record: Record,
         still_current: impl Fn() -> bool,
     ) -> io::Result<History> {
-        self.update_while(subject, still_current, |history| {
+        self.update_for_new_record(subject, still_current, |history, limit, content_limit| {
             if !record.apply_runs.is_empty()
                 || record.apply_recovery.is_some()
                 || record.modularization.is_some()
@@ -120,7 +170,7 @@ impl Store {
                     "Append apply, verification and export data through their own workflows",
                 ));
             }
-            insert_record(history, record)
+            insert_record(history, record, limit, content_limit)
         })
     }
 
@@ -177,7 +227,7 @@ impl Store {
                 "The apply proposal requires its complete reviewed source",
             ));
         }
-        self.update_while(subject, still_current, |history| {
+        self.update_with_new_content(subject, still_current, |history, limit| {
             if history.records.iter().any(|record| {
                 record.apply_recovery.as_ref().is_some_and(|recovery| {
                     recovery.revision == run.id
@@ -230,6 +280,7 @@ impl Store {
                 }
                 pre.apply_recovery = None;
             }
+            run.apply_retention(limit)?;
             pre.apply_runs.insert(0, run);
             pre.updated_at = now_millis().max(pre.updated_at);
             Ok(true)
@@ -256,7 +307,7 @@ impl Store {
         {
             return Err(retention_changed());
         }
-        let result = self.update_while(subject, &still_current, |history| {
+        let result = self.update_with_new_content(subject, &still_current, |history, limit| {
             let recoveries = history
                 .records
                 .iter()
@@ -296,7 +347,9 @@ impl Store {
                 return Err(invalid("This analysis has reached its apply run limit"));
             }
             recovery.validate(&pre.analysis)?;
-            pre.apply_recovery = Some(recovery.clone());
+            let mut retained = recovery.clone();
+            retained.retain_new_source(limit, previous)?;
+            pre.apply_recovery = Some(retained);
             pre.updated_at = now_millis().max(pre.updated_at);
             Ok(true)
         });
@@ -449,7 +502,7 @@ impl Store {
         still_current: impl Fn() -> bool,
     ) -> io::Result<History> {
         require_snippet(subject)?;
-        self.update_while(subject, still_current, |history| {
+        self.update_for_new_record(subject, still_current, |history, limit, content_limit| {
             if record.purpose != Purpose::Verify
                 || !record.apply_runs.is_empty()
                 || record.apply_recovery.is_some()
@@ -465,7 +518,7 @@ impl Store {
                 .ok_or_else(|| invalid("The analysis record no longer exists"))?;
             record.previous_record_id = Some(pre_id);
             record.verification = Some(Verification::compare(pre, run_id, &record)?);
-            insert_record(history, record)
+            insert_record(history, record, limit, content_limit)
         })
     }
 
@@ -605,6 +658,37 @@ impl Store {
         java::content_limit(&ClipboardPolicy::load())
     }
 
+    fn update_for_new_record(
+        &self,
+        subject: Subject,
+        still_current: impl Fn() -> bool,
+        change: impl FnOnce(&mut History, u8, usize) -> io::Result<bool>,
+    ) -> io::Result<History> {
+        let history_limit = || crate::workspace::analysis_history_limit_at(&self.profile);
+        let limit = history_limit();
+        self.update_with_new_content(
+            subject,
+            || still_current() && history_limit() == limit,
+            |history, content_limit| change(history, limit, content_limit),
+        )
+    }
+
+    fn update_with_new_content(
+        &self,
+        subject: Subject,
+        still_current: impl Fn() -> bool,
+        change: impl FnOnce(&mut History, usize) -> io::Result<bool>,
+    ) -> io::Result<History> {
+        let user_limit = || crate::workspace::analysis_content_limit_at(&self.profile);
+        let limit = user_limit();
+        self.update_with_lock(
+            subject,
+            || still_current() && user_limit() >= limit,
+            lock_history,
+            |history, ceiling| change(history, ceiling.min(limit)),
+        )
+    }
+
     fn update(
         &self,
         subject: Subject,
@@ -724,7 +808,12 @@ fn valid_export(export: &ExportEntry, record: &Record) -> bool {
         }
 }
 
-fn insert_record(history: &mut History, record: Record) -> io::Result<bool> {
+fn insert_record(
+    history: &mut History,
+    mut record: Record,
+    limit: u8,
+    content_limit: usize,
+) -> io::Result<bool> {
     if let Some(existing) = history
         .records
         .iter()
@@ -738,21 +827,35 @@ fn insert_record(history: &mut History, record: Record) -> io::Result<bool> {
         return Ok(false);
     }
     validate_source(&record)?;
-    let protected = (record.purpose == Purpose::Verify)
-        .then_some(record.previous_record_id)
-        .flatten();
+    record.source.apply_retention(content_limit);
+    let removals = retention_removals(&history.records, Some(&record), limit);
+    history.records.retain(|old| !removals.contains(&old.id));
     history.records.insert(0, record);
-    let accepted: HashSet<_> = history
-        .records
-        .iter()
+    if history.records.len() > MAX_RECORDS {
+        return Err(invalid("The analysis history is full of protected records"));
+    }
+    Ok(true)
+}
+
+fn retention_removals(records: &[Record], next: Option<&Record>, limit: u8) -> HashSet<SnippetId> {
+    let excess = (records.len() + 1).saturating_sub(usize::from(limit));
+    if excess == 0 {
+        return HashSet::new();
+    }
+    let protected = next
+        .filter(|record| record.purpose == Purpose::Verify)
+        .and_then(|record| record.previous_record_id);
+    let accepted: HashSet<_> = next
+        .into_iter()
+        .chain(records)
         .flat_map(|record| &record.apply_runs)
         .filter(|run| run.status == ApplyStatus::Accepted)
         .map(|run| run.id)
         .collect();
     let mut verified = HashSet::new();
-    let evidence: HashSet<_> = history
-        .records
-        .iter()
+    let evidence: HashSet<_> = next
+        .into_iter()
+        .chain(records)
         .filter(|record| {
             record.verification.as_ref().is_some_and(|verification| {
                 verification.matches_applied_revision
@@ -762,27 +865,23 @@ fn insert_record(history: &mut History, record: Record) -> io::Result<bool> {
         })
         .map(|record| record.id)
         .collect();
-    let mut index = history.records.len();
-    while history.records.len() > RETENTION && index > 1 {
-        index -= 1;
-        let old = &history.records[index];
-        if !old.pinned
-            && Some(old.id) != protected
-            && !evidence.contains(&old.id)
-            && old.apply_recovery.is_none()
-            && !modularization::retained(old)
-            && old
-                .apply_runs
-                .iter()
-                .all(|run| run.status == ApplyStatus::Rejected)
-        {
-            history.records.remove(index);
-        }
-    }
-    if history.records.len() > MAX_RECORDS {
-        return Err(invalid("The analysis history is full of protected records"));
-    }
-    Ok(true)
+    records
+        .iter()
+        .rev()
+        .filter(|old| {
+            !old.pinned
+                && Some(old.id) != protected
+                && !evidence.contains(&old.id)
+                && old.apply_recovery.is_none()
+                && !modularization::retained(old)
+                && old
+                    .apply_runs
+                    .iter()
+                    .all(|run| run.status == ApplyStatus::Rejected)
+        })
+        .take(excess)
+        .map(|record| record.id)
+        .collect()
 }
 
 fn lock_history(directory: &Directory) -> io::Result<File> {
@@ -868,14 +967,10 @@ impl Document {
         }
         for record in &mut history.records {
             let source = &mut record.source;
+            source.apply_retention(retention_limit);
             let Some(content) = &source.content else {
                 continue;
             };
-            if !source_fits(content, retention_limit) {
-                source.content = None;
-                source.content_truncated = true;
-                continue;
-            }
             if let Some(stored) = blobs.get(&source.sha256) {
                 source.content = Some(Arc::clone(stored));
                 continue;

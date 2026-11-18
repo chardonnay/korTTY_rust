@@ -34,7 +34,8 @@ def certificates(directory):
     )
     openssl("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
             "-config", "ca.cnf", "-keyout", "ca.key", "-out", "ca.pem")
-    openssl("req", "-new", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=127.0.0.1",
+    openssl("req", "-new", "-newkey", "rsa:2048", "-nodes", "-config", "ca.cnf",
+            "-subj", "/CN=127.0.0.1",
             "-keyout", "leaf.key", "-out", "leaf.csr")
     openssl("x509", "-req", "-days", "1", "-in", "leaf.csr", "-CA", "ca.pem",
             "-CAkey", "ca.key", "-CAcreateserial", "-extfile", "leaf.ext", "-out", "leaf.pem")
@@ -65,6 +66,7 @@ def run(command, scenario):
             endpoint_path = "/v1/chat/completions"
             responses = [
                 (None, False, {"ready": True}),
+                (None, True, None),
                 (None, True, {"title": "Build output", "summary": "build.sh exited 2.",
                               "keywords": ["build.sh"]}),
             ]
@@ -103,10 +105,18 @@ def run(command, scenario):
                     else:
                         assert "build.sh exited 2, token=***" in actual[1], "reviewed evidence missing"
                         assert "private-test-token" not in actual[1], "protected evidence transmitted"
-                    content = json.dumps(answer)
-                    response = json.dumps({"choices": [{"message": {"content": content}}]}).encode()
+                    if answer is None:
+                        assert "response_format" in body, "expected reviewed structured request"
+                        payload = {"error": {"code": "unsupported_response_format"}}
+                        status = 400
+                    else:
+                        if scenario == "--journal-summary" and streaming:
+                            assert "response_format" not in body, "retry retained the rejected format"
+                        payload = {"choices": [{"message": {"content": json.dumps(answer)}}]}
+                        status = 200
+                    response = json.dumps(payload).encode()
                     verified.append(self.connection.version())
-                    self.send_response(200)
+                    self.send_response(status)
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(response)))
                     self.end_headers()

@@ -5,7 +5,7 @@ use std::path::{Component, Path};
 
 use crate::sftp_window::files::LocalStamp;
 use crate::sftp_window::local_tree::Directory;
-use crate::sftp_window::tree::snapshot::Entry as SnapshotEntry;
+use crate::sftp_window::tree::snapshot::{Entry as SnapshotEntry, LocalLeaf};
 use crate::sftp_window::worker::resume::persist::Identity;
 use crate::sftp_window::worker::{Failure, Result};
 
@@ -25,7 +25,12 @@ pub(super) fn remove(
     let directory = match expected {
         SnapshotEntry::LocalFolder(_) => true,
         SnapshotEntry::LocalFile { .. } => false,
-        SnapshotEntry::Remote(_) | SnapshotEntry::Blocked => return Err(stale()),
+        SnapshotEntry::LocalLeaf(stamp) => {
+            return platform::remove_leaf(parent, name, expected_parent, stamp, before_write);
+        }
+        SnapshotEntry::Remote(_) | SnapshotEntry::RemoteLink { .. } | SnapshotEntry::Blocked => {
+            return Err(stale());
+        }
     };
     platform::remove(
         parent,
@@ -64,7 +69,10 @@ fn check_entry(file: &File, expected: &SnapshotEntry) -> Result<Metadata> {
             stamp,
             identity: saved,
         } => metadata.is_file() && *saved == identity && *stamp == LocalStamp::capture(&metadata),
-        SnapshotEntry::Remote(_) | SnapshotEntry::Blocked => false,
+        SnapshotEntry::LocalLeaf(_) => false,
+        SnapshotEntry::Remote(_) | SnapshotEntry::RemoteLink { .. } | SnapshotEntry::Blocked => {
+            false
+        }
     };
     if matches { Ok(metadata) } else { Err(stale()) }
 }
@@ -76,6 +84,29 @@ fn stale() -> Failure {
 #[cfg(windows)]
 mod platform {
     use super::*;
+
+    pub(super) fn remove_leaf(
+        parent_path: &Path,
+        name: &OsStr,
+        expected_parent: &Identity,
+        expected: &LocalLeaf,
+        before_write: &impl Fn() -> Result<()>,
+    ) -> Result<Outcome> {
+        let ancestors = Directory::hold_reviewed_removal_ancestors(parent_path)?;
+        let parent = ancestors.last().ok_or_else(stale)?;
+        check_parent(parent, expected_parent)?;
+        let file = parent.open_link_for_review(name, true)?;
+        if LocalLeaf::capture(&file)?.as_ref() != Some(expected) {
+            return Err(stale());
+        }
+        before_write()?;
+        check_parent(&Directory::open_path(parent_path)?, expected_parent)?;
+        if LocalLeaf::capture(&file)?.as_ref() != Some(expected) {
+            return Err(stale());
+        }
+        kortty_files::tree::remove(file)?;
+        confirm_removal(parent, parent_path, name, expected_parent)
+    }
 
     pub(super) fn remove(
         parent_path: &Path,
@@ -93,24 +124,30 @@ mod platform {
         check_parent(&Directory::open_path(parent_path)?, expected_parent)?;
         check_entry(&file, expected)?;
         match kortty_files::tree::remove(file) {
-            Ok(()) => {
-                let verified = Directory::open_path(parent_path)
-                    .map_err(Failure::from)
-                    .and_then(|current| check_parent(&current, expected_parent))
-                    .and_then(|()| {
-                        parent
-                            .require_absent_after_removal(name)
-                            .map_err(Into::into)
-                    });
-                verified
-                    .map_err(|error| error.context(" · Local removal could not be confirmed"))?;
-                Ok(Outcome::Removed(None))
-            }
+            Ok(()) => confirm_removal(&parent, parent_path, name, expected_parent),
             Err(error) if directory && error.kind() == io::ErrorKind::DirectoryNotEmpty => {
                 Ok(Outcome::KeptNotEmpty)
             }
             Err(error) => Err(error.into()),
         }
+    }
+
+    fn confirm_removal(
+        parent: &Directory,
+        parent_path: &Path,
+        name: &OsStr,
+        expected_parent: &Identity,
+    ) -> Result<Outcome> {
+        Directory::open_path(parent_path)
+            .map_err(Failure::from)
+            .and_then(|current| check_parent(&current, expected_parent))
+            .and_then(|()| {
+                parent
+                    .require_absent_after_removal(name)
+                    .map_err(Into::into)
+            })
+            .map_err(|error| error.context(" · Local removal could not be confirmed"))?;
+        Ok(Outcome::Removed(None))
     }
 }
 
@@ -207,31 +244,65 @@ mod platform {
             }
         })();
         match remove_staged {
-            Ok(true) => {
-                let verified = stage.verify_parent(expected_parent).and_then(|()| {
-                    match statat(stage.parent.file(), name, NOFOLLOW) {
-                        Err(Errno::NOENT) => Ok(()),
-                        Ok(_) => {
-                            Err(io::Error::other("The original local name is now occupied").into())
-                        }
-                        Err(error) => Err(io::Error::from(error).into()),
-                    }
-                });
-                let cleanup = stage.cleanup();
-                let warning = match (verified, cleanup) {
-                    (Err(error), Err(cleanup)) => {
-                        Some(error.context(format!(" · {}", cleanup.message)))
-                    }
-                    (Err(error), Ok(())) | (Ok(()), Err(error)) => Some(error),
-                    (Ok(()), Ok(())) => None,
-                };
-                Ok(Outcome::Removed(warning))
-            }
+            Ok(true) => Ok(stage.finish_removal(name, expected_parent)),
             Ok(false) => {
                 stage.restore(name, payload, &moved)?;
                 stage.cleanup()?;
                 Ok(Outcome::KeptNotEmpty)
             }
+            Err(error) => match stage.restore(name, payload, &moved) {
+                Ok(()) => Err(stage.finish_failure(error)),
+                Err(restore) => Err(error.context(format!(" · {}", restore.message))),
+            },
+        }
+    }
+
+    pub(super) fn remove_leaf(
+        parent_path: &Path,
+        name: &OsStr,
+        expected_parent: &Identity,
+        expected: &LocalLeaf,
+        before_write: &impl Fn() -> Result<()>,
+    ) -> Result<Outcome> {
+        let parent = Directory::open_path(parent_path)?;
+        check_parent(&parent, expected_parent)?;
+        check_protected(&parent)?;
+        if LocalLeaf::from_stat(&statat(parent.file(), name, NOFOLLOW).map_err(io::Error::from)?)
+            != *expected
+        {
+            return Err(stale());
+        }
+        let stage = Quarantine::create(parent_path, parent, nonce()?)?;
+        let payload = OsStr::new(PAYLOAD);
+        let moved = (|| -> Result<Stat> {
+            before_write()?;
+            stage.verify_parent(expected_parent)?;
+            stage.verify()?;
+            let named = statat(stage.parent.file(), name, NOFOLLOW).map_err(io::Error::from)?;
+            if LocalLeaf::from_stat(&named) != *expected {
+                return Err(stale());
+            }
+            stage.move_entry(name, payload)
+        })()
+        .map_err(|error| stage.finish_failure(error))?;
+        let stamp = LocalLeaf::from_stat(&moved);
+        let removed = (|| -> Result<()> {
+            if !expected.same_after_rename(&stamp) {
+                return Err(stale());
+            }
+            before_write()?;
+            stage.verify_parent(expected_parent)?;
+            stage.verify()?;
+            let current =
+                statat(stage.folder.file(), payload, NOFOLLOW).map_err(io::Error::from)?;
+            if LocalLeaf::from_stat(&current) != stamp {
+                return Err(stale());
+            }
+            unlinkat(stage.folder.file(), payload, AtFlags::empty()).map_err(io::Error::from)?;
+            Ok(())
+        })();
+        match removed {
+            Ok(()) => Ok(stage.finish_removal(name, expected_parent)),
             Err(error) => match stage.restore(name, payload, &moved) {
                 Ok(()) => Err(stage.finish_failure(error)),
                 Err(restore) => Err(error.context(format!(" · {}", restore.message))),
@@ -314,6 +385,10 @@ mod platform {
         pub(super) fn relocate(&self, name: &OsStr, payload: &OsStr, held: &File) -> Result<Stat> {
             let named = statat(self.parent.file(), name, NOFOLLOW).map_err(io::Error::from)?;
             require_same(&named, &stat(held)?)?;
+            self.move_entry(name, payload)
+        }
+
+        fn move_entry(&self, name: &OsStr, payload: &OsStr) -> Result<Stat> {
             renameat_with(
                 self.parent.file(),
                 name,
@@ -396,6 +471,26 @@ mod platform {
                 Ok(()) => error,
                 Err(cleanup) => error.context(format!(" · {}", cleanup.message)),
             }
+        }
+
+        fn finish_removal(&self, name: &OsStr, expected_parent: &Identity) -> Outcome {
+            let verified = self.verify_parent(expected_parent).and_then(|()| {
+                match statat(self.parent.file(), name, NOFOLLOW) {
+                    Err(Errno::NOENT) => Ok(()),
+                    Ok(_) => {
+                        Err(io::Error::other("The original local name is now occupied").into())
+                    }
+                    Err(error) => Err(io::Error::from(error).into()),
+                }
+            });
+            let warning = match (verified, self.cleanup()) {
+                (Err(error), Err(cleanup)) => {
+                    Some(error.context(format!(" · {}", cleanup.message)))
+                }
+                (Err(error), Ok(())) | (Ok(()), Err(error)) => Some(error),
+                (Ok(()), Ok(())) => None,
+            };
+            Outcome::Removed(warning)
         }
     }
 
@@ -525,6 +620,47 @@ mod tests {
             b"keep"
         );
         assert_eq!(fs::read_dir(&root).unwrap().count(), 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_local_leaf_removal_restores_the_staged_link_on_cancellation() {
+        use std::cell::Cell;
+        use std::os::unix::fs::symlink;
+
+        use rustix::fs::{AtFlags, statat};
+
+        use crate::sftp_window::tree::snapshot::LocalLeaf;
+
+        let fixture = Profile::new();
+        let root = fixture.0.canonicalize().unwrap();
+        let name = OsStr::new("selected-link");
+        symlink("missing", root.join(name)).unwrap();
+        let parent = Directory::open_path(&root).unwrap();
+        let identity = Identity::directory(&parent).unwrap();
+        let stamp = statat(parent.file(), name, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        let calls = Cell::new(0);
+        let result = remove(
+            &root,
+            name,
+            &identity,
+            &SnapshotEntry::LocalLeaf(LocalLeaf::from_stat(&stamp)),
+            &|| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 2 {
+                    assert!(fs::symlink_metadata(root.join(name)).is_err());
+                    return Err(io::Error::other("Stopped by fixture").into());
+                }
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 2);
+        assert_eq!(
+            fs::read_link(root.join(name)).unwrap(),
+            Path::new("missing")
+        );
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
     }
 
     #[cfg(unix)]

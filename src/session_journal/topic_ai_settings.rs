@@ -11,6 +11,10 @@ pub(crate) const MAX_MODEL_BYTES: usize = 256;
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct Preferences {
     pub(crate) enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) summaries_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) screenshot_analysis_enabled: Option<bool>,
     pub(crate) endpoint: String,
     pub(crate) model: String,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -22,6 +26,8 @@ impl Default for Preferences {
     fn default() -> Self {
         Self {
             enabled: false,
+            summaries_enabled: None,
+            screenshot_analysis_enabled: None,
             endpoint: String::new(),
             model: String::new(),
             vision_enabled: false,
@@ -31,6 +37,14 @@ impl Default for Preferences {
 }
 
 impl Preferences {
+    pub(crate) fn allows_summaries(&self) -> bool {
+        self.enabled && self.summaries_enabled.unwrap_or(true)
+    }
+
+    pub(crate) fn allows_screenshot_analysis(&self, policy: &ClipboardPolicy) -> bool {
+        self.screenshot_analysis_enabled.unwrap_or(true) && vision_allowed(policy)
+    }
+
     pub(crate) fn is_default(&self) -> bool {
         self == &Self::default()
     }
@@ -52,7 +66,7 @@ impl Preferences {
         &self,
         policy: &ClipboardPolicy,
     ) -> io::Result<Option<Profile>> {
-        if !vision_allowed(policy)
+        if !self.allows_screenshot_analysis(policy)
             || !policy
                 .terminal_logging
                 .journal_ai_screenshot_analysis()

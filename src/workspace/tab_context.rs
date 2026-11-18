@@ -832,7 +832,7 @@ impl Workspace {
         };
         batch.targets.iter().any(|target| {
             self.terminal_tab(owner, target.tab)
-                .is_some_and(|tab| self.tab_needs_close_confirmation(tab))
+                .is_some_and(|tab| self.group_close_needs_terminal_confirmation(tab))
         })
     }
 

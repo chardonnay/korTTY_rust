@@ -65,6 +65,14 @@ pub(crate) struct JobProcessProbe {
 }
 
 impl JobProcessProbe {
+    pub(crate) fn has_running_children(&self) -> bool {
+        let Some(_master) = self.master.upgrade() else {
+            return false;
+        };
+        let running = || matches!(child_pid_running(self.shell), Ok(true));
+        running() && job_processes::has_running_children(self.shell) && running()
+    }
+
     pub(crate) fn find<T>(
         &self,
         previous: Option<JobProcessIdentity>,

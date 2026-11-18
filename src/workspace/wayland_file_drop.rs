@@ -1,4 +1,4 @@
-//! Route external Wayland file offers to the SFTP listing that accepted the drop.
+//! Route external Wayland file and text offers to their exact drop targets.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -8,13 +8,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use iced::advanced::widget::Id;
 use iced::futures::{StreamExt as _, stream::BoxStream};
 use iced::{Point, Subscription, Task, window};
-use kortty_windowing::wayland_file_drop::{Event, Permit, Watch, local_paths, watch};
+use kortty_windowing::wayland_file_drop::{Event, Kind, Permit, Watch, local_paths, watch};
 use kortty_windowing::x11_file_drag;
 use kortty_windowing::{wayland_drag::Surface, wayland_file_drag};
 
-use super::{Message as Desktop, Workspace, remote_dock::desktop_drag};
+use super::terminal_text_drop::{PaneHit, PaneTarget};
+use super::{
+    Message as Desktop, Workspace,
+    remote_dock::{TerminalUploadTarget, desktop_drag},
+};
 use crate::sftp_window::{
     self, DesktopDestination, ExternalFileDrag, PreparedFileDrag, WaylandDrop, desktop_drop_target,
 };
@@ -28,6 +33,7 @@ pub enum Message {
     X11Registered(Generation, Option<Arc<x11_file_drag::Surface>>),
     Offer(Generation, Event),
     Target(Generation, u64, Option<DesktopDestination>),
+    PaneTarget(Generation, u64, Option<PaneTarget>),
     DragFinished(Generation, u64, wayland_file_drag::Outcome),
     X11DragFinished(Generation, u64, x11_file_drag::Outcome),
     Cleanup,
@@ -101,7 +107,7 @@ const CONSUMER_GRACE: Duration = Duration::from_secs(60);
 
 struct Drop {
     id: u64,
-    instance: window::Id,
+    instance: Option<window::Id>,
     watch: Arc<Watch>,
     stage: Stage,
     permit: Permit,
@@ -110,6 +116,10 @@ struct Drop {
 enum Stage {
     Locating,
     Reading(DesktopDestination),
+    LocatingText,
+    ReadingText(PaneTarget),
+    LocatingTerminalFiles,
+    ReadingTerminalFiles(TerminalUploadTarget),
     Admitting(Arc<AtomicBool>),
 }
 
@@ -256,6 +266,14 @@ impl State {
 }
 
 impl Workspace {
+    fn wayland_pane_drop_candidates(&self, owner: window::Id, kind: Kind) -> Vec<(Id, PaneTarget)> {
+        self.pane_drop_candidates(owner, |target| match kind {
+            Kind::Text => self.text_drop_target_current(owner, target),
+            Kind::Files => self
+                .terminal_upload_target(owner, target.tab, target.session, target.stream)
+                .is_some(),
+        })
+    }
     pub(super) fn wayland_drag_preparation_subscription(&self) -> Subscription<Desktop> {
         if !self.wayland_file_drop.retained.is_empty()
             || self
@@ -526,10 +544,20 @@ impl Workspace {
             .iter()
             .filter_map(|(&owner, drop)| {
                 let pending = drop.pending();
-                (self.native_sftp_drag_target(owner) != Some(drop.instance)
-                    || !pending
-                    || !drop.permit.is_live())
-                .then_some((owner, pending))
+                let current = match drop.stage {
+                    Stage::LocatingText => !self
+                        .wayland_pane_drop_candidates(owner, Kind::Text)
+                        .is_empty(),
+                    Stage::LocatingTerminalFiles => !self
+                        .wayland_pane_drop_candidates(owner, Kind::Files)
+                        .is_empty(),
+                    Stage::ReadingText(target) => self.text_drop_target_current(owner, target),
+                    Stage::ReadingTerminalFiles(ref target) => {
+                        self.terminal_upload_target_current(owner, target)
+                    }
+                    _ => self.native_sftp_drag_target(owner) == drop.instance,
+                };
+                (!current || !pending || !drop.permit.is_live()).then_some((owner, pending))
             })
             .collect();
         for (owner, reject) in stale {
@@ -547,6 +575,7 @@ impl Workspace {
             | Message::X11Registered(generation, _)
             | Message::Offer(generation, _)
             | Message::Target(generation, _, _)
+            | Message::PaneTarget(generation, _, _)
             | Message::DragFinished(generation, _, _)
             | Message::X11DragFinished(generation, _, _) => *generation,
             Message::Cleanup => return Task::none(),
@@ -613,12 +642,42 @@ impl Workspace {
                     return Task::none();
                 }
                 if let Some(destination) = destination
-                    && self.native_sftp_drag_target(owner) == Some(drop.instance)
+                    && self.native_sftp_drag_target(owner) == drop.instance
                     && drop.permit.is_live()
                     && drop.watch.accept(id)
                     && let Some(drop) = self.wayland_file_drop.pending.get_mut(&owner)
                 {
                     drop.stage = Stage::Reading(destination);
+                } else {
+                    self.wayland_file_drop.reject(owner);
+                }
+                return Task::none();
+            }
+            Message::PaneTarget(_, id, target) => {
+                let Some(drop) = self.wayland_file_drop.same_offer(owner, id) else {
+                    return Task::none();
+                };
+                if !matches!(
+                    drop.stage,
+                    Stage::LocatingText | Stage::LocatingTerminalFiles
+                ) {
+                    return Task::none();
+                }
+                let next = target.and_then(|target| match drop.stage {
+                    Stage::LocatingText if self.text_drop_target_current(owner, target) => {
+                        Some(Stage::ReadingText(target))
+                    }
+                    Stage::LocatingTerminalFiles => self
+                        .terminal_upload_target(owner, target.tab, target.session, target.stream)
+                        .map(Stage::ReadingTerminalFiles),
+                    _ => None,
+                });
+                if let Some(next) = next
+                    && drop.permit.is_live()
+                    && drop.watch.accept(id)
+                    && let Some(drop) = self.wayland_file_drop.pending.get_mut(&owner)
+                {
+                    drop.stage = next;
                 } else {
                     self.wayland_file_drop.reject(owner);
                 }
@@ -631,6 +690,7 @@ impl Workspace {
             Event::Dropped {
                 id,
                 position,
+                kind,
                 permit,
             } => {
                 let Some((_, watch)) = registration.native.clone() else {
@@ -639,10 +699,39 @@ impl Workspace {
                 if !permit.is_live() {
                     return Task::none();
                 }
-                let Some(instance) = self.native_sftp_drag_target(owner) else {
-                    watch.finish(id, false);
-                    return Task::none();
+                let instance = match kind {
+                    Kind::Text => None,
+                    Kind::Files => self.native_sftp_drag_target(owner),
                 };
+                if instance.is_none() {
+                    let candidates = self.wayland_pane_drop_candidates(owner, kind);
+                    if candidates.is_empty() {
+                        watch.finish(id, false);
+                        return Task::none();
+                    }
+                    self.wayland_file_drop.reject(owner);
+                    self.wayland_file_drop.pending.insert(
+                        owner,
+                        Drop {
+                            id,
+                            instance: None,
+                            watch,
+                            stage: match kind {
+                                Kind::Text => Stage::LocatingText,
+                                Kind::Files => Stage::LocatingTerminalFiles,
+                            },
+                            permit,
+                        },
+                    );
+                    return window::operate_at(
+                        owner,
+                        window::NativePosition::Surface(position),
+                        move |point| Box::new(PaneHit::new(point, candidates)),
+                    )
+                    .map(move |target| {
+                        Desktop::WaylandFileDrop(Message::PaneTarget(generation, id, target))
+                    });
+                }
                 self.wayland_file_drop.reject(owner);
                 self.wayland_file_drop.pending.insert(
                     owner,
@@ -654,7 +743,12 @@ impl Workspace {
                         permit,
                     },
                 );
-                window::operate_at(owner, position, desktop_drop_target).map(move |destination| {
+                window::operate_at(
+                    owner,
+                    window::NativePosition::Surface(position),
+                    desktop_drop_target,
+                )
+                .map(move |destination| {
                     Desktop::WaylandFileDrop(Message::Target(generation, id, destination))
                 })
             }
@@ -662,10 +756,35 @@ impl Workspace {
                 let Some(drop) = self.wayland_file_drop.same_offer(owner, id) else {
                     return Task::none();
                 };
+                if let Stage::ReadingText(target) = drop.stage {
+                    let watch = Arc::clone(&drop.watch);
+                    let live = drop.permit.is_live();
+                    self.wayland_file_drop.pending.remove(&owner);
+                    let accepted = live
+                        && std::str::from_utf8(&data).is_ok_and(|text| {
+                            self.admit_terminal_text_drop(owner, target, text.to_owned())
+                        });
+                    watch.finish(id, accepted);
+                    return Task::none();
+                }
+                if let Stage::ReadingTerminalFiles(target) = &drop.stage {
+                    let watch = Arc::clone(&drop.watch);
+                    let live = drop.permit.is_live();
+                    let target = target.clone();
+                    self.wayland_file_drop.pending.remove(&owner);
+                    let upload = live
+                        .then(|| local_paths(&data))
+                        .flatten()
+                        .and_then(|paths| self.open_terminal_upload(owner, target, paths));
+                    watch.finish(id, upload.is_some());
+                    return upload.unwrap_or_else(Task::none);
+                }
                 let Stage::Reading(destination) = &drop.stage else {
                     return Task::none();
                 };
-                let instance = drop.instance;
+                let Some(instance) = drop.instance else {
+                    return Task::none();
+                };
                 if !drop.permit.is_live() || self.native_sftp_drag_target(owner) != Some(instance) {
                     self.wayland_file_drop.reject(owner);
                     return Task::none();

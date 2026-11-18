@@ -17,7 +17,7 @@ pub enum Theme {
 }
 
 impl Theme {
-    fn palette(self) -> Palette {
+    fn palette(self) -> Palette<'static> {
         match self {
             Self::Light => Palette {
                 canvas: "#ffffff",
@@ -56,8 +56,8 @@ impl Theme {
     }
 }
 
-struct Palette {
-    canvas: &'static str,
+struct Palette<'a> {
+    canvas: &'a str,
     text: &'static str,
     edge: &'static str,
 }
@@ -66,20 +66,35 @@ impl Scene {
     /// Renders the scene as self-contained SVG. Input labels are escaped as
     /// plain text. The SVG contains no scripts, callbacks, links or resources.
     pub fn to_svg(&self, theme: Theme) -> String {
-        self.svg_with_preferred_font(theme, system_label_family())
+        self.to_svg_with_background(theme, None)
+    }
+
+    /// Renders a diagram with an optional RGB canvas override.
+    pub fn to_svg_with_background(&self, theme: Theme, background: Option<[u8; 3]>) -> String {
+        self.svg_with_preferred_font(theme, system_label_family(), background)
     }
 
     /// Renders the same scene using a caller-provided font family. This method
     /// performs no system font discovery. The caller supplies the font when rasterizing.
     pub fn to_svg_with_font_family(&self, theme: Theme, family: &str) -> String {
-        self.svg_with_preferred_font(theme, Some(family))
+        self.svg_with_preferred_font(theme, Some(family), None)
     }
 
-    fn svg_with_preferred_font(&self, theme: Theme, family: Option<&str>) -> String {
+    fn svg_with_preferred_font(
+        &self,
+        theme: Theme,
+        family: Option<&str>,
+        background: Option<[u8; 3]>,
+    ) -> String {
         let mut svg = String::new();
         let width = self.bounds.width;
         let height = self.bounds.height;
-        let palette = theme.palette();
+        let background = background.map(|[r, g, b]| format!("#{r:02x}{g:02x}{b:02x}"));
+        let default_palette = theme.palette();
+        let palette = Palette {
+            canvas: background.as_deref().unwrap_or(default_palette.canvas),
+            ..default_palette
+        };
         let _ = write!(
             svg,
             r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" font-family=""#

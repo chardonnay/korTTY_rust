@@ -3,6 +3,54 @@ use crate::ai_manager::{Configuration, backup};
 use crate::clipboard_policy::ClipboardPolicy;
 
 #[test]
+fn imported_java_journal_preferences_require_current_review_without_outbound_grants() {
+    let (endpoint, _) = listener();
+    let (scratch, mut workspace, capture, _) = seeded(endpoint.local_addr().unwrap());
+    let root = scratch.0.canonicalize().unwrap();
+    let config = |minutes| {
+        let xml = format!(
+            "<globalSettings><sessionJournalSummarizeIntervalMinutes>{minutes}</sessionJournalSummarizeIntervalMinutes><sessionJournalAiTitleEnabled>true</sessionJournalAiTitleEnabled></globalSettings>"
+        );
+        let (bytes, _) = backup::portable_java_profiles(xml.as_bytes()).unwrap();
+        serde_json::from_slice::<Configuration>(&bytes).unwrap()
+    };
+    workspace.set_test_ai_configuration(config(17));
+    let manager = show_manager(&mut workspace);
+    let _ = summary(&mut workspace, manager, Event::Settings);
+    let _ = summary(&mut workspace, manager, Event::SaveSettings);
+    assert_eq!(
+        Queue::load(&root).unwrap().preferences().interval_minutes,
+        5
+    );
+    assert!(!Queue::load(&root).unwrap().preferences().automatic_title);
+    let _ = summary(&mut workspace, manager, Event::Settings);
+    let _ = summary(&mut workspace, manager, Event::UseImportedPreferences);
+    workspace.set_test_ai_configuration(config(23));
+    // Editing one field must not discard the provenance of the other imported field.
+    let _ = summary(&mut workspace, manager, Event::Interval("19".into()));
+    let _ = summary(&mut workspace, manager, Event::SaveSettings);
+    assert!(
+        workspace
+            .journal_summaries
+            .status
+            .as_deref()
+            .unwrap()
+            .contains("preferences changed")
+    );
+    assert!(!Queue::load(&root).unwrap().preferences().automatic_title);
+    let _ = summary(&mut workspace, manager, Event::UseImportedPreferences);
+    let _ = summary(&mut workspace, manager, Event::SaveSettings);
+    let disk = Queue::load(&root).unwrap();
+    assert_eq!(disk.preferences().interval_minutes, 23);
+    assert!(disk.preferences().automatic_title);
+    assert!(!disk.preferences().enabled);
+    assert!(disk.preferences().reviewed_grant().is_none());
+    assert!(disk.preferences().automation_grant().is_none());
+    assert_eq!(endpoint.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+    finish_capture(&capture);
+}
+
+#[test]
 fn journal_summary_settings_save_limits_and_drop_stale_recording_receipts() {
     let (endpoint, _) = listener();
     let (scratch, mut workspace, capture, _) = seeded(endpoint.local_addr().unwrap());

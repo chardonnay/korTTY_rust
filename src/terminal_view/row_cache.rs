@@ -426,6 +426,7 @@ mod tests {
             renderer.reset(bounds);
             let view = TerminalView {
                 session: crate::session::SessionId(1),
+                stream_generation: 1,
                 frame,
                 font_size: 14,
                 font: Font::MONOSPACE,
@@ -528,6 +529,7 @@ mod tests {
         );
         let view = TerminalView {
             session: crate::session::SessionId(1),
+            stream_generation: 1,
             frame: &frame,
             font_size: 14,
             font: Font::MONOSPACE,

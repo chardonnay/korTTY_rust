@@ -143,3 +143,85 @@ fn swarm_automation_journal_revocation_stops_pending_capture() {
     let catalog = session_journal::catalog(&root.join("journals")).unwrap();
     assert!(catalog.journals.is_empty());
 }
+
+#[test]
+fn swarm_journal_records_only_dispatched_commands_as_optional_masked_input() {
+    use session_journal::CaptureKind;
+
+    for capture_input in [false, true] {
+        let profile = Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        let (mut workspace, id, keys) = journal_fixture(&root);
+        for edit in [
+            SwarmJournalEdit::Enabled(true),
+            SwarmJournalEdit::Input(capture_input),
+        ] {
+            let _ = workspace.swarm_action(id, Message::Journal(edit));
+        }
+        let task = workspace.swarm_action(id, Message::Start);
+        drain(&mut workspace, task);
+        let member = workspace.terminal_agents.swarms[&id]
+            .members
+            .iter()
+            .find_map(|(&member, ticket)| (ticket.key() == keys[0]).then_some(member))
+            .unwrap();
+        let run = workspace.terminal_agents.runs.get_mut(&member).unwrap();
+        let secrets = crate::terminal_logging::Secrets::default();
+        secrets.add("fixture-journal-password");
+        run.redactor = run.redactor.with_overlay(&secrets.seal().unwrap()).unwrap();
+        let _ = run.record_command("$ internal probe".into(), true);
+        let _ = run.record_command("$ denied command".into(), false);
+        let command = run
+            .record_command("$ printf fixture-journal-password".into(), false)
+            .unwrap();
+        command.store(true, std::sync::atomic::Ordering::Release);
+        run.record("fixture output".into());
+        run.record_command("$ pwd".into(), false)
+            .unwrap()
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        let task = workspace.swarm_action(id, Message::Cancel(keys[0]));
+        drain(&mut workspace, task);
+        let source = &workspace.terminal_agents.swarms[&id].journal.links[0];
+        let page = source.capture_page(None, None, None).unwrap();
+        let inputs: Vec<_> = page
+            .records
+            .iter()
+            .filter(|record| record.kind == CaptureKind::Input)
+            .map(|record| record.text.as_str())
+            .collect();
+        assert_eq!(
+            inputs,
+            if capture_input {
+                vec!["printf ***", "pwd"]
+            } else {
+                vec![]
+            }
+        );
+        let outputs: Vec<_> = page
+            .records
+            .iter()
+            .filter(|record| record.kind == CaptureKind::Output)
+            .map(|record| record.text.as_str())
+            .collect();
+        assert!(
+            outputs
+                .iter()
+                .any(|output| output.contains("fixture output"))
+        );
+        let contents = page
+            .records
+            .iter()
+            .map(|record| record.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for excluded in [
+            "internal probe",
+            "denied command",
+            "fixture-journal-password",
+            "$ pwd",
+        ] {
+            assert!(!contents.contains(excluded));
+        }
+    }
+}

@@ -255,6 +255,9 @@ impl Workspace {
         profile: TerminalProfile,
         shell: LocalShell,
     ) -> Result<LocalSettings, &'static str> {
+        if !self.window_settings.automatic_local_shell_integration() {
+            return Err("Automatic setup for local shells is disabled in Settings → Terminal.");
+        }
         if !self.window_settings.prompt_navigation_enabled
             || !super::shell_integration::supports_marks(profile)
         {
@@ -909,6 +912,19 @@ fn wrap(id: window::Id, message: Message) -> Desktop {
 mod tests {
     use super::*;
     use crate::ssh_dialog::{LoginMessage, Password};
+
+    #[test]
+    fn quick_local_shell_setup_respects_the_global_choice_without_disabling_marks() {
+        let mut workspace = Workspace::default();
+        workspace.window_settings.automatic_local_shell_integration = Some(false);
+        assert_eq!(
+            workspace
+                .quick_shell_integration(TerminalProfile::Xterm, LocalShell::Default)
+                .unwrap_err(),
+            "Automatic setup for local shells is disabled in Settings → Terminal."
+        );
+        assert!(workspace.window_settings.prompt_navigation_enabled);
+    }
 
     #[cfg(windows)]
     #[test]

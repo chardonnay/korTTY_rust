@@ -124,11 +124,19 @@ pub(super) fn convert(
                     themes.limited,
                     "themes with unsupported settings or external assets omitted in part",
                 );
-                if themes.added > 0 {
+                if themes.added > 0 || themes.edited_built_in > 0 {
                     snapshot.insert(data::WINDOW_SETTINGS.into(), Zeroizing::new(bytes));
+                }
+                if themes.added > 0 {
                     report
                         .entries
                         .push(format!("Custom themes ({})", themes.added));
+                }
+                if themes.edited_built_in > 0 {
+                    report.entries.push(format!(
+                        "Edited built-in themes for unmodified presets ({})",
+                        themes.edited_built_in
+                    ));
                 }
             }
             Err(error) => report.omit("themes.xml", error),
@@ -191,10 +199,32 @@ pub(super) fn convert(
                 toolbar = import.toolbar;
                 if let Some(contents) = import.contents {
                     snapshot.insert(data::WINDOW_SETTINGS.into(), Zeroizing::new(contents));
+                    if import.count != 0 {
+                        report.entries.push(format!(
+                            "Global preferences for unset fields ({})",
+                            import.count
+                        ));
+                    }
+                }
+                if import.teamwork_proposals != 0 {
                     report.entries.push(format!(
-                        "Global preferences for unset fields ({})",
-                        import.count
+                        "Inactive Java Teamwork settings for review ({})",
+                        import.teamwork_proposals
                     ));
+                }
+                if import.swarm_journal_proposal {
+                    report.entries.push(
+                        "Inactive Java Swarm journal settings for review in the Swarm window."
+                            .into(),
+                    );
+                }
+                if import.java_update_opt_in {
+                    report.entries.push("Java automatic update checks are available for review in Rust update settings.".into());
+                }
+                if import.java_log_directory {
+                    report.omissions.push(
+                        "Java application log folder requires selection on this device.".into(),
+                    );
                 }
                 if import.sftp_overwrite {
                     report.entries.push("SFTP conflict default in this backup is Replace regular files. A saved local conflict default takes precedence.".into());
@@ -308,6 +338,45 @@ pub(super) fn convert(
                     imported.role_hints_omitted,
                     "invalid Java AI role suggestions omitted",
                 );
+                if imported.journal_preferences_omitted {
+                    report.omissions.push(
+                        "Invalid Java Session Journal interval or title preferences were omitted."
+                            .into(),
+                    );
+                }
+                if imported.memory_tokens_omitted {
+                    report
+                        .omissions
+                        .push("Invalid Java AI Memory token budget was omitted.".into());
+                }
+                report.note_count(
+                    imported.memory_preferences_omitted,
+                    "invalid Java AI Memory activation or learning preferences omitted",
+                );
+                report.note_count(
+                    imported.skill_preferences_omitted,
+                    "invalid Java AI skill preferences omitted",
+                );
+                if imported.agent_shortcut_omitted {
+                    report.omissions.push(
+                        "Invalid or oversized Java Agent command preferences were omitted.".into(),
+                    );
+                }
+                if imported.agent_execution_omitted {
+                    report
+                        .omissions
+                        .push("Invalid Java Agent execution preference was omitted.".into());
+                }
+                if imported.agent_confirmation_omitted {
+                    report.omissions.push(
+                        "Invalid Java Agent command confirmation preference was omitted.".into(),
+                    );
+                }
+                if imported.journal_semantic_search_omitted {
+                    report.omissions.push(
+                        "Invalid Java Journal semantic search preference was omitted.".into(),
+                    );
+                }
                 if imported.journal_evidence_omitted {
                     report.omissions.push(
                         "Invalid or unsupported Java Session Journal evidence limits were omitted."
@@ -322,6 +391,14 @@ pub(super) fn convert(
                     || imported.role_hints != 0
                     || imported.journal_profile_hints != 0
                     || imported.journal_evidence_hint
+                    || imported.journal_preferences_hint
+                    || imported.memory_tokens_hint
+                    || imported.memory_preferences_hint
+                    || imported.skill_preferences_hint
+                    || imported.agent_shortcut_hint
+                    || imported.agent_execution_hint
+                    || imported.agent_confirmation_hint
+                    || imported.journal_semantic_search_hint
                 {
                     if ClipboardPolicy::load().ai_profile_creation_allowed() {
                         snapshot.insert(ai::SETTINGS.into(), Zeroizing::new(bytes));
@@ -376,6 +453,46 @@ pub(super) fn convert(
                                 .entries
                                 .push("Session Journal evidence limits requiring review".into());
                         }
+                        if imported.journal_preferences_hint {
+                            report.entries.push(
+                                "Session Journal interval and title suggestions requiring review"
+                                    .into(),
+                            );
+                        }
+                        if imported.memory_tokens_hint {
+                            report
+                                .entries
+                                .push("AI Memory token budget requiring review".into());
+                        }
+                        if imported.agent_shortcut_hint {
+                            report
+                                .entries
+                                .push("Agent command preferences requiring review".into());
+                        }
+                        if imported.journal_semantic_search_hint {
+                            report
+                                .entries
+                                .push("Journal semantic search preference requiring review".into());
+                        }
+                        if imported.skill_preferences_hint {
+                            report.entries.push("Java AI skill preferences were retained as inactive suggestions for explicit adoption in AI Manager.".into());
+                        }
+                        if imported.memory_preferences_hint {
+                            report.entries.push(
+                                "AI Memory activation and learning preferences requiring review"
+                                    .into(),
+                            );
+                        }
+                        if imported.agent_execution_hint {
+                            report
+                                .entries
+                                .push("Agent execution preference requiring review".into());
+                        }
+                        if imported.agent_confirmation_hint {
+                            report.entries.push(
+                                "Agent command confirmation preference requiring review".into(),
+                            );
+                        }
                         journal_profiles = Some(imported);
                     } else {
                         report.note_count(count, "Java AI profiles omitted by managed policy");
@@ -391,6 +508,40 @@ pub(super) fn convert(
                             imported.journal_profile_hints,
                             "Java Session Journal profile suggestions omitted by managed policy",
                         );
+                        if imported.journal_semantic_search_hint {
+                            report.omissions.push("Java Journal semantic search preference was omitted by managed policy.".into());
+                        }
+                        if imported.agent_confirmation_hint {
+                            report.omissions.push("Java Agent command confirmation preference was omitted by managed policy.".into());
+                        }
+                        if imported.agent_execution_hint {
+                            report.omissions.push(
+                                "Java Agent execution preference was omitted by managed policy."
+                                    .into(),
+                            );
+                        }
+                        if imported.agent_shortcut_hint {
+                            report.omissions.push(
+                                "Java Agent command preferences were omitted by managed policy."
+                                    .into(),
+                            );
+                        }
+                        if imported.skill_preferences_hint {
+                            report.omissions.push(
+                                "Java AI skill preferences were omitted by managed policy.".into(),
+                            );
+                        }
+                        if imported.memory_preferences_hint {
+                            report.omissions.push("Java AI Memory activation and learning preferences were omitted by managed policy.".into());
+                        }
+                        if imported.memory_tokens_hint {
+                            report.omissions.push(
+                                "Java AI Memory token budget was omitted by managed policy.".into(),
+                            );
+                        }
+                        if imported.journal_preferences_hint {
+                            report.omissions.push("Java Session Journal interval and title suggestions were omitted by managed policy.".into());
+                        }
                         if imported.journal_evidence_hint {
                             report.omissions.push("Java Session Journal evidence limits were omitted by managed policy.".into());
                         }
@@ -483,6 +634,16 @@ pub(super) fn convert(
                 .omissions
                 .push("Managed policy prevents Java knowledge store suggestions.".into());
         }
+    }
+
+    if let Some(profiles) = &journal_profiles
+        && let Some(settings) = snapshot.get_mut(data::WINDOW_SETTINGS)
+        && let Some(bytes) = backup_data::associate_java_swarm_journal_profile(
+            settings,
+            profiles.java_profile_sources(),
+        )?
+    {
+        *settings = Zeroizing::new(bytes);
     }
 
     if let Some(bytes) = connections {

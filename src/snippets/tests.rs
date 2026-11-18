@@ -83,11 +83,13 @@ fn custom_header_policy_checks_new_identities_on_every_store_write() {
                 id: None,
                 input: input("Allowed entry"),
                 metadata: Metadata::default(),
+                history: Vec::new(),
             },
             archive::ImportedSnippet {
                 id: None,
                 input: header("Imported header"),
                 metadata: Metadata::default(),
+                history: Vec::new(),
             },
         ],
         ..archive::Imports::default()

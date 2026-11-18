@@ -34,7 +34,10 @@ pub(crate) enum Setting {
     CodeTextLanguage,
     ChatTerminalActions,
     AgentShortcut,
+    AgentExecution,
+    AgentConfirmation,
     ShowAgentSetup,
+    JournalSemanticSearch,
     Profile(ProfileSetting),
     Role(Role),
     Embedding,
@@ -48,7 +51,10 @@ impl Setting {
             | Self::CodeTextLanguage
             | Self::ChatTerminalActions
             | Self::AgentShortcut
-            | Self::ShowAgentSetup => Page::General,
+            | Self::AgentExecution
+            | Self::AgentConfirmation
+            | Self::ShowAgentSetup
+            | Self::JournalSemanticSearch => Page::General,
             Self::Profile(_) => Page::Profiles,
             Self::Role(_) | Self::Embedding => Page::LocalPreferences,
         }
@@ -61,7 +67,10 @@ impl Setting {
             Self::CodeTextLanguage => "Default code text language",
             Self::ChatTerminalActions => "AI chat code blocks in the terminal",
             Self::AgentShortcut => "Enable terminal agent shortcuts",
+            Self::AgentExecution => "Allow Agent command execution",
+            Self::AgentConfirmation => "Require approval for mutating Agent command sets",
             Self::ShowAgentSetup => "Show terminal agent setup for submitted aliases",
+            Self::JournalSemanticSearch => "Use local semantic ranking for journal questions",
             Self::Profile(setting) => setting.title(),
             Self::Role(role) => role.label(),
             Self::Embedding => "Default embedding model",
@@ -75,7 +84,12 @@ impl Setting {
             Self::CodeTextLanguage => "snippet script comments output messages translation",
             Self::ChatTerminalActions => "actions insert run copy save",
             Self::AgentShortcut => "agent ask plan alias input command name case OSC 133",
+            Self::AgentExecution => "agent execute run swarm scheduled diagnostics permission",
+            Self::AgentConfirmation => {
+                "agent confirmation mutating command sets approve remaining always"
+            }
             Self::ShowAgentSetup => "run dialog ask skip bypass startup prompt confirmation",
+            Self::JournalSemanticSearch => "journal semantic search embedding lexical ranking BM25",
             Self::Profile(setting) => setting.keywords(),
             Self::Role(Role::Text) => "translation profile roles",
             Self::Role(_) => "profile roles",
@@ -237,10 +251,13 @@ pub(super) fn results<'a>(
     let query = query.trim().to_lowercase();
     [
         Setting::Features,
+        Setting::JournalSemanticSearch,
         Setting::GlobalTimeout,
         Setting::CodeTextLanguage,
         Setting::ChatTerminalActions,
         Setting::AgentShortcut,
+        Setting::AgentExecution,
+        Setting::AgentConfirmation,
         Setting::ShowAgentSetup,
     ]
     .into_iter()

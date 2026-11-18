@@ -13,6 +13,21 @@ const FONT: u8 = 17;
 const TEST_PASSWORD: &str = "workspace-test-password";
 
 #[test]
+fn ssh_encoding_resolution_keeps_connection_and_teamwork_overrides_first() {
+    let global = DefaultEncoding::Text(TextEncoding::Windows1252);
+    assert_eq!(global.resolve(None, None), Some(TextEncoding::Windows1252));
+    assert_eq!(
+        global.resolve(None, Some(TextEncoding::Latin9)),
+        Some(TextEncoding::Latin9)
+    );
+    assert_eq!(
+        global.resolve(Some(TextEncoding::Utf8), Some(TextEncoding::Latin9)),
+        Some(TextEncoding::Utf8)
+    );
+    assert_eq!(DefaultEncoding::Emulation.resolve(None, None), None);
+}
+
+#[test]
 fn mcp_masking_uses_ssh_secrets_when_journaling_and_logging_are_off() {
     let mut workspace = Workspace::default();
     workspace.set_test_ai_configuration(
@@ -285,7 +300,7 @@ fn teamwork_ssh_rejects_changed_or_removed_selections_before_open_and_submit() {
     let changed = fixture.catalog("replacement.example");
     assert_eq!(
         changed.entries().next().unwrap().identity(),
-        &selected.identity
+        selected.route.identity()
     );
 
     for (current, sftp) in [(changed, false), (teamwork::Catalog::default(), true)] {
@@ -318,6 +333,43 @@ fn teamwork_ssh_rejects_changed_or_removed_selections_before_open_and_submit() {
             workspace.windows[&owner].notice.as_deref(),
             Some(TEAMWORK_RESELECT)
         );
+    }
+}
+
+#[test]
+fn teamwork_reviewed_route_round_trips_and_binds_source_group_and_login() {
+    let fixture = TeamworkFixture::new();
+    let original = fixture.catalog_with_auth(
+        "shared.example",
+        "operator",
+        "<group>Production</group><credentialId>foreign-id</credentialId>",
+    );
+    let selected = fixture.selection(&original);
+    let encoded = serde_json::to_string(selected.route.as_ref()).unwrap();
+    assert!(!encoded.contains("foreign-id"));
+    let reviewed: teamwork::ReviewedRoute = serde_json::from_str(&encoded).unwrap();
+    assert!(reviewed.matches(original.entries().next().unwrap()));
+
+    let other_source = TeamworkFixture::new();
+    for catalog in [
+        other_source.catalog_with_auth(
+            "shared.example",
+            "operator",
+            "<group>Production</group><credentialId>foreign-id</credentialId>",
+        ),
+        fixture.catalog_with_auth(
+            "shared.example",
+            "operator",
+            "<group>Staging</group><credentialId>foreign-id</credentialId>",
+        ),
+        fixture.catalog_with_auth(
+            "shared.example",
+            "different-user",
+            "<group>Production</group><credentialId>foreign-id</credentialId>",
+        ),
+        fixture.catalog_with_auth("shared.example", "operator", "<group>Production</group>"),
+    ] {
+        assert!(!reviewed.matches(catalog.entries().next().unwrap()));
     }
 }
 
@@ -360,7 +412,8 @@ fn teamwork_default_vault_password_is_bound_to_the_effective_target_and_scope() 
 
     let fixture = TeamworkFixture::new();
     let vault_path = fixture.0.join("vault.bin");
-    let mut vault = Vault::create(&vault_path, b"teamwork-auth-test-master").unwrap();
+    let mut vault =
+        Vault::create(&vault_path, &crate::vault_window::test_vault_password()[..]).unwrap();
     let credential = vault
         .save(
             CredentialInput {
@@ -383,7 +436,7 @@ fn teamwork_default_vault_password_is_bound_to_the_effective_target_and_scope() 
 
     let eligible = fixture.catalog_with_auth("shared.example", "", "");
     let selected = fixture.selection(&eligible);
-    assert!(selected.default_auth_eligible);
+    assert!(selected.route.default_auth_eligible);
     workspace.set_teamwork_catalog_for_test(eligible);
     let _ = workspace.show_teamwork_ssh(owner, selected, false);
     let key = workspace.guarded_ssh_form_key(owner);
@@ -428,6 +481,27 @@ fn teamwork_default_vault_password_is_bound_to_the_effective_target_and_scope() 
         assert_eq!(form.target_endpoint().unwrap().username, "operator");
         assert!(form.vault_password().is_none());
     }
+
+    workspace.set_teamwork_auth_for_test(teamwork::DefaultAuth::Ordered(teamwork::OrderedAuth {
+        credential: Some(credential.clone()),
+        username: "fallback-operator".into(),
+        temporary_key: true,
+        ..teamwork::OrderedAuth::default()
+    }));
+    for (host, username, uses_password) in [
+        ("shared.example", "vault-user", true),
+        ("different.example", "fallback-operator", false),
+    ] {
+        let catalog = fixture.catalog_with_auth(host, "operator", "");
+        let selection = fixture.selection(&catalog);
+        workspace.set_teamwork_catalog_for_test(catalog);
+        let _ = workspace.show_teamwork_ssh(owner, selection, false);
+        let Stage::Form(form) = &workspace.pending_ssh_mut(owner).unwrap().stage else {
+            panic!("expected a shared login form");
+        };
+        assert_eq!(form.target_endpoint().unwrap().username, username);
+        assert_eq!(form.explicit_vault().is_some(), uses_password);
+    }
 }
 
 #[test]
@@ -435,10 +509,10 @@ fn teamwork_vault_unlock_resumes_the_same_target_after_the_prompt_closes() {
     use crate::vault_window::{Completion, Message as VaultMessage, VaultWindow};
     use kortty_vault::{CredentialInput, Secret, Vault};
 
-    const MASTER: &[u8] = b"teamwork-unlock-test-master";
+    let master_password = crate::vault_window::test_vault_password();
     let fixture = TeamworkFixture::new();
     let path = fixture.0.join("vault.bin");
-    let mut vault = Vault::create(&path, MASTER).unwrap();
+    let mut vault = Vault::create(&path, &master_password[..]).unwrap();
     let credential = vault
         .save(
             CredentialInput {
@@ -466,7 +540,11 @@ fn teamwork_vault_unlock_resumes_the_same_target_after_the_prompt_closes() {
     assert!(workspace.pending_ssh_mut(owner).is_none());
     let _ = workspace.update_vault(
         unlock,
-        VaultMessage::Completed(Completion::unlock_fixture(&path, MASTER, true)),
+        VaultMessage::Completed(Completion::unlock_fixture(
+            &path,
+            &master_password[..],
+            true,
+        )),
     );
     assert!(workspace.vault_id.is_none());
     assert!(workspace.pending_ssh_mut(owner).is_none());
@@ -490,7 +568,7 @@ fn cancelling_teamwork_vault_unlock_preserves_the_source_and_rejects_a_changed_p
 
     let fixture = TeamworkFixture::new();
     let path = fixture.0.join("vault.bin");
-    drop(Vault::create(&path, b"teamwork-cancel-test-master").unwrap());
+    drop(Vault::create(&path, &crate::vault_window::test_vault_password()[..]).unwrap());
     let catalog = fixture.catalog_with_auth("shared.example", "operator", "");
     let selection = fixture.selection(&catalog);
     let mut workspace = Workspace::default();
@@ -1505,7 +1583,7 @@ fn confirmed_quit_cancels_pending_shell_and_sftp_authentication() {
     workspace.sftp_logins.insert(sftp, pending);
     assert!(cancellations.iter().all(|dial| !dial.is_cancelled()));
 
-    let _ = workspace.quit_confirmed(false);
+    let _ = workspace.quit();
     assert!(workspace.windows[&shell].pending_ssh.is_none());
     assert!(workspace.sftp_logins.is_empty());
     assert!(cancellations.iter().all(DialCancellation::is_cancelled));

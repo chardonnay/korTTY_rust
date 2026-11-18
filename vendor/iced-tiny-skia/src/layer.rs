@@ -12,6 +12,27 @@ use std::sync::Arc;
 
 pub type Stack = layer::Stack<Layer>;
 
+fn text_visible_bounds(text: &Text) -> Option<Rectangle> {
+    match text {
+        Text::Editor {
+            clip_bounds,
+            transformation,
+            ..
+        } => Some(*clip_bounds * *transformation),
+        Text::Cached {
+            align_x: core::text::Alignment::Right,
+            bounds,
+            clip_bounds,
+            ..
+        } => Rectangle {
+            x: bounds.x - bounds.width,
+            ..*bounds
+        }
+        .intersection(clip_bounds),
+        _ => text.visible_bounds(),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Layer {
     pub bounds: Rectangle,
@@ -235,7 +256,7 @@ impl Layer {
             |item| {
                 item.as_slice()
                     .iter()
-                    .filter_map(Text::visible_bounds)
+                    .filter_map(text_visible_bounds)
                     .map(|bounds| bounds * item.transformation())
                     .collect()
             },
@@ -244,7 +265,7 @@ impl Layer {
                     text_a.as_slice(),
                     text_b.as_slice(),
                     |text| {
-                        text.visible_bounds()
+                        text_visible_bounds(text)
                             .into_iter()
                             .map(|bounds| bounds * text_a.transformation())
                             .collect()

@@ -64,6 +64,319 @@ fn client(replies: impl FnOnce(&mut Vec<u8>)) -> Client {
     .unwrap()
 }
 
+#[test]
+fn delete_selection_preflights_all_entries_then_removes_only_selected_children() {
+    let root = tempfile::tempdir().unwrap();
+    let first = root.path().join("first.txt");
+    let second = root.path().join("second.txt");
+    let retained = root.path().join("retained.txt");
+    for path in [&first, &second, &retained] {
+        std::fs::write(path, b"fixture").unwrap();
+    }
+    let snapshot = || crate::sftp_window::files::list_local(root.path()).unwrap();
+    let selected = |directory: &crate::sftp_window::Directory| {
+        directory
+            .entries
+            .iter()
+            .filter(|entry| entry.display != "retained.txt")
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let mut client = client(|_| {});
+    let original = snapshot();
+    std::fs::write(&second, b"changed fixture").unwrap();
+    assert!(
+        super::super::delete_selection(&mut client, &original.path, &selected(&original), || false)
+            .is_err()
+    );
+    assert!(first.exists() && second.exists() && retained.exists());
+    let reviewed = snapshot();
+    let result =
+        super::super::delete_selection(&mut client, &reviewed.path, &selected(&reviewed), || false)
+            .unwrap();
+    assert!(
+        matches!(result, crate::sftp_window::worker::Reply::Changed { note, .. }
+        if note == "Deleted 2 entries")
+    );
+    assert!(!first.exists() && !second.exists() && retained.exists());
+}
+
+#[test]
+fn deletion_cancellation_reports_confirmed_removals_and_keeps_remaining_entries() {
+    let root = tempfile::tempdir().unwrap();
+    let first = root.path().join("first.txt");
+    let second = root.path().join("second.txt");
+    std::fs::write(&first, b"fixture").unwrap();
+    std::fs::write(&second, b"fixture").unwrap();
+    let directory = crate::sftp_window::files::list_local(root.path()).unwrap();
+    let mut client = client(|_| {});
+    let run = |client: &mut Client, stop: &dyn Fn() -> bool| {
+        super::super::delete_selection(client, &directory.path, &directory.entries, stop).unwrap()
+    };
+    assert!(matches!(run(&mut client, &|| true),
+        crate::sftp_window::worker::Reply::Changed { note, .. }
+        if note == "Deletion stopped · Deleted 0 of 2 entries"));
+    assert!(first.exists() && second.exists());
+    assert!(matches!(run(&mut client, &|| !first.exists()),
+        crate::sftp_window::worker::Reply::Changed { note, .. }
+        if note == "Deletion stopped · Deleted 1 of 2 entries"));
+    assert!(!first.exists() && second.exists());
+}
+
+#[test]
+fn server_delete_reports_an_unconfirmed_removal_after_disconnect() {
+    let entries = ["first.txt", "second.txt"].map(|name| crate::sftp_window::Entry {
+        name: EntryName::Remote(name.as_bytes().to_vec()),
+        display: name.to_owned(),
+        hidden: false,
+        kind: EntryKind::File,
+        size: Some(10),
+        modified: None,
+        owner: None,
+        group: None,
+        mode: None,
+    });
+    let mut client = client(|bytes| {
+        for id in [1, 2, 3] {
+            attributes(bytes, id, 24);
+        }
+        status(bytes, 4, 0);
+        attributes(bytes, 5, 24);
+    });
+    let error = super::super::delete_selection(
+        &mut client,
+        &Location::Remote(b"/fixture".to_vec()),
+        &entries,
+        || false,
+    )
+    .unwrap_err();
+    assert!(error.disconnected);
+    assert!(error.message.contains("Deleted 1 of 2 entries"));
+    assert!(error.message.contains("second.txt"));
+    assert!(
+        error
+            .message
+            .contains("The last server removal could not be confirmed")
+    );
+}
+
+#[test]
+fn recursive_deletion_reviews_descendants_and_refuses_changed_or_replayed_plans() {
+    use super::super::recursive_delete::{apply, review};
+
+    let root = tempfile::tempdir().unwrap();
+    let selected = root.path().join("chosen");
+    let child = selected.join("nested");
+    std::fs::create_dir_all(&child).unwrap();
+    std::fs::write(child.join("file.txt"), b"fixture").unwrap();
+    let retained = root.path().join("unselected.txt");
+    std::fs::write(&retained, b"retained").unwrap();
+    let mut client = client(|_| {});
+    let control = Arc::new(Control::default());
+    let listing = crate::sftp_window::files::list_local(root.path()).unwrap();
+    let entries = listing
+        .entries
+        .into_iter()
+        .filter(|entry| entry.display == "chosen")
+        .collect::<Vec<_>>();
+    let plan = |client: &mut Client| {
+        review(
+            client,
+            listing.path.clone(),
+            &entries,
+            Arc::downgrade(&control),
+            &|| false,
+        )
+        .unwrap()
+    };
+    let first = plan(&mut client);
+    assert_eq!(
+        first.paths(),
+        ["chosen", "chosen/nested", "chosen/nested/file.txt"]
+    );
+    assert!(selected.exists() && retained.exists());
+    std::fs::write(child.join("late.txt"), b"changed").unwrap();
+    assert!(apply(&mut client, &first, &control, &|| false).is_err());
+    assert!(child.join("file.txt").exists() && child.join("late.txt").exists());
+    let second = plan(&mut client);
+    let result = apply(&mut client, &second, &control, &|| false).unwrap();
+    assert!(
+        matches!(result, crate::sftp_window::worker::Reply::Changed { note, .. }
+        if note == "Deleted 4 of 4 reviewed entries")
+    );
+    assert!(!selected.exists() && retained.exists());
+    assert!(apply(&mut client, &second, &control, &|| false).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn recursive_local_deletion_reviews_links_and_special_entries_without_following_them() {
+    use std::os::unix::fs::{FileTypeExt as _, symlink};
+    use std::os::unix::net::UnixListener;
+    use std::process::Command;
+
+    use super::super::recursive_delete::{apply, review};
+
+    let root = tempfile::tempdir().unwrap();
+    let selected = root.path().join("chosen");
+    let outside = root.path().join("retained");
+    let link = selected.join("directory-link");
+    let socket_path = selected.join("socket");
+    let fifo = root.path().join("selected-fifo");
+    std::fs::create_dir(&selected).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("file"), b"retained").unwrap();
+    symlink("../retained", &link).unwrap();
+    symlink("missing", selected.join("broken-link")).unwrap();
+    let socket = UnixListener::bind(&socket_path).unwrap();
+    assert!(
+        Command::new("mkfifo")
+            .args(["-m", "600"])
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let listing = files::list_local(root.path()).unwrap();
+    let entries = listing
+        .entries
+        .into_iter()
+        .filter(|entry| matches!(entry.display.as_str(), "chosen" | "selected-fifo"))
+        .collect::<Vec<_>>();
+    assert!(entries.iter().all(Entry::batch_selectable));
+    let mut client = client(|_| {});
+    let control = Arc::new(Control::default());
+    let plan = |client: &mut Client| {
+        review(
+            client,
+            listing.path.clone(),
+            &entries,
+            Arc::downgrade(&control),
+            &|| false,
+        )
+        .unwrap()
+    };
+    let first = plan(&mut client);
+    assert_eq!(
+        first.paths(),
+        [
+            "chosen",
+            "chosen/broken-link",
+            "chosen/directory-link",
+            "chosen/socket",
+            "selected-fifo"
+        ]
+    );
+    std::fs::rename(&link, outside.join("old-link")).unwrap();
+    symlink("../retained", &link).unwrap();
+    assert!(apply(&mut client, &first, &control, &|| false).is_err());
+    assert!(
+        std::fs::symlink_metadata(&fifo)
+            .unwrap()
+            .file_type()
+            .is_fifo()
+    );
+    assert!(
+        std::fs::symlink_metadata(&socket_path)
+            .unwrap()
+            .file_type()
+            .is_socket()
+    );
+    let second = plan(&mut client);
+    let result = apply(&mut client, &second, &control, &|| false).unwrap();
+    assert!(matches!(
+        result, crate::sftp_window::worker::Reply::Changed { note, .. }
+        if note == "Deleted 5 of 5 reviewed entries"
+    ));
+    drop(socket);
+    assert_eq!(std::fs::read(outside.join("file")).unwrap(), b"retained");
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+}
+
+#[cfg(windows)]
+#[test]
+fn recursive_local_deletion_windows_reviews_junctions_and_preserves_the_targets() {
+    use std::os::windows::fs::symlink_file;
+    use std::process::Command;
+
+    use super::super::recursive_delete::{apply, review};
+
+    let junction = |path: &Path, target: &Path| {
+        let output = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command",
+                "New-Item -ItemType Junction -Path $env:KORTTY_FIXTURE_JUNCTION -Target $env:KORTTY_FIXTURE_TARGET -ErrorAction Stop | Out-Null"])
+            .env("KORTTY_FIXTURE_JUNCTION", path)
+            .env("KORTTY_FIXTURE_TARGET", target)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    let root = tempfile::tempdir().unwrap();
+    let selected = root.path().join("chosen");
+    let outside = root.path().join("retained");
+    std::fs::create_dir(&selected).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("file"), b"retained").unwrap();
+    let link = selected.join("junction");
+    let direct_link = root.path().join("selected-junction");
+    junction(&link, &outside);
+    junction(&direct_link, &outside);
+    let symlink = selected.join("file-link");
+    let has_symlink = match symlink_file(outside.join("file"), &symlink) {
+        Ok(()) => true,
+        Err(error) if error.raw_os_error() == Some(1314) => {
+            eprintln!("Windows symbolic link creation is unavailable in this test account");
+            false
+        }
+        Err(error) => panic!("Could not create the symbolic link fixture: {error}"),
+    };
+
+    let listing = files::list_local(root.path()).unwrap();
+    let entries = listing
+        .entries
+        .into_iter()
+        .filter(|entry| matches!(entry.display.as_str(), "chosen" | "selected-junction"))
+        .collect::<Vec<_>>();
+    assert!(entries.iter().any(|entry| entry.kind == EntryKind::Link));
+    let mut client = client(|_| {});
+    let control = Arc::new(Control::default());
+    let plan = |client: &mut Client| {
+        review(
+            client,
+            listing.path.clone(),
+            &entries,
+            Arc::downgrade(&control),
+            &|| false,
+        )
+        .unwrap()
+    };
+    let first = plan(&mut client);
+    let mut expected = vec!["chosen", "chosen/junction", "selected-junction"];
+    if has_symlink {
+        expected.insert(1, "chosen/file-link");
+    }
+    assert_eq!(first.paths(), expected);
+    std::fs::rename(&link, outside.join("old-junction")).unwrap();
+    junction(&link, &outside);
+    assert!(apply(&mut client, &first, &control, &|| false).is_err());
+    assert!(link.exists() && direct_link.exists());
+    let second = plan(&mut client);
+    let result = apply(&mut client, &second, &control, &|| false).unwrap();
+    assert!(
+        matches!(
+            &result, crate::sftp_window::worker::Reply::Changed { note, .. }
+            if *note == format!("Deleted {} of {} reviewed entries", expected.len(), expected.len())
+        ),
+        "{result:?}"
+    );
+    assert_eq!(std::fs::read(outside.join("file")).unwrap(), b"retained");
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+}
+
 fn interrupt(target: &Path) -> Offer {
     let mut first = client(|bytes| {
         attributes(bytes, 1, 24);

@@ -74,6 +74,7 @@ pub enum Event {
     EvidenceLines(String),
     EvidenceTokens(String),
     UseImportedEvidence,
+    UseImportedPreferences,
     AutomaticTitle(bool),
     RecordingTitleRequest(bool),
     AutomationTitleRequest(bool),
@@ -255,6 +256,7 @@ enum Review {
     Settings {
         enabled: bool,
         interval: String,
+        imported_preferences: Option<(Option<u16>, Option<bool>)>,
         automatic_title: bool,
         recording_title_request: bool,
         automation_title_request: bool,
@@ -591,7 +593,7 @@ impl Workspace {
 
     pub(in crate::workspace) fn journal_summaries_allowed(&self) -> bool {
         session_journal::topic_ai_settings::allowed(&self.clipboard.policy)
-            && self.window_settings.journal_ai.enabled
+            && self.window_settings.journal_ai.allows_summaries()
             && self.ai_features_enabled()
             && !self.exiting
     }
@@ -934,6 +936,7 @@ impl Workspace {
                     Review::Settings {
                         enabled: settings.enabled,
                         interval: settings.interval_minutes.to_string(),
+                        imported_preferences: None,
                         automatic_title: settings.automatic_title,
                         recording_title_request: settings
                             .reviewed_grant()
@@ -979,8 +982,10 @@ impl Workspace {
                 match self.journal_summaries.reviews.get_mut(&id) {
                     Some(Review::Settings {
                         automatic_title, ..
-                    })
-                    | Some(Review::Run {
+                    }) => {
+                        *automatic_title = value;
+                    }
+                    Some(Review::Run {
                         automatic_title, ..
                     }) => *automatic_title = value,
                     None => {}
@@ -1033,6 +1038,28 @@ impl Workspace {
                     evidence_limits.imported = None;
                 }
             }
+            Event::UseImportedPreferences => {
+                if self.journal_summaries_allowed()
+                    && let Some(imported @ (minutes, title)) = self
+                        .ai_configuration()
+                        .and_then(|config| config.imported_journal_preferences())
+                    && (!title.unwrap_or(false) || self.journal_rename_allowed())
+                    && let Some(Review::Settings {
+                        interval,
+                        automatic_title,
+                        imported_preferences,
+                        ..
+                    }) = self.journal_summaries.reviews.get_mut(&id)
+                {
+                    if let Some(minutes) = minutes {
+                        *interval = minutes.to_string();
+                    }
+                    if let Some(title) = title {
+                        *automatic_title = title;
+                    }
+                    *imported_preferences = Some(imported);
+                }
+            }
             Event::UseImportedEvidence => {
                 if self.journal_summaries_allowed()
                     && let Some(imported @ (limits, chunking)) =
@@ -1052,6 +1079,7 @@ impl Workspace {
                 if let Some(Review::Settings {
                     enabled,
                     interval,
+                    imported_preferences,
                     automatic_title,
                     recording_title_request,
                     automation_title_request,
@@ -1068,6 +1096,15 @@ impl Workspace {
                 {
                     let rename_allowed = self.journal_rename_allowed();
                     let now = Timestamp::now();
+                    if imported_preferences.is_some()
+                        && self
+                            .ai_configuration()
+                            .and_then(|config| config.imported_journal_preferences())
+                            != *imported_preferences
+                    {
+                        self.journal_summaries.status = Some("Imported Java Journal preferences changed. Review the current suggestions again.".into());
+                        return Task::none();
+                    }
                     if let Some(imported) = evidence_limits.imported
                         && self.imported_summary_evidence_limits() != Some(imported)
                     {
@@ -2406,7 +2443,7 @@ impl Workspace {
                 let model = if cli {
                     Run::begin_reviewed_cli(transport, authorize)
                 } else {
-                    Run::begin_reviewed_https(transport, authorize)
+                    Run::begin_reviewed_https(transport, credential.clone(), authorize)
                 }
                 .ok();
                 let mask = https::Mask {
@@ -2939,6 +2976,13 @@ impl Workspace {
                 text("Journal summary settings").size(19),
                 checkbox(*enabled).label("Summarize eligible journal recordings automatically").on_toggle(Event::Enable),
                 text_input("Summary interval in minutes", interval).on_input(Event::Interval),
+                self.ai_configuration().and_then(|config| config.imported_journal_preferences()).map(|(minutes, title)| row![
+                    text(format!("Imported from Java · interval: {} · automatic title: {}",
+                        minutes.map_or_else(|| "not specified".into(), |value| format!("{value} min")),
+                        title.map_or("not specified", |value| if value { "on" } else { "off" }))).size(13),
+                    button("Use imported preferences").on_press_maybe(
+                        (!title.unwrap_or(false) || rename_allowed).then_some(Event::UseImportedPreferences)),
+                ].spacing(8).wrap()),
                 checkbox(*automatic_title && rename_allowed)
                     .label("Generate a title when an eligible journal closes")
                     .on_toggle_maybe(rename_allowed.then_some(Event::AutomaticTitle)),

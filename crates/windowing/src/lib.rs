@@ -28,6 +28,8 @@ mod windows_alpha;
 #[cfg(target_os = "windows")]
 mod windows_clipboard;
 #[cfg(target_os = "windows")]
+pub mod windows_desktop_drop;
+#[cfg(target_os = "windows")]
 pub mod windows_file_drag;
 #[cfg(target_os = "windows")]
 mod windows_placement;
@@ -39,6 +41,8 @@ pub use windows::password_prompt::{NativePassword, open_password_prompt};
 mod x11;
 #[cfg(target_os = "linux")]
 mod x11_clipboard;
+#[cfg(target_os = "linux")]
+pub mod x11_desktop_drop;
 #[cfg(target_os = "linux")]
 pub mod x11_file_drag;
 #[cfg(target_os = "linux")]

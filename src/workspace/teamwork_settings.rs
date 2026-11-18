@@ -11,6 +11,7 @@ use crate::connection_store::teamwork::{
     ManagedSource, Settings, Source, SourceKind,
 };
 
+use super::backup_data::teamwork::{Proposals, SourceProposal};
 use super::dialog_placement::{Kind, escape};
 use super::{Message as Desktop, Workspace};
 
@@ -25,6 +26,8 @@ pub enum Message {
     Retry,
     Loaded(Result<Settings, String>),
     Add,
+    AddJavaSource(usize),
+    UseJavaInterval,
     DefaultInterval(String),
     SourceType(usize, SourceKind),
     Location(usize, String),
@@ -73,6 +76,45 @@ struct SourceDraft {
 }
 
 impl Draft {
+    fn can_add_java_source(&self, source: &SourceProposal) -> bool {
+        if self.sources.len() >= MAX_SOURCES {
+            return false;
+        }
+        let origin = Source {
+            kind: source.kind,
+            location: source.location.clone(),
+            enabled: false,
+            check_interval_minutes: source.interval,
+        }
+        .origin()
+        .ok();
+        !self.sources.iter().any(|saved| {
+            saved.kind == source.kind && saved.location.trim() == source.location
+                || origin.as_ref().is_some_and(|origin| {
+                    (Source {
+                        kind: saved.kind,
+                        location: saved.location.clone(),
+                        enabled: false,
+                        check_interval_minutes: source.interval,
+                    })
+                    .origin()
+                    .as_ref()
+                    .is_ok_and(|saved| saved == origin)
+                })
+        })
+    }
+
+    fn add_java_source(&mut self, source: &SourceProposal) {
+        if self.can_add_java_source(source) {
+            self.sources.push(SourceDraft {
+                kind: source.kind,
+                location: source.location.clone(),
+                enabled: false,
+                interval: source.interval.to_string(),
+            });
+        }
+    }
+
     fn new(settings: Settings) -> Self {
         let default_interval = settings.default_check_interval_minutes.to_string();
         let sources = settings
@@ -195,6 +237,7 @@ impl Workspace {
         }
         let allowed = self.teamwork_sync_allowed();
         let custom = self.custom_teamwork_sources_allowed();
+        let java = self.window_settings.java_teamwork.as_ref();
         let Some(dialog) = self
             .teamwork_settings
             .0
@@ -232,6 +275,20 @@ impl Workspace {
                         enabled: true,
                         interval: DEFAULT_CHECK_INTERVAL_MINUTES.to_string(),
                     });
+                }
+            }
+            Message::AddJavaSource(index) if custom => {
+                if let Some(source) = java.and_then(|proposals| proposals.sources.get(index))
+                    && let Some(draft) = dialog.edit()
+                {
+                    draft.add_java_source(source);
+                }
+            }
+            Message::UseJavaInterval if custom => {
+                if let Some(interval) = java.and_then(|proposals| proposals.interval)
+                    && let Some(draft) = dialog.edit()
+                {
+                    draft.default_interval = interval.to_string();
                 }
             }
             Message::DefaultInterval(value) if custom && interval_text(&value) => {
@@ -448,6 +505,9 @@ impl Workspace {
                 let validation = draft.candidate();
                 let valid = validation.is_ok() && custom;
                 let mut body = sources(draft, custom);
+                if custom && let Some(java) = &self.window_settings.java_teamwork {
+                    body = body.push(java_proposals(draft, java));
+                }
                 if !custom {
                     body = body.push(
                         text("Custom Teamwork sources are unavailable under the current policy.")
@@ -664,6 +724,71 @@ fn focus(id: window::Id) -> Desktop {
     Desktop::TeamworkSettings(id, Message::Focus)
 }
 
+fn java_proposals<'a>(draft: &Draft, proposals: &'a Proposals) -> Column<'a, Message> {
+    let mut body = column![text("Imported Java Teamwork settings").size(17)].spacing(6);
+    for (index, source) in proposals.sources.iter().enumerate() {
+        let kind = match source.kind {
+            SourceKind::File => "Shared file",
+            SourceKind::Git => "Git repository",
+        };
+        let status = if source.was_enabled {
+            "previously enabled"
+        } else {
+            "previously disabled"
+        };
+        body = body
+            .push(
+                text(format!("{kind} · {} · {status}", source.location))
+                    .wrapping(Wrapping::WordOrGlyph),
+            )
+            .push(
+                button("Add disabled source").on_press_maybe(
+                    draft
+                        .can_add_java_source(source)
+                        .then_some(Message::AddJavaSource(index)),
+                ),
+            );
+    }
+    if let Some(interval) = proposals.interval {
+        body = body.push(
+            button(text(format!(
+                "Use Java default interval ({interval} minutes)"
+            )))
+            .on_press_maybe(
+                (minutes(&draft.default_interval) != Some(interval))
+                    .then_some(Message::UseJavaInterval),
+            ),
+        );
+    }
+    for (label, value) in [
+        ("Credential ID", &proposals.credential),
+        ("SSH key ID", &proposals.key),
+        ("Username", &proposals.username),
+    ] {
+        if let Some(value) = value {
+            body = body.push(text(format!("{label} · {value}")).wrapping(Wrapping::WordOrGlyph));
+        }
+    }
+    if let Some(value) = proposals.temporary_key {
+        body = body.push(text(if value {
+            "Temporary key preference · On"
+        } else {
+            "Temporary key preference · Off"
+        }));
+    }
+    if proposals.credential.is_some()
+        || proposals.key.is_some()
+        || proposals.username.is_some()
+        || proposals.temporary_key.is_some()
+    {
+        body = body.push(
+            text("Review these references and select local authentication in Connection Manager.")
+                .wrapping(Wrapping::WordOrGlyph),
+        );
+    }
+    body
+}
+
 fn load(id: window::Id) -> Task<Desktop> {
     Task::perform(
         async { Settings::load().map_err(|error| error.to_string()) },
@@ -678,6 +803,69 @@ mod tests {
 
     use super::*;
     use crate::workspace::chrome;
+
+    #[test]
+    fn java_teamwork_restore_only_adds_reviewed_disabled_sources_to_the_draft() {
+        let import = super::super::backup_data::portable_java_preferences(
+            br#"<globalSettings>
+              <teamworkSources>
+                <source><id>java-source</id><type>GIT</type><location>https://git.example/shared</location><checkIntervalMinutes>20</checkIntervalMinutes><enabled>true</enabled></source>
+                <source><id>java-source</id><location>https://git.example/duplicate</location></source>
+                <source><location>https://user:password@git.example/secret</location></source>
+                <source><type>SHARED_FILE</type><location>relative-to-java.xml</location></source>
+              </teamworkSources>
+              <teamworkDefaultCheckIntervalMinutes>45</teamworkDefaultCheckIntervalMinutes>
+              <teamworkDefaultCredentialId>old-credential</teamworkDefaultCredentialId>
+              <teamworkDefaultSshKeyId>old-key</teamworkDefaultSshKeyId>
+              <teamworkDefaultUsername>operator</teamworkDefaultUsername>
+              <teamworkUseTemporaryKey>true</teamworkUseTemporaryKey>
+            </globalSettings>"#,
+            None,
+        ).unwrap();
+        assert_eq!(import.teamwork_proposals, 7);
+        assert_eq!(import.count, 0);
+        assert_eq!(import.omitted, 2);
+        let incoming = import.contents.unwrap();
+        use super::super::backup_data::merge_java_window_settings;
+        let restored = merge_java_window_settings(None, &incoming, &Default::default())
+            .unwrap()
+            .unwrap();
+        assert!(
+            merge_java_window_settings(Some(&restored), &incoming, &Default::default())
+                .unwrap()
+                .is_none()
+        );
+        let values: serde_json::Value = serde_json::from_slice(&restored).unwrap();
+        let proposals: Proposals = serde_json::from_value(values["java_teamwork"].clone()).unwrap();
+        assert_eq!(proposals.interval, Some(45));
+        assert_eq!(proposals.credential.as_deref(), Some("old-credential"));
+        assert_eq!(proposals.key.as_deref(), Some("old-key"));
+        assert_eq!(proposals.username.as_deref(), Some("operator"));
+        assert_eq!(proposals.temporary_key, Some(true));
+
+        let mut draft = Draft::new(Settings {
+            default_check_interval_minutes: 30,
+            ..Settings::default()
+        });
+        assert!(!draft.dirty());
+        let source = &proposals.sources[0];
+        assert!(source.was_enabled);
+        assert_eq!(source.id.as_deref(), Some("java-source"));
+        draft.add_java_source(source);
+        draft.add_java_source(source);
+        let candidate = draft.candidate().unwrap();
+        assert_eq!(candidate.sources.len(), 1);
+        assert!(!candidate.sources[0].enabled);
+        assert_eq!(candidate.sources[0].check_interval_minutes, 20);
+        assert_eq!(candidate.default_check_interval_minutes, 30);
+        draft.add_java_source(&proposals.sources[1]);
+        assert!(
+            draft.candidate().is_err(),
+            "the shared file needs a local path"
+        );
+        draft.sources[1].location = location(0);
+        assert!(!draft.candidate().unwrap().sources[1].enabled);
+    }
 
     fn location(index: usize) -> String {
         std::env::temp_dir()

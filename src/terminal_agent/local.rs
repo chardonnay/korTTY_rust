@@ -43,6 +43,7 @@ pub(super) fn run(
     cwd: &Path,
     text: &str,
     cancel: &Cancel,
+    started: impl FnOnce(),
 ) -> Result<Outcome, String> {
     if cancel.requested() {
         return Ok(Outcome {
@@ -59,9 +60,9 @@ pub(super) fn run(
         return Err("The approved local shell, directory or command is unavailable.".into());
     }
     #[cfg(unix)]
-    let result = unix::run(shell, cwd, text, cancel);
+    let result = unix::run(shell, cwd, text, cancel, started);
     #[cfg(windows)]
-    let result = windows::run(shell, cwd, text, cancel);
+    let result = windows::run(shell, cwd, text, cancel, started);
     result.map_err(|_| "Could not start or supervise the approved local command.".into())
 }
 

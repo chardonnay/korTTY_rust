@@ -283,6 +283,13 @@ impl fmt::Debug for ApplyRecovery {
 }
 
 impl ApplyRecovery {
+    pub(crate) fn stage_progress(&self) -> (usize, usize) {
+        (
+            self.checkpoint.as_deref().map_or(0, Checkpoint::completed),
+            self.request.total_stages,
+        )
+    }
+
     pub(in crate::snippet_analysis) fn matches_live(&self, live: &Self) -> bool {
         if !self.request.selection.matches_live(&live.request.selection) {
             return false;
@@ -309,9 +316,24 @@ impl ApplyRecovery {
     }
 
     pub(in crate::snippet_analysis) fn apply_retention(&mut self, limit: usize) -> io::Result<()> {
-        self.request.selection.apply_retention(limit)?;
+        self.retain_new_source(limit, None)
+    }
+
+    pub(in crate::snippet_analysis) fn retain_new_source(
+        &mut self,
+        limit: usize,
+        previous: Option<&Self>,
+    ) -> io::Result<()> {
+        if let Some(previous) = previous {
+            self.request.selection = previous.request.selection.clone();
+        } else {
+            self.request.selection.apply_retention(limit)?;
+        }
         if let Some(point) = self.checkpoint.as_mut()
             && !point.fits_retention(limit)
+            && previous
+                .and_then(|saved| saved.checkpoint.as_deref())
+                .is_none_or(|saved| !saved.has_source() || saved.code_sha256 != point.code_sha256)
         {
             Arc::make_mut(point).omit_source();
         }

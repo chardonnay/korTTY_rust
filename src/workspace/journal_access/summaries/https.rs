@@ -104,7 +104,7 @@ impl Authority {
         let settings =
             WindowSettings::read(&root.join("window-settings.json")).map_err(|_| changed)?;
         let policy = ClipboardPolicy::load();
-        if !settings.journal_ai.enabled
+        if !settings.journal_ai.allows_summaries()
             || self.receipt.mode == Mode::Automation && !policy.automation_journal_allowed()
         {
             return Err(changed.into());

@@ -153,7 +153,7 @@ fn resolve(host: &str, port: u16) -> io::Result<(SocketAddr, Vec<SocketAddr>)> {
 #[cfg(test)]
 mod tests {
     use std::net::TcpListener;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::OnceLock;
 
     use super::*;
 
@@ -194,21 +194,25 @@ mod tests {
         let socket = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = Endpoint::new("127.0.0.1", socket.local_addr().unwrap().port()).unwrap();
         drop(socket);
-        let cancelled = AtomicBool::new(false);
-        let started = Instant::now();
-        thread::scope(|scope| {
+        let cancelled_at = OnceLock::new();
+        let latency = thread::scope(|scope| {
             scope.spawn(|| {
                 thread::sleep(Duration::from_millis(100));
-                cancelled.store(true, Ordering::Release);
+                cancelled_at.set(Instant::now()).unwrap();
             });
             let error = connect_transport_with_options(
                 &endpoint,
                 ConnectOptions::new(300, 20).unwrap(),
-                || cancelled.load(Ordering::Acquire),
+                || cancelled_at.get().is_some(),
             )
             .unwrap_err();
+            let latency = cancelled_at.get().unwrap().elapsed();
             assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+            latency
         });
-        assert!(started.elapsed() < Duration::from_millis(800));
+        assert!(
+            latency < Duration::from_millis(800),
+            "cancellation took {latency:?} after the signal"
+        );
     }
 }

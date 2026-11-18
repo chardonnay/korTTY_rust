@@ -3,6 +3,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -68,6 +69,7 @@ pub enum Message {
     SavedTargets(Result<Vec<headless::Source>, &'static str>),
     SnippetPrepared(u64, Result<snippet::Review, &'static str>),
     Journal(SwarmJournalEdit),
+    AdoptJavaJournal,
     SaveJournalDefaults,
     EstimateJournal,
     JournalEstimate(u64, Result<AutomationEstimate, &'static str>),
@@ -127,6 +129,7 @@ impl fmt::Debug for Message {
 
 #[derive(Clone)]
 pub enum MemberAction {
+    ApproveRemaining(u64),
     Approve(u64),
     Answer(u64, String),
     ReviewModel(request_review::Message),
@@ -710,10 +713,12 @@ impl Group {
         state: &'a State,
         surface: StatusSurface,
         palette: Option<Palette>,
-        batch_allowed: bool,
+        approvals: impl Into<super::policy::Approvals>,
         web_available: bool,
         summary_profiles: Vec<AutomationSummaryProvider>,
     ) -> Element<'a, Message> {
+        let approvals = approvals.into();
+        let batch_allowed = approvals.batch;
         let muted = palette.map(|palette| palette.muted.color());
         if let Some(save) = &self.save_name {
             let editing = !self.saving_conversation && !self.closing;
@@ -916,6 +921,20 @@ impl Group {
                                         Message::Member(id, MemberAction::Approve(run.epoch))
                                     )
                                 ),
+                                (approvals.remaining
+                                    && !run.confirm_every_command
+                                    && run.ordinary_command_review())
+                                .then(|| {
+                                    button("Approve future ordinary commands for this target")
+                                        .on_press_maybe(
+                                            (!run.paused && !run.cancel.requested()).then_some(
+                                                Message::Member(
+                                                    id,
+                                                    MemberAction::ApproveRemaining(run.epoch),
+                                                ),
+                                            ),
+                                        )
+                                }),
                             ]
                             .spacing(5),
                         );
@@ -1050,7 +1069,7 @@ impl State {
         id: window::Id,
         animate: bool,
         palette: Option<Palette>,
-        batch_allowed: bool,
+        approvals: super::policy::Approvals,
         web_available: bool,
         summary_profiles: impl FnOnce() -> Vec<AutomationSummaryProvider>,
     ) -> Option<Element<'_, Message>> {
@@ -1059,7 +1078,7 @@ impl State {
                 self,
                 StatusSurface { id, animate },
                 palette,
-                batch_allowed,
+                approvals,
                 web_available,
                 summary_profiles(),
             ))
@@ -1107,7 +1126,7 @@ impl Workspace {
     }
 
     pub(in crate::workspace) fn swarm_status_animated(&self, id: window::Id) -> bool {
-        self.window_settings.appearance.animations
+        self.window_settings.appearance.animations()
             && self.native_focused_window == Some(id)
             && self
                 .terminal_agents
@@ -1241,6 +1260,7 @@ impl Workspace {
         mut group: Group,
     ) -> (window::Id, Task<Desktop>) {
         group.owner = Some(owner);
+        group.journal.java_proposal = self.window_settings.java_swarm_journal.clone();
         if let Err(error) = group.journal.load_defaults() {
             group.notice = format!("Could not load Swarm journal defaults ({error}).");
         }
@@ -1358,6 +1378,9 @@ impl Workspace {
     }
 
     fn swarm_policy_for(&self, mode: SwarmMode) -> Result<ClipboardPolicy, &'static str> {
+        if mode == SwarmMode::Agent {
+            self.require_agent_execution_enabled()?;
+        }
         require_swarm_policy(&self.clipboard.policy, mode)?;
         let policy = ClipboardPolicy::load();
         require_swarm_policy(&policy, mode)?;
@@ -1373,6 +1396,7 @@ impl Workspace {
             modes.push(SwarmMode::Advisory);
             if require_swarm_policy(&self.clipboard.policy, SwarmMode::Agent).is_ok()
                 && require_swarm_policy(&policy, SwarmMode::Agent).is_ok()
+                && self.require_agent_execution_enabled().is_ok()
             {
                 modes.push(SwarmMode::Agent);
             }
@@ -1456,7 +1480,10 @@ impl Workspace {
         }
         if matches!(
             message,
-            Message::Journal(_) | Message::SaveJournalDefaults | Message::EstimateJournal
+            Message::Journal(_)
+                | Message::AdoptJavaJournal
+                | Message::SaveJournalDefaults
+                | Message::EstimateJournal
         ) {
             group.set_journal_allowed(self.swarm_journal_capture_allowed());
         }
@@ -1651,6 +1678,15 @@ impl Workspace {
             }
             Message::Journal(edit) if setup && group.journal_allowed => {
                 group.journal.edit(edit);
+            }
+            Message::AdoptJavaJournal if setup && group.journal_allowed => {
+                match group.journal.adopt_java() {
+                    Ok(true) => {
+                        group.notice = "Java journal settings copied to this Swarm. Review the settings before running or saving defaults.".into();
+                    }
+                    Ok(false) => {}
+                    Err(error) => group.notice = error.to_string(),
+                }
             }
             Message::SaveJournalDefaults if setup && group.journal_allowed => {
                 group.notice = match group.journal.save_defaults() {
@@ -1964,6 +2000,7 @@ impl Workspace {
                 self.terminal_agents.swarms.insert(id, group);
                 let message = match action {
                     MemberAction::Approve(epoch) => RunMessage::Approve(epoch),
+                    MemberAction::ApproveRemaining(epoch) => RunMessage::ApproveRemaining(epoch),
                     MemberAction::Answer(epoch, answer) => RunMessage::Answer(epoch, answer),
                     MemberAction::ReviewModel(message) => RunMessage::ReviewModel(message),
                 };
@@ -2513,8 +2550,7 @@ impl Workspace {
                             active.conclusion(ticket.key(), conclusion);
                         }
                     }
-                    self.terminal_agents.runs.remove(&id_member);
-                    if let Some((settings, run)) = &group.journal_run
+                    if let Some((settings, journal_run)) = &group.journal_run
                         && let Some(row) = queue
                             .rows()
                             .iter()
@@ -2524,11 +2560,13 @@ impl Workspace {
                         tasks.push(journal_task(
                             id,
                             settings.clone(),
-                            run.clone(),
+                            journal_run.clone(),
                             row,
+                            (journal::evidence(run), run.redactor.clone()),
                             self.clipboard.policy.terminal_logging.clone(),
                         ));
                     }
+                    self.terminal_agents.runs.remove(&id_member);
                     return false;
                 }
                 true
@@ -2783,6 +2821,7 @@ fn journal_task(
     settings: crate::session_journal::automation::CaptureSettings,
     run: crate::session_journal::automation::Run,
     row: &engine::Row,
+    (evidence, run_redactor): (engine::journal::Evidence, crate::terminal_logging::Redactor),
     policy: crate::terminal_logging::Policy,
 ) -> Task<Desktop> {
     let row = row.clone();
@@ -2792,12 +2831,27 @@ fn journal_task(
             std::thread::Builder::new()
                 .name("kortty-swarm-journal".into())
                 .spawn(move || {
+                    let fresh = ClipboardPolicy::load();
                     let result = if settings.stopped.load(Ordering::Acquire)
-                        || !ClipboardPolicy::load().automation_journal_allowed()
+                        || !fresh.automation_journal_allowed()
+                        || !fresh.terminal_logging.equivalent_redactions(&policy)
                     {
                         Ok(None)
                     } else {
-                        match engine::journal::publish(&settings, run, &row, policy) {
+                        let secrets = crate::terminal_logging::Secrets::default();
+                        run_redactor.add_known_secrets(&secrets);
+                        let artifact = secrets.seal().and_then(|secrets| {
+                            let redactor =
+                                crate::terminal_logging::Redactor::for_journal(secrets, policy);
+                            engine::journal::publish(
+                                &settings,
+                                run,
+                                &row,
+                                evidence,
+                                Arc::new(redactor),
+                            )
+                        });
+                        match artifact {
                             Ok(artifact) => Ok(Some(artifact)),
                             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
                                 Ok(None)

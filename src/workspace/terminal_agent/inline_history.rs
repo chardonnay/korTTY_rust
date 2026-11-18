@@ -297,7 +297,7 @@ impl Run {
 
 impl Workspace {
     pub(super) fn publish_agent_inline_history(&self, run: &Run) {
-        let Some(update) = run.inline_update(self.window_settings.appearance.animations) else {
+        let Some(update) = run.inline_update(self.window_settings.appearance.animations()) else {
             return;
         };
         let Ok(source) = run.binding.live() else {

@@ -70,6 +70,13 @@ fn live_swarm_agent_reviews_a_new_model_request_after_each_approved_command() {
         .keys()
         .next()
         .unwrap();
+    // Preserve manual command review while testing model-request boundaries.
+    workspace
+        .terminal_agents
+        .runs
+        .get_mut(&member)
+        .unwrap()
+        .confirm_every_command = true;
     let action = |workspace: &mut Workspace, action| {
         workspace.swarm_action(group, Message::Member(member, action))
     };

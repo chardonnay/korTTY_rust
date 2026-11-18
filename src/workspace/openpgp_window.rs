@@ -650,7 +650,7 @@ mod tests {
                 (id, tab)
             });
 
-        assert!(workspace.guard_hosted_quit(false).is_some());
+        assert!(workspace.guard_hosted_quit(Default::default()).is_some());
         let token = workspace.openpgp[&first].hosted_close.unwrap();
         assert!(workspace.openpgp[&second].hosted_close.is_none());
         let _ = workspace.update_openpgp(first, Message::HostedClose(token, true));

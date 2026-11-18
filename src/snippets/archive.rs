@@ -52,6 +52,7 @@ pub(super) struct ImportedSnippet {
     pub(super) id: Option<SnippetId>,
     pub(super) input: Input,
     pub(super) metadata: Metadata,
+    pub(super) history: Vec<super::history::Revision>,
 }
 
 impl Imports {
@@ -311,6 +312,10 @@ struct Portable {
         skip_serializing_if = "Vec::is_empty"
     )]
     diagrams: Vec<diagrams::Saved>,
+    #[serde(skip)]
+    history_max_size: Option<u8>,
+    #[serde(skip)]
+    history: Vec<super::history::Revision>,
 }
 
 fn deserialize_entries<'de, D: serde::Deserializer<'de>>(
@@ -409,11 +414,13 @@ impl Portable {
             executable: self.executable,
             tags: self.tags,
             diagrams: self.diagrams,
+            history_max_size: self.history_max_size,
         };
         Ok(ImportedSnippet {
             id,
             input,
             metadata,
+            history: self.history,
         })
     }
 }
@@ -433,6 +440,8 @@ impl From<&Snippet> for Portable {
             executable: metadata.executable,
             tags: metadata.tags.clone(),
             diagrams: metadata.diagrams.clone(),
+            history_max_size: None,
+            history: Vec::new(),
         }
     }
 }
@@ -567,6 +576,43 @@ fn read_xml_field(entry: &mut Portable, field: Node<'_, '_>) -> io::Result<bool>
         "fileName" => entry.file_name = Some(xml_text(field)?),
         "executable" => entry.executable = Some(boolean(&xml_text(field)?)?),
         "savedDiagrams" => entry.diagrams = read_diagrams(&xml_text(field)?)?,
+        "historyMaxSize" => {
+            entry.history_max_size = Some(
+                xml_text(field)?
+                    .trim()
+                    .parse()
+                    .map_err(|_| invalid("Invalid snippet history limit"))?,
+            );
+        }
+        "history" => {
+            for item in xml_elements(field)? {
+                if !xml_is(item, "entry") {
+                    return Err(invalid("Invalid snippet history entry"));
+                }
+                let (mut content, mut timestamp) = (None, None);
+                for field in xml_elements(item)? {
+                    if xml_is(field, "content") && content.is_none() {
+                        content = Some(xml_text(field)?);
+                    } else if xml_is(field, "timestamp") && timestamp.is_none() {
+                        timestamp = Some(
+                            xml_text(field)?
+                                .trim()
+                                .parse()
+                                .map_err(|_| invalid("Invalid snippet history timestamp"))?,
+                        );
+                    } else {
+                        return Err(invalid("Invalid snippet history field"));
+                    }
+                }
+                entry.history.push(super::history::Revision {
+                    content: content
+                        .ok_or_else(|| invalid("Missing snippet history source"))?
+                        .into(),
+                    timestamp: timestamp
+                        .ok_or_else(|| invalid("Missing snippet history timestamp"))?,
+                });
+            }
+        }
         "tags" => {
             for tag in xml_elements(field)? {
                 if !xml_is(tag, "tag") {

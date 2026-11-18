@@ -166,6 +166,7 @@ pub enum Setting {
     ClipboardWrite,
     ClipboardRead,
     CommandMarks,
+    AutomaticLocalShellIntegration,
     CommandTimestamps,
     RemoteSidebar,
     SftpParallel,
@@ -175,7 +176,11 @@ pub enum Setting {
     SftpIdle,
     InitialTerminalSize,
     SerialDefaultEncoding,
+    SshDefaultEncoding,
+    ConfirmBusyTerminalClose,
+    SkipTerminalGroupCloseConfirmation,
     TerminalLinkDetection,
+    TerminalDragDrop,
     TerminalCopyOnSelect,
     QuickSelectAlphabet,
     QuickSelectPatterns,
@@ -203,6 +208,8 @@ pub enum Setting {
     JournalDirectory,
     JournalClickableLinks,
     JournalAiProfile,
+    JournalAiSummaries,
+    JournalScreenshotAnalysis,
     JournalVision,
     JournalAutomaticVision,
     ExportWatermark,
@@ -229,13 +236,19 @@ pub enum Setting {
     SnippetBackground,
     SnippetCursorStyle,
     SnippetCursorColor,
+    SnippetLineNumbers,
+    SnippetWordWrap,
+    SnippetAnalysisHistory,
+    SnippetVersionHistory,
+    SnippetAlternativeCount,
+    SnippetAnalysisContentLimit,
     AgentDesign,
     ApplicationUpdates,
     ApplicationUpdateInterval,
 }
 
 impl Setting {
-    const ALL: [Self; 77] = [
+    const ALL: &'static [Self] = &[
         Self::FontFamily,
         Self::FontSize,
         Self::Colors,
@@ -247,6 +260,7 @@ impl Setting {
         Self::ClipboardWrite,
         Self::ClipboardRead,
         Self::CommandMarks,
+        Self::AutomaticLocalShellIntegration,
         Self::CommandTimestamps,
         Self::RemoteSidebar,
         Self::SftpParallel,
@@ -256,7 +270,11 @@ impl Setting {
         Self::SftpIdle,
         Self::InitialTerminalSize,
         Self::SerialDefaultEncoding,
+        Self::SshDefaultEncoding,
+        Self::ConfirmBusyTerminalClose,
+        Self::SkipTerminalGroupCloseConfirmation,
         Self::TerminalLinkDetection,
+        Self::TerminalDragDrop,
         Self::TerminalCopyOnSelect,
         Self::QuickSelectAlphabet,
         Self::QuickSelectPatterns,
@@ -284,6 +302,8 @@ impl Setting {
         Self::JournalDirectory,
         Self::JournalClickableLinks,
         Self::JournalAiProfile,
+        Self::JournalAiSummaries,
+        Self::JournalScreenshotAnalysis,
         Self::JournalVision,
         Self::JournalAutomaticVision,
         Self::ExportWatermark,
@@ -310,6 +330,12 @@ impl Setting {
         Self::SnippetBackground,
         Self::SnippetCursorStyle,
         Self::SnippetCursorColor,
+        Self::SnippetLineNumbers,
+        Self::SnippetWordWrap,
+        Self::SnippetAnalysisHistory,
+        Self::SnippetVersionHistory,
+        Self::SnippetAlternativeCount,
+        Self::SnippetAnalysisContentLimit,
         Self::AgentDesign,
         Self::ApplicationUpdates,
         Self::ApplicationUpdateInterval,
@@ -334,6 +360,7 @@ impl Setting {
             Self::CommandMarks => {
                 "Use the command marks of shells set up for shell integration (OSC 133)"
             }
+            Self::AutomaticLocalShellIntegration => "Allow automatic integration for local shells",
             Self::CommandTimestamps => "Show command timestamps",
             Self::RemoteSidebar => "Remote files sidebar",
             Self::SftpParallel => "Parallel file transfers",
@@ -343,7 +370,13 @@ impl Setting {
             Self::SftpIdle => "Close SFTP after inactivity",
             Self::InitialTerminalSize => "Initial terminal size",
             Self::SerialDefaultEncoding => "Default serial character encoding",
+            Self::SshDefaultEncoding => "Default SSH character encoding",
+            Self::ConfirmBusyTerminalClose => "Confirm before closing busy or split terminals",
+            Self::SkipTerminalGroupCloseConfirmation => {
+                "Skip terminal confirmation when closing windows or groups of tabs"
+            }
             Self::TerminalLinkDetection => "Detect web and e-mail addresses in terminal text",
+            Self::TerminalDragDrop => "Allow drag and drop onto terminals",
             Self::TerminalCopyOnSelect => "Copy selection to clipboard automatically",
             Self::QuickSelectAlphabet => "Quick select label letters",
             Self::QuickSelectPatterns => "Quick select patterns",
@@ -375,6 +408,8 @@ impl Setting {
             Self::JournalDirectory => "Session journal storage folder",
             Self::JournalClickableLinks => "Make web addresses in journals clickable",
             Self::JournalAiProfile => "Enable local journal AI profile",
+            Self::JournalAiSummaries => "Allow journal AI summaries",
+            Self::JournalScreenshotAnalysis => "Allow journal screenshot analysis",
             Self::JournalVision => "Allow image input for this local model",
             Self::JournalAutomaticVision => "Automatically analyze screenshots with AI",
             Self::ExportWatermark => "Add a watermark to exported documents",
@@ -401,6 +436,12 @@ impl Setting {
             Self::SnippetBackground => "Background color",
             Self::SnippetCursorStyle => "Cursor style",
             Self::SnippetCursorColor => "Cursor color",
+            Self::SnippetLineNumbers => "Line numbers",
+            Self::SnippetWordWrap => "Word wrap",
+            Self::SnippetAnalysisHistory => "Saved analysis reports per snippet or folder",
+            Self::SnippetVersionHistory => "Default saved snippet versions",
+            Self::SnippetAlternativeCount => "AI alternative solutions per request",
+            Self::SnippetAnalysisContentLimit => "Stored source per analysis field (bytes)",
             Self::AgentDesign => "Default AI agent design",
             Self::ApplicationUpdates => "Check automatically for Rust updates",
             Self::ApplicationUpdateInterval => "Update check interval",
@@ -426,10 +467,14 @@ impl Setting {
             | Self::ClipboardWrite
             | Self::ClipboardRead
             | Self::CommandMarks
+            | Self::AutomaticLocalShellIntegration
             | Self::CommandTimestamps
             | Self::RemoteSidebar
             | Self::InitialTerminalSize
             | Self::SerialDefaultEncoding
+            | Self::SshDefaultEncoding
+            | Self::ConfirmBusyTerminalClose
+            | Self::SkipTerminalGroupCloseConfirmation
             | Self::TerminalLinkDetection
             | Self::TerminalCopyOnSelect
             | Self::QuickSelectAlphabet
@@ -445,6 +490,7 @@ impl Setting {
             | Self::CodingAgentAppBadge
             | Self::CodingAgentDockAutomatic
             | Self::BoldTextMode => Section::Terminal,
+            Self::TerminalDragDrop => Section::Terminal,
             Self::CodingAgentNotifications
             | Self::TerminalNotifications
             | Self::SilenceThreshold => Section::Messaging,
@@ -457,6 +503,8 @@ impl Setting {
             | Self::JournalDirectory
             | Self::JournalClickableLinks
             | Self::JournalAiProfile
+            | Self::JournalAiSummaries
+            | Self::JournalScreenshotAnalysis
             | Self::JournalVision
             | Self::JournalAutomaticVision => Section::Logging,
             Self::ExportWatermark | Self::ExportFooter | Self::ExportSnippetCode => Section::Export,
@@ -479,7 +527,13 @@ impl Setting {
             | Self::SnippetForeground
             | Self::SnippetBackground
             | Self::SnippetCursorStyle
-            | Self::SnippetCursorColor => Section::SnippetEditor,
+            | Self::SnippetCursorColor
+            | Self::SnippetLineNumbers
+            | Self::SnippetWordWrap
+            | Self::SnippetAnalysisHistory
+            | Self::SnippetVersionHistory
+            | Self::SnippetAlternativeCount
+            | Self::SnippetAnalysisContentLimit => Section::SnippetEditor,
         }
     }
 
@@ -500,6 +554,7 @@ impl Setting {
             Self::ClipboardWrite => "paste write",
             Self::ClipboardRead => "paste access consent",
             Self::CommandMarks => "prompt navigation jumps setup bash zsh fish",
+            Self::AutomaticLocalShellIntegration => "shell integration local startup wrapper",
             Self::CommandTimestamps => "terminal time gutter command date",
             Self::RemoteSidebar => "sftp ssh folder dock left right hidden",
             Self::SftpParallel => {
@@ -517,7 +572,15 @@ impl Setting {
             Self::SerialDefaultEncoding => {
                 "serial device port character set charset utf-8 latin1 latin9 iso-8859 windows-1252"
             }
+            Self::SshDefaultEncoding => {
+                "ssh character set charset utf-8 latin1 latin9 iso-8859 windows-1252"
+            }
+            Self::ConfirmBusyTerminalClose => {
+                "close tab window pane confirmation terminal shell running"
+            }
+            Self::SkipTerminalGroupCloseConfirmation => "close all other right tabs quit window",
             Self::TerminalLinkDetection => "links clickable open URL email hyperlink OSC 8",
+            Self::TerminalDragDrop => "paste external text files drag drop",
             Self::TerminalCopyOnSelect => {
                 "copy on select automatic mouse drag terminal text clipboard PRIMARY"
             }
@@ -574,6 +637,8 @@ impl Setting {
                 "session journal AI profile model server loopback address filter journal exports by topic"
             }
             Self::JournalVision => "session journal screenshot image vision consent local AI model",
+            Self::JournalAiSummaries => "session journal summary generation AI",
+            Self::JournalScreenshotAnalysis => "session journal screenshot descriptions tags AI",
             Self::JournalAutomaticVision => {
                 "session journal automatically analyze screenshot capture description tags"
             }
@@ -604,6 +669,14 @@ impl Setting {
             Self::SnippetBackground => "editor background color hex rgb",
             Self::SnippetCursorStyle => "caret shape block line underscore",
             Self::SnippetCursorColor => "caret colour color hex rgb",
+            Self::SnippetLineNumbers => "source gutter numbering preview",
+            Self::SnippetWordWrap => "source horizontal scrolling long lines preview",
+            Self::SnippetAnalysisHistory => "code analysis history retention limit pinned reports",
+            Self::SnippetVersionHistory => "source version editing history snapshots",
+            Self::SnippetAlternativeCount => "snippet AI code alternatives count",
+            Self::SnippetAnalysisContentLimit => {
+                "script text UTF-8 maximum size checkpoint storage"
+            }
             Self::Shortcuts => "key bindings accelerator record commands keymap",
             Self::AgentDesign => "AI agent presentation activity status floating classic standard",
             Self::ApplicationUpdates => {
@@ -635,6 +708,15 @@ pub enum Message {
     Color(window::Id, color_settings::Edit),
     EditorCaret(window::Id, editor_settings::Edit),
     SnippetAppearance(window::Id, snippet_editor_settings::Edit),
+    SnippetAnalysisHistory(window::Id, u8),
+    SnippetVersionHistory(window::Id, u8),
+    SnippetAlternativeCount(window::Id, u8),
+    SnippetAnalysisContentLimit(window::Id, String),
+    SnippetAnalysisHistoryPreview(
+        window::Id,
+        std::sync::Weak<()>,
+        Option<crate::snippet_analysis::store::RetentionPreview>,
+    ),
     Theme(window::Id, theme_settings::Edit),
     Design(window::Id, Design),
     DesignAnimations(window::Id, bool),
@@ -658,6 +740,7 @@ pub enum Message {
     ShellTitles(window::Id, bool),
     RecentTabs(window::Id, bool),
     CommandMarks(window::Id, bool),
+    AutomaticLocalShellIntegration(window::Id, bool),
     CommandTimestamps(window::Id, bool),
     RemoteSidebar(window::Id, RemoteSidebarPosition),
     SftpParallel(window::Id, u8),
@@ -672,7 +755,11 @@ pub enum Message {
     TerminalColumns(window::Id, String),
     TerminalRows(window::Id, String),
     SerialDefaultEncoding(window::Id, TextEncoding),
+    SshDefaultEncoding(window::Id, super::ssh_access::DefaultEncoding),
+    ConfirmBusyTerminalClose(window::Id, bool),
+    SkipTerminalGroupCloseConfirmation(window::Id, bool),
     TerminalLinkDetection(window::Id, bool),
+    TerminalDragDrop(window::Id, bool),
     TerminalCopyOnSelect(window::Id, bool),
     QuickSelect(window::Id, quick_select_settings::Edit),
     TerminalScrollbar(window::Id, bool),
@@ -742,14 +829,23 @@ impl Draft {
         if edit.colors != before.colors {
             current.colors = edit.colors;
         }
-        if edit.appearance != before.appearance {
-            current.appearance = edit.appearance;
+        if edit.appearance.design != before.appearance.design {
+            current.appearance.design = edit.appearance.design;
+        }
+        if edit.appearance.animations != before.appearance.animations {
+            current.appearance.animations = edit.appearance.animations;
         }
         if edit.ai_agent_design != before.ai_agent_design {
             current.ai_agent_design = edit.ai_agent_design;
         }
         if edit.ai_agent_designs != before.ai_agent_designs {
             current.ai_agent_designs = edit.ai_agent_designs.clone();
+        }
+        if edit.ai_agent_panel.placement != before.ai_agent_panel.placement {
+            current.ai_agent_panel.placement = edit.ai_agent_panel.placement;
+        }
+        if edit.ai_agent_panel.width != before.ai_agent_panel.width {
+            current.ai_agent_panel.width = edit.ai_agent_panel.width;
         }
         if policy.problem.is_none() && policy.updates_allowed {
             if edit.application_updates.enabled != before.application_updates.enabled {
@@ -773,9 +869,29 @@ impl Draft {
             }
         }
         if edit.snippet_appearance != before.snippet_appearance {
+            let line_numbers = current.snippet_appearance.line_numbers;
+            let word_wrap = current.snippet_appearance.word_wrap;
             current
                 .snippet_appearance
                 .clone_from(&edit.snippet_appearance);
+            if edit.snippet_appearance.line_numbers == before.snippet_appearance.line_numbers {
+                current.snippet_appearance.line_numbers = line_numbers;
+            }
+            if edit.snippet_appearance.word_wrap == before.snippet_appearance.word_wrap {
+                current.snippet_appearance.word_wrap = word_wrap;
+            }
+        }
+        if edit.snippet_analysis_history_limit != before.snippet_analysis_history_limit {
+            current.snippet_analysis_history_limit = edit.snippet_analysis_history_limit;
+        }
+        if edit.snippet_history_limit != before.snippet_history_limit {
+            current.snippet_history_limit = edit.snippet_history_limit;
+        }
+        if edit.snippet_alternative_count != before.snippet_alternative_count {
+            current.snippet_alternative_count = edit.snippet_alternative_count;
+        }
+        if edit.snippet_analysis_content_limit != before.snippet_analysis_content_limit {
+            current.snippet_analysis_content_limit = edit.snippet_analysis_content_limit;
         }
         if edit.export_branding != before.export_branding {
             current.export_branding = edit.export_branding.clone();
@@ -826,6 +942,9 @@ impl Draft {
         if edit.prompt_navigation_enabled != before.prompt_navigation_enabled {
             current.prompt_navigation_enabled = edit.prompt_navigation_enabled;
         }
+        if edit.automatic_local_shell_integration != before.automatic_local_shell_integration {
+            current.automatic_local_shell_integration = edit.automatic_local_shell_integration;
+        }
         if edit.command_timestamps_enabled != before.command_timestamps_enabled {
             current.command_timestamps_enabled = edit.command_timestamps_enabled;
         }
@@ -861,8 +980,23 @@ impl Draft {
         if edit.terminal_link_detection_enabled != before.terminal_link_detection_enabled {
             current.terminal_link_detection_enabled = edit.terminal_link_detection_enabled;
         }
+        if edit.terminal_drag_drop != before.terminal_drag_drop {
+            current.terminal_drag_drop = edit.terminal_drag_drop;
+        }
         if edit.serial_default_encoding != before.serial_default_encoding {
             current.serial_default_encoding = edit.serial_default_encoding;
+        }
+        if edit.ssh_default_encoding != before.ssh_default_encoding {
+            current.ssh_default_encoding = edit.ssh_default_encoding;
+        }
+        if edit.confirm_busy_terminal_close != before.confirm_busy_terminal_close {
+            current.confirm_busy_terminal_close = edit.confirm_busy_terminal_close;
+        }
+        if edit.skip_terminal_group_close_confirmation
+            != before.skip_terminal_group_close_confirmation
+        {
+            current.skip_terminal_group_close_confirmation =
+                edit.skip_terminal_group_close_confirmation;
         }
         if edit.terminal_copy_on_select_enabled != before.terminal_copy_on_select_enabled {
             current.terminal_copy_on_select_enabled = edit.terminal_copy_on_select_enabled;
@@ -1270,6 +1404,14 @@ impl Workspace {
             Message::LoggingPrepared(id, revision, settings, result) => {
                 return self.logging_settings_prepared(id, revision, settings, result);
             }
+            Message::SnippetAnalysisHistoryPreview(id, ticket, result) => {
+                if let Some(dialog) = self.settings.dialog_mut(id) {
+                    dialog
+                        .snippet_appearance
+                        .finish_history_preview(ticket, result);
+                }
+                return Task::none();
+            }
             message @ (Message::Section(id, _)
             | Message::Search(id, _)
             | Message::SearchStep(id, _)
@@ -1281,6 +1423,10 @@ impl Workspace {
             | Message::FontSizeInput(id, _)
             | Message::Color(id, _)
             | Message::SnippetAppearance(id, _)
+            | Message::SnippetAnalysisHistory(id, _)
+            | Message::SnippetVersionHistory(id, _)
+            | Message::SnippetAlternativeCount(id, _)
+            | Message::SnippetAnalysisContentLimit(id, _)
             | Message::EditorCaret(id, _)
             | Message::Theme(id, _)
             | Message::Export(id, _)
@@ -1300,6 +1446,7 @@ impl Workspace {
             | Message::ShellTitles(id, _)
             | Message::RecentTabs(id, _)
             | Message::CommandMarks(id, _)
+            | Message::AutomaticLocalShellIntegration(id, _)
             | Message::CommandTimestamps(id, _)
             | Message::RemoteSidebar(id, _)
             | Message::SftpParallel(id, _)
@@ -1314,7 +1461,11 @@ impl Workspace {
             | Message::TerminalColumns(id, _)
             | Message::TerminalRows(id, _)
             | Message::SerialDefaultEncoding(id, _)
+            | Message::SshDefaultEncoding(id, _)
+            | Message::ConfirmBusyTerminalClose(id, _)
+            | Message::SkipTerminalGroupCloseConfirmation(id, _)
             | Message::TerminalLinkDetection(id, _)
+            | Message::TerminalDragDrop(id, _)
             | Message::TerminalCopyOnSelect(id, _)
             | Message::QuickSelect(id, _)
             | Message::TerminalScrollbar(id, _)
@@ -1450,11 +1601,11 @@ impl Workspace {
                 dialog.problem = None;
             }
             Message::Design(_, design) if dialog.section == Section::Appearance => {
-                dialog.draft.preferences.appearance.design = design;
+                dialog.draft.preferences.appearance.design = Some(design);
                 dialog.problem = None;
             }
             Message::DesignAnimations(_, enabled) if dialog.section == Section::Appearance => {
-                dialog.draft.preferences.appearance.animations = enabled;
+                dialog.draft.preferences.appearance.animations = Some(enabled);
                 dialog.problem = None;
             }
             Message::EditorCaret(_, edit) if dialog.section == Section::Editor => {
@@ -1465,6 +1616,50 @@ impl Workspace {
                 dialog
                     .snippet_appearance
                     .update(&mut dialog.draft.preferences.snippet_appearance, edit);
+                dialog.problem = None;
+            }
+            Message::SnippetAnalysisHistory(_, limit)
+                if dialog.section == Section::SnippetEditor
+                    && crate::snippet_analysis::store::HISTORY_LIMITS.contains(&limit) =>
+            {
+                dialog.draft.preferences.snippet_analysis_history_limit = Some(limit);
+                dialog.problem = None;
+                let initial = dialog
+                    .initial
+                    .preferences
+                    .snippet_analysis_history_limit
+                    .unwrap_or(crate::snippet_analysis::store::DEFAULT_HISTORY_LIMIT);
+                return dialog
+                    .snippet_appearance
+                    .preview_history_limit(id, initial, limit);
+            }
+            Message::SnippetVersionHistory(_, limit)
+                if dialog.section == Section::SnippetEditor
+                    && crate::snippets::history::LIMITS.contains(&limit) =>
+            {
+                dialog.draft.preferences.snippet_history_limit = Some(limit);
+                dialog.problem = None;
+            }
+            Message::SnippetAlternativeCount(_, count)
+                if dialog.section == Section::SnippetEditor
+                    && crate::snippet_window::ai_assist::ALTERNATIVE_COUNTS.contains(&count) =>
+            {
+                dialog.draft.preferences.snippet_alternative_count = Some(count);
+                dialog.problem = None;
+            }
+            Message::SnippetAnalysisContentLimit(_, value)
+                if dialog.section == Section::SnippetEditor
+                    && self
+                        .clipboard
+                        .policy
+                        .snippets
+                        .analysis_max_stored_content_bytes
+                        != Some(0) =>
+            {
+                dialog.snippet_appearance.update_content_limit(
+                    &mut dialog.draft.preferences.snippet_analysis_content_limit,
+                    value,
+                );
                 dialog.problem = None;
             }
             Message::PasteWarning(_, mode)
@@ -1514,6 +1709,11 @@ impl Workspace {
             }
             Message::CommandMarks(_, value) => {
                 dialog.draft.preferences.prompt_navigation_enabled = value
+            }
+            Message::AutomaticLocalShellIntegration(_, enabled)
+                if dialog.section == Section::Terminal =>
+            {
+                dialog.draft.preferences.automatic_local_shell_integration = Some(enabled);
             }
             Message::CommandTimestamps(_, value) => {
                 dialog.draft.preferences.command_timestamps_enabled = value;
@@ -1631,6 +1831,25 @@ impl Workspace {
             Message::SerialDefaultEncoding(_, encoding) if dialog.section == Section::Terminal => {
                 dialog.draft.preferences.serial_default_encoding = encoding;
             }
+            Message::SshDefaultEncoding(_, encoding) if dialog.section == Section::Terminal => {
+                dialog.draft.preferences.ssh_default_encoding = Some(encoding);
+            }
+            Message::ConfirmBusyTerminalClose(_, enabled)
+                if dialog.section == Section::Terminal =>
+            {
+                dialog.draft.preferences.confirm_busy_terminal_close = enabled;
+            }
+            Message::SkipTerminalGroupCloseConfirmation(_, skip)
+                if dialog.section == Section::Terminal =>
+            {
+                dialog
+                    .draft
+                    .preferences
+                    .skip_terminal_group_close_confirmation = Some(skip);
+            }
+            Message::TerminalDragDrop(_, enabled) if dialog.section == Section::Terminal => {
+                dialog.draft.preferences.terminal_drag_drop = Some(enabled);
+            }
             Message::TerminalLinkDetection(_, value) => {
                 dialog.draft.preferences.terminal_link_detection_enabled = value;
             }
@@ -1696,12 +1915,24 @@ impl Workspace {
                 dialog.draft.preferences.terminal_bold_text_mode = mode;
             }
             Message::AgentDesignCatalog(_, edit) if dialog.section == Section::AgentDesign => {
+                use agent_design_settings::Edit;
                 let preferences = &mut dialog.draft.preferences;
-                dialog.agent_design.update(
-                    &mut preferences.ai_agent_designs,
-                    &mut preferences.ai_agent_design,
-                    edit,
-                );
+                match edit {
+                    Edit::DockPlacement(placement) => {
+                        preferences.ai_agent_panel.placement = Some(placement)
+                    }
+                    Edit::DockWidth(width)
+                        if super::terminal_agent::design::DockPreferences::WIDTH_RANGE
+                            .contains(&width) =>
+                    {
+                        preferences.ai_agent_panel.width = Some(width);
+                    }
+                    edit => dialog.agent_design.update(
+                        &mut preferences.ai_agent_designs,
+                        &mut preferences.ai_agent_design,
+                        edit,
+                    ),
+                }
             }
             Message::ApplicationUpdates(_, enabled)
                 if dialog.section == Section::Updates
@@ -2394,6 +2625,9 @@ impl Workspace {
             geometry = self
                 .dialog_placement
                 .set_remembering(next.startup.remember_geometry);
+            if next.ai_agent_panel != self.window_settings.ai_agent_panel {
+                self.cancel_agent_dock_resizes();
+            }
             self.window_settings = next;
             if backgrounds_changed {
                 self.refresh_terminal_backgrounds();
@@ -2682,7 +2916,13 @@ impl Workspace {
                     .view(&dialog.draft.preferences.key_bindings, id),
             ),
             Section::Editor => editor_settings::view(dialog),
-            Section::SnippetEditor => snippet_editor_settings::view(dialog),
+            Section::SnippetEditor => snippet_editor_settings::view(
+                dialog,
+                self.clipboard
+                    .policy
+                    .snippets
+                    .analysis_max_stored_content_bytes,
+            ),
             Section::AgentDesign => {
                 let preferences = &dialog.draft.preferences;
                 highlighted(
@@ -2691,6 +2931,7 @@ impl Workspace {
                     dialog.agent_design.view(
                         &preferences.ai_agent_designs,
                         preferences.ai_agent_design,
+                        preferences.ai_agent_panel,
                         id,
                         dialog.input_target(Setting::AgentDesign, true),
                     ),
@@ -2731,6 +2972,8 @@ impl Workspace {
                         .spacing(8)
                         .align_y(Alignment::Center),
                     ),
+                    (allowed && !preferences.enabled && dialog.draft.preferences.java_update_opt_in)
+                        .then(|| text("Your Java backup enabled automatic update checks. Enable the checkbox and save to use automatic checks in Rust.").size(14)),
                     text(self.application_update_channel()).size(14),
                     text("Review available archives in Help → About kortty.").size(14),
                     text(self.application_update_status()).size(14),
@@ -2936,9 +3179,40 @@ impl Workspace {
             ),
         ]
         .spacing(7);
+        use super::ssh_access::DefaultEncoding;
         let mut page = column![
             text("Terminal Settings").size(18),
             initial_terminal_size(dialog),
+            highlighted(
+                dialog,
+                Setting::ConfirmBusyTerminalClose,
+                checkbox(settings.confirm_busy_terminal_close)
+                    .label(Setting::ConfirmBusyTerminalClose.label())
+                    .on_toggle(move |enabled| Desktop::Settings(Message::ConfirmBusyTerminalClose(id, enabled))),
+            ),
+            highlighted(
+                dialog,
+                Setting::SkipTerminalGroupCloseConfirmation,
+                checkbox(settings.skip_terminal_group_close_confirmation.unwrap_or_default())
+                    .label(Setting::SkipTerminalGroupCloseConfirmation.label())
+                    .on_toggle(move |skip| Desktop::Settings(Message::SkipTerminalGroupCloseConfirmation(id, skip))),
+            ),
+            highlighted(
+                dialog,
+                Setting::SshDefaultEncoding,
+                column![
+                    text(Setting::SshDefaultEncoding.label()),
+                    pick_list(DefaultEncoding::ALL, Some(settings.ssh_default_encoding.unwrap_or_default()), move |encoding| {
+                        Desktop::Settings(Message::SshDefaultEncoding(id, encoding))
+                    }),
+                    text("Applies to SSH connections that use the default. Reconnect to apply changes.").size(13),
+                    settings.java_ssh_encoding_hint.filter(|_| settings.ssh_default_encoding.is_none()).map(|encoding| {
+                        button(text(format!("Use Java encoding ({encoding})"))).on_press(
+                            Desktop::Settings(Message::SshDefaultEncoding(id, DefaultEncoding::Text(encoding)))
+                        )
+                    }),
+                ].spacing(5),
+            ),
             highlighted(
                 dialog,
                 Setting::SerialDefaultEncoding,
@@ -3078,8 +3352,26 @@ impl Workspace {
                 text("Terminal clipboard requests use the managed internal clipboard.").size(13),
             );
         }
+        let page = page.push(highlighted(
+            dialog,
+            Setting::TerminalDragDrop,
+            checkbox(settings.terminal_drag_drop.unwrap_or(true))
+                .label(Setting::TerminalDragDrop.label())
+                .on_toggle(move |enabled| {
+                    Desktop::Settings(Message::TerminalDragDrop(id, enabled))
+                }),
+        ));
         page.push(rule::horizontal(1))
             .push(text("Shell Integration").size(16))
+            .push(highlighted(
+                dialog,
+                Setting::AutomaticLocalShellIntegration,
+                checkbox(settings.automatic_local_shell_integration())
+                    .label(Setting::AutomaticLocalShellIntegration.label())
+                    .on_toggle(move |enabled| {
+                        Desktop::Settings(Message::AutomaticLocalShellIntegration(id, enabled))
+                    }),
+            ))
             .push(highlighted(
                 dialog,
                 Setting::CommandMarks,
@@ -3644,7 +3936,7 @@ impl fmt::Display for RestoreChoice {
 
 fn search_matches(query: &str) -> impl Iterator<Item = Setting> {
     let query = normalized(query);
-    Setting::ALL.into_iter().filter(move |setting| {
+    Setting::ALL.iter().copied().filter(move |setting| {
         let query = query.trim();
         if query.chars().take(2).count() < 2 {
             return false;
@@ -3755,7 +4047,10 @@ mod tests {
         assert_eq!(workspace.window_theme(other), original);
         assert!(workspace.settings.0.as_ref().unwrap().problem.is_some());
         let _ = workspace.update_settings(Message::Cancel(id));
-        assert_eq!(workspace.window_settings.appearance.design, Design::Normal);
+        assert_eq!(
+            workspace.window_settings.appearance.design(),
+            Design::Normal
+        );
 
         let _ = workspace.update_settings(Message::OpenAt(owner, Section::Appearance));
         let id = workspace.settings.0.as_ref().unwrap().id;
@@ -3774,8 +4069,8 @@ mod tests {
         let restored: WindowSettings =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         std::fs::remove_dir_all(folder).unwrap();
-        assert_eq!(restored.appearance.design, design);
-        assert!(!restored.appearance.animations);
+        assert_eq!(restored.appearance.design(), design);
+        assert!(!restored.appearance.animations());
         assert_eq!(workspace.window_settings, restored);
         let palette = design.palette().unwrap();
         for window in [owner, other] {
@@ -4141,12 +4436,20 @@ mod tests {
         for edit in [
             Edit::Family(Some(MONOSPACED.into())),
             Edit::Size("30".into()),
+            Edit::LineNumbers(true),
+            Edit::WordWrap(false),
             Edit::Color(Color::Foreground, "#AABBCC".into()),
             Edit::Color(Color::Background, "#223344".into()),
             Edit::Color(Color::Background, String::new()),
         ] {
             let _ = workspace.update_settings(Message::SnippetAppearance(id, edit));
         }
+        let _ = workspace.update_settings(Message::SnippetAnalysisHistory(id, 8));
+        let _ = workspace.update_settings(Message::SnippetAnalysisContentLimit(id, "0".into()));
+        assert_eq!(
+            workspace.window_settings.snippet_analysis_history_limit,
+            None
+        );
         assert_eq!(
             workspace.window_settings.snippet_editor_appearance(),
             inherited
@@ -4164,6 +4467,10 @@ mod tests {
             Some(MONOSPACED)
         );
         assert_eq!(actual.size, 30);
+        assert_eq!(restored.snippet_appearance.line_numbers, Some(true));
+        assert_eq!(restored.snippet_appearance.word_wrap, Some(false));
+        assert_eq!(restored.snippet_analysis_history_limit, Some(8));
+        assert_eq!(restored.snippet_analysis_content_limit, Some(0));
         assert_eq!(actual.foreground, Rgb::from_hex(0xaabbcc));
         assert_eq!(actual.background, terminal.background);
         assert_eq!(restored.editor_appearance(), file_editor);
@@ -4854,6 +5161,32 @@ mod tests {
         for pane in workspace.sessions.values() {
             let _ = pane.session.stop().recv_blocking();
         }
+    }
+
+    #[test]
+    fn ssh_encoding_selection_saves_an_explicit_choice_without_changing_serial()
+    -> std::io::Result<()> {
+        use super::super::ssh_access::DefaultEncoding;
+
+        let mut workspace = Workspace::default();
+        workspace.window_settings.java_ssh_encoding_hint = Some(TextEncoding::Latin9);
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.update_settings(Message::OpenAt(owner, Section::Terminal));
+        let id = workspace.settings.0.as_ref().unwrap().id;
+        let value = DefaultEncoding::Text(TextEncoding::Latin9);
+        assert!(
+            search_matches("ssh charset").any(|setting| setting == Setting::SshDefaultEncoding)
+        );
+        let _ = workspace.update_settings(Message::SshDefaultEncoding(id, value));
+        assert_eq!(workspace.window_settings.ssh_default_encoding, None);
+        let scratch = crate::snippets::tests::Profile::new();
+        let path = scratch.0.join("window-settings.json");
+        let _ = workspace.save_settings_to(id, |preferences| preferences.save(&path));
+        let saved = WindowSettings::read(&path)?;
+        assert_eq!(saved.ssh_default_encoding, Some(value));
+        assert_eq!(workspace.window_settings.ssh_default_encoding, Some(value));
+        assert_eq!(saved.serial_default_encoding, TextEncoding::Utf8);
+        Ok(())
     }
 
     #[test]

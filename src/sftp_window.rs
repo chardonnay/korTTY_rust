@@ -38,6 +38,7 @@ mod extract;
 mod files;
 mod idle;
 mod listing;
+mod listing_keys;
 mod local_accounts;
 mod ownership;
 pub(crate) mod parallel;
@@ -146,6 +147,16 @@ pub(crate) struct Entry {
 }
 
 impl Entry {
+    fn batch_selectable(&self) -> bool {
+        self.kind.copyable() || tree::snapshot::known_special_mode(self.mode)
+    }
+
+    fn recursive_delete_supported(&self) -> bool {
+        self.kind.transferable()
+            || self.kind == EntryKind::Link
+            || tree::snapshot::known_special_mode(self.mode)
+    }
+
     fn ownership_reviewable(&self) -> bool {
         self.kind.transferable()
             && self.owner.is_some_and(|id| id != u32::MAX)
@@ -301,6 +312,15 @@ impl Panel {
         ))
     }
 
+    fn copyable_selection(&self) -> bool {
+        !self.selected.is_empty()
+            && self
+                .entries()
+                .filter(|entry| self.selected.contains(&entry.name) && entry.kind.copyable())
+                .count()
+                == self.selected.len()
+    }
+
     fn toggle(&mut self, name: EntryName, checked: bool) {
         if !checked {
             self.selected.remove(&name);
@@ -311,14 +331,14 @@ impl Panel {
                 directory
                     .entries
                     .iter()
-                    .any(|entry| entry.name == name && entry.kind.copyable())
+                    .any(|entry| entry.name == name && entry.batch_selectable())
             })
         {
             return;
         }
         if self
             .selected()
-            .is_some_and(|(_, entry)| !entry.kind.copyable())
+            .is_some_and(|(_, entry)| !entry.batch_selectable())
         {
             self.selected.clear();
         }
@@ -401,6 +421,7 @@ pub enum Message {
     Change(Side, Change),
     EditName(String),
     ConfirmChange,
+    ReviewDeletion,
     ChangeOwnership,
     ChangeLocalOwnership,
     OwnerId(String),
@@ -416,6 +437,7 @@ pub enum Message {
     SetConflictDefault(ConflictDefault),
     Dismiss,
     CancelTransfer,
+    CancelDeletion,
     CancelActiveTransfer(u64),
     PauseQueue(bool),
     CancelQueued(u64),
@@ -444,6 +466,11 @@ enum Prompt {
         selected: Option<Entry>,
         input: String,
     },
+    Delete {
+        directory: Location,
+        entries: Vec<Entry>,
+    },
+    RecursiveDelete(Arc<worker::recursive_delete::Plan>),
     Ownership(ownership::Draft),
     Conflict {
         row: workbench::Id,
@@ -465,6 +492,7 @@ struct Busy {
     measuring: bool,
     syncing: bool,
     server_copy: bool,
+    deleting: Option<Side>,
     archive: Option<Side>,
     archive_review: Option<archive::Draft>,
     extracting: Option<extract::Phase>,
@@ -487,7 +515,7 @@ impl Busy {
         self.extract_review = None;
         self.replacement_setup = None;
         if let Some(cancel) = &self.sync_cancel {
-            if self.archive == Some(Side::Local) {
+            if self.archive == Some(Side::Local) || self.deleting == Some(Side::Local) {
                 cancel.stop_local();
             } else if let Some(worker) = worker {
                 cancel.stop(worker);
@@ -497,6 +525,8 @@ impl Busy {
 }
 
 pub struct SftpWindow {
+    local_path_input: iced::widget::Id,
+    remote_path_input: iced::widget::Id,
     target: SshTarget,
     attached_to: Option<SessionId>,
     incognito: bool,
@@ -518,6 +548,7 @@ pub struct SftpWindow {
     parallel: parallel::Transfers,
     idle: idle::Idle,
     comparison: Option<compare::View>,
+    comparison_ai_font_size: u8,
     image: Option<picture::Preview>,
     remote_images_allowed: bool,
     conflict_default: ConflictDefault,
@@ -705,6 +736,8 @@ impl SftpWindow {
         editor_policy: RemoteEditorPolicy,
     ) -> Self {
         Self {
+            local_path_input: iced::widget::Id::unique(),
+            remote_path_input: iced::widget::Id::unique(),
             target,
             attached_to,
             incognito: false,
@@ -726,6 +759,7 @@ impl SftpWindow {
             parallel: parallel::Transfers::default(),
             idle: idle::Idle::default(),
             comparison: None,
+            comparison_ai_font_size: comparison_ai::DEFAULT_FONT_SIZE,
             image: None,
             remote_images_allowed: editor_policy != RemoteEditorPolicy::Deny,
             conflict_default: ConflictDefault::Ask,
@@ -835,6 +869,21 @@ impl SftpWindow {
 
     pub(crate) fn incognito(&self) -> bool {
         self.incognito
+    }
+
+    pub(crate) fn configure_comparison_ai_font(&mut self, size: Option<u8>) {
+        self.comparison_ai_font_size = size
+            .unwrap_or(comparison_ai::DEFAULT_FONT_SIZE)
+            .clamp(comparison_ai::MIN_FONT_SIZE, comparison_ai::MAX_FONT_SIZE);
+    }
+
+    pub(crate) fn configure_hidden_entries(&mut self, show_local: bool, show_remote: bool) {
+        self.local.hide_hidden = !show_local;
+        self.remote.hide_hidden = !show_remote;
+    }
+
+    pub(crate) fn shows_hidden_entries(&self, side: Side) -> bool {
+        !self.panel(side).hide_hidden
     }
 
     pub(crate) fn set_incognito(&mut self, incognito: bool) {
@@ -1020,7 +1069,10 @@ impl SftpWindow {
             self.discard_partial();
             self.parallel.clear_offers();
             self.workbench.clear();
-            self.remote = Panel::default();
+            self.remote = Panel {
+                hide_hidden: self.remote.hide_hidden,
+                ..Panel::default()
+            };
             self.home = None;
             self.target = target;
         }
@@ -1043,6 +1095,12 @@ impl SftpWindow {
 
     pub fn transfer_running(&self) -> bool {
         self.desktop_drop.local_job.is_some() || self.remote_transfer_running()
+    }
+
+    pub(crate) fn deletion_running(&self) -> bool {
+        self.busy
+            .as_ref()
+            .is_some_and(|busy| busy.deleting.is_some())
     }
 
     fn remote_transfer_running(&self) -> bool {
@@ -1072,7 +1130,11 @@ impl SftpWindow {
 
     pub fn request_close(&mut self) -> bool {
         self.cancel_desktop_drop();
-        if self.transfer_running() || self.ownership_running() || self.external.active() {
+        if self.transfer_running()
+            || self.deletion_running()
+            || self.ownership_running()
+            || self.external.active()
+        {
             if !matches!(self.prompt, Some(Prompt::Close(_))) {
                 self.prompt = Some(Prompt::Close(self.prompt.take().map(Box::new)));
             }
@@ -1231,6 +1293,12 @@ impl SftpWindow {
                 }
                 return self.try_external_upload(false);
             }
+            Message::CancelDeletion => {
+                if let Some(busy) = self.busy.as_mut().filter(|busy| busy.deleting.is_some()) {
+                    busy.stop_reviewed_transfer(self.worker.as_ref());
+                    self.status = Some("Stopping deletion…".into());
+                }
+            }
             Message::CancelTransfer
                 if self.busy.as_ref().is_some_and(|busy| {
                     busy.progress.is_some()
@@ -1272,6 +1340,7 @@ impl SftpWindow {
                 }
             }
             Message::ConfirmChange => return self.confirm_change(),
+            Message::ReviewDeletion => return self.review_deletion(),
             Message::OwnerId(value) => self.edit_ownership(true, value),
             Message::GroupId(value) => self.edit_ownership(false, value),
             Message::OwnershipMode(value) => self.edit_ownership_mode(value),
@@ -1400,6 +1469,7 @@ impl SftpWindow {
                 panel.selected.clear();
             }
             Message::Hidden(side) => {
+                self.note_activity(std::time::Instant::now());
                 let panel = self.panel_mut(side);
                 panel.hide_hidden = !panel.hide_hidden;
                 panel.page = 0;
@@ -1603,13 +1673,18 @@ impl SftpWindow {
         let (Some(directory), Some(target)) = (&source_panel.directory, &target.directory) else {
             return VecDeque::new();
         };
-        make_transfers(
+        let transfers = make_transfers(
             directory,
             &target.path,
             source_panel
                 .entries()
                 .filter(|entry| source_panel.selected.contains(&entry.name)),
-        )
+        );
+        if transfers.len() == source_panel.selected.len() {
+            transfers
+        } else {
+            VecDeque::new()
+        }
     }
 
     fn queue_transfers(&mut self, transfers: VecDeque<worker::Transfer>) -> Task<Message> {
@@ -1964,10 +2039,28 @@ impl SftpWindow {
     }
 
     fn ask_change(&mut self, side: Side, operation: Change) {
+        if !self.panel_available(side) || self.parallel.active() {
+            return;
+        }
         let panel = self.panel(side);
         let Some(directory) = &panel.directory else {
             return;
         };
+        if operation == Change::Delete {
+            let entries: Vec<_> = directory
+                .entries
+                .iter()
+                .filter(|entry| panel.selected.contains(&entry.name) && panel.visible(entry))
+                .cloned()
+                .collect();
+            if !entries.is_empty() && entries.len() == panel.selected.len() {
+                self.prompt = Some(Prompt::Delete {
+                    directory: directory.path.clone(),
+                    entries,
+                });
+            }
+            return;
+        }
         let selected = panel.selected().map(|(_, entry)| entry.clone());
         if operation != Change::NewFolder && selected.is_none() {
             return;
@@ -1988,28 +2081,56 @@ impl SftpWindow {
     }
 
     fn confirm_change(&mut self) -> Task<Message> {
-        if !matches!(self.prompt, Some(Prompt::Change { .. })) {
+        if !matches!(
+            self.prompt,
+            Some(Prompt::Change { .. } | Prompt::Delete { .. } | Prompt::RecursiveDelete(_))
+        ) {
             return Task::none();
         }
-        let Some(Prompt::Change {
-            operation,
-            directory,
-            selected,
-            input,
-        }) = self.prompt.take()
-        else {
-            return Task::none();
-        };
-        self.dispatch(
-            worker::Operation::Change {
-                directory,
+        match self.prompt.take() {
+            Some(Prompt::Delete { directory, entries }) => self.dispatch(
+                worker::Operation::DeleteSelection {
+                    directory,
+                    entries,
+                    cancel: worker::sync::Cancel::default(),
+                },
+                "Deleting selected entries",
+                None,
+            ),
+            Some(Prompt::RecursiveDelete(plan)) => self.dispatch(
+                worker::Operation::ApplyDeletion(plan, worker::sync::Cancel::default()),
+                "Deleting reviewed tree entries",
+                None,
+            ),
+            Some(Prompt::Change {
                 operation,
+                directory,
                 selected,
                 input,
-            },
-            "Changing file",
-            None,
-        )
+            }) => self.dispatch(
+                worker::Operation::Change {
+                    directory,
+                    operation,
+                    selected,
+                    input,
+                },
+                "Changing file",
+                None,
+            ),
+            _ => Task::none(),
+        }
+    }
+
+    fn review_deletion(&mut self) -> Task<Message> {
+        let Some(worker) = self.worker.as_ref().filter(|worker| !worker.is_closed()) else {
+            return Task::none();
+        };
+        let Some(Prompt::Delete { directory, entries }) = &self.prompt else {
+            return Task::none();
+        };
+        let operation = worker.review_deletion(directory.clone(), entries.clone());
+        self.prompt = None;
+        self.dispatch(operation, "Reviewing folder contents", None)
     }
 
     fn server_copy_source(&self) -> Option<(Vec<u8>, String)> {
@@ -2135,6 +2256,16 @@ impl SftpWindow {
             &operation,
             worker::Operation::ReviewServerCopy(..) | worker::Operation::ApplyServerCopy(..)
         );
+        let deleting = match &operation {
+            worker::Operation::DeleteSelection { directory, .. } => Some(directory),
+            worker::Operation::ReviewDeletion(request, _) => Some(request.directory()),
+            worker::Operation::ApplyDeletion(plan, _) => Some(plan.directory()),
+            _ => None,
+        }
+        .map(|directory| match directory {
+            Location::Local(_) => Side::Local,
+            Location::Remote(_) => Side::Remote,
+        });
         let ownership = operation.ownership_cancel().is_some();
         let archive = operation.archive_side();
         let extracting = match &operation {
@@ -2147,7 +2278,10 @@ impl SftpWindow {
             | worker::Operation::ReviewSyncReplacement(_, cancel)
             | worker::Operation::ApplySyncReplacement(_, _, cancel, _)
             | worker::Operation::ReviewServerCopy(_, cancel)
-            | worker::Operation::ApplyServerCopy(_, _, cancel) => Some(cancel),
+            | worker::Operation::ApplyServerCopy(_, _, cancel)
+            | worker::Operation::ReviewDeletion(_, cancel)
+            | worker::Operation::ApplyDeletion(_, cancel)
+            | worker::Operation::DeleteSelection { cancel, .. } => Some(cancel),
             worker::Operation::MeasureFolders(request) => request
                 .allocated
                 .as_ref()
@@ -2188,6 +2322,7 @@ impl SftpWindow {
             measuring,
             syncing,
             server_copy,
+            deleting,
             archive,
             archive_review: None,
             extracting,
@@ -2388,6 +2523,11 @@ impl SftpWindow {
                 worker::Reply::EditorSaved(_)
                 | worker::Reply::ExternalEditorSaved(_)
                 | worker::Reply::ProjectImageOpened(_) => {}
+                worker::Reply::RecursiveDeletionReviewed(plan) => {
+                    if !busy.cancelled && self.prompt.is_none() {
+                        self.prompt = Some(Prompt::RecursiveDelete(Arc::clone(plan)));
+                    }
+                }
                 worker::Reply::Changed { directory, note } => {
                     if let Some(directory) = directory
                         && (busy.queued.is_none() || self.directory_visible(&directory.path))
@@ -2643,7 +2783,7 @@ impl SftpWindow {
         desktop_drag: bool,
     ) -> Element<'_, Message> {
         if let Some(comparison) = &self.comparison {
-            return comparison.view();
+            return comparison.view(self.comparison_ai_font_size);
         }
         if let Some(prompt) = &self.prompt {
             if matches!(prompt, Prompt::Conflict { .. })
@@ -2706,6 +2846,12 @@ impl SftpWindow {
                     "Cancel comparison"
                 })
                 .on_press(Message::CancelComparison),
+            );
+        }
+        if let Some(busy) = self.busy.as_ref().filter(|busy| busy.deleting.is_some()) {
+            top = top.push(
+                button("Stop deletion")
+                    .on_press_maybe((!busy.cancelled).then_some(Message::CancelDeletion)),
             );
         }
         if self.ownership_running() {
@@ -2854,6 +3000,18 @@ impl SftpWindow {
         content.height(Length::Fill).into()
     }
 
+    fn panel_available(&self, side: Side) -> bool {
+        (side == Side::Local
+            || self
+                .worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_closed()))
+            && self.busy.is_none()
+            && self.panel(side).directory.is_some()
+            && self.desktop_drop.local_job.is_none()
+            && self.local_listing_request.is_none()
+    }
+
     fn panel_view<'a>(
         &'a self,
         side: Side,
@@ -2866,11 +3024,7 @@ impl SftpWindow {
             .worker
             .as_ref()
             .is_some_and(|worker| !worker.is_closed());
-        let available = (online || side == Side::Local)
-            && self.busy.is_none()
-            && panel.directory.is_some()
-            && self.desktop_drop.local_job.is_none()
-            && self.local_listing_request.is_none();
+        let available = self.panel_available(side);
         let change_available = available && !self.parallel.active();
         let visible = |entry: &&Entry| panel.visible(entry);
         let total = panel.entries().len();
@@ -2878,6 +3032,8 @@ impl SftpWindow {
         let last_page = count.saturating_sub(1) / PAGE_SIZE;
         let page = panel.page.min(last_page);
         let selected = panel.selected().map(|(_, entry)| entry);
+        let can_change_selection = change_available && selected.is_some();
+        let can_delete = change_available && !panel.selected.is_empty();
         let other = if side == Side::Local {
             &self.remote
         } else {
@@ -2887,11 +3043,15 @@ impl SftpWindow {
             && available
             && self.transfer_allowed
             && other.directory.is_some()
-            && (panel.selected.len() > 1 || selected.is_some_and(|entry| entry.kind.copyable()));
+            && panel.copyable_selection();
         let compare =
             change_available && self.queue_available() && self.comparison_pair(side).is_some();
         let compare_folders =
             change_available && self.queue_available() && self.folder_pair(Some(side)).is_some();
+        let path_id = match side {
+            Side::Local => &self.local_path_input,
+            Side::Remote => &self.remote_path_input,
+        };
         let paths = row![
             button("Home").on_press_maybe(available.then_some(Message::Home(side))),
             button("Up").on_press_maybe(
@@ -2903,6 +3063,7 @@ impl SftpWindow {
                 .then_some(Message::Up(side))
             ),
             text_input("Path", &panel.path)
+                .id(path_id.clone())
                 .on_input(move |path| Message::Path(side, path))
                 .on_submit_maybe(available.then_some(Message::Go(side))),
             button("Go").on_press_maybe(available.then_some(Message::Go(side)))
@@ -2930,12 +3091,10 @@ impl SftpWindow {
                     change_available.then_some(Message::Change(side, Change::NewFolder))
                 ),
                 button("Rename").on_press_maybe(
-                    (change_available && selected.is_some())
-                        .then_some(Message::Change(side, Change::Rename))
+                    can_change_selection.then_some(Message::Change(side, Change::Rename))
                 ),
                 button("Delete").on_press_maybe(
-                    (change_available && selected.is_some())
-                        .then_some(Message::Change(side, Change::Delete))
+                    can_delete.then_some(Message::Change(side, Change::Delete))
                 ),
                 button("Rights").on_press_maybe(
                     (change_available
@@ -3066,7 +3225,7 @@ impl SftpWindow {
                 }),
             ));
         }
-        container(
+        let content = container(
             column![
                 text(if panel.selected.len() > 1 {
                     format!("{header} · {} selected", panel.selected.len())
@@ -3077,7 +3236,13 @@ impl SftpWindow {
                 paths,
                 browser::breadcrumbs_view(panel.directory.as_ref(), available),
                 filter.wrap(),
-                self.panel_listing(side, available, page, zone),
+                listing_keys::wrap(
+                    self.panel_listing(side, available, page, zone),
+                    side,
+                    self.busy.is_none() && panel.directory.is_some(),
+                    can_change_selection,
+                    can_delete,
+                ),
                 row![
                     button("Previous")
                         .on_press_maybe((page > 0).then_some(Message::Page(side, false))),
@@ -3094,7 +3259,8 @@ impl SftpWindow {
             .height(Length::Fill),
         )
         .width(Length::Fill)
-        .into()
+        .into();
+        listing_keys::pane(content, path_id.clone())
     }
 
     fn panel_listing<'a>(
@@ -3137,52 +3303,52 @@ impl SftpWindow {
                 .take(PAGE_SIZE)
             {
                 let selected = panel.selected.contains(&entry.name);
-                let toggle = available
-                    && entry.kind.copyable()
-                    && (selected || panel.selected.len() < MAX_SELECTION);
-                let item = row![
-                    container(checkbox(selected && entry.kind.copyable()).on_toggle_maybe(
-                        toggle.then_some(move |checked| Message::ToggleSelection(
-                            side,
-                            entry.name.clone(),
-                            checked
-                        )),
-                    ))
-                    .width(22),
-                    zone.item(
-                        button(listing::columns(
-                            entry,
-                            panel.folder_sizes.get(&entry.name).copied(),
-                            panel.measurement == Some(browser::Measurement::Allocated),
-                            directory.and_then(|directory| directory.modified(entry)),
-                            &timezone,
-                            account_labels,
+                let selectable = entry.batch_selectable();
+                let toggle =
+                    available && selectable && (selected || panel.selected.len() < MAX_SELECTION);
+                let item =
+                    row![
+                        container(checkbox(selected && selectable).on_toggle_maybe(
+                            toggle.then_some(move |checked| Message::ToggleSelection(
+                                side,
+                                entry.name.clone(),
+                                checked
+                            )),
                         ))
-                        .style(if selected {
-                            button::primary
-                        } else {
-                            button::secondary
-                        })
-                        .width(Length::Fill)
-                        .padding([3, 4])
-                        .on_press_maybe(
-                            available.then(|| Message::Select(side, entry.name.clone())),
+                        .width(22),
+                        zone.item(
+                            button(listing::columns(
+                                entry,
+                                panel.folder_sizes.get(&entry.name).copied(),
+                                panel.measurement == Some(browser::Measurement::Allocated),
+                                directory.and_then(|directory| directory.modified(entry)),
+                                &timezone,
+                                account_labels,
+                            ))
+                            .style(if selected {
+                                button::primary
+                            } else {
+                                button::secondary
+                            })
+                            .width(Length::Fill)
+                            .padding([3, 4])
+                            .on_press_maybe(
+                                available.then(|| Message::Select(side, entry.name.clone())),
+                            ),
+                            drag_view.as_ref().map(|view| view.row(entry)).or_else(|| {
+                                (entry.kind == EntryKind::Directory && desktop_listing.is_some())
+                                    .then(|| {
+                                        drag::Item::desktop(
+                                            side,
+                                            desktop_listing,
+                                            Some(entry.name.clone()),
+                                        )
+                                    })
+                            })
                         ),
-                        drag_view.as_ref().map(|view| view.row(entry)).or_else(|| {
-                            (entry.kind == EntryKind::Directory && desktop_listing.is_some()).then(
-                                || {
-                                    drag::Item::desktop(
-                                        side,
-                                        desktop_listing,
-                                        Some(entry.name.clone()),
-                                    )
-                                },
-                            )
-                        })
-                    ),
-                ]
-                .spacing(5)
-                .align_y(Alignment::Center);
+                    ]
+                    .spacing(5)
+                    .align_y(Alignment::Center);
                 rows = rows.push(item);
             }
             let header = row![
@@ -3356,6 +3522,25 @@ impl SftpWindow {
                 .spacing(12)
                 .into()
             }
+            Prompt::Close(_)
+                if self
+                    .busy
+                    .as_ref()
+                    .is_some_and(|busy| busy.deleting.is_some()) =>
+            {
+                column![
+                    text("Stop deletion and close?").size(20),
+                    text("Entries already removed will stay deleted."),
+                    row![
+                        button("Keep open").on_press(Message::ConfirmClose(false)),
+                        button("Stop and close").on_press(Message::ConfirmClose(true))
+                    ]
+                    .spacing(8)
+                ]
+                .padding(16)
+                .spacing(12)
+                .into()
+            }
             Prompt::Close(_) => column![
                 text("Cancel the running transfer and close?").size(20),
                 row![
@@ -3393,6 +3578,54 @@ impl SftpWindow {
                 ]
                 .spacing(8)
                 .wrap()
+            ]
+            .padding(16)
+            .spacing(12)
+            .into(),
+            Prompt::Delete { directory, entries } => column![
+                text(format!("Delete {} selected entries?", entries.len())).size(20),
+                text(directory.display()),
+                container(
+                    scrollable(entries.iter().fold(column![].spacing(4), |rows, entry| {
+                        rows.push(text(&entry.display))
+                    }))
+                    .height(Length::Shrink)
+                )
+                .max_height(260),
+                text("This removes files, links and empty folders."),
+                row![
+                    button("Cancel").on_press(Message::Dismiss),
+                    button("Review folder contents…").on_press_maybe(
+                        (entries
+                            .iter()
+                            .any(|entry| entry.kind == EntryKind::Directory)
+                            && entries.iter().all(Entry::recursive_delete_supported))
+                        .then_some(Message::ReviewDeletion),
+                    ),
+                    button("Delete").on_press(Message::ConfirmChange),
+                ]
+                .spacing(8),
+            ]
+            .padding(16)
+            .spacing(12)
+            .into(),
+            Prompt::RecursiveDelete(plan) => column![
+                text(format!("Delete {} reviewed entries?", plan.paths().len())).size(20),
+                text(plan.directory().display()),
+                container(
+                    scrollable(
+                        plan.paths()
+                            .iter()
+                            .fold(column![].spacing(4), |rows, path| { rows.push(text(path)) })
+                    )
+                    .height(Length::Shrink)
+                )
+                .max_height(340),
+                row![
+                    button("Cancel").on_press(Message::Dismiss),
+                    button("Delete reviewed entries").on_press(Message::ConfirmChange),
+                ]
+                .spacing(8),
             ]
             .padding(16)
             .spacing(12)
@@ -3588,6 +3821,55 @@ mod tests {
     }
 
     #[test]
+    fn file_change_prompts_show_the_exact_selected_entries() {
+        let target = serde_json::from_value(serde_json::json!({
+            "host": "localhost", "port": 22, "username": "fixture"
+        }))
+        .unwrap();
+        let mut window = SftpWindow::new(target, None, false, RemoteEditorPolicy::Deny);
+        let names = ["one.txt", "two.txt"].map(|name| EntryName::Local(name.into()));
+        window.local.load(Arc::new(Directory::sorted(
+            Location::Local(PathBuf::from("fixture")),
+            names
+                .iter()
+                .zip(["one.txt", "two.txt"])
+                .map(|(name, display)| Entry {
+                    name: name.clone(),
+                    display: display.into(),
+                    hidden: false,
+                    kind: EntryKind::File,
+                    size: None,
+                    modified: None,
+                    owner: None,
+                    group: None,
+                    mode: None,
+                })
+                .collect(),
+        )));
+        let _ = window.update(Message::Change(Side::Local, Change::Delete));
+        assert!(window.prompt.is_none());
+        let _ = window.update(Message::Select(Side::Local, names[0].clone()));
+        let _ = window.update(Message::Change(Side::Local, Change::Rename));
+        assert!(matches!(&window.prompt, Some(Prompt::Change {
+            operation: Change::Rename, selected: Some(entry), ..
+        }) if entry.name == names[0]));
+        let _ = window.update(Message::Dismiss);
+        let _ = window.update(Message::ToggleSelection(
+            Side::Local,
+            names[1].clone(),
+            true,
+        ));
+        let _ = window.update(Message::Change(Side::Local, Change::Rename));
+        assert!(window.prompt.is_none());
+        let _ = window.update(Message::Change(Side::Local, Change::Delete));
+        assert!(
+            matches!(&window.prompt, Some(Prompt::Delete { entries, .. })
+            if entries.iter().map(|entry| &entry.name).eq(&names))
+        );
+        assert!(window.busy.is_none());
+    }
+
+    #[test]
     fn transfer_selection_includes_links_and_single_actions_require_one_entry() {
         let entry = |name: &str, kind| Entry {
             name: EntryName::Remote(name.as_bytes().to_vec()),
@@ -3603,10 +3885,18 @@ mod tests {
         let folder = entry("folder", EntryKind::Directory);
         let file = entry("file", EntryKind::File);
         let link = entry("link", EntryKind::Link);
-        let special = entry("special", EntryKind::Other);
+        let unknown = entry("unknown", EntryKind::Other);
+        let mut fifo = entry("fifo", EntryKind::Other);
+        fifo.mode = Some(0o010600);
         let directory = Arc::new(Directory::sorted(
             Location::Remote(b"/source".to_vec()),
-            vec![folder.clone(), file.clone(), link.clone(), special.clone()],
+            vec![
+                folder.clone(),
+                file.clone(),
+                link.clone(),
+                unknown.clone(),
+                fifo.clone(),
+            ],
         ));
         let mut panel = Panel::default();
         panel.load(directory.clone());
@@ -3614,8 +3904,14 @@ mod tests {
         assert_eq!(panel.selected().unwrap().1.kind, EntryKind::Directory);
         panel.toggle(file.name.clone(), true);
         panel.toggle(link.name.clone(), true);
-        panel.toggle(special.name, true);
+        panel.toggle(unknown.name, true);
         assert_eq!(panel.selected.len(), 3);
+        assert!(panel.copyable_selection());
+        panel.toggle(fifo.name.clone(), true);
+        assert_eq!(panel.selected.len(), 4);
+        assert!(!panel.copyable_selection());
+        panel.toggle(fifo.name, false);
+        assert!(panel.copyable_selection());
         assert!(panel.selected().is_none());
         panel.toggle(folder.name, false);
         assert!(panel.selected().is_none());

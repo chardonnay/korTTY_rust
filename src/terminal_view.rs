@@ -140,6 +140,7 @@ impl Selection {
 
 pub struct TerminalView<'a> {
     pub session: SessionId,
+    pub(crate) stream_generation: u64,
     pub frame: &'a Arc<Frame>,
     pub font_size: u8,
     pub font: Font,
@@ -471,6 +472,19 @@ impl canvas::Program<Message> for TerminalView<'_> {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Option<Action<Message>> {
+        if let Event::Window(window::Event::FileDropped(path)) = event
+            && cursor.is_over(bounds)
+        {
+            return Some(
+                Action::publish(Message::TerminalFileDropped(
+                    self.owner,
+                    self.session,
+                    self.stream_generation,
+                    path.clone(),
+                ))
+                .and_capture(),
+            );
+        }
         let metrics = Metrics::with_font(self.font_size, self.font);
         if let Event::Window(window::Event::RedrawRequested(now)) = event {
             let redraw = [
@@ -1076,6 +1090,7 @@ fn projected_agent_rows_have_no_raw_hit_and_only_bound_keys_are_captured() {
     };
     let mut view = TerminalView {
         session,
+        stream_generation: 1,
         frame: &frame,
         font_size: 14,
         font: Font::MONOSPACE,
@@ -1230,6 +1245,7 @@ fn terminal_copy_on_select_only_emits_completion_for_a_local_drag() {
     let frame = selection_test_frame(terminal.snapshot());
     let view = TerminalView {
         session,
+        stream_generation: 1,
         frame: &frame,
         font_size: 14,
         font: Font::MONOSPACE,
@@ -1252,6 +1268,30 @@ fn terminal_copy_on_select_only_emits_completion_for_a_local_drag() {
     let start = Point::new(INSET + 1.0, INSET + 1.0);
     let end = Point::new(INSET + 60.0, INSET + 1.0);
     let mut state = State::default();
+    let path = std::path::PathBuf::from("drop fixture");
+    let file = Event::Window(window::Event::FileDropped(path.clone()));
+    assert!(
+        view.update(&mut state, &file, bounds, mouse::Cursor::Unavailable)
+            .is_none()
+    );
+    assert!(
+        view.update(
+            &mut state,
+            &file,
+            bounds,
+            mouse::Cursor::Available(Point::new(600.0, 10.0))
+        )
+        .is_none()
+    );
+    let (message, _, status) = view
+        .update(&mut state, &file, bounds, mouse::Cursor::Available(start))
+        .unwrap()
+        .into_inner();
+    assert!(
+        matches!(message, Some(Message::TerminalFileDropped(window, pane, 1, dropped))
+        if window == owner && pane == session && dropped == path)
+    );
+    assert_eq!(status, iced::event::Status::Captured);
     let event = |state: &mut State, event, point| {
         view.update(state, &event, bounds, mouse::Cursor::Available(point))
             .and_then(|action| action.into_inner().0)

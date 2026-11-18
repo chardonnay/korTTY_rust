@@ -88,8 +88,12 @@ impl<'a> ClipMask<'a> {
         if drawing.is_within(&bounds) {
             return None;
         }
+        Some(self.viewport(bounds))
+    }
+
+    pub(crate) fn viewport(&mut self, bounds: Rectangle) -> &Mask {
         self.set(bounds);
-        Some(self.mask)
+        self.mask
     }
 
     fn set(&mut self, bounds: Rectangle) {

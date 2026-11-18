@@ -74,7 +74,19 @@ impl<'a> Page<'a> {
 
 impl Workspace {
     pub(super) fn set_journal_system_theme(&mut self, mode: theme::Mode) {
+        let was_dark = self.journal_system_dark();
         self.journal_appearance_ui.system_theme = mode;
+        self.sync_scheduler_views();
+        if was_dark != self.journal_system_dark()
+            && self
+                .window_settings
+                .snippet_diagram_appearance
+                .mode
+                .unwrap_or_default()
+                == crate::diagram_window::appearance::Mode::Auto
+        {
+            self.refresh_snippet_diagram_appearance();
+        }
     }
 
     pub(super) fn journal_appearance_page(&self, target: Target) -> Page<'_> {
@@ -99,7 +111,7 @@ impl Workspace {
         }
     }
 
-    fn journal_system_dark(&self) -> bool {
+    pub(super) fn journal_system_dark(&self) -> bool {
         self.journal_appearance_ui.system_theme != theme::Mode::Light
     }
 

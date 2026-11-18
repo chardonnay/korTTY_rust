@@ -15,8 +15,8 @@ use kortty_jobs::{
 
 use super::journal_search::{JournalColumn, JournalSearchMode};
 use super::{
-    Confirmation, JournalDetail, MAX_JOURNAL_RETENTION_DAYS, Message, Page, RemoteAction,
-    RunProposalView, SchedulerView, SchedulerWindow, Scope, SshCommand, sync,
+    Confirmation, DiagramColorMode, JournalDetail, MAX_JOURNAL_RETENTION_DAYS, Message, Page,
+    RemoteAction, RunProposalView, SchedulerView, SchedulerWindow, Scope, SshCommand, sync,
 };
 use crate::diagram_window::Format;
 
@@ -736,7 +736,10 @@ impl Default for Layout {
     fn default() -> Self {
         Self {
             jobs: split(pane_grid::Axis::Vertical, 0.27),
-            journal: split(pane_grid::Axis::Horizontal, 0.72),
+            journal: split(
+                pane_grid::Axis::Horizontal,
+                f32::from(super::DEFAULT_JOURNAL_DIVIDER) / 1000.0,
+            ),
         }
     }
 }
@@ -751,7 +754,9 @@ fn split(axis: pane_grid::Axis, ratio: f32) -> pane_grid::State<bool> {
 
 pub(super) struct DiagramView {
     pub scope: Scope,
-    direction: Direction,
+    horizontal: Option<bool>,
+    color: Option<DiagramColorMode>,
+    system_dark: bool,
     pub(super) theme: Theme,
     scale: f32,
     pub(super) preview: Option<DiagramPreview>,
@@ -769,7 +774,9 @@ impl Default for DiagramView {
     fn default() -> Self {
         Self {
             scope: Scope::All,
-            direction: Direction::TopToBottom,
+            horizontal: None,
+            color: None,
+            system_dark: true,
             theme: Theme::Dark,
             scale: 1.0,
             preview: None,
@@ -780,6 +787,37 @@ impl Default for DiagramView {
 }
 
 impl DiagramView {
+    pub(super) fn preferences(&self) -> (Option<bool>, Option<DiagramColorMode>) {
+        (self.horizontal, self.color)
+    }
+
+    pub(super) fn apply_preferences(
+        &mut self,
+        horizontal: Option<bool>,
+        color: Option<DiagramColorMode>,
+        system_dark: bool,
+    ) -> bool {
+        let direction = self.direction();
+        let theme = self.theme;
+        self.horizontal = horizontal;
+        self.color = color;
+        self.system_dark = system_dark;
+        self.theme = match color.unwrap_or(DiagramColorMode::Dark) {
+            DiagramColorMode::Auto if !system_dark => Theme::Light,
+            DiagramColorMode::Light => Theme::Light,
+            DiagramColorMode::Auto | DiagramColorMode::Dark => Theme::Dark,
+        };
+        self.direction() != direction || self.theme != theme
+    }
+
+    fn direction(&self) -> Direction {
+        if self.horizontal == Some(true) {
+            Direction::LeftToRight
+        } else {
+            Direction::TopToBottom
+        }
+    }
+
     pub fn refresh(&mut self, scheduler: &Scheduler<SshCommand>, selected: Option<&JobId>) {
         let scope = match self.scope {
             Scope::All => DiagramScope::All,
@@ -788,7 +826,7 @@ impl DiagramView {
         };
         self.preview = None;
         self.error = None;
-        match scheduler.diagram(self.direction, scope) {
+        match scheduler.diagram(self.direction(), scope) {
             Ok(diagram) if !diagram.nodes().is_empty() => {
                 let scene = Arc::new(diagram.layout());
                 self.preview = Some(DiagramPreview {
@@ -811,17 +849,16 @@ impl DiagramView {
     }
 
     pub fn toggle_direction(&mut self) {
-        self.direction = match self.direction {
-            Direction::TopToBottom => Direction::LeftToRight,
-            Direction::LeftToRight => Direction::TopToBottom,
-        };
+        self.horizontal = Some(self.horizontal != Some(true));
     }
 
     pub fn toggle_theme(&mut self) {
-        self.theme = match self.theme {
-            Theme::Light => Theme::Dark,
-            Theme::Dark => Theme::Light,
+        let color = match self.color.unwrap_or(DiagramColorMode::Dark) {
+            DiagramColorMode::Auto => DiagramColorMode::Dark,
+            DiagramColorMode::Dark => DiagramColorMode::Light,
+            DiagramColorMode::Light => DiagramColorMode::Auto,
         };
+        self.apply_preferences(self.horizontal, Some(color), self.system_dark);
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -838,15 +875,16 @@ impl DiagramView {
             );
         }
         controls = controls.extend([
-            button(match self.direction {
+            button(match self.direction() {
                 Direction::TopToBottom => "Vertical",
                 Direction::LeftToRight => "Horizontal",
             })
             .on_press(Message::DiagramDirection)
             .into(),
-            button(match self.theme {
-                Theme::Dark => "Dark",
-                Theme::Light => "Light",
+            button(match self.color.unwrap_or(DiagramColorMode::Dark) {
+                DiagramColorMode::Auto => "Auto",
+                DiagramColorMode::Dark => "Dark",
+                DiagramColorMode::Light => "Light",
             })
             .on_press(Message::DiagramTheme)
             .into(),
@@ -1987,7 +2025,50 @@ fn tab_style(active: bool) -> fn(&iced::Theme, button::Status) -> button::Style 
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn scheduler_diagram_resolves_auto_without_overwriting_the_saved_mode() {
+        let mut view = DiagramView::default();
+        assert_eq!(view.theme, Theme::Dark);
+        assert!(view.apply_preferences(Some(true), Some(DiagramColorMode::Auto), false));
+        assert_eq!(view.direction(), Direction::LeftToRight);
+        assert_eq!(view.theme, Theme::Light);
+        assert!(view.apply_preferences(Some(true), Some(DiagramColorMode::Auto), true));
+        assert_eq!(view.theme, Theme::Dark);
+        assert_eq!(
+            view.preferences(),
+            (Some(true), Some(DiagramColorMode::Auto))
+        );
+        view.toggle_direction();
+        assert_eq!(
+            view.preferences(),
+            (Some(false), Some(DiagramColorMode::Auto))
+        );
+    }
+
     use super::*;
+
+    #[test]
+    fn scheduler_journal_resize_rejects_nonfinite_and_clamps_the_saved_ratio() {
+        let profile = crate::scheduler_window::tests::Profile::temporary();
+        let mut runtime = SchedulerWindow::open(profile.file()).unwrap();
+        let mut view = runtime.new_view();
+        let pane_grid::Node::Split { id: split, .. } = *view.layout.journal.layout() else {
+            panic!("Scheduler requires a journal divider");
+        };
+        let resize = |ratio| Message::ResizeJournal(pane_grid::ResizeEvent { split, ratio });
+        let _ = runtime.update_view(&mut view, resize(0.4));
+        assert_eq!(view.journal_divider(), Some(720));
+        let _ = runtime.update_view(
+            &mut view,
+            Message::Page(crate::scheduler_window::Page::Journal),
+        );
+        let _ = runtime.update_view(&mut view, resize(0.98));
+        let _ = runtime.update_view(&mut view, resize(f32::NAN));
+        assert_eq!(view.journal_divider(), Some(900));
+        let _ = runtime.update_view(&mut view, resize(0.1));
+        assert_eq!(view.journal_divider(), Some(200));
+    }
 
     #[test]
     fn scheduler_view_uses_reference_dividers() {

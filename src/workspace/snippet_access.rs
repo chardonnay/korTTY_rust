@@ -214,7 +214,11 @@ impl Workspace {
         self.refresh_snippet_recovery();
         (
             id,
-            Task::batch([opened, self.poll_snippet_structure(id, Instant::now())]),
+            Task::batch([
+                opened,
+                self.poll_snippet_structure(id, Instant::now()),
+                self.reopen_snippet_analysis_panel(id),
+            ]),
         )
     }
 
@@ -299,29 +303,99 @@ impl Workspace {
                     Message::Snippets(id, snippet_window::Message::Assist(event))
                 });
             }
-            surface
-                .window
-                .view(
-                    self.editor_content_theme(),
-                    self.window_settings.snippet_editor_appearance(),
-                    self.window_settings.snippet_editor_caret(),
-                    surface.window.selected_id().is_some_and(|snippet| {
-                        self.snippet_editor_elsewhere(id, snippet).is_some()
-                    }),
-                    snippet_window::transfer::Context {
-                        enabled: self.snippet_transfer_enabled(id),
-                        page: surface.transfer.as_ref().map(|state| &state.view),
-                    },
-                    surface.analysis.view(
-                        self.window_settings.snippet_analysis_auto_diagram,
-                        self.window_settings.snippet_analysis_auto_modularization,
-                        &surface.window,
-                        self.ai_configuration().as_deref(),
-                        crate::local_ai::cli::allowed(&self.clipboard.policy, false),
-                    ),
-                )
-                .map(move |message| Message::Snippets(id, message))
+            iced::widget::responsive(move |size| {
+                surface
+                    .window
+                    .view(
+                        self.editor_content_theme(),
+                        snippet_window::EditorPreferences {
+                            appearance: self.window_settings.snippet_editor_appearance(),
+                            caret: self.window_settings.snippet_editor_caret(),
+                            languages: &self.window_settings.custom_snippet_code_languages,
+                            line_numbers: self
+                                .window_settings
+                                .snippet_appearance
+                                .line_numbers
+                                .unwrap_or_default(),
+                            word_wrap: self
+                                .window_settings
+                                .snippet_appearance
+                                .word_wrap
+                                .unwrap_or(true),
+                        },
+                        surface.window.selected_id().is_some_and(|snippet| {
+                            self.snippet_editor_elsewhere(id, snippet).is_some()
+                        }),
+                        snippet_window::transfer::Context {
+                            enabled: self.snippet_transfer_enabled(id),
+                            page: surface.transfer.as_ref().map(|state| &state.view),
+                        },
+                        surface.analysis.view(
+                            analysis::Presentation {
+                                side_panel: self.window_settings.snippet_analysis_panel,
+                                side_space: snippet_window::analysis_available_width(size.width),
+                                apply_progress_dock: self
+                                    .window_settings
+                                    .snippet_apply_progress_dock
+                                    .unwrap_or(true),
+                                auto_diagram: self.window_settings.snippet_analysis_auto_diagram,
+                                auto_plan: self
+                                    .window_settings
+                                    .snippet_analysis_auto_modularization,
+                                report_font: self.window_settings.snippet_analysis_report_font_size,
+                                diagram_options_expanded: self
+                                    .window_settings
+                                    .snippet_analysis_diagram_options_expanded
+                                    .unwrap_or(false),
+                                project_diagram_visible: self
+                                    .window_settings
+                                    .snippet_analysis_project_diagram_visible
+                                    .unwrap_or(true),
+                                snippet_diagram_horizontal: self
+                                    .window_settings
+                                    .snippet_diagram_horizontal
+                                    .unwrap_or(false),
+                                diagram_appearance: self.window_settings.snippet_diagram_appearance,
+                                system_dark: self.journal_system_dark(),
+                            },
+                            &surface.window,
+                            self.ai_configuration().as_deref(),
+                            crate::local_ai::cli::allowed(&self.clipboard.policy, false),
+                        ),
+                        size.width,
+                    )
+                    .map(move |message| Message::Snippets(id, message))
+            })
+            .into()
         })
+    }
+
+    pub(super) fn analysis_diagram_options(&self, id: window::Id) -> Option<bool> {
+        self.snippets
+            .values()
+            .any(|surface| {
+                surface
+                    .analysis
+                    .diagram_windows()
+                    .any(|window| window == id)
+            })
+            .then_some(
+                self.window_settings
+                    .snippet_analysis_diagram_options_expanded
+                    .unwrap_or(false),
+            )
+    }
+
+    pub(super) fn set_analysis_diagram_options(&mut self, owner: window::Id, expanded: bool) {
+        if self
+            .window_settings
+            .snippet_analysis_diagram_options_expanded
+            != Some(expanded)
+        {
+            self.window_settings
+                .snippet_analysis_diagram_options_expanded = Some(expanded);
+            self.save_window_settings(Some(owner));
+        }
     }
 
     fn open_snippet_comparison(
@@ -518,19 +592,26 @@ impl Workspace {
         ) {
             surface.assist = ai_assist::State::default();
         }
-        if matches!(
+        let editor_selected = matches!(
             message,
             snippet_window::Message::Select(_)
                 | snippet_window::Message::Open(_)
                 | snippet_window::Message::SelectTab(_)
+                | snippet_window::Message::CycleTab(_)
                 | snippet_window::Message::New
-        ) {
+        );
+        if editor_selected {
             surface.analysis.editor();
         }
         if locked {
             surface.close_after_work = false;
         }
         let snippets = &mut surface.window;
+        snippets.set_history_limit(
+            self.window_settings
+                .snippet_history_limit
+                .unwrap_or(snippets::history::DEFAULT_LIMIT),
+        );
         if matches!(message, snippet_window::Message::CopyCommand(_))
             && (!self.clipboard.policy.write_allowed || self.clipboard.policy.problem.is_some())
         {
@@ -587,6 +668,39 @@ impl Workspace {
         }
         surface.assist.revalidate_source(snippets);
         let task = match update {
+            Update::LineNumbers(enabled) | Update::WordWrap(enabled) => {
+                let mut next = self.window_settings.clone();
+                if matches!(update, Update::LineNumbers(_)) {
+                    next.snippet_appearance.line_numbers = Some(enabled);
+                } else {
+                    next.snippet_appearance.word_wrap = Some(enabled);
+                }
+                match crate::profile::window_settings_path().and_then(|path| next.save(&path)) {
+                    Ok(()) => self.window_settings = next,
+                    Err(error) => self.notice(
+                        id,
+                        format!("Could not save snippet display settings ({error})"),
+                    ),
+                }
+                Task::none()
+            }
+            Update::RememberLanguage(language) => {
+                let mut next = self.window_settings.clone();
+                let languages = &mut next.custom_snippet_code_languages;
+                if languages.len() < snippet_window::languages::MAX_CUSTOM
+                    && !languages.contains(&language)
+                {
+                    languages.push(language);
+                    match crate::profile::window_settings_path().and_then(|path| next.save(&path)) {
+                        Ok(()) => self.window_settings = next,
+                        Err(error) => self.notice(
+                            id,
+                            format!("Could not remember the code language ({error})"),
+                        ),
+                    }
+                }
+                Task::none()
+            }
             Update::EditorTool(job) => job
                 .task()
                 .map(move |message| Message::Snippets(id, snippet_window::Message::Tools(message))),
@@ -692,6 +806,11 @@ impl Workspace {
             task,
             resume,
             self.poll_snippet_structure(id, Instant::now()),
+            if editor_selected {
+                self.reopen_snippet_analysis_panel(id)
+            } else {
+                Task::none()
+            },
         ])
     }
 
@@ -769,7 +888,9 @@ impl Workspace {
     pub(super) fn snippet_structure_subscription(&self) -> Subscription<Message> {
         let pending = self.snippet_structure_save_at.is_some()
             || self.snippets.iter().any(|(&id, surface)| {
-                surface.window.structure_needs_tick() && self.snippet_structure_surface_visible(id)
+                surface.window.history_needs_tick()
+                    || (surface.window.structure_needs_tick()
+                        && self.snippet_structure_surface_visible(id))
             });
         if pending && !self.exiting && !self.scheduler_draining {
             super::scheduler_access::desktop_clock(Duration::from_millis(50))
@@ -791,12 +912,19 @@ impl Workspace {
     }
 
     fn poll_snippet_structure(&mut self, id: window::Id, now: Instant) -> Task<Message> {
-        if !self.snippet_structure_surface_visible(id) {
-            return Task::none();
-        }
+        let visible = self.snippet_structure_surface_visible(id);
         let Some(surface) = self.snippets.get_mut(&id) else {
             return Task::none();
         };
+        surface.window.set_history_limit(
+            self.window_settings
+                .snippet_history_limit
+                .unwrap_or(snippets::history::DEFAULT_LIMIT),
+        );
+        surface.window.poll_history(now);
+        if !visible {
+            return Task::none();
+        }
         surface
             .window
             .apply_structure_preferences(self.window_settings.snippet_structure);

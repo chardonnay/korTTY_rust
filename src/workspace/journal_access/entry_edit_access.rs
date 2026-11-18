@@ -397,8 +397,8 @@ impl Workspace {
             Event::Resize(ratio) => viewer.entry_editor.resize(ratio),
             Event::EndResize => {
                 let split = viewer.entry_editor.split();
-                if split != self.window_settings.journal_edit_split {
-                    self.window_settings.journal_edit_split = split;
+                if Some(split) != self.window_settings.journal_edit_split {
+                    self.window_settings.journal_edit_split = Some(split);
                     for surface in self.journals.values_mut() {
                         if let Mode::Viewer(viewer) = &mut surface.mode {
                             viewer.entry_editor.set_split(split);

@@ -245,7 +245,7 @@ impl Check {
     fn current_journal_root(&self, policy: &ClipboardPolicy) -> Option<PathBuf> {
         let settings =
             WindowSettings::read(&self.profile_root.join("window-settings.json")).ok()?;
-        if !settings.journal_ai.enabled {
+        if !settings.journal_ai.allows_summaries() {
             return None;
         }
         policy

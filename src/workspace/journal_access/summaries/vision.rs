@@ -8,7 +8,7 @@ use crate::ai_manager::{Configuration, ProfileRef};
 use crate::clipboard_policy::ClipboardPolicy;
 use crate::local_ai::Profile;
 use crate::session_journal::summary_queue::{AutomationVision, ProfileChoice, Queue, Receipt};
-use crate::session_journal::topic_ai_settings::{self, Preferences};
+use crate::session_journal::topic_ai_settings::Preferences;
 use crate::workspace::tab_titles::WindowSettings;
 
 use super::Workspace;
@@ -134,7 +134,7 @@ fn resolve(
     if !configuration.enabled()
         || !settings.enabled
         || !settings.vision_enabled
-        || !topic_ai_settings::vision_allowed(policy)
+        || !settings.allows_screenshot_analysis(policy)
         || !policy.automation_journal_allowed()
         || !policy.recording_allowed
         || !policy

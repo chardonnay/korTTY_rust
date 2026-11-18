@@ -48,6 +48,53 @@ fn sets_selected_term_in_the_shell() {
     );
 }
 
+#[test]
+fn local_process_probe_tracks_background_jobs() {
+    #[cfg(unix)]
+    let (options, command) = (
+        LaunchOptions {
+            command: Some(vec!["/bin/sh".into(), "-i".into()]),
+            ..LaunchOptions::default()
+        },
+        b"/bin/sleep 2 &\n".as_slice(),
+    );
+    #[cfg(windows)]
+    let (options, command) = (
+        LaunchOptions {
+            shell: LocalShell::CommandPrompt,
+            ..LaunchOptions::default()
+        },
+        b"start \"\" /b powershell.exe -NoProfile -Command \"Start-Sleep -Seconds 2\"\r".as_slice(),
+    );
+    let mut pty = Pty::spawn_with_options(80, 24, "xterm-256color", &options).unwrap();
+    let probe = pty.job_process_probe().unwrap();
+    let mut reader = pty.take_reader().unwrap();
+    let drain = thread::spawn(move || {
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).unwrap();
+        output
+    });
+    assert!(!probe.has_running_children());
+    let mut writer = pty.take_writer().unwrap();
+    writer.write_all(command).unwrap();
+    for expected in [true, false] {
+        let deadline = Instant::now() + TEST_TIMEOUT;
+        while probe.has_running_children() != expected {
+            if Instant::now() >= deadline {
+                pty.shutdown().unwrap();
+                panic!(
+                    "expected child activity {expected}; terminal output: {}",
+                    String::from_utf8_lossy(&drain.join().unwrap())
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    pty.shutdown().unwrap();
+    assert!(!probe.has_running_children());
+    drain.join().unwrap();
+}
+
 #[cfg(windows)]
 #[test]
 fn windows_presets_run_distinct_system_shells() {

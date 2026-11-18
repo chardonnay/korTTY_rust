@@ -212,6 +212,72 @@ fn sftp_file_comparison_rejects_binary_and_oversized_inputs() {
 }
 
 #[test]
+fn sftp_comparison_ai_font_requires_the_active_panel_and_keeps_private_changes_local() {
+    use crate::clipboard_policy::ClipboardPolicy;
+    use crate::sftp_window::compare::{View, ai};
+
+    let fixture = crate::snippets::tests::Profile::new();
+    let root = fixture.0.canonicalize().unwrap();
+    let left = root.join("left.txt");
+    let right = root.join("right.txt");
+    fs::write(&left, "left").unwrap();
+    fs::write(&right, "right").unwrap();
+    let policy = ClipboardPolicy::default();
+    super::upload::window(&context(&root), |window, _, control| {
+        let Reply::Compared(review) = execute(
+            &mut client(|_| {}),
+            Operation::CompareFiles([Location::Local(left), Location::Local(right)]),
+            control,
+            RemoteEditorPolicy::Deny,
+        )
+        .unwrap() else {
+            panic!("expected a file comparison");
+        };
+        window.comparison = Some(View::files(83, &review));
+        let event = |window: &mut SftpWindow, ticket, event| {
+            window.update_comparison_ai(
+                ticket,
+                event,
+                ai::Scope {
+                    config: None,
+                    policy: &policy,
+                    vault: None,
+                    terminal_secrets: None,
+                },
+            )
+        };
+        window.configure_comparison_ai_font(Some(17));
+        assert!(matches!(
+            event(window, 83, ai::Event::SetFontSize(18)),
+            ai::Update::None
+        ));
+        assert_eq!(window.comparison_ai_font_size, 17);
+        let _ = event(window, 83, ai::Event::Open(ai::Mode::Explain));
+        assert!(matches!(
+            event(window, 84, ai::Event::SetFontSize(18)),
+            ai::Update::None
+        ));
+        assert!(matches!(
+            event(window, 83, ai::Event::SetFontSize(33)),
+            ai::Update::None
+        ));
+        assert_eq!(window.comparison_ai_font_size, 17);
+        assert!(matches!(
+            event(window, 83, ai::Event::SetFontSize(18)),
+            ai::Update::SaveFontSize(18)
+        ));
+        window.set_incognito(true);
+        window.comparison = Some(View::files(85, &review));
+        let _ = event(window, 85, ai::Event::Open(ai::Mode::Explain));
+        assert!(matches!(
+            event(window, 85, ai::Event::SetFontSize(19)),
+            ai::Update::None
+        ));
+        assert_eq!(window.comparison_ai_font_size, 19);
+    });
+}
+
+#[test]
 fn sftp_ai_right_local_draft_refresh_requires_matching_bytes_and_connection() {
     use crate::clipboard_policy::ClipboardPolicy;
     use crate::sftp_window::compare::{View, ai};

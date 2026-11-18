@@ -1,4 +1,4 @@
-use iced::widget::{button, column, pick_list, row, scrollable, text, text_input};
+use iced::widget::{button, checkbox, column, pick_list, row, scrollable, text, text_input};
 use iced::{Element, Length};
 
 use crate::terminal_agent::design::Approval;
@@ -6,7 +6,11 @@ use crate::terminal_agent::design::Approval;
 use super::{Message, Mode, Phase, Purpose, Run, engine, palette, request_review};
 
 impl Run {
-    pub(super) fn view(&self, palette: Option<palette::Palette>) -> Element<'_, Message> {
+    pub(super) fn view(
+        &self,
+        palette: Option<palette::Palette>,
+        remaining_allowed: bool,
+    ) -> Element<'_, Message> {
         let title = match self.mode {
             Mode::Run => "AI Agent",
             Mode::Ask => "Ask Agent",
@@ -69,8 +73,12 @@ impl Run {
                 column![
                     pick_list(self.profiles.as_slice(), self.profile().cloned(), Message::Profile),
                     text_input("Describe your task", &self.goal).on_input(Message::Goal),
+                    (self.mode == Mode::Run).then(|| checkbox(self.auto_approve_root).label("Auto-approve commands, including sudo, for this run (root=true)").on_toggle(Message::AutoApproveRoot)),
+                    (self.mode == Mode::Run).then(|| checkbox(self.confirm_every_command).label("Confirm every command in this run").on_toggle(Message::ConfirmEveryCommand)),
                     text(match self.mode {
-                        Mode::Run => "Each command, including the environment probe, requires a separate approval.",
+                        Mode::Run if self.auto_approve_root => "Review the environment probe first. This run requests automatic command approval, including sudo. Policy and global confirmation settings override it; password authentication remains separate. If permitted, root=true overrides ask=true.",
+                        Mode::Run if self.confirm_every_command => "Each command, including the environment probe, requires a separate approval.",
+                        Mode::Run => "Review the environment probe first. Read-only commands may continue automatically; mutating commands require approval.",
                         Mode::Ask => "Review your question and any selected terminal text before sending them to this AI profile.",
                         Mode::Plan => "Review each planning request before sending it to this AI profile. Implement is a separate action.",
                     }).size(13),
@@ -114,6 +122,10 @@ impl Run {
 
         if let Some(command) = self.reviewed_command() {
             let password = self.reviewed_password_sudo();
+            let root_approved = self
+                .run_approval
+                .as_ref()
+                .is_some_and(super::policy::RunApproval::root_active);
             let approval: Element<'_, Message> = if let Some(review) = password {
                 if self.sudo_terminal.is_some() {
                     button("Approve with this run's sudo ticket")
@@ -126,24 +138,28 @@ impl Run {
                         .into()
                 } else {
                     row![
-                        review
-                            .credential_label()
-                            .map(|_| button("Approve with vault password").on_press_maybe(
-                                (!self.paused).then_some(Message::Password(
-                                    super::password::Message::Approve(
-                                        self.epoch,
-                                        super::password::Source::Vault,
-                                    ),
-                                ))
-                            )),
-                        button("Approve with manual password").on_press_maybe(
-                            (!self.paused).then_some(Message::Password(
-                                super::password::Message::Approve(
-                                    self.epoch,
-                                    super::password::Source::Manual,
-                                ),
-                            )),
-                        ),
+                        review.credential_label().map(|_| button(if root_approved {
+                            "Authenticate sudo with vault password"
+                        } else {
+                            "Approve with vault password"
+                        })
+                        .on_press_maybe((!self.paused).then_some(Message::Password(
+                            super::password::Message::Approve(
+                                self.epoch,
+                                super::password::Source::Vault,
+                            ),
+                        )))),
+                        button(if root_approved {
+                            "Authenticate sudo with manual password"
+                        } else {
+                            "Approve with manual password"
+                        })
+                        .on_press_maybe((!self.paused).then_some(
+                            Message::Password(super::password::Message::Approve(
+                                self.epoch,
+                                super::password::Source::Manual,
+                            ),)
+                        ),),
                     ]
                     .spacing(6)
                     .wrap()
@@ -158,13 +174,21 @@ impl Run {
                     } else {
                         "Approve command once"
                     })
-                    .on_press_maybe((!self.paused).then_some(Message::Approve(self.epoch)))
+                    .on_press_maybe((!self.paused).then_some(Message::Approve(self.epoch))),
+                    (remaining_allowed
+                        && !self.confirm_every_command
+                        && self.ordinary_command_review())
+                    .then(|| button("Approve future ordinary commands for this run")
+                        .on_press_maybe(
+                            (!self.paused).then_some(Message::ApproveRemaining(self.epoch))
+                        )),
                 ]
                 .into()
             };
             page = page.push(
                 column![
                     text(command.0).size(15),
+                    (remaining_allowed && !self.confirm_every_command && self.ordinary_command_review()).then(|| text("Run-wide approval ends on pause, failure, elevation or changed settings. Password and elevation requests require separate review.").size(13)),
                     (self.reviewing_sudo() && password.is_none())
                         .then(|| text("Passwordless sudo as root over SSH").size(13)),
                     password.map(|review| column![

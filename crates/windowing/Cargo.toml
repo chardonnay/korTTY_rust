@@ -7,6 +7,8 @@ description = "Platform pointer hit testing for native kortty windows"
 
 [dependencies]
 raw-window-handle = "0.6.2"
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
 url = "2.5"
 
 [target.'cfg(target_os = "macos")'.dependencies]

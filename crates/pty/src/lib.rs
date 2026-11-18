@@ -290,6 +290,12 @@ impl JobProcessIdentity {
 pub struct JobProcessProbe(platform::JobProcessProbe);
 
 impl JobProcessProbe {
+    /// Reports live child activity, including jobs outside the foreground group.
+    /// Unavailable process information is treated as no observed activity.
+    pub fn has_running_children(&self) -> bool {
+        self.0.has_running_children()
+    }
+
     /// Finds an inspected process, preferring the previously observed live identity.
     pub fn find<T>(
         &self,

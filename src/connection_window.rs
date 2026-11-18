@@ -226,6 +226,13 @@ struct TeamworkAuthDraft {
     conflict: bool,
 }
 
+pub(crate) struct JavaTeamworkAuth {
+    pub(crate) credential: Option<String>,
+    pub(crate) key: Option<String>,
+    pub(crate) username: Option<String>,
+    pub(crate) temporary_key: Option<bool>,
+}
+
 impl TeamworkAuthDraft {
     fn new(saved: teamwork::DefaultAuth) -> Self {
         Self {
@@ -308,6 +315,7 @@ pub struct ConnectionWindow {
     teamwork: teamwork::Catalog,
     teamwork_available: bool,
     teamwork_auth: Option<TeamworkAuthDraft>,
+    java_teamwork_auth: Option<JavaTeamworkAuth>,
     teamwork_auth_saving: bool,
     custom_badges: Arc<Catalog>,
     path: PathBuf,
@@ -392,6 +400,7 @@ impl ConnectionWindow {
             teamwork: teamwork::Catalog::default(),
             teamwork_available: false,
             teamwork_auth: None,
+            java_teamwork_auth: None,
             teamwork_auth_saving: false,
             custom_badges: Arc::new(custom_badges),
             path,
@@ -465,6 +474,16 @@ impl ConnectionWindow {
         match (&mut self.teamwork_auth, value) {
             (Some(draft), Some(saved)) => draft.refresh(saved),
             (_, value) => self.teamwork_auth = value.map(TeamworkAuthDraft::new),
+        }
+    }
+
+    pub(crate) fn set_java_teamwork_auth(&mut self, proposal: JavaTeamworkAuth) {
+        if proposal.credential.is_some()
+            || proposal.key.is_some()
+            || proposal.username.is_some()
+            || proposal.temporary_key.is_some()
+        {
+            self.java_teamwork_auth = Some(proposal);
         }
     }
 
@@ -1063,6 +1082,8 @@ impl ConnectionWindow {
                             | teamwork::DefaultAuth::TemporaryKey { username }
                             if username.len() > TEAMWORK_USERNAME_DRAFT_BYTES
                     )
+                    && !matches!(&value, teamwork::DefaultAuth::Ordered(settings)
+                        if settings.username.len() > TEAMWORK_USERNAME_DRAFT_BYTES)
                 {
                     auth.draft = value;
                     if !auth.dirty() {

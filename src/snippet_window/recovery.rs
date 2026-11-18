@@ -140,6 +140,8 @@ impl Draft {
         self.replace_content(iced::widget::text_editor::Content::with_text(
             &snapshot.content,
         ));
+        self.version_due = Some(Instant::now());
+        self.version_selected = None;
         self.structure.changed(None);
         self.content_changed = true;
         self.metadata_changed = true;

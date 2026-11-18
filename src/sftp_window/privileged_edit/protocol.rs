@@ -22,7 +22,9 @@ pub(crate) use transfer::{MAX_TRANSFER_BYTES, copy_digest, download, upload};
 pub(crate) use tree::{
     TreeUpload, inspect_tree, preview_tree_upload_merge, upload_tree, upload_tree_merge,
 };
-pub(crate) use tree_download::{download_tree, download_tree_merge, preview_tree_download};
+pub(crate) use tree_download::{
+    download_tree, download_tree_create, download_tree_merge, preview_tree_download,
+};
 
 const MAX_HEADER: usize = 8192;
 const MAX_PATH: usize = 2048;
@@ -84,12 +86,34 @@ impl fmt::Display for Failure {
 
 impl std::error::Error for Failure {}
 
+pub(crate) struct MergeClaim {
+    pub(crate) proof: [u8; 32],
+    pub(crate) receiver: Option<[u8; 32]>,
+    pub(crate) actions: usize,
+    pub(crate) bytes: u64,
+}
+
+impl MergeClaim {
+    pub(super) fn from_preview(
+        preview: &crate::sftp_window::scheduled::Preview,
+        receiver: Option<[u8; 32]>,
+    ) -> Self {
+        Self {
+            proof: preview.proof,
+            receiver,
+            actions: preview.paths.len() + preview.replacements.len(),
+            bytes: preview.bytes,
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct MergeReport {
     pub(crate) created: usize,
     pub(crate) replaced: usize,
     pub(crate) bytes: u64,
     pub(crate) recovery_prefix: Option<String>,
+    pub(crate) receiver: Option<[u8; 32]>,
     pub(crate) error: Option<Failure>,
 }
 

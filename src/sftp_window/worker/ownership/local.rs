@@ -213,7 +213,7 @@ impl<F: Fn() -> Result<()>> Walk<'_, F> {
             && (reviewed.kind != files::local_kind(&metadata)
                 || reviewed.owner != Some(metadata.uid())
                 || reviewed.group != Some(metadata.gid())
-                || reviewed.mode != Some(metadata.mode() & 0o777)
+                || reviewed.mode != Some(metadata.mode())
                 || (metadata.is_file() && reviewed.size != Some(metadata.len())))
         {
             return Err(stale());

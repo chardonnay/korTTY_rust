@@ -942,6 +942,10 @@ fn parse_virtual_terminal(fields: &Fields<'_, '_>) -> ParseResult<TerminalOption
     })
 }
 
+pub(crate) fn read_swarm_journal(node: Node<'_, '_>) -> Option<Options> {
+    parse_session_journal(node).ok()
+}
+
 fn parse_session_journal(node: Node<'_, '_>) -> ParseResult<Options> {
     let fields = Fields::new(node)?;
     let days = fields

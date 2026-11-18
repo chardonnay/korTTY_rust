@@ -1285,6 +1285,203 @@ fn recurring_sftp_editor_reopens_and_authorizes_only_its_calendar() {
 }
 
 #[test]
+fn recurring_protected_folder_editor_persists_modes_and_admits_chain_and_calendar() {
+    use serde_json::json;
+    for direction in ["upload", "download"] {
+        for sudo in ["passwordless", "vault"] {
+            for (calendar, replace_changed) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
+                let profile = Profile::temporary();
+                let root = profile.0.canonicalize().unwrap();
+                let path = root.join("scheduler.json");
+                let id = JobId::new("protected-recurring-folder").unwrap();
+                let predecessor = JobId::new("prepare-protected-copy").unwrap();
+                let connection = json!({"id":1,"target":{"host":"server.example","port":22,"username":"operator"}});
+                let prepare: SshCommand =
+                    serde_json::from_value(json!({"connection":connection,"command":"true"}))
+                        .unwrap();
+                let action: SshCommand = serde_json::from_value(json!({
+                    "connection":connection,"sudo":sudo,
+                    "remote":{"kind":format!("privileged_tree_{direction}"),"direction":direction,
+                    "local":root.join("receiver"),"remote":"/protected/receiver","replace_changed":replace_changed,"standing":sync::standing::Settings::default()}
+                })).unwrap();
+                let mut job = Job::new(id.clone(), "Recurring protected folder", action)
+                    .unwrap()
+                    .with_dependencies(DependencyMode::Chain, vec![predecessor.clone()], None);
+                if calendar {
+                    job = job.with_schedule(
+                        kortty_jobs::JobSchedule::default()
+                            .with_fixed_times(["12:00".parse().unwrap()]),
+                    );
+                }
+                let graph = JobGraph::new(vec![
+                    Job::new(predecessor.clone(), "Prepare", prepare).unwrap(),
+                    job,
+                ])
+                .unwrap();
+                SchedulerStore::open(&path)
+                    .unwrap()
+                    .commit_with_actions(&graph, &[], &[])
+                    .unwrap();
+                let mut app = TestWindow::open(path.clone()).unwrap();
+                app.runtime.zone = TimeZone::UTC;
+                app.runtime.set_execution_allowed(true);
+                app.update(Message::Select(id.clone()));
+                save_reviewed_folder_copy(&mut app, Some([6; 32]));
+                drop(app);
+                let mut app = TestWindow::open(path).unwrap();
+                app.runtime.zone = TimeZone::UTC;
+                app.runtime.set_execution_allowed(true);
+                app.runtime
+                    .scheduler
+                    .initialize_schedules(TimeZone::UTC, SystemTime::now())
+                    .unwrap();
+                app.update(Message::Select(id.clone()));
+                assert!(app.update(Message::Run(false)).is_empty());
+                app.update(Message::Select(predecessor));
+                let prepare = app.update(Message::Run(false)).pop().unwrap();
+                let completed = |id| {
+                    Message::Finished(Completion {
+                        id,
+                        outcome: RunOutcome::Success,
+                        detail: None,
+                        output: None,
+                        recording: None,
+                        swarm_report: None,
+                    })
+                };
+                let request = app.update(completed(prepare.id)).pop().unwrap();
+                assert_eq!(request.job, id);
+                assert_eq!(request.trigger, RunTrigger::Dependency);
+                let context = app.runtime.sync_run_context(&request).unwrap();
+                let (approval, admission) = context.standing_approval().unwrap();
+                let receipt = context
+                    .store
+                    .load_tree(
+                        &id,
+                        Some(&approval.approval),
+                        context.scope,
+                        SystemTime::now(),
+                        Some(admission),
+                    )
+                    .unwrap();
+                assert_eq!(receipt.receiver, [6; 32]);
+                assert_eq!(receipt.create_root, !replace_changed);
+                let original_job = app.runtime.scheduler.graph().job(&id).unwrap();
+                let mut changed_action = original_job.action().clone();
+                changed_action.sudo = if changed_action.sudo == SudoMode::Vault {
+                    SudoMode::Passwordless
+                } else {
+                    SudoMode::Vault
+                };
+                let mut changed_job = Job::new(id.clone(), "Different elevation", changed_action)
+                    .unwrap()
+                    .with_dependencies(
+                        original_job.mode(),
+                        original_job.dependencies().to_vec(),
+                        original_job.max_age_minutes(),
+                    );
+                if let Some(schedule) = original_job.schedule() {
+                    changed_job = changed_job.with_schedule(schedule.clone());
+                }
+                let changed_copy = match changed_job.action().remote.as_ref().unwrap() {
+                    RemoteAction::PrivilegedTreeUpload(copy)
+                    | RemoteAction::PrivilegedTreeDownload(copy) => copy,
+                    _ => unreachable!(),
+                };
+                let changed_scope = changed_copy
+                    .standing_scope(
+                        &changed_job,
+                        changed_job.action().connection.as_ref().unwrap(),
+                        &TimeZone::UTC,
+                    )
+                    .unwrap();
+                assert_ne!(changed_scope, context.scope);
+                assert!(
+                    context
+                        .store
+                        .load_tree(
+                            &id,
+                            Some(&approval.approval),
+                            changed_scope,
+                            SystemTime::now(),
+                            Some(admission)
+                        )
+                        .is_err()
+                );
+                let forged = RunRequest {
+                    id: request.id,
+                    job: request.job.clone(),
+                    action: Arc::clone(&request.action),
+                    trigger: RunTrigger::Scheduled,
+                    started_at: request.started_at,
+                    cancellation: request.cancellation.clone(),
+                };
+                assert!(app.runtime.sync_run_context(&forged).is_none());
+
+                assert!(
+                    context
+                        .store
+                        .load_standing(
+                            &id,
+                            Some(&approval.approval),
+                            context.scope,
+                            SystemTime::now()
+                        )
+                        .is_err()
+                );
+                context
+                    .store
+                    .arm_tree(&id, &receipt, admission, (1, 4), &|| false)
+                    .unwrap();
+                context
+                    .store
+                    .finish_tree(
+                        &id,
+                        &receipt,
+                        admission.firing(),
+                        if replace_changed { [6; 32] } else { [7; 32] },
+                    )
+                    .unwrap();
+                app.update(completed(request.id));
+                let advanced = context
+                    .store
+                    .load_tree(
+                        &id,
+                        Some(&approval.approval),
+                        context.scope,
+                        SystemTime::now(),
+                        None,
+                    )
+                    .unwrap();
+                assert!(!advanced.create_root);
+                assert_eq!(
+                    advanced.receiver,
+                    if replace_changed { [6; 32] } else { [7; 32] }
+                );
+                if calendar {
+                    let due = app.runtime.scheduler.scheduled_at(&id).unwrap();
+                    let next = app
+                        .runtime
+                        .update_runtime_at(Message::Tick, due)
+                        .pop()
+                        .unwrap();
+                    assert_eq!(next.trigger, RunTrigger::Scheduled);
+                    assert!(
+                        app.runtime
+                            .sync_run_context(&next)
+                            .unwrap()
+                            .standing_approval()
+                            .is_some()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn recurring_sftp_editor_admits_exact_chain_rounds_and_optional_calendar() {
     use serde_json::json;
 

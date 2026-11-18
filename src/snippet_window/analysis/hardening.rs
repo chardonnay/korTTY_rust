@@ -82,6 +82,14 @@ impl Draft {
         &self.preferences.classic
     }
 
+    pub(crate) fn classic_open(&self) -> bool {
+        self.classic_open
+    }
+
+    pub(crate) fn set_classic_open(&mut self, open: bool) {
+        self.classic_open = open;
+    }
+
     pub(crate) fn update(&mut self, edit: Edit, input_supported: bool) {
         match edit {
             Edit::ExpandClassic => self.classic_open = !self.classic_open,

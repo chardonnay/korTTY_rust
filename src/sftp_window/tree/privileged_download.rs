@@ -1,3 +1,4 @@
+use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
@@ -53,6 +54,16 @@ impl Destination {
         serde_json::to_vec(&self.identity).map_err(io::Error::other)
     }
 
+    pub(in crate::sftp_window) fn vacancy_receipt(&self) -> io::Result<[u8; 32]> {
+        self.verify()?;
+        require_absent(&self.path)?;
+        let parent = receiver_for_directory(self.path.parent().ok_or_else(changed)?, &self.parent)?
+            .ok_or_else(changed)?;
+        let mut hash = Sha256::new_with_prefix(b"kortty-protected-local-tree-vacancy-v1\0");
+        hash.update(serde_json::to_vec(&(&self.path, parent)).map_err(io::Error::other)?);
+        Ok(hash.finalize().into())
+    }
+
     fn verify(&self) -> io::Result<()> {
         let current = checked_parent(self.path.parent().ok_or_else(changed)?)?;
         self.identity.require_directory(&current)
@@ -89,6 +100,31 @@ pub(crate) enum PublishError {
 }
 
 impl Stage {
+    pub(in crate::sftp_window) fn publish_with_receiver(
+        self,
+        vacancy: [u8; 32],
+        mut permitted: impl FnMut() -> bool,
+    ) -> Result<[u8; 32], PublishError> {
+        let path = self.destination.path.clone();
+        let receiver =
+            receiver_for_directory(&path, self.root().map_err(|_| PublishError::Refused)?)
+                .map_err(|_| PublishError::Refused)?
+                .ok_or(PublishError::Refused)?;
+        self.publish(|| {
+            permitted()
+                && Destination::inspect(&path)
+                    .and_then(|destination| destination.vacancy_receipt())
+                    .is_ok_and(|current| current == vacancy)
+        })?;
+        let published = Directory::open_path(&path).map_err(|_| PublishError::Uncertain)?;
+        if receiver_for_directory(&path, &published).map_err(|_| PublishError::Uncertain)?
+            != Some(receiver)
+        {
+            return Err(PublishError::Uncertain);
+        }
+        Ok(receiver)
+    }
+
     pub(crate) fn root(&self) -> io::Result<&Directory> {
         self.root.as_ref().ok_or_else(changed)
     }
@@ -231,6 +267,25 @@ impl Stage {
     }
 }
 
+pub(in crate::sftp_window) fn receiver_for_directory(
+    path: &Path,
+    directory: &Directory,
+) -> io::Result<Option<[u8; 32]>> {
+    let stamp = local::reviewed_tree_parent_stamp(directory)?;
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+    let birth = local::reviewed_tree_parent_birth(directory, &stamp);
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    let birth: Option<(i64, u32)> = None;
+    let Some(birth) = birth else {
+        return Ok(None);
+    };
+    let bytes = serde_json::to_vec(&(path, &stamp, birth)).map_err(io::Error::other)?;
+    let mut hash = Sha256::new_with_prefix(b"kortty-protected-local-tree-receiver-v1\0");
+    hash.update((bytes.len() as u64).to_be_bytes());
+    hash.update(bytes);
+    Ok(Some(hash.finalize().into()))
+}
+
 impl Drop for Stage {
     fn drop(&mut self) {
         self.folders.clear();
@@ -303,6 +358,69 @@ mod tests {
     use std::io::Write as _;
 
     use super::*;
+
+    fn create_private_directory(parent: &Path, name: &str) {
+        use std::ffi::OsStr;
+
+        Directory::open_path(parent)
+            .unwrap()
+            .create_child(OsStr::new(name))
+            .unwrap();
+    }
+
+    #[test]
+    fn privileged_tree_creation_receipt_binds_created_receiver_and_rejects_late_destination() {
+        for populated in [false, true] {
+            let profile = crate::snippets::tests::Profile::new();
+            let root = profile.0.canonicalize().unwrap();
+            create_private_directory(&root, "destination");
+            let parent = root.join("destination");
+            let target = parent.join("receiver");
+            let destination = Destination::inspect(&target).unwrap();
+            let vacancy = destination.vacancy_receipt().unwrap();
+            let mut stage = destination.stage().unwrap();
+            if populated {
+                stage.directory(&["empty".into()]).unwrap();
+                let mut file = stage.file(&["file".into()]).unwrap();
+                file.write_all(b"source payload").unwrap();
+                file.sync_all().unwrap();
+            }
+            let receiver = stage.publish_with_receiver(vacancy, || true).unwrap();
+            assert_ne!(receiver, vacancy);
+            assert_eq!(
+                receiver_for_directory(&target, &Directory::open_path(&target).unwrap()).unwrap(),
+                Some(receiver)
+            );
+            assert!(Destination::inspect(&target).is_err());
+            fs::rename(&target, parent.join("original")).unwrap();
+            create_private_directory(&parent, "receiver");
+            assert_ne!(
+                receiver_for_directory(&target, &Directory::open_path(&target).unwrap()).unwrap(),
+                Some(receiver)
+            );
+        }
+        for late in [false, true] {
+            let profile = crate::snippets::tests::Profile::new();
+            let root = profile.0.canonicalize().unwrap();
+            create_private_directory(&root, "destination");
+            let parent = root.join("destination");
+            let target = parent.join("receiver");
+            let destination = Destination::inspect(&target).unwrap();
+            let vacancy = destination.vacancy_receipt().unwrap();
+            let stage = destination.stage().unwrap();
+            if late {
+                fs::create_dir(&target).unwrap();
+                fs::write(target.join("foreign"), b"keep").unwrap();
+            }
+            assert!(stage.publish_with_receiver(vacancy, || late).is_err());
+            if late {
+                assert_eq!(fs::read(target.join("foreign")).unwrap(), b"keep");
+                assert_eq!(fs::read_dir(&parent).unwrap().count(), 1);
+            } else {
+                assert_eq!(fs::read_dir(&parent).unwrap().count(), 0);
+            }
+        }
+    }
 
     #[test]
     fn privileged_tree_download_stage_refuses_late_target_and_cancellation() {

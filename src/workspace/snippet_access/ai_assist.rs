@@ -15,7 +15,8 @@ use crate::snippet_analysis::request::MAX_REMOTE_REQUEST_BYTES;
 #[cfg(test)]
 use crate::snippet_window::SnippetWindow;
 use crate::snippet_window::ai_assist::{
-    Action, Change, Editor, Message as ActionMessage, Outcome, Recipe, Request, Snapshot,
+    Action, Change, Editor, MAX_TARGET_LANGUAGE_BYTES, Message as ActionMessage, Outcome, Recipe,
+    Request, Snapshot, translation_language,
 };
 use crate::snippet_window::{self, compare};
 use crate::terminal_clipboard::TerminalClipboard;
@@ -119,6 +120,15 @@ struct Proposed {
     outbound: Option<Outbound>,
     outcome: Outcome,
     diff: Option<Box<compare::View>>,
+    alternative: Option<usize>,
+}
+
+impl Proposed {
+    fn selected_outcome(&self) -> &Outcome {
+        self.alternative
+            .and_then(|index| self.outcome.alternatives.get(index))
+            .map_or(&self.outcome, |alternative| &alternative.outcome)
+    }
 }
 
 #[derive(Clone)]
@@ -127,6 +137,8 @@ struct Context<'a> {
     vault: Option<&'a VaultWindow>,
     vault_revision: Weak<()>,
     file: Option<&'a FileScope>,
+    snippet_translation_language: Option<&'a str>,
+    snippet_alternative_count: Option<u8>,
 }
 
 #[derive(Clone)]
@@ -397,10 +409,34 @@ impl State {
                         diff.review_body().map(ActionMessage::Diff),
                         row![
                             button("Apply reviewed change").on_press(ActionMessage::Apply),
+                            result.alternative.map(|_| {
+                                button("Other alternatives")
+                                    .on_press(ActionMessage::ChooseAlternative(None))
+                            }),
                             button("Discard proposal").on_press(ActionMessage::Back),
                             close()
                         ]
                         .spacing(8)
+                    ]
+                    .spacing(8)
+                    .into()
+                } else if !result.outcome.alternatives.is_empty() {
+                    let alternatives = result.outcome.alternatives.iter().enumerate().fold(
+                        column![text("Alternative solutions").size(18)].spacing(10),
+                        |list, (index, alternative)| {
+                            list.push(
+                                column![
+                                    button(text(&alternative.title))
+                                        .on_press(ActionMessage::ChooseAlternative(Some(index))),
+                                    text(&alternative.summary),
+                                ]
+                                .spacing(3),
+                            )
+                        },
+                    );
+                    column![
+                        scrollable(alternatives).height(Length::Fill),
+                        row![button("Back").on_press(ActionMessage::Back), close()].spacing(8)
                     ]
                     .spacing(8)
                     .into()
@@ -474,6 +510,8 @@ impl Workspace {
             vault: self.vault.as_ref(),
             vault_revision: self.vault_change_revision(),
             file: None,
+            snippet_translation_language: None,
+            snippet_alternative_count: None,
         };
         for surface in self.snippets.values_mut() {
             if surface
@@ -550,11 +588,20 @@ impl Workspace {
             vault: self.vault.as_ref(),
             vault_revision: self.vault_change_revision(),
             file: None,
+            snippet_translation_language: self
+                .window_settings
+                .snippet_translation_target_language
+                .as_deref(),
+            snippet_alternative_count: self.window_settings.snippet_alternative_count,
         };
         let Some(surface) = self.snippets.get_mut(&id) else {
             return Task::none();
         };
-        surface.assist.update(
+        let remembers_language = matches!(action, ActionMessage::Review)
+            && surface.assist.0.as_ref().is_some_and(|panel| {
+                matches!(panel.phase, Phase::Configure) && panel.recipe.action == Action::Translate
+            });
+        let task = surface.assist.update(
             &mut surface.window,
             action,
             config,
@@ -565,7 +612,21 @@ impl Workspace {
                 file: false,
             },
             &self.clipboard,
-        )
+        );
+        if remembers_language
+            && let Some(panel) = surface.assist.0.as_ref()
+            && matches!(panel.phase, Phase::Review(_))
+            && let Some(language) = translation_language(&panel.recipe.target_language)
+            && self
+                .window_settings
+                .snippet_translation_target_language
+                .as_deref()
+                != Some(language)
+        {
+            self.window_settings.snippet_translation_target_language = Some(language.to_owned());
+            self.save_window_settings(Some(id));
+        }
+        task
     }
 
     pub(in crate::workspace) fn ssh_file_ai_origin(
@@ -674,6 +735,8 @@ impl Workspace {
             vault: self.vault.as_ref(),
             vault_revision,
             file: Some(&scope),
+            snippet_translation_language: None,
+            snippet_alternative_count: None,
         };
         let mut state = std::mem::take(&mut editor.ai_assist);
         let before = editor.file_ai_revision();
@@ -761,6 +824,12 @@ impl State {
                     } else {
                         Action::Describe
                     },
+                    target_language: context
+                        .snippet_translation_language
+                        .and_then(translation_language)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    alternative_count: context.snippet_alternative_count,
                     ..Recipe::default()
                 },
                 profiles: Vec::new(),
@@ -804,7 +873,8 @@ impl State {
                 Ok(())
             }
             ActionMessage::TargetLanguage(value)
-                if matches!(panel.phase, Phase::Configure) && value.len() <= 80 =>
+                if matches!(panel.phase, Phase::Configure)
+                    && value.len() <= MAX_TARGET_LANGUAGE_BYTES =>
             {
                 panel.recipe.target_language = value;
                 Ok(())
@@ -897,7 +967,14 @@ impl State {
                     result.and_then(|outcome| {
                         if let Some(outbound) = &outbound {
                             outbound.require_current(&approved, context)?;
-                            if context.vault.is_some_and(|vault| vault.summary_contains_secret(outcome.proposed_text())) {
+                            if context.vault.is_some_and(|vault| {
+                                vault.summary_contains_secret(outcome.proposed_text())
+                                    || outcome.alternatives.iter().any(|alternative| {
+                                        vault.summary_contains_secret(&alternative.title)
+                                            || vault.summary_contains_secret(&alternative.summary)
+                                            || vault.summary_contains_secret(alternative.outcome.proposed_text())
+                                    })
+                            }) {
                                 return Err("The AI result contains a vault credential. Review a new request.".into());
                             }
                         }
@@ -913,10 +990,25 @@ impl State {
                             outbound,
                             outcome,
                             diff,
+                            alternative: None,
                         }));
                         Ok(())
                     })
                 }
+            }
+            ActionMessage::ChooseAlternative(choice) => {
+                if let Phase::Result(proposed) = &mut panel.phase
+                    && !proposed.outcome.alternatives.is_empty()
+                    && choice.is_none_or(|index| index < proposed.outcome.alternatives.len())
+                {
+                    proposed.alternative = choice;
+                    proposed.diff = proposed
+                        .selected_outcome()
+                        .change
+                        .as_ref()
+                        .map(|(_, diff)| diff_view(diff.clone()));
+                }
+                Ok(())
             }
             ActionMessage::Apply => {
                 if let Phase::Result(proposed) = &panel.phase
@@ -940,7 +1032,7 @@ impl State {
                         .accept_ai_change(
                             panel.source.clone(),
                             panel.recipe.clone(),
-                            &proposed.outcome,
+                            proposed.selected_outcome(),
                         )
                         .map(|()| {
                             if let Some(change) = editor.last_ai_change() {
@@ -1668,7 +1760,8 @@ mod tests {
         let mut editor = SnippetWindow::open(scratch.path()).unwrap();
         let _ = editor.update(snippet_window::Message::Open(snippet));
         let path = root.join("test-vault.bin");
-        let mut vault = Vault::create(&path, b"snippet-assist-fixture").unwrap();
+        let mut vault =
+            Vault::create(&path, &crate::vault_window::test_vault_password()[..]).unwrap();
         vault
             .save(
                 CredentialInput {
@@ -1806,6 +1899,8 @@ mod tests {
             vault: None,
             vault_revision: Weak::new(),
             file: None,
+            snippet_translation_language: None,
+            snippet_alternative_count: None,
         };
         assert!(matches!(
             panel.masked_request(&config, &transport, limit, &context),
@@ -1858,7 +1953,8 @@ mod tests {
             .unwrap();
         let saved = Configuration::load_fixture_from(&root).unwrap();
         let path = root.join("vault.bin");
-        let mut vault = Vault::create(&path, b"editor-cli-fixture").unwrap();
+        let mut vault =
+            Vault::create(&path, &crate::vault_window::test_vault_password()[..]).unwrap();
         vault
             .save(
                 CredentialInput {

@@ -1,13 +1,13 @@
 //! Edits the profile-local design catalog and previews an isolated sample run.
 
-use iced::widget::{button, column, container, pick_list, row, text, text_input};
+use iced::widget::{button, column, container, pick_list, row, slider, text, text_input};
 use iced::{Element, Length, Size, window};
 
 use crate::terminal_agent::design::{
     Approval, Arrangement, Catalog, History, Layout, Preset, Status,
 };
 use crate::workspace::terminal_agent::design::{
-    compose, history_slot, status_indicator, status_slot,
+    DockPlacement, DockPreferences, compose, status_indicator, status_slot,
 };
 
 use super::{Desktop, Message};
@@ -25,6 +25,8 @@ pub(crate) enum Edit {
     Remove(String),
     ConfirmRemove(String, bool),
     Module(String, Module),
+    DockPlacement(DockPlacement),
+    DockWidth(u16),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -143,6 +145,7 @@ impl Editor {
         &'a self,
         catalog: &'a Catalog,
         preset: Preset,
+        dock: DockPreferences,
         id: window::Id,
         target: Option<&iced::widget::Id>,
     ) -> Element<'a, Desktop> {
@@ -159,6 +162,12 @@ impl Editor {
             text("Default AI agent design"),
             pick_list(choices.clone(), default, move |choice| msg(Edit::Default(choice.id))),
             text("Applies to newly opened agent activity. Saved connections can choose their own design.").size(14),
+            text("Agent panel placement"),
+            pick_list(DockPlacement::ALL, Some(dock.placement.unwrap_or_default()), move |placement| {
+                msg(Edit::DockPlacement(placement))
+            }),
+            text(format!("Agent panel side width ({} px)", dock.width())),
+            slider(DockPreferences::WIDTH_RANGE, dock.width(), move |width| msg(Edit::DockWidth(width))),
             text("Design to edit"),
             pick_list(choices, choice.clone(), move |choice| msg(Edit::Select(choice.id))),
             row![
@@ -231,19 +240,20 @@ impl Editor {
         }
         editor
             .push(text(self.notice).size(14))
-            .push(preview::view(&self.demo, layout, id))
+            .push(preview::view(&self.demo, layout, dock, id))
             .into()
     }
 }
 
 fn preview_static(
     layout: Layout,
+    dock: DockPreferences,
     parts: Element<'static, Desktop>,
     terminal: Element<'static, Desktop>,
     phase: &'static str,
     stage: usize,
 ) -> Element<'static, Desktop> {
-    let history_position = history_slot(layout.history);
+    let history_position = dock.history_slot(layout);
     let (history, activity_window, floating) =
         if layout.arrangement == Arrangement::PictureInPicture {
             (None, None, Some(parts))
@@ -270,6 +280,9 @@ fn preview_static(
     } else {
         layout.status
     };
+    let side_width = dock.side_width(260.0);
+    let rail = status == Status::Minimap
+        && history_position != Some(crate::workspace::terminal_agent::design::Slot::Right);
     let terminal = compose(
         terminal,
         history,
@@ -277,7 +290,7 @@ fn preview_static(
         history_position,
         status_slot(status),
         Size::new(650.0, 320.0),
-        260.0,
+        (side_width, if rail { 84.0 } else { side_width }),
     );
     let terminal = if let Some(floating) = floating {
         crate::workspace::terminal_agent::design::pip::preview(terminal, floating)

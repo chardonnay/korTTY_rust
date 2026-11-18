@@ -12,7 +12,7 @@ use iced::futures::future::{Either, select};
 use kortty_control::{
     ErrorCode as ControlError, Fault as ControlFault, ReadMode, Reply, Screen as ControlScreen,
 };
-use kortty_pty::{LaunchOptions, Pty};
+use kortty_pty::{JobProcessProbe, LaunchOptions, Pty};
 use kortty_recording::CaptureOptions;
 use kortty_serial::SerialPort;
 use kortty_ssh::WindowSize;
@@ -264,6 +264,7 @@ struct Shared {
     program_notifications: Mutex<std::collections::VecDeque<kortty_terminal::ProgramNotification>>,
     output_activity: Arc<activity::Clock>,
     local_shell_pid: AtomicU32,
+    local_process_probe: Mutex<Option<JobProcessProbe>>,
     flatpak_host_shell: AtomicBool,
     sandbox_backend: Mutex<Option<&'static str>>,
     serial: Option<Arc<SerialConnection>>,
@@ -987,6 +988,7 @@ impl Session {
             program_notifications: Mutex::default(),
             output_activity: Arc::default(),
             local_shell_pid: AtomicU32::new(0),
+            local_process_probe: Mutex::default(),
             flatpak_host_shell: AtomicBool::new(false),
             sandbox_backend: Mutex::default(),
             serial,
@@ -1158,6 +1160,16 @@ impl Session {
         };
         let pid = self.shared.local_shell_pid.load(Ordering::Acquire);
         (pid != 0 && !events.is_closed() && self.frame().status == Status::Running).then_some(pid)
+    }
+
+    pub(crate) fn local_shell_has_running_children(&self) -> bool {
+        let probe = self
+            .shared
+            .local_process_probe
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        probe.is_some_and(|probe| probe.has_running_children())
     }
 
     pub(crate) fn flatpak_host_shell(&self) -> bool {
@@ -2295,6 +2307,10 @@ fn run_session(
         let backend = match &transport {
             StreamTransport::Pty(pty) => {
                 let host = pty.uses_flatpak_host();
+                *shared
+                    .local_process_probe
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = pty.job_process_probe();
                 shared.flatpak_host_shell.store(host, Ordering::Release);
                 shared
                     .local_shell_pid
@@ -2335,6 +2351,11 @@ fn run_session(
 
     // Unpublish before any wait or shutdown can reap the child and release its PID.
     drop(published_pid);
+    shared
+        .local_process_probe
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
     inputs.close();
     shared.journal_available.store(false, Ordering::Release);
     shared.journal_input.store(false, Ordering::Release);
@@ -4556,6 +4577,7 @@ mod search_tests {
             program_notifications: Mutex::default(),
             output_activity: Arc::default(),
             local_shell_pid: AtomicU32::new(0),
+            local_process_probe: Mutex::default(),
             flatpak_host_shell: AtomicBool::new(false),
             sandbox_backend: Mutex::default(),
             serial: None,

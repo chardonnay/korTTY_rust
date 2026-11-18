@@ -1,55 +1,49 @@
 # Remaining Java-to-Rust porting plan
 
-Source audit and implementation checkpoint updated on 2026-11-17. This is the
-current backlog for the scope in [HANDOFF.md](HANDOFF.md). Implementation and
-execution history stays in [PORTING-PARITY.md](PORTING-PARITY.md). Its baseline tables describe the
-original handoff and must not be read as the current missing-feature list.
-Detailed verification files linked under `target/verification/` are local
-build records. The verification summaries in this plan are available in Git.
+Source audit updated on 2026-11-18. This plan tracks the scope agreed in
+[HANDOFF.md](HANDOFF.md). The [parity record](PORTING-PARITY.md) identifies the
+source and environment for earlier checks. Detailed logs under
+`target/verification/` are local build records.
 
 ## Current result and actionable backlog
 
-**Java v2.26.0 parity is not complete.** The current working tree implements
-the release's Agent-to-Chat continuation, Agent profile role, AI Manager search,
-journal chat transcripts/exports, command summaries and background progress,
-snippet structure panel, and Lua editor tools. These implementations do not
-close the remaining inherited Java workflows or the native release gates.
-
-The 2026-11-17 reconciliation checks the pinned Java tag, its documentation
-manifest, current Rust entry points and retained verification records. It
-covers the working tree based on `main` at `8fdb5d41a100611ef1f8ffa9e7f5c37eb049e5da`,
-including the uncommitted porting changes after PR #4.
-Native desktop, real provider and full terminal acceptance retain their own
-evidence requirements.
+**Java v2.26.0 parity remains partial.** The comparison uses Java tag
+`v2.26.0` (`b235d91f2035`) and the Rust working tree on merged PR #7
+(`e3c1760a576f0f358d529c5076537f60d32e7f22`), including subsequent local
+changes. Agent-to-Chat continuation, the Agent profile role, AI Manager
+search, Journal chat exports, command summaries, the snippet structure
+panel and Lua editor tools are present. The open implementation tasks
+below also cover workflows inherited from earlier Java releases.
 
 ### Reconciliation against the current working tree
 
-The implementation goal is paused. The reconciliation compared source hashes
-with the latest natively exercised manifest, `af1c17601ffa`. At that point,
-apart from this plan and the parity history, only `src/local_ai/streaming.rs`
-and `src/session_journal/question.rs` differed. They contain an unfinished
-HTTPS credential-binding change. Subsequent pull-request preparation applied
-formatting and small Clippy fixes in knowledge indexing, connection-import
-preview storage and the Java-pattern code/fixtures. Windows ARM64 workspace
-Clippy now passes, including test-target compilation. Runtime acceptance of
-the partial credential change and the earlier package's scope are unchanged.
+| Implemented in the working tree | Evidence and remaining acceptance |
+| --- | --- |
+| Saved local shell profiles, local and SSH `agent` recognition, connection overrides and the three OS sandbox paths | Verify remaining shells, packaged isolation and desktop behavior on the outstanding native targets (D1/D2/A1/T5). |
+| Journal HTTPS credential binding for questions, summary preflight, streaming and retries | F1 has focused native regressions on Windows ARM64, Apple Silicon and Fedora ARM64. Exercise configured providers and the desktop review under V5. |
+| Calendar and Chain transfers to protected files and folders, including creation followed by a merge into the same confirmed folder | State and editor fixtures cover both directions and both sudo modes. Recurring protected folders still need an end-to-end run against the deployed helper. Earlier real sudo/rsync checks cover their recorded routes. [Folder verification](PORTING-PARITY.md#recurring-protected-folder-creation-and-confirmed-receiver-progression) |
+| Reviewed recursive SFTP deletion, terminal text/file drop routing, remembered snippet translation language and selectable AI alternatives with diff and undo | Direct and jump OpenSSH deletion passed on Apple Silicon and Fedora. The GTK text gesture reached the inactive split on X11 at 100% and 200% and on Xwayland at 100%. Remaining desktop sources and live provider interaction are in V1–V5. [Desktop drop evidence](PORTING-PARITY.md#x11-text-drops-in-terminal-panes) · [Snippet evidence](PORTING-PARITY.md#selectable-snippet-alternatives) |
+| Local knowledge snapshots up to five million passages and 64 GiB, recording interchange, diagram export and native package staging | Measure real corpora, check configured Qdrant recovery, and complete native playback, exports and release verification. Merge CI passed for Windows, macOS and Ubuntu. Later local changes have targeted records. [Merge CI](https://github.com/chardonnay/korTTY_rust/actions/runs/44106367721) |
 
-| Area | Implemented and evidenced scope | What remains |
-| --- | --- | --- |
-| Shell, connections and local isolation, D1/D2/A1/T5 | Saved shell profiles, integration opt-in, local/SSH `agent` recognition, connection overrides and Linux/macOS/Windows sandbox launch paths exist. | Remaining shell, native desktop and architecture acceptance; broader Windows sandbox shell compatibility. |
-| File transfer and Scheduler, T3/Q1/Q2 | Ordinary recurring SFTP supports Calendar and Chain. Protected single-file replacement supports both directions, both sudo modes and recurring approval. Protected folder merges into existing destinations support one-use approval. rsync creation, replacement, mixed sources, missing local parents and receiver progression have native fixtures. | Recurring protected folder synchronization; reference-required destinations outside the supported ownership/metadata contract; configured native Scheduler review, recovery and deployment acceptance. |
-| Java migration, M1/D3 | Additive data restore, disabled Scheduler drafts including sudo staging, toolbar/global preference subsets, Journal markers, highlight sets, expanded Java regex matching, AI roles/model/knowledge hints, analyses and scoped Memory restore exist. | Remaining global-field mappings and omissions, ambiguous legacy identities, residual regex semantics, native model reattachment after portable restore, and desktop/cross-host adoption acceptance. See the [field audit](#remaining-field-and-identity-audit). |
-| AI workflows, B1/S2/S3/J2/J3 | Reviewed exact HTTP(S) routes and server-selected models cover Chat, standalone Agent Ask/Run, interactive code assistance, full analysis, split/apply, and eligible Journal question/summary routes. Java Journal-role adoption and loopback HTTPS questions/summaries have targeted native evidence. | Finish and verify the partial credential-binding change first. Decide compatibility for the named remaining exact-model consumers; verify real configured providers, native review and revocation. |
-| Knowledge, B5/B6 | Local snapshots admit 5,000,000 passages and 64 GiB. Disk-backed scoring, vector/text staging, refresh and cancellation exist. The five-million-record synthetic ceiling and larger dense fixtures passed. | Real-source/provider measurements at higher tiers, native UI and configured Qdrant recovery; assess the separate Qdrant limits. Increasing the local passage ceiling to Java's limit is complete. |
-| Desktop, editor, journals and recording, D4/D5/S/J/R | Native windows, notifications, structure navigation, diagram/export paths, journal workflows and recording interchange are implemented. | The specified native interaction matrix, provider/runtime acceptance and target-specific cases under V1–V5. |
-| Packaging and security, U4/V6/V7 | ZIP/TAR.GZ, MSI, DMG, DEB/RPM, Pacman and Flatpak staging exist, with partial native package/isolation evidence. | A verified current source snapshot, publisher signing/notarization, remaining clean-system/architecture checks, dependency remediation, independent external SSH review and performance measurements. |
+### Confirmed implementation work
 
-Completed implementation does not imply complete platform acceptance. The
-remaining code work is concentrated in the partial credential change,
-protected recurring folders, destination/metadata variants and migration
-gaps. Exact-model and product-scope differences need a recorded disposition
-before prescribing additional implementation. Mosh remains excluded and real
-IBM/HP/serial hardware acceptance remains user-deferred.
+| Work item | Java behavior and remaining Rust change |
+| --- | --- |
+| Q1/M1 · Schedule Teamwork connections | Java resolves direct Teamwork targets and members of connection groups. Rust has interactive Teamwork login and a reviewed shared-route identity, but saved Scheduler targets use local numeric connection IDs. Extend the picker, saved jobs, group refresh and dispatch to bind the shared source and route. Check duplicate IDs, changed group membership and authentication on reopen and at firing. [Native Scheduler targets](src/scheduler_window/connection.rs) · [Shared route](src/connection_store/teamwork/reviewed_route.rs) |
+| T3/T4/Q1/Q2 · Finish SFTP comparison and transfer recovery | The Java comparison can switch among the two originals and either original against the AI draft. Rust has the original diff and the right-file preview. Add the left-file/draft view and pair selection. Java also allows saving over another existing server file. Rust supports a new remote name and reviewed replacement of the right server file through the Linux helper. Extend reviewed destination and server coverage with permission preservation, optional backup and conflict recovery. Add recovery for private rsync staging abandoned by a forcibly terminated helper. [Java comparison](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SftpFileDiffDialog.java) · [Draft preview](src/sftp_window/compare/ai.rs) · [Server save](src/sftp_window/compare/ai/server.rs) · [Helper cleanup](crates/server-archive/src/server/privileged_rsync/upload/handoff.rs) |
+| S2/S3 · Unify mixed-language snippets | Add the Java editor action, local detection of embedded languages, target selection and reviewed before/after diff. Connect optional migration before full-analysis Apply and security fixes. Preserve the surrounding pipeline document when the user selects script steps only. Rust already supports translating prose, reading historical migration options and generating a new single-language workflow script. [Java language unification](https://github.com/chardonnay/korTTY/blob/v2.26.0/app-docs/site/docs/en/reference/language-migration.md) · [Native assistant actions](src/snippet_window/ai_assist.rs) |
+| S2 · Finish snippet review actions | Java lets the user check individual security findings before requesting fixes. The Rust standalone security action passes the whole report into the fix request. Add severity-ordered selection and bind fixes to the selected findings and reviewed source. Full code analysis already has a separate selection workflow. Add the reviewed AI fallback for formatting and syntax checks when the local tool cannot handle the request. [Java report](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SnippetSecurityReportDialog.java) · [Native review and fix](src/workspace/snippet_access/ai_assist.rs) · [Native tools](src/editor_window/tools.rs) |
+| S1/S2/M1 · Finish editor controls and migration | Implement the adjustable, remembered width between the snippet library and editor. Map imported open/active tabs to exact restored snippet IDs. Rust already restores its own tabs. Add the Java preference for optional extra AI instructions and the separate zoom settings for alternatives, diff and review. Java also offers code previews, expansion and selection copying in each alternatives card. Rust currently lists titles and summaries and opens the selected code in a diff. [Java workspace](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SnippetWorkspaceDialog.java) · [Native layout](src/snippet_window.rs) · [Tab persistence](src/snippet_window/session.rs) |
+| M1/B4 · Complete portable data adoption | Map Java backup retention and frequency, and ASCII Art image-size and copy-format preferences. Resolve ambiguous existing toolbar, group and highlight references through provenance or explicit review. Add a native restore workflow that verifies local GGUF/MLX assets and reattaches them to their restored model IDs. Java model-catalog adoption already exists. Verify additive restore, conflicts and restart on another host. [Field and identity audit](#remaining-field-and-identity-audit) · [Portable model metadata](src/profile_backup/data/ai.rs) |
+
+The reduced editor still needs a decision on Java's multi-language completion
+list, configurable shortcut and opt-in inline AI suggestions after a typing
+pause. Rust offers explicit reviewed completion and local Lua suggestions.
+Also decide which remaining consumers can accept server-selected AI models
+(Agent Planning, Swarm, scheduled AI, vision and embeddings). Track the
+native and external release requirements separately under [V1–V7](#native-acceptance-and-release-gates).
+
+### Work package references
 
 The following work packages record the supported cases and remaining
 implementation, acceptance or scope decisions. In this table, J code
@@ -63,7 +57,7 @@ paths are relative to `src/main/java/de/kortty/`, J manual paths to
 | B6 | Newly added files and folders default to 50 MiB per file. Reviewed UTF-8, PDF and folder settings accept up to 1 GiB, with a 500 MiB scan limit. Legacy approvals retain their earlier bounds. Native Windows and Fedora ARM64 workers processed 500 MiB fixtures. Windows also passed cancellation and cleanup tests. | J `features/rag.md` and `rag/RagSourceScanner.java`. R `src/ai_manager/local/knowledge/source.rs` and `src/knowledge_pdf.rs`. Apple Silicon passed packaged-worker extraction, the exact 500 MiB limit, cancellation and spool cleanup. The local backend supports 5,000,000 passages and 64 GiB per snapshot. Above 8,192 passages, search reads vectors from the validated snapshot and index construction stages vectors in a temporary file. The expanded local format uses a 32-bit passage count. Fedora ARM64 passed staging, exact search, refresh and replacement publication with 524,288 dense synthetic 1,536-dimensional vectors. Apple Silicon passed the same workflow at 1,048,576 passages. Windows ARM64 passed 524,288 passages after correcting publication with an open reader. Verify higher corpus tiers with configured providers and real sources. |
 | B8 | Verify LM Studio MCP over loopback HTTPS with a configured provider. Java Toolpack profiles can retain an inactive plugin hint. Adoption in AI Manager requires endpoint trust, a locally enrolled credential and exact user-entered tool names. | J `core/AiServiceFactory.java`, `core/LmStudioNativeAiService.java`; R `src/ai_manager/profiles/web.rs`, `src/local_ai/web_search/mcp.rs::search`. Verify native adoption and invocation with an installed LM Studio and the configured plugin. Preserve certificate validation, exact integration, masked query/excerpt review and model binding. Broader automatic web selection from later command output requires a scope decision. |
 | T3 / T4 | Reviewed existing-file replacement destinations and native acceptance of macOS file drag-out. AppKit Copy starts from the original mouse gesture in the SFTP Manager or terminal sidebar. Reviewed AI replacement of the compared right server file is limited to the native Linux helper. | J `ui/SFTPManagerTab.java`, `ui/TerminalRemoteSidebar.java`; R `src/sftp_window/drag.rs`, `src/workspace/remote_dock/desktop_drag.rs`, `src/sftp_window/compare/ai.rs`. Verify the new AppKit drags in Finder, including cancellation, delayed file reads and route or policy revocation. General replacement must preserve reviewed identity, metadata and recovery under external changes. |
-| Q1 | rsync accepts separate vacant-output batches and combined transfers mixing files, named folders and folder contents. Each saved route has a reviewed source projection and destination. Combined transfers publish one vacant or reviewed existing tree with scoped mirror deletion and recovery. Existing Linux uploads use the protected receiver helper. Recurring existing-directory approval binds calendar and Chain firings to the eligible saved routes and advances each receiver only after confirmed publication. Recurring uploads require the Linux v3 helper. Passwordless elevation supports reviewed files, directories and combined sources per route with separate protected Linux read, create and replacement roots. An upload can replace one exact reviewed Linux file. A direct ordinary or passwordless download can replace one reviewed local file per route. Both retain the original and preserve supported receiver metadata. Confirmed recurring file replacements record the exact successor and consume no removals. Windows supports a reviewed executable with a private staged DLL bundle. One-use changed-file SFTP downloads are implemented for Windows and Unix. The upload path supports login-owned private remote files with recovery. Explicit recurring SFTP calendar approval supports ordinary replacements in both directions with per-firing bounds and recovery. Recurring SFTP Chain approval passed pinned OpenSSH acceptance on Fedora. Privileged file transfers support one-use and bounded recurring replacement approval. One-use privileged folder uploads and downloads can publish reviewed changes into existing destinations. Configured desktop deployments and broader target metadata compatibility remain open. | J `features/jobscheduler.md`, `jobscheduler/JobSchedulerJobRunner.java`; R `src/job_executor/rsync.rs`, `src/job_executor/rsync/native/mixed.rs`, `src/scheduler_window/rsync.rs`, `src/scheduler_window/sync.rs`. Verify recurring approval and reapproval in native Scheduler windows, recovery after interrupted publication and guarded SFTP replacement. Fedora verified combined elevation with real sudo and pinned OpenSSH. Verify configured deployments and remaining native editor paths. Local file receiver regressions and the opt-in Fedora and Windows pinned SSH cases passed. Complete native Scheduler editor and remaining platform checks. Verify recurring passwordless receivers on remaining platforms. The reviewed creation-to-replacement layouts are implemented; derive any additional destination layout from a pinned Java case. |
+| Q1 | rsync accepts separate vacant-output batches and combined transfers mixing files, named folders and folder contents. Each saved route has a reviewed source projection and destination. Combined transfers publish one vacant or reviewed existing tree with scoped mirror deletion and recovery. Existing Linux uploads use the protected receiver helper. Recurring existing-directory approval binds calendar and Chain firings to the eligible saved routes and advances each receiver only after confirmed publication. Recurring uploads require the Linux v3 helper. Passwordless elevation supports reviewed files, directories and combined sources per route with separate protected Linux read, create and replacement roots. An upload can replace one exact reviewed Linux file. A direct ordinary or passwordless download can replace one reviewed local file per route. Both retain the original and preserve supported receiver metadata. Confirmed recurring file replacements record the exact successor and consume no removals. Windows supports a reviewed executable with a private staged DLL bundle. One-use changed-file SFTP downloads are implemented for Windows and Unix. The upload path supports login-owned private remote files with recovery. Explicit recurring SFTP calendar approval supports ordinary replacements in both directions with per-firing bounds and recovery. Recurring SFTP Chain approval passed pinned OpenSSH acceptance on Fedora. Privileged file transfers support one-use and bounded recurring replacement approval. Privileged folder uploads and downloads support one-use and recurring merges, including confirmed vacant-to-existing receiver progression. Configured desktop deployments and broader target metadata compatibility remain open. | J `features/jobscheduler.md`, `jobscheduler/JobSchedulerJobRunner.java`; R `src/job_executor/rsync.rs`, `src/job_executor/rsync/native/mixed.rs`, `src/scheduler_window/rsync.rs`, `src/scheduler_window/sync.rs`. Verify recurring approval and reapproval in native Scheduler windows, recovery after interrupted publication and guarded SFTP replacement. Fedora verified combined elevation with real sudo and pinned OpenSSH. Verify configured deployments and remaining native editor paths. Local file receiver regressions and the opt-in Fedora and Windows pinned SSH cases passed. Complete native Scheduler editor and remaining platform checks. Verify recurring passwordless receivers on remaining platforms. The reviewed creation-to-replacement layouts are implemented; derive any additional destination layout from a pinned Java case. |
 | Q2 | Privileged SFTP transfers support one-use and bounded recurring replacement of a reviewed local or server file in both sudo modes. The ordinary and sudo Linux Scheduler routes implement opt-in archive path reuse per firing, ZIP Add, TAR regeneration and recovery for server and local output. Fedora passed isolated helper checks with real sudo and PAM. Pinned OpenSSH client fixtures passed for both sudo modes. Ordinary SFTP and the Linux sudo route support reviewed explicit-class symbolic permissions and owner/group name resolution. The Linux sudo archive helper creates root-private ZIP, including vault-backed password ZIP, and streams a verified local copy from an administrator download root. A separate protocol supports a reviewed vault-backed sudo challenge. | J `features/jobscheduler.md`, `features/sftp.md`, `ui/JobSchedulerDialog.java`. R `src/scheduler_window/remote.rs`, `src/scheduler_window/ownership.rs`, `src/job_executor/remote/server_archive.rs`, `src/job_executor/remote/privileged.rs`. Verify repeated schedules, local-copy replacement, cancellation and same-path archival through authorized sudo. Check named resolution, symbolic modes, changed pins and denied policy. |
 | M1 | Java backups fill unset Coding Agents, remote sidebar, supported keyboard and recording preferences. Restored terminal preferences include shell tab titles, command timestamps, link detection, transparency and silence threshold. The Scheduler menu status and field-by-field terminal notification settings also restore. Supported SFTP transfer, idle and archive defaults fill unset fields. The preview identifies replace-on-conflict. Journal appearance, capture format, link behavior, and PDF branding fill unset fields. Terminal selection, paste protection and pacing, and compatible Quick Select patterns fill unset fields. Quick Select and terminal highlighting preserve supported Java expressions, including named captures, word boundaries and final-line anchors. The bounded matcher also imports lookarounds, numeric and named backreferences, atomic groups and possessive quantifiers. Inline and scoped Java case, Unicode-class, comments and line flags restore. Java grapheme escapes use the bounded matcher with grapheme classifications matching OpenJDK 25.0.2 and Unicode 16.0. Numeric and named backreferences apply the ASCII or Unicode case mode active at the reference. The Unicode backreference table matches JDK 25. Supported Unicode case-insensitive bracket classes match Java singleton and range rules. Unicode case-insensitive literals preserve Java single-character, literal-run, and quantifier boundaries. All 18 Java-named character properties use Unicode 16.0 and Java-specific identifier and whitespace rules. POSIX and binary Unicode properties preserve Java flag handling and category aliases. Java script and block selectors use Unicode 16.0 with Java's short script aliases and historical block names. Java octal, control, paired UTF-16, named scalar and short category escapes restore, and the bounded matcher preserves the previous-match anchor and subsequent empty matches. The generated Unicode 16.0 scalar name catalog matches OpenJDK 25.0.2. Java quote delimiters are removed before parsing expressions. Empty quote sequences preserve adjacency in classes and elsewhere. Isolated UTF-16 surrogate literals support bounded repetition, alternation and fixed-width lookbehind. Matching keeps UTF-16 positions internally and returns complete UTF-8 characters when displaying partial matches. Numbered and named backreferences can compare partial UTF-16 captures and follow Java case modes. Surrogate literals and ranges in character classes, the surrogate category and surrogate blocks use UTF-16 matching. Negation and intersections preserve low-surrogate membership. Other character predicates carry their surrogate membership in that mode. The UTF-16 matcher supports variable-width lookbehind with Java's width limits, nearest-first candidate order and original endpoint check. The bounded Java matcher uses UTF-16 positions for ordinary predicates and empty matches without an explicit surrogate atom. Linear Java matching returns empty matches after nonempty matches and checks low-surrogate positions after empty matches. The bounded matcher applies Java word boundaries and selects code-unit or code-point scanning from the source predicates. Regular word assertions use the bounded Java matcher when supplementary characters or nonspacing marks can affect them. Escaped supplementary characters in literal runs preserve Java's scanner selection. The 3,251-case comparison matches OpenJDK. The recorded Java line-ending cases cover CRLF retry, direct and grouped repetition, and lookbehind. Imported whole-word highlight rules retry alternatives inside Java boundary assertions in the terminal and logfile viewer. Inline canonical-equivalence flags cover bracket classes and explicit Unicode properties. Pending Java highlight restores recover the marker for legacy literals. Reimport upgrades a legacy remapped set in place when its content-derived ID proves the relationship. Audit ambiguous legacy sets stored under their source ID. Audit other regex syntax and the limits of the bounded fallback. Compound class negation and property complements subtract from the scalar range, including at U+D7FF and U+E000. Nested classes and intersections preserve Java set operations, including empty operands, lone ampersands after nested operands and vertical-whitespace escapes in ranges. Remembered-window and dashboard options and fixed startup geometry with signed coordinates and maximization fill unset fields. Java startup applies stored bounds and maximization. The restore preserves those values when the record includes fullscreen metadata. Snippet analysis diagram, modularization, and source-code export defaults fill unset fields. File-editor caret preferences and the active Java snippet editor font and palette fields also restore. The logfile viewer uses native terminal highlight sets and a saved link, path and keyword presentation. Java backups restore compatible custom highlight sets for presentation and resolve logfile viewer references at ID conflicts. Existing local selections are preserved. Verify native clicks and presentation across desktop backends. Live terminal master and alternate-screen settings fill unset fields. The global default and imported SSH, local shell and serial choices follow remapped custom IDs. Transactional restore verifies the reviewed mapping before publishing connections. Serial connection editing exposes the same set selector. Custom Journal markers and ordered rules restore with exact remapping at conflicts. Remaining Java backup work covers residual regex semantics, unmapped global settings and unresolved or ambiguous identities. Native inspection of retained analysis snapshots and diagrams is implemented and awaits desktop acceptance. Java GGUF and MLX registry metadata restores as inactive hints for separately reviewed native models. Saved snippet and folder analyses can restore from matching Java library entries with inert workflow evidence and verified source snapshots. Read-only run history includes reviewed options, stages, completion markers, checkpoints and model provenance. Unique built-in skill identities restore historical usage and Java-specific size measurements. Custom, deleted and otherwise unmapped Java IDs restore as separate read-only usage histories in native skill reports. Exact new SSH, local shell, and serial profiles can restore Memory documents, history and fully matched mixed archives using canonical and supported legacy scope IDs. Default, text, coding, Agent and snippet security role references restore as inactive suggestions. Java RAG definitions restore as inactive suggestions. Java Scheduler file transfers, sudo staging, ordinary or privileged archives, and sudo commands, snippets and file actions restore as disabled drafts. Staging, archives, sudo file actions and sudo virtual terminals bind exact individual routes. Adoption requires a reviewed sudo mode and current policy. Archive and protected transfer workflows verify their installed helper where required. Java rsync jobs restore as disabled route-bound drafts with independently selected native destinations and fresh review. | J `core/BackupManager.java`, `features/backup.md`. R `src/profile_backup/archive/java.rs::classify`, `src/profile_backup/java_migration.rs`, `src/profile_backup/java_scheduler.rs`. Existing saved connections support explicit AI Memory destinations. Colliding Java filenames are reported and exact archive IDs restore independently. Windows ARM64 verified the assignment dialog and restart. Verify the workflow on macOS and Linux desktops. Verify serial Memory in a native desktop terminal. Verify adoption of imported roles and model settings on native desktops. Keep credentials, host pins, executable paths and execution approvals subject to separate review. See the detailed M1 row for remaining Scheduler and Memory cases. |
 | U4 | ZIP/TAR.GZ and optional Windows MSI and Linux ZIP/DEB/RPM/Pacman/Flatpak staging exist. ARM64 passed the real Java-to-Rust Pacman downgrade and Flatpak replacement. Host-shell integration and required local Landlock isolation passed in the Fedora ARM64 Flatpak. Both MSI architectures passed Windows Installer database and cabinet verification using retained executables. Native Apple Silicon DMG creation, app copy and launch passed. | Java v2.26.0 release assets and R `packaging/src/main.rs`, `packaging/src/dmg.rs`, `packaging/src/msi.rs`, `packaging/src/linux.rs`. Verify the remaining clean-system install, upgrade, removal, dependency and signing cases on native systems. Repeat the Flatpak launch and Landlock checks on x86-64. The earlier notarized Apple Silicon ZIP covers its recorded source. |
@@ -106,8 +100,7 @@ metadata can inform usage records after a response. Exact-model workflows keep
 their own profile restrictions. APIs that require an explicit model can reject
 these requests. [LM Studio documents that rejection](https://lmstudio.ai/docs/developer/rest/streaming-events#error).
 
-The following are **acceptance or scope work**, not proof of missing core
-implementations:
+The following work requires native acceptance or a scope decision.
 
 - **Native acceptance, V1–V5:** window/split movement, geometry and focus,
   notifications, supported shells, the 21 terminal profiles, editor/diagram
@@ -118,12 +111,12 @@ implementations:
   obtain independent external SSH review, build and verify one fixed source
   snapshot per target, and measure startup, idle memory and p95 input latency.
   An existing test count or notarization does not cover subsequent source edits.
-- **Product dispositions:** remembered vault unlock and persisted temporary
-  keys; automatic web tools using arbitrary later command output; Java's
-  standing approval for commands not yet generated; larger/dynamic Swarm
-  groups and incognito scope; optional telemetry, third-party native effects
-  and editor features outside the agreed reduced editor. Record the decision
-  before calling these complete or removing their boundaries.
+- **Product decisions** cover remembered vault unlock, persisted temporary
+  keys, automatic web requests using later command output, and round-wide
+  approval of future commands across Swarm targets. An explicit grant for one
+  run or one target already exists. Larger or dynamic Swarms, incognito scope,
+  optional telemetry, third-party effects and the extent of inline editor
+  completion also need decisions.
 - **Explicit scope/deferments:** both Mosh modes are excluded; application
   text stays English; JVM/JMX/JAR mechanisms use native equivalents. Real
   IBM/HP and physical serial checks remain deferred by the user.
@@ -259,6 +252,70 @@ workflows and tracks their residual differences:
   YAML, TOML, HTML, CSS, JavaScript, TypeScript, Java, Perl, SQL and Terraform.
   Java bundles more formatter runtimes.
   Verify the newly added installed-tool routes on each native platform.
+  The snippet editor also offers built-in and remembered language
+  labels. Java's `customSnippetCodeLanguages` list appends validated,
+  normalized entries to the existing Rust list on additive restore.
+  Verify selecting and remembering labels across native editor windows.
+  Snippet editors and previews share saved line-number and word-wrap
+  toggles. Java `snippetLineNumbers` and `snippetWordWrap` fill unset
+  Rust choices independently. Unwrapped lines support horizontal
+  scrolling and caret tracking. Verify both switches during live
+  editing, scrolling and window transfers on native desktops.
+  Snippet and folder analysis history supports a saved 1–20 report
+  limit, with a default of five. Java `snippetAnalysisHistoryMaxSize`
+  fills the unset Rust preference. Saving a new report applies the
+  limit and preserves pinned records, verified evidence and pending
+  recovery. In Settings, lowering the limit previews how many reports
+  across current snippets and folders would be removed as new analyses
+  are saved. The preview and publication share the same retention
+  rules. Verify both on native desktops.
+  The separate `snippetAnalysisMaxStoredContentBytes` preference fills
+  an unset Rust source limit. New report, apply and checkpoint source
+  fields use the lower of the user limit and the managed ceiling.
+  Existing snapshots remain subject to the managed ceiling and the
+  file budget. Verify the storage control on native desktops.
+  Snippet editor tabs capture debounced source versions and navigate
+  them in the editor. Saving a snippet persists its versions. Java's
+  `snippetHistoryMaxSize` restores as an unset global preference, and
+  the private library restore preserves saved versions and per-snippet
+  overrides. Verify the slider, tab transfers, and overrides on
+  native desktops.
+  The Structure panel restores unset visibility and requested width
+  from Java's `snippetStructurePanelVisible` and
+  `snippetStructurePanelWidth` independently. Verify drag and reopen
+  behavior on native desktops. The analysis report can appear beside
+  its matching editor with a draggable width. Java's
+  `snippetAnalysisPanelVisible` and `snippetAnalysisPanelWidth` fill
+  unset fields separately. Opening an editor with saved analysis
+  history reopens the enabled panel. Narrow layouts and active reviews
+  use the full report tab. Verify docking, resizing and source jumps
+  on native desktops. Apply progress can move between the report and
+  a right-hand dock. Live and same-session runs follow the saved
+  placement, and restored runs can be docked explicitly. Java
+  `snippetAiProgressDockVisible` fills the unset placement preference.
+  Verify moving live and saved progress, narrow-window fallback, and
+  opening review from the dock on native desktops.
+  The saved code-analysis report font and the default expansion state
+  of classic hardening options restore from Java's
+  `codeAnalysisFontSize` and `codeAnalysisHardeningExpanded` when the
+  matching Rust preferences are unset. The analysis preview and
+  enlarged flowchart share a saved diagram-options toggle. Java's
+  `codeAnalysisDiagramOptionsExpanded` fills that preference when
+  unset. Project analysis also saves its diagram visibility independently
+  of automatic generation, and Java `codeAnalysisProjectDiagramVisible`
+  fills that unset choice. Snippet diagrams and analysis previews share
+  a saved vertical or horizontal layout. Java `snippetDiagramLayout`
+  fills the unset layout preference. Snippet diagrams and analysis
+  previews share the saved system, light or dark palette and a custom
+  light canvas. SVG and PNG diagram exports use those same colors.
+  Java `snippetDiagramColorMode` and `snippetDiagramBackgroundColor`
+  fill the matching unset preferences independently. Verify controls,
+  OS theme changes and reopen behavior on native desktops.
+  Java's saved classic and input-hardening selections, input enable
+  switch, and file-size limit fill unset Rust preferences independently.
+  Snippet Analysis and Terminal Workflow use those defaults when
+  initializing reviewed requests. Verify the restored choices in both
+  native dialogs.
 - **J2 — Journal summaries and progress.** Summary cards follow command
   boundaries and omit help-only calls and recognized failed starts. The
   reviewed chunk option processes retained long command output in multiple
@@ -336,13 +393,15 @@ workflows and tracks their residual differences:
   See the [Scheduler folder restore checkpoint](PORTING-PARITY.md#java-scheduler-connection-group-restore).
   Snippet jobs also require matching snippet and variable definitions. Existing
   job IDs take precedence.
-  Unsupported actions, unresolved or conflicting target and snippet references,
-  Scheduler credentials, host pins, history, and webhooks are omitted.
+  The Rust importer dispatches all 15 action names in the tagged
+  `JobActionType.java`. Unsupported option combinations, unresolved or
+  conflicting target and snippet references, Scheduler credentials, host
+  pins, history and webhooks have their own omission or review paths.
   Later Windows ARM64 runs supersede the earlier interrupted application run.
   The connection-group checkpoint passed 3,308 application tests, including
   encrypted backup/startup replay coverage. A later historical checkpoint passed
   3,320. Native desktop review and cross-host acceptance remain open. M1 tracks
-  the unconverted Java stores and Scheduler actions. Persisted temporary keys
+  remaining fields, action options and shared target identities. Persisted temporary keys
   still need a scope decision.
 
 The Rust packager stages ZIP archives for Windows and macOS and a TAR.GZ for
@@ -363,8 +422,9 @@ The broader release audit also confirmed these workflow differences:
   snippets through its reviewed Swarm mode. Java's standing round-wide
   approval extends to later commands that were absent from the initial review.
   A native batch includes the currently known ordinary commands in order per
-  target. Later generated commands, privileged commands and managed per-command
-  policy still require their own reviews. Native scheduled Swarm
+  target. A separate explicit per-target grant can cover later ordinary
+  commands in that run. Elevation and managed per-command confirmation retain
+  their own reviews. Native scheduled Swarm
   supports sixteen parallel slots and 32 selected saved SSH routes. Java can
   resolve current group membership including descendants. Native jobs persist
   selected groups and validate the effective route list at firing and dispatch.
@@ -388,7 +448,8 @@ The broader release audit also confirmed these workflow differences:
   Planning, Swarm and jobs. Rust supports those review flows alongside
   Text and Coding retrieval. Live review supports local indexes and Qdrant.
   Scheduler reviews support local, anonymous Qdrant and vault-backed Qdrant
-  indexes. Larger corpus capacity remains open. Durable environment-key
+  indexes. Real-corpus performance at the implemented local ceiling and the
+  separate Qdrant capacity review remain open. Durable environment-key
   Qdrant is a native extension beyond the Java vault-key route.
   Native model-family presets and GGUF recommendations use the pinned
   catalogue. Cloud setup offers eight presets with offline examples. The guided
@@ -439,7 +500,8 @@ The broader release audit also confirmed these workflow differences:
   a reviewed optional `.bak` through the native Linux helper. It requires a
   protected directory and matching ownership, bytes and access metadata.
   Extending the workflow to another existing server file and other server
-  platforms remains open.
+  platforms remains open. The Java dialog's left-file/draft comparison and
+  selector for the three comparison pairs also require implementation.
   Native UI and configured provider acceptance remain open.
   The remaining Scheduler replacement, rsync and sudo variants are tracked
   in Q1 and Q2.
@@ -465,13 +527,12 @@ The broader release audit also confirmed these workflow differences:
   `b235d91f20356f8a9b33ad5398550a043cc21ed2`. The earlier audited release
   commit `1ebbe724ee84d55f31295ec3060eecad3653d2f2` differs only in
   `package/size-baselines.json`. The latest spot checks use the tagged tree.
-- The current audit uses Rust based on `main` at
-  `8fdb5d41a100611ef1f8ffa9e7f5c37eb049e5da` and its uncommitted changes.
-  The earlier audit used `a76c8f5b945bc17bd567f584a447a505cc260adc` and
-  [PR #4](https://github.com/chardonnay/korTTY_rust/pull/4). The retained PR #4
-  CI evidence covers `590acff495710843614c60028e347361beb0734e`, not the current
-  working tree. No CI rerun or online status check was part of this reconciliation.
-  Record the source snapshot and executable hashes for subsequent verification.
+- The November 18 audit includes the uncommitted Rust source on `main`
+  at `e3c1760a576f0f358d529c5076537f60d32e7f22`. The previous audit on
+  `8fdb5d4` and the earlier PR #4 runs are historical. GitHub records
+  successful format, Clippy, test, release-build and staging steps for all
+  three runners on the PR #7 merge commit. The later working-tree changes have
+  individual verification records. [Merge CI](https://github.com/chardonnay/korTTY_rust/actions/runs/44106367721)
 - SithTermFX remains v1.2.7 at
   `8b02de38b7c6396f1af2558b0b00477cfb9a2871`. Retained reference fixtures
   and their recorded runs were inspected. This audit did not repeat an
@@ -501,22 +562,24 @@ user executable.
 
 ### Current evidence and distribution
 
-The latest snapshot with native Journal execution and package verification is
+The retained Apple Silicon ZIP below was built from
 `af1c17601ffa2f32c3aade762b13eca1727c0d6f0c826a631844d7d94baf65ed`
-on base `8fdb5d4`. The later credential-binding and pull-request preparation
-changes have only the static checks listed below. The latest targeted runs
-must not be presented as a current full workspace pass.
+on base `8fdb5d4`. Subsequent Journal, Scheduler, SFTP, desktop and snippet
+results cover the individual scopes below and in the parity record.
 
 | Snapshot and platform | Retained result | Limit of the result |
 | --- | --- | --- |
-| Pull-request preparation, Windows ARM64, Rust 1.99.1 | `cargo fmt --all --check` and `cargo clippy --locked --workspace --all-targets -- -D warnings` passed. Cargo used 23 jobs of 26 CPUs with the default development profile. | Static checks and test-target compilation; no new application test execution, native Mac/Fedora rerun or package build. F1 remains incomplete. |
+| PR #7 merge, `e3c1760` | Windows, Ubuntu and macOS passed their configured tests and release staging. [GitHub Actions](https://github.com/chardonnay/korTTY_rust/actions/runs/44106367721) | Covers the merged revision. |
+| Post-merge Journal HTTPS binding (F1) | Four opt-in TLS cases passed on each of Windows ARM64, Apple Silicon and Fedora ARM64, alongside the regular Journal tests at the recorded revisions. [Windows](target/verification/20261117-journal-credential-windows-lld.log) · [Apple Silicon](target/verification/20261117-journal-credential-native-final-macos.log) · [Fedora](target/verification/20261117-journal-language-native-fedora-lld.log) | Configured provider and packaged desktop acceptance remain open. |
+| November 18 snippet alternatives | Fedora ARM64 passed 35 focused tests. Windows ARM64 passed app and test-target Clippy. [Fedora](target/verification/20261118-snippet-alternatives-fedora.log) · [Windows](target/verification/20261118-snippet-alternatives-windows.log) | Covers the imported count, candidate handling and reviewed assistant paths. Live provider and GUI acceptance remain open. |
+| Pre-merge PR preparation, Windows ARM64, Rust 1.99.1 | `cargo fmt --all --check` and `cargo clippy --locked --workspace --all-targets -- -D warnings` passed. | Static checks on that revision. |
 | `af1c17601ffa`, Apple Silicon | 612 regular Journal tests passed, with 12 ignored; two opt-in loopback TLS question/summary tests passed separately. The release ZIP passed checksum, ARM64, strict ad hoc app/SSH worker signatures and CLI startup. Separate Seatbelt and packaged backup-startup checks passed. | Targeted application tests; no new full workspace, desktop GUI acceptance, Developer ID signing or notarization. |
 | `af1c17601ffa`, Fedora ARM64 | One regular loopback TLS selection test passed, with two ignored; both opt-in TLS fixtures passed separately with TLS 1.3. | Targeted tests, not a full suite or a Fedora release package. |
 | `af1c17601ffa`, Windows ARM64 | `cargo check --locked -p kortty --tests` passed. | Compilation only; no execution of the latest Journal tests on Windows. |
 | `e75aff4df394`, Apple Silicon | The latest retained full workspace run passed 4,332 tests, with zero failures and 198 ignored. | Earlier full-analysis snapshot; later source changes require a new suite. |
 
 Evidence: [PR preparation Clippy](target/verification/20261117-pr-current-833377bc5b-windows-clippy-final.log),
-[latest executed source context](target/verification/20261117-native-journal-loopback-tls-macos-af1c17601ffa-source-context.txt),
+[Mac package source context](target/verification/20261117-native-journal-loopback-tls-macos-af1c17601ffa-source-context.txt),
 [source manifest](target/verification/20261117-native-journal-loopback-tls-macos-af1c17601ffa-source.sha256),
 [Mac Journal tests](target/verification/20261117-native-journal-loopback-tls-macos-af1c17601ffa-tests.log),
 [Mac package checks](target/verification/20261117-native-journal-loopback-tls-macos-af1c17601ffa-package.log),
@@ -530,7 +593,7 @@ The retained latest Apple Silicon
 [ZIP](target/dist/kortty-0.1.0-aarch64-apple-darwin-af1c17601ffa/kortty-0.1.0-aarch64-apple-darwin.zip)
 is 41,292,554 bytes and has SHA-256
 `988a378e3f02fbc1e94b002ae461356a858510f5a3ea301bb2f4a23e0af0da48`.
-It is ad hoc signed and predates the unfinished credential-binding change.
+It is ad hoc signed and predates the subsequently verified credential-binding change.
 The historical notarized Developer ID package does not cover this candidate.
 
 #### Earlier snapshot evidence
@@ -745,28 +808,37 @@ not been identified.
 
 ## Implementation order
 
-The original Steps 1–6 produced implementation checkpoints; they did not
-complete every row or the release matrix. The following order replaces the
-old instruction to restart those steps. Keep the existing shell/Agent,
-connection-policy, Swarm, journal, editor and sandbox implementations.
-D4/V1/V2 acceptance accompanies each relevant change. Security dependency
-work and arranging independent review under V6 can start alongside this list.
+Start with the [confirmed implementation work](#confirmed-implementation-work).
+Schedule shared Teamwork routes, finish the SFTP comparison and recovery
+cases, then complete the snippet actions and portable restore mappings.
+Existing native flows and their acceptance records are the starting point.
+The six work packages below cover compatibility decisions, platform
+acceptance and release preparation. The independent SSH review under V6
+can proceed alongside implementation.
 
-**F1 — Finish and exercise the paused credential-binding change.**
-`src/local_ai/streaming.rs` adds `stream_reviewed_structured_before` and
-`src/session_journal/question.rs` calls it with the question authority's
-captured credential. Pull-request preparation formatted the change and passed
-Windows ARM64 workspace Clippy, including application/test compilation.
-Runtime regression checks remain outstanding. Journal summary streaming in
-`src/session_journal/summary_ai.rs` still
-uses `stream_structured`; the common summary run does not yet carry the same
-immutable reviewed credential. Complete the question, summary and preflight
-contract consistently. Keep the existing source/profile/vault/policy checks
-and verify credential rotation or removal between review and dispatch, retry,
-cancellation and refusal before a request reaches the fixture. Then run
-formatting, the relevant compilation/Clippy and native Journal/TLS regressions.
-Record a new source snapshot before claiming these changes verified or
-repackaging. The previous TLS successes apply to the previous implementation.
+**F1 — Implemented and verified Journal HTTPS credential binding.**
+Questions and summaries now pass the captured credential into the HTTPS
+completion attempt. Summary connection checks and retries retain the same
+snapshot, and the transport applies it to LM Studio model lookups before
+completion where applicable. The summary TLS fixture checks stale credentials,
+revocation, cancellation and a retry after the provider rejects the requested
+structured format. Windows ARM64 passed 606 Journal tests, 53 LM Studio tests
+and four private TLS cases before the startup cache follow-up. The cache now
+keys HTTPS results on the same credential used by the reviewed request. The
+summary fixture also exercises removal of a previously approved credential.
+Windows ARM64 passed 606 Journal tests (10 ignored) and all four TLS cases
+after the cache follow-up. Apple Silicon passed 612 Journal tests (12 ignored)
+and all four TLS cases, including the removal and retry checks, on source manifest
+`bf19c116594c8be69026e5d63ccee8295847e4c37f81c7326cb285e0063cbad7`.
+See the [Windows test record](target/verification/20261117-journal-credential-windows-lld.log)
+and the [macOS test record](target/verification/20261117-journal-credential-native-final-macos.log).
+Fedora ARM64 passed 614 Journal tests (12 ignored), 206 Scheduler tests, the
+diagram import fixture and all four TLS cases on the later source manifest
+`94e140faf0376a978b7ccfb46f22ba8626b115a39d2e71a920f1ca84ddfbdc23`.
+[Fedora record](target/verification/20261117-journal-language-native-fedora-lld.log).
+The implementation and focused native regressions for F1 are complete.
+Configured-provider desktop acceptance remains under V5 and current release
+packages under V7.
 
 The existing-local-file rsync runtime fixtures passed on Fedora and Windows.
 Recurring direct file downloads can start at an initially vacant name on one
@@ -784,7 +856,8 @@ contents or combined receiver in a checked Linux parent. Later firings
 replace the exact receiver confirmed by publication. Fedora passed Calendar
 and Chain fixtures for these transitions. Protected single-file replacement
 and one-use folder merges are also implemented and have native OpenSSH/sudo
-evidence. Continue with recurring protected folder synchronization, the
+evidence. Recurring protected folder creation and merges are now implemented.
+Continue with their live helper and native Scheduler acceptance, the
 remaining destination contracts and native Scheduler editor/deployment
 acceptance. See the
 [missing-parent checkpoint](PORTING-PARITY.md#scheduler-rsync-downloads-with-missing-local-parents-and-java-group-paths)
@@ -814,9 +887,9 @@ checkpoints.
    governs the initial request and its retries. Verify the behavior against a
    configured gateway and model that reject the original mode or output limit.
 2. **Complete data migration and knowledge acceptance, M1/B6.** Convert the
-   remaining non-secret Java stores with review and restart replay. Add
-   supported Scheduler action imports after their native definitions are
-   complete; all imported jobs remain disabled until reviewed. Keep external
+   remaining non-secret Java stores with review and restart replay. Check
+   the outstanding options and target bindings for the 15 recognized Java
+   Scheduler action kinds. Imported jobs stay disabled pending review. Keep external
    model files, credentials and execution authority separate. The local
    passage ceiling now matches Java at 5,000,000 and the snapshot byte limit
    is 64 GiB. Keep the disk-backed implementation and complete real-corpus
@@ -848,9 +921,35 @@ checkpoints.
    snippet profile routing with configured providers and connection overrides.
 3. **Complete file and Scheduler variants, T3/T4/Q1/Q2.** Verify reviewed
    rsync creation and replacement on the remaining native desktop routes.
-   Recurring privileged single-file transfers and one-use protected folder
-   merges are implemented. Extend protected folder synchronization to
-   recurring approval with bounded changes, receipt progression and recovery.
+   Add Teamwork target and group resolution to the saved job and its
+   execution-time checks. Complete the left-file/draft diff and the
+   reviewed replacement of another existing server file in the SFTP Manager.
+   Recurring privileged single-file transfers and protected folder transfers to
+   existing or initially vacant receivers are implemented, including bounded
+   recurring Calendar and Chain approval. First publication binds the confirmed
+   created receiver; later runs merge only into that identity. Verify this
+   progression, failure recovery and reapproval through deployed native routes.
+   The receiver-witness protocol and local merge completion now have backend
+   support: optional legacy-compatible receipt requests, held receiver identity
+   and metadata, and pre-transfer action/payload accounting. Existing-receiver
+   recurrence now connects per-firing admission, durable pending/completed state,
+   reapproval/recovery, schedule/sudo-mode binding and the review UI. The earlier
+   macOS/Fedora checkpoint passed two focused state tests, the eight-combination
+   editor fixture, all 208 Scheduler tests and 30 privileged tests per platform;
+   explicit helper fixtures remained ignored. Windows ARM64 Clippy passed.
+   Vacant receiver progression is now connected in both directions and both
+   sudo modes. The first creation charges the receiver root as an action even
+   for an empty source. The creation checkpoint passed the expanded sixteen-case
+   editor fixture and focused state/publication tests on macOS, Fedora and
+   Windows; Scheduler counts were 209, 209 and 210 respectively. Explicit native
+   SSH/helper fixtures remain excluded from those counts. Fedora used LLD after
+   a GNU AArch64 test-link failure. See the
+   [creation verification entry](PORTING-PARITY.md#recurring-protected-folder-creation-and-confirmed-receiver-progression).
+   Download review and limits include the entire streamed manifest, including
+   unchanged files. Earlier native protocol, local-merge and Linux server
+   receiver-anchor tests also passed at their recorded snapshots. Live
+   helper, recurring-job and native UI acceptance remain open. See the protected-
+   folder receiver entry in PORTING-PARITY.md for exact scope and records.
    Cover reference-required destinations outside the supported ownership
    and metadata scope.
    Fedora passed pinned OpenSSH ordinary SFTP Chain starts in both directions
@@ -935,7 +1034,8 @@ checkpoints.
    Verify macOS Finder drag-out independently of the replacement work.
 4. **Close the bounded scope audits.** Record explicit decisions for remaining
    vault/key persistence, approval/automatic-web behavior, Swarm capacity,
-   reduced editor and optional telemetry/plugin differences. Derive any new
+   local completion lists, optional AI ghost text, other reduced-editor
+   differences and optional telemetry/plugins. Derive any new
    implementation from a named pinned Java action. Do not infer a missing
    terminal opcode, SSH algorithm or editor language from a historical summary.
 5. **Complete native workflow acceptance, D/A/B/S/J/T/P/R and V1–V5.** Cover
@@ -980,7 +1080,7 @@ Evidence for the completed D2/D3 work includes
 
 | ID | State and implemented coverage | Remaining work |
 | --- | --- | --- |
-| A1 | Acceptance. Built-in Run/Ask/Plan, reviewed local/SSH execution, skills/quota, bounded history, opt-in `agent` aliases, Tab completion, sudo/vault challenges and mirror holds exist. PowerShell/CMD integration and per-pane setup/status now ship in source. Native ConPTY PowerShell 5.1/CMD and Fedora SSH Agent routes passed. Permitted terminal AI initializes an in-memory SSH credential mask independently of capture, including incognito, without enabling logging. R `src/workspace/terminal_agent/shortcut.rs`, `src/workspace/ssh_access.rs`, `src/session/shell_activity.rs`, `crates/pty/src/shell_integration.rs`. | Verify remaining supported shells, native desktops and current packages. Complete native manual password entry on macOS/X11/Wayland, history/run controls, mirror release, changed targets and revocation. Custom-program Agent Run remains blocked by the native-shell capability gate. See the diagnostic contract below. |
+| A1 | Implementation + acceptance. Built-in Run/Ask/Plan, reviewed local/SSH execution, skills/quota, bounded history, opt-in `agent` aliases, Tab completion, sudo/vault challenges and mirror holds exist. PowerShell/CMD integration and per-pane setup/status now ship in source. Native ConPTY PowerShell 5.1/CMD and Fedora SSH Agent routes passed. Permitted terminal AI initializes an in-memory SSH credential mask independently of capture, including incognito, without enabling logging. R `src/workspace/terminal_agent/shortcut.rs`, `src/workspace/ssh_access.rs`, `src/session/shell_activity.rs`, `crates/pty/src/shell_integration.rs`. | The inline root-bypass option and grant revocation passed targeted native macOS/Fedora tests; automatic read-only dispatch and inline per-run confirmation passed targeted native macOS/Fedora tests. Verify remaining supported shells, native desktops and current packages. Complete native manual password entry on macOS/X11/Wayland, history/run controls, mirror release, changed targets and revocation. Custom-program Agent Run remains blocked by the native-shell capability gate. See the diagnostic contract below. |
 | A2 | Acceptance + bounded audit. Planning stages, design module IDs d01–d20, docking/status/approval placement, inline history, picture-in-picture, usage/repair display, seven activity export formats and Agent-to-Chat/Journal links exist. R `src/terminal_agent/design/custom.rs`, `src/workspace/terminal_agent/`. | Native d14 cursor review, d19 snap/follow/detach, d20 behavior, inline selection/Kitty row mapping, exports, linked Journal cards and live provider usage/repair. There is no demonstrated missing design-module ID. |
 | A3 | Acceptance + bounded audit. Live and saved targets, named pre-run saved SSH drafts, completed interactive rounds with renaming, reviewed continuation, connection groups and working-directory metadata, history search, Markdown/text/PDF export, saved journal defaults, estimate and journal links are implemented. A batch review binds one approval to the displayed ordinary commands and target identities. R `src/workspace/terminal_agent/swarm.rs` and its `batch.rs`/`comparison.rs`/`conversation.rs`. | Verify native renaming, selection, batch review and revocation, comparison, failure isolation, workflow drafts and continuation over pinned SSH. Evaluate Java's standing batch policy and incognito target scope against native authority requirements. Saved follow-up uses reviewed saved SSH routes. |
 | A4 | Acceptance. All eight pinned Agent verbs, events, wait/start/rename and `notification.show` have native Control/CLI routes. Windows socket backpressure and native notification submission have evidence. | Native visible delivery and exact focus/target routing, stale agents, moved splits, timeouts and losses across desktops. Admission/native submission receipts alone do not prove a displayed notice or activation. |
@@ -1236,9 +1336,9 @@ profiles. Native desktop and configured-provider acceptance remain open.
 
 | ID | State and implemented coverage | Remaining work |
 | --- | --- | --- |
-| S1 | Acceptance. Rust, Python, shell, Markdown, AsciiDoc, Dockerfile, SQL, Perl, Ruby, Lua, PowerShell, Java, Groovy, JavaScript and TypeScript structure scanners exist. Python recognizes `with … as`, `except … as`, unpacking and initial augmented assignments and classifies `dict()` and `tuple()` bindings. Lua syntax and completion, LuaJIT detection, and reviewed native format and syntax actions are implemented. | Verify native jumps after edits, nested scopes, repeated names, Unicode, placeholders, and editor tool review, cancellation and SFTP save. Verify discovery and launch from Finder or Dock. The [Step 5 product audit](target/verification/20261112-step5-product-audits.md) records the reference structure cases. |
-| S2 | Acceptance. Completion/improvement/correction/translation/descriptions/alternatives/security actions, description-only Apply/Undo, compact/embedded commands and reviewed HTTPS and CLI assistance exist. | Configured providers and native selection boundaries, changed source, discard/undo, original-profile reruns and explicit clipboard review on each desktop. |
-| S3 | Acceptance. Hardening, validation, script headers, optional modularization, durable selective publication/recovery and workflow diagrams exist. Manual split planning and per-module generation use reviewed HTTPS or CLI alongside local and managed profiles. Outbound reviews bind the saved source, profile, credential context and current job, and are renewed after restart. Single-snippet and folder analyses accept saved CLI profiles. After a saved HTTPS or CLI analysis, the opt-in follow-up opens a separate split preview for that exact report and profile. | Verify actual configured providers, native optional-chain/option-only flow, language eligibility, collisions, cancellation, selected-file publication and restart recovery. |
+| S1 | Implementation, acceptance and reduced-editor scope. Rust, Python, shell, Markdown, AsciiDoc, Dockerfile, SQL, Perl, Ruby, Lua, PowerShell, Java, Groovy, JavaScript and TypeScript structure scanners exist. Python recognizes `with … as`, `except … as`, unpacking and initial augmented assignments and classifies `dict()` and `tuple()` bindings. Lua syntax and completion, LuaJIT detection, and reviewed native format and syntax actions are implemented. | Implement the adjustable library/editor divider. Decide the extent of the multi-language completion list and inline AI suggestions. Verify native jumps after edits, nested scopes, repeated names, Unicode, placeholders, and editor tool review, cancellation and SFTP save. Verify discovery and launch from Finder or Dock. The [Step 5 product audit](target/verification/20261112-step5-product-audits.md) records the reference structure cases. |
+| S2 | Implementation and acceptance. Explicit reviewed completion, improvement, correction, translation, descriptions, selectable snippet alternatives and security actions exist, including description-only Apply/Undo, compact and embedded commands, and reviewed HTTPS and CLI assistance. | Implement programming-language unification, per-finding selection for Security Check, the missing assistant controls and the reviewed formatting/syntax fallback. Verify configured providers and native selection boundaries, changed source, alternative choice and preview, discard/undo, original-profile reruns and explicit clipboard review on each desktop. |
+| S3 | Implementation and acceptance. Hardening, validation, script headers, optional modularization, durable selective publication/recovery and workflow diagrams exist. Manual split planning and per-module generation use reviewed HTTPS or CLI alongside local and managed profiles. Outbound reviews bind the saved source, profile, credential context and current job, and are renewed after restart. Single-snippet and folder analyses accept saved CLI profiles. After a saved HTTPS or CLI analysis, the opt-in follow-up opens a separate split preview for that exact report and profile. | Add the optional language-unification stage before applying analysis changes. Verify actual configured providers, native optional-chain/option-only flow, language eligibility, collisions, cancellation, selected-file publication and restart recovery. |
 | S4 | Resolved. Pinned Java project/folder Apply uses task-local preview state and saves accepted files without durable project Apply/POST records. | No new durable folder Apply/POST implementation is required for confirmed parity. Existing single-snippet durable recovery/POST and S3 modularization remain in scope. |
 | S5 | Acceptance + bounded audit. Native per-snippet diagram persistence, selection/revision binding, stale previews, source jumps, regeneration/deletion, structured interchange and backup exist. Private Java JAXB `<snippets>` library migration retains diagram ownership, source digest, selection bounds and stale references. | Verify private-library migration on native desktops and review unsupported diagram formats against concrete examples. Java standalone snippet exports omit diagrams. Native focus/navigation/restart/whole-scene export remains acceptance. |
 
@@ -1249,6 +1349,17 @@ Evidence includes
 and [Python bindings](PORTING-PARITY.md#model-policy-enforcement-and-python-structure-bindings).
 The seven supported native diagram families and PDF/SVG/PNG exporters exist.
 Their complete interaction and export matrix belongs to V5.
+
+For S2, the tagged snippet editor offers optional AI formatting when the
+formatter is unavailable or cannot meet a requested line width. It also
+offers an AI syntax check for unsupported lint languages. Rust exposes
+built-in and installed tools and a generic reviewed improvement action.
+Connect these specific fallback actions to request review, preserve the
+selected range where appropriate, and keep the syntax check read-only.
+For completions, the Java list combines local identifiers and language
+idioms with optional model candidates. The typing-pause suggestions are
+session opt-in. Record the supported native scope before adding background
+requests. [Java editor](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SnippetEditDialog.java) · [Java completion behavior](https://github.com/chardonnay/korTTY/blob/v2.26.0/app-docs/site/docs/en/features/snippets.md#ai-code-completions)
 
 ## Session journals
 
@@ -1261,8 +1372,8 @@ See [Scheduler screenshots and local vision](PORTING-PARITY.md#scheduler-screens
 | ID | State and implemented coverage | Remaining work |
 | --- | --- | --- |
 | J1 | Acceptance. Per-connection automatic capture, opt-in typed input, XML settings, raw evidence, screenshots, redaction and retention exist. | Native input-off/on, imported omitted/explicit values, command boundaries, reconnect, duplicate/import/export, limits and restart. Preserve screenshot consent and the native typed-input privacy default. |
-| J2 | Acceptance. Local/managed periodic and closing summaries, durable catch-up, re-evaluation, backfill and screenshot re-description exist. Command cards, help and failed-start filtering, the reviewed long-output mode, classified command counts in journal metadata, startup finalization of abandoned native interactive journals, reopenable progress details, and row/group status badges are implemented. Reviewed HTTPS and CLI approvals bind the profile revision, journal root, source identity, redaction rules and output mode. OpenAI-compatible HTTPS summaries support server-selected models through the same approval checks. Live, entry and screenshot note editors offer separate reviewed HTTPS and CLI translation. The native journal viewer and compatible browsers for HTML bundles have a 40-pixel scrollbar thumb minimum. R `src/session_journal/summary_job.rs`, `src/workspace/journal_access/summaries.rs`. | Complete and verify F1 for the summary preflight and streaming credential snapshot. Verify native close and count recovery, scheduling, cancellation, restart, pending deletion and configured HTTPS and CLI providers. Verify local vision, per-connection overrides, desktop progress lifecycle and native scrollbar dragging. |
-| J3 | Acceptance. Reviewed local, HTTPS and CLI Q&A, lexical cross-journal search, reciprocal-rank fusion and exact capture/entry/chat citations exist. Saved HTTP loopback and reviewed OpenAI-compatible HTTPS profiles, including eligible loopback HTTPS, can use server-selected models for Q&A. Each question still requires approval of the exact masked evidence and destination. The viewer and manager preselect an eligible saved HTTPS Journal role. Without a dedicated role, the global HTTPS default is used when no configured local answer takes precedence. Recording and Scheduler retain their separate summary approvals. Separately reviewed local semantic ranking reuses a private per-journal vector for the exact document, masked card and model. Stale and unavailable cache entries use fresh reviewed embeddings or lexical fallback. | Complete and verify the unfinished F1 question dispatch change. Verify native citation routing, stale-source/policy rejection, recorded chats and configured providers. The CLI route uses one approved invocation and validates exact quotations from the reviewed evidence. The semantic scope follows the reviewed candidate shortlist. J `core/SessionJournalAskService.java`, `core/SessionJournalSemanticIndex.java`, R `src/session_journal/question/rank.rs`. |
+| J2 | Acceptance. Local/managed periodic and closing summaries, durable catch-up, re-evaluation, backfill and screenshot re-description exist. Command cards, help and failed-start filtering, the reviewed long-output mode, classified command counts in journal metadata, startup finalization of abandoned native interactive journals, reopenable progress details, and row/group status badges are implemented. F1 binds the HTTPS credential at preflight, streaming and retry. Reviewed HTTPS and CLI approvals bind the profile revision, journal root, source identity, redaction rules and output mode. OpenAI-compatible HTTPS summaries support server-selected models through the same approval checks. Live, entry and screenshot note editors offer separate reviewed HTTPS and CLI translation. The native journal viewer and compatible browsers for HTML bundles have a 40-pixel scrollbar thumb minimum. R `src/session_journal/summary_job.rs`, `src/workspace/journal_access/summaries.rs`. | Verify native close and count recovery, scheduling, cancellation, restart, pending deletion and configured HTTPS and CLI providers. Verify local vision, per-connection overrides, desktop progress lifecycle and native scrollbar dragging. |
+| J3 | Acceptance. Reviewed local, HTTPS and CLI Q&A, lexical cross-journal search, reciprocal-rank fusion and exact capture/entry/chat citations exist. Saved HTTP loopback and reviewed OpenAI-compatible HTTPS profiles, including eligible loopback HTTPS, can use server-selected models for Q&A. F1 passes the reviewed HTTPS credential through question dispatch. Each question requires approval of the exact masked evidence and destination. The viewer and manager preselect an eligible saved HTTPS Journal role. Without a dedicated role, the global HTTPS default is used when no configured local answer takes precedence. Recording and Scheduler retain their separate summary approvals. Separately reviewed local semantic ranking reuses a private per-journal vector for the exact document, masked card and model. Stale and unavailable cache entries use fresh reviewed embeddings or lexical fallback. | Verify native citation routing, stale-source/policy rejection, recorded chats and configured providers. The CLI route uses one approved invocation and validates exact quotations from the reviewed evidence. The semantic scope follows the reviewed candidate shortlist. J `core/SessionJournalAskService.java`, `core/SessionJournalSemanticIndex.java`, R `src/session_journal/question/rank.rs`. |
 
 See [HTTPS journal answers](PORTING-PARITY.md#reviewed-https-journal-answers-and-retained-scheduler-totals)
 and [journal search and recovery](PORTING-PARITY.md#source-selection-managed-recovery-local-file-ownership-journal-search-and-mlx-removal).
@@ -1305,8 +1416,8 @@ See [scheduled AI Memory and journal fact checks](PORTING-PARITY.md#scheduled-ai
 | --- | --- | --- |
 | T1 | Acceptance. Hosted/detached workbench, parallel lanes, idle protection and transfer limits exist. Attached sessions use at most two transfer lanes. A managed cap of one locks the SFTP parallel preference and preserves the personal value. J `ui/SettingsDialog.java`, R `src/sftp_window/parallel.rs`. | Verify native large and colliding transfers, cap changes while lanes drain, idle settings, and hosted/detached behavior. |
 | T2 | Acceptance. Durable single-file downloads/new uploads, reviewed replacement-upload resume, folder child retry and recovery exist. Settings and Java SFTP preference interchange include `sftpResumePartialTransfers` (default on) and dependent `sftpKeepPartialOnCancel` (default off). Turning resume off releases retained offers and history pins and changes waiting retries to fresh copies. | Verify live Java preference exchange, native Linux/macOS interruption and restart, real parallel-lane retries and remote cancellation cleanup after a lost connection. Remote stage removal requires verification of the authenticated route and stage ownership. |
-| T3 | Implementation + acceptance. Browser child-queue folder merge, selective retry, regular-file source links, changed-file batches, destination-only removal and same-server copy exist. Ordinary browser/Scheduler download inheritance and P1's transfer-policy separation are implemented. One-use Windows and Unix Scheduler downloads and ordinary login-owned private remote replacement uploads have reviewed publication, recovery and content-bound approval. Ordinary recurring Calendar and Chain SFTP replacement is implemented in both directions. Protected single-file replacement supports one-use and recurring approval; protected folder merges support one-use approval. | Verify extension absence without client-payload fallback, collisions, foreign-owner writes and changed destinations. Add recurring protected folder synchronization while retaining the implemented file and one-use folder approvals. Ordinary recurring Calendar and Chain replacement already passed pinned OpenSSH fixtures; verify native approval and reapproval. Identify reference-required destinations outside the supported ownership, mode and extended-ACL boundaries and implement their metadata and recovery contract. |
-| T4 | Implementation + acceptance. Native text and external file editing, browser **Open image**, Linux guarded elevated text writeback, and reviewed AI comparison with editable presets and local/unsaved snippet drafts exist. A review can publish a new draft file to a chosen canonical directory on the same authenticated server connection. Local draft replacement reviews an existing target, can create a new `.bak`, and can replace the compared right local file and refresh the exact pair. The right server file can be replaced through the checked native Linux helper with optional `.bak`, preserving supported access metadata and reloading the exact pair. Local and SFTP file editors offer reviewed AI workflows that use the originating saved connection profile when available. An explicit picker choice persists across actions. J `ui/SFTPManagerTab.java`, R `src/sftp_window/worker.rs`, `src/sftp_window/compare/ai.rs`, `crates/ssh/src/sftp/edit.rs`. | Verify the implemented AppKit Copy drag-out from the file manager and terminal sidebar, including cancellations, revoked transfers and staging lifetime. Verify native UI and configured providers, close/reconnect, bounded masked streaming, cancellation and publication. Verify the native Linux helper via direct and isolated SSH. Extend replacement to other reviewed existing destinations and supported server platforms. Verify native image opening, editor launch/writeback/disconnect/recovery and elevated writeback with a real authorized sudo account. |
+| T3 | Implementation + acceptance. Browser child-queue folder merge, selective retry, regular-file source links, changed-file batches, destination-only removal and same-server copy exist. Ordinary browser/Scheduler download inheritance and P1's transfer-policy separation are implemented. One-use Windows and Unix Scheduler downloads and ordinary login-owned private remote replacement uploads have reviewed publication, recovery and content-bound approval. Ordinary recurring Calendar and Chain SFTP replacement is implemented in both directions. Protected single-file replacement supports one-use and recurring approval; protected folder transfers support one-use and bounded recurring approval for existing or initially vacant receivers. | Verify extension absence without client-payload fallback, collisions, foreign-owner writes and changed destinations. Verify recurring first publication into vacant protected receivers through the installed helper and configured native routes; retain and verify the implemented file and existing-folder approvals. Ordinary recurring Calendar and Chain replacement already passed pinned OpenSSH fixtures; verify native approval and reapproval. Identify reference-required destinations outside the supported ownership, mode and extended-ACL boundaries and implement their metadata and recovery contract. |
+| T4 | Implementation + acceptance. Native text and external file editing, browser **Open image**, Linux guarded elevated text writeback, and reviewed AI comparison with editable presets and local/unsaved snippet drafts exist. A review can publish a new draft file to a chosen canonical directory on the same authenticated server connection. Local draft replacement reviews an existing target, can create a new `.bak`, and can replace the compared right local file and refresh the exact pair. The right server file can be replaced through the checked native Linux helper with optional `.bak`, preserving supported access metadata and reloading the exact pair. Local and SFTP file editors offer reviewed AI workflows that use the originating saved connection profile when available. An explicit picker choice persists across actions. J `ui/SFTPManagerTab.java`, R `src/sftp_window/worker.rs`, `src/sftp_window/compare/ai.rs`, `crates/ssh/src/sftp/edit.rs`. | Verify the implemented AppKit Copy drag-out from the file manager and terminal sidebar, including cancellations, revoked transfers and staging lifetime. Verify native UI and configured providers, close/reconnect, bounded masked streaming, cancellation and publication. Verify the native Linux helper via direct and isolated SSH. Add left-file/draft comparison and pair switching. Extend replacement to other reviewed existing destinations and supported server platforms. Verify native image opening, editor launch/writeback/disconnect/recovery and elevated writeback with a real authorized sudo account. |
 | T5 | Acceptance + bounded audit. Local PTY sandbox launch paths use Linux Landlock/seccomp, macOS Seatbelt and Windows Process Security Environments. Fedora ARM64 local-shell and worker containment, installed Flatpak local-shell containment, Windows ARM64 ConPTY containment, and native Apple Silicon Seatbelt and packaged SSH isolation passed. Windows uses CMD with Win32k lockdown and rejects the Windows PowerShell preset in sandbox mode. | Run local-shell and packaged SSH fixtures on native macOS Intel and Windows x64, including interactive behavior and containment. Track broader Windows shell compatibility. Direct, process-isolated and jump RSA passed on Apple Silicon. V6 still tracks the external review and active dependency advisories. See the [native Mac verification](target/verification/20261112-step6-macos.md). |
 | T6 | Acceptance, hardware deferred. Saved serial connections, encodings, grouping/tags/favorites/pins, mixed library actions and import/export exist. | Native Manager selection/actions/interchange. Physical break/modem/flow-control tests remain user-deferred under V4. Serial library organization is no longer an implementation gap. |
 
@@ -1314,6 +1425,43 @@ Java drag transfers and global archive defaults are in `ui/SFTPManagerTab.java`,
 `ui/TerminalRemoteSidebar.java` and `ui/SettingsDialog.java`. The native queue,
 archive dialog and transfer preferences live in `src/sftp_window.rs`,
 `src/sftp_window/archive.rs` and `src/workspace/settings_window/sftp_settings.rs`.
+
+Java terminal-surface drops use `ui/TerminalView.java`. Text goes to the
+exact pane and uses paste protection. A file drop uses the pane's open
+SSH route and checks the current shell identity before starting SFTP.
+On native Wayland, Rust now routes UTF-8 text offers to the pane under
+the pointer through its paste protection. The imported
+`terminalDragDropEnabled` preference and the Terminal setting gate
+admission. Internal clipboard policy, mirrored input and stale terminal
+streams block text drops. Verify compositor interaction with an external
+source, tab and stream changes, and copy-only negotiation. Native Wayland
+file offers now open a terminal upload review on the exact SSH split.
+The review uses the canonical SFTP directory reached from the tracked shell
+directory or the SFTP start directory. It binds the stream and shell
+context until completion and uses the existing upload conflict controls.
+Verify compositor delivery, folder uploads, cancellation and reconnection
+on deployed Wayland routes. Windows, macOS and X11 use native file-drop
+coordinates to select the terminal pane and send file batches to the
+same reviewed uploader. Verify the real desktop gestures from Explorer,
+Finder and an X11 file manager, including multiple files and drops outside
+the terminal. AppKit accepts external plain-text Copy offers and uses the
+same terminal target binding and paste protection as Wayland. File offers
+retain the existing AppKit file route. Verify text drops from a native
+macOS source into an inactive split, policy changes and no drop over tool
+panels. Windows uses a shared OLE drop target for Unicode text and files.
+The native client coordinates drive the shared terminal target checks and
+paste protection. File offers still emit Iced file events. Verify live
+text and file drops from Windows desktop sources across DPI settings,
+including inactive terminal splits and drops over tool panels. X11 uses
+an Xdnd proxy to receive Unicode text and file offers. Text transfers begin
+on drop and follow the shared pane, stream, clipboard and paste checks.
+The live GTK 4 fixture reached the intended inactive split and left drops
+over the application chrome unprocessed on X11 at 100 and 200 percent
+scale and on Mutter Xwayland at 100 percent. Continue live acceptance with
+desktop text selections and file managers, including application zoom,
+tool overlays, and the Wayland-to-Xwayland path.
+Keep terminal-surface routing independent of drops on the SFTP Manager
+and the remote-files sidebar.
 
 ### File operation contracts to preserve
 
@@ -1358,13 +1506,14 @@ file without special mode bits. Unix replacement requires preservable UID/GID
 and rejects unsupported extended access ACLs. Browser foreign-owner in-place
 replacement is already implemented with its documented partial-visibility
 contract. Identify the remaining Java-required destination cases individually
-before extending these contracts. Protected single-file replacement now
-supports both sudo modes and recurring approval. Protected folder changes
-still use one-use review. Ordinary recurring SFTP and recurring rsync support
-Calendar and Chain starts. `Copy::validate_job_schedule` continues to reject
-standing approval for privileged folder copies. See
-R `src/scheduler_window/sync.rs::Copy::validate_job_schedule` and
-`src/sftp_window/worker/sync/replacement/remote.rs`.
+before extending these contracts. Protected single-file replacement and
+protected folder transfers support both sudo modes and one-use or bounded
+recurring approval. `Copy::validate_job_schedule` admits an enabled calendar
+or a Chain with predecessors. Each protected folder run checks the bound
+receiver, and an unconfirmed publication requires review before another
+firing. The deployed helper and native Scheduler still need this acceptance
+case. [Schedule validation](src/scheduler_window/sync.rs) ·
+[Standing approval](src/scheduler_window/sync/standing.rs)
 
 Initially vacant recurring rsync downloads of a single file per saved route
 review the vacant name and its existing local parent. The first successful
@@ -1535,8 +1684,8 @@ Agent and native-tool outputs against their own review scopes.
 
 | ID | State and implemented coverage | Remaining work |
 | --- | --- | --- |
-| Q1 | Implementation + acceptance. Missing-only SFTP sync, one-use/standing/cascade/predecessor reviews, multi-target Agent/Swarm, per-round approval, comparison and saved follow-up exist. Read-only and iterative scheduled Swarms admit up to sixteen reviewed target workflows and queue the remainder of up to 32 routes. Windows and Unix have a one-use reviewed changed-file download path. Ordinary uploads can replace reviewed private files owned by the remote login. Recurring approval can explicitly authorize replacements in either direction within the firing budget. rsync supports reviewed regular-file and directory transfer on Unix and Windows, including literal batches and mixed file and folder projections. Each combined route stages and verifies one tree with named or contents placement, scoped mirror deletion and recovery. Existing downloads support protected local folders and regular files on Linux, macOS and Windows. Direct file replacement supports one-use and recurring approval, with explicit distinct local paths for grouped routes. Recurring single and mixed existing-directory plans bind calendar and Chain occurrences, a reviewed receiver per route, and aggregate byte, entry and removal limits. Recurring Linux uploads use the protected v3 helper. Passwordless elevation uses a fixed Linux helper for direct and combined transfers, including guarded existing-directory upload and download. | Verify native larger Swarm runs over pinned SSH with configured providers, cancellation, journal/report/reopen and saved group refresh and reapproval after membership changes. Verify the implemented recurring file replacement paths on native desktops. Add recurring protected folder synchronization under T3 and address reference-required remote destinations outside the supported upload scope. Fedora verified ordinary SFTP Calendar and Chain starts through pinned OpenSSH. Verify configured deployments and remaining native editor paths for combined passwordless transfers. Passwordless standing rsync covers existing protected remote files and remote or local directories. Fedora verified recurring direct-file downloads with ordinary and passwordless pinned OpenSSH. Windows verified the one-use direct-file receiver over pinned OpenSSH. Confirm native approval and recovery and verify the remaining platform cases. Fedora verified first publication and replacement at vacant Linux server file and directory receivers through ordinary and passwordless routes. Verify disjoint and shared file and directory hierarchies and imported group layout through native Scheduler review and adoption. Verify merge, mirror and recurring approval through native desktop interaction. Verify deletion scope, recurrence, cascade and expiry, groups and batches on Windows and native macOS. |
-| Q2 | Implementation + acceptance. Elevated command/script/snippet, reviewed new-file/new-tree transfers, one-use and bounded recurring protected file replacement in both directions, one-use protected folder merges into existing destinations, desktop outcomes and independently approved HTTPS webhooks exist. Typed Linux sudo actions cover mkdir, octal and explicit-class symbolic chmod, numeric chown, regular-file and recursive folder copy to vacant paths, no-replace file/folder rename and protected deletion. The Scheduler can resolve names through a bounded read-only command on one pinned saved route. Explicit acceptance stores the UID or GID. Recursive operations support up to 128 total entries. The browser and Scheduler support server-only ZIP, TAR, TAR.BZ2 and 7z creation with reviewed output UID, GID and ordinary mode through the updated helper. Ordinary Scheduler jobs can create vault-backed AES-256 ZIP and verify and publish an optional local copy using the same SSH session. An opt-in Linux workflow supports ordinary same-path archive updates, ZIP Add, fresh TAR output and recovery for the remote and local files. A separately installed Linux helper supports these archive formats and AES-256 ZIP through a path-constrained Scheduler sudo route with either an explicit passwordless review or a separately reviewed vault password. An administrator download root can permit a local copy of its newly published archive through the same command channel. | Ordinary SFTP symbolic permissions require a canonical path and the server's no-follow `lsetstat` extension. Verify symbolically computed ordinary modes through the descriptor-held sudo path with an authorized SSH route. Add recurring protected folder approval and receipt progression; retain the tested one-use folder merge and file-recovery implementation. Verify the installed folder helper through a configured native Scheduler route. Verify recurring file replacements and reapproval from native Scheduler windows against a deployed helper. Verify native adoption of restored Java sudo staging drafts. Fedora verified ordinary and sudo client update fixtures and the Java archive layouts. Verify a configured desktop route with the installed helper. Verify the optional protected archive copy with pinned SSH, configured download roots, revocation and local publication. The native pinned client and the installed V2 helper passed separate Fedora checks, including actual sudo/PAM in an isolated test account. Verify deployment on a saved desktop route. Verify archive output metadata through the installed helper and live pinned SSH. The privileged route retains root-owned private output, consistent with Java's archive sudo controls. Verify named ownership over a live native SSH route, the installed archive helper under transfer denial, real authorized sudo, Windows/macOS publication, configured webhooks and live desktop delivery. J `jobscheduler/JobSchedulerJobRunner.java`, R `src/job_executor/remote/privileged.rs`. |
+| Q1 | Implementation + acceptance. Missing-only SFTP sync, one-use/standing/cascade/predecessor reviews, multi-target Agent/Swarm, per-round approval, comparison and saved follow-up exist. Read-only and iterative scheduled Swarms admit up to sixteen reviewed target workflows and queue the remainder of up to 32 routes. Windows and Unix have a one-use reviewed changed-file download path. Ordinary uploads can replace reviewed private files owned by the remote login. Recurring approval can explicitly authorize replacements in either direction within the firing budget. rsync supports reviewed regular-file and directory transfer on Unix and Windows, including literal batches and mixed file and folder projections. Each combined route stages and verifies one tree with named or contents placement, scoped mirror deletion and recovery. Existing downloads support protected local folders and regular files on Linux, macOS and Windows. Direct file replacement supports one-use and recurring approval, with explicit distinct local paths for grouped routes. Recurring single and mixed existing-directory plans bind calendar and Chain occurrences, a reviewed receiver per route, and aggregate byte, entry and removal limits. Recurring Linux uploads use the protected v3 helper. Passwordless elevation uses a fixed Linux helper for direct and combined transfers, including guarded existing-directory upload and download. | Implement Teamwork target selection, group refresh and firing with the reviewed shared route and current scoped credentials. Recover private rsync staging after forced helper termination. Verify native larger Swarm runs over pinned SSH with configured providers, cancellation, journal/report/reopen and saved group refresh and reapproval after membership changes. Verify the implemented recurring file replacement paths on native desktops. Verify the implemented recurring vacant-folder progression under T3 through deployed native routes and address reference-required remote destinations outside the supported upload scope. Fedora verified ordinary SFTP Calendar and Chain starts through pinned OpenSSH. Verify configured deployments and remaining native editor paths for combined passwordless transfers. Passwordless standing rsync covers existing protected remote files and remote or local directories. Fedora verified recurring direct-file downloads with ordinary and passwordless pinned OpenSSH. Windows verified the one-use direct-file receiver over pinned OpenSSH. Confirm native approval and recovery and verify the remaining platform cases. Fedora verified first publication and replacement at vacant Linux server file and directory receivers through ordinary and passwordless routes. Verify disjoint and shared file and directory hierarchies and imported group layout through native Scheduler review and adoption. Verify merge, mirror and recurring approval through native desktop interaction. Verify deletion scope, recurrence, cascade and expiry, groups and batches on Windows and native macOS. |
+| Q2 | Implementation + acceptance. Elevated command/script/snippet, reviewed new-file/new-tree transfers, one-use and bounded recurring protected file replacement in both directions, one-use and recurring protected folder transfers with confirmed vacant-to-existing receiver progression, desktop outcomes and independently approved HTTPS webhooks exist. Typed Linux sudo actions cover mkdir, octal and explicit-class symbolic chmod, numeric chown, regular-file and recursive folder copy to vacant paths, no-replace file/folder rename and protected deletion. The Scheduler can resolve names through a bounded read-only command on one pinned saved route. Explicit acceptance stores the UID or GID. Recursive operations support up to 128 total entries. The browser and Scheduler support server-only ZIP, TAR, TAR.BZ2 and 7z creation with reviewed output UID, GID and ordinary mode through the updated helper. Ordinary Scheduler jobs can create vault-backed AES-256 ZIP and verify and publish an optional local copy using the same SSH session. An opt-in Linux workflow supports ordinary same-path archive updates, ZIP Add, fresh TAR output and recovery for the remote and local files. A separately installed Linux helper supports these archive formats and AES-256 ZIP through a path-constrained Scheduler sudo route with either an explicit passwordless review or a separately reviewed vault password. An administrator download root can permit a local copy of its newly published archive through the same command channel. | Ordinary SFTP symbolic permissions require a canonical path and the server's no-follow `lsetstat` extension. Verify symbolically computed ordinary modes through the descriptor-held sudo path with an authorized SSH route. Verify recurring vacant-folder progression, existing-folder standing approval, durable pending state and native recovery through the installed helper and native Scheduler windows. Verify the installed folder helper through a configured native Scheduler route. Verify recurring file replacements and reapproval from native Scheduler windows against a deployed helper. Verify native adoption of restored Java sudo staging drafts. Fedora verified ordinary and sudo client update fixtures and the Java archive layouts. Verify a configured desktop route with the installed helper. Verify the optional protected archive copy with pinned SSH, configured download roots, revocation and local publication. The native pinned client and the installed V2 helper passed separate Fedora checks, including actual sudo/PAM in an isolated test account. Verify deployment on a saved desktop route. Verify archive output metadata through the installed helper and live pinned SSH. The privileged route retains root-owned private output, consistent with Java's archive sudo controls. Verify named ownership over a live native SSH route, the installed archive helper under transfer denial, real authorized sudo, Windows/macOS publication, configured webhooks and live desktop delivery. J `jobscheduler/JobSchedulerJobRunner.java`, R `src/job_executor/remote/privileged.rs`. |
 | Q3 | Acceptance. Per-target Session Journals, capture revocation independent of execution, closing summaries, retention, estimates/totals, result links and Java retention-preference XML exist. | Native viewer/details/estimate/options and import/export dialogs, actual run/provider outcomes and target lifecycle. Verify a successful scheduled command under installed capture denial while existing retention continues. Java JAXB 0/37/3650 round trips already exist. |
 | P1 | Acceptance + bounded audit. Managed Control activation, SFTP separation, update feed, encrypted recovery output, scoped AI restrictions, protected/provisioned models, custom headers, automation capture and managed SFTP conflict defaults exist. Startup supports managed and personal password requirements. The shared `allow-telemetry` Boolean is accepted for compatibility. Scoped `rule.ai-memory.statistics` controls local collection. | Decide the scope of remembered vault unlock. Verify startup vault setup and unlock, the stricter host-pin lock contract, native worker enforcement, scoped precedence and revocation, SMB sources, signed protected inference and macOS protected-cache restart. See the [field audit](target/verification/20261112-step5-policy-audit.md) for the earlier snapshot. |
 | R1 | Acceptance. Native/tiled playback, visible IBM recording, Java JSONL/GZIP import/export, legacy plain JSONL import, and reviewed WebM/VP9 and MKV/FFV1 exports exist. Java reader compatibility and both Fedora codecs have evidence. | Native wide/resize/synchronized playback and approved encoder execution/cancellation/cleanup on Windows/macOS. Java recording interchange and video export are no longer implementation gaps. |
@@ -1588,21 +1737,421 @@ Evidence includes
 
 ### Remaining field and identity audit
 
-The backup importer is additive and explicit; implementing a native setting
-does not automatically import the Java value. The 2026-11-17 source check
-compared `GlobalSettings.java` at v2.26.0 with `src/workspace/backup_data.rs`
-and its typed preference readers. The remaining work must be tracked by
-field and policy rather than by a new blanket "Java backup support" task:
+The additive importer handles individual fields. The November 18 check
+compared the 346 top-level non-static fields in the tagged
+`GlobalSettings.java` with the 42 readers in the
+[November 17 inventory](target/verification/20261117-java-global-field-triage.json)
+and the six additional Rust modules in `src/workspace/backup_data/`.
+The check looked for each exact field name as a quoted string before the
+first `#[cfg(test)]` in each of the 48 files. It found 197 names and left
+149 for inspection through other readers, aliases, omissions and product
+decisions. For example, `aiSkillsEnabled` has a working delegated import.
+A literal match also requires checking its behavior. The figures measure
+search coverage.
 
-- Map or record a disposition for unhandled non-secret preferences, including
-  `sessionJournalSummarizeIntervalMinutes`, `sessionJournalAiTitleEnabled`,
-  `sessionJournalSemanticSearchEnabled`,
-  `jobSchedulerDependencyDiagramHorizontal`,
-  `jobSchedulerDependencyDiagramColorMode`, `aiMemoryMaxTokens` and
-  `terminalAgentCommandName`. These names have no current import mapping.
-  Verify the native equivalent, omitted/default values, bounds, existing-value
-  precedence and restart replay. This list is a confirmed starting set, not
-  an exhaustive mapping of all Java fields.
+- Map `maxBackupCount` and `autoBackupInterval`. Both applications
+  support 0–100 retained backups and Off, Daily, Weekly and Monthly
+  scheduling. Rust already implements rotation and scheduled backups. On
+  migration, preserve existing native choices and require the native
+  destination and credential configuration before automatic execution.
+  [Java backup settings](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/model/GlobalSettings.java) · [Native preferences](src/profile_backup/preferences.rs)
+- Map `asciiArtPictureSize`, `asciiArtImageSize`, `asciiArtCopyCommentStyle`,
+  `asciiArtCopyPrintStyle` and `asciiArtCopyGap`. The native ASCII Art
+  dialog already saves both image sizes and the copy format. Its Java
+  settings adapter currently applies only imported zoom to those display
+  preferences. Check individual defaults and existing native choices on
+  additive restore. [Java controls](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AsciiArtBannerDialog.java) · [Native preferences](src/workspace/ascii_art.rs)
+- Migrate `snippetWorkspaceOpenTabs` and `snippetWorkspaceActiveTab` after
+  resolving the restored snippet IDs. Cover an existing native tab session,
+  a remapped ID and a missing snippet. Bind
+  `snippetWorkspaceLibraryDividerPosition` to the new adjustable library
+  divider. The deprecated manager preview divider has a separate disposition
+  below. [Native tab state](src/snippet_window/session.rs)
+- Add `aiSnippetEditorAdditionalInstructionsEnabled` to the native editor
+  controls and import its value. Honor it in the affected snippet actions
+  before preparing the reviewed request. Migrate `aiAlternativesFontSize`,
+  `aiDiffFontSize` and `aiReviewFontSize` when the corresponding views
+  support independent zoom. The analysis-report and SFTP comparison AI fonts
+  already have their own settings.
+- Java application log retention and the update check interval now fill
+  individually unset native fields using the pinned Java bounds. A saved
+  disabled update preference can fill an unset field. A saved enabled
+  preference is shown in Rust update settings for review and requires the
+  existing native opt-in and Save. Java log folder paths require selection on
+  the current machine. Old update timestamps and prompt state belong to the
+  Java release channel. Java telemetry consent does not opt in to Rust
+  telemetry. Verify the displayed preferences in the native settings window.
+- The six Teamwork global fields now restore as inactive suggestions. Teamwork
+  Settings can copy one proposed source at a time into the native editor as a
+  disabled entry, retaining its Java source ID in the proposal. The editor
+  checks duplicate source origins and requires a valid native path or Git URL
+  before saving. Apply the proposed default interval explicitly. The Java
+  credential ID, key ID, username and temporary-key preference are visible in
+  the Teamwork view of Connection Manager. Its Java mapping picker offers local
+  vault passwords and registered keys by the imported method, and carries the
+  Java username into a selected key draft. The existing Apply step checks the
+  current local choices and saved state before committing. Verify restore,
+  source activation and authentication mapping on native desktops.
+  Interactive SSH and SFTP can now retain password, key and temporary-key
+  defaults together. They select the first available method in that order
+  before opening the login form. The native password must cover the selected
+  endpoint. Existing single-method defaults remain readable. Verify the
+  configured fallback and vault-unlock interaction on native desktops.
+  The Java Scheduler resolver also supports Teamwork connections with password
+  and registered-key fallback. Rust Scheduler references currently address
+  entries in the local saved connection store. The desktop login now uses a
+  serializable Teamwork route reference with the source origin, external ID,
+  exact group, source target and jump endpoints, auth methods and default-auth
+  eligibility. The reference contains neither native credentials nor foreign
+  credential IDs. Use it for a distinct Scheduler target kind with backward
+  compatibility for local IDs. Java Scheduler accepts both explicit Teamwork
+  targets and descendants of a selected group. Extend the Scheduler picker
+  and group refresh together and reject ambiguous IDs across sources.
+  Bind the source route and the effective username, pinned SSH route and scoped
+  local authentication in the existing approval paths. Recheck source visibility,
+  membership and route before use. Keep Java's scheduled password and registered
+  key behavior separate from the interactive temporary-key flow.
+  `TeamworkSourceConfig.readOnly` is documented as informational in Java and
+  is not a missing write-back feature. Its `policyManaged` field is transient
+  and must not become policy authority through restore. The wider global-field
+  inventory remains open.
+- Java `aiSkillsEnabled`, `aiSkillAutoDetectionEnabled`, `aiSkillAutoCreate`
+  and `aiSkillStatisticsEnabled` now import as four independent, inactive
+  suggestions for the existing native Skills switches. Explicit adoption
+  retains the automatic-selection confirmation, managed learning/statistics
+  overrides and read-only restrictions; normal Save establishes runtime use.
+  Additive replay preserves earlier hints and native preferences. Invalid or
+  duplicate fields are reported separately. Apple Silicon and Fedora ARM64
+  passed the three new fixtures, 340 AI Manager tests, 147 profile-backup tests
+  and 246 Agent tests. Windows ARM64 application/test Clippy passed. The
+  [four-field semantic audit](target/verification/20261117-java-skill-field-audit.json)
+  records the exact mappings and pinned reference. Native desktop/cross-host
+  adoption and complete field-by-field reconciliation remain open. See the
+  skill-preferences entry in PORTING-PARITY.md.
+- `terminalAgentConfirmMutatingCommandSets` now imports as an inactive hint and
+  can be adopted explicitly in AI Manager. The native preference defaults to
+  false, matching Java, and controls whether a command review can grant
+  continuation for future ordinary commands in the same run/target. Standalone
+  and per-target Swarm reviews expose that explicit action. Grants bind the
+  current profile revision and saved settings, and require managed Allow mode.
+  Pause, failure, elevation requests, profile/settings changes and run closure
+  end the grant. Background dispatch checks it again before starting a command.
+  Windows ARM64 Clippy and targeted native Apple Silicon/Fedora Agent,
+  scheduler and AI Manager tests passed; see the confirmation entry in
+  PORTING-PARITY.md. Native desktop interaction and live SSH acceptance remain
+  open. Automatic read-only dispatch now uses Java's command-shape checks plus native
+  command-word checks after an explicitly reviewed, successful probe. Explicit
+  model confirmation requests remain marked for review. Outside an explicitly
+  permitted root bypass, inline `ask=true` and the per-run checkbox prevent
+  automatic dispatch and continuation grants.
+  Targeted native Apple Silicon/Fedora Agent, backend, Scheduler-Agent and
+  AI Manager tests passed for these paths, as did Windows ARM64 Clippy. See the
+  automatic-dispatch entry in PORTING-PARITY.md. The inline root-bypass option is now implemented with the current policy,
+  profile and credential controls. Its grants share revocation with background
+  copies, and pause invalidates pending approved-directory replies. Native
+  Apple Silicon/Fedora fixtures and 246 Agent tests passed, alongside backend,
+  Scheduler-Agent and AI Manager selections. Windows ARM64 Clippy passed.
+  Live SSH root execution and password interaction remain acceptance requirements.
+  See the root-bypass entry in PORTING-PARITY.md for snapshot and cleanup records. The native ordinary-command grant
+  does not bypass elevation or password approval.
+- Java `terminalAgentExecutionEnabled` now imports as an inactive AI Manager
+  hint. Explicit adoption and Save control a native execution switch whose
+  default remains true, matching Java. Agent Run, executing Swarm and scheduled
+  Agent diagnostics enforce it; Ask, planning and ordinary snippets retain
+  their separate policy checks. Existing runs are cancelled on reconciliation.
+  Background Agent dispatch and scheduled execution reread saved settings
+  before dispatch, including previously approved commands. Policy restrictions
+  continue to apply. Windows ARM64 application/test Clippy passed with warnings
+  denied. Apple Silicon passed the explicit gate fixture, 236 Agent tests
+  (three ignored), 27 Agent backend tests, 58 Scheduler-Agent tests and
+  335 AI Manager tests (12 ignored). Native desktop, live SSH revocation and
+  other target runtime acceptance remain open. See the Agent execution entry
+  in PORTING-PARITY.md.
+- Java `aiMemoryEnabled` and `aiMemoryLearningMode` now import as
+  independently optional, inactive AI Manager hints. Java and Rust both
+  support Propose and Off. Missing fields preserve native values; malformed
+  fields are reported independently without dropping a valid sibling.
+  Additive replay fills only absent hint fields. The Memory page provides
+  separate explicit adoption actions, with the current feature, read-only
+  and managed learning-policy guards. The token budget is unchanged by these
+  actions. Only the normal Save affects the loaded runtime configuration.
+  Windows ARM64 application/test Clippy passed with warnings denied. Apple
+  Silicon passed the explicit persisted-runtime fixture, 86 Memory tests and
+  333 AI Manager tests (12 ignored). Native desktop adoption and the wider
+  Memory migration acceptance remain open. See the Memory activation entry
+  in PORTING-PARITY.md.
+- Java `sessionJournalSemanticSearchEnabled` now imports as an inactive
+  AI Manager suggestion. Explicit adoption and Save establish the native
+  default for preparing cross-journal questions. Enabled preparation uses
+  the configured local embedding model with masked query/search cards, keeps
+  the evidence review before answer dispatch, and falls back to lexical
+  ranking if no model is available. The preparation view names the embedding
+  model and describes the data sent. Configuration changes cancel stale
+  preparations. The setting is searchable in AI Manager. Windows ARM64
+  application/test Clippy passed with warnings denied. Apple Silicon passed
+  the explicit semantic-preparation fixture, 617 Journal tests (12 ignored)
+  and 330 AI Manager tests (12 ignored). Native desktop/provider acceptance
+  remains open. See the semantic search entry in PORTING-PARITY.md.
+- Java `terminalAgentCommandName` and
+  `terminalAgentCommandNameCaseInsensitive` now import as independently
+  optional, inactive AI Manager suggestions. Additive replay fills missing
+  hint fields without replacing native preferences. Explicit adoption changes
+  the name/case settings and preserves the shortcut enablement switch; the
+  normal Save performs the concurrent-configuration check. Rust now accepts
+  names up to 8 KiB instead of 32 bytes, with the same ASCII character rules
+  as Java. The capture budget includes the full alias and prompt budgets.
+  Java names beyond this bounded input contract are reported as omitted.
+  Windows ARM64 application/test Clippy passed with warnings denied. Apple
+  Silicon passed 615 Journal tests (12 ignored), 328 AI Manager tests
+  (12 ignored) and 36 shortcut tests (one live SSH case ignored), including
+  persisted adoption and actual local-shell input with a longer custom name.
+  Desktop adoption and live SSH acceptance of an imported custom name remain
+  open. See the Agent command migration entry in PORTING-PARITY.md.
+- Java `aiMemoryMaxTokens` now imports as an inactive AI Manager suggestion.
+  The reader follows Java's 500–4,000 token bounds; malformed values are
+  reported as omitted. Additive replay preserves an existing hint and all
+  native Memory settings. Explicit adoption changes only the proposed token
+  budget, observes the current managed cap and leaves Memory enablement and
+  learning unchanged. The normal AI Manager Save persists the choice and
+  rejects a concurrently changed configuration. Windows ARM64 application/test
+  Clippy passed. Apple Silicon passed 41 Memory tests, eight AI backup tests,
+  27 Java profile-import tests and 615 Journal tests (12 ignored). The tests
+  cover portable replay, native preference preservation, invalid values,
+  explicit adoption and live policy limits. Native desktop adoption remains
+  open. See the Memory budget entry in PORTING-PARITY.md.
+- Journal summary interval and automatic-title preferences now import as
+  inactive, independently optional suggestions. Interval values follow Java
+  bounds (1–240 minutes). Additive replay fills missing suggestion fields
+  without replacing existing ones. Adoption in Journal summary settings
+  rechecks the imported source at Save, retains native settings until explicit
+  adoption, and does not enable summaries or grant outbound title requests.
+  Windows ARM64 passed 609 Journal tests (10 ignored), seven AI backup
+  tests and 27 Java profile-import tests, including adoption, changed-source
+  rejection, bounds, omission reporting and portable replay. Application/test
+  Clippy passed with warnings denied. The later Apple Silicon Memory-budget
+  snapshot also passed the Journal adoption fixtures in its 615 Journal tests
+  (12 ignored). Native desktop adoption and remaining cross-host acceptance
+  remain open. See the Journal preferences entry in PORTING-PARITY.md.
+- Scheduler dependency diagram orientation and Auto, Light, and Dark color
+  mode now restore from Java into individually unset fields. The native view
+  reads the saved settings, and changes in the diagram persist for the next
+  view or restart. Auto follows the native system theme. Verify import,
+  native interaction and export on the remaining targets. Windows ARM64
+  passed both focused preference tests and 207 Scheduler tests (one ignored).
+  [Scheduler record](target/verification/20261117-scheduler-diagram-windows-suite.log).
+- The Scheduler journal's table/detail divider accepts the saved Java
+  position when the native field is unset. Rust starts at 72 percent for a
+  fresh profile, clamps drags between 20 and 90 percent, and saves the position
+  after a brief pause or at shutdown. New hosted and separate Scheduler views
+  read the saved value. Verify dragging and reopening in native desktop views.
+- Java's `sessionJournalLiveTailHeightVh` maps to the native Live Journal
+  dock's log allocation when the native preference is unset. The dock
+  exposes a height slider from 15 to 85 percent of the space shared by
+  the timeline and output. It saves the profile preference on release
+  or after a short pause and preserves it when reopening the log.
+  Verify the control and anchor behavior during a live desktop capture.
+- Java's `journalLivePanelPlacement`, `journalLivePanelWidth`, and
+  `sessionJournalViewerEditDividerPosition` fill unset native layout
+  preferences independently. The importer applies the native width and
+  editor split limits. Saved native values win on restore and replay.
+  Verify the imported placement, width and editor divider on native
+  desktops after restarting kortty.
+- The explicit Java window bounds for Journal Manager, Journal Viewer and
+  Screenshot Editor now restore as independent placement fallbacks.
+  Existing native per-dialog bounds take precedence. Detached windows
+  apply the native screen placement and size limits. Verify all three
+  dialogs on native desktops, including an unplugged secondary monitor.
+- Imported Java dialog bounds now also cover AI Manager, Saved Chats,
+  ASCII Art, Snippet Manager, Job Scheduler, and the Guide Viewer. The
+  named Java geometry list maps exact keys for Journal Markers, Journal
+  Export and the terminal's Journal Note. Duplicates and unknown keys
+  are reported as omissions. Verify hosted and detached openings after
+  restore. Continue auditing named Java keys against distinct native
+  dialogs and preserve any existing native placement.
+- Java's last main-window bounds, maximized state, and Dashboard
+  visibility now restore as startup fallbacks. Active fixed bounds and
+  the native last-window record take precedence within their respective
+  settings. The local remember-geometry and remember-Dashboard switches
+  still apply. Verify restart, maximization, and display changes on
+  native desktops.
+- Java's `fileBrowserPosition`, `fileBrowserWidth`, and
+  `fileBrowserShowHidden` now restore as local file browser defaults.
+  Existing native side and width take precedence. An older native dock
+  file can still inherit the newly persisted hidden-files choice until
+  the user changes it in Rust. The Java last-root path is reported as an
+  omission and requires selection on this device. The native file
+  browser now remembers the last folder it opened successfully on this
+  device and falls back to the home directory if the folder disappears.
+  Verify local navigation and restart on native desktops.
+- The SFTP file comparison AI panel supports the Java 9–32 point font
+  range and 13-point default for questions and answers. The ordinary
+  view saves changes as a global preference for newly opened SFTP views.
+  Incognito changes remain local to the view. Java `sftpDiffAiFontSize`
+  fills the unset native preference with Java's clamping behavior.
+  Verify the font controls and reopen behavior on native desktops.
+- The SFTP Manager remembers the local and server hidden-entry toggles
+  independently for newly opened standalone, attached, and project views.
+  Java `sftpShowHiddenLocal` and `sftpShowHiddenRemote` fill unset choices.
+  Both panels show hidden entries by default. Changes in incognito views
+  stay in the view. The focused file listing accepts Command+Shift+Period
+  on macOS and Ctrl+Shift+Period on Windows and Linux. Verify restart and
+  the toggles in standalone and hosted views on native desktops.
+- Command+L on macOS and Ctrl+L on Windows and Linux focus the active
+  SFTP pane's path field and select its existing path. The same field
+  handles ordinary editing and navigation. Verify the shortcut with
+  native keyboard focus in standalone and hosted views.
+- The focused SFTP list accepts F2 for Rename and Delete or
+  Command/Ctrl+Backspace for the existing Delete confirmation. The keys
+  share the buttons' availability checks. Rename requires a single
+  selection. Delete accepts multiple selected files, links or empty
+  folders in either pane and shows the directory and selected names.
+  The worker checks the selection before starting and reports partial
+  completion if an operation fails. Running deletion has a Stop action
+  and a close confirmation. Cancellation stops before the next removal.
+  The result distinguishes confirmed removals from a server removal
+  whose reply was lost. Recursive deletion previews regular files,
+  folders, server symbolic links and recognized POSIX special entries,
+  whether selected directly or included in a selected server folder.
+  A mixed selection containing a special entry can be reviewed for
+  deletion. Queued and drag transfers require every selected entry to
+  be copyable. Recursive deletion revalidates the reviewed snapshot
+  and removes children before their parents. Server links are removed as
+  entries using their reviewed link targets, including dangling links.
+  Recognized special entries are reviewed and unlinked using metadata
+  without opening them.
+  The reviewed path requires protected server directories and the SFTP
+  POSIX rename extension. On Unix, local recursive removal also reviews
+  links and recognized special entries without following or opening them.
+  It verifies their identity and metadata through a private quarantine
+  in the protected parent and restores a relocated entry on cancellation
+  when its original name is vacant. Apple Silicon passed the native
+  local link, FIFO and cancellation checks. Windows reviews local
+  symbolic links and drive-path junctions by file ID and their reparse
+  data. It holds the parent chain and removes the reviewed entry by
+  handle. The review excludes volume mount points and unknown reparse
+  types. Native Windows ARM64 passed junction removal and stale-review
+  refusal. The fixture account could not create a Windows symlink.
+  Fedora ARM64 passed local recursive deletion of links, a FIFO and a
+  Unix-domain socket, and the authenticated OpenSSH server-side test.
+  Verify Windows symlinks. Verify shortcuts,
+  deletion review and cancellation in native standalone and hosted views.
+  Apple Silicon passed recursive deletion against the native OpenSSH
+  SFTP subsystem over pipes, including rejection of a stale review and
+  a refreshed listing after removal. The regular SFTP
+  Manager worker also passed the same review and removal scenario through
+  native loopback OpenSSH on Apple Silicon with public-key authentication
+  and a pinned host key. The same native test covered changed link
+  targets, dangling links and preservation of a directory link's target.
+  Separate runs covered a FIFO inside a selected folder and a FIFO
+  directly selected with the folder. The worker refused confirmation
+  after the FIFO became a file and removed a nested Unix-domain socket
+  and the restored FIFO after a fresh review.
+  macOS and Fedora ARM64 also passed the same worker test through a local
+  OpenSSH jump, with distinct pinned keys for the jump and target server.
+  Acceptance on configured deployment routes and with native desktop
+  interaction remains open.
+- The Java `showMenuBar` property has no runtime consumers in v2.26.0.
+  The in-window menu toggle is session-only in both implementations, so
+  a legacy stored value requires no import mapping.
+- Java v2.26.0 declares the deprecated `snippetManagerPreviewDividerPosition`
+  and the old `dashboardDividerPosition` in its settings models. Their
+  accessors have no application consumers in the pinned source. The
+  active snippet workspace and Dashboard retain their native layout
+  handling.
+- Java `asciiArtPreviewFontSize` fills an unset native ASCII Art preview
+  size. The importer keeps fractional values and clamps finite sizes to
+  the Java range of 6 through 40. Existing ASCII Art zoom settings take
+  precedence. Verify the restored preview size and zoom controls in the
+  native dialog.
+- Java `snippetTranslationTargetLanguage` fills an unset native choice.
+  A successful snippet translation review remembers the target for the
+  next dialog and across restart. Other snippet actions use their own
+  prompts. Verify the imported choice in the native editor and after a
+  restart.
+- Java `aiSnippetAlternativeSolutionCount` fills an unset native
+  Snippet Editor preference. The reviewed request asks for up to 1–10
+  distinct replacement candidates and defaults to three. A candidate
+  opens the existing diff review before it can replace the selected
+  range. Verify the choice, discard, apply and undo workflow on native
+  desktops with a configured provider.
+- Java's `aiAgentPanelPlacement` and `aiAgentPanelSideWidth` fill
+  individually unset Rust Agent Design preferences. Regular pane
+  history can use the design default or dock at the bottom, left, or
+  right. The native Settings preview reflects the preferred side width.
+  Inline history and the floating, adaptive and picture-in-picture
+  arrangements retain their placement behavior. The View menu exposes
+  the placement choices. A native divider previews the width during
+  drag and saves it at completion for the still-current pane and
+  layout. Verify menu navigation, drag, and restart on native desktops.
+- Java's `defaultTerminalSettings` now fills unset native terminal font,
+  initial dimensions, scrollback, SSH keepalive, bold mode, timestamps,
+  color and cursor fields. Explicit `terminalCursorBlink` takes precedence
+  over the blink encoded in older cursor styles. The Java customization
+  flag gates ANSI and selection colors, and explicit native ANSI colors
+  keep their individual entries. The Java global theme selection follows
+  exact built-in and restored custom IDs. The separate theme-font flag
+  restores when unset, and the Java base cursor style remains effective.
+  Existing native selections and custom base colors take precedence.
+  Edited built-in theme definitions restore under their original IDs
+  when the native preset has no saved edit. Stock definitions need no
+  local override. Java image paths are retained as inactive metadata.
+  Verify inherited defaults and edited presets in desktop terminal sessions.
+- Java's `defaultTerminalSettings.closeWithoutConfirmation` fills an unset
+  native busy-terminal close preference. The separate global
+  `closeActiveTerminalWindowsWithoutConfirmation` fills the independent
+  Terminal Settings option for windows, application quit and tab batches.
+  Its enabled value bypasses the ordinary terminal and Close All prompts.
+  Active serial sessions and hosted editors retain their existing safeguards.
+  Window close and application quit now include idle connected terminals
+  when the global skip option is off. A single tab, pane, and the Close
+  Other Tabs and Close Tabs to the Right actions use the busy-terminal
+  rule. SSH without a known prompt is treated as busy. Saved and Teamwork
+  connections can override the busy-terminal preference.
+  Local busy detection uses the shell's live child processes, including
+  background jobs, together with observed prompt and alternate screen
+  state. Windows uses the terminal's job object. macOS and Linux query
+  live children of the local shell. Flatpak host shells use terminal
+  activity because the host process tree is unavailable through the
+  sandbox-side launcher. Application quit asks for each affected window
+  before closing any terminal sessions. Cancel discards the quit
+  approvals. If a previously reviewed window gains a new or reconnected
+  session, it needs another review. Verify the close dialogs on native
+  desktops, including idle SSH, multiple windows and editor guards.
+- The global SSH encoding preference now applies at connect and
+  reconnect. Saved and Teamwork connection overrides take precedence.
+  Rust preserves the emulation default when no override is saved.
+  Java backups apply supported encodings only if
+  `terminalEncodingConfirmed` was set. Older non-default choices
+  appear as suggestions in Terminal Settings and require Save. Verify
+  real input and output on configured SSH connections and reconnects.
+- Java's Journal AI summary and screenshot analysis switches now import into
+  independent native settings. Existing native choices take precedence.
+  These settings gate the corresponding workflows, including scheduled
+  summaries and automatic screenshot descriptions. They retain the existing
+  requirements for a configured profile, managed policy, image input and
+  reviewed routes or recording consent. Verify both controls in native
+  settings and with a configured provider.
+- Java's `swarmSessionJournal` now restores as an inactive suggestion in
+  the interactive Swarm window. Explicit adoption copies recording, closing
+  summary, retention, and deduplication choices into the current draft.
+  Saving defaults remains a separate action. An imported summary profile
+  stays unresolved until selected in the native editor. An exact source
+  match from the same backup can prefill the existing profile suggestion.
+  Verify the desktop restore, adoption and recording flow with a configured
+  provider.
+- Interactive Swarm journals offer optional input capture for reviewed
+  commands. The recorder distinguishes output from command previews and
+  uses the execution backend's start signal for local, attached SSH, and
+  saved SSH targets. Probes and commands stopped before dispatch are
+  omitted. Persistent defaults and Java adoption both retain the input
+  choice. Known secrets are masked again at publication. Verify the
+  desktop workflow on a live attached and saved SSH target.
+- The saved Journal note translation language now fills an unset native
+  preference using the existing native language validator. The migration
+  preserves a native choice and trims Java's saved text. Apple Silicon passed
+  the valid/invalid, replay and precedence fixture together with 613 Journal,
+  206 Scheduler and four TLS tests. Windows ARM64 application/test Clippy
+  passed. [Native record](target/verification/20261117-journal-language-native-macos.log).
 - Complete the remaining global-field inventory. Distinguish portable
   preferences from machine paths, transient geometry/history, provider
   secrets and execution/clipboard/Control/MCP consent. Explicit native
@@ -1677,7 +2226,7 @@ device-local proofs, and restores these replacements as disabled jobs.
 A combined draft can adopt ordered mixed sources, named and contents layouts,
 and the original delete option. Adopted drafts keep both the job and the
 schedule disabled. Verify these implemented adoption paths in native
-Scheduler windows; extend recurring protected folder workflows and any
+Scheduler windows; verify recurring protected folder workflows on deployed routes and implement any
 reference-required destination contracts identified under T3/Q1/Q2.
 
 Java Scheduler upload, download and sync with both sudo and staging selected
@@ -1705,11 +2254,25 @@ and `src/profile_backup/java_scheduler.rs::parse_action`.
 
 For global settings, supported display defaults fill individually missing Rust
 preferences. These include manager tabs, connection colors and split focus,
-tab switching order, terminal scrollbars, workflow font size, manual UI scale,
-and remote sidebar position and width. Coding Agents detection, notifications,
+tab switching order, terminal scrollbars, workflow font size, guide zoom,
+app design and animations, and remote sidebar position and width. The app
+design importer accepts all 17 pinned Java IDs and their enum spellings.
+The design and animation flags fill separate unset native choices. A
+saved choice of Normal or enabled animations survives restore.
+Verify their appearance after restart on native desktops.
+Java's `guideFontScalePercent` takes
+precedence over the older fallback from manual UI font scale. It uses the
+same 70–250% limits as the native reader and fills only an unset native
+zoom. The general Java UI font scale is a separate preference.
+Coding Agents detection, notifications,
 badge and panel settings restore with the same merge rules. Supported Java
 menu action chords and explicit removals fill unset native keyboard overrides.
 Existing native assignments and reserved key combinations take precedence.
+Java's `shellIntegrationEnabled` fills the independent global setting for
+automatic local startup wrappers. The connection still needs an explicit
+wrapper opt-in. The global wrapper setting leaves mark handling for
+already-integrated shells and SSH under the separate command-marks control.
+Verify the saved-profile and Quick Connect presentation on native desktops.
 Recording scope, color capture, idle pause and threshold fill unset preferences.
 A fresh recording profile can restore availability after restart. Java
 v2.26.0 captures replay files for either persisted format value and offers
@@ -1817,9 +2380,11 @@ the Rust publisher signatures.
 
 U1 evidence is recorded in
 [shared MLX policy and release checks](PORTING-PARITY.md#shared-mlx-update-policy-managed-download-restrictions-and-python-parameters).
-The repository CI matrix covers macOS, Ubuntu and Windows format checks,
-Clippy, tests and release staging. PR #4 completed that matrix for the commit
-recorded in [Current evidence and distribution](#current-evidence-and-distribution).
+Run native format checks, Clippy, tests and release staging locally on
+macOS, Linux and Windows. GitHub's equivalent Native Rust CI matrix is
+available on manual dispatch. The PR #7 merge passed the hosted matrix
+at `e3c1760`. See [local verification](README.md#verification) and
+[current evidence and distribution](#current-evidence-and-distribution).
 Publisher packages and clean-system acceptance remain in V7.
 
 ## Native acceptance and release gates
@@ -1838,7 +2403,7 @@ the recorded platform, package and audit evidence from its earlier snapshot.
 | V4 | All 21 emulations exist. Complete GUI/key/reply/charset/mode/resize/reflow and supported Scheduler comparisons per profile. Restore the pinned SithTermFX checkout before fixture regeneration. Verify audible Windows/Linux bell and retain documented Wyse differences. Real TN3270/TN5250, HP application/device and physical serial break/modem/flow-control remain explicitly user-deferred. |
 | V5 | Enabled real providers and signed runtimes, every AI Manager section hosted/detached, editor source jumps after edits, seven bounded diagram families, clicks after zoom, full SVG/PNG/PDF beyond the viewport, retained analyses after restart and consent/cancellation at mutation boundaries. Include current A/B/S/J changes. |
 | V6 | The separate SSH source review led to two transport fixes with native wire regressions. Apple Silicon passed the packaged App Sandbox, changed pin, tampered helper, approved tunnel, cancellation and jump fixtures. Resolve the recorded `crypto-bigint` and OpenPGP RSA findings after refreshing the dependency audit, obtain external independent review, and complete native Windows x64 and macOS Intel packaged isolation. Keep the SFTP external replacement race as a separate hardening risk. See the [SSH audit](target/verification/20261112-step6-ssh-audit.md). |
-| V7 | The latest verified Apple Silicon candidate is `af1c17601ffa`: targeted Journal/TLS tests, ad hoc package checks, Seatbelt and packaged backup startup passed. The credential-binding change remains incomplete and unverified at runtime; the PR preparation passes Windows workspace Clippy. The last retained full Mac workspace pass is the earlier `e75aff4df394` snapshot with 4,332 passed and 198 ignored. See [current evidence and distribution](#current-evidence-and-distribution) for exact platform coverage. Earlier Windows full-suite, packaged SSH, Developer ID, notarization and Gatekeeper results cover only their recorded snapshots; PR #4 CI also predates the current working tree. After F1 and the remaining implementation, rerun the appropriate full suites and native gates, build publisher packages from one fixed source snapshot per target, and verify installation, signatures, notarization/stapling where applicable. Measure same-host startup, idle memory and p95 input latency, including 5K macOS. Keep candidates separate from release acceptance while security and release gates remain open. |
+| V7 | Merge CI passed for `e3c1760` on Windows, macOS and Ubuntu. Later F1 and other feature tests have their own recorded revisions. The retained Apple Silicon ZIP `af1c17601ffa` predates F1 and has an ad hoc signature. Build the release candidate from one fixed revision, run the full suites and native gates, and verify clean installation, upgrade, removal, signatures and macOS notarization, stapling and Gatekeeper. Measure same-host startup, idle memory and p95 input latency, including 5K macOS. [Source and package evidence](#current-evidence-and-distribution) |
 
 Forwarding currently permits thirteen concurrent streams and four remote listener
 registrations per SSH connection. Establish a reference workload before raising
@@ -1878,7 +2443,7 @@ new provider.
 The previously recorded Windows ARM64 dependency tree confirms the affected NIST
 generation is active through Sunset even when inspecting `kortty-ssh` alone.
 OpenPGP and the application's direct RSA dependency select `rsa 0.9.10`
-in that record. The 2026-11-17 local lockfile inspection still contains
+in that record. The 2026-11-18 local lockfile inspection still contains
 `crypto-bigint 0.5.5`, `elliptic-curve 0.13.8`, `pgp 0.21.0` and `rsa 0.9.10`,
 alongside the newer SSH RSA dependencies. Upstream status and advisories
 were not refreshed in this documentation reconciliation. Repeat the current

@@ -730,7 +730,7 @@ impl Draft {
                     draft.sync_excludes = text_editor::Content::with_text(&copy.excludes);
                     draft.sync_approval = copy.approval.clone();
                     draft.sync_replace_changed = copy.replace_changed;
-                    if let (RemoteAction::Sync(_), Some(settings)) = (remote, &copy.standing) {
+                    if let Some(settings) = &copy.standing {
                         draft.sync_standing = true;
                         draft.sync_standing_days = settings.days.to_string();
                         draft.sync_standing_firings = settings.limits.max_firings.to_string();
@@ -1976,6 +1976,19 @@ impl Draft {
         Ok(settings)
     }
 
+    fn protected_tree_standing_view(&self) -> Element<'_, Message> {
+        column![
+            checkbox(self.sync_standing).label("Allow recurring protected folder transfers on this device")
+                .on_toggle(Message::SyncStanding),
+            self.sync_standing.then(|| self.standing_limits_view(false)),
+            text(if self.sync_standing {
+                "Each approved calendar or Chain firing may create or replace eligible entries in the reviewed receiver. Originals remain in private recovery folders. An unconfirmed run requires a new review. Downloads charge the complete source payload, including unchanged files."
+            } else {
+                "Save one approval for Run Now or one scheduled date and time. With recurring approval, an absent receiver is created once; later firings merge into that exact receiver."
+            }).size(12),
+        ].spacing(6).into()
+    }
+
     fn standing_limits_view(&self, replacement: bool) -> Element<'_, Message> {
         column![
             text("Enable a calendar or choose Chain with predecessors on the Job page.").size(12),
@@ -2070,6 +2083,14 @@ impl Draft {
                     | Source::PrivilegedTreeDownload
             ) {
                 self.sync_replace_changed = false;
+                if self.privileged_tree()
+                    || matches!(
+                        source,
+                        Source::PrivilegedTreeUpload | Source::PrivilegedTreeDownload
+                    )
+                {
+                    self.sync_standing = false;
+                }
                 self.sync_approval = None;
             }
             if self.regular_transfer()
@@ -2890,7 +2911,8 @@ impl Draft {
                     },
                     replace_changed: self.sync_replace_changed,
                     approval: self.sync_approval.clone(),
-                    standing: (self.sync_standing && !self.privileged_tree())
+                    standing: self
+                        .sync_standing
                         .then(|| self.sync_standing_settings(false))
                         .transpose()?,
                 };
@@ -4435,7 +4457,7 @@ impl Draft {
                     .push(checkbox(self.sync_replace_changed)
                         .label("Review changes in an existing local folder")
                         .on_toggle(Message::SyncReplaceChanged))
-                    .push(text("Save one approval for Run Now or one scheduled date and time.").size(12)),
+                    .push(self.protected_tree_standing_view()),
                 Source::SyncUpload | Source::SyncDownload | Source::PrivilegedTreeUpload => {
                     let editor = editor
                         .push(form_row("Local folder", input(Field::LocalFile, "Absolute existing local folder", &self.local_file)))
@@ -4448,7 +4470,7 @@ impl Draft {
                             .push(checkbox(self.sync_replace_changed)
                                 .label("Review changes in an existing server folder")
                                 .on_toggle(Message::SyncReplaceChanged))
-                            .push(text("Save one approval for Run Now or one scheduled date and time.").size(12))
+                            .push(self.protected_tree_standing_view())
                     } else {
                         let editor = editor.push(checkbox(self.sync_replace_changed)
                             .label(if self.source == Source::SyncDownload {

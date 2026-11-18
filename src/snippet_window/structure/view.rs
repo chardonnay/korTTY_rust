@@ -18,9 +18,9 @@ use crate::snippets::resolve::{PlaceholderEntry, PlaceholderStatus};
 
 use super::{Report, Span};
 
-const DEFAULT_WIDTH: f32 = 340.0;
-const MIN_PANEL: f32 = 160.0;
-const MAX_PANEL: f32 = 1600.0;
+const DEFAULT_WIDTH: f32 = super::DEFAULT_WIDTH as f32;
+const MIN_PANEL: f32 = super::MIN_WIDTH as f32;
+const MAX_PANEL: f32 = super::MAX_WIDTH as f32;
 const MIN_EDITOR: f32 = 180.0;
 const DIVIDER: f32 = 6.0;
 const STACK_WIDTH: f32 = MIN_PANEL + MIN_EDITOR + horizontal_divider::WIDTH;

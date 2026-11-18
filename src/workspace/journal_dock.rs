@@ -27,10 +27,20 @@ mod images;
 mod view;
 
 use view::{LinkContext, Panel, PanelActions, State};
-pub(super) use view::{Placement, Preferences};
+pub(super) use view::{Placement, Preferences, WIDTH_RANGE};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SAVE_WIDTH_DELAY: Duration = Duration::from_millis(350);
+const SAVE_LOG_HEIGHT_DELAY: Duration = Duration::from_millis(500);
+pub(super) const LIVE_LOG_HEIGHT: std::ops::RangeInclusive<u8> = 15..=85;
+const DEFAULT_LIVE_LOG_HEIGHT: u8 = 44;
+
+pub(super) fn clamp_live_log_height(height: i32) -> u8 {
+    height.clamp(
+        i32::from(*LIVE_LOG_HEIGHT.start()),
+        i32::from(*LIVE_LOG_HEIGHT.end()),
+    ) as u8
+}
 const TERMINAL_RESERVE: f32 = 260.0;
 const MIN_VISIBLE_WIDTH: f32 = 150.0;
 const MAX_LOG_BYTES: usize = 512 * 1024;
@@ -64,6 +74,8 @@ pub enum Action {
         target: LinkTarget,
     },
     ToggleLog,
+    LiveLogHeight(u8),
+    FinishLiveLogResize,
     Refresh,
     ShowScreenshot(ImageKey),
     HideScreenshot(ImageKey),
@@ -463,7 +475,10 @@ impl Workspace {
         if !self.journal_allowed() || self.exiting || self.scheduler_draining {
             return Subscription::none();
         }
-        let mut poll = DockPoll::default();
+        let mut poll = DockPoll {
+            catch_up: self.journal_live_log_height_save.is_some(),
+            ..DockPoll::default()
+        };
         for (&owner, window) in &self.windows {
             let dock = &window.journal_dock;
             poll.catch_up |= dock.resized_at.is_some();
@@ -564,6 +579,12 @@ impl Workspace {
     }
 
     pub(super) fn journal_dock_tick(&mut self) -> Task<Desktop> {
+        if self
+            .journal_live_log_height_save
+            .is_some_and(|(at, _)| at.elapsed() >= SAVE_LOG_HEIGHT_DELAY)
+        {
+            self.flush_live_log_height();
+        }
         let owners: Vec<_> = self
             .windows
             .iter()
@@ -583,11 +604,23 @@ impl Workspace {
 
     pub(super) fn flush_journal_dock_resize(&mut self, owner: window::Id) {
         if self
+            .journal_live_log_height_save
+            .is_some_and(|(_, editing)| editing == owner)
+        {
+            self.flush_live_log_height();
+        }
+        if self
             .windows
             .get(&owner)
             .is_some_and(|window| window.journal_dock.resized_at.is_some())
         {
             self.persist_journal_dock(owner);
+        }
+    }
+
+    pub(super) fn flush_live_log_height(&mut self) {
+        if let Some((_, owner)) = self.journal_live_log_height_save.take() {
+            self.save_window_settings(Some(owner));
         }
     }
 
@@ -722,6 +755,7 @@ impl Workspace {
         else {
             return Task::none();
         };
+        let visible = dock.placement() != Placement::Hidden;
         let Some(bound) = dock
             .bound
             .as_mut()
@@ -766,6 +800,24 @@ impl Workspace {
                     bound.log.text.clear();
                 }
             }
+            Action::LiveLogHeight(height)
+                if visible && bound.log_open && LIVE_LOG_HEIGHT.contains(&height) =>
+            {
+                if self.window_settings.journal_live_log_height != Some(height) {
+                    self.window_settings.journal_live_log_height = Some(height);
+                    self.journal_live_log_height_save = Some((Instant::now(), owner));
+                }
+            }
+            Action::FinishLiveLogResize
+                if visible
+                    && bound.log_open
+                    && self
+                        .journal_live_log_height_save
+                        .is_some_and(|(_, editing)| editing == owner) =>
+            {
+                self.flush_live_log_height();
+            }
+            Action::LiveLogHeight(_) | Action::FinishLiveLogResize => {}
             Action::Refresh if !bound.detached => {
                 bound.refresh = true;
                 // Retry unavailable images even when the reread has the same timeline revision.
@@ -880,6 +932,11 @@ impl Workspace {
                     timeline: &bound.timeline.entries,
                     timeline_limited: bound.timeline.limited,
                     tail: bound.log_open.then_some(bound.log.text.as_str()),
+                    tail_height: self
+                        .window_settings
+                        .journal_live_log_height
+                        .filter(|height| LIVE_LOG_HEIGHT.contains(height))
+                        .unwrap_or(DEFAULT_LIVE_LOG_HEIGHT),
                     notice: bound.notice.as_deref(),
                     scroll_key: run,
                     note_editor: editor,
@@ -926,6 +983,11 @@ impl Workspace {
                     }),
                     open_viewer: message(Action::Open),
                     toggle_log: message(Action::ToggleLog),
+                    resize_log: bound.map(|bound| view::LogHeightAction {
+                        owner,
+                        tab: bound.source.tab,
+                        run: bound.source.run,
+                    }),
                     more,
                 },
                 appearance.map(|(_, appearance)| appearance.content),
@@ -1024,6 +1086,46 @@ fn clock(poll: &DockPoll) -> BoxStream<'static, Desktop> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_log_height_changes_only_for_the_current_open_log() {
+        let scratch = crate::snippets::tests::Profile::new();
+        let capture = Arc::new(
+            session_journal::Capture::start(
+                scratch.0.join("journals"),
+                session_journal::Metadata::default(),
+            )
+            .unwrap(),
+        );
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let dock = &mut workspace.windows.get_mut(&owner).unwrap().journal_dock;
+        dock.place(Placement::Right);
+        dock.bind(DockSource {
+            tab: 1,
+            run: 2,
+            title: "Fixture".into(),
+            capture,
+        });
+
+        let _ =
+            workspace.update_journal_dock(owner, Message::Bound(1, 2, Action::LiveLogHeight(65)));
+        assert_eq!(workspace.window_settings.journal_live_log_height, None);
+        let _ = workspace.update_journal_dock(owner, Message::Bound(1, 2, Action::ToggleLog));
+        for (run, height) in [(3, 65), (2, 90)] {
+            let _ = workspace
+                .update_journal_dock(owner, Message::Bound(1, run, Action::LiveLogHeight(height)));
+        }
+        assert!(workspace.journal_live_log_height_save.is_none());
+        let _ =
+            workspace.update_journal_dock(owner, Message::Bound(1, 2, Action::LiveLogHeight(65)));
+        assert_eq!(workspace.window_settings.journal_live_log_height, Some(65));
+        assert!(
+            workspace
+                .journal_live_log_height_save
+                .is_some_and(|(_, window)| window == owner)
+        );
+    }
 
     #[test]
     fn dock_links_match_only_the_current_visible_field_and_target() {

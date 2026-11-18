@@ -226,7 +226,12 @@ fn message(id: window::Id, action: Action) -> Desktop {
     Desktop::Settings(Message::AgentDesignCatalog(id, Edit::Demo(action)))
 }
 
-pub(super) fn view(demo: &Demo, layout: Layout, id: window::Id) -> Element<'static, Desktop> {
+pub(super) fn view(
+    demo: &Demo,
+    layout: Layout,
+    dock: super::DockPreferences,
+    id: window::Id,
+) -> Element<'static, Desktop> {
     let model = demo.model();
     let token = demo.token();
     let terminal = Canvas::new(canvas::Preview {
@@ -294,6 +299,7 @@ pub(super) fn view(demo: &Demo, layout: Layout, id: window::Id) -> Element<'stat
     column![
         super::preview_static(
             layout,
+            dock,
             activity,
             terminal,
             demo.phase(),

@@ -1,4 +1,4 @@
-//! Copy-only file offers and bounded pipe reads on the clipboard event loop.
+//! Copy-only desktop offers and bounded pipe reads on the clipboard event loop.
 
 use std::collections::HashMap;
 use std::io::{self, ErrorKind, Read};
@@ -12,12 +12,14 @@ use sctk::reexports::client::Proxy;
 use sctk::reexports::client::protocol::wl_data_device::WlDataDevice;
 use sctk::reexports::client::protocol::wl_data_device_manager::DndAction;
 
-use crate::file_drop::{Event, Permit, Registration, Target, URI_LIST};
+use crate::file_drop::{Event, Kind, Permit, Registration, Target, URI_LIST};
 
 use super::{State, drag::active_offer, set_non_blocking};
 
 const MAX_ACTIVE_DROPS: usize = 4;
 const MAX_URI_LIST_BYTES: usize = 1024 * 1024;
+const MAX_TEXT_BYTES: usize = 64 * 1024;
+const TEXT_TYPES: [&str; 3] = ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain"];
 const CHUNK_BYTES: usize = 16 * 1024;
 const DROP_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -33,6 +35,8 @@ struct Hover {
     registration: Arc<Registration>,
     device: WlDataDevice,
     offer: DragOffer,
+    mime: String,
+    kind: Kind,
     rejected: bool,
 }
 
@@ -41,6 +45,8 @@ struct Pending {
     registration: Arc<Registration>,
     device: WlDataDevice,
     offer: DragOffer,
+    mime: String,
+    kind: Kind,
     phase: Phase,
     deadline: Instant,
     permit: Permit,
@@ -70,11 +76,7 @@ impl State {
         if !registration.live() {
             return;
         }
-        if let Some(old) = self
-            .file_drops
-            .watches
-            .insert(registration.surface, registration)
-        {
+        if let Some(old) = self.file_drops.watches.insert(registration.surface, registration) {
             old.revoke();
             self.cancel_file_drops(|pending| Arc::ptr_eq(&pending.registration, &old));
             self.reject_file_drop_hovers(|hover| Arc::ptr_eq(&hover.registration, &old));
@@ -95,20 +97,17 @@ impl State {
     }
 
     pub(super) fn file_drop_enter(&mut self, device: &WlDataDevice) {
-        let Some(offer) = active_offer(device).filter(|offer| {
-            offer.inner().version() >= 3
-                && !self.file_drag.own_offer(offer)
-                && offer.with_mime_types(|types| types.iter().any(|mime| mime == URI_LIST))
-        }) else {
+        let Some(offer) = active_offer(device)
+            .filter(|offer| offer.inner().version() >= 3 && !self.file_drag.own_offer(offer))
+        else {
+            return;
+        };
+        let Some((mime, kind)) = offer.with_mime_types(|types| preferred_type(types)) else {
             return;
         };
         let Some(target) = target(&offer) else { return };
-        let Some(registration) = self
-            .file_drops
-            .watches
-            .get(&target.surface)
-            .filter(|watch| watch.live())
-            .cloned()
+        let Some(registration) =
+            self.file_drops.watches.get(&target.surface).filter(|watch| watch.live()).cloned()
         else {
             return;
         };
@@ -116,7 +115,7 @@ impl State {
             return;
         }
         if registration.while_live(|| {
-            offer.accept_mime_type(offer.serial, Some(URI_LIST.to_owned()));
+            offer.accept_mime_type(offer.serial, Some(mime.clone()));
             offer.set_actions(DndAction::Copy, DndAction::Copy);
         }) {
             registration.notify(Event::Hover { target });
@@ -124,17 +123,16 @@ impl State {
                 registration,
                 device: device.clone(),
                 offer,
+                mime,
+                kind,
                 rejected: false,
             });
         }
     }
 
     pub(super) fn file_drop_motion(&mut self, device: &WlDataDevice) {
-        let Some(hover) = self
-            .file_drops
-            .hovers
-            .iter()
-            .find(|hover| &hover.device == device && !hover.rejected)
+        let Some(hover) =
+            self.file_drops.hovers.iter().find(|hover| &hover.device == device && !hover.rejected)
         else {
             return;
         };
@@ -161,11 +159,8 @@ impl State {
     }
 
     pub(super) fn file_drop_performed(&mut self, device: &WlDataDevice) {
-        let Some(position) = self
-            .file_drops
-            .hovers
-            .iter()
-            .position(|hover| &hover.device == device)
+        let Some(position) =
+            self.file_drops.hovers.iter().position(|hover| &hover.device == device)
         else {
             return;
         };
@@ -190,6 +185,7 @@ impl State {
             hover.registration.notify(Event::Dropped {
                 id,
                 target,
+                kind: hover.kind,
                 permit: permit.clone(),
             });
             self.file_drops.pending.push(Pending {
@@ -197,6 +193,8 @@ impl State {
                 registration: hover.registration,
                 device: hover.device,
                 offer,
+                mime: hover.mime,
+                kind: hover.kind,
                 phase: Phase::AwaitingDestination,
                 deadline,
                 permit,
@@ -217,24 +215,28 @@ impl State {
         if pending.live() {
             pending
                 .registration
-                .while_live(|| pipe = pending.offer.receive(URI_LIST.to_owned()).ok());
+                .while_live(|| pipe = pending.offer.receive(pending.mime.clone()).ok());
         }
         let Some(pipe) = pipe.filter(|pipe| set_non_blocking(pipe.as_raw_fd()).is_ok()) else {
             self.close_file_drop(position, false, true);
             return;
         };
         let registration = Arc::clone(registration);
+        let limit = match pending.kind {
+            Kind::Files => MAX_URI_LIST_BYTES,
+            Kind::Text => MAX_TEXT_BYTES,
+        };
         let mut content = Vec::new();
         let token = self.loop_handle.insert_source(pipe, move |_, file, state| {
             // The file stays registered and is only used to read on this worker thread.
             let file = unsafe { file.get_mut() };
-            match read_chunk(file, &mut content) {
+            match read_chunk(file, &mut content, limit) {
                 Ok(false) => PostAction::Continue,
                 result => {
                     let result = result.map(|_| std::mem::take(&mut content));
                     state.file_drop_read(&registration, id, result);
                     PostAction::Remove
-                }
+                },
             }
         });
         if let Ok(token) = token {
@@ -250,11 +252,8 @@ impl State {
         id: u64,
         result: io::Result<Vec<u8>>,
     ) {
-        let Some(position) = self
-            .file_drops
-            .pending
-            .iter()
-            .position(|pending| pending.matches(registration, id))
+        let Some(position) =
+            self.file_drops.pending.iter().position(|pending| pending.matches(registration, id))
         else {
             return;
         };
@@ -273,11 +272,8 @@ impl State {
         id: u64,
         accepted: bool,
     ) {
-        if let Some(position) = self
-            .file_drops
-            .pending
-            .iter()
-            .position(|pending| pending.matches(registration, id))
+        if let Some(position) =
+            self.file_drops.pending.iter().position(|pending| pending.matches(registration, id))
         {
             let pending = &self.file_drops.pending[position];
             let accepted =
@@ -303,9 +299,7 @@ impl State {
             pending.offer.destroy();
         }
         if cancelled {
-            pending
-                .registration
-                .notify(Event::Cancelled { id: pending.id });
+            pending.registration.notify(Event::Cancelled { id: pending.id });
         }
     }
 
@@ -326,20 +320,15 @@ impl State {
     }
 
     fn reject_file_drop_hovers(&mut self, predicate: impl Fn(&Hover) -> bool) {
-        for hover in self
-            .file_drops
-            .hovers
-            .iter_mut()
-            .filter(|hover| !hover.rejected && predicate(hover))
+        for hover in
+            self.file_drops.hovers.iter_mut().filter(|hover| !hover.rejected && predicate(hover))
         {
             hover.rejected = true;
             // Keep the offer tracked until SCTK delivers leave or drop, which
             // can already be queued when the watch is withdrawn.
             if hover.offer.inner().is_alive() {
                 hover.offer.accept_mime_type(hover.offer.serial, None);
-                hover
-                    .offer
-                    .set_actions(DndAction::empty(), DndAction::empty());
+                hover.offer.set_actions(DndAction::empty(), DndAction::empty());
             }
         }
     }
@@ -366,28 +355,34 @@ impl State {
 fn target(offer: &DragOffer) -> Option<Target> {
     let surface = offer.surface.id().as_ptr() as usize;
     (offer.surface.is_alive() && surface != 0 && offer.x.is_finite() && offer.y.is_finite())
-        .then_some(Target {
-            surface,
-            x: offer.x,
-            y: offer.y,
+        .then_some(Target { surface, x: offer.x, y: offer.y })
+}
+
+fn preferred_type(types: &[String]) -> Option<(String, Kind)> {
+    std::iter::once((URI_LIST, Kind::Files))
+        .chain(TEXT_TYPES.map(|mime| (mime, Kind::Text)))
+        .find_map(|(mime, kind)| {
+            types
+                .iter()
+                .find(|candidate| candidate.eq_ignore_ascii_case(mime))
+                .map(|candidate| (candidate.clone(), kind))
         })
 }
 
-fn read_chunk(input: &mut impl Read, content: &mut Vec<u8>) -> io::Result<bool> {
+fn read_chunk(input: &mut impl Read, content: &mut Vec<u8>, limit: usize) -> io::Result<bool> {
     let mut buffer = [0; CHUNK_BYTES];
     match input.read(&mut buffer) {
         Ok(0) => Ok(true),
-        Ok(count) if count <= MAX_URI_LIST_BYTES - content.len() => {
+        Ok(count) if count <= limit.saturating_sub(content.len()) => {
             content.extend_from_slice(&buffer[..count]);
             Ok(false)
-        }
-        Ok(_) => Err(io::Error::new(
-            ErrorKind::InvalidData,
-            "Wayland file drop exceeds its size limit",
-        )),
+        },
+        Ok(_) => {
+            Err(io::Error::new(ErrorKind::InvalidData, "Wayland file drop exceeds its size limit"))
+        },
         Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {
             Ok(false)
-        }
+        },
         Err(error) => Err(error),
     }
 }
@@ -400,15 +395,15 @@ mod tests {
     fn accepts_the_limit_only_after_eof() {
         let mut content = vec![0; MAX_URI_LIST_BYTES - 1];
         let mut input = &b"x"[..];
-        assert!(!read_chunk(&mut input, &mut content).unwrap());
+        assert!(!read_chunk(&mut input, &mut content, MAX_URI_LIST_BYTES).unwrap());
         assert_eq!(content.len(), MAX_URI_LIST_BYTES);
-        assert!(read_chunk(&mut input, &mut content).unwrap());
+        assert!(read_chunk(&mut input, &mut content, MAX_URI_LIST_BYTES).unwrap());
     }
 
     #[test]
     fn rejects_bytes_beyond_the_limit() {
         let mut content = vec![0; MAX_URI_LIST_BYTES];
-        let error = read_chunk(&mut &b"x"[..], &mut content).unwrap_err();
+        let error = read_chunk(&mut &b"x"[..], &mut content, MAX_URI_LIST_BYTES).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::InvalidData);
         assert_eq!(content.len(), MAX_URI_LIST_BYTES);
     }
@@ -424,7 +419,7 @@ mod tests {
 
         let mut content = b"earlier bytes".to_vec();
         for kind in [ErrorKind::WouldBlock, ErrorKind::Interrupted] {
-            assert!(!read_chunk(&mut NotReady(kind), &mut content).unwrap());
+            assert!(!read_chunk(&mut NotReady(kind), &mut content, MAX_URI_LIST_BYTES).unwrap());
         }
         assert_eq!(content, b"earlier bytes");
     }

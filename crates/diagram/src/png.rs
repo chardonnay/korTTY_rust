@@ -74,6 +74,16 @@ impl Scene {
     /// Returns an error for an invalid scale, a raster beyond the allocation
     /// budget, missing fonts for labels, or a render or encoding failure.
     pub fn to_png(&self, theme: Theme, scale: u8) -> Result<Vec<u8>, PngError> {
+        self.to_png_with_background(theme, scale, None)
+    }
+
+    /// Renders a PNG with an optional RGB canvas override.
+    pub fn to_png_with_background(
+        &self,
+        theme: Theme,
+        scale: u8,
+        background: Option<[u8; 3]>,
+    ) -> Result<Vec<u8>, PngError> {
         if !(1..=3).contains(&scale) {
             return Err(PngError::InvalidScale);
         }
@@ -101,7 +111,7 @@ impl Scene {
         }
         // Only the crate's generated SVG enters the rasterizer. Diagram labels
         // have already been escaped, so no input can introduce SVG resources.
-        let tree = usvg::Tree::from_str(&self.to_svg(theme), &options)
+        let tree = usvg::Tree::from_str(&self.to_svg_with_background(theme, background), &options)
             .map_err(|error| PngError::Render(Box::new(error)))?;
         let mut image = tiny_skia::Pixmap::new(width, height).ok_or(PngError::ImageTooLarge)?;
         let scale = f32::from(scale);
@@ -114,6 +124,22 @@ impl Scene {
             .encode_png()
             .map_err(|error| PngError::Encode(Box::new(error)))
     }
+}
+
+#[cfg(test)]
+#[test]
+fn custom_canvas_matches_the_svg_and_png_renderers() {
+    let scene = crate::parse_mermaid("flowchart TD\na[One] --> b[Two]")
+        .unwrap()
+        .layout();
+    let background = Some([18, 52, 86]);
+    let svg = scene.to_svg_with_background(Theme::Light, background);
+    assert!(svg.contains("fill=\"#123456\""));
+    let bytes = scene
+        .to_png_with_background(Theme::Light, 1, background)
+        .unwrap();
+    let image = tiny_skia::Pixmap::decode_png(&bytes).unwrap();
+    assert_eq!(&image.data()[..4], &[18, 52, 86, 255]);
 }
 
 struct SystemFonts {

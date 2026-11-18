@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -16,17 +17,19 @@ use crate::horizontal_divider::{self, Grow, WIDTH as DIVIDER_WIDTH};
 use crate::profile;
 use crate::sftp_window::{Directory, EntryKind, EntryName, Location, list_local};
 
+use super::backup_data::{DockPosition, JavaLocalDock};
 use super::transparency;
 use super::{Message as WorkspaceMessage, Workspace};
 
-const MIN_WIDTH: f32 = 280.0;
-const MAX_WIDTH: f32 = 900.0;
+pub(super) const MIN_WIDTH: f32 = 280.0;
+pub(super) const MAX_WIDTH: f32 = 900.0;
 const DEFAULT_WIDTH: f32 = 380.0;
 const TERMINAL_RESERVE: f32 = 320.0;
 const CONTENT_HORIZONTAL_PADDING: f32 = 14.0;
 const HISTORY_LIMIT: usize = 32;
 const PAGE_SIZE: usize = 96;
-const PREFERENCE_LIMIT: u64 = 4096;
+const ROOT_PATH_LIMIT: usize = 4096;
+const PREFERENCE_LIMIT: u64 = 32 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -35,11 +38,15 @@ pub enum Side {
     Right,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Preference {
     side: Option<Side>,
     width: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    show_hidden: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_root: Option<OsString>,
 }
 
 impl Default for Preference {
@@ -47,19 +54,43 @@ impl Default for Preference {
         Self {
             side: None,
             width: DEFAULT_WIDTH,
+            show_hidden: None,
+            last_root: None,
         }
     }
 }
 
 impl Preference {
-    pub(super) fn side(self) -> Option<Side> {
+    pub(super) fn side(&self) -> Option<Side> {
         self.side
     }
 
-    pub(super) fn load() -> Self {
-        profile::local_dock_path()
+    pub(super) fn load(java: JavaLocalDock) -> Self {
+        let native = profile::local_dock_path()
             .and_then(|path| Self::read(&path))
-            .unwrap_or_default()
+            .ok();
+        Self::with_java_defaults(native, java)
+    }
+
+    fn with_java_defaults(native: Option<Self>, java: JavaLocalDock) -> Self {
+        let mut preference = native.unwrap_or_else(|| Self {
+            side: match java.placement {
+                Some(DockPosition::Left) => Some(Side::Left),
+                Some(DockPosition::Right) => Some(Side::Right),
+                _ => None,
+            },
+            width: java.width.map_or(DEFAULT_WIDTH, |width| {
+                f32::from(width).clamp(MIN_WIDTH, MAX_WIDTH)
+            }),
+            show_hidden: None,
+            last_root: None,
+        });
+        preference.show_hidden = preference.show_hidden.or(java.show_hidden);
+        preference
+    }
+
+    pub(super) fn show_hidden(&self) -> bool {
+        self.show_hidden.unwrap_or(false)
     }
 
     fn read(path: &Path) -> io::Result<Self> {
@@ -73,28 +104,38 @@ impl Preference {
         if bytes.len() as u64 > PREFERENCE_LIMIT {
             return Err(io::Error::other("dock preference exceeds the size limit"));
         }
-        let preference: Self = serde_json::from_slice(&bytes)?;
+        let mut preference: Self = serde_json::from_slice(&bytes)?;
         if !(MIN_WIDTH..=MAX_WIDTH).contains(&preference.width) {
             return Err(io::Error::other("dock width is outside the allowed range"));
         }
+        preference.last_root = preference.last_root.filter(|path| valid_root(path));
         Ok(preference)
     }
 
-    fn save(self) -> io::Result<()> {
-        profile::save_atomic(&profile::local_dock_path()?, &serde_json::to_vec(&self)?)
+    fn save(&self) -> io::Result<()> {
+        profile::save_atomic(&profile::local_dock_path()?, &serde_json::to_vec(self)?)
     }
 
-    fn width_at(self, available: f32) -> f32 {
+    fn remember_root(&mut self, root: &Path) -> bool {
+        let root = root.as_os_str();
+        if self.last_root.as_deref() == Some(root) || !valid_root(root) {
+            return false;
+        }
+        self.last_root = Some(root.to_os_string());
+        true
+    }
+
+    fn width_at(&self, available: f32) -> f32 {
         self.width
             .min((available - TERMINAL_RESERVE - DIVIDER_WIDTH).max(MIN_WIDTH))
     }
 
-    fn pane_width(self, window_width: f32) -> f32 {
+    fn pane_width(&self, window_width: f32) -> f32 {
         self.width_at(window_width - CONTENT_HORIZONTAL_PADDING)
     }
 
     pub(super) fn tab_drop_coordinates(
-        self,
+        &self,
         window_width: f32,
         pointer_x: f64,
         native_width: f64,
@@ -116,8 +157,13 @@ impl Preference {
     }
 }
 
+fn valid_root(path: &OsStr) -> bool {
+    Path::new(path).is_absolute() && path.as_encoded_bytes().len() <= ROOT_PATH_LIMIT
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum Navigation {
+    Restore,
     Visit,
     Back,
     Forward,
@@ -161,6 +207,13 @@ pub(super) struct Browser {
 }
 
 impl Browser {
+    pub(super) fn new(show_hidden: bool) -> Self {
+        Self {
+            show_hidden,
+            ..Self::default()
+        }
+    }
+
     fn current_path(&self) -> Option<&Path> {
         match &self.directory.as_ref()?.path {
             Location::Local(path) => Some(path),
@@ -168,11 +221,14 @@ impl Browser {
         }
     }
 
-    fn start(&mut self) -> Task<Message> {
+    fn start(&mut self, last_root: Option<PathBuf>) -> Task<Message> {
         if self.directory.is_some() || self.busy || self.status.is_some() {
             return Task::none();
         }
-        self.home()
+        let home = home();
+        self.load_using(Navigation::Restore, move || {
+            initial_directory(last_root.as_deref(), home.as_deref())
+        })
     }
 
     fn home(&mut self) -> Task<Message> {
@@ -207,6 +263,14 @@ impl Browser {
     }
 
     fn load(&mut self, path: PathBuf, navigation: Navigation) -> Task<Message> {
+        self.load_using(navigation, move || list_local(&path))
+    }
+
+    fn load_using(
+        &mut self,
+        navigation: Navigation,
+        list: impl FnOnce() -> io::Result<Directory> + Send + 'static,
+    ) -> Task<Message> {
         if self.busy {
             return Task::none();
         }
@@ -216,7 +280,7 @@ impl Browser {
         let request = self.request;
         Task::perform(
             async move {
-                list_local(&path)
+                list()
                     .map(Arc::new)
                     .map_err(|error| format!("Could not list folder: {error}"))
             },
@@ -229,20 +293,20 @@ impl Browser {
         request: u64,
         navigation: Navigation,
         result: Result<Arc<Directory>, String>,
-    ) {
+    ) -> bool {
         if !self.busy || request != self.request {
-            return;
+            return false;
         }
         self.busy = false;
         let directory = match result {
             Ok(directory) => directory,
             Err(error) => {
                 self.status = Some(error);
-                return;
+                return false;
             }
         };
         let Location::Local(path) = &directory.path else {
-            return;
+            return false;
         };
         let previous = self
             .current_path()
@@ -267,12 +331,13 @@ impl Browser {
                     remember(&mut self.back, previous);
                 }
             }
-            Navigation::Refresh => {}
+            Navigation::Refresh | Navigation::Restore => {}
         }
         self.path = path.to_string_lossy().into_owned();
         self.directory = Some(directory);
         self.displayed = request;
         self.filter_entries();
+        true
     }
 
     fn filter_entries(&mut self) {
@@ -427,6 +492,17 @@ fn home() -> Option<PathBuf> {
         .filter(|path| path.is_absolute())
 }
 
+fn initial_directory(last_root: Option<&Path>, home: Option<&Path>) -> io::Result<Directory> {
+    if let Some(root) = last_root
+        && Some(root) != home
+        && let Ok(directory) = list_local(root)
+    {
+        return Ok(directory);
+    }
+    let home = home.ok_or_else(|| io::Error::other("Home directory is unavailable"))?;
+    list_local(home)
+}
+
 fn remember(history: &mut VecDeque<PathBuf>, path: PathBuf) {
     if history.len() == HISTORY_LIMIT {
         history.pop_front();
@@ -439,10 +515,11 @@ impl Workspace {
         if self.local_dock.side.is_none() {
             return Task::none();
         }
+        let last_root = self.local_dock.last_root.as_deref().map(PathBuf::from);
         self.windows.get_mut(&id).map_or_else(Task::none, |window| {
             window
                 .local_files
-                .start()
+                .start(last_root)
                 .map(move |message| WorkspaceMessage::LocalDock(id, message))
         })
     }
@@ -473,6 +550,19 @@ impl Workspace {
             }
             Message::FinishResize(side) => {
                 if self.local_dock.side == Some(side) {
+                    self.persist_local_dock(id);
+                }
+            }
+            Message::ShowHidden(show) => {
+                let browser = &mut self
+                    .windows
+                    .get_mut(&id)
+                    .expect("checked window")
+                    .local_files;
+                browser.show_hidden = show;
+                browser.filter_entries();
+                if self.local_dock.show_hidden != Some(show) {
+                    self.local_dock.show_hidden = Some(show);
                     self.persist_local_dock(id);
                 }
             }
@@ -519,11 +609,6 @@ impl Workspace {
                         }
                         Task::none()
                     }
-                    Message::ShowHidden(show) => {
-                        browser.show_hidden = show;
-                        browser.filter_entries();
-                        Task::none()
-                    }
                     Message::Page(forward) => {
                         if forward {
                             if browser.visible.len() > (browser.page + 1) * PAGE_SIZE {
@@ -545,13 +630,20 @@ impl Workspace {
                         }
                     }
                     Message::Listed(request, navigation, result) => {
-                        browser.listed(request, navigation, result);
+                        if browser.listed(request, navigation, result)
+                            && !matches!(navigation, Navigation::Restore | Navigation::Refresh)
+                            && let Some(root) = browser.current_path()
+                            && self.local_dock.remember_root(root)
+                        {
+                            self.persist_local_dock(id);
+                        }
                         Task::none()
                     }
                     Message::Toggle(_)
                     | Message::Hide
                     | Message::Resize(_, _)
-                    | Message::FinishResize(_) => unreachable!(),
+                    | Message::FinishResize(_)
+                    | Message::ShowHidden(_) => unreachable!(),
                 };
                 return task.map(move |message| WorkspaceMessage::LocalDock(id, message));
             }

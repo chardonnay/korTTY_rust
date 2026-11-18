@@ -1,4 +1,4 @@
-//! Incoming file drops on the registered Wayland clipboard worker.
+//! Incoming desktop drops on the registered Wayland clipboard worker.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -7,6 +7,12 @@ use std::time::Instant;
 use crate::worker::{self, Command, Commands};
 
 pub(crate) const URI_LIST: &str = "text/uri-list";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Kind {
+    Files,
+    Text,
+}
 
 /// Coordinates relative to the native Wayland surface.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -20,12 +26,12 @@ pub struct Target {
 pub enum Event {
     Hover { target: Target },
     Leave,
-    Dropped { id: u64, target: Target, permit: Permit },
+    Dropped { id: u64, target: Target, kind: Kind, permit: Permit },
     Received { id: u64, data: Vec<u8> },
     Cancelled { id: u64 },
 }
 
-/// Watch one surface for file drops. The callback runs on the clipboard worker
+/// Watch one surface for file and text drops. The callback runs on the clipboard worker
 /// and must return promptly. Dropping the watch cancels its offers and reads.
 pub fn watch(
     display: usize,
@@ -95,7 +101,7 @@ impl Watch {
                 .is_ok()
     }
 
-    /// Finish only after the application has accepted the received paths. A
+    /// Finish only after the application has accepted the received data. A
     /// false value rejects the drop before or after receipt. Returns whether
     /// the request was queued.
     pub fn finish(&self, id: u64, accepted: bool) -> bool {

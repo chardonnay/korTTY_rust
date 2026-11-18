@@ -66,7 +66,6 @@ impl Exchange {
 
     pub(super) fn valid(&self) -> bool {
         valid_id(&self.id)
-            && Preset::from_java_id(&self.id).is_none()
             && self
                 .font_family
                 .as_deref()
@@ -105,6 +104,7 @@ pub(crate) struct Import {
     pub(crate) added: usize,
     pub(crate) unchanged: usize,
     pub(crate) built_in: usize,
+    pub(crate) edited_built_in: usize,
     pub(crate) limited: usize,
 }
 
@@ -130,6 +130,14 @@ pub(crate) fn read(path: &Path) -> io::Result<Library> {
 }
 
 pub(crate) fn decode(bytes: &[u8]) -> io::Result<Library> {
+    decode_library(bytes, false)
+}
+
+pub(crate) fn decode_backup(bytes: &[u8]) -> io::Result<Library> {
+    decode_library(bytes, true)
+}
+
+fn decode_library(bytes: &[u8], include_built_in_edits: bool) -> io::Result<Library> {
     if bytes.len() > MAX_BYTES {
         return Err(invalid("Java themes XML exceeds 256 KiB."));
     }
@@ -175,7 +183,7 @@ pub(crate) fn decode(bytes: &[u8]) -> io::Result<Library> {
         if !ids.insert(id) {
             return Err(invalid("Java themes XML repeats a theme ID."));
         }
-        if Preset::from_java_id(id).is_some() {
+        if !include_built_in_edits && Preset::from_java_id(id).is_some() {
             library.built_in += 1;
         } else {
             library.entries.push(definition(
@@ -251,7 +259,7 @@ fn definition(row: Node<'_, '_>, id: &str, legacy_palette: bool) -> io::Result<D
     }
     let limited = family.is_none()
         || exchange.background_image_path.is_some()
-        || built_in
+        || (built_in && Preset::from_java_id(id).is_none())
         || row.children().filter(Node::is_element).any(|node| {
             node.tag_name().namespace().is_some()
                 || !matches!(
@@ -310,6 +318,9 @@ pub(crate) fn merge(themes: &mut Themes, library: Library) -> io::Result<Import>
 }
 
 pub(crate) fn merge_backup(themes: &mut Themes, incoming: Themes) -> io::Result<Import> {
+    if !incoming.valid() {
+        return Err(invalid("Invalid Java theme backup catalogue."));
+    }
     let entries = incoming
         .edited
         .into_iter()
@@ -343,6 +354,23 @@ fn merge_inner(themes: &mut Themes, library: Library, keep_existing: bool) -> io
     };
     for entry in library.entries {
         report.limited += usize::from(entry.limited);
+        if let Some(preset) = Preset::from_java_id(&entry.exchange.id) {
+            let id = Id::BuiltIn(preset);
+            let (stock_name, stock_scheme) = preset.definition();
+            let stock = entry.name == stock_name
+                && entry.scheme == stock_scheme
+                && entry.exchange.font_family.is_none()
+                && entry.exchange.background_image_path.is_none()
+                && panel_colors::resolved_panel_colors(entry.scheme, entry.exchange.panel_colors)
+                    == panel_colors::resolved_panel_colors(stock_scheme, [None; 6]);
+            if stock || draft.edited.iter().any(|theme| theme.id == id) {
+                report.built_in += 1;
+            } else {
+                draft.edited.push(entry.into_stored(id));
+                report.edited_built_in += 1;
+            }
+            continue;
+        }
         if let Some(existing) = draft.edited.iter().find(|theme| {
             theme
                 .java
@@ -365,14 +393,7 @@ fn merge_inner(themes: &mut Themes, library: Library, keep_existing: bool) -> io
             report.unchanged += 1;
         } else {
             let id = draft.allocate_custom_id().map_err(io::Error::other)?;
-            draft.edited.push(StoredTheme {
-                id,
-                name: entry.name,
-                scheme: entry.scheme,
-                java: Some(entry.exchange),
-                background_asset: None,
-                agent_panel_colors: Default::default(),
-            });
+            draft.edited.push(entry.into_stored(id));
             report.added += 1;
         }
     }
@@ -381,6 +402,19 @@ fn merge_inner(themes: &mut Themes, library: Library, keep_existing: bool) -> io
     }
     *themes = draft;
     Ok(report)
+}
+
+impl Definition {
+    fn into_stored(self, id: Id) -> StoredTheme {
+        StoredTheme {
+            id,
+            name: self.name,
+            scheme: self.scheme,
+            java: Some(self.exchange),
+            background_asset: None,
+            agent_panel_colors: Default::default(),
+        }
+    }
 }
 
 pub(crate) fn encode(themes: &Themes) -> io::Result<Vec<u8>> {
@@ -556,6 +590,7 @@ mod tests {
                 added: 1,
                 unchanged: 0,
                 built_in: 1,
+                edited_built_in: 0,
                 limited: 1
             }
         );
@@ -582,6 +617,7 @@ mod tests {
                 added: 0,
                 unchanged: 1,
                 built_in: 0,
+                edited_built_in: 0,
                 limited: 1
             }
         );

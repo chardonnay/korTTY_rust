@@ -220,6 +220,7 @@ mod tests {
         let mut view = TerminalView {
             owner,
             session,
+            stream_generation: 3,
             frame: &frame,
             font_size: 14,
             font: Font::MONOSPACE,

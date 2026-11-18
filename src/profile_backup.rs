@@ -24,6 +24,7 @@ mod rotation;
 pub(crate) mod schedule;
 mod writer;
 
+pub(crate) use java_scheduler::read_swarm_journal;
 pub(crate) use openpgp::decrypt_openpgp_document;
 pub(crate) use restore::{JavaMemoryReview, JavaMemoryTarget};
 pub(crate) use restore::{

@@ -82,6 +82,12 @@ impl Workspace {
             return Ok(Task::none());
         }
         match message {
+            Message::AutoApproveRoot(enabled) if run.phase == Phase::Setup => {
+                run.auto_approve_root = enabled;
+            }
+            Message::ConfirmEveryCommand(enabled) if run.phase == Phase::Setup => {
+                run.confirm_every_command = enabled;
+            }
             Message::Goal(goal) if run.phase == Phase::Setup && goal.len() <= MAX_GOAL => {
                 run.goal = goal
             }
@@ -137,12 +143,21 @@ impl Workspace {
                 run.turns = 0;
                 return self.start_agent(id, run, false);
             }
-            Message::Approve(epoch) | Message::ApproveBatch(epoch)
+            Message::Approve(epoch)
+            | Message::ApproveBatch(epoch)
+            | Message::ApproveRemaining(epoch)
                 if epoch == run.epoch
                     && !run.paused
                     && run.reviewed_password_sudo().is_none()
                     && matches!(run.phase, Phase::ProbeApproval | Phase::Approval) =>
             {
+                if matches!(message, Message::ApproveRemaining(_)) {
+                    let approval = self.approve_remaining_agent_commands(run)?;
+                    run.revoke_command_approval();
+                    run.run_approval = Some(approval);
+                } else if run.run_approval.is_some() && !self.automatic_agent_command(run) {
+                    run.revoke_command_approval();
+                }
                 if matches!(message, Message::ApproveBatch(_)) {
                     if !self.start_batch_approval(run) {
                         run.notice =
@@ -199,9 +214,11 @@ impl Workspace {
                 return self.agent_turn(id, run);
             }
             Message::Pause if !run.phase.finished() && !run.cancel.requested() => {
+                run.auto_approve_root = false;
+                let had_approval = run.revoke_command_approval();
                 run.paused = !run.paused;
                 if run.paused
-                    && run.batch_commands.take().is_some()
+                    && (run.batch_commands.take().is_some() || had_approval)
                     && let Phase::ReviewedDirectory { probe } = run.phase
                 {
                     run.next(
@@ -277,6 +294,9 @@ impl Workspace {
                 if let Some(usage) = skill_usage {
                     usage.record();
                 }
+                if let Some(task) = self.continue_agent_commands(id, run)? {
+                    return Ok(task);
+                }
             }
             Message::ScriptRevision(epoch, result)
                 if epoch == run.epoch && run.phase == Phase::ScriptValidation =>
@@ -296,6 +316,14 @@ impl Workspace {
                 if epoch == run.epoch
                     && matches!(run.phase, Phase::Probe | Phase::Running | Phase::Elevated) =>
             {
+                if run.phase == Phase::Probe
+                    && result
+                        .as_ref()
+                        .as_ref()
+                        .is_ok_and(|outcome| outcome.status == engine::Status::Exited(0))
+                {
+                    run.probe_reviewed = true;
+                }
                 let result = result.as_ref().as_ref().map_err(Clone::clone)?;
                 run.record_result(result)?;
                 if run.phase == Phase::Elevated && result.status != engine::Status::Exited(0) {
@@ -318,6 +346,10 @@ impl Workspace {
                     return Err("The command did not complete. Review its partial result.".into());
                 }
                 if run.commands.is_empty() {
+                    if result.status != engine::Status::Exited(0) {
+                        run.auto_approve_root = false;
+                        run.revoke_command_approval();
+                    }
                     run.batch_commands = None;
                     return self.agent_turn(id, run);
                 }
@@ -325,6 +357,13 @@ impl Workspace {
                     Phase::Approval,
                     "Review the next exact command and its destination.",
                 );
+                if result.status != engine::Status::Exited(0) {
+                    run.auto_approve_root = false;
+                    run.revoke_command_approval();
+                }
+                if let Some(task) = self.continue_agent_commands(id, run)? {
+                    return Ok(task);
+                }
                 if run.finish_batch_command(result.status == engine::Status::Exited(0)) {
                     return self.agent_transition(id, run, Message::ApproveBatch(epoch));
                 }
@@ -455,6 +494,29 @@ impl Workspace {
         ))
     }
 
+    pub(super) fn continue_agent_commands(
+        &self,
+        id: window::Id,
+        run: &mut Run,
+    ) -> Result<Option<Task<Desktop>>, String> {
+        if !self.automatic_agent_command(run) {
+            return Ok(None);
+        }
+        let message = if run.reviewed_password_sudo().is_some() {
+            if run.sudo_terminal.is_none() {
+                run.notice = "This command is covered by the run's root approval. Choose a sudo authentication source.".into();
+                return Ok(None);
+            }
+            Message::Password(password::Message::Approve(
+                run.epoch,
+                password::Source::Ticket,
+            ))
+        } else {
+            Message::Approve(run.epoch)
+        };
+        self.agent_transition(id, run, message).map(Some)
+    }
+
     fn accept_target_review(
         &self,
         id: window::Id,
@@ -550,7 +612,7 @@ impl Workspace {
             Purpose::Script(review) => review.prepared.preview(),
             Purpose::Agent(_) => command.text(),
         };
-        run.record(format!("$ {preview}"));
+        let journal_dispatch = run.record_command(format!("$ {preview}"), probe);
         run.inline_command(command.text());
         let epoch = run.next(
             if probe {
@@ -572,13 +634,22 @@ impl Workspace {
                 let worker = std::thread::Builder::new()
                     .name("kortty-agent-command".into())
                     .spawn(move || {
-                        let _ = send.send_blocking(execution.run(command, &cancel, || {
-                            policy.check()?;
-                            if let Some(batch) = &batch {
-                                batch.check()?;
-                            }
-                            Ok(())
-                        }));
+                        let _ = send.send_blocking(execution.run(
+                            command,
+                            &cancel,
+                            || {
+                                policy.check()?;
+                                if let Some(batch) = &batch {
+                                    batch.check()?;
+                                }
+                                Ok(())
+                            },
+                            || {
+                                if let Some(dispatch) = &journal_dispatch {
+                                    dispatch.store(true, std::sync::atomic::Ordering::Release);
+                                }
+                            },
+                        ));
                     });
                 Arc::new(match worker {
                     Ok(_) => receive
@@ -617,6 +688,9 @@ impl Workspace {
             .ai_configuration()
             .ok_or("AI is unavailable under the current settings.")?;
         let profile = run.profile().ok_or("The agent profile is unavailable.")?;
+        if run.mode == Mode::Run && !config.agent_execution_enabled() {
+            return Err("Agent command execution is disabled in AI Manager.".into());
+        }
         if profile.server_default.is_some()
             && (run.binding.private()
                 || run.binding.saved().is_some()

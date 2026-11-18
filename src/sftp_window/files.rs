@@ -83,8 +83,8 @@ fn windows_hidden(_: &Metadata) -> bool {
 
 #[cfg(unix)]
 fn local_mode(metadata: &Metadata) -> Option<u32> {
-    use std::os::unix::fs::PermissionsExt as _;
-    Some(metadata.permissions().mode() & 0o777)
+    use std::os::unix::fs::MetadataExt as _;
+    Some(metadata.mode())
 }
 
 #[cfg(not(unix))]

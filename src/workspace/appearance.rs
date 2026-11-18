@@ -87,6 +87,12 @@ impl Design {
         Self::ALL[(self as usize + offset) % len]
     }
 
+    pub(super) fn from_id(id: &str) -> Option<Self> {
+        let normalized = id.trim().to_ascii_lowercase().replace('_', "-");
+        let value = serde::de::value::StrDeserializer::<serde::de::value::Error>::new(&normalized);
+        Self::deserialize(value).ok()
+    }
+
     pub(super) fn palette(self) -> Option<Palette> {
         self.definition().1
     }
@@ -192,34 +198,28 @@ impl fmt::Display for Design {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub(super) struct Preferences {
-    #[serde(deserialize_with = "read_design_id")]
-    pub(super) design: Design,
-    pub(super) animations: bool,
+    #[serde(
+        deserialize_with = "read_design_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(super) design: Option<Design>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) animations: Option<bool>,
 }
 
-fn read_design_id<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Design, D::Error> {
-    let id = Option::<String>::deserialize(deserializer)?.unwrap_or_default();
-    let normalized = id.trim().to_ascii_lowercase().replace('_', "-");
-    let id = serde::de::value::StrDeserializer::<D::Error>::new(&normalized);
-    Ok(Design::deserialize(id).unwrap_or_default())
-}
-
-impl Default for Preferences {
-    fn default() -> Self {
-        Self {
-            design: Design::Normal,
-            animations: true,
-        }
-    }
+fn read_design_id<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Design>, D::Error> {
+    Ok(Option::<String>::deserialize(deserializer)?
+        .as_deref()
+        .and_then(Design::from_id))
 }
 
 impl Preferences {
     pub(super) fn fresh() -> Self {
         Self {
-            design: Design::AtlantaFxPrimerDark,
+            design: Some(Design::AtlantaFxPrimerDark),
             ..Self::default()
         }
     }
@@ -228,14 +228,22 @@ impl Preferences {
         *self == Self::default()
     }
 
+    pub(super) fn design(self) -> Design {
+        self.design.unwrap_or_default()
+    }
+
+    pub(super) fn animations(self) -> bool {
+        self.animations.unwrap_or(true)
+    }
+
     pub(super) fn status_cursor<Message: 'static>(
         self,
         focused: bool,
     ) -> Option<Element<'static, Message>> {
-        if !self.animations {
+        if !self.animations() {
             return None;
         }
-        let color = self.design.pulse_color()?;
+        let color = self.design().pulse_color()?;
         Some(
             Canvas::new(Pulse { color, focused })
                 .width(18)
@@ -352,6 +360,11 @@ mod tests {
             let encoded = serde_json::to_value(design).unwrap();
             assert_eq!(encoded, id);
             assert_eq!(serde_json::from_value::<Design>(encoded).unwrap(), design);
+            assert_eq!(Design::from_id(id), Some(design));
+            assert_eq!(
+                Design::from_id(&id.to_ascii_uppercase().replace('-', "_")),
+                Some(design)
+            );
             assert_eq!(design.step(true), Design::ALL[(index + 1) % len]);
             assert_eq!(design.step(false), Design::ALL[(index + len - 1) % len]);
         }
@@ -367,8 +380,8 @@ mod tests {
         assert!(Design::Normal.palette().is_none());
         let unsupported: Preferences =
             serde_json::from_str(r#"{"design":"unknown","animations":false}"#).unwrap();
-        assert_eq!(unsupported.design, Design::Normal);
-        assert!(!unsupported.animations);
+        assert_eq!(unsupported.design(), Design::Normal);
+        assert!(!unsupported.animations());
     }
 
     #[test]
@@ -381,8 +394,8 @@ mod tests {
             4
         );
         let disabled = Preferences {
-            design: Design::AmberCrt,
-            animations: false,
+            design: Some(Design::AmberCrt),
+            animations: Some(false),
         };
         assert!(disabled.status_cursor::<()>(true).is_none());
         let now = Instant::now();

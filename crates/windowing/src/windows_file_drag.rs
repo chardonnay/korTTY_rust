@@ -98,10 +98,10 @@ fn owns_press(hwnd: HWND) -> bool {
     }
 }
 
-struct Ole;
+pub(super) struct Ole;
 
 impl Ole {
-    fn initialize() -> Option<Self> {
+    pub(super) fn initialize() -> Option<Self> {
         // SAFETY: OLE is initialized on this thread with its reserved pointer null.
         (unsafe { OleInitialize(null()) } >= 0).then_some(Self)
     }
@@ -152,9 +152,9 @@ fn file_list(paths: &[PathBuf]) -> Option<Vec<u16>> {
     Some(wide)
 }
 
-struct ComReference<T: ComObject>(NonNull<T>);
+pub(super) struct ComReference<T: ComObject>(NonNull<T>);
 
-trait ComObject {
+pub(super) trait ComObject {
     const RELEASE: unsafe extern "system" fn(*mut c_void) -> u32;
 }
 
@@ -167,11 +167,11 @@ impl ComObject for DropSource {
 }
 
 impl<T: ComObject> ComReference<T> {
-    fn new(object: T) -> Self {
+    pub(super) fn new(object: T) -> Self {
         Self(NonNull::from(Box::leak(Box::new(object))))
     }
 
-    fn as_ptr(&self) -> *mut c_void {
+    pub(super) fn as_ptr(&self) -> *mut c_void {
         self.0.cast().as_ptr()
     }
 }
@@ -270,12 +270,13 @@ struct FileData {
 }
 
 #[repr(C)]
-struct DataVtable {
+pub(super) struct DataVtable {
     base: IUnknown_Vtbl,
-    get_data: unsafe extern "system" fn(*mut c_void, *const FORMATETC, *mut STGMEDIUM) -> HRESULT,
+    pub(super) get_data:
+        unsafe extern "system" fn(*mut c_void, *const FORMATETC, *mut STGMEDIUM) -> HRESULT,
     get_data_here:
         unsafe extern "system" fn(*mut c_void, *const FORMATETC, *mut STGMEDIUM) -> HRESULT,
-    query_get_data: unsafe extern "system" fn(*mut c_void, *const FORMATETC) -> HRESULT,
+    pub(super) query_get_data: unsafe extern "system" fn(*mut c_void, *const FORMATETC) -> HRESULT,
     canonical_format:
         unsafe extern "system" fn(*mut c_void, *const FORMATETC, *mut FORMATETC) -> HRESULT,
     set_data:
@@ -309,7 +310,7 @@ static DATA_VTABLE: DataVtable = DataVtable {
     enum_advise: data_enum_advise,
 };
 
-unsafe fn query_interface(
+pub(super) unsafe fn query_interface(
     this: *mut c_void,
     iid: *const GUID,
     out: *mut *mut c_void,
@@ -579,6 +580,10 @@ mod tests {
                 E_NOINTERFACE,
             );
             assert!(queried.is_null());
+            assert_eq!(
+                crate::windows_desktop_drop::files(data.as_ptr()),
+                Some(vec![first.clone(), second.clone()]),
+            );
             assert_eq!(
                 data_get(data.as_ptr(), &FILE_FORMAT, &mut first_medium),
                 S_OK

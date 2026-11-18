@@ -1413,6 +1413,13 @@ impl Workspace {
                     .is_none_or(|approved| current_config(current.as_ref(), approved));
                 match result {
                     Ok(history) => {
+                        page.session_apply_runs.insert(run);
+                        page.session_apply_runs.retain(|id| {
+                            history
+                                .records
+                                .iter()
+                                .any(|record| record.apply_runs.iter().any(|run| run.id == *id))
+                        });
                         page.history = Some(history);
                         page.record = Some(pre);
                         page.refresh_record_hash(&surface.window);

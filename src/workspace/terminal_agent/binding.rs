@@ -108,19 +108,25 @@ impl ApprovedExecution {
         command: CommandToRun,
         cancel: &Cancel,
         before_dispatch: impl Fn() -> Result<(), String>,
+        started: impl FnOnce(),
     ) -> Result<Outcome, String> {
         match (self, command) {
             (Self::Attached(target), CommandToRun::Plain(command)) => {
                 before_dispatch()?;
-                target.execute(&command, cancel)
+                target.execute(&command, cancel, started)
             }
             (Self::Attached(target), CommandToRun::PasswordlessSudo(reviewed)) => {
                 before_dispatch()?;
-                target.execute_passwordless_sudo(reviewed, cancel)
+                target.execute_passwordless_sudo(reviewed, cancel, started)
             }
-            (Self::Saved(execution), CommandToRun::Plain(command)) => {
-                execution.run_guarded(&command, cancel, before_dispatch)
-            }
+            (Self::Saved(execution), CommandToRun::Plain(command)) => execution
+                .run_checked_with_start(
+                    &command,
+                    cancel,
+                    crate::ssh_connection::trust_store,
+                    before_dispatch,
+                    started,
+                ),
             (Self::Saved(_), CommandToRun::PasswordlessSudo(_)) => {
                 Err("Passwordless sudo requires an attached SSH agent run.".into())
             }

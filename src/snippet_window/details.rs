@@ -12,6 +12,7 @@ pub enum Message {
     Folder(String),
     OperatingSystem(String),
     FileName(String),
+    HistoryLimit(String),
     Mode(FileMode),
     Apply,
     Cancel,
@@ -50,6 +51,7 @@ pub(super) struct Form {
     metadata: Metadata,
     description: text_editor::Content,
     tags: text_editor::Content,
+    history_limit: String,
     error: Option<String>,
 }
 
@@ -72,12 +74,21 @@ impl Form {
             metadata: metadata.clone(),
             description: text_editor::Content::with_text(&metadata.description),
             tags: text_editor::Content::with_text(&metadata.tags.join("\n")),
+            history_limit: metadata
+                .history_max_size
+                .map(|limit| limit.to_string())
+                .unwrap_or_default(),
             error: None,
         }
     }
 
     pub(super) fn changed(&self, original: &Metadata) -> bool {
         &self.metadata != original
+            || self.history_limit
+                != original
+                    .history_max_size
+                    .map(|value| value.to_string())
+                    .unwrap_or_default()
     }
 
     pub(super) fn rebase_folder(&mut self, old: &str, new: &str) {
@@ -97,6 +108,10 @@ impl Form {
                 self.metadata.file_name = (!name.is_empty()).then_some(name);
             }
             Message::Mode(mode) => self.metadata.executable = mode.value(),
+            Message::HistoryLimit(mut value) => {
+                value.truncate(value.floor_char_boundary(8));
+                self.history_limit = value;
+            }
             Message::Description(action) => {
                 if let Some(value) = edit(&mut self.description, action, 16 * 1024) {
                     self.metadata.description = value;
@@ -113,6 +128,17 @@ impl Form {
                 }
             }
             Message::Apply => {
+                self.metadata.history_max_size = if self.history_limit.is_empty() {
+                    None
+                } else if let Ok(limit) = self.history_limit.parse::<u8>()
+                    && limit <= *crate::snippets::history::LIMITS.end()
+                {
+                    Some(limit)
+                } else {
+                    self.error =
+                        Some("Enter a version count from 0 to 99 or leave it blank.".into());
+                    return None;
+                };
                 self.metadata.folder_path = self.metadata.folder_path.trim().into();
                 self.metadata.operating_system = self
                     .metadata
@@ -178,6 +204,14 @@ impl Form {
                     .unwrap_or_default(),
             )
             .on_input(Message::OperatingSystem),
+            row![
+                text("History versions"),
+                text_input("Use global default", &self.history_limit)
+                    .on_input(Message::HistoryLimit),
+            ]
+            .spacing(8),
+            text("Use 0 for no count limit. The snippet library storage limit still applies.")
+                .size(13),
             text("Description"),
             text_editor(&self.description)
                 .height(Length::Fill)

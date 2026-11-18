@@ -1,10 +1,12 @@
 use std::fmt;
 
-use iced::advanced::text::Highlighter;
+use iced::advanced::text::{self, Highlighter, Renderer as _};
 use iced::advanced::widget::{Operation, Tree, tree};
 use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, renderer};
-use iced::widget::TextEditor;
-use iced::{Element, Event, Length, Rectangle, Renderer, Size, Theme, mouse};
+use iced::widget::{TextEditor, text_editor};
+use iced::{
+    Element, Event, Font, Length, Padding, Pixels, Point, Rectangle, Renderer, Size, Theme, mouse,
+};
 use iced_tiny_skia::{TextEditorCaret, TextEditorCaretShape};
 use serde::{Deserialize, Serialize};
 
@@ -74,29 +76,166 @@ pub(crate) fn view<'a, H: Highlighter, Message: 'a>(
     font_size: u8,
     preferences: Preferences,
 ) -> Element<'a, Message> {
+    view_with_layout(
+        editor,
+        content_theme,
+        appearance,
+        font_size,
+        preferences,
+        None,
+        None,
+    )
+}
+
+pub(crate) fn view_with_layout<'a, H: Highlighter, Message: 'a>(
+    editor: TextEditor<'a, H, Message>,
+    content_theme: Theme,
+    appearance: Appearance,
+    font_size: u8,
+    preferences: Preferences,
+    numbered_content: Option<&'a text_editor::Content>,
+    word_wrap: Option<bool>,
+) -> Element<'a, Message> {
+    let gutter = numbered_content.map(|content| Gutter {
+        content,
+        font: appearance.font,
+        size: Pixels(f32::from(font_size)),
+        width: content.line_count().max(1).ilog10() as f32 * f32::from(font_size)
+            + f32::from(font_size)
+            + PADDING,
+    });
+    let padding = Padding {
+        left: PADDING + gutter.as_ref().map_or(0.0, |gutter| gutter.width),
+        ..Padding::new(PADDING)
+    };
+    let editor = match word_wrap {
+        Some(true) => editor.wrapping(text::Wrapping::WordOrGlyph),
+        Some(false) => editor.horizontal_scroll(horizontal_metrics),
+        None => editor,
+    };
     let editor = editor
         .font(appearance.font)
         .size(f32::from(font_size))
-        .padding(PADDING)
+        .padding(padding)
         .style(move |_, status| iced::widget::text_editor::Style {
             value: TextEditorCaret::VALUE_COLOR,
             ..appearance.style(&content_theme, status)
         });
+    let padding = editor.content_padding();
     Element::new(CaretEditor {
         editor: editor.into(),
+        padding,
+        gutter,
         caret: TextEditorCaret {
             foreground: appearance.foreground.color(),
             color: preferences.color.color(),
             shape: preferences.shape.renderer_shape(),
             clip_bounds: None,
             fallback_cell_width: cell_width_ratio(appearance.font) * f32::from(font_size),
+            use_widget_x: word_wrap == Some(false),
         },
     })
+}
+
+fn horizontal_metrics(
+    editor: &<Renderer as text::Renderer>::Editor,
+) -> text_editor::HorizontalMetrics {
+    use text::editor::Editor as _;
+
+    let cursor = editor.cursor().position;
+    let buffer = editor.buffer();
+    let mut metrics = text_editor::HorizontalMetrics::default();
+    for run in buffer.layout_runs() {
+        let left = if run.rtl {
+            let right = buffer.size().0.unwrap_or(run.line_w);
+            metrics.left = metrics.left.min(right - run.line_w);
+            right - run.line_w
+        } else {
+            metrics.right = metrics.right.max(run.line_w);
+            0.0
+        };
+        if run.line_i == cursor.line {
+            metrics.caret_x = Some(
+                run.glyphs
+                    .iter()
+                    .find(|glyph| (glyph.start..glyph.end).contains(&cursor.column))
+                    .map_or(if run.rtl { left } else { run.line_w }, |glyph| {
+                        glyph.x + if glyph.level.is_rtl() { glyph.w } else { 0.0 }
+                    }),
+            );
+        }
+    }
+    metrics
 }
 
 struct CaretEditor<'a, Message> {
     editor: Element<'a, Message>,
     caret: TextEditorCaret,
+    padding: Padding,
+    gutter: Option<Gutter<'a>>,
+}
+
+struct Gutter<'a> {
+    content: &'a text_editor::Content,
+    font: Font,
+    size: Pixels,
+    width: f32,
+}
+
+impl Gutter<'_> {
+    fn draw(
+        &self,
+        renderer: &mut Renderer,
+        bounds: Rectangle,
+        viewport: &Rectangle,
+        color: iced::Color,
+    ) {
+        let mut gutter = bounds.shrink(PADDING);
+        gutter.width = gutter.width.min(self.width - PADDING);
+        let editor = self.content.editor();
+        let buffer = editor.buffer();
+        if let Some(height) = buffer.size().1 {
+            gutter.height = gutter.height.min(height);
+        }
+        let Some(clip) = gutter.intersection(viewport) else {
+            return;
+        };
+        let row_height = buffer.metrics().line_height;
+        let line_height = text::LineHeight::Absolute(Pixels(row_height));
+        let paint = |renderer: &mut Renderer, line: usize, top: f32| {
+            renderer.fill_text(
+                text::Text {
+                    content: (line + 1).to_string(),
+                    bounds: Size::new(gutter.width, row_height),
+                    size: self.size,
+                    line_height,
+                    font: self.font,
+                    align_x: text::Alignment::Right,
+                    align_y: iced::alignment::Vertical::Top,
+                    shaping: text::Shaping::Advanced,
+                    wrapping: text::Wrapping::None,
+                },
+                Point::new(gutter.x + gutter.width, gutter.y + top),
+                color,
+                clip,
+            );
+        };
+        let scroll = buffer.scroll();
+        let mut previous = None;
+        for run in buffer.layout_runs() {
+            if previous == Some(run.line_i) {
+                continue;
+            }
+            previous = Some(run.line_i);
+            // The iterator can begin on a wrapped continuation after scrolling.
+            if run.line_i != scroll.line || run.line_top <= -scroll.vertical {
+                paint(renderer, run.line_i, run.line_top);
+            }
+        }
+        if previous.is_none() && buffer.lines.len() <= 1 {
+            paint(renderer, 0, 0.0);
+        }
+    }
 }
 
 impl<Message> Widget<Message, Theme, Renderer> for CaretEditor<'_, Message> {
@@ -164,7 +303,7 @@ impl<Message> Widget<Message, Theme, Renderer> for CaretEditor<'_, Message> {
         viewport: &Rectangle,
     ) {
         let caret = TextEditorCaret {
-            clip_bounds: layout.bounds().shrink(PADDING).intersection(viewport),
+            clip_bounds: layout.bounds().shrink(self.padding).intersection(viewport),
             ..self.caret
         };
         renderer.with_text_editor_caret(caret, |renderer| {
@@ -172,6 +311,9 @@ impl<Message> Widget<Message, Theme, Renderer> for CaretEditor<'_, Message> {
                 .as_widget()
                 .draw(tree, renderer, theme, style, layout, cursor, viewport);
         });
+        if let Some(gutter) = &self.gutter {
+            gutter.draw(renderer, layout.bounds(), viewport, self.caret.foreground);
+        }
     }
 
     fn mouse_interaction(
@@ -197,6 +339,267 @@ mod tests {
     use iced::{Background, Color, Font, Pixels};
 
     use super::*;
+
+    #[test]
+    fn unwrapped_editor_scrolls_beyond_its_width_and_translates_clicks() {
+        fn build(
+            content: &text_editor::Content,
+            appearance: Appearance,
+        ) -> Element<'_, text_editor::Action> {
+            view_with_layout(
+                text_editor(content)
+                    .height(Length::Fill)
+                    .on_action(|action| action),
+                Theme::Dark,
+                appearance,
+                appearance.size,
+                Preferences::default(),
+                None,
+                Some(false),
+            )
+        }
+
+        let viewport = Viewport::with_physical_size(Size::new(120, 60), 1.0);
+        let bounds = Rectangle::with_size(viewport.logical_size());
+        let mut renderer = Renderer::new(Font::MONOSPACE, Pixels(16.0));
+        let mut content = text_editor::Content::with_text(&format!("{}TAIL", " ".repeat(80)));
+        let appearance = Appearance {
+            font: Font::MONOSPACE,
+            size: 16,
+            foreground: Rgb::from_hex(0xffffff),
+            background: Rgb::from_hex(0x000000),
+        };
+        let mut editor = build(&content, appearance);
+        let mut tree = Tree::new(editor.as_widget());
+        let limits = layout::Limits::new(Size::ZERO, bounds.size());
+        let node = editor.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let draw = |editor: &Element<'_, text_editor::Action>,
+                    tree: &Tree,
+                    renderer: &mut Renderer,
+                    node: &layout::Node| {
+            renderer.reset(bounds);
+            editor.as_widget().draw(
+                tree,
+                renderer,
+                &Theme::Dark,
+                &renderer::Style::default(),
+                Layout::new(node),
+                mouse::Cursor::Unavailable,
+                &bounds,
+            );
+            let mut pixmap = tiny_skia::Pixmap::new(120, 60).unwrap();
+            let mut mask = tiny_skia::Mask::new(120, 60).unwrap();
+            renderer.draw(
+                &mut pixmap.as_mut(),
+                &mut mask,
+                &viewport,
+                &[bounds],
+                Color::TRANSPARENT,
+            );
+            (8..31).any(|y| (6..114).any(|x| pixmap.pixel(x, y).unwrap().red() > 100))
+        };
+        assert!(!draw(&editor, &tree, &mut renderer, &node));
+        let cursor = mouse::Cursor::Available(Point::new(95.0, 13.0));
+        let mut messages = Vec::new();
+        let track = mouse::Cursor::Available(Point::new(114.0, 50.0));
+        for (event, cursor, tail_visible) in [
+            (
+                mouse::Event::ButtonPressed(mouse::Button::Left),
+                track,
+                true,
+            ),
+            (
+                mouse::Event::ButtonReleased(mouse::Button::Left),
+                track,
+                true,
+            ),
+            (
+                mouse::Event::WheelScrolled {
+                    delta: mouse::ScrollDelta::Pixels { x: 2000.0, y: 0.0 },
+                },
+                cursor,
+                false,
+            ),
+            (
+                mouse::Event::WheelScrolled {
+                    delta: mouse::ScrollDelta::Pixels { x: -2000.0, y: 0.0 },
+                },
+                cursor,
+                true,
+            ),
+        ] {
+            editor.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(event),
+                Layout::new(&node),
+                cursor,
+                &renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &bounds,
+            );
+            assert!(messages.is_empty());
+            assert_eq!(draw(&editor, &tree, &mut renderer, &node), tail_visible);
+        }
+        editor.as_widget_mut().update(
+            &mut tree,
+            &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            Layout::new(&node),
+            cursor,
+            &renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &bounds,
+        );
+        let [text_editor::Action::Click(click)] = messages.as_slice() else {
+            panic!("expected repositioned click, got {messages:?}");
+        };
+        assert!(click.x > bounds.width);
+        drop(editor);
+        content.perform(text_editor::Action::Click(*click));
+        assert!(content.cursor().position.column >= 80);
+        content.perform(text_editor::Action::Move(text_editor::Motion::End));
+        let mut editor = build(&content, appearance);
+        let mut tree = Tree::new(editor.as_widget());
+        let node = editor.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        assert!(draw(&editor, &tree, &mut renderer, &node));
+
+        let long_token = text_editor::Content::with_text(&"W".repeat(84));
+        let mut wrapped: Element<'_, ()> = view_with_layout(
+            text_editor(&long_token)
+                .height(Length::Fill)
+                .on_action(|_| ()),
+            Theme::Dark,
+            appearance,
+            appearance.size,
+            Preferences::default(),
+            None,
+            Some(true),
+        );
+        let mut tree = Tree::new(wrapped.as_widget());
+        let _ = wrapped
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let editor = long_token.editor();
+        assert!(
+            editor
+                .buffer()
+                .layout_runs()
+                .filter(|run| run.line_i == 0)
+                .count()
+                > 1
+        );
+
+        let right_aligned = text_editor::Content::with_text(&"אבג".repeat(40));
+        let mut editor = build(&right_aligned, appearance);
+        let mut tree = Tree::new(editor.as_widget());
+        let node = editor.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let mut messages = Vec::new();
+        for event in [
+            mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Pixels { x: 2000.0, y: 0.0 },
+            },
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+        ] {
+            editor.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(event),
+                Layout::new(&node),
+                cursor,
+                &renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &bounds,
+            );
+        }
+        let [text_editor::Action::Click(click)] = messages.as_slice() else {
+            panic!("expected click in right-aligned text, got {messages:?}");
+        };
+        assert!(click.x < 0.0);
+    }
+
+    #[test]
+    fn numbered_editor_paints_only_logical_line_starts_even_with_wrapping_and_scroll() {
+        let viewport = Viewport::with_physical_size(Size::new(120, 92), 1.0);
+        let bounds = Rectangle::with_size(viewport.logical_size());
+        let mut renderer = Renderer::new(Font::MONOSPACE, Pixels(16.0));
+        let mut content = text_editor::Content::with_text("one two three four five\nnext\nlast");
+        let appearance = Appearance {
+            font: Font::MONOSPACE,
+            size: 16,
+            foreground: Rgb::from_hex(0xffffff),
+            background: Rgb::from_hex(0x000000),
+        };
+        let render = |renderer: &mut Renderer, content: &text_editor::Content| {
+            let mut editor: Element<'_, ()> = view_with_layout(
+                text_editor(content).height(Length::Fill).on_action(|_| ()),
+                Theme::Dark,
+                appearance,
+                appearance.size,
+                Preferences::default(),
+                Some(content),
+                Some(true),
+            );
+            let mut tree = Tree::new(editor.as_widget());
+            let limits = layout::Limits::new(Size::ZERO, bounds.size());
+            let node = editor.as_widget_mut().layout(&mut tree, renderer, &limits);
+            renderer.reset(bounds);
+            editor.as_widget().draw(
+                &tree,
+                renderer,
+                &Theme::Dark,
+                &renderer::Style::default(),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &bounds,
+            );
+            let mut pixmap = tiny_skia::Pixmap::new(120, 92).unwrap();
+            let mut mask = tiny_skia::Mask::new(120, 92).unwrap();
+            renderer.draw(
+                &mut pixmap.as_mut(),
+                &mut mask,
+                &viewport,
+                &[bounds],
+                Color::TRANSPARENT,
+            );
+            pixmap
+        };
+        let pixels = render(&mut renderer, &content);
+        let has_number = |pixels: &tiny_skia::Pixmap, top: f32, height: f32| {
+            ((PADDING + top).max(PADDING) as u32..(PADDING + top + height) as u32)
+                .any(|y| (5..21).any(|x| pixels.pixel(x, y).is_some_and(|pixel| pixel.red() > 100)))
+        };
+        {
+            let editor = content.editor();
+            let buffer = editor.buffer();
+            let runs: Vec<_> = buffer.layout_runs().collect();
+            assert!(runs.iter().filter(|run| run.line_i == 0).count() > 1);
+            let mut previous = None;
+            for run in runs {
+                if run.line_top + run.line_height <= bounds.height - 2.0 * PADDING {
+                    assert_eq!(
+                        has_number(&pixels, run.line_top, run.line_height),
+                        previous != Some(run.line_i)
+                    );
+                }
+                previous = Some(run.line_i);
+            }
+        }
+        content.perform(text_editor::Action::Scroll { lines: 1 });
+        let pixels = render(&mut renderer, &content);
+        let editor = content.editor();
+        let buffer = editor.buffer();
+        let mut runs = buffer.layout_runs();
+        let first = runs.next().unwrap();
+        assert_eq!(first.line_i, 0);
+        assert!(!has_number(&pixels, first.line_top, first.line_height));
+        let second_line = runs.find(|run| run.line_i == 1).unwrap();
+        assert!(has_number(
+            &pixels,
+            second_line.line_top,
+            second_line.line_height
+        ));
+    }
 
     #[test]
     fn file_editor_caret_keeps_the_block_glyph_visible_and_respects_selection() {

@@ -9,7 +9,9 @@ use crate::editor_window::caret::Shape;
 use crate::snippet_window::appearance::MAX_FONT_SIZE;
 use crate::terminal_theme::Rgb;
 
-use super::{RawFields, merge_unset_section, preference, preference_node, preference_text};
+use super::{
+    RawFields, java_flag, merge_unset_section, preference, preference_node, preference_text,
+};
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -17,6 +19,17 @@ pub(super) struct Preferences {
     caret: Caret,
     fonts: Fonts,
     palette: Palette,
+    #[serde(default)]
+    layout: Layout,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Layout {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line_numbers: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    word_wrap: Option<bool>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -164,6 +177,10 @@ impl Preferences {
                 }),
             },
             palette: Palette::read(root, omitted),
+            layout: Layout {
+                line_numbers: preference(root, "snippetLineNumbers", omitted, java_flag),
+                word_wrap: preference(root, "snippetWordWrap", omitted, java_flag),
+            },
         };
         (settings.count() != 0).then_some(settings)
     }
@@ -178,6 +195,8 @@ impl Preferences {
             self.palette.background.is_some(),
             self.palette.cursor_style.is_some(),
             self.palette.cursor_color.is_some(),
+            self.layout.line_numbers.is_some(),
+            self.layout.word_wrap.is_some(),
         ]
         .into_iter()
         .filter(|set| *set)
@@ -203,7 +222,8 @@ impl Preferences {
         let caret = merge_unset_section(fields, "editor_caret", &self.caret)?;
         let fonts = merge_unset_section(fields, "snippet_appearance", &self.fonts)?;
         let palette = merge_unset_section(fields, "snippet_appearance", &self.palette)?;
-        Ok(caret || fonts || palette)
+        let layout = merge_unset_section(fields, "snippet_appearance", &self.layout)?;
+        Ok(caret || fonts || palette || layout)
     }
 }
 

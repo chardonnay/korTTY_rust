@@ -28,6 +28,14 @@ Open and close a menu during output, abort with `Ctrl+C`, and continue typing at
 
 Development and test builds include line information for backtraces by default. Cargo does not create an incremental build cache or separate debug objects for this. On macOS and Linux, `bash scripts/with-scratch.sh cargo test --locked --workspace` bundles temporary files and cleans up the run directory and its process group even after an error. Run `cargo clean --profile dev` after the last check and `cargo clean --release` after verifying packages. Archives under `target/dist/` are preserved. The cleanup steps in [AGENTS.md](AGENTS.md) apply for cross-builds and VM tests.
 
+On Windows, create a private runtime directory owned by the current user with an
+inheritable full-control ACL for that user and inherited permissions disabled.
+Set `TEMP` and `TMP` to it during tests and restore them in `finally`, then remove
+the run directory. The **Run Windows tests** step in
+[ci.yml](.github/workflows/ci.yml) provides the ACL setup. A random directory name
+alone does not establish the ownership and access contract required by protected
+receiver tests.
+
 **File → New Tab** and the tab symbol open **Quick Connect**. The second terminal symbol starts a local shell. In Quick Connect, you can choose the emulation for the new session. The menu contains Xterm, the six DEC-VT profiles, Sun CDE, Wyse 50/60/160, TeleVideo 910/920/925, HP 2392 and 700/92, SCO ANSI, DEC CTERM, and PETSCII. The worker sets the corresponding `TERM` identifier. **View → Panes** contains **Split Pane**, **Split Right**, and **Split Down** for independent sessions. **Split Pane** selects the direction based on the character dimensions. The direction focus and **Next Pane** or **Previous Pane** restore the split view for a zoomed pane. The pane title can be dragged within the tab. **Move tab** moves an entire tab to an existing or new window and retains its sessions. Dragging the tab title has native paths for macOS, Windows, X11, and Wayland. Under Wayland, the compositor confirms the drop on a registered kortty window. The compositor assigns keyboard focus. **Move tab** remains available as a target selection.
 
 The main view adopts the Java groups **Terminal**, **Tools**, and **Settings** in the toolbar and the application menus below it. The macOS system menu offers the same available actions. **View → Customize toolbar…** opens the editor. It offers search, drag-and-drop, icon sizes from 16 to 64, and separate visibility for bars and groups. **Add connection** directly opens the catalog for saved connections and groups. **Finish** saves the layout for all windows. **Cancel** discards the draft. When renaming in **Connection Manager**, attached folders and their subfolders follow the new path. This also applies to an open draft.
@@ -1087,6 +1095,21 @@ To upload into an existing protected folder, select **Review changes in an exist
 **SSH · Review privileged folder download** reviews a complete root-owned tree from one pinned Linux SSH route. Choose an absent local directory under a protected parent, review the exact files and directories, choose **Approve one run**, and save. The job consumes the approval before requesting file bodies. It checks each digest and the final source acknowledgement before publishing the complete private tree locally. Both privileged folder actions accept up to 128 entries and 1 GiB.
 
 For an existing destination, select **Review changes in an existing local folder**. The review lists new entries and changed files. The job verifies all source data and rechecks the approved receiver and pinned route before publishing. It preserves the existing folder, unchanged files, and entries found only on the receiver. Replacements retain supported local access metadata and keep the originals in private sibling folders. The run journal reports how to find them. A portable backup retains the paths and sudo mode and restores the job disabled for fresh review.
+
+Either privileged folder action also offers **Allow recurring protected folder
+transfers on this device** for Calendar or Chain starts. Set the approval duration,
+number of firings and per-firing entry and payload limits, review the comparison,
+then save. An existing-folder review binds that receiver immediately. An absent
+destination review permits one complete no-replace root publication and binds
+subsequent merges to the confirmed new receiver. The first creation counts the
+root itself as an action, including for an empty source. An independently created
+or replaced receiver is never adopted automatically. Recurring uploads require
+the updated installed Linux folder helper and its configured destination and
+replacement roots. Downloads require a local filesystem with stable directory
+birth identity. Their payload limit includes unchanged source files because the
+read helper streams the complete source. Each claimed publication consumes one
+firing allowance. An interrupted or unconfirmed run blocks further automatic
+publication until explicit reapproval; retain any reported recovery originals.
 
 For **Upload file** or **Download file**, choose **Privileged staging** to enable passwordless sudo or a saved sudo credential on one pinned Linux SSH route. Select **Review paths and SSH route…**, approve the displayed operation, and save the job. The approval covers subsequent runs of the same action on this device. Each run streams one regular file of at most 1 GiB through the fixed `/usr/bin/sudo` and `/usr/bin/python3` helper. The helper uses root-controlled directories and publishes uploads as new root-owned files with mode `0600`. Downloads publish to a new local file after the complete digest is verified. The file transfer and scheduler sudo policies apply. A changed route, path, elevation mode or restored job needs a new approval.
 
@@ -2325,22 +2348,12 @@ with a static C runtime so the ZIP can run without the Visual C++
 Redistributable.
 
 ```powershell
-$target = (rustc -vV | Select-String '^host: ').Line.Substring(6)
-$previousRustFlags = $env:RUSTFLAGS
-try {
-    $env:RUSTFLAGS = '-C target-feature=+crt-static'
-    cargo build --release --locked --workspace --target $target
-    if ($LASTEXITCODE -ne 0) { throw "Release build failed ($LASTEXITCODE)" }
-    $binDir = "target/$target/release"
-    & "./$binDir/kortty-package.exe" --target $target --bin-dir $binDir
-    if ($LASTEXITCODE -ne 0) { throw "Package staging failed ($LASTEXITCODE)" }
-} finally {
-    $env:RUSTFLAGS = $previousRustFlags
-}
+./scripts/release-windows.ps1
 ```
 
-On Windows, add `--windows-msi` to stage an MSI with the ZIP and its own
-SHA-256 sidecar. Install WiX Toolset 4 or later and the matching
+Run `./scripts/release-windows.ps1 -PackageArguments @('--windows-msi')` to
+stage an MSI with the ZIP and its own SHA-256 sidecar. Install WiX Toolset 4
+or later and the matching
 `WixToolset.UI.wixext` extension. The installer supports x64 and ARM64 native
 payloads and keeps the desktop, CLI and SSH worker in the same directory. Its
 per-machine `kortty Rust` product and default directory allow the Java
@@ -2382,6 +2395,9 @@ bash scripts/with-scratch.sh bash -ec '
 The [porting parity checklist](PORTING-PARITY.md) tracks implementation and
 acceptance against the pinned Java and SithTermFX references.
 
+Run native tests and release builds locally on the target OS. GitHub runs the
+Native Rust CI workflow only on manual dispatch. Code scanning runs separately.
+
 For native development builds on Windows, macOS and Fedora, run
 `python scripts/cargo-native.py build --locked` (`python3` on macOS or Fedora).
 The wrapper estimates one GiB per Cargo job, reserves memory for the host,
@@ -2393,10 +2409,22 @@ and caps jobs at the available logical CPUs and Linux cgroup limits. Use
 ```sh
 cargo fmt --all --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace
 ```
 
-On macOS, `bash scripts/with-scratch.sh --zsh-tests cargo test --locked --workspace --all-targets` runs the tests with `/bin/zsh` and standard parallelism. The PTY tests use a separate `ZDOTDIR` with disabled file history. This prevents simultaneously starting test shells from waiting for the same zsh history lock.
+Run the native suite with the command for your platform.
+
+| Platform | Command |
+| --- | --- |
+| Windows (PowerShell) | `./scripts/test-windows.ps1` |
+| macOS | `bash scripts/with-scratch.sh --zsh-tests cargo test --locked --workspace --all-targets` |
+| Linux | `SHELL=/bin/sh bash scripts/with-scratch.sh cargo test --locked --workspace --all-targets` |
+
+The Windows script gives tests a private directory for temporary files and
+application data. For focused checks, pass Cargo test arguments, for example
+`./scripts/test-windows.ps1 -CargoArguments @('-p', 'kortty-pty', '--lib')`.
+The macOS suite uses `/bin/zsh` with its own `ZDOTDIR` and file history disabled.
+Run the release commands above when a native package is needed. Follow
+[AGENTS.md](AGENTS.md) for build cleanup and package verification.
 
 Run the opt-in macOS OpenSSH fixture under a private scratch directory
 with a user-owned ancestor, such as `KORTTY_SCRATCH_PARENT="$HOME"`.

@@ -1,4 +1,4 @@
-//! File paths received from a Wayland desktop drag source.
+//! File and text offers received from a Wayland desktop drag source.
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -9,7 +9,7 @@ use smithay_clipboard::file_drop;
 
 use crate::wayland_drag::Surface;
 
-pub use file_drop::{Permit, Watch};
+pub use file_drop::{Kind, Permit, Watch};
 
 const MAX_LIST_BYTES: usize = 1024 * 1024;
 const MAX_PATH_BYTES: usize = 4096;
@@ -20,6 +20,7 @@ pub enum Event {
     Dropped {
         id: u64,
         position: (f64, f64),
+        kind: Kind,
         permit: Permit,
     },
     Received {
@@ -33,10 +34,16 @@ pub enum Event {
 
 pub fn watch(surface: Surface, notify: impl Fn(Event) + Send + Sync + 'static) -> Option<Watch> {
     file_drop::watch(surface.display, surface.surface, move |event| match event {
-        file_drop::Event::Dropped { id, target, permit } if target.surface == surface.surface => {
+        file_drop::Event::Dropped {
+            id,
+            target,
+            kind,
+            permit,
+        } if target.surface == surface.surface => {
             notify(Event::Dropped {
                 id,
                 position: (target.x, target.y),
+                kind,
                 permit,
             });
         }

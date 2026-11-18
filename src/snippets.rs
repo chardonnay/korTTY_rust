@@ -37,6 +37,7 @@ pub(crate) mod archive;
 pub(crate) mod diagrams;
 pub(crate) mod exchange;
 pub(crate) mod folders;
+pub(crate) mod history;
 pub(crate) mod modularization;
 pub(crate) mod recipients;
 pub(crate) mod resolve;
@@ -111,9 +112,14 @@ pub(crate) struct Snippet {
     content: Arc<str>,
     #[serde(default, skip_serializing_if = "Metadata::is_empty")]
     metadata: Metadata,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    history: Vec<history::Revision>,
 }
 
 impl Snippet {
+    pub(crate) fn history(&self) -> &[history::Revision] {
+        &self.history
+    }
     pub(crate) fn id(&self) -> SnippetId {
         self.id
     }
@@ -151,7 +157,13 @@ impl Snippet {
             category: input.category.trim().into(),
             content: input.content,
             metadata,
+            history: Vec::new(),
         }
+    }
+
+    fn with_history(mut self, history: Vec<history::Revision>) -> Self {
+        self.history = history;
+        self
     }
 
     pub(crate) fn label(&self) -> String {
@@ -163,6 +175,7 @@ impl Snippet {
     }
 
     fn validate(&self) -> io::Result<()> {
+        history::validate(&self.history)?;
         if !valid_field(&self.name, MAX_NAME_BYTES) || self.name.is_empty() {
             return Err(invalid("Enter a snippet name up to 160 bytes"));
         }
@@ -217,6 +230,8 @@ pub(crate) struct Metadata {
     pub(crate) tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) diagrams: Vec<diagrams::Saved>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) history_max_size: Option<u8>,
 }
 
 impl Metadata {
@@ -228,9 +243,16 @@ impl Metadata {
             && self.executable.is_none()
             && self.tags.is_empty()
             && self.diagrams.is_empty()
+            && self.history_max_size.is_none()
     }
 
     pub(crate) fn validate(&self) -> io::Result<()> {
+        if self
+            .history_max_size
+            .is_some_and(|limit| limit > *history::LIMITS.end())
+        {
+            return Err(invalid("Invalid snippet history limit"));
+        }
         if self.description.len() > 16 * 1024
             || self.description.contains('\0')
             || self.operating_system.as_deref().is_some_and(|system| {
@@ -572,6 +594,7 @@ impl Library {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn save(
         &mut self,
         editing: Option<SnippetId>,
@@ -607,15 +630,17 @@ impl Library {
         self.commit(candidate)
     }
 
+    #[cfg(test)]
     pub(crate) fn save_with_metadata(
         &mut self,
         editing: Option<SnippetId>,
         input: Input,
         metadata: Option<Metadata>,
     ) -> io::Result<SnippetId> {
-        self.store_snippet(editing, None, input, metadata)
+        self.store_snippet(editing, None, input, metadata, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn create_with_id(
         &mut self,
         id: SnippetId,
@@ -625,7 +650,21 @@ impl Library {
         if self.get(id).is_some() {
             return Err(invalid("The new snippet ID is already in use"));
         }
-        self.store_snippet(None, Some(id), input, Some(metadata))
+        self.store_snippet(None, Some(id), input, Some(metadata), None)
+    }
+
+    pub(crate) fn save_with_history(
+        &mut self,
+        editing: Option<SnippetId>,
+        creating: Option<SnippetId>,
+        input: Input,
+        metadata: Option<Metadata>,
+        versions: Vec<history::Revision>,
+    ) -> io::Result<SnippetId> {
+        if creating.is_some_and(|id| self.get(id).is_some()) {
+            return Err(invalid("The new snippet ID is already in use"));
+        }
+        self.store_snippet(editing, creating, input, metadata, Some(versions))
     }
 
     fn store_snippet(
@@ -634,6 +673,7 @@ impl Library {
         creating: Option<SnippetId>,
         input: Input,
         metadata: Option<Metadata>,
+        versions: Option<Vec<history::Revision>>,
     ) -> io::Result<SnippetId> {
         let mut candidate = self.document.as_ref().clone();
         let id = editing.or(creating).map_or_else(SnippetId::new, Ok)?;
@@ -660,14 +700,16 @@ impl Library {
                 None => previous.metadata.clone(),
             };
             diagrams::rebase(&mut metadata.diagrams, &previous.content, &input.content);
-            *previous = Snippet::from_input(id, input, metadata);
+            let history = versions.unwrap_or_else(|| std::mem::take(&mut previous.history));
+            *previous = Snippet::from_input(id, input, metadata).with_history(history);
         } else {
             if input.content.trim().is_empty() {
                 return Err(invalid("Enter snippet text"));
             }
-            candidate
-                .snippets
-                .push(Snippet::from_input(id, input, metadata.unwrap_or_default()));
+            candidate.snippets.push(
+                Snippet::from_input(id, input, metadata.unwrap_or_default())
+                    .with_history(versions.unwrap_or_default()),
+            );
         }
         self.commit(candidate)?;
         Ok(id)
@@ -689,6 +731,7 @@ impl Library {
             id,
             input,
             metadata,
+            history,
         } in imports.structured
         {
             if !names.insert(input.name.trim().to_lowercase()) {
@@ -700,7 +743,7 @@ impl Library {
             };
             candidate
                 .snippets
-                .push(Snippet::from_input(id, input, metadata));
+                .push(Snippet::from_input(id, input, metadata).with_history(history));
         }
         for mut input in imports.text {
             let base = input.name.trim();
@@ -909,10 +952,11 @@ pub(crate) fn portable_java_backup(
         id,
         input,
         metadata,
+        history,
     } in imports.structured
     {
         let id = id.map(Ok).unwrap_or_else(SnippetId::new)?;
-        let snippet = Snippet::from_input(id, input, metadata);
+        let snippet = Snippet::from_input(id, input, metadata).with_history(history);
         if snippet.is_script_header() && !custom_script_headers_allowed() {
             skipped_headers += 1;
         } else {

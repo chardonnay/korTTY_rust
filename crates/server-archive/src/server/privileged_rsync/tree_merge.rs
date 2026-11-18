@@ -23,6 +23,8 @@ use crate::server::{
     Directory, File, PRIVATE_DIRECTORY, PRIVATE_FILE, absolute_file, invalid, same_node,
 };
 
+mod creation;
+
 pub(crate) fn serve() -> io::Result<()> {
     let mut output = io::stdout().lock();
     let mut recovery = ExistingRecovery::default();
@@ -61,6 +63,24 @@ fn exchange(
     let request: Request = read(&mut *input)?;
     if !request.valid() {
         return Err(invalid("Invalid protected folder upload"));
+    }
+    if request.create_root {
+        let (path, _) = absolute_file(&request.root)?;
+        let parent = rules.destination_parent(path, false)?;
+        let mount = mount_id(&parent.fd)?;
+        let binding = BoundDirectory::new(path, parent, mount)?;
+        return creation::exchange(
+            &request,
+            Directory::from_fd(binding.directory.fd.try_clone()?.into())?,
+            rules.revision(),
+            input,
+            output,
+            recovery,
+            || {
+                rules.require_current()?;
+                binding.require(path, &rules.destination_parent(path, false)?)
+            },
+        );
     }
     let paths = request
         .entries
@@ -127,7 +147,10 @@ fn exchange(
         write(&mut *output, &Reply::Applied { index })?;
         *recovery = ExistingRecovery::default();
     }
-    Ok(Some(Reply::Complete))
+    plan.require_scope(rules)?;
+    Ok(Some(Reply::Complete {
+        receiver: plan.review.receiver,
+    }))
 }
 
 struct Plan<'a> {
@@ -256,11 +279,22 @@ impl<'a> Plan<'a> {
         for binding in directories.values() {
             fingerprint.update(binding.fingerprint);
         }
+        let receiver = request
+            .receiver_receipt
+            .then(|| {
+                receiver_anchor(
+                    rules.revision(),
+                    root,
+                    &directories.get(root).ok_or_else(changed)?.directory,
+                )
+            })
+            .transpose()?;
         let plan = Self {
             directories,
             slots,
             review: Review {
                 fingerprint: fingerprint.finalize().into(),
+                receiver,
                 changes,
             },
         };
@@ -328,7 +362,7 @@ impl Slot<'_> {
             }
             Self::NewTree(target) => {
                 let stage = UploadStage::create_checked(target.parent())?;
-                let expected = receive_tree(&stage.payload, request, group, input)?;
+                let expected = receive_tree(&stage.payload, request, group, input, false)?;
                 let tree = target.prepare_transfer(&stage, expected)?;
                 Ok(Prepared::Tree(stage, tree))
             }
@@ -385,17 +419,22 @@ fn receive_tree(
     request: &Request,
     group: &[usize],
     input: &mut impl Read,
+    include_root: bool,
 ) -> io::Result<kortty_server_archive::rsync_tree::Inventory> {
-    let path = &request.entries[group[0]].path;
+    let path = (!include_root).then(|| request.entries[group[0]].path.as_str());
     let mut directories = BTreeMap::new();
     let mut inventory = BTreeMap::new();
-    for index in &group[1..] {
+    for index in group.iter().skip(usize::from(!include_root)) {
         let entry = &request.entries[*index];
-        let relative = entry
-            .path
-            .strip_prefix(path.as_str())
-            .and_then(|name| name.strip_prefix('/'))
-            .ok_or_else(changed)?;
+        let relative = if let Some(path) = path {
+            entry
+                .path
+                .strip_prefix(path)
+                .and_then(|name| name.strip_prefix('/'))
+                .ok_or_else(changed)?
+        } else {
+            entry.path.as_str()
+        };
         let (parent, name) = relative.rsplit_once('/').unwrap_or(("", relative));
         let directory = if parent.is_empty() {
             root
@@ -410,13 +449,69 @@ fn receive_tree(
         }
         inventory.insert(relative.split('/').collect::<Vec<_>>(), entry.file);
     }
-    let mut manifest = Manifest::bounded_transfer(group.len() as u32 - 1, MAX_BYTES);
+    let mut manifest =
+        Manifest::bounded_transfer((group.len() - usize::from(!include_root)) as u32, MAX_BYTES);
     for (parts, file) in inventory {
         manifest.add(&parts.join("/"), file.map(|file| (file.bytes, file.sha256)))?;
     }
     Ok(manifest.finish())
 }
 
+fn receiver_anchor(policy: [u8; 32], path: &str, directory: &Directory) -> io::Result<[u8; 32]> {
+    let mut hash = Sha256::new_with_prefix(b"kortty-protected-tree-receiver-v1\0");
+    hash.update(policy);
+    hash.update(directory_fingerprint(path, directory)?);
+    Ok(hash.finalize().into())
+}
+
 fn changed() -> io::Error {
     invalid("A reviewed protected folder entry changed or is outside its scope")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::{self, DirBuilder, Permissions};
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+
+    #[test]
+    fn protected_tree_receiver_anchor_binds_policy_identity_and_metadata_not_payload() {
+        let mut nonce = [0; 16];
+        getrandom::fill(&mut nonce).unwrap();
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("kortty-merge-receiver-{}", hex::encode(nonce)));
+        DirBuilder::new().mode(0o700).create(&root).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let path = root.join("receiver");
+        DirBuilder::new().mode(0o700).create(&path).unwrap();
+        let anchor = |policy| {
+            receiver_anchor(
+                policy,
+                path.to_str().unwrap(),
+                &Directory::open_parent(path.to_str().unwrap()).unwrap(),
+            )
+            .unwrap()
+        };
+        let initial = anchor([1; 32]);
+        fs::write(path.join("file"), b"original").unwrap();
+        assert_eq!(anchor([1; 32]), initial);
+        fs::write(path.join("file"), b"changed source publication").unwrap();
+        assert_eq!(anchor([1; 32]), initial);
+        assert_ne!(anchor([2; 32]), initial);
+        fs::set_permissions(&path, Permissions::from_mode(0o750)).unwrap();
+        assert_ne!(anchor([1; 32]), initial);
+        fs::set_permissions(&path, Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(anchor([1; 32]), initial);
+        fs::rename(&path, root.join("prior")).unwrap();
+        DirBuilder::new().mode(0o700).create(&path).unwrap();
+        assert_ne!(anchor([1; 32]), initial);
+    }
 }

@@ -86,17 +86,28 @@ pub(crate) struct Control {
 
 #[derive(Clone)]
 pub(crate) struct JobProcessProbe {
-    shell: Weak<OwnedHandle>,
+    process: Weak<OwnedHandle>,
     job: Weak<OwnedHandle>,
+    idle_processes: u32,
 }
 
 impl JobProcessProbe {
+    pub(crate) fn has_running_children(&self) -> bool {
+        let (Some(process), Some(job)) = (self.process.upgrade(), self.job.upgrade()) else {
+            return false;
+        };
+        let running = || matches!(signaled(&process, 0), Ok(false));
+        running()
+            && active_job_processes(&job).is_ok_and(|count| count > self.idle_processes)
+            && running()
+    }
+
     pub(crate) fn find<T>(
         &self,
         previous: Option<JobProcessIdentity>,
         inspect: impl Fn(&str, &[&str]) -> Option<T>,
     ) -> Option<(JobProcessIdentity, T)> {
-        let shell = self.shell.upgrade()?;
+        let shell = self.process.upgrade()?;
         let job = self.job.upgrade()?;
         if !matches!(signaled(&shell, 0), Ok(false)) {
             return None;
@@ -126,8 +137,10 @@ impl Control {
 
     pub(crate) fn job_process_probe(&self) -> Option<JobProcessProbe> {
         Some(JobProcessProbe {
-            shell: Arc::downgrade(&self.process),
+            process: Arc::downgrade(&self.process),
             job: Arc::downgrade(self.job.as_ref()?),
+            // AppContainer terminals keep the broker and its shell in the job.
+            idle_processes: 1 + u32::from(self.sandbox.is_some()),
         })
     }
 
@@ -941,18 +954,7 @@ pub(crate) fn terminate_job(job: &OwnedHandle) -> io::Result<()> {
     // directories alive until the entire job, including descendants, has exited.
     let deadline = Instant::now() + Duration::from_millis(REAP_TIMEOUT_MS.into());
     loop {
-        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
-        // SAFETY: job is live and accounting is the writable structure for this class.
-        bool_result(unsafe {
-            QueryInformationJobObject(
-                job.as_raw_handle(),
-                JobObjectBasicAccountingInformation,
-                (&raw mut accounting).cast(),
-                size_of_val(&accounting) as u32,
-                null_mut(),
-            )
-        })?;
-        if accounting.ActiveProcesses == 0 {
+        if active_job_processes(job)? == 0 {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -963,6 +965,21 @@ pub(crate) fn terminate_job(job: &OwnedHandle) -> io::Result<()> {
         }
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn active_job_processes(job: &OwnedHandle) -> io::Result<u32> {
+    let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+    // SAFETY: job is live and accounting is the writable structure for this class.
+    bool_result(unsafe {
+        QueryInformationJobObject(
+            job.as_raw_handle(),
+            JobObjectBasicAccountingInformation,
+            (&raw mut accounting).cast(),
+            size_of_val(&accounting) as u32,
+            null_mut(),
+        )
+    })?;
+    Ok(accounting.ActiveProcesses)
 }
 
 fn limited_job(process_memory: Option<usize>) -> io::Result<OwnedHandle> {

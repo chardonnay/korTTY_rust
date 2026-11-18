@@ -28,6 +28,8 @@ pub enum Edit {
     JournalClickableLinks(bool),
     JournalLogFormat(LogFormat),
     JournalAiEnabled(bool),
+    JournalAiSummaries(bool),
+    JournalScreenshotAnalysis(bool),
     JournalAiEndpoint(String),
     JournalAiModel(String),
     JournalVisionEnabled(bool),
@@ -51,6 +53,8 @@ pub(super) struct Editor {
     journal_clickable_links: Option<bool>,
     journal_log_format: Option<LogFormat>,
     journal_ai_enabled: Option<bool>,
+    journal_ai_summaries: Option<bool>,
+    journal_screenshot_analysis: Option<bool>,
     journal_ai_endpoint: TextDraft,
     journal_ai_model: TextDraft,
     journal_vision_enabled: Option<bool>,
@@ -146,6 +150,9 @@ impl Editor {
         {
             next.enabled = enabled;
         }
+        if let Some(enabled) = self.journal_ai_summaries {
+            next.summaries_enabled = Some(enabled);
+        }
         for (draft, before, target) in [
             (
                 &self.journal_ai_endpoint,
@@ -162,6 +169,9 @@ impl Editor {
             }
         }
         if topic_ai_settings::vision_allowed(policy) {
+            if let Some(enabled) = self.journal_screenshot_analysis {
+                next.screenshot_analysis_enabled = Some(enabled);
+            }
             if let Some(enabled) = self.journal_vision_enabled
                 && enabled != initial.vision_enabled
             {
@@ -178,7 +188,11 @@ impl Editor {
             }
         }
         next.validate().map_err(|error| error.to_string())?;
-        if next != *current
+        if (next.enabled != current.enabled
+            || next.endpoint != current.endpoint
+            || next.model != current.model
+            || next.vision_enabled != current.vision_enabled
+            || next.auto_screenshot_analysis != current.auto_screenshot_analysis)
             && next.enabled
             && next.endpoint.is_empty()
             && next.model.is_empty()
@@ -369,6 +383,12 @@ impl Workspace {
             }
             Edit::JournalAiEnabled(value) if journal_ai_allowed => {
                 dialog.logging.journal_ai_enabled = Some(value);
+            }
+            Edit::JournalAiSummaries(value) if journal_ai_allowed => {
+                dialog.logging.journal_ai_summaries = Some(value);
+            }
+            Edit::JournalScreenshotAnalysis(value) if vision_allowed => {
+                dialog.logging.journal_screenshot_analysis = Some(value);
             }
             Edit::JournalAiEndpoint(value) if journal_ai_allowed => {
                 dialog.logging.journal_ai_endpoint = Some(journal_ai_text(
@@ -661,6 +681,22 @@ impl Workspace {
             text("The format applies to new recordings.").size(13),
             highlighted(dialog, Setting::JournalClickableLinks, links),
             self.journal_ai_settings(dialog),
+            highlighted(
+                dialog,
+                Setting::JournalAiSummaries,
+                checkbox(
+                    dialog
+                        .logging
+                        .journal_ai_summaries
+                        .or(dialog.draft.preferences.journal_ai.summaries_enabled)
+                        .unwrap_or(true)
+                )
+                .label(Setting::JournalAiSummaries.label())
+                .on_toggle_maybe(
+                    topic_ai_settings::allowed(&self.clipboard.policy)
+                        .then_some(move |enabled| wrap(id, Edit::JournalAiSummaries(enabled)))
+                ),
+            ),
             self.journal_vision_settings(dialog),
         ]
         .spacing(8)
@@ -724,6 +760,10 @@ impl Workspace {
         let edit_vision = allowed && profile_enabled;
         let edit_automatic = allowed && managed.is_none();
         let id = dialog.id;
+        let screenshot_analysis = editor
+            .journal_screenshot_analysis
+            .or(saved.screenshot_analysis_enabled)
+            .unwrap_or(true);
         let image: Row<'_, Desktop> = row![
             checkbox(allowed && vision)
                 .label(Setting::JournalVision.label())
@@ -749,6 +789,13 @@ impl Workspace {
         .align_y(Alignment::Center);
         column![
             highlighted(dialog, Setting::JournalVision, image),
+            highlighted(
+                dialog,
+                Setting::JournalScreenshotAnalysis,
+                checkbox(allowed && screenshot_analysis)
+                    .label(Setting::JournalScreenshotAnalysis.label())
+                    .on_toggle_maybe(allowed.then_some(move |enabled| wrap(id, Edit::JournalScreenshotAnalysis(enabled)))),
+            ),
             highlighted(dialog, Setting::JournalAutomaticVision, automatic),
             text("Automatic analysis is on by default. With image input enabled for a local profile, it adds a description and tags to new screenshots. You can turn it off here or for the current recording.").size(13),
         ]
@@ -1191,7 +1238,7 @@ mod tests {
                 endpoint: local_ai::DEFAULT_ENDPOINT.into(),
                 model: "journal-model".into(),
                 vision_enabled: true,
-                auto_screenshot_analysis: true,
+                ..JournalAiPreferences::default()
             };
             workspace.window_settings.save(&path)?;
             let (owner, _) = workspace.open_window(false);

@@ -21,22 +21,17 @@ mod view;
 const EDIT_DELAY: Duration = Duration::from_millis(350);
 const CARET_DELAY: Duration = Duration::from_millis(150);
 const DEFAULT_WIDTH: u16 = 340;
+pub(crate) const MIN_WIDTH: u16 = 160;
+pub(crate) const MAX_WIDTH: u16 = 1600;
 static NEXT_SOURCE: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub(crate) struct Preferences {
-    pub(crate) visible: bool,
-    width: u16,
-}
-
-impl Default for Preferences {
-    fn default() -> Self {
-        Self {
-            visible: false,
-            width: DEFAULT_WIDTH,
-        }
-    }
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) visible: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) width: Option<u16>,
 }
 
 impl Preferences {
@@ -45,7 +40,13 @@ impl Preferences {
     }
 
     fn width(self) -> u16 {
-        self.width.clamp(160, 1600)
+        self.width
+            .unwrap_or(DEFAULT_WIDTH)
+            .clamp(MIN_WIDTH, MAX_WIDTH)
+    }
+
+    pub(crate) fn visible(self) -> bool {
+        self.visible.unwrap_or_default()
     }
 }
 
@@ -143,7 +144,7 @@ impl SnippetWindow {
 
     pub(crate) fn apply_structure_preferences(&mut self, preferences: Preferences) {
         self.structure.show_immediately |=
-            preferences.visible && !self.structure.preferences.visible;
+            preferences.visible() && !self.structure.preferences.visible();
         self.structure.preferences = preferences;
         let width = f32::from(preferences.width());
         self.draft.structure.panel.set_width(width);
@@ -165,7 +166,7 @@ impl SnippetWindow {
     }
 
     fn structure_active(&self) -> bool {
-        self.structure.preferences.visible
+        self.structure.preferences.visible()
             && !self.tabs.is_empty()
             && !self.tabs.is_preview()
             && self.prompt.is_none()
@@ -248,8 +249,9 @@ impl SnippetWindow {
     pub(super) fn update_structure(&mut self, message: Message) -> Update {
         match message {
             Message::Toggle if !self.tabs.is_empty() && !self.tabs.is_preview() => {
-                self.structure.preferences.visible = !self.structure.preferences.visible;
-                self.structure.show_immediately = self.structure.preferences.visible;
+                let visible = !self.structure.preferences.visible();
+                self.structure.preferences.visible = Some(visible);
+                self.structure.show_immediately = visible;
             }
             Message::Ready(ticket, report) => {
                 let Some(scan) = self.structure.flight.filter(|scan| scan.ticket == ticket) else {
@@ -293,14 +295,13 @@ impl SnippetWindow {
                         return Update::FocusEditor;
                     }
                 } else {
-                    self.draft.structure.panel.update(message, report);
-                    self.structure.preferences.width =
-                        self.draft
-                            .structure
-                            .panel
-                            .width()
-                            .round()
-                            .clamp(160.0, 1600.0) as u16;
+                    let panel = &mut self.draft.structure.panel;
+                    let previous = panel.width().round() as u16;
+                    panel.update(message, report);
+                    let width = panel.width().round() as u16;
+                    if previous != width {
+                        self.structure.preferences.width = Some(width);
+                    }
                 }
             }
             Message::Toggle | Message::Panel(_) => {}
@@ -355,6 +356,35 @@ mod tests {
         let _ = window.update(WindowMessage::Edit(text_editor::Action::Edit(
             text_editor::Edit::Paste(Arc::new(source.into())),
         )));
+    }
+
+    #[test]
+    fn structure_preferences_remember_only_explicit_visibility_and_width_changes() {
+        let profile = Profile::new();
+        let mut window = SnippetWindow::open(profile.path()).unwrap();
+        set_source(&mut window, "fn fixture() {}\n");
+
+        let _ = window.update(WindowMessage::Structure(Message::Toggle));
+        let _ = window.update(WindowMessage::Structure(Message::Panel(
+            view::Message::Filter("fixture".into()),
+        )));
+        assert_eq!(
+            serde_json::to_value(window.structure_preferences()).unwrap(),
+            serde_json::json!({"visible": true}),
+        );
+        let _ = window.update(WindowMessage::Structure(Message::Panel(
+            view::Message::Resize {
+                available: 950.0,
+                width: 419.0,
+            },
+        )));
+        let _ = window.update(WindowMessage::Structure(Message::Toggle));
+        let saved = serde_json::to_value(window.structure_preferences()).unwrap();
+        assert_eq!(saved, serde_json::json!({"visible": false, "width": 419}));
+        let mut reopened = SnippetWindow::open(profile.path()).unwrap();
+        reopened.apply_structure_preferences(serde_json::from_value(saved).unwrap());
+        assert!(!reopened.structure_preferences().visible());
+        assert_eq!(reopened.draft.structure.panel.width(), 419.0);
     }
 
     #[test]

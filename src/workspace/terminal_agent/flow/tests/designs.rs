@@ -89,7 +89,17 @@ fn native_adaptive_timeline_reuses_the_selected_timeline_history() {
 
     fixture.run_mut(id).design.arrangement = Arrangement::Adaptive;
     let adaptive = inspect_design(&fixture, stream, size, Histories::default()).0;
-    assert_eq!(adaptive, fixed, "the single timeline keeps its full height");
+    let [adaptive] = adaptive.as_slice() else {
+        panic!("adaptive layout should show one timeline");
+    };
+    assert_eq!(adaptive.y, fixed[0].y);
+    assert_eq!(adaptive.height, fixed[0].height);
+    assert_eq!(adaptive.x + adaptive.width, fixed[0].x + fixed[0].width);
+    assert_eq!(
+        adaptive.width - fixed[0].width,
+        crate::horizontal_divider::WIDTH,
+        "the adaptive timeline has no resize grip"
+    );
 
     fixture.run_mut(id).design.history = History::Conversation;
     let distinct = inspect_design(&fixture, stream, size, Histories::default()).0;

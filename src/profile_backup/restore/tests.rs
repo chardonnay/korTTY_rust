@@ -1470,6 +1470,8 @@ fn java_display_preferences_add_only_unset_fields_and_keep_theme_replay_safe() {
         <splitPaneFocusRingEnabled>false</splitPaneFocusRingEnabled>
         <tabSwitchMostRecentFirst>true</tabSwitchMostRecentFirst>
         <tabTitleFromShellEnabled>false</tabTitleFromShellEnabled>
+        <shellIntegrationEnabled>false</shellIntegrationEnabled>
+        <terminalDragDropEnabled>false</terminalDragDropEnabled>
         <commandTimestampsEnabled>true</commandTimestampsEnabled>
         <terminalLinkDetectionEnabled>false</terminalLinkDetectionEnabled>
         <jobSchedulerMenuStatusEnabled>false</jobSchedulerMenuStatusEnabled>
@@ -1487,6 +1489,7 @@ fn java_display_preferences_add_only_unset_fields_and_keep_theme_replay_safe() {
         <sftpAutoCloseMinutes>15</sftpAutoCloseMinutes>
         <sftpDefaultZipPath>/srv/archives&amp;reports</sftpDefaultZipPath>
         <sftpDefaultZipCompression>9</sftpDefaultZipCompression>
+        <sftpDiffAiFontSize>19</sftpDiffAiFontSize>
         <sessionJournalPageSchemeId>ocean</sessionJournalPageSchemeId>
         <sessionJournalPageTheme>dark</sessionJournalPageTheme>
         <sessionJournalFontScalePercent>135</sessionJournalFontScalePercent>
@@ -1518,6 +1521,25 @@ fn java_display_preferences_add_only_unset_fields_and_keep_theme_replay_safe() {
         </fixedWindowGeometry>
         <codeAnalysisDiagramAutoGenerate>false</codeAnalysisDiagramAutoGenerate>
         <codeAnalysisProposeModularization>true</codeAnalysisProposeModularization>
+        <codeAnalysisFontSize>22</codeAnalysisFontSize>
+        <snippetAnalysisHistoryMaxSize>9</snippetAnalysisHistoryMaxSize>
+        <snippetHistoryMaxSize>42</snippetHistoryMaxSize>
+        <snippetAnalysisMaxStoredContentBytes>262145</snippetAnalysisMaxStoredContentBytes>
+        <codeAnalysisHardeningExpanded>true</codeAnalysisHardeningExpanded>
+        <snippetHardeningOptions>STRICT_MODE,SAFE_MODE</snippetHardeningOptions>
+        <snippetInputHardeningEnabled>true</snippetInputHardeningEnabled>
+        <snippetInputHardeningOptions>PARAM_VALIDATION,FILE_SIZE_LIMIT</snippetInputHardeningOptions>
+        <snippetInputHardeningMaxFileSizeMb>25</snippetInputHardeningMaxFileSizeMb>
+        <codeAnalysisDiagramOptionsExpanded>true</codeAnalysisDiagramOptionsExpanded>
+        <codeAnalysisProjectDiagramVisible>false</codeAnalysisProjectDiagramVisible>
+        <snippetDiagramLayout>horizontal</snippetDiagramLayout>
+        <snippetStructurePanelVisible>true</snippetStructurePanelVisible>
+        <snippetStructurePanelWidth>851.25</snippetStructurePanelWidth>
+        <snippetAnalysisPanelVisible>true</snippetAnalysisPanelVisible>
+        <snippetAnalysisPanelWidth>605.5</snippetAnalysisPanelWidth>
+        <snippetAiProgressDockVisible>false</snippetAiProgressDockVisible>
+        <snippetDiagramColorMode>light</snippetDiagramColorMode>
+        <snippetDiagramBackgroundColor>#ABCDEF</snippetDiagramBackgroundColor>
         <snippetAnalysisExportIncludeCode>true</snippetAnalysisExportIncludeCode>
         <editorCursorStyle>UNDERSCORE</editorCursorStyle>
         <logfileViewerHighlightLinks>false</logfileViewerHighlightLinks>
@@ -1525,6 +1547,15 @@ fn java_display_preferences_add_only_unset_fields_and_keep_theme_replay_safe() {
         <logfileViewerKeywordSetId>builtin.network</logfileViewerKeywordSetId>
         <editorCursorColor>#445566</editorCursorColor>
         <snippetFontFamily>Fixture Mono</snippetFontFamily><snippetFontSize>19</snippetFontSize>
+        <snippetLineNumbers>true</snippetLineNumbers>
+        <snippetWordWrap>false</snippetWordWrap>
+        <customSnippetCodeLanguages>
+            <language> Gleam </language>
+            <language>GLEAM</language>
+            <language>pwsh</language>
+            <language>bad value</language>
+            <language>Fennel</language>
+        </customSnippetCodeLanguages>
         <snippetForegroundColor>#010203</snippetForegroundColor>
         <selectedSnippetEditorProfileId>custom-fixture</selectedSnippetEditorProfileId>
         <snippetEditorProfiles><profile><id>custom-fixture</id><builtIn>false</builtIn>
@@ -1536,7 +1567,8 @@ fn java_display_preferences_add_only_unset_fields_and_keep_theme_replay_safe() {
         <showTerminalScrollbar>false</showTerminalScrollbar>
         <hideTerminalScrollbarsInFullscreen>true</hideTerminalScrollbarsInFullscreen>
         <workflowScriptFontSize>21</workflowScriptFontSize>
-        <uiFontScaleAuto>false</uiFontScaleAuto><uiFontScalePercent>132</uiFontScalePercent>
+        <uiFontScaleAuto>true</uiFontScaleAuto><uiFontScalePercent>132</uiFontScalePercent>
+        <guideFontScalePercent>210</guideFontScalePercent>
         <terminalRemoteSidebarWidth>450.5</terminalRemoteSidebarWidth>
         <terminalRemoteSidebarPosition>RIGHT</terminalRemoteSidebarPosition>
         <terminalFontSize>26</terminalFontSize>
@@ -1573,7 +1605,11 @@ fn java_display_preferences_add_only_unset_fields_and_keep_theme_replay_safe() {
         "startup":{"remember_geometry":true,"fixed":{"height":820}},
         "snippet_analysis_auto_diagram":true,
         "editor_caret":{"shape":"block"},"snippet_appearance":{"font_size":26,"background":[1,2,3]},
-        "logfile_presentation":{"links":true},
+        "logfile_presentation":{"links":true},"custom_snippet_code_languages":["zig","gleam"],
+        "snippet_diagram_appearance":{"mode":"dark"},
+        "snippet_structure":{"visible":false},
+        "snippet_analysis_panel":{"width":777},
+        "snippet_hardening":{"classic":[]},
         "legacy_editor_font":{"name":"Preserved","weight":500}}"#;
     directory
         .publish_copy(data::WINDOW_SETTINGS, initial)
@@ -1584,10 +1620,13 @@ fn java_display_preferences_add_only_unset_fields_and_keep_theme_replay_safe() {
     };
     let preview = inspect();
     let (_, entries, _) = preview.java_review().unwrap();
+    let count = crate::workspace::backup_data::portable_java_preferences(SETTINGS, None)
+        .unwrap()
+        .count;
     assert!(
         entries
             .iter()
-            .any(|line| line == "Global preferences for unset fields (69)")
+            .any(|line| line == &format!("Global preferences for unset fields ({count})"))
     );
     assert!(
         entries
@@ -1604,7 +1643,7 @@ fn java_display_preferences_add_only_unset_fields_and_keep_theme_replay_safe() {
     }));
     let pending: serde_json::Value =
         serde_json::from_slice(&preview.snapshot[data::WINDOW_SETTINGS]).unwrap();
-    assert_eq!(pending["java_display_preferences"]["manual_scale"], 132);
+    assert_eq!(pending["java_display_preferences"]["manual_scale"], 210);
     assert!(pending.get("remote_sidebar_position").is_none());
     super::super::queue_restore_at(&local.0, preview, RestoreMode::JavaAdditive).unwrap();
     drop(ProfileLease::acquire(&local.0, || false).unwrap());
@@ -1616,6 +1655,8 @@ fn java_display_preferences_add_only_unset_fields_and_keep_theme_replay_safe() {
         ("split_pane_focus_ring_enabled", json!(false)),
         ("tab_switch_most_recent_first", json!(true)),
         ("tab_title_from_shell_enabled", json!(false)),
+        ("automatic_local_shell_integration", json!(false)),
+        ("terminal_drag_drop", json!(false)),
         ("command_timestamps_enabled", json!(true)),
         ("terminal_link_detection_enabled", json!(true)),
         ("job_menu_status_enabled", json!(false)),
@@ -1623,6 +1664,33 @@ fn java_display_preferences_add_only_unset_fields_and_keep_theme_replay_safe() {
         ("terminal_silence_seconds", json!(110)),
         ("snippet_analysis_auto_diagram", json!(true)),
         ("snippet_analysis_auto_modularization", json!(true)),
+        ("snippet_analysis_report_font_size", json!(22)),
+        ("snippet_analysis_history_limit", json!(9)),
+        ("snippet_history_limit", json!(42)),
+        ("snippet_analysis_content_limit", json!(262145)),
+        ("snippet_analysis_hardening_expanded", json!(true)),
+        (
+            "snippet_hardening",
+            json!({
+                "classic": [],
+                "inputEnabled": true,
+                "input": ["parameterValidation", "fileSizeLimit"],
+                "maxFileSizeMib": 25
+            }),
+        ),
+        ("snippet_analysis_diagram_options_expanded", json!(true)),
+        ("snippet_analysis_project_diagram_visible", json!(false)),
+        ("snippet_diagram_horizontal", json!(true)),
+        ("snippet_structure", json!({"visible":false,"width":800})),
+        (
+            "snippet_analysis_panel",
+            json!({"visible":true,"width":777}),
+        ),
+        ("snippet_apply_progress_dock", json!(false)),
+        (
+            "snippet_diagram_appearance",
+            json!({"mode":"dark","background":[171,205,239]}),
+        ),
         ("snippet_analysis_export_include_code", json!(true)),
         ("editor_caret", json!({"shape":"block","color":[68,85,102]})),
         (
@@ -1632,12 +1700,14 @@ fn java_display_preferences_add_only_unset_fields_and_keep_theme_replay_safe() {
         (
             "snippet_appearance",
             json!({"font_family":"Fixture Mono","font_size":26,
-            "foreground":[170,187,204],"background":[1,2,3],"cursor_style":"line","cursor_color":[221,238,255]}),
+            "foreground":[170,187,204],"background":[1,2,3],"cursor_style":"line","cursor_color":[221,238,255],
+            "line_numbers":true,"word_wrap":false}),
         ),
         (
             "startup",
             json!({"remember_geometry":true,"remember_dashboard":false,
-            "use_fixed_geometry":true,"fixed":{"width":1400,"height":820,"x":-129,"y":-80,"maximized":true}}),
+            "use_fixed_geometry":true,"fixed":{"width":1400,"height":820,"x":-129,"y":-80,"maximized":true},
+            "java_last_geometry":{"width":732,"height":600,"x":4800,"y":3010,"maximized":false}}),
         ),
         ("terminal_copy_on_select_enabled", json!(false)),
         ("paste_warning", json!("always")),
@@ -1667,6 +1737,11 @@ fn java_display_preferences_add_only_unset_fields_and_keep_theme_replay_safe() {
         ("sftp_keep_partial_on_cancel", json!(true)),
         ("sftp_conflict_default", json!("overwrite")),
         ("sftp_idle_minutes", json!(15)),
+        ("sftp_comparison_ai_font_size", json!(19)),
+        (
+            "custom_snippet_code_languages",
+            json!(["zig", "gleam", "fennel"]),
+        ),
         (
             "sftp_archive",
             json!({"level":3,"remote_directory":"/srv/archives&reports"}),
@@ -1684,7 +1759,7 @@ fn java_display_preferences_add_only_unset_fields_and_keep_theme_replay_safe() {
         ("show_terminal_scrollbar", json!(true)),
         ("hide_terminal_scrollbars_in_fullscreen", json!(true)),
         ("workflow_script_font", json!(21)),
-        ("manual_scale", json!(132)),
+        ("manual_scale", json!(210)),
         ("remote_sidebar_width", json!(451)),
         ("remote_sidebar_position", json!("left")),
         ("terminal_font", json!(19)),
@@ -1702,11 +1777,28 @@ fn java_display_preferences_add_only_unset_fields_and_keep_theme_replay_safe() {
     active["terminal_transparency"] = json!(40);
     active["terminal_notifications"]["programs"] = json!(true);
     active["sftp_archive"]["remote_directory"] = json!("/srv/local archives");
+    active["sftp_comparison_ai_font_size"] = json!(22);
     active["journal_appearance"]["scale"] = json!(145);
     active["paste_line_delay_ms"] = json!(20);
     active["startup"]["fixed"]["x"] = json!(32);
     active["snippet_analysis_export_include_code"] = json!(false);
+    active["snippet_analysis_report_font_size"] = json!(18);
+    active["snippet_analysis_hardening_expanded"] = json!(false);
+    active["snippet_analysis_diagram_options_expanded"] = json!(false);
+    active["snippet_analysis_project_diagram_visible"] = json!(true);
+    active["snippet_diagram_horizontal"] = json!(false);
+    active["snippet_diagram_appearance"]["background"] = json!([230, 231, 232]);
+    active["snippet_structure"]["width"] = json!(367);
+    active["snippet_analysis_panel"]["visible"] = json!(false);
+    active["snippet_apply_progress_dock"] = json!(true);
+    active["automatic_local_shell_integration"] = json!(true);
+    active["snippet_hardening"]["maxFileSizeMib"] = json!(0);
     active["snippet_appearance"]["foreground"] = json!([123, 45, 67]);
+    active["snippet_appearance"]["line_numbers"] = json!(false);
+    active["snippet_appearance"]["word_wrap"] = json!(true);
+    active["snippet_analysis_history_limit"] = json!(2);
+    active["snippet_history_limit"] = json!(5);
+    active["snippet_analysis_content_limit"] = json!(0);
     let updated = serde_json::to_vec(&active).unwrap();
     directory
         .replace_file(data::WINDOW_SETTINGS, &updated)

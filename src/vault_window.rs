@@ -178,6 +178,13 @@ impl fmt::Display for Kind {
 #[derive(Clone)]
 pub struct Completion(Arc<Mutex<Option<Finished>>>);
 
+#[cfg(test)]
+pub(crate) fn test_vault_password() -> Zeroizing<[u8; 32]> {
+    let mut password = Zeroizing::new([0; 32]);
+    getrandom::fill(&mut password[..]).expect("generate a test vault password");
+    password
+}
+
 impl Completion {
     pub(crate) fn recovery_key_changed(&self) -> bool {
         self.0

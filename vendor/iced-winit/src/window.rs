@@ -72,6 +72,10 @@ where
         let _ = self.entries.insert(
             id,
             Window {
+                #[cfg(target_os = "windows")]
+                desktop_drop: None,
+                #[cfg(target_os = "linux")]
+                desktop_drop: None,
                 raw: window,
                 state,
                 exit_on_close_request,
@@ -163,6 +167,10 @@ where
     C: Compositor<Renderer = P::Renderer>,
     P::Theme: theme::Base,
 {
+    #[cfg(target_os = "windows")]
+    pub desktop_drop: Option<kortty_windowing::windows_desktop_drop::Target>,
+    #[cfg(target_os = "linux")]
+    pub desktop_drop: Option<kortty_windowing::x11_desktop_drop::Target>,
     pub raw: Arc<winit::window::Window>,
     pub state: State<P>,
     pub exit_on_close_request: bool,

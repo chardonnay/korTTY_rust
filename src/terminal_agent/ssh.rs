@@ -19,14 +19,16 @@ pub(super) fn run(
     cwd: &str,
     command: &str,
     cancel: &Cancel,
+    started: impl FnOnce(),
 ) -> Result<Outcome, String> {
-    run_wire(opener, &remote_command(cwd, command)?, cancel)
+    run_wire(opener, &remote_command(cwd, command)?, cancel, started)
 }
 
 pub(super) fn run_wire(
     opener: ExecOpener,
     command: &str,
     cancel: &Cancel,
+    started: impl FnOnce(),
 ) -> Result<Outcome, String> {
     let gate = cancel.clone();
     let result = match opener {
@@ -34,12 +36,14 @@ pub(super) fn run_wire(
             .open_cancellable(command, move || gate.requested())
             .map_err(|_| "Could not open the approved SSH command channel.")
             .and_then(|channel| {
+                started();
                 direct(channel, cancel).map_err(|_| "The SSH command streams are unavailable.")
             }),
         ExecOpener::Worker(opener) => opener
             .open_exec(command, || gate.requested())
             .map_err(|_| "Could not open the approved isolated SSH command channel.")
             .and_then(|channel| {
+                started();
                 isolated(channel, cancel)
                     .map_err(|_| "The isolated SSH command streams are unavailable.")
             }),

@@ -212,7 +212,7 @@ impl Client {
         };
         let transport = self.transport(deadline)?;
         if protocol == Protocol::LmStudio {
-            self.require_lm_studio_reasoning(deadline)?;
+            self.require_lm_studio_reasoning(deadline, attempt, &mut before_dispatch)?;
         }
         let deadline =
             self.before_completion_dispatch(transport, deadline, &mut before_dispatch, attempt)?;

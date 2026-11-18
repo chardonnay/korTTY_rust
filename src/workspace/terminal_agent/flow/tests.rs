@@ -19,6 +19,324 @@ mod pip;
 mod shortcut;
 
 #[test]
+fn root_bypass_requires_probe_overrides_ask_and_revokes_with_saved_confirmation() {
+    let mut fixture = Fixture::new(false, false);
+    let id = fixture.open(Mode::Run);
+    no_task(fixture.send(id, Message::AutoApproveRoot(true)));
+    no_task(fixture.send(id, Message::ConfirmEveryCommand(true)));
+    let root = fixture.profile.0.canonicalize().unwrap();
+    let checking = fixture.run_mut(id).next(Phase::Directory, "Checking");
+    drop(fixture.send(
+        id,
+        Message::Directory(checking, Ok(LocalDirectory::capture(root.clone()).unwrap())),
+    ));
+    fixture.run_mut(id).manual_directory = Some(root.to_str().unwrap().into());
+    let decide = |fixture: &mut Fixture| {
+        fixture.run_mut(id).commands.clear();
+        let epoch = fixture.run_mut(id).next(Phase::Thinking, "Deciding");
+        let decision = Decision {
+            summary: "Write".into(),
+            message: "Write fixture".into(),
+            action: Action::Commands(vec![Command {
+                command: "touch root-fixture".into(),
+                purpose: "Write".into(),
+                risk: engine::Risk::RequiresConfirmation,
+                elevation: Elevation::None,
+            }]),
+        };
+        fixture.send(id, Message::Decision(epoch, Arc::new(Ok(decision).into())))
+    };
+    drop(decide(&mut fixture));
+    assert!(fixture.run(id).phase == Phase::Approval);
+    fixture.run_mut(id).probe_reviewed = true;
+    // The automatic path schedules directory revalidation; never poll its command task.
+    drop(decide(&mut fixture));
+    assert!(matches!(
+        fixture.run(id).phase,
+        Phase::ReviewedDirectory { probe: false }
+    ));
+    let dispatch = fixture
+        .workspace
+        .agent_dispatch_policy(fixture.run(id))
+        .unwrap();
+    assert!(dispatch.check().is_ok());
+    let baseline = Configuration::load_fixture_from(&root).unwrap();
+    let mut json = serde_json::to_value(&baseline).unwrap();
+    json["general"]["agent_confirm_mutating"] = true.into();
+    let changed: Configuration = serde_json::from_value(json).unwrap();
+    changed.save_fixture_at(&root, &baseline).unwrap();
+    assert!(dispatch.check().is_err());
+    let mut run = fixture.workspace.terminal_agents.runs.remove(&id).unwrap();
+    run.next(Phase::Approval, "Review again");
+    assert!(!fixture.workspace.automatic_agent_command(&mut run));
+    assert!(!run.auto_approve_root && run.run_approval.is_none());
+    assert!(!root.join("root-fixture").exists());
+}
+
+#[test]
+fn root_bypass_pause_revokes_captured_dispatch_and_pending_directory_epoch() {
+    let mut fixture = Fixture::new(false, false);
+    let id = fixture.open(Mode::Run);
+    let root = fixture.profile.0.canonicalize().unwrap();
+    let checking = fixture.run_mut(id).next(Phase::Directory, "Checking");
+    drop(fixture.send(
+        id,
+        Message::Directory(checking, Ok(LocalDirectory::capture(root.clone()).unwrap())),
+    ));
+    let run = fixture.run_mut(id);
+    run.auto_approve_root = true;
+    run.probe_reviewed = true;
+    run.commands.push_back(ReviewedCommand {
+        proposal: Command {
+            command: "touch stale-root-fixture".into(),
+            purpose: "Write".into(),
+            risk: engine::Risk::RequiresConfirmation,
+            elevation: Elevation::None,
+        },
+        sudo: None,
+    });
+    run.next(Phase::Approval, "Review");
+    let mut run = fixture.workspace.terminal_agents.runs.remove(&id).unwrap();
+    assert!(fixture.workspace.automatic_agent_command(&mut run));
+    let dispatch = fixture.workspace.agent_dispatch_policy(&run).unwrap();
+    assert!(dispatch.check().is_ok());
+    let pending = run.next(
+        Phase::ReviewedDirectory { probe: false },
+        "Checking approved directory",
+    );
+    fixture.workspace.terminal_agents.runs.insert(id, run);
+    drop(fixture.send(id, Message::Pause));
+    assert!(dispatch.check().is_err());
+    assert!(fixture.run(id).phase == Phase::Approval);
+    assert!(fixture.run(id).epoch > pending);
+    drop(fixture.send(id, Message::Pause));
+    no_task(fixture.send(
+        id,
+        Message::Directory(pending, Ok(LocalDirectory::capture(root.clone()).unwrap())),
+    ));
+    assert!(fixture.run(id).phase == Phase::Approval);
+    assert!(!fixture.run(id).auto_approve_root);
+    assert!(!root.join("stale-root-fixture").exists());
+}
+
+#[test]
+fn root_bypass_obeys_managed_confirm_and_pause_discards_the_request() {
+    let mut fixture = Fixture::new(false, false);
+    let id = fixture.open(Mode::Run);
+    fixture.run_mut(id).auto_approve_root = true;
+    fixture.run_mut(id).confirm_every_command = true;
+    fixture.run_mut(id).probe_reviewed = true;
+    fixture.run_mut(id).commands.push_back(ReviewedCommand {
+        proposal: Command {
+            command: "sudo -n id -u".into(),
+            purpose: "Inspect".into(),
+            risk: engine::Risk::RequiresConfirmation,
+            elevation: Elevation::None,
+        },
+        sudo: None,
+    });
+    fixture.run_mut(id).next(Phase::Approval, "Review");
+    fixture.workspace.clipboard.policy.ai_agent_execution =
+        crate::clipboard_policy::AiAgentExecution::Confirm;
+    let mut run = fixture.workspace.terminal_agents.runs.remove(&id).unwrap();
+    assert!(!fixture.workspace.automatic_agent_command(&mut run));
+    fixture.workspace.clipboard.policy.ai_agent_execution =
+        crate::clipboard_policy::AiAgentExecution::Allow;
+    assert!(fixture.workspace.automatic_agent_command(&mut run));
+    fixture.workspace.terminal_agents.runs.insert(id, run);
+    drop(fixture.send(id, Message::Pause));
+    assert!(!fixture.run(id).auto_approve_root && fixture.run(id).run_approval.is_none());
+}
+
+#[test]
+fn automatic_read_only_commands_require_probe_review_and_obey_per_run_confirmation() {
+    let mut fixture = Fixture::new(false, false);
+    let id = fixture.open(Mode::Run);
+    let root = fixture.profile.0.canonicalize().unwrap();
+    let checking = fixture
+        .run_mut(id)
+        .next(Phase::Directory, "Checking directory");
+    let task = fixture.send(
+        id,
+        Message::Directory(checking, Ok(LocalDirectory::capture(root.clone()).unwrap())),
+    );
+    drop(task);
+    fixture.run_mut(id).manual_directory = Some(root.to_str().unwrap().into());
+    let decide = |fixture: &mut Fixture, command: &str| {
+        fixture.run_mut(id).commands.clear();
+        let epoch = fixture.run_mut(id).next(Phase::Thinking, "Deciding");
+        let decision = Decision {
+            summary: "Inspect".into(),
+            message: "Check".into(),
+            action: Action::Commands(vec![Command {
+                command: command.into(),
+                purpose: "Inspect".into(),
+                risk: engine::Risk::ReadOnly,
+                elevation: Elevation::None,
+            }]),
+        };
+        fixture.send(id, Message::Decision(epoch, Arc::new(Ok(decision).into())))
+    };
+    drop(decide(&mut fixture, "pwd"));
+    assert!(fixture.run(id).phase == Phase::Approval);
+    fixture.run_mut(id).probe_reviewed = true;
+    fixture.workspace.clipboard.policy.ai_agent_execution =
+        crate::clipboard_policy::AiAgentExecution::Confirm;
+    drop(decide(&mut fixture, "pwd"));
+    assert!(matches!(
+        fixture.run(id).phase,
+        Phase::ReviewedDirectory { probe: false }
+    ));
+    assert!(fixture.run(id).run_approval.is_some());
+    fixture.run_mut(id).confirm_every_command = true;
+    drop(decide(&mut fixture, "pwd"));
+    assert!(fixture.run(id).phase == Phase::Approval);
+    fixture.run_mut(id).confirm_every_command = false;
+    drop(decide(&mut fixture, "touch file"));
+    assert!(fixture.run(id).phase == Phase::Approval);
+    assert!(fixture.run(id).run_approval.is_none());
+}
+
+#[test]
+fn run_wide_approval_continues_ordinary_decisions_and_revokes_before_dispatch() {
+    let mut fixture = Fixture::new(false, false);
+    let id = fixture.open(Mode::Run);
+    let root = fixture.profile.0.canonicalize().unwrap();
+    let checking = fixture
+        .run_mut(id)
+        .next(Phase::Directory, "Checking directory");
+    let task = fixture.send(
+        id,
+        Message::Directory(checking, Ok(LocalDirectory::capture(root.clone()).unwrap())),
+    );
+    drop(task);
+    let command = Command {
+        command: "printf fixture".into(),
+        purpose: "Fixture".into(),
+        risk: engine::Risk::RequiresConfirmation,
+        elevation: Elevation::None,
+    };
+    fixture.run_mut(id).commands.push_back(ReviewedCommand {
+        proposal: command.clone(),
+        sudo: None,
+    });
+    fixture.run_mut(id).next(Phase::Approval, "Review");
+    let approval = fixture
+        .workspace
+        .approve_remaining_agent_commands(fixture.run(id))
+        .unwrap();
+    fixture.run_mut(id).run_approval = Some(approval);
+    fixture.run_mut(id).manual_directory = Some(root.to_str().unwrap().into());
+    let epoch = fixture.run_mut(id).next(Phase::Thinking, "Deciding");
+    let decision = Decision {
+        summary: "Fixture".into(),
+        message: "Continue".into(),
+        action: Action::Commands(vec![command]),
+    };
+    let task = fixture.send(id, Message::Decision(epoch, Arc::new(Ok(decision).into())));
+    assert!(matches!(
+        fixture.run(id).phase,
+        Phase::ReviewedDirectory { probe: false }
+    ));
+    assert!(fixture.run(id).run_approval.is_some());
+    drop(task);
+    let dispatch = fixture
+        .workspace
+        .agent_dispatch_policy(fixture.run(id))
+        .unwrap();
+    let baseline = Configuration::load_fixture_from(&root).unwrap();
+    let mut json = serde_json::to_value(&baseline).unwrap();
+    json["general"]["agent_confirm_mutating"] = true.into();
+    let changed: Configuration = serde_json::from_value(json).unwrap();
+    changed.save_fixture_at(&root, &baseline).unwrap();
+    assert!(dispatch.check().is_err());
+    let run = fixture.run_mut(id);
+    run.next(Phase::Approval, "Review again");
+    let mut run = fixture.workspace.terminal_agents.runs.remove(&id).unwrap();
+    assert!(!fixture.workspace.automatic_agent_command(&mut run));
+    assert!(run.run_approval.is_none());
+}
+
+#[test]
+fn run_wide_approval_is_blocked_by_policy_and_expires_on_pause_or_elevation() {
+    let mut fixture = Fixture::new(false, false);
+    let id = fixture.open(Mode::Run);
+    fixture.run_mut(id).commands.push_back(ReviewedCommand {
+        proposal: Command {
+            command: "printf fixture".into(),
+            purpose: "Fixture".into(),
+            risk: engine::Risk::ReadOnly,
+            elevation: Elevation::None,
+        },
+        sudo: None,
+    });
+    fixture.run_mut(id).next(Phase::Approval, "Review");
+    fixture.workspace.clipboard.policy.ai_agent_execution =
+        crate::clipboard_policy::AiAgentExecution::Confirm;
+    assert!(
+        fixture
+            .workspace
+            .approve_remaining_agent_commands(fixture.run(id))
+            .is_err()
+    );
+    fixture.workspace.clipboard.policy.ai_agent_execution =
+        crate::clipboard_policy::AiAgentExecution::Allow;
+    let approval = fixture
+        .workspace
+        .approve_remaining_agent_commands(fixture.run(id))
+        .unwrap();
+    fixture.run_mut(id).run_approval = Some(approval);
+    let task = fixture.send(id, Message::Pause);
+    drop(task);
+    assert!(fixture.run(id).run_approval.is_none());
+    fixture.run_mut(id).paused = false;
+    fixture
+        .run_mut(id)
+        .commands
+        .front_mut()
+        .unwrap()
+        .proposal
+        .command = "sudo id".into();
+    assert!(
+        fixture
+            .workspace
+            .approve_remaining_agent_commands(fixture.run(id))
+            .is_err()
+    );
+}
+
+#[test]
+fn execution_preference_blocks_run_and_reconciles_existing_runs_without_blocking_ask_or_plan() {
+    let mut fixture = Fixture::new(false, true);
+    let run = fixture.open(Mode::Run);
+    let disabled: Configuration = serde_json::from_value(json!({
+        "general": {"agent_execution_enabled": false},
+        "profiles": {"profiles": [{"id":1,"name":"Fixture","endpoint":"127.0.0.1:12345","model":"fixture"}], "default":1,"last_id":1}
+    })).unwrap();
+    fixture.workspace.set_test_ai_configuration(disabled);
+    assert!(
+        !fixture
+            .workspace
+            .terminal_agent_available(fixture.session, Mode::Run)
+    );
+    assert!(
+        fixture
+            .workspace
+            .terminal_agent_available(fixture.session, Mode::Ask)
+    );
+    assert!(
+        fixture
+            .workspace
+            .terminal_agent_available(fixture.session, Mode::Plan)
+    );
+    assert!(fixture.workspace.swarm_ai_policy(Mode::Run).is_err());
+    assert!(fixture.workspace.swarm_ai_policy(Mode::Ask).is_ok());
+    let _ = fixture.workspace.reconcile_terminal_agents();
+    assert!(fixture.run(run).cancel.requested());
+    assert!(fixture.run(run).phase == Phase::Cancelled);
+}
+
+#[test]
 fn terminal_agent_activity_export_keeps_completed_runs_scoped_and_masked() {
     use crate::terminal_agent::activity_report::Format;
     use activity_export::{Message as Export, Scope};
@@ -1377,6 +1695,8 @@ fn terminal_agent_private_transport_omits_durable_usage_account() {
 fn agent_passwordless_sudo_is_refused_on_local_targets_before_any_approval() {
     let mut fixture = Fixture::new(false, false);
     let id = fixture.open(Mode::Run);
+    fixture.run_mut(id).auto_approve_root = true;
+    fixture.run_mut(id).probe_reviewed = true;
     let directory = LocalDirectory::capture(fixture.profile.0.canonicalize().unwrap()).unwrap();
     let checking = fixture
         .run_mut(id)
@@ -1449,6 +1769,8 @@ fn agent_passwordless_sudo_failure_stops_queued_commands_without_a_retry() {
 fn agent_password_sudo_blocks_local_targets_and_unowned_password_messages() {
     let mut fixture = Fixture::new(false, false);
     let id = fixture.open(Mode::Run);
+    fixture.run_mut(id).auto_approve_root = true;
+    fixture.run_mut(id).probe_reviewed = true;
     let epoch = fixture
         .run_mut(id)
         .next(Phase::Thinking, "Waiting for a decision");

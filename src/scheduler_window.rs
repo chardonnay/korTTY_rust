@@ -77,6 +77,22 @@ const SAVE_RETRY: Duration = Duration::from_secs(2);
 const MAX_WORKING_DIRECTORY_BYTES: usize = 4096;
 pub(crate) const DEFAULT_JOURNAL_RETENTION_DAYS: u16 = 14;
 pub(crate) const MAX_JOURNAL_RETENTION_DAYS: u16 = 3650;
+pub(crate) const JOURNAL_DIVIDER_RANGE: std::ops::RangeInclusive<u16> = 200..=900;
+pub(crate) const DEFAULT_JOURNAL_DIVIDER: u16 = 720;
+
+pub(crate) fn journal_divider_parts(ratio: f64) -> Option<u16> {
+    ratio
+        .is_finite()
+        .then(|| (ratio.clamp(0.2, 0.9) * 1000.0).round() as u16)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum DiagramColorMode {
+    Auto,
+    Light,
+    Dark,
+}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -1108,6 +1124,22 @@ pub(crate) enum JournalDetails {
 }
 
 impl SchedulerView {
+    pub(crate) fn apply_journal_divider(&mut self, parts: Option<u16>) {
+        let parts = parts
+            .filter(|parts| JOURNAL_DIVIDER_RANGE.contains(parts))
+            .unwrap_or(DEFAULT_JOURNAL_DIVIDER);
+        if let pane_grid::Node::Split { id, .. } = *self.layout.journal.layout() {
+            self.layout.journal.resize(id, f32::from(parts) / 1000.0);
+        }
+    }
+
+    pub(crate) fn journal_divider(&self) -> Option<u16> {
+        match self.layout.journal.layout() {
+            pane_grid::Node::Split { ratio, .. } => journal_divider_parts(f64::from(*ratio)),
+            pane_grid::Node::Pane(_) => None,
+        }
+    }
+
     pub(crate) fn automation_summary_profile(
         &self,
     ) -> Option<&crate::session_journal::summary_queue::ProfileChoice> {
@@ -2051,7 +2083,14 @@ impl SchedulerWindow {
                 self.refresh_diagram(view);
             }
             Message::ResizeJobs(event) => view.layout.jobs.resize(event.split, event.ratio),
-            Message::ResizeJournal(event) => view.layout.journal.resize(event.split, event.ratio),
+            Message::ResizeJournal(event)
+                if view.page == Page::Journal
+                    && matches!(view.layout.journal.layout(), pane_grid::Node::Split { id, .. } if *id == event.split) =>
+            {
+                if let Some(parts) = journal_divider_parts(f64::from(event.ratio)) {
+                    view.apply_journal_divider(Some(parts));
+                }
+            }
             Message::JournalSearch(search) if view.page == Page::Journal => {
                 view.journal_search.set_text(search);
             }
@@ -3717,6 +3756,21 @@ impl SchedulerWindow {
         }
     }
 
+    pub(crate) fn apply_diagram_preferences(
+        &self,
+        view: &mut SchedulerView,
+        horizontal: Option<bool>,
+        color: Option<DiagramColorMode>,
+        system_dark: bool,
+    ) {
+        if view
+            .diagram
+            .apply_preferences(horizontal, color, system_dark)
+        {
+            self.refresh_diagram(view);
+        }
+    }
+
     fn local_time(&self, instant: SystemTime) -> String {
         let Ok(timestamp) = instant.try_into() else {
             return "Unavailable".into();
@@ -3733,6 +3787,10 @@ impl SchedulerWindow {
 }
 
 impl SchedulerView {
+    pub(crate) fn diagram_preferences(&self) -> (Option<bool>, Option<DiagramColorMode>) {
+        self.diagram.preferences()
+    }
+
     pub(crate) fn diagram_mermaid(&self) -> Option<String> {
         Some(self.diagram.preview.as_ref()?.mermaid.clone())
     }

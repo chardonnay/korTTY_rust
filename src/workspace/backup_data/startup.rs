@@ -6,6 +6,7 @@ use std::ops::RangeInclusive;
 use roxmltree::Node;
 use serde::{Deserialize, Serialize};
 
+use crate::profile::WindowPlacement;
 use crate::workspace::window_lifecycle::FixedGeometry;
 
 use super::{
@@ -23,6 +24,10 @@ pub(super) struct Preferences {
     use_fixed_geometry: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     fixed: Option<FixedGeometry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    java_last_geometry: Option<FixedGeometry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    java_dashboard_visible: Option<bool>,
 }
 
 fn dimension<T: Copy + Into<f64>>(
@@ -40,8 +45,8 @@ fn dimension<T: Copy + Into<f64>>(
         .ok_or(())
 }
 
-fn geometry(root: Node<'_, '_>) -> Result<Option<FixedGeometry>, ()> {
-    let Some(geometry) = preference_node(root, "fixedWindowGeometry")? else {
+fn geometry(root: Node<'_, '_>, name: &str) -> Result<Option<FixedGeometry>, ()> {
+    let Some(geometry) = preference_node(root, name)? else {
         return Ok(None);
     };
     // Java reapplies the saved bounds and maximization on launch. Its geometry
@@ -50,24 +55,33 @@ fn geometry(root: Node<'_, '_>) -> Result<Option<FixedGeometry>, ()> {
         Some(value) => java_flag(value).ok_or(())?,
         None => false,
     };
+    let (width, height) = if name == "fixedWindowGeometry" {
+        (FixedGeometry::WIDTH, FixedGeometry::HEIGHT)
+    } else {
+        (WindowPlacement::WIDTH, WindowPlacement::HEIGHT)
+    };
     Ok(Some(FixedGeometry {
-        width: dimension(geometry, "width", FixedGeometry::WIDTH)? as u16,
-        height: dimension(geometry, "height", FixedGeometry::HEIGHT)? as u16,
+        width: dimension(geometry, "width", width)? as u16,
+        height: dimension(geometry, "height", height)? as u16,
         x: dimension(geometry, "x", FixedGeometry::POSITION)? as i32,
         y: dimension(geometry, "y", FixedGeometry::POSITION)? as i32,
         maximized,
     }))
 }
 
+fn read_geometry(root: Node<'_, '_>, name: &str, omitted: &mut usize) -> Option<FixedGeometry> {
+    match geometry(root, name) {
+        Ok(bounds) => bounds,
+        Err(()) => {
+            *omitted += 1;
+            None
+        }
+    }
+}
+
 impl Preferences {
     pub(super) fn read(root: Node<'_, '_>, omitted: &mut usize) -> Option<Self> {
-        let fixed = match geometry(root) {
-            Ok(fixed) => fixed,
-            Err(()) => {
-                *omitted += 1;
-                None
-            }
-        };
+        let fixed = read_geometry(root, "fixedWindowGeometry", omitted);
         let use_fixed_geometry = preference(root, "useFixedWindowGeometry", omitted, |text| {
             java_flag(text).filter(|&enabled| !enabled || fixed.is_some())
         });
@@ -76,6 +90,8 @@ impl Preferences {
             remember_dashboard: preference(root, "rememberDashboardState", omitted, java_flag),
             use_fixed_geometry,
             fixed,
+            java_last_geometry: read_geometry(root, "lastWindowGeometry", omitted),
+            java_dashboard_visible: preference(root, "dashboardVisible", omitted, java_flag),
         };
         (settings.count() != 0).then_some(settings)
     }
@@ -85,16 +101,25 @@ impl Preferences {
             self.remember_geometry.is_some(),
             self.remember_dashboard.is_some(),
             self.use_fixed_geometry.is_some(),
+            self.java_dashboard_visible.is_some(),
         ]
         .into_iter()
         .filter(|set| *set)
         .count()
             + if self.fixed.is_some() { 5 } else { 0 }
+            + if self.java_last_geometry.is_some() {
+                5
+            } else {
+                0
+            }
     }
 
     pub(super) fn merge(&self, fields: &mut RawFields) -> io::Result<bool> {
         if self.fixed.is_some_and(|fixed| fixed.clamped() != fixed)
             || self.use_fixed_geometry == Some(true) && self.fixed.is_none()
+            || self
+                .java_last_geometry
+                .is_some_and(|bounds| !bounds.remembered_valid())
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

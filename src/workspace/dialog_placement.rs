@@ -92,7 +92,7 @@ pub(in crate::workspace) enum Kind {
 }
 
 impl Kind {
-    const fn key(self) -> &'static str {
+    pub(super) const fn key(self) -> &'static str {
         match self {
             Self::About => "about",
             Self::AiManager => "ai-manager",
@@ -784,7 +784,18 @@ impl Workspace {
         #[cfg(not(any(target_os = "windows", target_os = "linux")))]
         let _ = owner;
         let remembered = self.dialog_placement.remembered(kind);
-        let saved = remembered.or(fallback.filter(|_| !self.dialog_placement.disabled));
+        let saved = remembered.or_else(|| {
+            if self.dialog_placement.disabled {
+                return None;
+            }
+            fallback.or_else(|| {
+                let minimum = settings.min_size.unwrap_or(Size::new(0.0, 0.0));
+                self.window_settings
+                    .java_dialog_geometry
+                    .get(kind.key())
+                    .map(|geometry| geometry.placement(minimum))
+            })
+        });
         if let Some(saved) = saved {
             settings.size = Size::new(saved.width, saved.height);
         }
@@ -1242,6 +1253,82 @@ mod tests {
             })
         );
         assert_eq!(state.remembered(Kind::GlobalSettings), None);
+    }
+
+    #[test]
+    fn imported_dialog_geometry_uses_existing_native_placement_precedence() {
+        use super::super::journal_access::dialog_geometry::Geometry;
+
+        let mut workspace = Workspace::default();
+        let kind = Kind::AiManager;
+        let imported = Geometry::from_java(1160.0, 780.0, Some([-900, 80])).unwrap();
+        workspace
+            .window_settings
+            .java_dialog_geometry
+            .insert(kind.key().into(), imported);
+        let settings = || window::Settings {
+            size: Size::new(880.0, 640.0),
+            min_size: Some(Size::new(640.0, 480.0)),
+            ..window::Settings::default()
+        };
+        let (id, _) = workspace.open_placed_dialog(kind, settings());
+        assert_eq!(
+            workspace.dialog_placement.open[&id].preferred,
+            imported.placement(Size::new(640.0, 480.0))
+        );
+        let remembered = WindowPlacement {
+            width: 1020.0,
+            height: 720.0,
+            position: None,
+        };
+        workspace
+            .dialog_placement
+            .remembered
+            .insert(kind, Some(remembered));
+        let (id, _) = workspace.open_placed_dialog(kind, settings());
+        assert_eq!(workspace.dialog_placement.open[&id].preferred, remembered);
+
+        let _ = workspace.dialog_placement.set_remembering(false);
+        let (id, _) = workspace.open_placed_dialog(kind, settings());
+        assert_eq!(workspace.dialog_placement.open[&id].preferred.width, 880.0);
+    }
+
+    #[test]
+    fn journal_manager_applies_imported_bounds_until_native_bounds_exist() {
+        use super::super::journal_access::{Message as JournalMessage, dialog_geometry::Geometry};
+
+        let profile = crate::snippets::tests::Profile::new();
+        let mut workspace = Workspace::default();
+        workspace.window_settings.session_journal.directory =
+            profile.0.canonicalize().unwrap().to_str().unwrap().into();
+        workspace.window_settings.journal_manager_geometry =
+            Geometry::from_java(1030.0, 720.0, Some([-800, 100]));
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.update_session_journal(owner, JournalMessage::Open);
+        let imported = workspace
+            .dialog_placement
+            .open
+            .values()
+            .find(|placement| placement.kind == Kind::JournalManager)
+            .unwrap()
+            .preferred;
+        assert_eq!((imported.width, imported.height), (1030.0, 720.0));
+        assert_eq!(imported.position, SavedPosition::new(-800.0, 100.0));
+
+        let native = WindowPlacement {
+            width: 900.0,
+            height: 650.0,
+            position: None,
+        };
+        workspace
+            .dialog_placement
+            .remembered
+            .insert(Kind::JournalManager, Some(native));
+        let (other, _) = workspace.open_window(false);
+        let _ = workspace.update_session_journal(other, JournalMessage::Open);
+        assert!(workspace.dialog_placement.open.values().any(|placement| {
+            placement.kind == Kind::JournalManager && placement.preferred == native
+        }));
     }
 
     #[test]

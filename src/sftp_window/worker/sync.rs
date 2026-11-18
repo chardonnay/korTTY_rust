@@ -20,7 +20,7 @@ use crate::workspace::SshTarget;
 use super::*;
 
 use super::download_access;
-mod removal;
+pub(super) mod removal;
 pub(in crate::sftp_window) mod replacement;
 pub(crate) use replacement::{
     FileWitness, LocalFileSnapshot, ReviewedFilePublication, ReviewedFileReceiver,
@@ -226,7 +226,7 @@ enum ActionKind {
     Folder(Location, DirectoryStamp),
     File {
         source: Location,
-        stamp: SnapshotEntry,
+        stamp: Box<SnapshotEntry>,
         parent: (Location, DirectoryStamp),
         digest: Option<[u8; 32]>,
     },
@@ -448,14 +448,14 @@ impl CopyPlan {
                     files += 1;
                     ActionKind::File {
                         source: source.location(path)?,
-                        stamp: stamp.clone(),
+                        stamp: Box::new(stamp.clone()),
                         parent: source.parent(path).ok_or_else(|| {
                             io::Error::other("A source folder could not be verified")
                         })?,
                         digest: None,
                     }
                 }
-                Kind::Blocked => continue,
+                Kind::Link | Kind::Blocked => continue,
             };
             if actions.len() == max_actions {
                 return Err(io::Error::other(if standing.is_some() {
