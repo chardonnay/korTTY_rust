@@ -50,6 +50,7 @@ pub(crate) mod rsync;
 pub(crate) mod rsync_authority;
 mod run_detail;
 pub(crate) mod script;
+mod standing_index;
 pub(crate) mod sync;
 mod view;
 pub(crate) mod webhooks;

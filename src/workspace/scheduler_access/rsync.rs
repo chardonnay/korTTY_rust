@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use iced::{Task, window};
 
+use crate::job_executor::rsync::PrivilegedPreviewMode;
 use crate::scheduler_window::rsync::UploadReceiverPreview;
 use crate::scheduler_window::{ConnectionRef, TargetGroups};
 use kortty_server_archive::rsync_tree::RecurringReceiver;
@@ -209,21 +210,22 @@ impl Workspace {
                     .as_ref()
                     .cloned()
                     .ok_or("The privileged rsync review is unavailable.")?;
-                let preview = match (review_vacant_server_upload, &spec.operation) {
+                let mode = match (review_vacant_server_upload, &spec.operation) {
                     (
                         true,
                         kortty_server_archive::privileged_rsync::Operation::Upload {
                             directory: true,
                             ..
                         },
-                    ) => job_executor::rsync::preview_privileged_tree_creation,
-                    (true, _) => job_executor::rsync::preview_privileged_file_creation,
-                    (false, _) => job_executor::rsync::preview_privileged,
+                    ) => PrivilegedPreviewMode::VacantTree,
+                    (true, _) => PrivilegedPreviewMode::VacantFile,
+                    (false, _) => PrivilegedPreviewMode::Standard,
                 };
-                preview(
+                job_executor::rsync::preview_privileged(
                     auth,
                     reference,
                     spec,
+                    mode,
                     trust,
                     Arc::clone(cancelled),
                     move || routes.open().map(|_| ()),

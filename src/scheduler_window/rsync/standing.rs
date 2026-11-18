@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::TryLockError;
-use std::io::{self, Read as _};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -12,7 +12,7 @@ use kortty_ssh::Endpoint;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::super::{RemoteAction, SshCommand, sync::valid_nonce};
+use super::super::{RemoteAction, SshCommand, standing_index, sync::valid_nonce};
 use super::routes::LocalWitness;
 use super::{Approval, ConnectionRef, LocalExistingSnapshot, MixedReceiver, RemotePath};
 use crate::job_executor::rsync::{LocalParentReceipt, VacantFileProof, VacantLocalTreeSnapshot};
@@ -21,7 +21,6 @@ use crate::ssh_dialog::LoginTarget;
 
 const FILE: &str = "job-rsync-standing-reviews.json";
 const LOCK: &str = ".job-rsync-standing-reviews.lock";
-const MAX_INDEX_BYTES: u64 = 4 * 1024 * 1024;
 const DAY: u64 = 24 * 60 * 60;
 const MAX_DAYS: u16 = 30;
 const MAX_FIRINGS: u16 = 128;
@@ -963,11 +962,10 @@ impl Store {
         let mut index = read_index(&directory)?;
         let result = change(&mut index)?;
         let bytes = serde_json::to_vec(&index)?;
-        if !valid_index(&index) || bytes.len() as u64 > MAX_INDEX_BYTES {
+        if !valid_index(&index) {
             return Err(needs_review());
         }
-        directory.replace_file(FILE, &bytes)?;
-        directory.sync()?;
+        standing_index::write(&directory, FILE, &bytes, needs_review)?;
         Ok(result)
     }
 }
@@ -1173,20 +1171,7 @@ fn valid_index(index: &Index) -> bool {
 }
 
 fn read_index(directory: &Directory) -> io::Result<Index> {
-    let file = match directory.open_private_file(FILE) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Index::new()),
-        Err(error) => return Err(error),
-    };
-    let mut bytes = Vec::new();
-    file.take(MAX_INDEX_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_INDEX_BYTES {
-        return Err(needs_review());
-    }
-    let index = serde_json::from_slice(&bytes)?;
-    valid_index(&index)
-        .then_some(index)
-        .ok_or_else(needs_review)
+    standing_index::read(directory, FILE, valid_index, needs_review)
 }
 
 fn needs_review() -> io::Error {

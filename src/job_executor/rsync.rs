@@ -201,77 +201,21 @@ pub(crate) fn preview_mixed(
     .map_err(|error| error.detail.to_owned())?
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum PrivilegedPreviewMode {
+    Standard,
+    VacantFile,
+    VacantTree,
+}
+
 pub(crate) fn preview_privileged(
     credentials: Credentials,
     reference: &ConnectionRef,
     spec: &privileged_rsync::Spec,
+    mode: PrivilegedPreviewMode,
     trust: &TrustStore,
     cancelled: Arc<AtomicBool>,
     require_current_routes: impl Fn() -> std::io::Result<()> + Send + Sync + 'static,
-) -> Result<privileged_rsync::Review, String> {
-    preview_privileged_destination(
-        credentials,
-        reference,
-        spec,
-        trust,
-        cancelled,
-        require_current_routes,
-        None,
-    )
-}
-
-pub(crate) fn preview_privileged_file_creation(
-    credentials: Credentials,
-    reference: &ConnectionRef,
-    spec: &privileged_rsync::Spec,
-    trust: &TrustStore,
-    cancelled: Arc<AtomicBool>,
-    require_current_routes: impl Fn() -> std::io::Result<()> + Send + Sync + 'static,
-) -> Result<privileged_rsync::Review, String> {
-    preview_privileged_destination(
-        credentials,
-        reference,
-        spec,
-        trust,
-        cancelled,
-        require_current_routes,
-        Some(UploadCreation::File),
-    )
-}
-
-pub(crate) fn preview_privileged_tree_creation(
-    credentials: Credentials,
-    reference: &ConnectionRef,
-    spec: &privileged_rsync::Spec,
-    trust: &TrustStore,
-    cancelled: Arc<AtomicBool>,
-    require_current_routes: impl Fn() -> std::io::Result<()> + Send + Sync + 'static,
-) -> Result<privileged_rsync::Review, String> {
-    preview_privileged_destination(
-        credentials,
-        reference,
-        spec,
-        trust,
-        cancelled,
-        require_current_routes,
-        Some(UploadCreation::Tree),
-    )
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum UploadCreation {
-    File,
-    Tree,
-}
-
-fn preview_privileged_destination(
-    credentials: Credentials,
-    reference: &ConnectionRef,
-    spec: &privileged_rsync::Spec,
-    trust: &TrustStore,
-    cancelled: Arc<AtomicBool>,
-    require_current_routes: impl Fn() -> std::io::Result<()> + Send + Sync + 'static,
-    creation: Option<UploadCreation>,
 ) -> Result<privileged_rsync::Review, String> {
     #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     {
@@ -292,7 +236,7 @@ fn preview_privileged_destination(
             spec,
             move || cancelled.load(std::sync::atomic::Ordering::Acquire),
             authority,
-            creation,
+            mode,
         )
         .map_err(|failure| failure.detail.to_owned())
     }
@@ -302,10 +246,10 @@ fn preview_privileged_destination(
             credentials,
             reference,
             spec,
+            mode,
             trust,
             cancelled,
             require_current_routes,
-            creation,
         );
         Err("Privileged rsync is unavailable on this platform.".into())
     }

@@ -1285,6 +1285,53 @@ pub(super) struct Review {
 }
 
 impl Review {
+    fn replace_proposal_context(
+        &mut self,
+        skill_review_error: &'static str,
+        update_prompt: impl Fn(proposal::Prompt, bool) -> Result<proposal::Prompt, String>,
+        update_approval: impl FnOnce(&mut Approval, bool),
+    ) -> Result<iced::Task<Message>, String> {
+        let standing = self.standing();
+        let firing = self.per_firing();
+        let Model {
+            prompts, skills, ..
+        } = self.model.as_mut().expect("checked model");
+        let skills = skills
+            .as_mut()
+            .filter(|skills| matches!(skills.classification, Classification::Closed))
+            .ok_or(skill_review_error)?;
+        let updated = prompts
+            .iter()
+            .map(|prompt| update_prompt((**prompt).clone(), standing))
+            .collect::<Result<Vec<_>, _>>()?;
+        for prompt in &updated {
+            prompt.cli_review_input(standing)?;
+        }
+        let generation = firing
+            .then(|| generation_grant(&updated, &self.approval.targets))
+            .transpose()?;
+        let advisory = self
+            .approval
+            .advisory
+            .as_ref()
+            .map(|grant| {
+                let pins = grant
+                    .reviewed_pins()
+                    .ok_or("The reviewed read-only skill assignments are unavailable.")?;
+                grant
+                    .clone()
+                    .with_reviewed_prompts(&updated, &self.approval.targets, pins.to_vec())
+            })
+            .transpose()?;
+        skills.renew_preview()?;
+        *prompts = updated.into_iter().map(Arc::new).collect();
+        self.approval.generation = generation;
+        self.approval.advisory = advisory;
+        update_approval(&mut self.approval, standing);
+        self.approval.comparison = None;
+        skills.proposal_quota(prompts, standing)
+    }
+
     pub(super) fn per_firing(&self) -> bool {
         self.approval.generation.is_some()
     }

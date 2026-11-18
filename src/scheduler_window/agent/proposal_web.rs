@@ -7,8 +7,8 @@ use iced::Task;
 use crate::workspace::terminal_ai::web;
 
 use super::{
-    Classification, Message, Model, SchedulerView, SchedulerWindow, generation_grant, scope,
-    scope_with_fresh_web, scope_with_web_lookup, web_lookup,
+    Message, Model, SchedulerView, SchedulerWindow, scope, scope_with_fresh_web,
+    scope_with_web_lookup, web_lookup,
 };
 
 const ENVIRONMENT_REVIEW_REQUIRED: &str =
@@ -467,46 +467,10 @@ impl SchedulerWindow {
             return Err("Fresh web lookups are reviewed separately for each run.".into());
         }
         let review = view.agent_review.as_mut().expect("checked review");
-        let standing = review.standing();
-        let firing = review.per_firing();
-        let Model {
-            prompts, skills, ..
-        } = review.model.as_mut().expect("checked model");
-        let skills = skills
-            .as_mut()
-            .filter(|skills| matches!(skills.classification, Classification::Closed))
-            .ok_or("Finish the skill review before changing web excerpts.")?;
-        let updated = prompts
-            .iter()
-            .map(|prompt| (**prompt).clone().with_web(evidence.clone(), standing))
-            .collect::<Result<Vec<_>, _>>()?;
-        for prompt in &updated {
-            prompt.cli_review_input(standing)?;
-        }
-        let generation = firing
-            .then(|| generation_grant(&updated, &review.approval.targets))
-            .transpose()?;
-        let advisory = review
-            .approval
-            .advisory
-            .as_ref()
-            .map(|grant| {
-                let pins = grant
-                    .reviewed_pins()
-                    .ok_or("The reviewed read-only skill assignments are unavailable.")?;
-                grant.clone().with_reviewed_prompts(
-                    &updated,
-                    &review.approval.targets,
-                    pins.to_vec(),
-                )
-            })
-            .transpose()?;
-        skills.renew_preview()?;
-        *prompts = updated.into_iter().map(Arc::new).collect();
-        review.approval.generation = generation;
-        review.approval.advisory = advisory;
-        review.approval.web = standing.then_some(evidence).flatten();
-        review.approval.comparison = None;
-        skills.proposal_quota(prompts, standing)
+        review.replace_proposal_context(
+            "Finish the skill review before changing web excerpts.",
+            |prompt, standing| prompt.with_web(evidence.clone(), standing),
+            |approval, standing| approval.web = standing.then(|| evidence.clone()).flatten(),
+        )
     }
 }

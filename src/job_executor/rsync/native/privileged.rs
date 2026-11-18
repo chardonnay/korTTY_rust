@@ -10,7 +10,7 @@ use kortty_server_archive::rsync_tree::{
     self as tree_protocol, ExistingTree, Inventory, projection,
 };
 
-use crate::job_executor::rsync::UploadCreation;
+use crate::job_executor::rsync::PrivilegedPreviewMode;
 use crate::scheduler_window::RemotePath;
 use crate::scheduler_window::rsync::standing::RemoteVacancy;
 use crate::sftp_window::{PrivateTreeDestination, PrivateTreePublishError, scheduled::Client};
@@ -27,7 +27,13 @@ pub(in crate::job_executor::rsync) fn review(
     cancelled: impl Fn() -> bool + Clone + Send + Sync + 'static,
     guard: ExecutionGuard,
 ) -> Result<Review, Failure> {
-    review_destination(exec, spec, cancelled, guard, None)
+    review_destination(
+        exec,
+        spec,
+        cancelled,
+        guard,
+        PrivilegedPreviewMode::Standard,
+    )
 }
 
 pub(in crate::job_executor::rsync) fn review_destination(
@@ -35,19 +41,23 @@ pub(in crate::job_executor::rsync) fn review_destination(
     spec: &Spec,
     cancelled: impl Fn() -> bool + Clone + Send + Sync + 'static,
     guard: ExecutionGuard,
-    creation: Option<UploadCreation>,
+    mode: PrivilegedPreviewMode,
 ) -> Result<Review, Failure> {
     if !spec.valid() {
         return Err(review_required());
     }
     let mut control = Control::open(exec, cancelled.clone(), guard)?;
-    let request = match creation {
-        Some(UploadCreation::File) => Request::ReviewRecurringFileUpload { spec: spec.clone() },
-        Some(UploadCreation::Tree) => Request::ReviewRecurringTreeUpload { spec: spec.clone() },
-        None => Request::Review { spec: spec.clone() },
+    let request = match mode {
+        PrivilegedPreviewMode::VacantFile => {
+            Request::ReviewRecurringFileUpload { spec: spec.clone() }
+        }
+        PrivilegedPreviewMode::VacantTree => {
+            Request::ReviewRecurringTreeUpload { spec: spec.clone() }
+        }
+        PrivilegedPreviewMode::Standard => Request::Review { spec: spec.clone() },
     };
     control.request(&request, &cancelled)?;
-    control.reviewed(spec, creation, &cancelled)
+    control.reviewed(spec, mode, &cancelled)
 }
 
 pub(super) fn review_source(
@@ -281,15 +291,15 @@ impl Control {
     fn reviewed(
         &mut self,
         spec: &Spec,
-        creation: Option<UploadCreation>,
+        mode: PrivilegedPreviewMode,
         stopped: &impl Fn() -> bool,
     ) -> Result<Review, Failure> {
         match self.helper.receive_privileged(stopped) {
             Ok(Reply::Reviewed { review })
                 if &review.spec == spec
                     && review.valid()
-                    && (!review.first_file || creation == Some(UploadCreation::File))
-                    && (!review.first_tree || creation == Some(UploadCreation::Tree))
+                    && (!review.first_file || mode == PrivilegedPreviewMode::VacantFile)
+                    && (!review.first_tree || mode == PrivilegedPreviewMode::VacantTree)
                     && (self.permitted)() =>
             {
                 Ok(review)
@@ -318,7 +328,7 @@ impl Control {
             ),
         };
         self.request(&request, stopped)?;
-        let review = self.reviewed(spec, None, stopped)?;
+        let review = self.reviewed(spec, PrivilegedPreviewMode::Standard, stopped)?;
         let expected = review.inventory.ok_or_else(review_required)?;
         if !limits.contains(expected)
             || recurring.is_some_and(|(approved, _)| {

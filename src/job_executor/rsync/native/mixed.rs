@@ -8,7 +8,7 @@ use kortty_server_archive::rsync_tree::{
     self as protocol, DeleteScope, ExistingTree, RecurringReceiver, projection,
 };
 
-use crate::job_executor::rsync::{RecurringReceiverTarget, UploadCreation};
+use crate::job_executor::rsync::{PrivilegedPreviewMode, RecurringReceiverTarget};
 use crate::scheduler_window::RemotePath;
 use crate::scheduler_window::rsync::{
     Elevation, MixedDestination, MixedPlan, MixedPrivilegedReview, MixedReceiver, MixedReview,
@@ -88,7 +88,7 @@ pub(in crate::job_executor::rsync) fn review(
                     &spec,
                     cancelled,
                     authority.clone(),
-                    Some(UploadCreation::Tree),
+                    PrivilegedPreviewMode::VacantTree,
                 )
             } else {
                 privileged::review(exec, &spec, cancelled.clone(), authority.clone()).or_else(

@@ -85,10 +85,11 @@ fn openssh_passwordless_recurring_rsync_creates_vacant_server_trees() {
                 |_, _, _| Err("unexpected credential"),
             )
             .unwrap();
-            let review = rsync::preview_privileged_tree_creation(
+            let review = rsync::preview_privileged(
                 credentials,
                 &fixture.reference,
                 &spec,
+                rsync::PrivilegedPreviewMode::VacantTree,
                 &fixture.trust,
                 Arc::new(AtomicBool::new(false)),
                 || Ok(()),
