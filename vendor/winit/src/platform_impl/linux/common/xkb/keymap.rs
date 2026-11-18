@@ -987,8 +987,9 @@ impl XkbKeymap {
                 &mut keysyms,
             );
 
-            if count == 1 && !keysyms.is_null() {
-                *keysyms
+            if count == 1 {
+                // XKB lends the symbols for this keymap. Treat an absent result as NoSymbol.
+                keysyms.as_ref().copied().unwrap_or(0)
             } else {
                 0
             }
