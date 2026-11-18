@@ -685,8 +685,8 @@ mod tests {
         assert!(before.is_some());
         fs::rename(&root, root.with_file_name("prior-receiver")).unwrap();
         let parent = Directory::open_path(root.parent().unwrap()).unwrap();
-        let _replacement =
-            local_tree::create_reviewed_tree_stage(&parent, OsStr::new("receiver")).unwrap();
+        // Close the creation handle before opening the reviewed Windows handle.
+        drop(local_tree::create_reviewed_tree_stage(&parent, OsStr::new("receiver")).unwrap());
         assert_ne!(inspect(&manifest, &root).receiver().unwrap(), before);
     }
 

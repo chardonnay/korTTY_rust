@@ -359,11 +359,22 @@ mod tests {
 
     use super::*;
 
+    fn create_private_directory(parent: &Path, name: &str) {
+        use std::ffi::OsStr;
+
+        Directory::open_path(parent)
+            .unwrap()
+            .create_child(OsStr::new(name))
+            .unwrap();
+    }
+
     #[test]
     fn privileged_tree_creation_receipt_binds_created_receiver_and_rejects_late_destination() {
         for populated in [false, true] {
             let profile = crate::snippets::tests::Profile::new();
-            let parent = profile.0.canonicalize().unwrap();
+            let root = profile.0.canonicalize().unwrap();
+            create_private_directory(&root, "destination");
+            let parent = root.join("destination");
             let target = parent.join("receiver");
             let destination = Destination::inspect(&target).unwrap();
             let vacancy = destination.vacancy_receipt().unwrap();
@@ -382,7 +393,7 @@ mod tests {
             );
             assert!(Destination::inspect(&target).is_err());
             fs::rename(&target, parent.join("original")).unwrap();
-            fs::create_dir(&target).unwrap();
+            create_private_directory(&parent, "receiver");
             assert_ne!(
                 receiver_for_directory(&target, &Directory::open_path(&target).unwrap()).unwrap(),
                 Some(receiver)
@@ -390,7 +401,9 @@ mod tests {
         }
         for late in [false, true] {
             let profile = crate::snippets::tests::Profile::new();
-            let parent = profile.0.canonicalize().unwrap();
+            let root = profile.0.canonicalize().unwrap();
+            create_private_directory(&root, "destination");
+            let parent = root.join("destination");
             let target = parent.join("receiver");
             let destination = Destination::inspect(&target).unwrap();
             let vacancy = destination.vacancy_receipt().unwrap();

@@ -575,7 +575,7 @@ fn matches_listing(entry: &Entry, metadata: &Metadata) -> bool {
         matches
             && entry.owner == Some(metadata.uid())
             && entry.group == Some(metadata.gid())
-            && entry.mode == Some(metadata.mode() & 0o777)
+            && entry.mode == Some(metadata.mode())
     };
     matches
 }
