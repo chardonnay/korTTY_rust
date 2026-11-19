@@ -30,11 +30,11 @@ impl Defaults {
         self.0.is_empty()
     }
 
-    fn get(&self, language: Language) -> Option<HeaderRef> {
+    pub(in crate::workspace) fn get(&self, language: Language) -> Option<HeaderRef> {
         self.0.get(&language).copied()
     }
 
-    fn set(&mut self, language: Language, id: Option<HeaderRef>) {
+    pub(in crate::workspace) fn set(&mut self, language: Language, id: Option<HeaderRef>) {
         if let Some(id) = id {
             self.0.insert(language, id);
         } else {
@@ -129,7 +129,7 @@ impl Entry {
     }
 }
 
-pub(super) fn applies_to(metadata: &str, language: Language) -> bool {
+pub(in crate::workspace) fn applies_to(metadata: &str, language: Language) -> bool {
     if metadata.eq_ignore_ascii_case(language.snippet_language()) {
         return true;
     }

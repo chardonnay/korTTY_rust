@@ -4,6 +4,8 @@ use kortty_server_archive::protocol::{Reply, read_stdio_request, write_reply};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod server;
+#[cfg(windows)]
+mod windows_draft_replace;
 
 fn main() -> io::Result<()> {
     let mut args = std::env::args_os().skip(1);
@@ -35,9 +37,11 @@ fn main() -> io::Result<()> {
         .is_some_and(|arg| arg == kortty_server_archive::draft_replace::ARGUMENT)
         && args.len() == 0
     {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         return server::draft_replace::serve();
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
+        return windows_draft_replace::serve();
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         return {
             std::thread::Builder::new()
                 .name("kortty-draft-deadline".into())

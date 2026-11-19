@@ -155,6 +155,181 @@ impl Fixture {
 }
 
 #[test]
+fn java_scheduler_restore_stages_shared_targets_with_exact_source_and_membership() {
+    use crate::clipboard_policy::ClipboardPolicy;
+    use crate::connection_store::teamwork::{Catalog, ManagedSource, Source, SourceKind};
+    use crate::scheduler_window::{SharedAuth, SharedTargets};
+
+    let ordered = r#"<connection id="z-order"><name>Ordered</name><host>ordered.example</host>
+        <username>fixture</username><group>Ops/Hosts</group></connection>"#;
+    let plain = GROUP_CONNECTIONS.replace("<connections>", &format!("<connections>{ordered}")).replace(
+        "<group>Ops/Hosts</group>",
+        "<group>Ops/Hosts</group><connectionSource>TEAMWORK</connectionSource><teamworkSourceId>fleet</teamworkSourceId>",
+    );
+    let test_profile = crate::snippets::tests::Profile::new();
+    let file = test_profile.0.join("shared.xml");
+    let scheduler = std::str::from_utf8(SCHEDULER).unwrap();
+    let globals = format!(
+        "<globalSettings><teamworkSources><source><id>fleet</id><type>SHARED_FILE</type><location>{}</location></source></teamworkSources></globalSettings>",
+        file.display()
+    );
+    let fixture = Fixture::with_connections(scheduler, plain.as_bytes(), Some(globals.as_bytes()));
+    let preview = super::super::inspect_java_password(&fixture.archive, &fixture.password).unwrap();
+    let source = preview.java.unwrap().scheduler.unwrap();
+    let directory = Directory::open(&fixture.root, true).unwrap();
+    let local = super::stage_java_connections(
+        &directory,
+        &source.connections,
+        Default::default(),
+        JavaTargetReuse {
+            toolbar: false,
+            scheduler: true,
+        },
+    )
+    .unwrap()
+    .unwrap();
+    let store =
+        crate::connection_store::import::java_connection_candidate(&local.contents).unwrap();
+    let policy = ClipboardPolicy {
+        custom_teamwork_sources_allowed: false,
+        teamwork_sources: vec![ManagedSource {
+            name: "Fleet".into(),
+            source: Source {
+                location: file.to_str().unwrap().into(),
+                enabled: true,
+                kind: SourceKind::File,
+                check_interval_minutes: 15,
+            },
+        }],
+        ..ClipboardPolicy::default()
+    };
+    let shared_row = r#"<connection id="b04d413f-9ee5-4b56-bc12-c72da52d4b3e">
+        <name>Primary</name><host>primary.example</host><username>fixture</username><group>Ops/Hosts</group>
+    </connection>"#;
+    let key = kortty_ssh::HostKey::from_openssh(
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKuSNsxvt1EJ0ELnEMXiOgkaExGvVly+uWvDAKyIGKcX",
+    )
+    .unwrap();
+    let trust = kortty_ssh::TrustStore::from_pins(
+        ["primary.example", "ordered.example"]
+            .into_iter()
+            .map(|host| (kortty_ssh::Endpoint::new(host, 22).unwrap(), key.clone()))
+            .collect(),
+    )
+    .unwrap();
+    for (extra, expect_group) in [
+        ("", true),
+        (
+            r#"<connection id="extra"><host>new.example</host><username>fixture</username><group>Ops/Hosts</group></connection>"#,
+            false,
+        ),
+    ] {
+        fs::write(
+            &file,
+            format!("<connections>{shared_row}{ordered}{extra}</connections>"),
+        )
+        .unwrap();
+        let catalog = Catalog::load_for_scheduler(&fixture.root, &policy).unwrap();
+        let shared = SharedTargets::new(&catalog, &store, &trust, |entry| {
+            Some((
+                entry.connection.login.endpoint.clone(),
+                SharedAuth::Key {
+                    id: 1,
+                    password_preference: None,
+                },
+            ))
+        });
+        let mut notes = Vec::new();
+        let backup =
+            super::super::inspect_java_password(&fixture.archive, &fixture.password).unwrap();
+        let bytes = super::java_jobs::stage(
+            &directory,
+            &backup.snapshot,
+            Some(&local),
+            backup.java.unwrap().scheduler.unwrap(),
+            &shared,
+            &policy,
+            &mut notes,
+        )
+        .unwrap()
+        .unwrap();
+        let jobs = super::java_scheduler::decode(&bytes).unwrap();
+        let command = jobs.job(&JobId::new(COMMAND).unwrap()).unwrap();
+        assert!(!command.enabled());
+        assert!(
+            command
+                .action()
+                .connection
+                .as_ref()
+                .unwrap()
+                .shared_identity()
+                .is_some()
+        );
+        let blocked = crate::clipboard_policy::parse(
+            "[meta]
+schema-version = 1
+[[rule]]
+[rule.servers]
+mode = 'deny'
+hosts = ['primary.example:22']",
+        )
+        .unwrap();
+        let isolated = ClipboardPolicy {
+            minimum_isolation: crate::session_security::IsolationLevel::Process,
+            ..ClipboardPolicy::default()
+        };
+        for denied in [&blocked, &isolated] {
+            let backup =
+                super::super::inspect_java_password(&fixture.archive, &fixture.password).unwrap();
+            if let Some(bytes) = super::java_jobs::stage(
+                &directory,
+                &backup.snapshot,
+                Some(&local),
+                backup.java.unwrap().scheduler.unwrap(),
+                &shared,
+                denied,
+                &mut Vec::new(),
+            )
+            .unwrap()
+            {
+                let remaining = super::java_scheduler::decode(&bytes).unwrap();
+                for id in [COMMAND, GROUP_JOB] {
+                    assert!(remaining.job(&JobId::new(id).unwrap()).is_none());
+                }
+            }
+        }
+        let grouped = jobs.job(&JobId::new(GROUP_JOB).unwrap());
+        assert_eq!(grouped.is_some(), expect_group);
+        if let Some(grouped) = grouped {
+            assert!(!grouped.enabled());
+            assert_eq!(
+                grouped
+                    .action()
+                    .target_groups
+                    .as_ref()
+                    .unwrap()
+                    .groups
+                    .len(),
+                2
+            );
+            assert!(
+                grouped
+                    .action()
+                    .require_current_targets(&store, &shared)
+                    .is_ok()
+            );
+            assert!(
+                grouped
+                    .action()
+                    .targets()
+                    .map(|route| route.target.host.as_str())
+                    .eq(["ordered.example", "secondary.example", "primary.example"])
+            );
+        }
+    }
+}
+
+#[test]
 fn java_scheduler_restore_preserves_group_order_and_explicit_selection() {
     let scheduler = std::str::from_utf8(SCHEDULER).unwrap().replacen(
         "<targetGroupNames/>",
@@ -196,11 +371,10 @@ fn java_scheduler_restore_preserves_group_order_and_explicit_selection() {
         let action = job.action();
         let groups = action.target_groups.as_ref().unwrap();
         assert!(
-            groups
-                .groups
+            groups.groups.iter().cloned().eq(group_paths
                 .iter()
-                .map(String::as_str)
-                .eq(group_paths.iter().copied())
+                .copied()
+                .map(crate::scheduler_window::ConnectionGroup::from))
         );
         assert_eq!(groups.explicit.as_slice(), explicit);
         assert!(action.targets().eq(ordered_targets));
@@ -219,6 +393,236 @@ fn java_scheduler_restore_preserves_group_order_and_explicit_selection() {
     fixture.queue();
     fixture.apply();
     assert_eq!(fs::read(fixture.root.join(JOBS)).unwrap(), jobs);
+}
+
+#[test]
+fn java_scheduler_manual_group_review_binds_a_renamed_group_with_exact_members() {
+    let scheduler = std::str::from_utf8(SCHEDULER).unwrap();
+    let fixture = Fixture::with_connections(scheduler, GROUP_CONNECTIONS.as_bytes(), None);
+    let directory = Directory::open(&fixture.root, true).unwrap();
+    let saved_source = GROUP_CONNECTIONS
+        .replace(" / Ops / Hosts / Child / ", "Saved/Hosts/Child")
+        .replace("Ops/Hosts", "Saved/Hosts")
+        .replace(
+            "</connections>",
+            r#"<connection><name>Primary alone</name>
+            <host>primary.example</host><username>fixture</username><group>Incomplete</group>
+            </connection></connections>"#,
+        );
+    let (bytes, count) = ConnectionPreview::java_backup(saved_source.as_bytes())
+        .unwrap()
+        .portable_java_backup()
+        .unwrap();
+    assert_eq!(count, 4);
+    directory.publish_copy(CONNECTIONS, &bytes).unwrap();
+    let saved = Store::open(fixture.root.join(CONNECTIONS)).unwrap();
+    let expected: Vec<_> = saved
+        .in_group("Saved/Hosts")
+        .map(ConnectionRef::from)
+        .collect();
+    let mut preview =
+        super::super::inspect_java_password(&fixture.archive, &fixture.password).unwrap();
+    preview
+        .prepare_java_scheduler_review_at(&fixture.root)
+        .unwrap();
+    let review = preview.java_scheduler_review_mut().unwrap();
+    let index = (0..review.len())
+        .find(|&index| {
+            review
+                .group_row(index)
+                .is_some_and(|(path, _, _)| path == "Ops/Hosts")
+        })
+        .unwrap();
+    let (_, choices, _) = review.group_row(index).unwrap();
+    assert_eq!(
+        choices
+            .iter()
+            .map(|choice| choice.0.as_deref())
+            .collect::<Vec<_>>(),
+        [None, Some("Saved/Hosts")]
+    );
+    assert!(
+        review
+            .select_group(index, Some("Incomplete".into()))
+            .is_err()
+    );
+    review
+        .select_group(index, Some("Saved/Hosts".into()))
+        .unwrap();
+    super::super::queue_restore_at(&fixture.root, preview, RestoreMode::JavaAdditive).unwrap();
+    fixture.apply();
+
+    let store = SchedulerStore::open(fixture.root.join(JOBS)).unwrap();
+    let scheduler = store.restore_with_actions::<SshCommand>().unwrap();
+    let group = scheduler
+        .graph()
+        .job(&JobId::new(GROUP_JOB).unwrap())
+        .unwrap();
+    assert!(!group.enabled());
+    assert!(group.action().targets().eq(&expected));
+    assert_eq!(
+        group.action().target_groups.as_ref().unwrap().groups,
+        [crate::scheduler_window::ConnectionGroup::from(
+            "Saved/Hosts"
+        )]
+    );
+    let direct = scheduler
+        .graph()
+        .job(&JobId::new(COMMAND).unwrap())
+        .unwrap();
+    assert_eq!(
+        direct.action().connection.as_ref(),
+        expected
+            .iter()
+            .find(|member| member.target.host == "primary.example")
+    );
+    assert!(store.journal().is_empty());
+}
+
+#[test]
+fn java_scheduler_manual_target_review_binds_only_the_same_route() {
+    let fixture = Fixture::new();
+    let directory = Directory::open(&fixture.root, true).unwrap();
+    let native_source = std::str::from_utf8(CONNECTION_XML).unwrap().replace(
+        "<name>Primary</name>",
+        "<name>Primary</name><tag>Local settings</tag>",
+    );
+    let (bytes, count) = ConnectionPreview::java_backup(native_source.as_bytes())
+        .unwrap()
+        .portable_java_backup()
+        .unwrap();
+    assert_eq!(count, 2);
+    directory.publish_copy(CONNECTIONS, &bytes).unwrap();
+    let current = Store::open(fixture.root.join(CONNECTIONS)).unwrap();
+    let primary = &current.connections()[0];
+    let secondary = &current.connections()[1];
+    let preview = || {
+        let mut preview =
+            super::super::inspect_java_password(&fixture.archive, &fixture.password).unwrap();
+        preview
+            .prepare_java_scheduler_review_at(&fixture.root)
+            .unwrap();
+        let review = preview.java_scheduler_review_mut().unwrap();
+        assert_eq!(review.len(), 1);
+        let (_, choices, selected) = review.row(0);
+        assert!(selected.is_some_and(|choice| choice.id.is_none()));
+        assert_eq!(
+            choices.iter().map(|choice| choice.id).collect::<Vec<_>>(),
+            [None, Some(primary.id)]
+        );
+        assert!(review.select(0, Some(secondary.id)).is_err());
+        review.select(0, Some(primary.id)).unwrap();
+        preview
+    };
+    let inspected = preview();
+    directory
+        .replace_file(CONNECTIONS, &[bytes.as_slice(), b" "].concat())
+        .unwrap();
+    assert!(
+        super::super::queue_restore_at(&fixture.root, inspected, RestoreMode::JavaAdditive)
+            .is_err_and(|error| error.to_string().contains("Saved connections changed"))
+    );
+    assert!(!directory.has_entry(PENDING).unwrap());
+    directory.replace_file(CONNECTIONS, &bytes).unwrap();
+    super::super::queue_restore_at(&fixture.root, preview(), RestoreMode::JavaAdditive).unwrap();
+    fixture.apply();
+    let store = SchedulerStore::open(fixture.root.join(JOBS)).unwrap();
+    let scheduler = store.restore_with_actions::<SshCommand>().unwrap();
+    let command = scheduler
+        .graph()
+        .job(&JobId::new(COMMAND).unwrap())
+        .unwrap();
+    assert!(!command.enabled());
+    assert_eq!(
+        command.action().connection,
+        Some(ConnectionRef::from(primary))
+    );
+    assert!(store.journal().is_empty());
+    assert_eq!(fs::read(fixture.root.join(CONNECTIONS)).unwrap(), bytes);
+}
+
+#[test]
+fn java_scheduler_reuses_exact_saved_targets_and_keeps_archive_group_order() {
+    let scheduler = std::str::from_utf8(SCHEDULER).unwrap();
+    let fixture = Fixture::with_connections(scheduler, GROUP_CONNECTIONS.as_bytes(), None);
+    let directory = Directory::open(&fixture.root, true).unwrap();
+    let document = roxmltree::Document::parse(GROUP_CONNECTIONS).unwrap();
+    let reversed: Vec<_> = document
+        .root_element()
+        .children()
+        .filter(roxmltree::Node::is_element)
+        .map(|node| &GROUP_CONNECTIONS[node.range()])
+        .collect();
+    let reordered = format!(
+        "<connections>{}{}{}</connections>",
+        reversed[2], reversed[1], reversed[0]
+    );
+    let (mut current, count) = ConnectionPreview::java_backup(reordered.as_bytes())
+        .unwrap()
+        .portable_java_backup()
+        .unwrap();
+    assert_eq!(count, 3);
+    current.extend_from_slice(b"\n\n");
+    directory.publish_copy(CONNECTIONS, &current).unwrap();
+    let connections = Store::open(fixture.root.join(CONNECTIONS)).unwrap();
+    let group_members = connections
+        .in_group("Ops/Hosts")
+        .map(ConnectionRef::from)
+        .collect::<Vec<_>>();
+    assert!(
+        group_members
+            .iter()
+            .map(|member| member.target.host.as_str())
+            .eq(["primary.example", "secondary.example"])
+    );
+
+    fixture.queue();
+    assert_eq!(
+        fs::read(fixture.root.join(PENDING)).unwrap()[PENDING_MAGIC_WITH_MODE.len()],
+        JAVA_JOBS
+    );
+    directory
+        .replace_file(CONNECTIONS, &[current.as_slice(), b" "].concat())
+        .unwrap();
+    assert!(
+        ProfileLease::acquire(&fixture.root, || false)
+            .is_err_and(|error| error.to_string().contains("connections changed"))
+    );
+    assert!(!directory.has_entry(JOBS).unwrap());
+    discard_pending_java(&pending_java_cancellation(&fixture.root).unwrap().unwrap()).unwrap();
+    directory.replace_file(CONNECTIONS, &current).unwrap();
+
+    fixture.queue();
+    fixture.apply();
+    let store = SchedulerStore::open(fixture.root.join(JOBS)).unwrap();
+    let scheduler = store.restore_with_actions::<SshCommand>().unwrap();
+    let group = scheduler
+        .graph()
+        .job(&JobId::new(GROUP_JOB).unwrap())
+        .unwrap();
+    assert!(!group.enabled());
+    let expected = [&group_members[1], &group_members[0]];
+    assert!(group.action().targets().eq(expected));
+    let targets = group.action().target_groups.as_ref().unwrap();
+    assert!(
+        targets
+            .group_order
+            .iter()
+            .copied()
+            .eq(expected.map(|member| member.id))
+    );
+    group
+        .action()
+        .require_current_target_groups(&connections)
+        .unwrap();
+    assert!(store.journal().is_empty());
+    drop(store);
+    let jobs = fs::read(fixture.root.join(JOBS)).unwrap();
+
+    fixture.queue();
+    fixture.apply();
+    assert_eq!(fs::read(fixture.root.join(JOBS)).unwrap(), jobs);
+    assert_eq!(fs::read(fixture.root.join(CONNECTIONS)).unwrap(), current);
 }
 
 #[test]
@@ -991,7 +1395,10 @@ fn java_scheduler_restore_keeps_rsync_routes_dependencies_and_options_inert() {
             .collect::<Vec<_>>(),
         ["primary.example", "secondary.example"]
     );
-    assert_eq!(mapped.target_groups.as_ref().unwrap().groups, ["Ops/Hosts"]);
+    assert_eq!(
+        mapped.target_groups.as_ref().unwrap().groups,
+        [crate::scheduler_window::ConnectionGroup::from("Ops/Hosts")]
+    );
     let mut routes = mapped.targets();
     let primary_id = routes.next().unwrap().id.to_string();
     let secondary_id = routes.next().unwrap().id.to_string();

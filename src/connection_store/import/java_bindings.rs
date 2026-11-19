@@ -35,12 +35,50 @@ pub(crate) struct JavaConnectionImport {
     pub(crate) memory_ids: BTreeMap<String, u64>,
     pub(crate) profile_ids: BTreeMap<String, u64>,
     pub(crate) groups: JavaSourceGroups,
+    pub(crate) scheduler_sources: BTreeMap<String, JavaSchedulerSource>,
+    existing_routes: BTreeMap<String, JavaImportedRoute>,
+}
+
+#[derive(Clone)]
+pub(crate) struct JavaSchedulerSource {
+    pub(crate) name: String,
+    pub(crate) target: LoginTarget,
+    pub(crate) jump: Option<LoginTarget>,
+    pub(crate) rsync_folder: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct JavaTargetReuse {
+    pub(crate) toolbar: bool,
+    pub(crate) scheduler: bool,
+}
+
+impl JavaConnectionImport {
+    pub(crate) fn reuse_targets(&mut self, current: Option<&[u8]>, reuse: JavaTargetReuse) {
+        let binds_existing = (reuse.toolbar && !self.profile_ids.is_empty())
+            || (reuse.scheduler && !self.scheduler_sources.is_empty());
+        if self.contents.is_none() && binds_existing {
+            self.contents = current.map(<[u8]>::to_vec);
+        }
+        if reuse.scheduler {
+            self.routes.append(&mut self.existing_routes);
+        }
+    }
 }
 
 #[derive(Default)]
 pub(crate) struct JavaSourceGroups {
     members: Vec<JavaGroupMember>,
     incomplete: bool,
+    shared: BTreeMap<String, JavaSharedRoute>,
+}
+
+pub(crate) struct JavaSharedRoute {
+    pub(crate) source: String,
+    pub(crate) group: String,
+    pub(crate) target: LoginTarget,
+    pub(crate) jump: Option<LoginTarget>,
+    pub(crate) rsync_folder: Option<String>,
 }
 
 struct JavaGroupMember {
@@ -66,12 +104,23 @@ impl JavaSourceGroups {
         }
     }
 
-    /// Resolves all source members before native deduplication or policy filtering.
-    pub(crate) fn resolve<'a>(
-        &'a self,
-        group: &str,
-        routes: &'a BTreeMap<String, JavaImportedRoute>,
-    ) -> Option<Vec<(&'a str, &'a JavaImportedRoute)>> {
+    pub(super) fn record_shared(&mut self, id: &str, route: JavaSharedRoute) {
+        self.shared.insert(id.to_owned(), route);
+    }
+
+    pub(super) fn remove_shared(&mut self, id: &str) {
+        self.shared.remove(id);
+    }
+
+    pub(crate) fn shared(&self, id: &str) -> Option<&JavaSharedRoute> {
+        self.shared.get(id)
+    }
+
+    pub(crate) fn has_shared(&self) -> bool {
+        !self.shared.is_empty()
+    }
+
+    pub(crate) fn member_ids<'a>(&'a self, group: &str) -> Option<Vec<&'a str>> {
         if self.incomplete || !library::valid_path(group) {
             return None;
         }
@@ -79,12 +128,22 @@ impl JavaSourceGroups {
             .members
             .iter()
             .filter(|entry| library::group_suffix(&entry.group, group).is_some())
-            .map(|entry| {
-                let id = entry.source_id.as_deref()?;
-                Some((id, routes.get(id)?))
-            })
+            .map(|entry| entry.source_id.as_deref())
             .collect::<Option<Vec<_>>>()?;
         (!members.is_empty()).then_some(members)
+    }
+
+    /// Resolves all source members before native deduplication or policy filtering.
+    #[cfg(test)]
+    pub(crate) fn resolve<'a>(
+        &'a self,
+        group: &str,
+        routes: &'a BTreeMap<String, JavaImportedRoute>,
+    ) -> Option<Vec<(&'a str, &'a JavaImportedRoute)>> {
+        self.member_ids(group)?
+            .into_iter()
+            .map(|id| Some((id, routes.get(id)?)))
+            .collect()
     }
 
     pub(crate) fn toolbar_members(
@@ -343,7 +402,42 @@ fn stage_import(
 ) -> io::Result<JavaConnectionImport> {
     let mut routes = BTreeMap::new();
     let mut memory_ids = BTreeMap::new();
-    let mut profile_ids = BTreeMap::new();
+    let mut profile_ids = existing_target_profiles(local, &imports, policy);
+    let scheduler_sources = imports
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            let id = entry.java_favorite_id.as_ref()?;
+            let (target, jump) = entry.java_route.as_ref()?;
+            Some((
+                id.clone(),
+                JavaSchedulerSource {
+                    name: entry.connection.name.clone(),
+                    target: target.clone(),
+                    jump: jump.clone(),
+                    rsync_folder: entry.java_rsync_folder.clone(),
+                },
+            ))
+        })
+        .collect();
+    let existing_routes = imports
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            let source = entry.java_favorite_id.as_ref()?;
+            let id = *profile_ids.get(source)?;
+            let (target, jump) = entry.java_route.as_ref()?;
+            Some((
+                source.clone(),
+                JavaImportedRoute {
+                    id,
+                    target: target.clone(),
+                    jump: jump.clone(),
+                    rsync_folder: entry.java_rsync_folder.clone(),
+                },
+            ))
+        })
+        .collect();
     let (candidate, outcome) = options::stage_with_java_library(
         local,
         &imports.entries,
@@ -389,7 +483,7 @@ fn stage_import(
             }
         },
     )?;
-    let contents = (outcome.imported > 0)
+    let contents = (outcome.imported > 0 || imports.java_groups.has_shared())
         .then(|| options::encode(&candidate))
         .transpose()?;
     Ok(JavaConnectionImport {
@@ -398,7 +492,104 @@ fn stage_import(
         memory_ids,
         profile_ids,
         groups: imports.java_groups,
+        scheduler_sources,
+        existing_routes,
     })
+}
+
+pub(crate) fn existing_java_profile_matches(
+    local: &Store,
+    source: &[u8],
+    policy: &ServerAccess,
+    library: JavaLibrarySettings,
+) -> io::Result<BTreeMap<String, u64>> {
+    let imports = binding_source(source, false)?.with_java_library(library);
+    Ok(existing_target_profiles(local, &imports, policy))
+}
+
+fn existing_target_profiles(
+    local: &Store,
+    imports: &Preview,
+    policy: &ServerAccess,
+) -> BTreeMap<String, u64> {
+    let group_of = |id| {
+        local
+            .document
+            .library
+            .membership
+            .get(&id)
+            .map_or("", String::as_str)
+    };
+    let mut matches = BTreeMap::new();
+    let mut counts = BTreeMap::<u64, usize>::new();
+    let mut record = |source: &str, id: Option<u64>| {
+        if let Some(id) = id {
+            matches.insert(source.to_owned(), id);
+            *counts.entry(id).or_default() += 1;
+        }
+    };
+    for entry in &imports.entries {
+        let (Some(source), Some((target, jump))) = (&entry.java_favorite_id, &entry.java_route)
+        else {
+            continue;
+        };
+        if !entry.java_target_reuse
+            || !matches!(
+                entry.connection.login.auth,
+                Auth::Prompt | Auth::KeyboardInteractive
+            )
+            || entry.connection.jump.as_ref().is_some_and(|login| {
+                !matches!(login.auth, Auth::Prompt | Auth::KeyboardInteractive)
+            })
+        {
+            continue;
+        }
+        let mut proposed = entry.connection.clone();
+        record(
+            source,
+            unique_profile(local.connections().iter().filter_map(|saved| {
+                proposed.id = saved.id;
+                (group_of(saved.id) == entry.group
+                    && *saved == proposed
+                    && local.os_badge_id(saved.id) == entry.badge.as_deref()
+                    && saved.matches_route(target, jump.as_ref())
+                    && saved.blocked_server(policy).is_none())
+                .then_some(saved.id)
+            })),
+        );
+    }
+    for entry in &imports.local_entries {
+        if let Some(source) = &entry.java_favorite_id {
+            let mut proposed = entry.profile.clone();
+            record(
+                source,
+                unique_profile(local.local_profiles().iter().filter_map(|saved| {
+                    proposed.id = saved.id;
+                    (group_of(saved.id) == entry.group && *saved == proposed).then_some(saved.id)
+                })),
+            );
+        }
+    }
+    for entry in &imports.serial_entries {
+        if let Some(source) = &entry.java_favorite_id {
+            let mut proposed = entry.profile.clone();
+            record(
+                source,
+                unique_profile(local.serial_profiles().iter().filter_map(|saved| {
+                    proposed.id = saved.id;
+                    proposed.pinned = saved.pinned;
+                    (group_of(saved.id) == entry.group && *saved == proposed).then_some(saved.id)
+                })),
+            );
+        }
+    }
+    matches.retain(|_, id| counts[id] == 1);
+    matches
+}
+
+fn unique_profile(mut ids: impl Iterator<Item = u64>) -> Option<u64> {
+    let first = ids.next()?;
+    ids.next().is_none().then_some(first)
 }
 
 fn eligible(entry: &ImportedProfile, local: &Document, policy: &ServerAccess) -> bool {
@@ -681,6 +872,41 @@ mod tests {
     }
 
     #[test]
+    fn java_teamwork_metadata_cannot_create_local_routes_or_shorten_groups() {
+        let source = br#"<connections>
+            <connection id="local">
+                <name>Local</name><host>local.example</host><username>alice</username><group>Fleet</group>
+                <connectionSource>LOCAL</connectionSource>
+            </connection>
+            <connection id="shared">
+                <name>Shared</name><host>shared.example</host><username>alice</username><group>Fleet/Sub</group>
+                <connectionSource>TEAMWORK</connectionSource><teamworkSourceId>fleet-source</teamworkSourceId>
+            </connection>
+            <connection id="ambiguous">
+                <name>Ambiguous</name><host>other.example</host><username>alice</username><group>Other</group>
+                <teamworkSourceId>another-source</teamworkSourceId>
+            </connection>
+        </connections>"#;
+        let preview = Preview::java_backup(source).unwrap();
+        assert_eq!(preview.unsupported, 2);
+        let (bytes, _) = preview.portable_java_backup().unwrap();
+        let portable = java_connection_candidate(&bytes).unwrap();
+        assert_eq!(portable.connections().len(), 1);
+        assert_eq!(
+            portable.connections()[0].login.endpoint.host,
+            "local.example"
+        );
+
+        let staged =
+            prepare_java_connection_import(source, None, &ServerAccess::default()).unwrap();
+        assert!(staged.routes.contains_key("local"));
+        assert!(!staged.routes.contains_key("shared"));
+        assert!(!staged.routes.contains_key("ambiguous"));
+        assert!(staged.groups.resolve("Fleet", &staged.routes).is_none());
+        assert!(staged.groups.resolve("Other", &staged.routes).is_none());
+    }
+
+    #[test]
     fn plain_java_lineage_tracks_only_new_exact_unambiguous_routes() {
         let local = br#"<connections>
             <connection><name>Collision</name><host>same.example</host><username>alice</username>
@@ -723,7 +949,7 @@ mod tests {
         assert_eq!(prepared.routes.len(), 1);
         let route = &prepared.routes["preserve-case"];
         let document = super::super::super::decode_document(&bytes).unwrap();
-        assert_eq!(document.connections.len(), 8);
+        assert_eq!(document.connections.len(), 7);
         assert_ne!(route.id, document.connections[0].id);
         assert_eq!(
             document.connections[0].jump.as_ref().unwrap().endpoint,

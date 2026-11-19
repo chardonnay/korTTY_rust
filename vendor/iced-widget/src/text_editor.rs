@@ -123,6 +123,7 @@ pub struct TextEditor<
     id: Option<widget::Id>,
     content: &'a Content<Renderer>,
     placeholder: Option<text::Fragment<'a>>,
+    inline_suggestion: Option<&'a str>,
     font: Option<Renderer::Font>,
     text_size: Option<Pixels>,
     line_height: LineHeight,
@@ -136,6 +137,7 @@ pub struct TextEditor<
     class: Theme::Class<'a>,
     key_binding: Option<Box<dyn Fn(KeyPress) -> Option<Binding<Message>> + 'a>>,
     on_edit: Option<Box<dyn Fn(Action) -> Message + 'a>>,
+    on_unfocus: Option<Box<dyn Fn() -> Message + 'a>>,
     highlighter_settings: Highlighter::Settings,
     highlighter_format: fn(
         &Highlighter::Highlight,
@@ -156,6 +158,7 @@ where
             id: None,
             content,
             placeholder: None,
+            inline_suggestion: None,
             font: None,
             text_size: None,
             line_height: LineHeight::default(),
@@ -169,6 +172,7 @@ where
             class: <Theme as Catalog>::default(),
             key_binding: None,
             on_edit: None,
+            on_unfocus: None,
             highlighter_settings: (),
             highlighter_format: |_highlight, _theme| {
                 highlighter::Format::default()
@@ -197,6 +201,18 @@ where
         placeholder: impl text::IntoFragment<'a>,
     ) -> Self {
         self.placeholder = Some(placeholder.into_fragment());
+        self
+    }
+
+    /// Draws a preview after the focused caret without changing editor content.
+    pub fn inline_suggestion(mut self, suggestion: Option<&'a str>) -> Self {
+        self.inline_suggestion = suggestion;
+        self
+    }
+
+    /// Notifies the caller when the editor loses keyboard focus.
+    pub fn on_unfocus(mut self, message: impl Fn() -> Message + 'a) -> Self {
+        self.on_unfocus = Some(Box::new(message));
         self
     }
 
@@ -314,6 +330,7 @@ where
             id: self.id,
             content: self.content,
             placeholder: self.placeholder,
+            inline_suggestion: self.inline_suggestion,
             font: self.font,
             text_size: self.text_size,
             line_height: self.line_height,
@@ -327,6 +344,7 @@ where
             class: self.class,
             key_binding: self.key_binding,
             on_edit: self.on_edit,
+            on_unfocus: self.on_unfocus,
             highlighter_settings: settings,
             highlighter_format: to_format,
             last_status: self.last_status,
@@ -593,10 +611,43 @@ pub struct State<Highlighter: text::Highlighter> {
     drag_click: Option<mouse::click::Kind>,
     partial_scroll: f32,
     horizontal: Cell<horizontal::Viewport>,
+    inline_gap: Cell<Option<InlineGap>>,
     last_theme: RefCell<Option<String>>,
     highlighter: RefCell<Highlighter>,
     highlighter_settings: Highlighter::Settings,
     highlighter_format_address: usize,
+}
+
+/// Vertical space occupied by preview lines below the caret.
+#[derive(Debug, Clone, Copy)]
+pub struct InlineGap {
+    caret: Point,
+    line_height: f32,
+    height: f32,
+}
+
+impl InlineGap {
+    fn start(self) -> f32 {
+        self.caret.y + self.line_height
+    }
+
+    /// Maps a source row's top to its temporary visual location.
+    pub fn row_top(self, top: f32) -> f32 {
+        if top >= self.start() - 0.01 {
+            top + self.height
+        } else {
+            top
+        }
+    }
+
+    fn source_point(self, mut point: Point) -> Point {
+        if point.y >= self.start() + self.height {
+            point.y -= self.height;
+        } else if point.y >= self.start() {
+            point = self.caret + Vector::new(0.0, self.line_height / 2.0);
+        }
+        point
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -631,6 +682,16 @@ impl<Highlighter: text::Highlighter> State<Highlighter> {
     /// Returns whether the [`TextEditor`] is currently focused or not.
     pub fn is_focused(&self) -> bool {
         self.focus.is_some()
+    }
+
+    /// The gap used by the last draw, for widgets aligned with the editor rows.
+    pub fn inline_gap(&self) -> Option<InlineGap> {
+        self.inline_gap.get()
+    }
+
+    /// Horizontal distance between the text origin and the visible viewport.
+    pub fn horizontal_offset(&self) -> f32 {
+        self.horizontal.get().offset
     }
 }
 
@@ -669,6 +730,7 @@ where
             drag_click: None,
             partial_scroll: 0.0,
             horizontal: Cell::default(),
+            inline_gap: Cell::default(),
             last_theme: RefCell::default(),
             highlighter: RefCell::new(Highlighter::new(
                 &self.highlighter_settings,
@@ -813,11 +875,12 @@ where
                 return;
             }
         }
+        let inline_gap = self.inline_suggestion.and_then(|_| state.inline_gap.get());
         let translate = |mut position: Point| {
             if self.horizontal_metrics.is_some() {
                 position.x = position.x.clamp(0.0, text_bounds.width) + horizontal.offset;
             }
-            position
+            inline_gap.map_or(position, |gap| gap.source_point(position))
         };
         if let Some(update) = Update::from_event(
             event,
@@ -980,6 +1043,7 @@ where
                         shell.capture_event();
                     }
 
+                    let was_focused = state.focus.is_some();
                     apply_binding(
                         binding,
                         self.content,
@@ -991,6 +1055,8 @@ where
 
                     if let Some(focus) = &mut state.focus {
                         focus.updated_at = Instant::now();
+                    } else if was_focused && let Some(message) = &self.on_unfocus {
+                        shell.publish(message());
                     }
                 }
             }
@@ -1076,6 +1142,26 @@ where
         let text_bounds = bounds.shrink(self.content_padding());
         let horizontal = self.horizontal_viewport(state, &internal.editor, text_bounds.width);
         let origin = text_bounds.position() - Vector::new(horizontal.offset, 0.0);
+        let text_size = self.text_size.unwrap_or_else(|| renderer.default_size());
+        let line_height = f32::from(self.line_height.to_absolute(text_size));
+        let inline = self.inline_suggestion.and_then(|suggestion| {
+            if !state.focus.as_ref().is_some_and(|focus| focus.is_window_focused) {
+                return None;
+            }
+            let Selection::Caret(mut caret) = internal.editor.selection() else {
+                return None;
+            };
+            if caret.y < 0.0 || caret.y >= text_bounds.height {
+                return None;
+            }
+            if let Some(x) = horizontal.caret_x() {
+                caret.x = x;
+            }
+            let height = suggestion.bytes().filter(|&byte| byte == b'\n').count() as f32 * line_height;
+            Some((suggestion, InlineGap { caret, line_height, height }))
+        });
+        let gap = inline.map(|(_, preview)| preview).filter(|gap| gap.height > 0.0);
+        state.inline_gap.set(gap);
 
         if internal.editor.is_empty() {
             if let Some(placeholder) = self.placeholder.clone() {
@@ -1098,6 +1184,25 @@ where
                     text_bounds,
                 );
             }
+        } else if let Some(gap) = gap {
+            let bottom = text_bounds.y + text_bounds.height;
+            let after = origin.y + gap.start();
+            let tail = after + gap.height;
+            if tail < bottom {
+                renderer.fill_editor(
+                    &internal.editor,
+                    origin + Vector::new(0.0, gap.height),
+                    style.value,
+                    Rectangle { y: tail, height: bottom - tail, ..text_bounds },
+                );
+            }
+            // Draw the unshifted section last so the caret adapter has its origin.
+            renderer.fill_editor(
+                &internal.editor,
+                origin,
+                style.value,
+                Rectangle { height: after.min(bottom) - text_bounds.y, ..text_bounds },
+            );
         } else {
             renderer.fill_editor(
                 &internal.editor,
@@ -1109,6 +1214,36 @@ where
 
         let translation = origin - Point::ORIGIN;
 
+        let draw_inline = |renderer: &mut Renderer, suggestion: &str, preview: InlineGap| {
+            for (row, text) in suggestion.split('\n').enumerate() {
+                let position = Point::new(
+                    origin.x + if row == 0 { preview.caret.x } else { 0.0 },
+                    origin.y + preview.caret.y + row as f32 * line_height,
+                );
+                let width = text_bounds.x + text_bounds.width - position.x;
+                if position.y >= text_bounds.y + text_bounds.height {
+                    break;
+                }
+                if width > 0.0 && !text.is_empty() {
+                    renderer.fill_text(
+                        Text {
+                            content: text.to_owned(),
+                            bounds: Size::new(width, line_height),
+                            size: text_size,
+                            line_height: self.line_height,
+                            font,
+                            align_x: text::Alignment::Default,
+                            align_y: alignment::Vertical::Top,
+                            shaping: text::Shaping::Advanced,
+                            wrapping: Wrapping::None,
+                        },
+                        position,
+                        style.placeholder,
+                        text_bounds,
+                    );
+                }
+            }
+        };
         if let Some(focus) = state.focus.as_ref() {
             match internal.editor.selection() {
                 Selection::Caret(mut position) if focus.is_cursor_visible() => {
@@ -1159,6 +1294,11 @@ where
                 }
                 Selection::Caret(_) => {}
             }
+        }
+        if let Some((suggestion, preview)) = inline {
+            renderer.with_layer(text_bounds, |renderer| {
+                draw_inline(renderer, suggestion, preview);
+            });
         }
         if let Some((track, thumb)) = horizontal.scrollbar(text_bounds) {
             for (bounds, color) in [

@@ -297,7 +297,7 @@ impl Run {
 
 impl Workspace {
     pub(super) fn publish_agent_inline_history(&self, run: &Run) {
-        let Some(update) = run.inline_update(self.window_settings.appearance.animations()) else {
+        let Some(update) = run.inline_update(self.window_settings.agent_animations()) else {
             return;
         };
         let Ok(source) = run.binding.live() else {
@@ -308,6 +308,17 @@ impl Workspace {
             && tab.incognito == source.private
         {
             pane.session.publish_agent_history(update);
+        }
+    }
+
+    pub(in crate::workspace) fn refresh_agent_inline_animations(&self) {
+        for run in self
+            .terminal_agents
+            .runs
+            .values()
+            .filter(|run| run.active())
+        {
+            self.publish_agent_inline_history(run);
         }
     }
 

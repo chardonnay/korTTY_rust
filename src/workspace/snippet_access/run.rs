@@ -1,8 +1,11 @@
 use std::fmt::{self, Write as _};
 use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use iced::widget::{button, checkbox, column, pane_grid, row, scrollable, text, text_input};
+use iced::widget::{
+    button, checkbox, column, pane_grid, row, scrollable, text, text_editor, text_input,
+};
 use iced::{Element, Length, Task, window};
 use kortty_terminal::TerminalProfile;
 use zeroize::Zeroizing;
@@ -26,13 +29,18 @@ pub(crate) struct PaletteTarget {
 }
 
 pub(crate) struct Snapshot {
+    path: PathBuf,
     snippet: Snippet,
     variables: Vec<Variable>,
 }
 
 impl Snapshot {
     fn load(id: SnippetId) -> io::Result<Arc<Self>> {
-        let library = Library::open(snippets::profile_path()?)?;
+        Self::load_at(snippets::profile_path()?, id)
+    }
+
+    fn load_at(path: PathBuf, id: SnippetId) -> io::Result<Arc<Self>> {
+        let library = Library::open(path.clone())?;
         let snippet = library.get(id).cloned().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -40,6 +48,7 @@ impl Snapshot {
             )
         })?;
         Ok(Arc::new(Self {
+            path,
             snippet,
             variables: library.variables().to_vec(),
         }))
@@ -66,6 +75,7 @@ pub(crate) enum RunMessage {
     Loaded(u64, Result<Arc<Snapshot>, String>),
     Value(u64, usize, Zeroizing<String>),
     Remember(u64, usize, bool),
+    Arguments(u64, text_editor::Action),
     Confirm(u64),
     ConfirmResolved(u64),
     Cancel(u64),
@@ -86,6 +96,7 @@ impl RunMessage {
             Self::Loaded(token, _)
             | Self::Value(token, ..)
             | Self::Remember(token, ..)
+            | Self::Arguments(token, _)
             | Self::Confirm(token)
             | Self::ConfirmResolved(token)
             | Self::Cancel(token)
@@ -102,6 +113,7 @@ pub(crate) struct RunPrompt {
     target: PaletteTarget,
     stage: Stage,
     trigger: Option<Trigger>,
+    parameterized: bool,
 }
 
 impl RunPrompt {
@@ -125,6 +137,7 @@ struct Review {
     fields: Vec<Field>,
     warning: Option<paste_protection::Warning>,
     may_remember: bool,
+    arguments: Option<text_editor::Content>,
 }
 
 struct Resolved {
@@ -134,6 +147,8 @@ struct Resolved {
     uses_clipboard: bool,
     contains_parameters: bool,
     remembered: Vec<(String, Zeroizing<String>)>,
+    arguments: Vec<Zeroizing<String>>,
+    parameterized: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -145,6 +160,10 @@ struct Field {
 impl Review {
     fn valid(&self) -> bool {
         self.fields.iter().all(|field| !field.invalid)
+            && self.arguments.as_ref().is_none_or(|content| {
+                let value = Zeroizing::new(content.text());
+                argument_lines(&value).all(valid_argument)
+            })
     }
 
     fn remembered(&self) -> Vec<(String, Zeroizing<String>)> {
@@ -166,6 +185,10 @@ impl Workspace {
         owner: window::Id,
     ) -> Option<PaletteTarget> {
         let tab = self.windows.get(&owner)?.tab()?;
+        self.snippet_run_target_for_tab(tab)
+    }
+
+    fn snippet_run_target_for_tab(&self, tab: &Tab) -> Option<PaletteTarget> {
         let panes = ordered_panes(tab);
         let index = panes
             .iter()
@@ -232,7 +255,7 @@ impl Workspace {
         if alternate {
             return self.show_snippet_manager(owner, Some(snippet));
         }
-        self.begin_snippet_run(owner, target, snippet, None)
+        self.begin_snippet_run(owner, target, snippet, None, None, false)
     }
 
     pub(in crate::workspace) fn invoke_highlight_snippet(
@@ -241,7 +264,50 @@ impl Workspace {
         target: Option<PaletteTarget>,
         trigger: Trigger,
     ) -> Task<Message> {
-        self.begin_snippet_run(owner, target, trigger.snippet, Some(trigger))
+        self.begin_snippet_run(owner, target, trigger.snippet, Some(trigger), None, false)
+    }
+
+    pub(super) fn run_library_snippet(
+        &mut self,
+        manager: window::Id,
+        snippet: SnippetId,
+        parameterized: bool,
+    ) -> Task<Message> {
+        let Some(owner) = self.snippet_source_owner(manager) else {
+            return Task::none();
+        };
+        if self.exiting
+            || self.scheduler_draining
+            || self.hosted_close_locks(manager)
+            || !self.palette_can_open(owner)
+        {
+            return self
+                .snippet_run_failure(owner, "Finish the pending dialog before running a snippet.");
+        }
+        let window = &self.windows[&owner];
+        let tab = window
+            .tab()
+            .or_else(|| {
+                window
+                    .tab_mru
+                    .iter()
+                    .find_map(|&id| window.terminal_tabs().find(|tab| tab.id == id))
+            })
+            .or_else(|| {
+                let mut tabs = window.terminal_tabs();
+                let tab = tabs.next()?;
+                tabs.next().is_none().then_some(tab)
+            });
+        let target = tab.and_then(|tab| self.snippet_run_target_for_tab(tab));
+        let path = self.snippets[&manager]
+            .window
+            .latest_library()
+            .path()
+            .to_path_buf();
+        Task::batch([
+            self.begin_snippet_run(owner, target, snippet, None, Some(path), parameterized),
+            window::gain_focus(owner),
+        ])
     }
 
     fn begin_snippet_run(
@@ -250,6 +316,8 @@ impl Workspace {
         target: Option<PaletteTarget>,
         snippet: SnippetId,
         trigger: Option<Trigger>,
+        path: Option<PathBuf>,
+        parameterized: bool,
     ) -> Task<Message> {
         let Some(target) = target else {
             return self.snippet_run_failure(owner, "Open a terminal pane to run snippets.");
@@ -271,10 +339,14 @@ impl Workspace {
                 target,
                 stage: Stage::Loading,
                 trigger,
+                parameterized,
             });
         }
         file_task(
-            move || Snapshot::load(snippet),
+            move || match path {
+                Some(path) => Snapshot::load_at(path, snippet),
+                None => Snapshot::load(snippet),
+            },
             move |result| Message::SnippetRun(owner, RunMessage::Loaded(token, result)),
         )
     }
@@ -321,7 +393,7 @@ impl Workspace {
                         "The saved snippet exceeds the one-line terminal input limit.",
                     );
                 }
-                let requirements =
+                let mut requirements =
                     resolve::copy_requirements(snapshot.snippet.content(), &snapshot.variables);
                 if requirements.clipboard && !self.clipboard.policy.read_allowed {
                     return self.snippet_run_failure(
@@ -330,7 +402,8 @@ impl Workspace {
                     );
                 }
                 let warning = self.snippet_warning(run.target.session, snapshot.snippet.content());
-                if run.trigger.is_none()
+                if !run.parameterized
+                    && run.trigger.is_none()
                     && !requirements.declared
                     && !requirements.clipboard
                     && warning.is_none()
@@ -349,17 +422,43 @@ impl Workspace {
                             uses_clipboard: false,
                             contains_parameters: false,
                             remembered: Vec::new(),
+                            arguments: Vec::new(),
+                            parameterized: false,
                         },
                         None,
                     );
                 }
-                let fields = vec![Field::default(); requirements.missing.len()];
+                let fields = if run.parameterized {
+                    let variables = resolve::referenced_variables(
+                        snapshot.snippet.content(),
+                        &snapshot.variables,
+                    );
+                    requirements.missing = variables
+                        .iter()
+                        .map(|variable| resolve::Entered {
+                            name: variable.name.clone(),
+                            value: Zeroizing::new(
+                                variable.default_value().unwrap_or_default().to_owned(),
+                            ),
+                        })
+                        .collect();
+                    variables
+                        .iter()
+                        .map(|variable| Field {
+                            remember: !tab.incognito && variable.default_value().is_some(),
+                            invalid: false,
+                        })
+                        .collect()
+                } else {
+                    vec![Field::default(); requirements.missing.len()]
+                };
                 Stage::Review(Review {
                     snapshot,
                     requirements,
                     fields,
                     warning,
                     may_remember: !tab.incognito,
+                    arguments: run.parameterized.then(text_editor::Content::new),
                 })
             }
             (Stage::Review(mut review), RunMessage::Value(_, index, value)) => {
@@ -385,6 +484,12 @@ impl Workspace {
                 }
                 Stage::Review(review)
             }
+            (Stage::Review(mut review), RunMessage::Arguments(_, action)) => {
+                if let Some(arguments) = &mut review.arguments {
+                    edit_arguments(arguments, action);
+                }
+                Stage::Review(review)
+            }
             (Stage::Review(review), RunMessage::Confirm(_)) if review.valid() => {
                 if let Err(reason) = self.snippet_target(owner, &run.target) {
                     return self.snippet_run_failure(owner, reason);
@@ -404,7 +509,7 @@ impl Workspace {
                     });
                     Stage::Clipboard(review)
                 } else {
-                    task = verify_snapshot(owner, token, run.id);
+                    task = verify_snapshot(owner, token, run.id, review.snapshot.path.clone());
                     Stage::Checking(review, None)
                 }
             }
@@ -418,7 +523,7 @@ impl Workspace {
                         "The clipboard text exceeds the 64 KiB limit.",
                     );
                 }
-                task = verify_snapshot(owner, token, run.id);
+                task = verify_snapshot(owner, token, run.id, review.snapshot.path.clone());
                 Stage::Checking(review, Some(value))
             }
             (Stage::Checking(review, clipboard), RunMessage::Checked(_, result)) => {
@@ -426,10 +531,12 @@ impl Workspace {
                     Ok(snapshot) => snapshot,
                     Err(error) => return self.snippet_run_failure(owner, error),
                 };
-                if snapshot.snippet != review.snapshot.snippet
+                if !snapshot
+                    .snippet
+                    .same_source_revision(&review.snapshot.snippet)
                     || snapshot.variables != review.snapshot.variables
                 {
-                    return self.snippet_run_failure(owner, "The saved snippet or variables changed. Open the palette and review them again.");
+                    return self.snippet_run_failure(owner, "The saved snippet or variables changed. Open the snippet again to review them.");
                 }
                 let source = match snapshot.expand(
                     &review.requirements.missing,
@@ -438,6 +545,12 @@ impl Workspace {
                     Ok(source) => source,
                     Err(reason) => return self.snippet_run_failure(owner, reason),
                 };
+                let arguments = review.arguments.as_ref().map_or_else(Vec::new, |content| {
+                    let text = Zeroizing::new(content.text());
+                    argument_lines(&text)
+                        .map(|line| Zeroizing::new(line.to_owned()))
+                        .collect()
+                });
                 return self.send_or_review_resolved(
                     owner,
                     run.target,
@@ -448,6 +561,8 @@ impl Workspace {
                         uses_clipboard: review.requirements.clipboard,
                         contains_parameters: review.requirements.declared,
                         remembered: review.remembered(),
+                        arguments,
+                        parameterized: run.parameterized,
                     },
                     run.trigger,
                 );
@@ -455,8 +570,9 @@ impl Workspace {
             (Stage::Resolved(mut resolved, warning), RunMessage::ConfirmResolved(_)) => {
                 resolved.accepted = resolved.accepted.with(warning);
                 let id = run.id;
+                let path = resolved.snapshot.path.clone();
                 task = file_task(
-                    move || Snapshot::load(id),
+                    move || Snapshot::load_at(path, id),
                     move |result| {
                         Message::SnippetRun(owner, RunMessage::ResolvedChecked(token, result))
                     },
@@ -468,10 +584,12 @@ impl Workspace {
                     Ok(snapshot) => snapshot,
                     Err(error) => return self.snippet_run_failure(owner, error),
                 };
-                if snapshot.snippet != resolved.snapshot.snippet
+                if !snapshot
+                    .snippet
+                    .same_source_revision(&resolved.snapshot.snippet)
                     || snapshot.variables != resolved.snapshot.variables
                 {
-                    return self.snippet_run_failure(owner, "The saved snippet or variables changed. Open the palette and review them again.");
+                    return self.snippet_run_failure(owner, "The saved snippet or variables changed. Open the snippet again to review them.");
                 }
                 return self.send_or_review_resolved(owner, run.target, resolved, run.trigger);
             }
@@ -490,7 +608,12 @@ impl Workspace {
         let run = self.windows.get(&owner)?.pending_snippet_run.as_ref()?;
         let token = run.token;
         let (title, _) = self.palette_snippet_presentation(owner, Some(&run.target));
-        let mut body = column![text("Run Snippet").size(20), text(title)].spacing(9);
+        let heading = if run.parameterized {
+            "Run Snippet with Parameters"
+        } else {
+            "Run Snippet"
+        };
+        let mut body = column![text(heading).size(20), text(title)].spacing(9);
         match &run.stage {
             Stage::Review(review) => {
                 body = body.push(text(review.snapshot.snippet.name()));
@@ -555,6 +678,20 @@ impl Workspace {
                 if !review.fields.is_empty() {
                     body = body.push(scrollable(fields).height(Length::Fill));
                 }
+                if let Some(arguments) = &review.arguments {
+                    body = body.push(text("Positional arguments"));
+                    body = body.push(
+                        text_editor(arguments)
+                            .height(86)
+                            .placeholder("One argument per line")
+                            .on_action(move |action| RunMessage::Arguments(token, action)),
+                    );
+                    if !argument_lines(&Zeroizing::new(arguments.text())).all(valid_argument) {
+                        body = body.push(
+                            text("Arguments cannot contain terminal control characters.").size(13),
+                        );
+                    }
+                }
                 body = body.push(
                     row![
                         button("Run")
@@ -572,7 +709,7 @@ impl Workspace {
                     .push(
                         text(format!("{} bytes of resolved text", resolved.source.len())).size(13),
                     );
-                if resolved.contains_parameters {
+                if resolved.contains_parameters || !resolved.arguments.is_empty() {
                     body = body.push(
                         text(
                             "Text preview is hidden because it contains expanded parameter values.",
@@ -710,6 +847,7 @@ impl Workspace {
                     token,
                     id: resolved.snapshot.snippet.id(),
                     target,
+                    parameterized: resolved.parameterized,
                     stage: Stage::Resolved(resolved, warning),
                     trigger,
                 });
@@ -730,13 +868,20 @@ impl Workspace {
             snapshot,
             source,
             remembered,
+            arguments,
+            parameterized,
             ..
         } = resolved;
         let snippet = &snapshot.snippet;
         let Some(pane) = self.sessions.get_mut(&target.session) else {
             return self.snippet_run_failure(owner, "The selected terminal pane closed.");
         };
-        let command = match command_line(snippet, &source, cfg!(windows) && pane.ssh.is_none()) {
+        let command = match command_line(
+            snippet,
+            &source,
+            &arguments,
+            cfg!(windows) && pane.ssh.is_none(),
+        ) {
             Ok(command) => command,
             Err(reason) => return self.snippet_run_failure(owner, reason),
         };
@@ -767,6 +912,9 @@ impl Workspace {
             owner,
             format!("Sent {} to {}.", snippet.name(), target.label),
         );
+        if !incognito {
+            self.record_snippet_use(owner, snapshot.path.clone(), snippet.id());
+        }
         if incognito || remembered.is_empty() {
             return window::gain_focus(owner);
         }
@@ -774,11 +922,12 @@ impl Workspace {
             window::gain_focus(owner),
             file_task(
                 move || {
-                    let mut library = Library::open(snippets::profile_path()?)?;
-                    library.remember_missing_defaults(
+                    let mut library = Library::open(snapshot.path.clone())?;
+                    library.remember_defaults(
                         remembered
                             .iter()
                             .map(|(name, value)| (name.as_str(), value.as_str())),
+                        parameterized.then_some(snapshot.variables.as_slice()),
                     )
                 },
                 move |result| match result {
@@ -802,9 +951,9 @@ impl Workspace {
     }
 }
 
-fn verify_snapshot(owner: window::Id, token: u64, id: SnippetId) -> Task<Message> {
+fn verify_snapshot(owner: window::Id, token: u64, id: SnippetId, path: PathBuf) -> Task<Message> {
     file_task(
-        move || Snapshot::load(id),
+        move || Snapshot::load_at(path, id),
         move |result| Message::SnippetRun(owner, RunMessage::Checked(token, result)),
     )
 }
@@ -827,6 +976,7 @@ fn ordered_panes(tab: &Tab) -> Vec<pane_grid::Pane> {
 fn command_line(
     snippet: &Snippet,
     source: &str,
+    arguments: &[Zeroizing<String>],
     native_windows_shell: bool,
 ) -> Result<Vec<u8>, &'static str> {
     if source.trim().is_empty() {
@@ -879,7 +1029,24 @@ fn command_line(
         }
         line.push_str("' | ");
         line.push_str(interpreter);
+        if !arguments.is_empty() {
+            line.push_str(if interpreter == "bash" {
+                " -s --"
+            } else {
+                " -"
+            });
+            for argument in arguments {
+                if !valid_argument(argument) {
+                    return Err("Arguments cannot contain terminal control characters.");
+                }
+                line.push(' ');
+                shell_quote(&mut line, argument);
+            }
+        }
     } else {
+        if !arguments.is_empty() {
+            return Err("Positional arguments require a Bash, Python, Perl or Ruby snippet.");
+        }
         let source = source.trim_end_matches(['\r', '\n']);
         if source.contains(['\r', '\n', '\t']) {
             return Err("Running multiple lines requires a supported snippet language.");
@@ -891,6 +1058,44 @@ fn command_line(
     }
     line.push('\r');
     Ok(std::mem::take(&mut *line).into_bytes())
+}
+
+fn argument_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.split([
+        '\r', '\n', '\u{B}', '\u{C}', '\u{85}', '\u{2028}', '\u{2029}',
+    ])
+    .filter(|line| !line.trim().is_empty())
+}
+
+fn valid_argument(text: &str) -> bool {
+    !text.chars().any(|ch| {
+        ch.is_control() || matches!(ch, '\u{061c}' | '\u{200e}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{2028}'..='\u{2029}')
+    })
+}
+
+fn edit_arguments(content: &mut text_editor::Content, action: text_editor::Action) {
+    let added = match &action {
+        text_editor::Action::Edit(text_editor::Edit::Paste(text)) => text.len(),
+        text_editor::Action::Edit(text_editor::Edit::Insert(ch)) => ch.len_utf8(),
+        text_editor::Action::Edit(text_editor::Edit::Enter) => 1,
+        _ => 0,
+    };
+    if added != 0 {
+        let source = Zeroizing::new(content.text());
+        let selection_size = content
+            .selection()
+            .map(Zeroizing::new)
+            .map_or(0, |text| text.len());
+        if source
+            .len()
+            .saturating_sub(selection_size)
+            .saturating_add(added)
+            > MAX_WIRE_BYTES
+        {
+            return;
+        }
+    }
+    content.perform(action);
 }
 
 fn shell_quote(output: &mut String, value: &str) {

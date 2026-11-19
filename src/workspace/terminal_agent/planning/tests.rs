@@ -118,10 +118,25 @@ fn fixture(
     endpoint: SocketAddr,
     context_limit: u32,
 ) -> (Workspace, window::Id, crate::session::SessionId) {
+    fixture_with_model(root, endpoint, context_limit, "test")
+}
+
+fn fixture_with_model(
+    root: &Path,
+    endpoint: SocketAddr,
+    context_limit: u32,
+    model: &str,
+) -> (Workspace, window::Id, crate::session::SessionId) {
+    let model_mode = if model.is_empty() {
+        "server-default"
+    } else {
+        "manual"
+    };
     let config: Configuration = serde_json::from_value(json!({
         "profiles": {
             "profiles": [{"id": 1, "name": "Planning fixture", "endpoint": endpoint.to_string(),
-                "model": "test", "selection_limit": context_limit, "max_output_tokens": OUTPUT_LIMIT,
+                "model": model, "model_mode": model_mode, "selection_limit": context_limit,
+                "max_output_tokens": OUTPUT_LIMIT,
                 "usage_budget": {"token_limit": 12000}}],
             "default": 1, "last_id": 1
         },
@@ -149,6 +164,189 @@ fn fixture(
     pane.frame = selection_test_frame(pane.frame.screen.clone());
     Arc::get_mut(&mut pane.frame).unwrap().status = Status::Running;
     (workspace, owner, source)
+}
+
+#[test]
+fn planning_reviews_loopback_server_selection_before_sending_without_a_model() {
+    let _exclusive = exclusive_run();
+    let (listener, _) = listener();
+    let endpoint = listener.local_addr().unwrap();
+    let profile = Profile::new();
+    let root = profile.0.canonicalize().unwrap();
+    let (mut workspace, owner, source) = fixture_with_model(&root, endpoint, CONTEXT_LIMIT, "");
+    let id = open_plan(&mut workspace, owner, source);
+    let choice = workspace.terminal_agents.runs[&id].profiles[0].clone();
+    no_task(workspace.update_terminal_agent(id, RunMessage::Profile(choice)));
+    no_task(workspace.update_terminal_agent(
+        id,
+        RunMessage::Goal("Outline a documentation update".into()),
+    ));
+    let start = workspace.update_terminal_agent(id, RunMessage::Start);
+    finish_review(&mut workspace, start);
+    let (epoch, [system, input]) = reviewed_messages(&workspace, id);
+    let destination = endpoint.to_string();
+    let review = workspace.terminal_agents.runs[&id]
+        .model_review
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        review.reviewed_destination(),
+        Some((destination.as_str(), "Server selects the model"))
+    );
+    no_model_request(&listener);
+
+    let worker = std::thread::spawn(move || {
+        let mut socket = accept(&listener);
+        let payload = request(&mut socket);
+        assert!(payload.get("model").is_none());
+        assert_eq!(payload["messages"][0]["content"], system);
+        assert_eq!(payload["messages"][1]["content"], input);
+        let content = json!({"status":"questions","summary":"Clarify the audience",
+            "userMessage":"Choose an audience","questions":[{"id":"q1","question":"Who will read it?",
+            "options":["Users","Maintainers"],"allowCustomAnswer":false}]});
+        let body = json!({"choices":[{"message":{"content":content.to_string()}}]}).to_string();
+        socket
+            .get_mut()
+            .write_all(fixture_http_response("200 OK", "", &body).as_bytes())
+            .unwrap();
+    });
+    let task = send_review(&mut workspace, id, epoch);
+    finish(&mut workspace, task, owner);
+    worker.join().unwrap();
+    let run = &workspace.terminal_agents.runs[&id];
+    assert!(
+        run.phase == Phase::PlanQuestions && run.target.is_none(),
+        "{}",
+        run.notice
+    );
+}
+
+fn configure_planning_https(
+    workspace: &mut Workspace,
+    root: &Path,
+    endpoint: &str,
+    allow_planning: bool,
+    credential_env: &str,
+) {
+    let previous = Configuration::load_fixture_from(root).unwrap();
+    let mut draft = serde_json::to_value(&previous).unwrap();
+    draft["profiles"]["profiles"][0] = json!({
+        "id": 1, "name": "Planning HTTPS fixture", "connection_mode": "remote-open-ai-exact",
+        "endpoint": endpoint, "model_mode": "server-default", "trusted_remote_endpoint": true,
+        "reviewed_agent_https": true, "reviewed_planning_https": allow_planning,
+        "credential_env": credential_env, "selection_limit": CONTEXT_LIMIT,
+        "max_output_tokens": OUTPUT_LIMIT, "usage_budget": {"token_limit": 12000}
+    });
+    let config: Configuration = serde_json::from_value(draft).unwrap();
+    config.save_fixture_at(root, &previous).unwrap();
+    workspace.set_test_ai_configuration(Configuration::load_fixture_from(root).unwrap());
+}
+
+fn review_planning_https(
+    workspace: &mut Workspace,
+    owner: window::Id,
+    source: crate::session::SessionId,
+    endpoint: &str,
+    goal: String,
+) -> (window::Id, u64, [String; 2]) {
+    let id = open_plan(workspace, owner, source);
+    let choice = workspace.terminal_agents.runs[&id].profiles[0].clone();
+    no_task(workspace.update_terminal_agent(id, RunMessage::Profile(choice)));
+    no_task(workspace.update_terminal_agent(id, RunMessage::Goal(goal)));
+    let start = workspace.update_terminal_agent(id, RunMessage::Start);
+    finish_review(workspace, start);
+    let (epoch, messages) = reviewed_messages(workspace, id);
+    let review = workspace.terminal_agents.runs[&id]
+        .model_review
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        review.reviewed_destination(),
+        Some((endpoint, "Server selects the model"))
+    );
+    assert_eq!(review.send_label(), "Send reviewed HTTPS request");
+    (id, epoch, messages)
+}
+
+#[test]
+fn planning_https_requires_its_own_saved_permission_and_rechecks_revocation() {
+    let scratch = Profile::new();
+    let root = scratch.0.canonicalize().unwrap();
+    let (mut workspace, owner, source) =
+        fixture(&root, "127.0.0.1:12345".parse().unwrap(), CONTEXT_LIMIT);
+    let endpoint = "https://example.invalid/tenant/v1/planning/";
+    configure_planning_https(&mut workspace, &root, endpoint, false, "");
+    assert!(
+        workspace
+            .build_agent(source, Mode::Plan, None, None, false)
+            .is_err()
+    );
+    assert!(
+        workspace
+            .build_agent(source, Mode::Ask, None, None, false)
+            .is_ok()
+    );
+
+    configure_planning_https(&mut workspace, &root, endpoint, true, "");
+    let (id, epoch, _) = review_planning_https(
+        &mut workspace,
+        owner,
+        source,
+        endpoint,
+        "Outline a documentation update".into(),
+    );
+    configure_planning_https(&mut workspace, &root, endpoint, false, "");
+    let task = send_review(&mut workspace, id, epoch);
+    finish_review(&mut workspace, task);
+    let run = &workspace.terminal_agents.runs[&id];
+    assert!(
+        run.phase == Phase::Blocked && run.target.is_none(),
+        "{}",
+        run.notice
+    );
+    assert!(run.notice.contains("changed"), "{}", run.notice);
+}
+
+#[test]
+#[ignore = "requires the private planning HTTPS fixture and its dedicated CA"]
+fn planning_https_transmits_only_the_exact_masked_review_without_a_model() {
+    use crate::local_ai::test_support::with_https_fixture_ca;
+
+    let _exclusive = exclusive_run();
+    let endpoint = std::env::var("KORTTY_TEST_HTTPS_APPLY_URL").unwrap();
+    let ca = std::fs::read(std::env::var_os("KORTTY_TEST_HTTPS_APPLY_CA_DER").unwrap()).unwrap();
+    let expected = std::env::var_os("KORTTY_TEST_HTTPS_APPLY_EXPECTED").unwrap();
+    let token = std::env::var("KORTTY_TEST_HTTPS_APPLY_KEY").unwrap();
+    let scratch = Profile::new();
+    let root = scratch.0.canonicalize().unwrap();
+    let (mut workspace, owner, source) =
+        fixture(&root, "127.0.0.1:12345".parse().unwrap(), CONTEXT_LIMIT);
+    configure_planning_https(
+        &mut workspace,
+        &root,
+        &endpoint,
+        true,
+        "KORTTY_TEST_HTTPS_APPLY_KEY",
+    );
+    let (id, epoch, messages) = review_planning_https(
+        &mut workspace,
+        owner,
+        source,
+        &endpoint,
+        format!("Outline a documentation update with reference {token}"),
+    );
+    assert!(!messages[1].contains(&token));
+    assert!(messages[1].contains("reference ***"));
+    std::fs::write(expected, serde_json::to_vec(&messages).unwrap()).unwrap();
+
+    let task = with_https_fixture_ca(ca, || send_review(&mut workspace, id, epoch));
+    finish(&mut workspace, task, owner);
+    let run = &workspace.terminal_agents.runs[&id];
+    assert!(
+        run.phase == Phase::PlanQuestions && run.target.is_none(),
+        "{}",
+        run.notice
+    );
 }
 
 fn reject_json_format(listener: &TcpListener) -> serde_json::Value {

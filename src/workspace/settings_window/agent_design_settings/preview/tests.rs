@@ -9,6 +9,33 @@ use iced_runtime::{UserInterface, user_interface::Cache};
 use super::*;
 
 #[test]
+fn previewing_one_module_leaves_the_saved_roles_and_default_intact() {
+    use super::super::Module;
+    use crate::terminal_agent::design::{Catalog, Preset, Status};
+
+    let mut editor = super::super::Editor::default();
+    let mut catalog = Catalog::default();
+    let mut preset = Preset::Standard;
+    let saved = catalog.layout(preset.id()).unwrap();
+    editor.update(
+        &mut catalog,
+        &mut preset,
+        Edit::Preview(Some(Module::Status(Status::Minimap))),
+    );
+    assert_eq!(
+        editor.preview_layout(&catalog, preset),
+        Layout {
+            status: Status::Minimap,
+            ..saved
+        }
+    );
+    assert_eq!(catalog.layout(preset.id()).unwrap(), saved);
+    assert_eq!(catalog.default_id(preset), Preset::Standard.id());
+    editor.update(&mut catalog, &mut preset, Edit::Preview(None));
+    assert_eq!(editor.preview_layout(&catalog, preset), saved);
+}
+
+#[test]
 fn changing_builtin_default_replays_only_when_the_displayed_design_changes() {
     use crate::terminal_agent::design::{Catalog, Preset};
 
@@ -88,6 +115,9 @@ fn canvas_clock_publishes_only_a_scoped_demo_tick_and_stops_while_paused() {
         token: demo.token(),
         playing: true,
         owner,
+        reduced_motion: false,
+        cursor_review: false,
+        deadline: None,
     };
     let mut clock = canvas::Clock::default();
     let now = Instant::now();
@@ -144,6 +174,61 @@ fn canvas_clock_publishes_only_a_scoped_demo_tick_and_stops_while_paused() {
     );
 }
 
+#[test]
+fn reduced_motion_skips_intermediate_frames_and_keeps_demo_timing() {
+    let demo = Demo::default();
+    let mut preview = canvas::Preview {
+        model: demo.model(),
+        style: Some(inline::Style::Inline),
+        token: demo.token(),
+        playing: true,
+        owner: window::Id::unique(),
+        reduced_motion: true,
+        cursor_review: false,
+        deadline: None,
+    };
+    let bounds = Rectangle::with_size(Size::new(640.0, 320.0));
+    let mut clock = canvas::Clock::default();
+    let now = Instant::now();
+    let redraw = |preview: &canvas::Preview, clock: &mut canvas::Clock, now| {
+        preview
+            .update(
+                clock,
+                &Event::Window(window::Event::RedrawRequested(now)),
+                bounds,
+                mouse::Cursor::Unavailable,
+            )
+            .unwrap()
+            .into_inner()
+    };
+    let next = now + Duration::from_millis(1500);
+    assert_eq!(
+        redraw(&preview, &mut clock, now).1,
+        window::RedrawRequest::At(next)
+    );
+    assert!(matches!(
+        redraw(&preview, &mut clock, next).0,
+        Some(Desktop::Settings(Message::AgentDesignCatalog(
+            _,
+            Edit::Demo(Action::Tick(_))
+        )))
+    ));
+
+    preview.playing = false;
+    preview.deadline = Some(next);
+    assert_eq!(
+        redraw(&preview, &mut clock, now).1,
+        window::RedrawRequest::At(next)
+    );
+    assert!(matches!(
+        redraw(&preview, &mut clock, next).0,
+        Some(Desktop::Settings(Message::AgentDesignCatalog(
+            _,
+            Edit::Demo(Action::StatusDeadline)
+        )))
+    ));
+}
+
 #[derive(Default)]
 struct ReplayBounds(Option<Rectangle>);
 
@@ -163,7 +248,7 @@ fn native_replay_button_emits_only_an_isolated_settings_demo_event() {
     let demo = Demo::default();
     let owner = window::Id::unique();
     let layout = Layout {
-        history: History::Focus,
+        history: super::super::History::Focus,
         ..Layout::default()
     };
     let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
@@ -172,6 +257,8 @@ fn native_replay_button_emits_only_an_isolated_settings_demo_event() {
             &demo,
             layout,
             super::super::DockPreferences::default(),
+            6,
+            false,
             owner,
         ),
         Size::new(760.0, 700.0),

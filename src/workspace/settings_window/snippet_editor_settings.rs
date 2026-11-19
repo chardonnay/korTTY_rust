@@ -1,6 +1,7 @@
 use std::fmt;
 use std::sync::{Arc, Weak};
 
+use iced::keyboard::{Key, Modifiers, key::Named};
 use iced::widget::{button, checkbox, column, container, pick_list, row, text, text_input};
 use iced::{Alignment, Element, Task, window};
 
@@ -12,6 +13,7 @@ use crate::snippet_analysis::store::{
 use crate::snippet_window::ai_assist::{ALTERNATIVE_COUNTS, DEFAULT_ALTERNATIVE_COUNT};
 use crate::snippet_window::appearance::{MAX_FONT_SIZE, Preferences};
 use crate::terminal_theme::{Rgb, installed_families, installed_font};
+use crate::workspace::SnippetCompletionChord;
 
 use super::{Desktop, Dialog, Message, Setting, highlighted};
 
@@ -50,6 +52,8 @@ pub(super) struct Editor {
     cursor: Option<String>,
     content_limit: Option<String>,
     history_preview: Option<HistoryPreview>,
+    recording_shortcut: bool,
+    shortcut_problem: Option<&'static str>,
 }
 
 enum HistoryPreview {
@@ -59,6 +63,52 @@ enum HistoryPreview {
 }
 
 impl Editor {
+    pub(super) fn recording_shortcut(&self) -> bool {
+        self.recording_shortcut
+    }
+
+    pub(super) fn stop_recording_shortcut(&mut self) {
+        self.recording_shortcut = false;
+        self.shortcut_problem = None;
+    }
+
+    pub(super) fn record_shortcut(&mut self) {
+        self.recording_shortcut = true;
+        self.shortcut_problem = None;
+    }
+
+    pub(super) fn capture_shortcut(
+        &mut self,
+        saved: &mut Option<SnippetCompletionChord>,
+        key: &Key,
+        modifiers: Modifiers,
+    ) -> bool {
+        if !self.recording_shortcut {
+            return false;
+        }
+        match key {
+            Key::Named(Named::Escape) => self.stop_recording_shortcut(),
+            Key::Named(
+                Named::Alt
+                | Named::AltGraph
+                | Named::Control
+                | Named::Shift
+                | Named::Meta
+                | Named::Super,
+            ) => {}
+            _ => match SnippetCompletionChord::capture(key, modifiers) {
+                Some(chord) => {
+                    *saved = Some(chord);
+                    self.stop_recording_shortcut();
+                }
+                None => {
+                    self.shortcut_problem = Some("This key cannot be used for snippet completion.")
+                }
+            },
+        }
+        true
+    }
+
     pub(super) fn update_content_limit(&mut self, saved: &mut Option<usize>, mut value: String) {
         if value.len() <= 16
             && let Ok(limit) = value.parse::<usize>()
@@ -373,6 +423,21 @@ pub(super) fn view(dialog: &Dialog, managed_content_limit: Option<usize>) -> Ele
                 move |count| Desktop::Settings(Message::SnippetAlternativeCount(id, count)),
             ),
         ].align_y(Alignment::Center).spacing(8)),
+        highlighted(dialog, Setting::SnippetCompletionShortcut, column![
+            row![
+                text(Setting::SnippetCompletionShortcut.label()),
+                text(dialog.draft.preferences.snippet_completion_shortcut.unwrap_or_default().to_string()),
+                button(if editor.recording_shortcut { "Press a shortcut…" } else { "Record…" })
+                    .on_press(Desktop::Settings(Message::RecordSnippetCompletionShortcut(id))),
+                button("Reset").on_press(Desktop::Settings(Message::ResetSnippetCompletionShortcut(id))),
+            ].align_y(Alignment::Center).spacing(8).wrap(),
+            editor.shortcut_problem.map(|problem| text(problem).size(13).style(text::danger)),
+        ].spacing(4)),
+        highlighted(dialog, Setting::SnippetAiAdditionalInstructions,
+            checkbox(dialog.draft.preferences.snippet_ai_additional_instructions())
+                .label(Setting::SnippetAiAdditionalInstructions.label())
+                .on_toggle(move |enabled| Desktop::Settings(Message::SnippetAiAdditionalInstructions(id, enabled)))
+        ),
         highlighted(dialog, Setting::SnippetAnalysisContentLimit, column![
             row![
                 text(Setting::SnippetAnalysisContentLimit.label()),

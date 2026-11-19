@@ -10,7 +10,7 @@ use crate::session::SessionId;
 
 use super::{
     Action, Chat, Desktop, MAX_CHATS, MAX_CONTEXT_BYTES, MAX_QUESTION_BYTES, Redactor,
-    SAVED_PROFILE_UNAVAILABLE, TITLE, Turn, Workspace, mask, metadata, store, tool_tabs,
+    SAVED_PROFILE_UNAVAILABLE, TITLE, Turn, Workspace, mask, metadata, store,
 };
 
 const MAX_STEPS: usize = 24;
@@ -429,12 +429,7 @@ impl Workspace {
         chat.source_stream = Some(origin.stream);
         chat.include_memory = false;
         let staged = chat.stage_agent_question(question);
-        let id = window::Id::unique();
-        self.terminal_chats.insert(id, chat);
-        Ok((
-            self.host_tool(origin.owner, tool_tabs::Kind::AiChat, id),
-            staged,
-        ))
+        Ok((self.host_terminal_chat(origin.owner, chat), staged))
     }
 }
 

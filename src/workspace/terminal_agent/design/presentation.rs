@@ -1,8 +1,39 @@
 //! Per-run presentation state; never grants execution authority.
 
 use std::cell::Cell;
+use std::time::{Duration, Instant};
 
 mod usage;
+
+#[derive(Default)]
+pub(super) struct StatusVisibility {
+    finished_at: Option<Instant>,
+    manual: Option<bool>,
+}
+
+impl StatusVisibility {
+    pub(super) fn finished(&mut self, now: Instant) {
+        self.finished_at = Some(now);
+        if self.manual == Some(true) {
+            self.manual = None;
+        }
+    }
+
+    pub(super) fn deadline(&self, seconds: u8) -> Option<Instant> {
+        let finished = self.finished_at?;
+        (seconds > 0 && self.manual.is_none())
+            .then(|| finished + Duration::from_secs(seconds.into()))
+    }
+
+    pub(super) fn visible(&self, seconds: u8, now: Instant) -> bool {
+        self.manual
+            .unwrap_or_else(|| self.deadline(seconds).is_none_or(|deadline| now < deadline))
+    }
+
+    pub(super) fn toggle(&mut self, seconds: u8, now: Instant) {
+        self.manual = Some(!self.visible(seconds, now));
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Message {
@@ -44,15 +75,29 @@ impl Dock {
 #[derive(Default)]
 pub(in crate::workspace::terminal_agent) struct Presentation {
     pub(super) dock_resize: Option<(super::DockPreferences, u16)>,
+    pub(in crate::workspace::terminal_agent) activity: super::activity::Panel,
     pub(in crate::workspace::terminal_agent) pip: super::pip::Panel,
     pub(in crate::workspace::terminal_agent) model_usage: usage::Usage,
     first: usize,
     selected: Option<usize>,
     pub(in crate::workspace::terminal_agent) drawer: bool,
     pub(super) dock: Cell<Dock>,
+    pub(super) status_visibility: StatusVisibility,
 }
 
 impl Presentation {
+    pub(in crate::workspace::terminal_agent) fn finished(&mut self, now: Instant) {
+        self.status_visibility.finished(now);
+    }
+
+    pub(in crate::workspace::terminal_agent) fn load_activity(
+        &mut self,
+        settings: &crate::workspace::tab_titles::WindowSettings,
+    ) {
+        self.activity = super::activity::Panel::load(settings);
+        self.pip.folded = self.activity.collapsed;
+    }
+
     pub(in crate::workspace::terminal_agent) fn review(&mut self, phase: super::super::Phase) {
         use super::super::Phase;
         if matches!(
@@ -115,6 +160,27 @@ impl Presentation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_hides_at_its_deadline_and_can_be_shown_until_the_next_run() {
+        let now = Instant::now();
+        let mut status = StatusVisibility::default();
+        assert!(status.visible(6, now));
+        assert_eq!(status.deadline(6), None);
+        status.finished(now);
+        let deadline = now + Duration::from_secs(6);
+        assert_eq!(status.deadline(6), Some(deadline));
+        assert!(status.visible(6, deadline - Duration::from_millis(1)));
+        assert!(!status.visible(6, deadline));
+        assert!(status.visible(0, deadline));
+        assert_eq!(status.deadline(0), None);
+        status.toggle(6, deadline);
+        assert!(status.visible(6, deadline + Duration::from_secs(60)));
+        assert_eq!(status.deadline(6), None);
+        status.toggle(6, deadline);
+        assert!(!status.visible(0, deadline));
+        assert!(StatusVisibility::default().visible(6, deadline));
+    }
 
     #[test]
     fn delayed_selection_never_selects_a_different_evicted_activity() {

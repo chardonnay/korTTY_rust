@@ -664,6 +664,154 @@ fn automatic_journal_summary_streams_progress_only_and_pauses_when_policy_is_rev
 }
 
 #[test]
+fn automatic_journal_summary_persists_local_server_selection_and_omits_model() {
+    use crate::ai_manager::Configuration;
+
+    let _exclusive = exclusive_run();
+    let (endpoint, _) = listener();
+    let address = endpoint.local_addr().unwrap();
+    let (scratch, mut workspace, capture, source) = seeded(address);
+    let root = scratch.0.canonicalize().unwrap();
+    let configured = |address: SocketAddr| -> Configuration {
+        serde_json::from_value(json!({
+            "profiles": {
+                "profiles": [{"id":1,"name":"Server-selected fixture","endpoint":address.to_string(),
+                    "connection_mode":"external","model":"","model_mode":"server-default"}],
+                "last_id":1
+            },
+            "local":{"roles":[null,null,null,1]}
+        }))
+        .unwrap()
+    };
+    configured(address)
+        .save_fixture_at(&root, &Configuration::default())
+        .unwrap();
+    workspace.set_test_ai_configuration(Configuration::load_fixture_from(&root).unwrap());
+    assert!(workspace.manager_journal_profile_ready());
+    workspace
+        .journal_summaries
+        .queue
+        .set_preferences(session_journal::summary_queue::Preferences {
+            enabled: true,
+            ..Default::default()
+        })
+        .unwrap();
+    workspace.register_journal_summaries(
+        Arc::clone(&capture),
+        ConnectionConfig {
+            ai_summaries: true,
+            ..Default::default()
+        },
+        Arc::new(Redactor::for_journal(
+            Secrets::default().seal().unwrap(),
+            Default::default(),
+        )),
+        "Build fixture".into(),
+    );
+    let reopened = Queue::load(&root).unwrap();
+    let receipt = reopened.pending().front().unwrap();
+    let choice = receipt.profile.as_ref().unwrap();
+    assert!(choice.pins_server_default());
+    assert_eq!(choice.destination, address.to_string());
+    assert!(
+        workspace
+            .journal_summary_profile(Some(choice), false)
+            .unwrap()
+            .uses_server_default_model()
+    );
+    assert!(
+        workspace
+            .journal_summary_profile(Some(choice), true)
+            .is_none()
+    );
+
+    finish_capture(&capture);
+    let server = thread::spawn(move || {
+        let mut check = accept(&endpoint);
+        let body = request(&mut check);
+        assert!(body.get("model").is_none());
+        assert_eq!(body["stream"], false);
+        check
+            .get_mut()
+            .write_all(fixture_response("200 OK", "", r#"{"ready":true}"#).as_bytes())
+            .unwrap();
+        drop(check);
+
+        let mut stream = accept(&endpoint);
+        let body = request(&mut stream);
+        assert!(body.get("model").is_none());
+        assert_eq!(body["stream"], true);
+        assert!(
+            body["messages"][1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("build.sh")
+        );
+        stream
+            .get_mut()
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+        let content =
+            r#"{"title":"Checked build","summary":"The build exited 2.","keywords":["build.sh"]}"#;
+        writeln!(
+            stream.get_mut(),
+            "data: {}\n",
+            json!({"choices":[{"index":0,"delta":{"content":content},"finish_reason":"stop"}]})
+        )
+        .unwrap();
+        stream.get_mut().write_all(b"data: [DONE]\n\n").unwrap();
+        drop(stream);
+
+        let mut closing = accept(&endpoint);
+        let body = request(&mut closing);
+        assert!(body.get("model").is_none());
+        closing.get_mut().write_all(fixture_response("200 OK", "", r#"{"title":"Closing fixture","summary":"The build was checked.","keywords":[]}"#).as_bytes()).unwrap();
+    });
+    let task = workspace.update(Desktop::JournalSummary(Worker::Pulse));
+    let mut actions = iced_runtime::task::into_stream(task).unwrap();
+    finish_pass(&mut workspace, &mut actions);
+    server.join().unwrap();
+    assert!(workspace.journal_summaries.queue.pending().is_empty());
+    assert!(
+        source
+            .read(None)
+            .unwrap()
+            .unwrap()
+            .timeline
+            .iter()
+            .any(|entry| entry.kind == "SESSION_SUMMARY")
+    );
+
+    let original = Configuration::load_fixture_from(&root).unwrap();
+    let changed = if address.port() == 8000 { 8001 } else { 8000 };
+    configured(SocketAddr::new(address.ip(), changed))
+        .save_fixture_at(&root, &original)
+        .unwrap();
+    workspace.set_test_ai_configuration(Configuration::load_fixture_from(&root).unwrap());
+    assert!(
+        workspace
+            .journal_summary_profile(Some(choice), false)
+            .is_none()
+    );
+    workspace
+        .journal_summaries
+        .queue
+        .enqueue([receipt.clone()])
+        .unwrap();
+    let _ = workspace.start_next_journal_summary();
+    assert!(workspace.journal_summaries.active.is_none());
+    assert!(
+        workspace
+            .journal_summaries
+            .paused
+            .contains(&receipt.generation)
+    );
+    assert_eq!(Queue::load(&root).unwrap().pending().front(), Some(receipt));
+}
+
+#[test]
 fn journal_summary_hands_a_closed_capture_to_the_saved_pass_after_a_live_write_failure() {
     let _exclusive = exclusive_run();
     let (endpoint, _) = listener();

@@ -101,6 +101,7 @@ impl Workspace {
 
     pub(super) fn start_snippet_knowledge(&mut self, id: window::Id) -> Task<Message> {
         let config = self.ai_configuration();
+        let instructions_enabled = self.window_settings.snippet_ai_additional_instructions();
         let token = self.allocate();
         let Some(surface) = self.snippets.get_mut(&id) else {
             return Task::none();
@@ -111,7 +112,7 @@ impl Workspace {
         let State::Review(review) = &page.state else {
             return Task::none();
         };
-        if !review.matches_snapshot(&surface.window, page, config.as_ref()) {
+        if !review.matches_snapshot(&surface.window, page, config.as_ref(), instructions_enabled) {
             page.state = State::Ready;
             page.status =
                 Some("The source or AI settings changed. Review the request again.".into());
@@ -169,6 +170,7 @@ impl Workspace {
         result: Result<Arc<RetrievedKnowledge>, String>,
     ) -> Task<Message> {
         let config = self.ai_configuration();
+        let instructions_enabled = self.window_settings.snippet_ai_additional_instructions();
         let Some(surface) = self.snippets.get_mut(&id) else {
             return Task::none();
         };
@@ -186,7 +188,7 @@ impl Workspace {
         {
             return Task::none();
         }
-        if !review.matches_snapshot(&surface.window, page, config.as_ref()) {
+        if !review.matches_snapshot(&surface.window, page, config.as_ref(), instructions_enabled) {
             page.state = State::Ready;
             page.status =
                 Some("The source or AI settings changed. Review the request again.".into());
@@ -343,6 +345,7 @@ mod tests {
         let window = SnippetWindow::open(profile.path()).unwrap();
         let history = store(&window).unwrap();
         let mut workspace = Workspace::default();
+        workspace.window_settings.snippet_ai_additional_instructions = Some(true);
         workspace.set_test_ai_configuration(configuration);
         workspace.window_settings.snippet_analysis_auto_diagram = false;
         let (owner, _) = workspace.open_window(false);

@@ -2,10 +2,11 @@
 
 use std::time::{Duration, Instant};
 
-use iced::widget::{Canvas, button, column, container, row, scrollable, text};
+use iced::widget::{Canvas, button, column, container, pick_list, responsive, row, text};
 use iced::{Element, Length, window};
 
-use crate::terminal_agent::design::{History, Layout, inline};
+use crate::terminal_agent::design::{Approval, Arrangement, Layout, inline};
+use crate::workspace::terminal_agent::design::{Sample, SampleAction, SampleGrid, SampleView};
 use inline::{Kind, Prompt, State, Step, StepState, Transcript};
 
 use super::{Desktop, Edit, Message};
@@ -32,6 +33,8 @@ pub(crate) enum Action {
     Tick(Token),
     Approve(Token),
     Cancel(Token),
+    Interact(Token, SampleAction),
+    StatusDeadline,
 }
 
 pub(super) struct Demo {
@@ -40,17 +43,23 @@ pub(super) struct Demo {
     playing: bool,
     cancelled: bool,
     expanded: bool,
+    finished_at: Option<Instant>,
+    sample: Sample,
 }
 
 impl Default for Demo {
     fn default() -> Self {
-        Self {
+        let mut demo = Self {
             generation: 1,
             stage: 0,
             playing: true,
             cancelled: false,
             expanded: false,
-        }
+            finished_at: None,
+            sample: Sample::default(),
+        };
+        demo.sync_sample();
+        demo
     }
 }
 
@@ -60,6 +69,9 @@ impl Demo {
         self.stage = 0;
         self.playing = true;
         self.cancelled = false;
+        self.finished_at = None;
+        self.sample.reset();
+        self.sync_sample();
     }
 
     fn token(&self) -> Token {
@@ -75,22 +87,39 @@ impl Demo {
 
     pub(super) fn update(&mut self, action: Action) {
         match action {
-            Action::Replay => self.replay(),
+            Action::Replay => return self.replay(),
             Action::Pause if self.active() => self.playing = !self.playing,
             Action::Details => self.expanded = !self.expanded,
             Action::Tick(token) if token == self.token() && self.playing && self.active() => {
                 self.stage += 1
             }
             Action::Next(token) if token == self.token() && self.active() => self.stage += 1,
-            Action::Approve(token) if token == self.token() && self.active() && self.stage == 3 => {
+            Action::Approve(token) | Action::Interact(token, SampleAction::Approve)
+                if token == self.token() && self.active() && self.stage == 3 =>
+            {
                 self.stage = 4
             }
-            Action::Cancel(token) if token == self.token() && self.active() => {
+            Action::Cancel(token) | Action::Interact(token, SampleAction::Cancel)
+                if token == self.token() && self.active() =>
+            {
                 self.cancelled = true;
                 self.playing = false;
             }
-            _ => {}
+            Action::Interact(token, action) if token == self.token() => {
+                self.sample.interact(action);
+                return;
+            }
+            _ => return,
         }
+        if !self.active() {
+            self.finished_at.get_or_insert_with(Instant::now);
+        }
+        self.sync_sample();
+    }
+
+    fn sync_sample(&mut self) {
+        let model = self.model();
+        self.sample.sync(&model);
     }
 
     fn phase(&self) -> &'static str {
@@ -230,38 +259,48 @@ pub(super) fn view(
     demo: &Demo,
     layout: Layout,
     dock: super::DockPreferences,
+    auto_hide_seconds: u8,
+    reduced_motion: bool,
     id: window::Id,
-) -> Element<'static, Desktop> {
-    let model = demo.model();
+) -> Element<'_, Desktop> {
+    let mut model = demo.model();
     let token = demo.token();
-    let terminal = Canvas::new(canvas::Preview {
-        model: model.clone(),
-        style: layout.history.inline_style(),
-        token,
-        playing: demo.playing && demo.active(),
-        owner: id,
-    })
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .into();
-    let mut activity = column![].spacing(5);
-    for (index, step) in model.steps.iter().enumerate() {
-        let content = format!("{} · {}", index + 1, step.title);
-        activity = activity.push(text(content).size(12));
-        if model.expanded && !step.detail.is_empty() {
-            activity = activity.push(text(step.detail.clone()).size(11));
-        }
+    let approval = model.prompt.is_some();
+    let cursor_review = approval && layout.approval == Approval::Cursor && layout.cursor_overlay();
+    if cursor_review {
+        model.prompt = None;
     }
-    if model.state.finished() {
-        activity = activity.push(
-            text(if demo.stage == 5 {
-                ANSWER
-            } else {
-                "Sample cancelled."
-            })
-            .size(12),
-        );
-    }
+    let deadline = demo
+        .finished_at
+        .filter(|_| auto_hide_seconds > 0)
+        .map(|finished| finished + Duration::from_secs(auto_hide_seconds.into()));
+    let now = Instant::now();
+    let preview = SampleView {
+        layout,
+        dock,
+        phase: (demo.phase(), usize::from(demo.stage).min(3)),
+        goal: GOAL,
+        approval: (approval && !cursor_review).then_some(VACUUM),
+        status_visible: deadline.is_none_or(|deadline| now < deadline),
+        reduced_motion,
+    };
+    let map = move |action| message(id, Action::Interact(token, action));
+    let scene = responsive(move |bounds| {
+        let terminal = Canvas::new(canvas::Preview {
+            model: model.clone(),
+            style: layout.history.inline_style(),
+            token,
+            playing: demo.playing && demo.active(),
+            owner: id,
+            reduced_motion,
+            cursor_review,
+            deadline: deadline.filter(|deadline| now < *deadline),
+        })
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into();
+        demo.sample.view(terminal, &preview, bounds, map)
+    });
     let mut controls = row![
         container(button("Replay").on_press(message(id, Action::Replay))).id("agent-demo-replay"),
         button(if demo.playing {
@@ -287,24 +326,18 @@ pub(super) fn view(
         controls =
             controls.push(button("Cancel sample").on_press(message(id, Action::Cancel(token))));
     }
-    let activity = scrollable(activity)
-        .height(
-            if matches!(layout.history, History::Transcript | History::StepCards) {
-                Length::Fixed(130.0)
-            } else {
-                Length::Fill
-            },
-        )
-        .into();
+    let grid = (layout.arrangement == Arrangement::Adaptive).then(|| {
+        pick_list(SampleGrid::ALL, Some(demo.sample.grid), move |grid| {
+            map(SampleAction::Grid(grid))
+        })
+    });
     column![
-        super::preview_static(
-            layout,
-            dock,
-            activity,
-            terminal,
-            demo.phase(),
-            usize::from(demo.stage).min(3)
-        ),
+        text("Design preview").size(17),
+        grid,
+        container(scene)
+            .height(384)
+            .width(Length::Fill)
+            .style(container::bordered_box),
         text("Sample only. Commands are never executed.").size(12),
         controls.wrap(),
     ]

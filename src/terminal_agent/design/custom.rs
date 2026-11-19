@@ -205,6 +205,18 @@ pub(crate) struct Layout {
     pub(crate) arrangement: Arrangement,
 }
 
+impl Layout {
+    pub(crate) fn cursor_overlay(self) -> bool {
+        !matches!(
+            self.arrangement,
+            Arrangement::PictureInPicture | Arrangement::Adaptive
+        ) && !matches!(
+            self.status,
+            Status::TopBar | Status::Hud | Status::Spotlight | Status::Toasts | Status::Orbit
+        )
+    }
+}
+
 impl Preset {
     pub(crate) fn layout(self) -> Layout {
         match self {

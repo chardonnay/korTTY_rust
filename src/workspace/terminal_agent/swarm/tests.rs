@@ -626,6 +626,7 @@ fn swarm_workflow_sends_only_the_reviewed_input_and_discards_stale_panel_results
     use crate::local_ai::test_support::{
         accept, exclusive_run, fixture_http_response, listener, request,
     };
+    use crate::workspace::question_history::{History, Kind};
     use std::io::Write as _;
 
     const FIXTURE: &str = "KORTTY_SWARM_WORKFLOW_MEMORY_FIXTURE";
@@ -714,6 +715,13 @@ fn swarm_workflow_sends_only_the_reviewed_input_and_discards_stale_panel_results
             Arc::new("operator@workflow.example.test:2222".into()),
         ))),
     );
+    let instructions = "Summarize the status\npassword=***";
+    let _ = send(
+        &mut workspace,
+        workflow::Message::Instructions(text_editor::Action::Edit(text_editor::Edit::Paste(
+            Arc::new("Summarize the status\npassword=fixture-instruction-secret".into()),
+        ))),
+    );
     let _ = send(&mut workspace, workflow::Message::Review);
     let workflow = workspace.terminal_agents.swarms[&id]
         .workflow
@@ -755,6 +763,12 @@ fn swarm_workflow_sends_only_the_reviewed_input_and_discards_stale_panel_results
         peer.accept().unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock
     );
+    assert!(
+        History::load_at(&root, Kind::Workflow)
+            .unwrap()
+            .entries()
+            .is_empty()
+    );
     memory
         .replace_file("MEMORY.md", global_memory.as_bytes())
         .unwrap();
@@ -788,6 +802,14 @@ fn swarm_workflow_sends_only_the_reviewed_input_and_discards_stale_panel_results
     assert!(body.get("response_format").is_none());
     let input = body["messages"][1]["content"].as_str().unwrap();
     assert_eq!(input, reviewed);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(input).unwrap()["instructions"],
+        instructions
+    );
+    assert_eq!(
+        History::load_at(&root, Kind::Workflow).unwrap().entries(),
+        [instructions]
+    );
     assert!(input.contains("operator") && input.contains("2222"));
     assert!(input.contains("password=***") && !input.contains("fixture-secret"));
     let sent_system = body["messages"][0]["content"].as_str().unwrap();
@@ -826,4 +848,28 @@ fn swarm_workflow_sends_only_the_reviewed_input_and_discards_stale_panel_results
     let group = &workspace.terminal_agents.swarms[&id];
     assert!(group.workflow.as_ref().unwrap().draft(3).is_none());
     assert_eq!(group.notice, crate::ai_manager::reviewed_memory::CHANGED);
+
+    let _ = workspace.swarm_action(id, Message::CloseWorkflow);
+    let _ = workspace.swarm_action(id, Message::ShowWorkflow);
+    let generation = workspace.terminal_agents.swarms[&id].workflow_generation;
+    for message in [
+        workflow::Message::HostSource(workflow::HostSource::Manual),
+        workflow::Message::Hosts(text_editor::Action::Edit(text_editor::Edit::Paste(
+            Arc::new("operator@workflow.example.test:2222".into()),
+        ))),
+        workflow::Message::RecallInstructions(instructions.into()),
+        workflow::Message::Review,
+    ] {
+        let _ = workspace.swarm_action(id, Message::Workflow(generation, message));
+    }
+    let group = &workspace.terminal_agents.swarms[&id];
+    let (_, recalled, _) = group.workflow.as_ref().unwrap().reviewed(1).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(recalled).unwrap()["instructions"],
+        instructions
+    );
+    assert_eq!(
+        peer.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
 }

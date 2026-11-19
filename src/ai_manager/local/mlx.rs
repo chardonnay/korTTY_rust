@@ -36,6 +36,7 @@ pub(crate) enum Action {
     Unpin(String),
     ReviewRuntimeRemoval,
     ReviewModel,
+    ReviewReattachment,
     Confirm,
     ConfirmOnline(u64),
     Discard,
@@ -62,6 +63,7 @@ impl Action {
             | Self::ReviewOnline
             | Self::ConfirmOnline(_)
             | Self::ReviewModel
+            | Self::ReviewReattachment
             | Self::Start
             | Self::Test
             | Self::Configure => true,
@@ -80,7 +82,7 @@ enum Review {
         choice: online::Choice,
     },
     Catalog(Arc<mlx_runtime::CatalogReview>),
-    Model(Arc<mlx_models::Review>),
+    Model(Arc<mlx_models::Review>, Option<mlx_models::Model>),
     Remove(Choice),
     RemoveRuntime(Arc<mlx_runtime::RemovalPlan>),
 }
@@ -98,7 +100,7 @@ pub(crate) enum ResultValue {
     OnlineInstalled(online::InstallOutcome),
     Unpinned(InstallationState),
     Catalog(Arc<mlx_runtime::CatalogReview>),
-    Model(Arc<mlx_models::Review>),
+    Model(Arc<mlx_models::Review>, Option<mlx_models::Model>),
     RuntimeRemovalReviewed(Option<Arc<mlx_runtime::RemovalPlan>>),
     RuntimeRemoved(Option<String>),
     Snapshot(Vec<mlx_models::Model>, InstallationState, String),
@@ -134,6 +136,7 @@ pub(super) struct State {
     review: Option<Review>,
     choices: Vec<Choice>,
     selected: Option<String>,
+    detached: bool,
     runtime: InstallationState,
     online: Option<Arc<online::Catalog>>,
     online_choice: Option<online::Choice>,
@@ -177,6 +180,14 @@ impl State {
             .selected
             .as_deref()
             .map(|id| runtime_package::mlx_model_status(profile, id));
+    }
+
+    fn refresh_reattachment(&mut self, profile: &Path) {
+        self.detached = self.selected.as_deref().is_some_and(|id| {
+            mlx_models::Registry::new(profile)
+                .detached_model(id)
+                .is_ok()
+        });
     }
 
     pub(super) fn invalidate_review(&mut self) {
@@ -234,9 +245,14 @@ impl State {
                 self.review = Some(Review::Catalog(review));
                 "Review the signed MLX catalog before accepting its trust changes.".into()
             }
-            ResultValue::Model(review) => {
-                self.review = Some(Review::Model(review));
-                "Review the local files before importing the MLX model.".into()
+            ResultValue::Model(review, restored) => {
+                let notice = if restored.is_some() {
+                    "Review the local files before reattaching the MLX model."
+                } else {
+                    "Review the local files before importing the MLX model."
+                };
+                self.review = Some(Review::Model(review, restored));
+                notice.into()
             }
             ResultValue::RuntimeRemovalReviewed(plan) => {
                 if let Some(plan) = plan {
@@ -269,6 +285,7 @@ impl State {
                     .or_else(|| self.choices.first().cloned());
                 self.select(selected);
                 self.refresh_status(profile);
+                self.refresh_reattachment(profile);
                 notice
             }
         }
@@ -394,8 +411,10 @@ impl State {
             selected.map(|choice| column![
                 text(format!("{} bytes · {}", choice.bytes, self.status.map_or_else(|| "Checking status".into(), |status| status.to_string()))).size(13),
                 row![
-                    action("Start", Action::Start, can_request),
-                    action("Test model", Action::Test, can_request),
+                    self.detached.then(|| action("Reattach local MLX…", Action::ReviewReattachment,
+                        can_request && Path::new(self.source.trim()).is_absolute())),
+                    action("Start", Action::Start, can_request && !self.detached),
+                    action("Test model", Action::Test, can_request && !self.detached),
                     action("Stop", Action::Stop, editing),
                     action("Remove model…", Action::ReviewRemoval, editing),
                 ].spacing(8).wrap(),
@@ -416,10 +435,10 @@ impl State {
                         format!("{} withdrawn packages\nCatalog SHA-256 {}", review.revoked_count(), review.index_sha256()),
                         "Accept MLX catalog",
                     ),
-                    Review::Model(review) => (
-                        "Import a private copy of these MLX files?",
-                        format!("{} · {} bytes\n{}\n{}", review.model().name, review.model().bytes, review.source().display(), review.asset_names().collect::<Vec<_>>().join("\n")),
-                        "Import MLX model",
+                    Review::Model(review, restored) => (
+                        if restored.is_some() { "Reattach these files to the restored MLX model?" } else { "Import a private copy of these MLX files?" },
+                        format!("{} · {} bytes\n{}\n{}", restored.as_ref().unwrap_or_else(|| review.model()).name, review.model().bytes, review.source().display(), review.asset_names().collect::<Vec<_>>().join("\n")),
+                        if restored.is_some() { "Reattach MLX model" } else { "Import MLX model" },
                     ),
                     Review::Remove(choice) => (
                         "Remove this private MLX model?",
@@ -513,12 +532,22 @@ impl Dialog {
                     mlx_runtime::accept_catalog(&profile, &review, cancelled)?;
                     snapshot(&profile, "Accepted the signed MLX runtime catalog.".into())
                 }),
-                Some(Review::Model(review)) => runtime_package::work(move |cancelled| {
-                    let model = mlx_models::Registry::new(&profile)
-                        .import(&review, cancelled)
-                        .map_err(|error| error.to_string())?;
-                    snapshot(&profile, format!("Imported MLX model {}.", model.name))
-                }),
+                Some(Review::Model(review, restored))
+                    if restored
+                        .as_ref()
+                        .is_none_or(|model| self.mlx.selected.as_ref() == Some(&model.id)) =>
+                {
+                    runtime_package::work(move |cancelled| {
+                        let registry = mlx_models::Registry::new(&profile);
+                        let (result, verb) = if let Some(model) = restored {
+                            (registry.reattach(&model, &review, cancelled), "Reattached")
+                        } else {
+                            (registry.import(&review, cancelled), "Imported")
+                        };
+                        let model = result.map_err(|error| error.to_string())?;
+                        snapshot(&profile, format!("{verb} MLX model {}.", model.name))
+                    })
+                }
                 Some(Review::Remove(choice)) if self.mlx.selected.as_ref() == Some(&choice.id) => {
                     runtime_package::work(move |_| {
                         runtime_package::with_stopped_mlx_model(&profile, &choice.id, || {
@@ -598,6 +627,7 @@ impl Dialog {
                 {
                     self.mlx.select(Some(choice));
                     self.mlx.refresh_status(&profile);
+                    self.mlx.refresh_reattachment(&profile);
                 }
                 return Task::none();
             }
@@ -645,7 +675,19 @@ impl Dialog {
                 let source = PathBuf::from(self.mlx.source.trim());
                 runtime_package::work(move |cancelled| {
                     mlx_models::Review::prepare(&source, cancelled)
-                        .map(|review| ResultValue::Model(Arc::new(review)))
+                        .map(|review| ResultValue::Model(Arc::new(review), None))
+                        .map_err(|error| error.to_string())
+                })
+            }
+            Action::ReviewReattachment if self.mlx.detached && self.mlx.review.is_none() => {
+                let Some(id) = self.mlx.selected.clone() else {
+                    return Task::none();
+                };
+                let source = PathBuf::from(self.mlx.source.trim());
+                runtime_package::work(move |cancelled| {
+                    mlx_models::Registry::new(&profile)
+                        .review_reattachment(&id, &source, cancelled)
+                        .map(|(model, review)| ResultValue::Model(Arc::new(review), Some(model)))
                         .map_err(|error| error.to_string())
                 })
             }

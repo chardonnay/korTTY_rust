@@ -382,6 +382,7 @@ mod tests {
         };
         view.draft.select_connection(ConnectionChoice::Saved {
             reference: ConnectionRef {
+                teamwork: None,
                 id: 1,
                 target: LoginTarget {
                     host: "test.example".into(),

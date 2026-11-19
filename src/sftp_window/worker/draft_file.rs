@@ -22,7 +22,13 @@ pub(crate) struct Request {
     peer: HostKey,
     owner: Weak<Control>,
     authorize: Authorize,
-    replacement: Option<(draft_replace::Spec, ExecOpener)>,
+    replacement: Option<Replacement>,
+}
+
+struct Replacement {
+    compared: Option<draft_replace::Original>,
+    backup: bool,
+    opener: ExecOpener,
 }
 
 impl Request {
@@ -84,21 +90,30 @@ impl Request {
         } else {
             directory.as_bytes()
         };
-        let mut request = Self::new(directory, name, draft, target, worker, authorize)?;
+        Self::new(directory, name, draft, target, worker, authorize)?.for_replacement(
+            Some(original.original().clone()),
+            backup,
+            worker,
+        )
+    }
+
+    pub(in crate::sftp_window) fn for_replacement(
+        mut self,
+        compared: Option<draft_replace::Original>,
+        backup: bool,
+        worker: &Worker,
+    ) -> io::Result<Self> {
+        std::str::from_utf8(&self.path)
+            .map_err(|_| io::Error::other("The server replacement path must be UTF-8"))?;
         let opener = worker.exec_opener().ok_or_else(|| {
             io::Error::other("Server replacement requires an authenticated helper channel")
         })?;
-        request.replacement = Some((
-            draft_replace::Spec {
-                destination: path.to_owned(),
-                original: original.original().clone(),
-                draft_bytes: request.draft.len(),
-                draft_digest: digest(request.draft.as_bytes())?,
-                backup,
-            },
+        self.replacement = Some(Replacement {
+            compared,
+            backup,
             opener,
-        ));
-        Ok(request)
+        });
+        Ok(self)
     }
 
     fn check(&self, control: &Control, cancel: &Cancel) -> Result<()> {
@@ -141,17 +156,22 @@ pub(in crate::sftp_window) fn valid_directory(path: &[u8]) -> bool {
     let Some(components) = path.strip_prefix(b"/") else {
         return false;
     };
+    let windows = draft_replace::windows_drive_path(path);
     path.len() <= MAX_DIRECTORY_BYTES
         && (components.is_empty()
-            || components.split(|&byte| byte == b'/').all(|name| {
-                name.len() <= 255
-                    && !name.iter().any(u8::is_ascii_control)
-                    && files::validate_transfer_name(name).is_ok()
-                    && std::str::from_utf8(name).ok().is_none_or(|name| {
-                        name.chars()
-                            .all(crate::session_journal::is_display_character)
-                    })
-            }))
+            || windows && path.len() == 4
+            || components
+                .split(|&byte| byte == b'/')
+                .skip(usize::from(windows))
+                .all(|name| {
+                    name.len() <= 255
+                        && !name.iter().any(u8::is_ascii_control)
+                        && files::validate_transfer_name(name).is_ok()
+                        && std::str::from_utf8(name).ok().is_none_or(|name| {
+                            name.chars()
+                                .all(crate::session_journal::is_display_character)
+                        })
+                }))
 }
 
 pub struct Plan {
@@ -181,6 +201,7 @@ impl fmt::Debug for Plan {
 pub(super) fn browse(
     client: &mut Client,
     directory: &[u8],
+    include_files: bool,
     editor_policy: RemoteEditorPolicy,
     control: &Control,
 ) -> Result<Arc<Directory>> {
@@ -203,15 +224,26 @@ pub(super) fn browse(
     let entries = client
         .read_dir_limited(&canonical, MAX_ENTRIES, MAX_LISTING_BYTES)?
         .into_iter()
-        .filter(|entry| entry.attrs.kind() == FileKind::Directory)
         .filter_map(|entry| {
-            let path = files::remote_join(&canonical, &entry.name);
-            valid_directory(&path).then(|| Entry {
+            let kind = match entry.attrs.kind() {
+                FileKind::Directory
+                    if valid_directory(&files::remote_join(&canonical, &entry.name)) =>
+                {
+                    EntryKind::Directory
+                }
+                FileKind::File
+                    if include_files && std::str::from_utf8(&entry.name).is_ok_and(valid_name) =>
+                {
+                    EntryKind::File
+                }
+                _ => return None,
+            };
+            Some(Entry {
                 display: files::display(&String::from_utf8_lossy(&entry.name)),
                 hidden: entry.name.starts_with(b"."),
                 name: EntryName::Remote(entry.name),
-                kind: EntryKind::Directory,
-                size: None,
+                kind,
+                size: entry.attrs.size.filter(|_| kind == EntryKind::File),
                 modified: entry.attrs.modified,
                 owner: entry.attrs.uid,
                 group: entry.attrs.gid,
@@ -254,7 +286,10 @@ impl Plan {
     }
 
     pub(in crate::sftp_window) fn replacement(&self) -> Option<&draft_replace::Spec> {
-        self.request.replacement.as_ref().map(|(spec, _)| spec)
+        match &self.operation {
+            OperationPlan::Create(_) => None,
+            OperationPlan::Replace(review) => Some(&review.spec),
+        }
     }
 
     pub(super) fn is_replacement(&self) -> bool {
@@ -267,10 +302,19 @@ impl Plan {
         backup: bool,
         draft: &Arc<str>,
     ) -> bool {
-        self.replacement()
-            .is_some_and(|spec| spec.backup == backup && &spec.original == original.original())
+        self.replaces_compared_file()
+            && self
+                .replacement()
+                .is_some_and(|spec| spec.backup == backup && &spec.original == original.original())
             && self.request.path == original.path()
             && Arc::ptr_eq(&self.request.draft, draft)
+    }
+
+    pub(in crate::sftp_window) fn replaces_compared_file(&self) -> bool {
+        self.request
+            .replacement
+            .as_ref()
+            .is_some_and(|replacement| replacement.compared.is_some())
     }
 }
 
@@ -282,9 +326,26 @@ pub(super) fn prepare(
 ) -> Result<Plan> {
     let result = (|| {
         request.check(control, cancel)?;
-        if let Some((spec, opener)) = &request.replacement {
+        if let Some(replacement) = &request.replacement {
+            let original = if let Some(original) = &replacement.compared {
+                original.clone()
+            } else {
+                compare::read_remote_draft_original(client, &request.path, &|| {
+                    cancel.stopped() || control.is_closed()
+                })?
+            };
+            let spec = draft_replace::Spec {
+                destination: std::str::from_utf8(&request.path)
+                    .map_err(io::Error::other)?
+                    .to_owned(),
+                original,
+                draft_bytes: request.draft.len(),
+                draft_digest: digest(request.draft.as_bytes())?,
+                backup: replacement.backup,
+            };
+            request.check(control, cancel)?;
             let reply = exchange(
-                opener,
+                &replacement.opener,
                 &draft_replace::Request::Review { spec: spec.clone() },
                 &[],
                 &request,
@@ -295,7 +356,7 @@ pub(super) fn prepare(
                 draft_replace::Reply::Reviewed { review } => review,
                 other => return Err(replacement_error(other)),
             };
-            review.validate_for(spec)?;
+            review.validate_for(&spec)?;
             request.check(control, cancel)?;
             return Ok(Plan {
                 request,
@@ -494,13 +555,14 @@ fn replace(
     control: &Control,
 ) -> Result<Publication> {
     let request = &plan.request;
-    let (spec, opener) = request.replacement.as_ref().expect("replacement plan");
+    let replacement = request.replacement.as_ref().expect("replacement plan");
+    let spec = &review.spec;
     let frame = draft_replace::Request::Apply {
         spec: spec.clone(),
         token: review.token.clone(),
     };
     let reply = exchange(
-        opener,
+        &replacement.opener,
         &frame,
         request.draft.as_bytes(),
         request,
@@ -559,7 +621,7 @@ fn replacement_error(reply: draft_replace::Reply) -> Failure {
             }
             note
         }
-        draft_replace::Reply::Unsupported => "Server replacement requires the native Linux helper.".into(),
+        draft_replace::Reply::Unsupported => "Server replacement requires an up-to-date native helper on the server.".into(),
         _ => "The helper returned an unexpected response. Check the reviewed server destination before retrying.".into(),
     };
     io::Error::other(note).into()
@@ -766,6 +828,9 @@ mod tests {
             b"/".as_slice(),
             b"/home/daniel/documents",
             b"/folder with spaces/raw-\xff",
+            b"/C:",
+            b"/C:/",
+            b"/d:/Users/Daniel",
         ] {
             assert!(valid_directory(allowed));
         }
@@ -779,6 +844,8 @@ mod tests {
             b"/home/a\nb",
             b"/home/a\0b",
             b"/home/drive:c",
+            b"/C:/data/D:",
+            b"/C:/data/../other",
         ] {
             assert!(!valid_directory(refused));
         }

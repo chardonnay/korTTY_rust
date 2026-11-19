@@ -51,13 +51,25 @@ fn reviewed_draft_replacement_preserves_raw_backup_mode_and_user_attributes() {
     for backup in [false, true] {
         let (scratch, spec) = fixture(backup);
         let original = File::open(&spec.destination).unwrap();
-        fsetxattr(
-            &original,
-            "user.kortty-fixture",
-            b"metadata",
-            XattrFlags::empty(),
-        )
-        .unwrap();
+        #[cfg(target_os = "linux")]
+        let attribute = "user.kortty-fixture";
+        #[cfg(target_os = "macos")]
+        let attribute = "com.kortty.fixture";
+        fsetxattr(&original, attribute, b"metadata", XattrFlags::empty()).unwrap();
+        #[cfg(target_os = "macos")]
+        let acl = {
+            let initial = kortty_files::ExtendedAcl::capture(&original).unwrap();
+            assert!(
+                std::process::Command::new("/bin/chmod")
+                    .args(["+a", "everyone deny execute", &spec.destination])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let acl = kortty_files::ExtendedAcl::capture(&original).unwrap();
+            assert!(acl != initial);
+            acl
+        };
         let reviewed = review(spec.clone()).unwrap();
         reviewed.validate_for(&spec).unwrap();
         let result = apply(&spec, &reviewed.token, DRAFT_TEXT).unwrap();
@@ -79,6 +91,8 @@ fn reviewed_draft_replacement_preserves_raw_backup_mode_and_user_attributes() {
                 assert_eq!(fs::read(path).unwrap(), expected);
                 assert_eq!(file.metadata().unwrap().mode() & 0o7777, 0o750);
                 assert_eq!(read_xattrs(&file).unwrap(), read_xattrs(&original).unwrap());
+                #[cfg(target_os = "macos")]
+                acl.require_applied(&file).unwrap();
             }
         }
         assert_eq!(

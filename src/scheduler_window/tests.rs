@@ -124,20 +124,38 @@ fn imported_privileged_adoption_requires_a_sudo_mode_current_pins_and_native_fil
     let mut draft = Draft::from_job(&job);
     assert!(
         draft
-            .adopt_imported_privileged(&connections, &trust, &policy, &snippet_path)
+            .adopt_imported_privileged(
+                &connections,
+                &SharedTargets::default(),
+                &trust,
+                &policy,
+                &snippet_path
+            )
             .unwrap_err()
             .contains("Choose passwordless")
     );
     draft.select_imported_sudo(SudoMode::Passwordless);
     assert!(
         draft
-            .adopt_imported_privileged(&connections, &untrusted, &policy, &snippet_path)
+            .adopt_imported_privileged(
+                &connections,
+                &SharedTargets::default(),
+                &untrusted,
+                &policy,
+                &snippet_path
+            )
             .unwrap_err()
             .contains("host key")
     );
     assert!(
         draft
-            .adopt_imported_privileged(&connections, &trust, &denied, &snippet_path)
+            .adopt_imported_privileged(
+                &connections,
+                &SharedTargets::default(),
+                &trust,
+                &denied,
+                &snippet_path
+            )
             .unwrap_err()
             .contains("policy")
     );
@@ -146,7 +164,13 @@ fn imported_privileged_adoption_requires_a_sudo_mode_current_pins_and_native_fil
     connections.save(changed).unwrap();
     assert!(
         draft
-            .adopt_imported_privileged(&connections, &trust, &policy, &snippet_path)
+            .adopt_imported_privileged(
+                &connections,
+                &SharedTargets::default(),
+                &trust,
+                &policy,
+                &snippet_path
+            )
             .unwrap_err()
             .contains("target changed")
     );
@@ -160,7 +184,13 @@ fn imported_privileged_adoption_requires_a_sudo_mode_current_pins_and_native_fil
         draft.select_imported_sudo(mode);
         assert!(
             !draft
-                .adopt_imported_privileged(&connections, &trust, &policy, &snippet_path)
+                .adopt_imported_privileged(
+                    &connections,
+                    &SharedTargets::default(),
+                    &trust,
+                    &policy,
+                    &snippet_path
+                )
                 .unwrap()
         );
         let adopted = draft.build(id.clone()).unwrap();
@@ -181,7 +211,13 @@ fn imported_privileged_adoption_requires_a_sudo_mode_current_pins_and_native_fil
     draft.select_imported_sudo(SudoMode::Passwordless);
     assert!(
         draft
-            .adopt_imported_privileged(&connections, &trust, &policy, &snippet_path)
+            .adopt_imported_privileged(
+                &connections,
+                &SharedTargets::default(),
+                &trust,
+                &policy,
+                &snippet_path
+            )
             .unwrap()
     );
     assert!(draft.build(id.clone()).is_err());
@@ -260,7 +296,13 @@ fn imported_archive_adoption_requires_its_route_pins_local_path_and_vault_choice
     assert!(
         app.view
             .draft
-            .adopt_imported_archive(&connections, &untrusted, &policy, &[])
+            .adopt_imported_archive(
+                &connections,
+                &SharedTargets::default(),
+                &untrusted,
+                &policy,
+                &[]
+            )
             .unwrap_err()
             .contains("host keys")
     );
@@ -270,7 +312,13 @@ fn imported_archive_adoption_requires_its_route_pins_local_path_and_vault_choice
     assert!(
         app.view
             .draft
-            .adopt_imported_archive(&connections, &trust, &policy, &[])
+            .adopt_imported_archive(
+                &connections,
+                &SharedTargets::default(),
+                &trust,
+                &policy,
+                &[]
+            )
             .unwrap_err()
             .contains("no longer matches")
     );
@@ -278,7 +326,13 @@ fn imported_archive_adoption_requires_its_route_pins_local_path_and_vault_choice
     assert!(
         app.view
             .draft
-            .adopt_imported_archive(&connections, &trust, &policy, &[])
+            .adopt_imported_archive(
+                &connections,
+                &SharedTargets::default(),
+                &trust,
+                &policy,
+                &[]
+            )
             .unwrap_err()
             .contains("local archive destination")
     );
@@ -290,7 +344,13 @@ fn imported_archive_adoption_requires_its_route_pins_local_path_and_vault_choice
     assert!(
         app.view
             .draft
-            .adopt_imported_archive(&connections, &trust, &policy, &[])
+            .adopt_imported_archive(
+                &connections,
+                &SharedTargets::default(),
+                &trust,
+                &policy,
+                &[]
+            )
             .unwrap_err()
             .contains("from the vault")
     );
@@ -309,7 +369,13 @@ fn imported_archive_adoption_requires_its_route_pins_local_path_and_vault_choice
     assert!(
         app.view
             .draft
-            .adopt_imported_archive(&connections, &trust, &denied, std::slice::from_ref(&choice))
+            .adopt_imported_archive(
+                &connections,
+                &SharedTargets::default(),
+                &trust,
+                &denied,
+                std::slice::from_ref(&choice)
+            )
             .unwrap_err()
             .contains("policy")
     );
@@ -318,7 +384,13 @@ fn imported_archive_adoption_requires_its_route_pins_local_path_and_vault_choice
     )));
     app.view
         .draft
-        .adopt_imported_archive(&connections, &trust, &policy, std::slice::from_ref(&choice))
+        .adopt_imported_archive(
+            &connections,
+            &SharedTargets::default(),
+            &trust,
+            &policy,
+            std::slice::from_ref(&choice),
+        )
         .unwrap();
     app.update(Message::Save);
     let job = app.selected_job().unwrap();
@@ -426,14 +498,26 @@ fn imported_privileged_archive_needs_native_approval_for_its_exact_local_copy() 
     assert!(
         app.view
             .draft
-            .adopt_imported_archive(&connections, &trust, &denied, &[])
+            .adopt_imported_archive(
+                &connections,
+                &SharedTargets::default(),
+                &trust,
+                &denied,
+                &[]
+            )
             .unwrap_err()
             .contains("forbids Scheduler sudo")
     );
     assert!(
         app.view
             .draft
-            .adopt_imported_archive(&connections, &trust, &policy, &[])
+            .adopt_imported_archive(
+                &connections,
+                &SharedTargets::default(),
+                &trust,
+                &policy,
+                &[]
+            )
             .unwrap_err()
             .contains("local archive destination")
     );
@@ -444,7 +528,13 @@ fn imported_privileged_archive_needs_native_approval_for_its_exact_local_copy() 
     ));
     app.view
         .draft
-        .adopt_imported_archive(&connections, &trust, &policy, &[])
+        .adopt_imported_archive(
+            &connections,
+            &SharedTargets::default(),
+            &trust,
+            &policy,
+            &[],
+        )
         .unwrap();
     assert_eq!(app.view.draft.sudo, SudoMode::Passwordless);
     app.update(Message::Save);
@@ -522,8 +612,8 @@ fn scheduler_target_groups_persist_source_and_block_changed_membership_until_ref
         text_editor::Edit::Paste(Arc::new("true".into())),
     )));
     app.update(Message::ConnectionSelected(choice));
-    app.update(Message::ConnectionGroupAdded(parent.clone()));
-    app.update(Message::ConnectionGroupAdded(child.clone()));
+    app.update(Message::ConnectionGroupAdded(parent.clone().into()));
+    app.update(Message::ConnectionGroupAdded(child.clone().into()));
     app.update(Message::Save);
     let job = app.selected_job().expect("saved group job");
     let id = job.id().clone();
@@ -533,7 +623,13 @@ fn scheduler_target_groups_persist_source_and_block_changed_membership_until_ref
         [nested, direct]
     );
     let source = action.target_groups.as_ref().unwrap();
-    assert_eq!(source.groups, [parent.clone(), child.clone()]);
+    assert_eq!(
+        source.groups,
+        [
+            ConnectionGroup::from(parent.clone()),
+            ConnectionGroup::from(child.clone())
+        ]
+    );
     assert_eq!(source.explicit[0].id, nested);
     assert!(action.require_current_target_groups(&store).is_ok());
     drop(app);
@@ -561,7 +657,605 @@ fn scheduler_target_groups_persist_source_and_block_changed_membership_until_ref
     );
     assert_eq!(
         job.action().target_groups.as_ref().unwrap().groups,
-        [parent, child]
+        [ConnectionGroup::from(parent), ConnectionGroup::from(child)]
+    );
+}
+
+#[test]
+fn scheduler_teamwork_jump_requires_unique_local_login_and_both_host_keys() {
+    use crate::clipboard_policy::{ClipboardPolicy, ServerAccess};
+    use crate::connection_store::Auth;
+    use crate::connection_store::teamwork::{
+        Catalog, DefaultAuth, ManagedSource, Source, SourceKind,
+    };
+    use crate::job_executor::Credentials;
+    use crate::vault_window::Kind;
+    use kortty_ssh::{Endpoint, HostKey, TrustStore};
+
+    let scratch = Profile::temporary();
+    let mut store = ConnectionStore::open(scratch.0.join("connections.json")).unwrap();
+    let source = scratch.0.join("fleet.xml");
+    fs::write(
+        &source,
+        r#"<connections schemaVersion="2"><connection id="jump-route">
+            <host>destination.example</host><username>operator</username>
+            <jumpServer><enabled>true</enabled><host>bastion.example</host>
+                <port>2222</port><username>relay</username><authMethod>PASSWORD</authMethod>
+                <credentialId>source-credential</credentialId></jumpServer>
+        </connection></connections>"#,
+    )
+    .unwrap();
+    let policy = ClipboardPolicy {
+        custom_teamwork_sources_allowed: false,
+        teamwork_sources: vec![ManagedSource {
+            name: "Fleet".into(),
+            source: Source {
+                location: source.to_str().unwrap().into(),
+                enabled: true,
+                kind: SourceKind::File,
+                check_interval_minutes: 15,
+            },
+        }],
+        ..Default::default()
+    };
+    let catalog = Catalog::load_for_scheduler(&scratch.0, &policy).unwrap();
+    let target = Endpoint::new("destination.example", 22).unwrap();
+    let bastion = Endpoint::new("bastion.example", 2222).unwrap();
+    let target_key = HostKey::from_openssh(
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKuSNsxvt1EJ0ELnEMXiOgkaExGvVly+uWvDAKyIGKcX",
+    )
+    .unwrap();
+    let jump_key = HostKey::from_openssh(
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDFjq5gouQTbXMW4LzV1KkPtjZgGxFcenR2uthQaggSo",
+    )
+    .unwrap();
+    let trust = TrustStore::from_pins(vec![
+        (target.clone(), target_key.clone()),
+        (bastion.clone(), jump_key),
+    ])
+    .unwrap();
+    let choice = |store: &ConnectionStore| {
+        SharedTargets::new(&catalog, store, &trust, |entry| {
+            Some((
+                entry.connection.login.endpoint.clone(),
+                SharedAuth::Password {
+                    credential: "target-local".into(),
+                },
+            ))
+        })
+        .choices()
+        .next()
+        .unwrap()
+        .reference()
+        .unwrap()
+        .clone()
+    };
+    assert!(choice(&store).validate().is_err());
+
+    let mut profile = grouped_connection("bastion.example");
+    profile.login.endpoint.port = 2222;
+    profile.login.endpoint.username = "relay".into();
+    profile.login.auth = Auth::VaultPassword("jump-local".into());
+    let id = store.save(profile).unwrap();
+    let reviewed = choice(&store);
+    reviewed.validate().unwrap();
+    let saved: ConnectionRef =
+        serde_json::from_slice(&serde_json::to_vec(&reviewed).unwrap()).unwrap();
+    assert_eq!(saved, reviewed);
+    let entry = catalog.get(saved.shared_identity().unwrap()).unwrap();
+    let default_auth = DefaultAuth::Password {
+        credential: "target-local".into(),
+    };
+    let check = |store: &ConnectionStore, trust: &TrustStore| {
+        SharedTargets::recheck(&catalog, store, &default_auth, trust, [saved.clone()])
+            .require(&saved)
+    };
+    assert!(check(&store, &trust).is_ok());
+    assert!(
+        saved
+            .strict_trust(trust.clone())
+            .unwrap()
+            .selected_pins(&[target.clone(), bastion.clone()])
+            .is_ok()
+    );
+    let access = ServerAccess::default();
+    let mut requests = Vec::new();
+    let credentials =
+        Credentials::resolve_shared(&saved, entry, &store, false, &access, |id, kind, login| {
+            assert_eq!(kind, Kind::Password);
+            requests.push((id.to_owned(), login.host.clone(), login.username.clone()));
+            Ok(kortty_vault::Secret::new("fixture-secret".into()))
+        })
+        .unwrap();
+    assert_eq!(
+        requests,
+        [
+            (
+                "target-local".into(),
+                "destination.example".into(),
+                "operator".into()
+            ),
+            (
+                "jump-local".into(),
+                "bastion.example".into(),
+                "relay".into()
+            ),
+        ]
+    );
+    let (destination, hops) = credentials.into_swarm_route().unwrap();
+    assert_eq!(destination.endpoint, target);
+    assert_eq!(hops.len(), 1);
+    assert_eq!(hops[0].endpoint, bastion);
+    let missing = TrustStore::from_pins(vec![(target.clone(), target_key.clone())]).unwrap();
+    let rotated =
+        TrustStore::from_pins(vec![(target, target_key.clone()), (bastion, target_key)]).unwrap();
+    for changed in [missing, rotated] {
+        assert!(check(&store, &changed).is_err());
+        assert!(saved.strict_trust(changed).is_err());
+    }
+
+    let mut updated = store.get(id).unwrap().clone();
+    updated.login.auth = Auth::VaultPassword("changed-jump-credential".into());
+    store.save(updated).unwrap();
+    assert!(check(&store, &trust).is_err());
+    assert!(
+        Credentials::resolve_shared(&saved, entry, &store, false, &access, |_, _, _| {
+            panic!("a changed route must not retrieve credentials")
+        })
+        .is_err()
+    );
+    let mut competing = store.get(id).unwrap().clone();
+    competing.name = "Alternate bastion login".into();
+    competing.id = 0;
+    store.save(competing).unwrap();
+    assert!(choice(&store).validate().is_err());
+}
+
+#[test]
+fn scheduler_teamwork_targets_round_trip_and_require_current_membership_and_pins() {
+    use crate::clipboard_policy::ClipboardPolicy;
+    use crate::connection_store::teamwork::{
+        Catalog, DefaultAuth, HiddenEntry, ManagedSource, Source, SourceKind,
+    };
+    use kortty_ssh::{Endpoint, HostKey, TrustStore};
+
+    let scratch = Profile::temporary();
+    let mut store = ConnectionStore::open(scratch.0.join("connections.json")).unwrap();
+    let local_group = store.create_group(None, "Fleet").unwrap();
+    let local = store
+        .save_in_group(grouped_connection("local.example.test"), Some(&local_group))
+        .unwrap();
+    let first = scratch.0.join("first.xml");
+    let second = scratch.0.join("second.xml");
+    let row = |id: &str, host: &str, group: &str| {
+        format!(
+            r#"<connection id="{id}"><host>{host}</host><port>22</port><username>shared</username><group>{group}</group></connection>"#
+        )
+    };
+    let initial = row("1", "one.example.test", "Fleet/Nested");
+    let write = |path: &Path, rows: &str| {
+        fs::write(
+            path,
+            format!(r#"<connections schemaVersion="2">{rows}</connections>"#),
+        )
+        .unwrap();
+    };
+    write(&first, &initial);
+    write(&second, &row("1", "two.example.test", "Fleet"));
+    let policy = ClipboardPolicy {
+        custom_teamwork_sources_allowed: false,
+        teamwork_sources: [&first, &second]
+            .into_iter()
+            .map(|path| ManagedSource {
+                name: path.file_stem().unwrap().to_string_lossy().into_owned(),
+                source: Source {
+                    location: path.to_str().unwrap().into(),
+                    enabled: true,
+                    kind: SourceKind::File,
+                    check_interval_minutes: 15,
+                },
+            })
+            .collect(),
+        ..ClipboardPolicy::default()
+    };
+    let read = || Catalog::load_for_scheduler(&scratch.0, &policy).unwrap();
+    let auth = DefaultAuth::Key {
+        id: 7,
+        username: "operator".into(),
+    };
+    let key = |seed: u8| {
+        let public = if seed == 9 {
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDFjq5gouQTbXMW4LzV1KkPtjZgGxFcenR2uthQaggSo"
+        } else {
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKuSNsxvt1EJ0ELnEMXiOgkaExGvVly+uWvDAKyIGKcX"
+        };
+        HostKey::from_openssh(public).unwrap()
+    };
+    let trust = |one_seed| {
+        TrustStore::from_pins(
+            [
+                ("one.example.test", one_seed),
+                ("two.example.test", 2),
+                ("new.example.test", 3),
+            ]
+            .into_iter()
+            .map(|(host, seed)| (Endpoint::new(host, 22).unwrap(), key(seed)))
+            .collect(),
+        )
+        .unwrap()
+    };
+    let trusted = trust(1);
+    let chooser = |entry: &crate::connection_store::teamwork::Entry| {
+        let mut target = entry.connection.login.endpoint.clone();
+        target.username = "operator".into();
+        Some((
+            target,
+            SharedAuth::Key {
+                id: 7,
+                password_preference: None,
+            },
+        ))
+    };
+    let catalogue = read();
+    let shared = SharedTargets::new(&catalogue, &store, &trusted, chooser);
+    let pick = |host: &str| {
+        shared
+            .choices()
+            .find(|choice| choice.reference().unwrap().target.host == host)
+            .unwrap()
+    };
+    let one = pick("one.example.test");
+    let two = pick("two.example.test");
+    let one_ref = one.reference().unwrap().clone();
+    let two_ref = two.reference().unwrap().clone();
+    assert_ne!(one_ref.id, two_ref.id);
+    assert_ne!(one_ref.id, local);
+    assert_eq!(one_ref.target.username, "operator");
+    let parent = shared
+        .groups()
+        .find(|group| group.to_string() == format!("Teamwork / Fleet [{}]", first.display()))
+        .unwrap();
+    let second_parent = shared
+        .groups()
+        .find(|group| group.to_string() == format!("Teamwork / Fleet [{}]", second.display()))
+        .unwrap();
+    let scoped = TargetGroups {
+        group_order: Vec::new(),
+        groups: vec![parent.clone()],
+        explicit: vec![],
+    };
+    assert_eq!(
+        scoped.resolve(&store, &shared, false).unwrap().as_slice(),
+        std::slice::from_ref(&one_ref)
+    );
+    let mut forged = one_ref.clone();
+    forged.id = local;
+    assert!(forged.validate().is_err());
+
+    let mut app = TestWindow::open(scratch.file()).unwrap();
+    app.runtime.set_shared_targets(shared);
+    app.runtime.set_connections(Some(&store));
+    assert!(app.runtime.connection_choices.contains(&one));
+    assert!(app.runtime.connection_choices.contains(&two));
+    app.update(Message::Edit(Field::Name, "Shared group job".into()));
+    app.update(Message::EditCommand(text_editor::Action::Edit(
+        text_editor::Edit::Paste(Arc::new("true".into())),
+    )));
+    app.update(Message::ConnectionSelected(one));
+    app.update(Message::ConnectionGroupAdded(parent));
+    app.update(Message::ConnectionGroupAdded(second_parent));
+    app.update(Message::ConnectionGroupAdded(local_group.into()));
+    app.update(Message::Save);
+    let saved = app
+        .selected_job()
+        .expect("saved Teamwork group job")
+        .action()
+        .clone();
+    assert!(saved.targets().eq([
+        &one_ref,
+        &two_ref,
+        &ConnectionRef::from(store.get(local).unwrap())
+    ]));
+    drop(app);
+    let app = TestWindow::open(scratch.file()).unwrap();
+    assert_eq!(app.selected_job().unwrap().action(), &saved);
+    let serialized = serde_json::to_value(&saved).unwrap();
+    assert_eq!(serialized["target_groups"]["groups"][2], "Fleet");
+    assert!(
+        serialized["additional_connections"][1]
+            .get("teamwork")
+            .is_none()
+    );
+
+    let recheck = |store: &ConnectionStore, auth: &DefaultAuth, trust: &TrustStore| {
+        saved.require_current_targets(
+            store,
+            &SharedTargets::recheck(&read(), store, auth, trust, saved.targets().cloned()),
+        )
+    };
+    assert!(recheck(&store, &auth, &trusted).is_ok());
+    assert!(one_ref.strict_trust(trusted.clone()).is_ok());
+    let rsync_action: SshCommand = serde_json::from_value(serde_json::json!({
+        "connection": one_ref,
+        "remote": {
+            "kind": "rsync_download",
+            "program": scratch.0.join("rsync"),
+            "local": scratch.0.join("download"),
+            "remote": "/artifact"
+        }
+    }))
+    .unwrap();
+    let rsync_action = rsync_action.validated().unwrap();
+    let transfer = rsync_action
+        .remote_action()
+        .unwrap()
+        .rsync_transfer()
+        .unwrap()
+        .0;
+    let request = rsync::ReviewRequests::for_transfer(transfer, &one_ref, &[], false).unwrap();
+    assert!(request.references().eq([&one_ref]));
+    let approval: rsync::Approval = serde_json::from_value(serde_json::json!({
+        "program": scratch.0.join("rsync"),
+        "digest": vec![0; 32],
+        "reference": one_ref,
+        "pins": sync::fingerprints(&sync::pins(&one_ref, &trusted).unwrap())
+    }))
+    .unwrap();
+    let mut reviewed_transfer = transfer.clone();
+    reviewed_transfer.approval = Some(approval);
+    let reviewed = rsync::Reviewed::restore(&reviewed_transfer).unwrap();
+    assert!(request.matches(&reviewed));
+    let changed_targets = SharedTargets::new(&catalogue, &store, &trusted, |entry| {
+        let (target, _) = chooser(entry)?;
+        Some((
+            target,
+            SharedAuth::Key {
+                id: 8,
+                password_preference: None,
+            },
+        ))
+    });
+    let changed = changed_targets
+        .choices()
+        .find_map(|choice| {
+            let reference = choice.reference()?;
+            (reference.shared_identity() == one_ref.shared_identity()).then(|| reference.clone())
+        })
+        .unwrap();
+    assert_eq!(changed.id, one_ref.id);
+    let changed_request =
+        rsync::ReviewRequests::for_transfer(transfer, &changed, &[], false).unwrap();
+    assert!(!changed_request.matches(&reviewed));
+    assert!(changed_targets.require_saved(&store, &one_ref).is_err());
+
+    verify_teamwork_privileged_review(
+        &store,
+        SharedTargets::new(&catalogue, &store, &trusted, chooser),
+        &one_ref,
+        &changed,
+        scoped,
+        &trusted,
+    );
+
+    // The worker resolves the locally bound credential using the reviewed effective login.
+    let password_targets = SharedTargets::new(&catalogue, &store, &trusted, |entry| {
+        let mut target = entry.connection.login.endpoint.clone();
+        target.username = "vault-login".into();
+        Some((
+            target,
+            SharedAuth::Password {
+                credential: "fixture-password".into(),
+            },
+        ))
+    });
+    let password = password_targets
+        .choices()
+        .find_map(|choice| {
+            let reference = choice.reference()?;
+            (reference.shared_identity() == one_ref.shared_identity()).then(|| reference.clone())
+        })
+        .unwrap();
+    let entry = catalogue.get(password.shared_identity().unwrap()).unwrap();
+    let secret = |id: &str, kind, login: &crate::ssh_dialog::LoginTarget| {
+        assert_eq!(id, "fixture-password");
+        assert_eq!(kind, crate::vault_window::Kind::Password);
+        assert_eq!(login.username, "vault-login");
+        assert_eq!(login.host, "one.example.test");
+        Ok(kortty_vault::Secret::new("test-secret".into()))
+    };
+    let access = crate::clipboard_policy::ServerAccess::default();
+    let mut credentials = crate::job_executor::Credentials::resolve_shared(
+        &password, entry, &store, false, &access, secret,
+    )
+    .unwrap();
+    let revision = Arc::new(());
+    credentials.bind_shared_vault_revision(Arc::downgrade(&revision));
+    drop(revision);
+    assert!(
+        matches!(credentials.into_swarm_route(), Err(error) if error.contains("vault changed"))
+    );
+    assert!(matches!(
+        crate::job_executor::Credentials::resolve_shared(&password, entry, &store, true, &access, |_, _, _| panic!("a recording must not retrieve a Teamwork password")),
+        Err(error) if error.contains("cannot record")
+    ));
+    assert!(one_ref.strict_trust(trust(9)).is_err());
+    assert!(recheck(&store, &auth, &trust(9)).is_err());
+    assert!(
+        recheck(
+            &store,
+            &DefaultAuth::TemporaryKey {
+                username: "operator".into()
+            },
+            &trusted
+        )
+        .is_err()
+    );
+    assert!(
+        recheck(
+            &store,
+            &DefaultAuth::Key {
+                id: 7,
+                username: "other".into()
+            },
+            &trusted
+        )
+        .is_err()
+    );
+
+    write(
+        &first,
+        &format!("{initial}{}", row("2", "new.example.test", "Fleet/Nested")),
+    );
+    assert_eq!(
+        recheck(&store, &auth, &trusted),
+        Err(connection::GROUP_TARGETS_CHANGED)
+    );
+    write(&first, &row("1", "one.example.test", "Fleet/Moved"));
+    assert!(recheck(&store, &auth, &trusted).is_err());
+    write(&first, &initial);
+    store
+        .hide_teamwork(&[HiddenEntry::from(
+            catalogue.get(one_ref.shared_identity().unwrap()).unwrap(),
+        )])
+        .unwrap();
+    assert!(recheck(&store, &auth, &trusted).is_err());
+    store
+        .restore_teamwork(one_ref.shared_identity().unwrap())
+        .unwrap();
+    assert!(recheck(&store, &auth, &trusted).is_ok());
+    fs::remove_file(&first).unwrap();
+    assert!(recheck(&store, &auth, &trusted).is_err());
+}
+
+fn verify_teamwork_privileged_review(
+    store: &ConnectionStore,
+    shared: SharedTargets,
+    route: &ConnectionRef,
+    changed: &ConnectionRef,
+    groups: TargetGroups,
+    trust: &kortty_ssh::TrustStore,
+) {
+    let profile = Profile::temporary();
+    let path = profile.file();
+    let id = JobId::new("teamwork-privileged-review").unwrap();
+    let policy = crate::clipboard_policy::ClipboardPolicy::default();
+    let imported: SshCommand = serde_json::from_value(serde_json::json!({
+        "connection": route,
+        "target_groups": groups,
+        "imported_privileged": {"routes": [route], "settings": {
+            "kind": "command", "text": "id -u", "options": {}
+        }}
+    }))
+    .unwrap();
+    let job = Job::new(
+        id.clone(),
+        "Imported sudo command",
+        imported.validated().unwrap(),
+    )
+    .unwrap()
+    .with_enabled(false);
+    let mut draft = Draft::from_job(&job);
+    draft.select_imported_sudo(SudoMode::Passwordless);
+    assert!(
+        draft
+            .adopt_imported_privileged(store, &SharedTargets::default(), trust, &policy, &profile.0)
+            .is_err()
+    );
+    assert!(
+        !draft
+            .adopt_imported_privileged(store, &shared, trust, &policy, &profile.0)
+            .unwrap()
+    );
+    let adopted = draft.build(id.clone()).unwrap();
+    assert!(!adopted.enabled());
+    assert_eq!(adopted.action().sudo, SudoMode::Passwordless);
+    assert_eq!(adopted.action().connection.as_ref(), Some(route));
+
+    let archive: SshCommand = serde_json::from_value(serde_json::json!({
+        "connection": route,
+        "remote": {"kind": "imported_archive", "route": route, "settings": {
+            "sources": ["/input/hosts"], "target": "/output/archive.zip",
+            "format": "zip", "level": 8, "java_excludes": [],
+        }}
+    }))
+    .unwrap();
+    let job = Job::new(id.clone(), "Imported archive", archive.validated().unwrap())
+        .unwrap()
+        .with_enabled(false);
+    let mut draft = Draft::from_job(&job);
+    let untrusted = kortty_ssh::TrustStore::from_pins(Vec::new()).unwrap();
+    assert!(
+        draft
+            .adopt_imported_archive(store, &shared, &untrusted, &policy, &[])
+            .is_err()
+    );
+    draft
+        .adopt_imported_archive(store, &shared, trust, &policy, &[])
+        .unwrap();
+    let adopted = draft.build(id.clone()).unwrap();
+    assert!(!adopted.enabled());
+    assert!(matches!(
+        &adopted.action().remote,
+        Some(RemoteAction::ServerArchive(_))
+    ));
+
+    let action: SshCommand = serde_json::from_value(serde_json::json!({
+        "connection": route,
+        "target_groups": groups,
+        "remote": {"kind": "chmod", "path": "/approved/teamwork", "mode": 416}
+    }))
+    .unwrap();
+    let graph = JobGraph::new(vec![
+        Job::new(id.clone(), "Teamwork permissions", action).unwrap(),
+    ])
+    .unwrap();
+    SchedulerStore::open(&path)
+        .unwrap()
+        .commit_with_actions(&graph, &[], &[])
+        .unwrap();
+    let mut app = TestWindow::open(path).unwrap();
+    app.runtime.set_execution_allowed(true);
+    app.runtime.set_shared_targets(shared);
+    app.runtime.set_connections(Some(store));
+    app.update(Message::Select(id));
+    app.update(Message::Page(Page::Action));
+    app.update(Message::Sudo(SudoMode::Passwordless));
+    let pins = sync::pins(route, trust).unwrap();
+    app.runtime
+        .review_privileged(&mut app.view, |reviewed| {
+            assert_eq!(reviewed, route);
+            Ok(sync::fingerprints(&pins))
+        })
+        .unwrap();
+    app.update(Message::ApprovePrivileged);
+    app.update(Message::Save);
+    assert_eq!(app.status(), Some("Job saved"));
+
+    let request = app.update(Message::Run(false)).pop().unwrap();
+    let context = app.runtime.privileged_run_context(&request).unwrap();
+    let RemoteAction::PrivilegedFileAction(metadata) = request.action.remote_action().unwrap()
+    else {
+        panic!("expected a reviewed privileged action");
+    };
+    assert!(
+        context
+            .authorize_file_action(metadata, route, SudoMode::Passwordless, &pins)
+            .is_ok()
+    );
+    assert!(
+        context
+            .authorize_file_action(metadata, changed, SudoMode::Passwordless, &pins)
+            .is_err()
+    );
+    assert!(
+        context
+            .authorize_file_action(metadata, route, SudoMode::Vault, &pins)
+            .is_err()
+    );
+    assert!(
+        context
+            .authorize_file_action(metadata, route, SudoMode::Passwordless, &[])
+            .is_err()
     );
 }
 
@@ -572,7 +1266,11 @@ fn scheduler_target_groups_allow_group_only_and_refuse_empty_or_oversized_groups
     let group = store.create_group(None, "Fleet").unwrap();
     let empty = store.create_group(None, "Empty").unwrap();
     let mut draft = Draft::default();
-    assert!(draft.add_connection_group(empty, &store).is_err());
+    assert!(
+        draft
+            .add_connection_group(empty.into(), &store, &SharedTargets::default())
+            .is_err()
+    );
     assert!(!draft.has_connection_groups());
     let id = store
         .save_in_group(grouped_connection("only.example.test"), Some(&group))
@@ -581,7 +1279,11 @@ fn scheduler_target_groups_allow_group_only_and_refuse_empty_or_oversized_groups
     draft.edit_command(text_editor::Action::Edit(text_editor::Edit::Paste(
         Arc::new("true".into()),
     )));
-    assert!(draft.add_connection_group(group.clone(), &store).unwrap());
+    assert!(
+        draft
+            .add_connection_group(group.clone().into(), &store, &SharedTargets::default())
+            .unwrap()
+    );
     let job_id = JobId::new("group-only").unwrap();
     let action = draft.build(job_id.clone()).unwrap().action().clone();
     assert!(action.target_groups.as_ref().unwrap().explicit.is_empty());
@@ -597,7 +1299,11 @@ fn scheduler_target_groups_allow_group_only_and_refuse_empty_or_oversized_groups
             )
             .unwrap();
     }
-    assert!(draft.refresh_connection_groups(&store).is_err());
+    assert!(
+        draft
+            .refresh_connection_groups(&store, &SharedTargets::default())
+            .is_err()
+    );
     assert_eq!(draft.build(job_id).unwrap().action(), &action);
 }
 
@@ -618,7 +1324,8 @@ fn scheduler_target_groups_keep_imported_swarm_selection_when_adopting_profile()
         })
         .collect::<Vec<ConnectionRef>>();
     let selection = TargetGroups {
-        groups: vec![group],
+        group_order: Vec::new(),
+        groups: vec![group.into()],
         explicit: Vec::new(),
     };
     let action: SshCommand = serde_json::from_value(serde_json::json!({
@@ -674,15 +1381,18 @@ fn scheduler_target_groups_refresh_bootstraps_and_removes_stale_selections() {
     app.update(Message::RefreshConnectionGroups);
     assert_eq!(
         app.runtime.connection_group_choices,
-        [first.clone(), second.clone()]
+        [
+            ConnectionGroup::from(first.clone()),
+            ConnectionGroup::from(second.clone())
+        ]
     );
     assert!(!app.view.dirty());
     app.update(Message::Edit(Field::Name, "Group recovery".into()));
     app.update(Message::EditCommand(text_editor::Action::Edit(
         text_editor::Edit::Paste(Arc::new("true".into())),
     )));
-    app.update(Message::ConnectionGroupAdded(first.clone()));
-    app.update(Message::ConnectionGroupAdded(second.clone()));
+    app.update(Message::ConnectionGroupAdded(first.clone().into()));
+    app.update(Message::ConnectionGroupAdded(second.clone().into()));
     let choice = ConnectionChoice::Saved {
         reference: store.get(b).unwrap().into(),
         name: "Explicit".into(),
@@ -719,10 +1429,10 @@ fn scheduler_target_groups_refresh_bootstraps_and_removes_stale_selections() {
     let two = store.get(b).unwrap().clone();
     store.save_in_group(one, None).unwrap();
     store.save_in_group(two, None).unwrap();
-    app.update(Message::ConnectionGroupRemoved(first));
+    app.update(Message::ConnectionGroupRemoved(first.into()));
     assert!(app.status().unwrap().contains("no saved SSH targets"));
     assert!(app.view.draft.build(job_id.clone()).is_err());
-    app.update(Message::ConnectionGroupRemoved(second));
+    app.update(Message::ConnectionGroupRemoved(second.into()));
     assert!(!app.view.draft.has_connection_groups());
     let choice = ConnectionChoice::Saved {
         reference: store.get(a).unwrap().into(),
@@ -745,6 +1455,7 @@ fn swarm_scheduler_handoff_builds_disabled_unapproved_draft() {
     use crate::ssh_dialog::LoginTarget;
 
     let targets = [1, 2].map(|id| ConnectionRef {
+        teamwork: None,
         id,
         target: LoginTarget {
             host: format!("host-{id}.example.test"),

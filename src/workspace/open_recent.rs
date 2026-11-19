@@ -24,14 +24,29 @@ pub(super) struct Preferences {
 enum RememberedProject {
     Named(String),
     File(projects::ProjectFile),
+    Imported {
+        imported_file: projects::ProjectFile,
+    },
 }
 
 impl RememberedProject {
     fn same_location(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Named(left), Self::Named(right)) => left == right,
-            (Self::File(left), Self::File(right)) => left.path() == right.path(),
-            _ => false,
+            _ => self
+                .file()
+                .zip(other.file())
+                .is_some_and(|(left, right)| left.path() == right.path()),
+        }
+    }
+
+    fn file(&self) -> Option<&projects::ProjectFile> {
+        match self {
+            Self::Named(_) => None,
+            Self::File(file)
+            | Self::Imported {
+                imported_file: file,
+            } => Some(file),
         }
     }
 }
@@ -49,9 +64,10 @@ impl Preferences {
             let valid = match &entry {
                 RememberedProject::Named(entry) => projects::Name::parse(entry)
                     .is_ok_and(|name| name.as_str() == entry && names.insert(name)),
-                RememberedProject::File(file) => {
-                    file.valid() && files.insert(file.path().to_owned())
-                }
+                RememberedProject::File(file)
+                | RememberedProject::Imported {
+                    imported_file: file,
+                } => file.valid() && files.insert(file.path().to_owned()),
             };
             if valid {
                 clean.push(entry);
@@ -63,10 +79,58 @@ impl Preferences {
         self.projects = clean;
     }
 
-    fn remember(&mut self, project: RememberedProject) {
-        self.projects.retain(|entry| !entry.same_location(&project));
+    fn remember(&mut self, project: RememberedProject, original: Option<&projects::ProjectFile>) {
+        self.projects.retain(|entry| {
+            !entry.same_location(&project)
+                && !entry
+                    .file()
+                    .zip(original)
+                    .is_some_and(|(entry, original)| entry.path() == original.path())
+        });
         self.projects.insert(0, project);
         self.projects.truncate(projects::RECENT_LIMIT);
+    }
+
+    pub(super) fn project_count(&self) -> usize {
+        self.projects.len()
+    }
+
+    pub(super) fn from_java(
+        cleared_at: Option<u64>,
+        paths: Option<roxmltree::Node<'_, '_>>,
+        omitted: &mut usize,
+    ) -> Option<Self> {
+        let mut history = Self {
+            cleared_at: cleared_at.unwrap_or_default(),
+            ..Self::default()
+        };
+        if let Some(paths) = paths {
+            for node in paths.children().filter(roxmltree::Node::is_element) {
+                let project = (history.projects.len() < projects::RECENT_LIMIT
+                    && node.has_tag_name("path")
+                    && node.tag_name().namespace().is_none()
+                    && node.attributes().next().is_none()
+                    && node.children().all(|child| child.is_text()))
+                .then(|| node.text())
+                .flatten()
+                .and_then(|path| projects::ProjectFile::new(path.into(), None).ok())
+                .map(|file| RememberedProject::Imported {
+                    imported_file: file,
+                });
+                match project {
+                    Some(project)
+                        if !history
+                            .projects
+                            .iter()
+                            .any(|entry| entry.same_location(&project)) =>
+                    {
+                        history.projects.push(project);
+                    }
+                    _ => *omitted += 1,
+                }
+            }
+        }
+        (!history.is_default()).then_some(history)
     }
 }
 
@@ -218,24 +282,26 @@ impl Workspace {
         owner: window::Id,
         name: &projects::Name,
     ) -> Task<Desktop> {
-        self.remember_recent_project(owner, RememberedProject::Named(name.as_str().into()))
+        self.remember_recent_project(owner, RememberedProject::Named(name.as_str().into()), None)
     }
 
     pub(super) fn remember_open_recent_project_file(
         &mut self,
         owner: window::Id,
         file: projects::ProjectFile,
+        original: Option<&projects::ProjectFile>,
     ) -> Task<Desktop> {
-        self.remember_recent_project(owner, RememberedProject::File(file))
+        self.remember_recent_project(owner, RememberedProject::File(file), original)
     }
 
     fn remember_recent_project(
         &mut self,
         owner: window::Id,
         project: RememberedProject,
+        original: Option<&projects::ProjectFile>,
     ) -> Task<Desktop> {
         let mut next = self.window_settings.open_recent.clone();
-        next.remember(project);
+        next.remember(project, original);
         if next != self.window_settings.open_recent {
             self.save_open_recent(Some(owner), next);
         }
@@ -281,7 +347,7 @@ fn project_entries(settings: &Preferences, store: Option<&projects::Store>) -> V
         .iter()
         .filter_map(|entry| match entry {
             RememberedProject::Named(name) => projects::Name::parse(name).ok(),
-            RememberedProject::File(_) => None,
+            RememberedProject::File(_) | RememberedProject::Imported { .. } => None,
         })
         .collect();
     let home = std::env::home_dir();
@@ -304,19 +370,26 @@ fn project_entries(settings: &Preferences, store: Option<&projects::Store>) -> V
                     recent.push(named_entry(named.remove(index)));
                 }
             }
-            RememberedProject::File(file) if file.is_present() => {
+            RememberedProject::File(file)
+            | RememberedProject::Imported {
+                imported_file: file,
+            } => {
+                let imported = matches!(entry, RememberedProject::Imported { .. });
+                if !imported && !file.is_present() {
+                    continue;
+                }
                 let folder = file
                     .path()
                     .parent()
                     .map(|path| folder_label(path, home.as_deref()))
                     .unwrap_or_default();
+                let prefix = if imported { "Imported: " } else { "" };
                 recent.push(Entry::ProjectFile {
-                    label: menu_label(&format!("{} — {folder}", file.display_name())),
+                    label: menu_label(&format!("{prefix}{} — {folder}", file.display_name())),
                     file: file.clone(),
                     cleared_at: settings.cleared_at,
                 });
             }
-            RememberedProject::File(_) => {}
         }
     }
     let remaining = projects::RECENT_LIMIT.saturating_sub(recent.len());
@@ -406,6 +479,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn java_open_recent_restores_order_and_keeps_imported_paths_unprobed() {
+        use crate::workspace::backup_data::{
+            merge_java_window_settings, portable_java_preferences,
+        };
+        use std::collections::BTreeMap;
+
+        #[cfg(windows)]
+        let root = r"C:\kortty-recent-backup-fixture";
+        #[cfg(not(windows))]
+        let root = "/kortty-recent-backup-fixture";
+        let xml = format!(
+            "<globalSettings><openRecentClearedAt>1234000</openRecentClearedAt>
+                <recentProjectPaths>
+                    <path>{root}/second/Release.kortty</path>
+                    <path>{root}/first/Release.kortty</path>
+                    <path>{root}/second/Release.kortty</path>
+                    <path>relative.kortty</path>
+                    <path>{root}/unrelated.txt</path>
+                </recentProjectPaths></globalSettings>"
+        );
+        let java = portable_java_preferences(xml.as_bytes(), None).unwrap();
+        assert_eq!(java.recent_projects, 2);
+        assert_eq!(java.omitted, 3);
+        assert!(java.recent_list_cutoff);
+        let incoming = java.contents.unwrap();
+        let installed = merge_java_window_settings(None, &incoming, &BTreeMap::new())
+            .unwrap()
+            .unwrap();
+        let mut history: Preferences = serde_json::from_value(
+            serde_json::from_slice::<serde_json::Value>(&installed).unwrap()["open_recent"].clone(),
+        )
+        .unwrap();
+        history.normalize();
+        assert_eq!(history.cleared_at, 1234000);
+        let recent = project_entries(&history, None);
+        assert_eq!(recent.len(), 2);
+        assert!(recent[0].label().starts_with("Imported: Release"));
+        assert!(recent[0].label().contains("second"));
+        assert!(recent[1].label().contains("first"));
+        let Entry::ProjectFile { file, .. } = &recent[0] else {
+            panic!("expected an imported project file");
+        };
+        let resolved =
+            projects::ProjectFile::new(file.path().with_file_name("Resolved.kortty"), None)
+                .unwrap();
+        history.remember(RememberedProject::File(resolved.clone()), Some(file));
+        assert_eq!(history.projects.len(), 2);
+        assert!(matches!(&history.projects[0], RememberedProject::File(file) if file == &resolved));
+
+        let local = br#"{"open_recent":{"cleared_at":9876,"projects":["Local"]}}"#;
+        assert!(
+            merge_java_window_settings(Some(local), &incoming, &BTreeMap::new())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn open_recent_project_files_keep_equal_filenames_distinct_and_drop_missing_paths()
     -> std::io::Result<()> {
         use std::fs;
@@ -429,9 +560,9 @@ mod tests {
             fs::write(file.path(), b"fixture")?;
         }
         let mut prefs: Preferences = serde_json::from_str(r#"{"projects":["Legacy"]}"#)?;
-        prefs.remember(RememberedProject::File(first.clone()));
-        prefs.remember(RememberedProject::File(second.clone()));
-        prefs.remember(RememberedProject::File(first.clone()));
+        prefs.remember(RememberedProject::File(first.clone()), None);
+        prefs.remember(RememberedProject::File(second.clone()), None);
+        prefs.remember(RememberedProject::File(first.clone()), None);
         let mut reloaded: Preferences = serde_json::from_slice(&serde_json::to_vec(&prefs)?)?;
         reloaded.normalize();
         assert_eq!(reloaded, prefs);

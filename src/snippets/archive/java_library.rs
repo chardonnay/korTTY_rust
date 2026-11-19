@@ -84,12 +84,12 @@ fn read_snippet(
             }
             "diagrams" => diagrams = Some(field),
             "executable" => entry.executable = Some(java_boolean(&xml_text(field)?)?),
-            "favorite"
-            | "usageCount"
-            | "lastUsed"
-            | "createdAt"
-            | "modifiedAt"
-            | "codeTextLanguageCode" => {
+            "favorite" => entry.stats.favorite = java_boolean(&xml_text(field)?).unwrap_or(false),
+            "createdAt" => entry.stats.created_at = java_timestamp(&xml_text(field)?),
+            "modifiedAt" => entry.stats.modified_at = java_timestamp(&xml_text(field)?),
+            "usageCount" => entry.stats.usage_count = xml_text(field)?.trim().parse().unwrap_or(0),
+            "lastUsed" => entry.stats.last_used = java_timestamp(&xml_text(field)?),
+            "codeTextLanguageCode" => {
                 xml_text(field)?;
             }
             "folderPath" | "savedDiagrams" => {
@@ -119,6 +119,14 @@ fn read_snippet(
     }
     imports.structured.push(entry.into_input(Some(id))?);
     Ok(())
+}
+
+fn java_timestamp(value: &str) -> Option<jiff::Timestamp> {
+    let millis = value.trim().parse::<i64>().ok()?;
+    if millis <= 0 {
+        return None;
+    }
+    jiff::Timestamp::from_millisecond(millis).ok()
 }
 
 fn java_boolean(value: &str) -> io::Result<bool> {

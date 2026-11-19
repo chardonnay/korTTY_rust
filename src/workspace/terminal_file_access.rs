@@ -303,6 +303,8 @@ impl Workspace {
                             };
                     }
                     let (id, task) = self.insert_native_editor(editor, loaded);
+                    let focused = self.allocate();
+                    self.snippet_editor_owners.insert(id, (owner, focused));
                     if remote {
                         self.terminal_files.remote_editors.insert(id, session);
                     }

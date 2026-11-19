@@ -50,6 +50,14 @@ impl ReviewedRoute {
         &self.identity
     }
 
+    pub(crate) fn endpoint(&self) -> &LoginTarget {
+        &self.target.endpoint
+    }
+
+    pub(crate) fn jump(&self) -> Option<&LoginTarget> {
+        self.jump.as_ref().map(|login| &login.endpoint)
+    }
+
     pub(crate) fn matches(&self, entry: &Entry) -> bool {
         *self == Self::from(entry)
     }

@@ -1,6 +1,6 @@
 //! Native toolbar rows and their in-window customization panel.
 
-use std::borrow::Cow;
+use std::{borrow::Cow, fmt};
 
 use iced::widget::{
     button, checkbox, column, container, mouse_area, pick_list, row, scrollable, slider, space,
@@ -9,13 +9,25 @@ use iced::widget::{
 use iced::{Alignment, Element, Length, Task, mouse, window};
 
 use super::toolbar_settings::{
-    Catalog, Draft, Edit, Group, Item, Layout, Location, MAX_ICON, MIN_ICON, Row,
+    Catalog, Draft, Edit, Group, Item, JavaTarget, Layout, Location, MAX_ICON, MIN_ICON, Row,
 };
 use super::{
     Action, Category, ChromeColors, Icon, Message, Navigation, OpenToolbarOverflow, ToolbarMessage,
     Workspace, WorkspaceMessage, button_style, divider, menu_popup, next_item, popup,
     settings_window, toolbar_drag, toolbar_strip, wrap,
 };
+
+#[derive(Clone, PartialEq)]
+struct AssignmentChoice {
+    destination: Item,
+    label: String,
+}
+
+impl fmt::Display for AssignmentChoice {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.label)
+    }
+}
 
 impl Workspace {
     pub(in crate::workspace) fn icon_toolbar(
@@ -681,6 +693,52 @@ impl Workspace {
         if draft.selected.is_some() {
             options = options.push(selection.wrap());
         }
+        if can_edit && let Some((location, Item::Unavailable(target))) = draft.selected_item() {
+            let (placeholder, choices) = match target {
+                JavaTarget::Connection(_) => (
+                    "Assign saved connection…",
+                    toolbar
+                        .connections()
+                        .iter()
+                        .map(|connection| AssignmentChoice {
+                            destination: Item::Connection(connection.id),
+                            label: connection.assignment_label.clone(),
+                        })
+                        .collect(),
+                ),
+                JavaTarget::Folder(_) => (
+                    "Assign saved group…",
+                    toolbar
+                        .folders()
+                        .iter()
+                        .filter(|folder| folder.populated)
+                        .map(|folder| AssignmentChoice {
+                            destination: Item::Folder(folder.path.clone()),
+                            label: folder.path.clone(),
+                        })
+                        .collect(),
+                ),
+                JavaTarget::Action(_) => ("", Vec::new()),
+            };
+            if !choices.is_empty() {
+                let target = draft.item_context.target(location);
+                let picker = pick_list(choices, None::<AssignmentChoice>, move |choice| {
+                    edit(
+                        id,
+                        Edit::AssignJavaTarget(target.clone(), choice.destination),
+                    )
+                })
+                .placeholder(placeholder)
+                .width(Length::Fill);
+                options = options.push(picker);
+            } else if !matches!(target, JavaTarget::Action(_)) {
+                options = options.push(
+                    text("No saved targets are available.")
+                        .size(12)
+                        .color(colors.muted),
+                );
+            }
+        }
         if !layout.has_room() {
             options = options.push(
                 text("Toolbar item limit reached.")
@@ -894,6 +952,11 @@ impl Workspace {
         match message {
             ToolbarMessage::Edit(id, Edit::ItemContext(_)) if self.owner_dialog(id).is_some() => {
                 self.chrome.toolbar.dismiss_item_menu(id);
+                Task::none()
+            }
+            ToolbarMessage::Edit(id, Edit::AssignJavaTarget(..))
+                if self.owner_dialog(id).is_some() =>
+            {
                 Task::none()
             }
             ToolbarMessage::Connect(id, connection) => self.open_recent_connection(id, connection),

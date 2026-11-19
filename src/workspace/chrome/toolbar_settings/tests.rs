@@ -381,6 +381,97 @@ fn drafts_are_window_local_and_reset_only_restores_items() {
 }
 
 #[test]
+fn unresolved_java_buttons_can_be_reassigned_in_place_to_current_saved_targets() -> io::Result<()> {
+    let scratch = Scratch::new()?;
+    let directory = crate::private_files::Directory::open(&scratch.0, false)?;
+    let (catalogue, _) = crate::connection_store::import::Preview::java_backup(br#"<connections>
+        <connection><name>Ops login</name><host>ops.example</host><username>user</username><group>Ops</group></connection>
+    </connections>"#)?.portable_java_backup()?;
+    directory.publish_copy("connections.json", &catalogue)?;
+    let store = Store::open(scratch.0.join("connections.json"))?;
+    let connection_id = store.connections()[0].id;
+    let mut toolbar = Toolbar::default();
+    toolbar.layout.connections.items = vec![
+        Item::Unavailable(JavaTarget::Connection("old-ssh".into())),
+        Item::Separator,
+        Item::Unavailable(JavaTarget::Folder("old-group".into())),
+    ];
+    let owner = window::Id::unique();
+    let other = window::Id::unique();
+    let connection = Location {
+        group: Group::Connections,
+        index: 0,
+    };
+    let folder = Location {
+        group: Group::Connections,
+        index: 2,
+    };
+    toolbar.refresh_connections(&store);
+    assert!(
+        toolbar.connections()[0]
+            .assignment_label
+            .contains("Ops / Ops login · SSH user@ops.example:22")
+    );
+    let _ = toolbar.update(Message::Open(owner, Catalog::Connections));
+    let _ = toolbar.update(Message::Edit(owner, Edit::Pick(connection)));
+    let stale = toolbar
+        .draft(owner)
+        .unwrap()
+        .item_context
+        .target(connection);
+    toolbar.refresh_connections(&store);
+    let current = toolbar
+        .draft(owner)
+        .unwrap()
+        .item_context
+        .target(connection);
+    for (window, target, destination) in [
+        (owner, stale, Item::Connection(connection_id)),
+        (other, current.clone(), Item::Connection(connection_id)),
+        (owner, current.clone(), Item::Connection(connection_id + 1)),
+        (owner, current.clone(), Item::Folder("Ops".into())),
+    ] {
+        let _ = toolbar.update(Message::Edit(
+            window,
+            Edit::AssignJavaTarget(target, destination),
+        ));
+        assert!(matches!(
+            toolbar.layout(owner).item(connection),
+            Some(Item::Unavailable(_))
+        ));
+    }
+    let _ = toolbar.update(Message::Edit(
+        owner,
+        Edit::AssignJavaTarget(current, Item::Connection(connection_id)),
+    ));
+    let _ = toolbar.update(Message::Edit(owner, Edit::Pick(folder)));
+    let target = toolbar.draft(owner).unwrap().item_context.target(folder);
+    let _ = toolbar.update(Message::Edit(
+        owner,
+        Edit::AssignJavaTarget(target, Item::Folder("Ops".into())),
+    ));
+    let expected = [
+        Item::Connection(connection_id),
+        Item::Separator,
+        Item::Folder("Ops".into()),
+    ];
+    assert_eq!(toolbar.layout(owner).items(Group::Connections), expected);
+    let path = scratch.0.join("toolbar.json");
+    save_to(&path, toolbar.layout(owner).clone())?;
+    assert_eq!(load_from(&path)?.items(Group::Connections), expected);
+    let _ = toolbar.update(Message::Cancel(owner));
+    assert!(matches!(
+        toolbar.layout(owner).item(connection),
+        Some(Item::Unavailable(_))
+    ));
+    assert!(matches!(
+        toolbar.layout(owner).item(folder),
+        Some(Item::Unavailable(_))
+    ));
+    Ok(())
+}
+
+#[test]
 fn drag_places_existing_and_catalog_items_and_cancels_stale_sources() {
     let owner = window::Id::unique();
     let mut draft = Draft {

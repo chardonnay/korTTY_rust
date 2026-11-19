@@ -1,6 +1,6 @@
 //! A separate generation review. Generated code is returned as an unsaved snippet.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 
 use iced::widget::{
@@ -17,6 +17,7 @@ use crate::terminal_agent::swarm::workflow::{
     self as engine, Draft, Header, HeaderFacts, Hosts, Language, Options, Request,
 };
 use crate::terminal_logging::{Policy, Redactor, Secrets};
+use crate::workspace::question_history::{History, Kind, MAX_WORKFLOW_INSTRUCTIONS};
 
 use super::super::knowledge_review;
 use super::super::request_review::{CliPresentation, OutboundAuthority};
@@ -31,7 +32,8 @@ pub enum Message {
     HostSource(HostSource),
     Hosts(text_editor::Action),
     Inventory(String),
-    Instructions(String),
+    Instructions(text_editor::Action),
+    RecallInstructions(String),
     Parallelism(String),
     Timeout(String),
     Retries(String),
@@ -80,7 +82,9 @@ pub(super) struct Form {
     host_source: HostSource,
     hosts: text_editor::Content,
     inventory: String,
-    instructions: String,
+    instructions: text_editor::Content,
+    history: Option<(PathBuf, History)>,
+    history_error: Option<String>,
     parallelism: String,
     timeout: String,
     retries: String,
@@ -253,7 +257,9 @@ impl Default for Form {
             host_source: HostSource::default(),
             hosts: text_editor::Content::new(),
             inventory: String::new(),
-            instructions: String::new(),
+            instructions: text_editor::Content::new(),
+            history: None,
+            history_error: None,
             parallelism: String::new(),
             timeout: options.timeout_seconds.to_string(),
             retries: options.retries.to_string(),
@@ -269,9 +275,14 @@ impl Default for Form {
 }
 
 impl Form {
-    pub(super) fn new(generation: u64) -> Self {
+    pub(super) fn new(generation: u64, history_root: Option<&Path>) -> Self {
         Self {
             generation,
+            history: history_root.and_then(|root| {
+                History::load_at(root, Kind::Workflow)
+                    .ok()
+                    .map(|history| (root.to_owned(), history))
+            }),
             ..Self::default()
         }
     }
@@ -336,7 +347,7 @@ impl Form {
             options,
             hardening,
             goal,
-            instructions: self.instructions.clone(),
+            instructions: self.instructions.text().trim().to_owned(),
         }
         .input(mask)
     }
@@ -413,6 +424,27 @@ impl Form {
             header.clone(),
             move || dispatch.require_dispatch(),
         )?;
+        if let Some((root, history)) = &mut self.history
+            && let Ok(input) = serde_json::from_str::<serde_json::Value>(input)
+            && let Some(instructions) = input["instructions"]
+                .as_str()
+                .filter(|value| !value.is_empty())
+        {
+            let recorded = History::load_at(root, Kind::Workflow).and_then(|mut current| {
+                current.update_at(root, |history| history.record(instructions.to_owned()))?;
+                Ok(current)
+            });
+            match recorded {
+                Ok(current) => {
+                    *history = current;
+                    self.history_error = None;
+                }
+                Err(error) => {
+                    self.history_error =
+                        Some(format!("Could not save instruction history ({error})."))
+                }
+            }
+        }
         self.stage = Stage::Waiting {
             _cancel: pending.cancel,
             authority: Arc::clone(authority),
@@ -463,7 +495,17 @@ impl Form {
             Message::HostSource(value) => self.host_source = value,
             Message::Hosts(action) => super::edit_bounded(&mut self.hosts, action, 8192),
             Message::Inventory(value) if value.len() <= 4096 => self.inventory = value,
-            Message::Instructions(value) if value.len() <= 4096 => self.instructions = value,
+            Message::Instructions(action) => {
+                super::edit_bounded(&mut self.instructions, action, MAX_WORKFLOW_INSTRUCTIONS);
+            }
+            Message::RecallInstructions(value)
+                if self
+                    .history
+                    .as_ref()
+                    .is_some_and(|(_, history)| history.entries().contains(&value)) =>
+            {
+                self.instructions = text_editor::Content::with_text(&value);
+            }
             Message::Parallelism(value) if value.len() <= 3 => self.parallelism = value,
             Message::Timeout(value) if value.len() <= 4 => self.timeout = value,
             Message::Retries(value) if value.len() <= 2 => self.retries = value,
@@ -588,8 +630,29 @@ impl Form {
                 };
                 form = form
                     .push(
-                        text_input("Additional instructions", &self.instructions)
-                            .on_input(Message::Instructions),
+                        text_editor(&self.instructions)
+                            .placeholder("Additional instructions")
+                            .height(80)
+                            .on_action(Message::Instructions),
+                    )
+                    .push(
+                        self.history
+                            .as_ref()
+                            .filter(|(_, history)| !history.entries().is_empty())
+                            .map(|(_, history)| {
+                                pick_list(
+                                    history.entries(),
+                                    None::<String>,
+                                    Message::RecallInstructions,
+                                )
+                                .placeholder("Instruction history")
+                                .width(Length::Fill)
+                            }),
+                    )
+                    .push(
+                        self.history_error
+                            .as_ref()
+                            .map(|error| text(error).size(13)),
                     )
                     .push(
                         row![

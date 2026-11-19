@@ -72,7 +72,7 @@ pub enum Outcome {
 #[derive(Default)]
 pub(super) struct Panel {
     browser: Option<Browser>,
-    from_recent_file: bool,
+    from_recent_file: Option<ProjectFile>,
     name: String,
     names: Vec<Name>,
     java_project: String,
@@ -194,7 +194,7 @@ impl Workspace {
         state.cancel_paste();
         state.projects = Some(Panel {
             browser: Some(Browser::new(Mode::Open)),
-            from_recent_file: true,
+            from_recent_file: Some(file.clone()),
             ..Panel::default()
         });
         let request = self.begin_project_work(window);
@@ -521,7 +521,7 @@ impl Workspace {
                             notice.push_str(&warning);
                         }
                         self.notice(window, notice);
-                        return self.remember_open_recent_project_file(window, source);
+                        return self.remember_open_recent_project_file(window, source, None);
                     }
                     Err(error) => {
                         panel.notice = Some(format!("Project operation failed ({error})"));
@@ -545,7 +545,7 @@ impl Workspace {
                                 Phase::Confirm(request, Confirmation::SaveFile(draft)),
                             );
                         }
-                        Confirmation::Open { .. } if panel.from_recent_file => {
+                        Confirmation::Open { .. } if panel.from_recent_file.is_some() => {
                             self.windows
                                 .get_mut(&window)
                                 .expect("project window")
@@ -649,6 +649,13 @@ impl Workspace {
             Intent::Open(folder, file) => {
                 if !self.project_open_allowed(window) {
                     return Task::none();
+                }
+                if let Some(panel) = self
+                    .windows
+                    .get_mut(&window)
+                    .and_then(|state| state.projects.as_mut())
+                {
+                    panel.from_recent_file = None;
                 }
                 let request = self.begin_project_work(window);
                 run(window, request, move || {
@@ -813,10 +820,13 @@ impl Workspace {
         }
         match self.restore_layout_into_with_tools(&layout, Some(owner), approved) {
             Ok((windows, restored)) => {
-                self.windows
+                let recent_file = self
+                    .windows
                     .get_mut(&owner)
                     .expect("project window")
-                    .projects = None;
+                    .projects
+                    .take()
+                    .and_then(|panel| panel.from_recent_file);
                 self.notice(owner, format!("Project {} opened.", target.name()));
                 self.session_restore.changed(false);
                 let recent = match target {
@@ -827,7 +837,7 @@ impl Workspace {
                         if reconnect {
                             self.queue_project_reconnects(&windows);
                         }
-                        self.remember_open_recent_project_file(owner, source)
+                        self.remember_open_recent_project_file(owner, source, recent_file.as_ref())
                     }
                 };
                 Task::batch([restored.chain(window::gain_focus(owner)), recent])

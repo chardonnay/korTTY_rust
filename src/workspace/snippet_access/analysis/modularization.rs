@@ -42,6 +42,7 @@ pub(super) struct Preview {
     outbound: Option<Box<OutboundReview>>,
     local_profile_revision: Option<[u8; 32]>,
     masked_source: bool,
+    includes_additional_instructions: bool,
     prompt: String,
     parts: Vec<Range<usize>>,
     page: usize,
@@ -849,6 +850,7 @@ impl Workspace {
             .ai_configuration()
             .filter(|_| !self.exiting && !self.scheduler_draining);
         let approval = self.allocate();
+        let instructions_enabled = self.window_settings.snippet_ai_additional_instructions();
         let vault_change = self.vault_change_revision();
         let policy = &self.clipboard.policy;
         let vault = self.vault.as_ref();
@@ -960,21 +962,37 @@ impl Workspace {
                     .zip(capture.snapshot.files())
                     .any(|(masked, original)| masked.content != original.content)
             });
-            let (guidance, instructions) = followup.as_ref().map_or_else(
-                || {
-                    (
-                        config.reviewed_snippet_skill_guidance(&page.selected_skills),
-                        page.instructions.as_str(),
-                    )
-                },
-                |followup| (followup.guidance.clone(), followup.instructions.as_str()),
+            let guidance = followup.as_ref().map_or_else(
+                || config.reviewed_snippet_skill_guidance(&page.selected_skills),
+                |followup| followup.guidance.clone(),
             );
+            let planning = matches!(action, Action::Plan);
+            let allows_instructions = page.allows_additional_instructions(instructions_enabled);
+            let existing_generation = record
+                .modularization
+                .as_ref()
+                .and_then(|job| job.generation.as_ref());
+            let instructions = if planning {
+                match &followup {
+                    Some(followup) if allows_instructions => followup.instructions.as_str(),
+                    Some(_) => "",
+                    None => page.additional_instructions(instructions_enabled),
+                }
+            } else if let Some(generation) = existing_generation {
+                if !allows_instructions && !generation.instructions.trim().is_empty() {
+                    return Err("This saved generation includes additional instructions. Enable the snippet editor setting to review it again.".into());
+                }
+                generation.instructions.as_str()
+            } else {
+                page.additional_instructions(instructions_enabled)
+            };
+            let includes_additional_instructions = !instructions.trim().is_empty();
             let mask = |text: &str| {
                 outbound
                     .as_ref()
                     .map_or_else(|| Ok(text.to_owned()), |review| review.masking.text(text))
             };
-            let (request, prompt, guidance) = if matches!(action, Action::Plan) {
+            let (request, prompt, guidance) = if planning {
                 if record
                     .modularization
                     .as_deref()
@@ -1025,9 +1043,6 @@ impl Workspace {
                     || config.code_text_language(),
                     |generation| generation.code_text_language,
                 );
-                let instructions = existing.map_or(page.instructions.as_str(), |generation| {
-                    &generation.instructions
-                });
                 let skills =
                     existing.map_or(guidance.text.as_str(), |generation| &generation.skills);
                 let instructions = mask(instructions)?;
@@ -1104,6 +1119,7 @@ impl Workspace {
                 outbound,
                 local_profile_revision,
                 masked_source,
+                includes_additional_instructions,
                 parts: apply::parts(&prompt),
                 prompt,
                 page: 0,
@@ -1165,6 +1181,7 @@ impl Workspace {
             .ai_configuration()
             .filter(|_| !self.exiting && !self.scheduler_draining);
         let token = self.allocate();
+        let instructions_enabled = self.window_settings.snippet_ai_additional_instructions();
         let policy = &self.clipboard.policy;
         let vault = self.vault.as_ref();
         let Some(surface) = self.snippets.get_mut(&id) else {
@@ -1181,6 +1198,8 @@ impl Workspace {
         let spawn = (|| {
             if !config.is_some_and(|config| Arc::ptr_eq(&config, &preview.config))
                 || !preview.capture.matches(&surface.window, page)
+                || (preview.includes_additional_instructions
+                    && !page.allows_additional_instructions(instructions_enabled))
             {
                 return Err("The source or AI settings changed. Review the request again.".into());
             }

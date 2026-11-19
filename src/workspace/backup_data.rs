@@ -12,6 +12,7 @@ use crate::diagram_window::appearance as diagram_appearance;
 use crate::scheduler_window::DiagramColorMode;
 use crate::session_journal::automation::Options as SwarmJournalOptions;
 use crate::session_journal::markers;
+use crate::snippet_window::ai_assist::FontView;
 use crate::snippet_window::analysis::{MAX_REPORT_FONT, MIN_REPORT_FONT};
 use crate::terminal_view::background_image::AssetId;
 
@@ -25,6 +26,7 @@ use super::{
         REMOTE_SIDEBAR_MIN_WIDTH, WindowSettings,
     },
     terminal_agent::design::{DockPlacement as AgentDockPlacement, DockPreferences as AgentDock},
+    terminal_agent::shortcut::{HISTORY_POPUP_HEIGHT, HISTORY_POPUP_WIDTH},
     terminal_notifications,
 };
 
@@ -35,12 +37,14 @@ mod hardening;
 mod journal;
 mod maintenance;
 pub(crate) mod recording;
+pub(super) mod session_recovery;
 mod sftp;
 mod snippet_languages;
 mod startup;
 pub(super) mod teamwork;
 mod terminal_defaults;
 mod terminal_input;
+pub(crate) mod workflow_headers;
 
 const DISPLAY_SECTION: &str = "java_display_preferences";
 const JAVA_SETTINGS_BYTES: usize = 4 * 1024 * 1024;
@@ -69,10 +73,16 @@ struct JavaDisplayPreferences {
     journal_screenshot_geometry: Option<super::journal_access::dialog_geometry::Geometry>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     java_dialog_geometry: dialog_geometry::Placements,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    java_workflow_header_defaults: workflow_headers::References,
     #[serde(skip_serializing_if = "JavaLocalDock::is_empty")]
     java_local_dock: JavaLocalDock,
     #[serde(skip_serializing_if = "AgentDock::is_empty")]
     ai_agent_panel: AgentDock,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ai_agent_design_auto_hide_seconds: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ai_agent_design_reduced_animations: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     scheduler_journal_divider: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -83,6 +93,8 @@ struct JavaDisplayPreferences {
     java_swarm_journal: Option<SwarmJournalOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     open_tool_windows_as_tabs: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    open_recent: Option<super::open_recent::Preferences>,
     #[serde(skip_serializing_if = "Option::is_none")]
     connection_color_border_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -104,11 +116,53 @@ struct JavaDisplayPreferences {
     #[serde(skip_serializing_if = "Option::is_none")]
     job_menu_status_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    prevent_system_sleep: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     journal_note_translation_language: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     snippet_translation_target_language: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     snippet_alternative_count: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snippet_completion_shortcut: Option<super::SnippetCompletionChord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snippet_ai_additional_instructions: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snippet_ai_alternatives_font_size: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snippet_ai_diff_font_size: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snippet_ai_diff_summary_divider: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snippet_ai_review_font_size: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snippet_ai_description_font_size: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snippet_security_report_font_size: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ai_result_font_size: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quick_connect_expanded_sections: Option<super::quick_connect::ExpandedSections>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quick_connect_effect_speed: Option<crate::terminal_effects::Speed>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quick_connect_appearance: Option<crate::connection_store::TerminalAppearance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_activity_font_size: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_plan_font_size: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_remember_activity_font: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_activity_height: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_activity_keep_collapsed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_activity_expand_all: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snippet_library_divider: Option<u16>,
+    #[serde(skip_serializing_if = "crate::snippet_window::library_columns::Widths::is_empty")]
+    snippet_library_columns: crate::snippet_window::library_columns::Widths,
     #[serde(skip_serializing_if = "Option::is_none")]
     scheduler_diagram_horizontal: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -132,7 +186,17 @@ struct JavaDisplayPreferences {
     #[serde(skip_serializing_if = "Option::is_none")]
     manual_scale: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    agent_history_popup_width: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_history_popup_height: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     ascii_art_preview_font_size: Option<f64>,
+    #[serde(skip_serializing_if = "super::ascii_art::ImportedPreferences::is_empty")]
+    ascii_art_java: super::ascii_art::ImportedPreferences,
+    #[serde(skip_serializing_if = "crate::profile_backup::preferences::JavaDefaults::is_empty")]
+    java_backup_defaults: crate::profile_backup::preferences::JavaDefaults,
+    #[serde(skip_serializing_if = "session_recovery::Preferences::is_empty")]
+    java_session_restore: session_recovery::Preferences,
     #[serde(skip_serializing_if = "Option::is_none")]
     snippet_analysis_report_font_size: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -454,6 +518,18 @@ fn merge_unset_section(
 
 impl JavaDisplayPreferences {
     fn fields(&self) -> io::Result<RawFields> {
+        if let Some(appearance) = &self.quick_connect_appearance {
+            appearance.validate()?;
+        }
+        if !self.ascii_art_java.valid() {
+            return Err(io::Error::other("Invalid Java ASCII Art preferences"));
+        }
+        if !self.java_backup_defaults.valid() {
+            return Err(io::Error::other("Invalid Java backup preferences"));
+        }
+        if !self.java_session_restore.valid() {
+            return Err(io::Error::other("Invalid Java session restore preferences"));
+        }
         if let Some(proposals) = &self.java_teamwork {
             proposals.validate()?;
         }
@@ -466,6 +542,16 @@ impl JavaDisplayPreferences {
             return Err(io::Error::other("Invalid Java Agent panel width"));
         }
         if self
+            .ai_agent_design_auto_hide_seconds
+            .is_some_and(|seconds| {
+                !super::terminal_agent::design::AUTO_HIDE_SECONDS.contains(&seconds)
+            })
+        {
+            return Err(io::Error::other(
+                "Invalid Java Agent status auto-hide delay",
+            ));
+        }
+        if self
             .snippet_hardening
             .as_ref()
             .is_some_and(|settings| !settings.valid())
@@ -474,6 +560,11 @@ impl JavaDisplayPreferences {
         }
         if !crate::snippet_window::languages::valid(&self.custom_snippet_code_languages) {
             return Err(io::Error::other("Invalid Java snippet language catalogue"));
+        }
+        if !self.snippet_library_columns.valid() {
+            return Err(io::Error::other(
+                "Invalid Java snippet library column widths",
+            ));
         }
         if self
             .workflow_script_font
@@ -491,11 +582,50 @@ impl JavaDisplayPreferences {
                 .manual_scale
                 .is_some_and(|scale| !(MIN_MANUAL_SCALE..=MAX_MANUAL_SCALE).contains(&scale))
             || self
+                .agent_history_popup_width
+                .is_some_and(|width| !HISTORY_POPUP_WIDTH.contains(&width))
+            || self
+                .agent_history_popup_height
+                .is_some_and(|height| !HISTORY_POPUP_HEIGHT.contains(&height))
+            || self
                 .ascii_art_preview_font_size
                 .is_some_and(|size| !super::ascii_art::valid_preview_font(size))
             || self.snippet_alternative_count.is_some_and(|count| {
                 !crate::snippet_window::ai_assist::ALTERNATIVE_COUNTS.contains(&count)
             })
+            || [
+                (
+                    FontView::Alternatives,
+                    self.snippet_ai_alternatives_font_size,
+                ),
+                (FontView::Diff, self.snippet_ai_diff_font_size),
+                (FontView::Review, self.snippet_ai_review_font_size),
+                (FontView::Description, self.snippet_ai_description_font_size),
+                (
+                    FontView::SecurityReport,
+                    self.snippet_security_report_font_size,
+                ),
+            ]
+            .into_iter()
+            .any(|(view, size)| size.is_some_and(|size| !view.bounds().contains(&size)))
+            || self
+                .ai_result_font_size
+                .is_some_and(|size| !super::terminal_ai::CHAT_RESULT_FONT_RANGE.contains(&size))
+            || self
+                .agent_activity_font_size
+                .is_some_and(|size| !super::terminal_agent::font::View::Activity.valid(size))
+            || self
+                .agent_plan_font_size
+                .is_some_and(|size| !super::terminal_agent::font::View::Plan.valid(size))
+            || self
+                .agent_activity_height
+                .is_some_and(|size| !super::terminal_agent::design::Height::valid(size))
+            || self
+                .snippet_ai_diff_summary_divider
+                .is_some_and(|parts| !crate::snippet_window::diff_summary::valid(parts))
+            || self
+                .snippet_library_divider
+                .is_some_and(|parts| !crate::snippet_window::LIBRARY_DIVIDER_RANGE.contains(&parts))
             || self
                 .snippet_analysis_report_font_size
                 .is_some_and(|size| !(MIN_REPORT_FONT..=MAX_REPORT_FONT).contains(&size))
@@ -550,16 +680,24 @@ impl JavaDisplayPreferences {
         fields.remove("key_bindings");
         fields.remove("maintenance");
         fields.remove("java_dialog_geometry");
+        fields.remove("snippet_library_columns");
+        fields.remove("java_workflow_header_defaults");
         fields.remove("java_local_dock");
         fields.remove("ai_agent_panel");
+        fields.remove("ascii_art_java");
+        fields.remove("java_backup_defaults");
+        fields.remove("java_session_restore");
         Ok(fields)
     }
 }
 
 pub(crate) struct JavaPreferences {
     pub(crate) teamwork_proposals: usize,
+    pub(crate) scheduler_teamwork_origins:
+        std::collections::BTreeMap<String, crate::connection_store::teamwork::Origin>,
     pub(crate) swarm_journal_proposal: bool,
     pub(crate) java_update_opt_in: bool,
+    pub(crate) session_restore_preferences: usize,
     pub(crate) java_log_directory: bool,
     pub(crate) contents: Option<Vec<u8>>,
     pub(crate) count: usize,
@@ -568,6 +706,14 @@ pub(crate) struct JavaPreferences {
     pub(crate) markers: markers::java::Import,
     pub(crate) highlights: io::Result<crate::terminal_highlight::JavaBackupImport>,
     pub(crate) toolbar: Option<java_toolbar::Source>,
+    pub(crate) snippet_tabs: crate::snippet_window::session::State,
+    pub(crate) workflow_header_defaults: usize,
+    pub(crate) manual_questions: Option<(Vec<u8>, usize)>,
+    pub(crate) terminal_questions: Option<(Vec<u8>, usize)>,
+    pub(crate) workflow_instructions: Option<(Vec<u8>, usize)>,
+    pub(crate) agent_history: Option<(Vec<u8>, usize)>,
+    pub(crate) recent_projects: usize,
+    pub(crate) recent_list_cutoff: bool,
     pub(crate) sftp_overwrite: bool,
     pub(crate) paste_warning_off: bool,
     pub(crate) analysis_export_includes_code: bool,
@@ -631,6 +777,9 @@ pub(crate) fn portable_java_preferences(
     let recording = recording::read(root)?;
     let markers = markers::java::read(root)?;
     let mut omitted = 0;
+    let snippet_tabs = read_snippet_workspace(root, &mut omitted);
+    let java_workflow_header_defaults = workflow_headers::read(root, &mut omitted);
+    let workflow_header_defaults = java_workflow_header_defaults.len();
     let journal_live_log_height = preference(
         root,
         "sessionJournalLiveTailHeightVh",
@@ -667,6 +816,56 @@ pub(crate) fn portable_java_preferences(
     );
     let toolbar = java_toolbar::read(root, icon_size, &mut omitted);
     let manual_scale = java_guide_scale(root, &mut omitted);
+    let recent_list_cutoff = preference(root, "openRecentClearedAt", &mut omitted, |value| {
+        value
+            .parse::<u64>()
+            .ok()
+            .filter(|cutoff| *cutoff <= crate::connection_store::use_timestamp())
+    });
+    let recent_paths = preference_node(root, "recentProjectPaths").unwrap_or_else(|()| {
+        omitted += 1;
+        None
+    });
+    let open_recent =
+        super::open_recent::Preferences::from_java(recent_list_cutoff, recent_paths, &mut omitted);
+    let recent_projects = open_recent
+        .as_ref()
+        .map_or(0, |history| history.project_count());
+    let mut questions = |name, kind| match preference_node(root, name) {
+        Ok(Some(wrapper)) => {
+            super::question_history::read_java_history(wrapper, kind, &mut omitted)
+        }
+        Ok(None) => Ok(None),
+        Err(()) => {
+            omitted += 1;
+            Ok(None)
+        }
+    };
+    let manual_questions = questions("guideAskHistory", super::question_history::Kind::Manual)?;
+    let terminal_questions = questions("aiPromptHistory", super::question_history::Kind::Terminal)?;
+    let workflow_instructions = questions(
+        "workflowInstructionsHistory",
+        super::question_history::Kind::Workflow,
+    )?;
+    use crate::terminal_agent::history as agent_history;
+    let agent_limit = preference(
+        root,
+        "terminalAgentInputHistorySize",
+        &mut omitted,
+        |value| {
+            let limit = value.parse::<i32>().ok()?;
+            Some(if limit <= 0 {
+                agent_history::DEFAULT_LIMIT
+            } else {
+                (limit as usize).clamp(agent_history::MIN_LIMIT, agent_history::MAX_LIMIT)
+            })
+        },
+    );
+    let agent_inputs = preference_node(root, "terminalAgentInputHistory").unwrap_or_else(|()| {
+        omitted += 1;
+        None
+    });
+    let agent_history = agent_history::read_java_backup(agent_inputs, agent_limit, &mut omitted)?;
     let ascii_art_preview_font_size =
         preference(root, "asciiArtPreviewFontSize", &mut omitted, |value| {
             super::ascii_art::clamp_preview_font(value.parse().ok()?)
@@ -680,8 +879,14 @@ pub(crate) fn portable_java_preferences(
     let startup = startup::Preferences::read(root, &mut omitted);
     let editor = editor::Preferences::read(root, &mut omitted);
     let logfile_presentation = JavaLogfilePreferences::read(root, &mut omitted);
+    let before_teamwork = omitted;
     let java_teamwork = teamwork::read(root, &mut omitted);
     let teamwork_proposals = java_teamwork.as_ref().map_or(0, teamwork::Proposals::count);
+    let scheduler_teamwork_origins = java_teamwork
+        .as_ref()
+        .filter(|_| omitted == before_teamwork)
+        .map(teamwork::Proposals::scheduler_origins)
+        .unwrap_or_default();
     let java_swarm_journal = match preference_node(root, "swarmSessionJournal") {
         Ok(None) => None,
         result => {
@@ -714,6 +919,12 @@ pub(crate) fn portable_java_preferences(
         "snippetTranslationTargetLanguage",
         &mut omitted,
         |value| crate::snippet_window::ai_assist::translation_language(value).map(str::to_owned),
+    );
+    let snippet_completion_shortcut = preference(
+        root,
+        "snippetCompletionShortcut",
+        &mut omitted,
+        super::SnippetCompletionChord::from_java,
     );
     let scheduler_diagram_color_mode = preference(
         root,
@@ -795,8 +1006,101 @@ pub(crate) fn portable_java_preferences(
             Some(count)
         },
     );
+    let snippet_library_divider = preference(
+        root,
+        "snippetWorkspaceLibraryDividerPosition",
+        &mut omitted,
+        |value| crate::snippet_window::library_divider_parts(value.parse().ok()?),
+    );
+    let snippet_library_columns = match preference_text(root, "snippetManagerColumnWidths") {
+        Ok(Some(value)) => {
+            crate::snippet_window::library_columns::Widths::read_java(value, &mut omitted)
+        }
+        Ok(None) => Default::default(),
+        Err(()) => {
+            omitted += 1;
+            Default::default()
+        }
+    };
+    let mut font = |name, view: FontView| {
+        preference(root, name, &mut omitted, |value| {
+            let size = value.parse::<i32>().ok()?;
+            let bounds = view.bounds();
+            Some(size.clamp(i32::from(*bounds.start()), i32::from(*bounds.end())) as u8)
+        })
+    };
+    let snippet_ai_alternatives_font_size = font("aiAlternativesFontSize", FontView::Alternatives);
+    let snippet_ai_diff_font_size = font("aiDiffFontSize", FontView::Diff);
+    let snippet_ai_review_font_size = font("aiReviewFontSize", FontView::Review);
+    let snippet_ai_description_font_size = font("aiDescribeFontSize", FontView::Description);
+    let snippet_security_report_font_size =
+        font("securityReportFontSize", FontView::SecurityReport);
+    let ai_result_font_size = preference(root, "aiResultFontSize", &mut omitted, |value| {
+        value
+            .parse()
+            .ok()
+            .filter(|size| super::terminal_ai::CHAT_RESULT_FONT_RANGE.contains(size))
+    });
+    let snippet_ai_diff_summary_divider = preference(
+        root,
+        "aiDiffDialogSummaryDividerPosition",
+        &mut omitted,
+        |value| crate::snippet_window::diff_summary::parts(value.parse().ok()?),
+    );
+    let ascii_art_java = super::ascii_art::ImportedPreferences::read(root, &mut omitted);
+    use crate::profile_backup::preferences::{Interval, JavaDefaults, MAX_RETENTION};
+    let java_backup_defaults = JavaDefaults {
+        retention: preference(root, "maxBackupCount", &mut omitted, |value| {
+            value
+                .parse::<i32>()
+                .ok()
+                .map(|count| count.clamp(0, i32::from(MAX_RETENTION)) as u8)
+        }),
+        interval: preference(root, "autoBackupInterval", &mut omitted, |value| {
+            Interval::from_id(&value.to_ascii_lowercase())
+        }),
+    };
+    let java_session_restore = session_recovery::Preferences::read(root, &mut omitted);
+    let agent_activity_font_size =
+        preference(root, "terminalAgentPanelFontSize", &mut omitted, |value| {
+            super::terminal_agent::font::View::Activity.read_java(value)
+        });
+    let agent_plan_font_size =
+        preference(root, "terminalAgentPlanFontSize", &mut omitted, |value| {
+            super::terminal_agent::font::View::Plan.read_java(value)
+        });
+    let agent_activity_height = preference(
+        root,
+        "terminalAgentPanelHeight",
+        &mut omitted,
+        super::terminal_agent::design::Height::read_java,
+    );
+    let quick_connect_expanded_sections = read_quick_connect_sections(root, &mut omitted);
+    let quick_connect_appearance = read_quick_connect_appearance(root, &mut omitted);
+    let quick_connect_effect_speed = preference(
+        root,
+        "lastQuickConnectTerminalEffectAnimationSpeed",
+        &mut omitted,
+        |value| crate::terminal_effects::Speed::try_from(value.parse::<f64>().ok()?).ok(),
+    );
+    let ai_agent_design_auto_hide_seconds = preference(
+        root,
+        "aiAgentDesignAutoHideSeconds",
+        &mut omitted,
+        |value| {
+            let range = super::terminal_agent::design::AUTO_HIDE_SECONDS;
+            Some(
+                value
+                    .parse::<i32>()
+                    .ok()?
+                    .clamp(i32::from(*range.start()), i32::from(*range.end()))
+                    as u8,
+            )
+        },
+    );
     let mut flag = |name| preference(root, name, &mut omitted, java_flag);
     let display = JavaDisplayPreferences {
+        java_session_restore,
         appearance,
         journal_live_log_height,
         journal_edit_split,
@@ -804,8 +1108,11 @@ pub(crate) fn portable_java_preferences(
         journal_viewer_geometry,
         journal_screenshot_geometry,
         java_dialog_geometry,
+        java_workflow_header_defaults,
         java_local_dock,
         ai_agent_panel,
+        ai_agent_design_auto_hide_seconds,
+        ai_agent_design_reduced_animations: flag("aiAgentDesignReducedAnimations"),
         scheduler_journal_divider,
         maintenance,
         java_teamwork,
@@ -823,9 +1130,30 @@ pub(crate) fn portable_java_preferences(
         terminal_link_detection_enabled: flag("terminalLinkDetectionEnabled"),
         terminal_drag_drop: flag("terminalDragDropEnabled"),
         job_menu_status_enabled: flag("jobSchedulerMenuStatusEnabled"),
+        prevent_system_sleep: flag("preventSystemSleep"),
         journal_note_translation_language,
         snippet_translation_target_language,
         snippet_alternative_count,
+        snippet_completion_shortcut,
+        snippet_ai_additional_instructions: flag("aiSnippetEditorAdditionalInstructionsEnabled"),
+        snippet_ai_alternatives_font_size,
+        snippet_ai_diff_font_size,
+        snippet_ai_diff_summary_divider,
+        snippet_ai_review_font_size,
+        snippet_ai_description_font_size,
+        snippet_security_report_font_size,
+        ai_result_font_size,
+        quick_connect_expanded_sections,
+        quick_connect_effect_speed,
+        quick_connect_appearance,
+        agent_activity_font_size,
+        agent_plan_font_size,
+        agent_remember_activity_font: flag("terminalAgentRememberPanelLayout"),
+        agent_activity_height,
+        agent_activity_keep_collapsed: flag("terminalAgentPanelKeepCollapsed"),
+        agent_activity_expand_all: flag("terminalAgentPanelExpandAll"),
+        snippet_library_divider,
+        snippet_library_columns,
         scheduler_diagram_horizontal: flag("jobSchedulerDependencyDiagramHorizontal"),
         scheduler_diagram_color_mode,
         snippet_analysis_auto_diagram: flag("codeAnalysisDiagramAutoGenerate"),
@@ -863,7 +1191,22 @@ pub(crate) fn portable_java_preferences(
                 .filter(|size| (MIN_WORKFLOW_FONT..=MAX_WORKFLOW_FONT).contains(size))
         }),
         manual_scale,
+        agent_history_popup_width: preference(
+            root,
+            "terminalAgentHistoryPopupWidth",
+            &mut omitted,
+            |text| java_history_popup_extent(text, HISTORY_POPUP_WIDTH),
+        ),
+        agent_history_popup_height: preference(
+            root,
+            "terminalAgentHistoryPopupHeight",
+            &mut omitted,
+            |text| java_history_popup_extent(text, HISTORY_POPUP_HEIGHT),
+        ),
+        open_recent,
         ascii_art_preview_font_size,
+        ascii_art_java,
+        java_backup_defaults,
         snippet_analysis_report_font_size: preference(
             root,
             "codeAnalysisFontSize",
@@ -1030,7 +1373,12 @@ pub(crate) fn portable_java_preferences(
         logfile_presentation,
         key_bindings,
     };
+    let session_restore_preferences = display.java_session_restore.count();
     let count = display.fields()?.len()
+        + display.snippet_library_columns.len()
+        + display.ascii_art_java.count()
+        + usize::from(display.java_backup_defaults.retention.is_some())
+        + usize::from(display.java_backup_defaults.interval.is_some())
         + usize::from(display.appearance.design.is_some())
         + usize::from(display.appearance.animations.is_some())
         + usize::from(display.snippet_diagram_appearance.mode.is_some())
@@ -1092,6 +1440,8 @@ pub(crate) fn portable_java_preferences(
         && teamwork_proposals == 0
         && !java_update_opt_in
         && !swarm_journal_proposal
+        && session_restore_preferences == 0
+        && workflow_header_defaults == 0
     {
         None
     } else {
@@ -1111,8 +1461,10 @@ pub(crate) fn portable_java_preferences(
     };
     Ok(JavaPreferences {
         teamwork_proposals,
+        scheduler_teamwork_origins,
         swarm_journal_proposal,
         java_update_opt_in,
+        session_restore_preferences,
         java_log_directory,
         contents,
         count,
@@ -1121,6 +1473,14 @@ pub(crate) fn portable_java_preferences(
         markers,
         highlights: crate::terminal_highlight::read_java_backup(root),
         toolbar,
+        snippet_tabs,
+        workflow_header_defaults,
+        manual_questions,
+        terminal_questions,
+        workflow_instructions,
+        agent_history,
+        recent_projects,
+        recent_list_cutoff: recent_list_cutoff.is_some_and(|value| value != 0),
         sftp_overwrite,
         paste_warning_off,
         analysis_export_includes_code: display.snippet_analysis_export_include_code == Some(true),
@@ -1164,6 +1524,11 @@ pub(crate) fn associate_java_swarm_journal_profile<'a>(
     validate_java_swarm_journal(options)?;
     *section = serde_json::value::to_raw_value(&display)?;
     Ok(Some(serde_json::to_vec(&fields)?))
+}
+
+fn java_history_popup_extent(text: &str, range: std::ops::RangeInclusive<u16>) -> Option<u16> {
+    let extent = text.parse::<i32>().ok()?;
+    Some(extent.clamp(i32::from(*range.start()), i32::from(*range.end())) as u16)
 }
 
 fn java_guide_scale(root: Node<'_, '_>, omitted: &mut usize) -> Option<u16> {
@@ -1210,6 +1575,131 @@ fn java_flag(text: &str) -> Option<bool> {
     }
 }
 
+fn read_snippet_workspace(
+    root: Node<'_, '_>,
+    omitted: &mut usize,
+) -> crate::snippet_window::session::State {
+    use crate::snippet_window::session::{MAX_IDS, State};
+    use crate::snippets::SnippetId;
+
+    let mut state = State::default();
+    let mut seen = std::collections::HashSet::new();
+    match preference_node(root, "snippetWorkspaceOpenTabs") {
+        Ok(Some(list)) => {
+            for entry in list.children().filter(|entry| entry.is_element()) {
+                let id = (entry.has_tag_name("snippetId")
+                    && entry.tag_name().namespace().is_none()
+                    && entry.attributes().next().is_none()
+                    && entry.children().count() == 1)
+                    .then(|| entry.text())
+                    .flatten()
+                    .and_then(|value| SnippetId::from_java_uuid(value.trim()).ok());
+                if let Some(id) = id
+                    && state.ids.len() < MAX_IDS
+                    && seen.insert(id)
+                {
+                    state.ids.push(id);
+                } else {
+                    *omitted += 1;
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(()) => *omitted += 1,
+    }
+    match preference_value(root, "snippetWorkspaceActiveTab", true).map(|v| v.map(str::trim)) {
+        Ok(None | Some("")) => {}
+        Ok(Some(value)) => {
+            state.active = SnippetId::from_java_uuid(value)
+                .ok()
+                .filter(|id| seen.contains(id));
+            *omitted += usize::from(state.active.is_none());
+        }
+        Err(()) => *omitted += 1,
+    }
+    state
+}
+
+fn read_quick_connect_appearance(
+    root: Node<'_, '_>,
+    omitted: &mut usize,
+) -> Option<crate::connection_store::TerminalAppearance> {
+    use crate::connection_store::{TerminalAppearance, ThemeOverride};
+    use crate::profile::{MAX_TERMINAL_FONT, MIN_TERMINAL_FONT};
+    use crate::terminal_theme::Rgb;
+    let node = match preference_node(root, "lastQuickConnectTerminalSettings") {
+        Ok(node) => node?,
+        Err(()) => {
+            *omitted += 1;
+            return None;
+        }
+    };
+    let style = TerminalAppearance {
+        theme: match preference_value(node, "themeId", true).map(|value| value.map(str::trim)) {
+            Ok(None | Some("")) => None,
+            Ok(Some(id)) => {
+                let theme = ThemeOverride::from_java(id.into());
+                *omitted += usize::from(theme.is_none());
+                theme
+            }
+            Err(()) => {
+                *omitted += 1;
+                None
+            }
+        },
+        font_family: preference(node, "fontFamily", omitted, |family| {
+            (!family.is_empty() && family.len() <= 160 && !crate::ssh_dialog::unsafe_text(family))
+                .then(|| family.to_owned())
+        }),
+        font_size: preference(node, "fontSize", omitted, |value| {
+            value
+                .parse()
+                .ok()
+                .filter(|size| (MIN_TERMINAL_FONT..=MAX_TERMINAL_FONT).contains(size))
+        }),
+        foreground: preference(node, "foregroundColor", omitted, Rgb::parse),
+        background: preference(node, "backgroundColor", omitted, Rgb::parse),
+        sgr_enabled: preference(node, "terminalColorsEnabled", omitted, java_flag),
+    };
+    (!style.is_default()).then_some(style)
+}
+
+fn read_quick_connect_sections(
+    root: Node<'_, '_>,
+    omitted: &mut usize,
+) -> Option<super::quick_connect::ExpandedSections> {
+    use super::quick_connect::Section;
+
+    let list = match preference_node(root, "quickConnectExpandedSections") {
+        Ok(list) => list?,
+        Err(()) => {
+            *omitted += 1;
+            return None;
+        }
+    };
+    let mut sections = super::quick_connect::ExpandedSections::new();
+    let mut malformed = false;
+    for entry in list.children().filter(|entry| !entry.is_comment()) {
+        if entry.is_text() && entry.text().is_some_and(|value| value.trim().is_empty()) {
+            continue;
+        }
+        let section = (entry.has_tag_name("section")
+            && entry.tag_name().namespace().is_none()
+            && entry.attributes().next().is_none()
+            && entry.children().count() == 1)
+            .then(|| entry.text())
+            .flatten()
+            .and_then(|value| Section::from_java(value.trim()));
+        if let Some(section) = section {
+            sections.insert(section);
+        } else {
+            malformed = true;
+            *omitted += 1;
+        }
+    }
+    (!malformed || !sections.is_empty()).then_some(sections)
+}
+
 fn preference_text<'a>(root: Node<'a, '_>, name: &str) -> Result<Option<&'a str>, ()> {
     preference_value(root, name, false).map(|text| text.map(str::trim))
 }
@@ -1253,7 +1743,7 @@ fn preference_node<'a, 'input>(
     Ok(Some(element))
 }
 
-fn preference<T>(
+pub(super) fn preference<T>(
     root: Node<'_, '_>,
     name: &str,
     omitted: &mut usize,
@@ -1327,6 +1817,26 @@ pub(crate) fn merge_java_window_settings(
         fields.entry(key).or_insert(value);
     }
     let added = before != fields.len();
+    let library_columns_added = !display.snippet_library_columns.is_empty()
+        && merge_unset_section(
+            &mut fields,
+            "snippet_library_columns",
+            &display.snippet_library_columns,
+        )?;
+    let ascii_art_added = !display.ascii_art_java.is_empty()
+        && merge_unset_section(&mut fields, "ascii_art_java", &display.ascii_art_java)?;
+    let backup_added = !display.java_backup_defaults.is_empty()
+        && merge_unset_section(
+            &mut fields,
+            "java_backup_defaults",
+            &display.java_backup_defaults,
+        )?;
+    let recovery_added = !display.java_session_restore.is_empty()
+        && merge_unset_section(
+            &mut fields,
+            "java_session_restore",
+            &display.java_session_restore,
+        )?;
     let appearance_added = !display.appearance.is_default()
         && merge_unset_section(&mut fields, "appearance", &display.appearance)?;
     let diagram_appearance_added = !display.snippet_diagram_appearance.is_empty()
@@ -1434,6 +1944,10 @@ pub(crate) fn merge_java_window_settings(
     if !themes_updated
         && !removed_marker
         && !added
+        && !library_columns_added
+        && !ascii_art_added
+        && !backup_added
+        && !recovery_added
         && !appearance_added
         && !diagram_appearance_added
         && !snippet_hardening_added
@@ -1527,6 +2041,68 @@ mod tests {
                     .is_none()
             );
         }
+    }
+
+    #[test]
+    fn java_session_restore_import_is_inactive_and_additive() {
+        use crate::profile::session::RestoreMode;
+
+        let input = portable_java_preferences(
+            br#"<globalSettings><sessionRestoreMode> AUTO </sessionRestoreMode>
+                <sessionRestoreScrollback>true</sessionRestoreScrollback>
+                <sessionRestoreScrollbackLines>6200</sessionRestoreScrollbackLines>
+                </globalSettings>"#,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                input.count,
+                input.session_restore_preferences,
+                input.omitted
+            ),
+            (0, 3, 0)
+        );
+        let bytes = input.contents.unwrap();
+        let local = br#"{"restore_output":{"enabled":false,"lines":700},"java_session_restore":{"output":false}}"#;
+        let restored = merge_java_window_settings(Some(local), &bytes, &BTreeMap::new())
+            .unwrap()
+            .unwrap();
+        let restored_settings = WindowSettings::decode(&restored).unwrap();
+        assert_eq!(
+            restored_settings.java_session_restore,
+            session_recovery::Preferences {
+                mode: Some(RestoreMode::Auto),
+                output: Some(false),
+                lines: Some(5000),
+            }
+        );
+        assert!(!restored_settings.restore_output.enabled);
+        assert_eq!(restored_settings.restore_output.lines, 700);
+        WindowSettings::validate_backup(&restored).unwrap();
+        assert!(
+            merge_java_window_settings(Some(&restored), &bytes, &BTreeMap::new())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            WindowSettings::validate_backup(br#"{"java_session_restore":{"lines":99}}"#).is_err()
+        );
+    }
+
+    #[test]
+    fn java_session_restore_reports_invalid_and_duplicate_fields() {
+        let input = portable_java_preferences(
+            br#"<globalSettings><sessionRestoreMode>auto</sessionRestoreMode>
+                <sessionRestoreMode>off</sessionRestoreMode>
+                <sessionRestoreScrollback>maybe</sessionRestoreScrollback>
+                <sessionRestoreScrollbackLines>not-a-number</sessionRestoreScrollbackLines>
+                </globalSettings>"#,
+            None,
+        )
+        .unwrap();
+        assert_eq!((input.count, input.omitted), (0, 3));
+        assert!(input.contents.is_none());
     }
 
     #[test]
@@ -1656,6 +2232,87 @@ mod tests {
             .unwrap()
             .is_none()
         );
+    }
+
+    #[test]
+    fn java_agent_history_popup_dimensions_merge_independently() {
+        let imported = portable_java_preferences(
+            br#"<globalSettings>
+                <terminalAgentHistoryPopupWidth>1800</terminalAgentHistoryPopupWidth>
+                <terminalAgentHistoryPopupHeight>-4</terminalAgentHistoryPopupHeight>
+            </globalSettings>"#,
+            None,
+        )
+        .unwrap();
+        assert_eq!((imported.count, imported.omitted), (2, 0));
+        let incoming = imported.contents.unwrap();
+        let restored = merge_java_window_settings(
+            Some(br#"{"agent_history_popup_width":540}"#),
+            &incoming,
+            &Default::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let settings = WindowSettings::decode(&restored).unwrap();
+        assert_eq!(settings.agent_history_popup_width, Some(540));
+        assert_eq!(settings.agent_history_popup_height, Some(120));
+
+        let restored = merge_java_window_settings(
+            Some(br#"{"agent_history_popup_height":275}"#),
+            &incoming,
+            &Default::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let settings = WindowSettings::decode(&restored).unwrap();
+        assert_eq!(settings.agent_history_popup_width, Some(1400));
+        assert_eq!(settings.agent_history_popup_height, Some(275));
+
+        let invalid = portable_java_preferences(
+            br#"<globalSettings>
+                <terminalAgentHistoryPopupWidth>480</terminalAgentHistoryPopupWidth>
+                <terminalAgentHistoryPopupWidth>600</terminalAgentHistoryPopupWidth>
+                <terminalAgentHistoryPopupHeight>invalid</terminalAgentHistoryPopupHeight>
+            </globalSettings>"#,
+            None,
+        )
+        .unwrap();
+        assert_eq!((invalid.count, invalid.omitted), (0, 2));
+    }
+
+    #[test]
+    fn java_agent_design_display_options_preserve_individual_native_choices() {
+        let import = portable_java_preferences(
+            br#"<globalSettings>
+                <aiAgentDesignAutoHideSeconds>90</aiAgentDesignAutoHideSeconds>
+                <aiAgentDesignReducedAnimations>true</aiAgentDesignReducedAnimations>
+            </globalSettings>"#,
+            None,
+        )
+        .unwrap();
+        assert_eq!((import.count, import.omitted), (2, 0));
+        let bytes = import.contents.unwrap();
+        let restored = merge_java_window_settings(
+            Some(br#"{"ai_agent_design_auto_hide_seconds":0}"#),
+            &bytes,
+            &Default::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let settings = WindowSettings::decode(&restored).unwrap();
+        assert_eq!(settings.agent_status_auto_hide_seconds(), 0);
+        assert!(!settings.agent_animations());
+
+        let restored = merge_java_window_settings(
+            Some(br#"{"ai_agent_design_reduced_animations":false}"#),
+            &bytes,
+            &Default::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let settings = WindowSettings::decode(&restored).unwrap();
+        assert_eq!(settings.agent_status_auto_hide_seconds(), 60);
+        assert!(settings.agent_animations());
     }
 
     #[test]
@@ -1859,6 +2516,417 @@ mod tests {
     }
 
     #[test]
+    fn java_ai_diff_summary_divider_fills_only_an_unset_preference() {
+        let import = |value| {
+            portable_java_preferences(
+                format!("<globalSettings><aiDiffDialogSummaryDividerPosition>{value}</aiDiffDialogSummaryDividerPosition></globalSettings>").as_bytes(),
+                None,
+            ).unwrap()
+        };
+        for (value, expected) in [("0.371", 371), ("0.01", 20), ("1.0", 900)] {
+            let incoming = import(value);
+            assert_eq!((incoming.count, incoming.omitted), (1, 0));
+            let contents = incoming.contents.unwrap();
+            let merged = merge_java_window_settings(None, &contents, &Default::default())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                WindowSettings::decode(&merged)
+                    .unwrap()
+                    .snippet_ai_diff_summary_divider,
+                Some(expected)
+            );
+            assert!(
+                merge_java_window_settings(Some(&merged), &contents, &Default::default())
+                    .unwrap()
+                    .is_none()
+            );
+            let native = br#"{"snippet_ai_diff_summary_divider":512}"#;
+            assert!(
+                merge_java_window_settings(Some(native), &contents, &Default::default())
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let invalid = import("NaN");
+        assert_eq!((invalid.count, invalid.omitted), (0, 1));
+        assert!(
+            WindowSettings::validate_backup(br#"{"snippet_ai_diff_summary_divider":901}"#).is_err()
+        );
+    }
+
+    #[test]
+    fn java_snippet_column_widths_merge_independently_and_reject_ambiguous_entries() {
+        let incoming = portable_java_preferences(
+            br#"<globalSettings><snippetManagerColumnWidths>name=180;language=95;category=100;category=200;operatingSystem=100;tags=1200;executable=NaN;favorite=45;lineCount=65;lastModified=145;usageCount=80;analysisStatus=78</snippetManagerColumnWidths></globalSettings>"#,
+            None,
+        ).unwrap();
+        assert_eq!((incoming.count, incoming.omitted), (9, 2));
+        let incoming = incoming.contents.unwrap();
+        let local = br#"{"snippet_library_columns":{"name":210}}"#;
+        let merged = merge_java_window_settings(Some(local), &incoming, &Default::default())
+            .unwrap()
+            .unwrap();
+        let decoded = WindowSettings::decode(&merged).unwrap();
+        assert_eq!(
+            serde_json::to_value(decoded.snippet_library_columns).unwrap(),
+            serde_json::json!({
+                "name": 210, "language": 95, "operatingSystem": 118, "tags": 900,
+                "favorite": 45, "lineCount": 65, "lastModified": 145, "usageCount": 80,
+                "analysisStatus": 78
+            })
+        );
+        assert!(
+            merge_java_window_settings(Some(&merged), &incoming, &Default::default())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            WindowSettings::validate_backup(br#"{"snippet_library_columns":{"name":20}}"#).is_err()
+        );
+    }
+
+    #[test]
+    fn java_snippet_library_divider_import_keeps_local_choice_and_clamps_java_values() {
+        let read = |value| {
+            portable_java_preferences(
+                format!("<globalSettings><snippetWorkspaceLibraryDividerPosition>{value}</snippetWorkspaceLibraryDividerPosition></globalSettings>").as_bytes(),
+                None,
+            ).unwrap()
+        };
+        for (value, expected) in [("0.43", 430), ("0.05", 150), ("0.95", 600)] {
+            let imported = read(value);
+            assert_eq!((imported.count, imported.omitted), (1, 0));
+            let incoming = imported.contents.unwrap();
+            let restored = merge_java_window_settings(None, &incoming, &Default::default())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                WindowSettings::decode(&restored)
+                    .unwrap()
+                    .snippet_library_divider,
+                Some(expected)
+            );
+            let local = br#"{"snippet_library_divider":365}"#;
+            assert!(
+                merge_java_window_settings(Some(local), &incoming, &Default::default())
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(read("NaN").omitted, 1);
+        assert_eq!(read("1").omitted, 1);
+        assert!(WindowSettings::validate_backup(br#"{"snippet_library_divider":601}"#).is_err());
+    }
+
+    #[test]
+    fn java_backup_defaults_adopt_only_portable_fields_when_native_settings_are_absent() {
+        use crate::profile_backup::preferences::{
+            self, Interval, JavaDefaults, Preferences, Progress,
+        };
+
+        let restored = portable_java_preferences(
+            br#"<globalSettings>
+                <maxBackupCount>0</maxBackupCount>
+                <autoBackupInterval>DAILY</autoBackupInterval>
+                <autoBackupDirectory>C:/other-machine</autoBackupDirectory>
+                <backupCredentialId>old-id</backupCredentialId>
+                <lastAutoBackupAt>456</lastAutoBackupAt>
+            </globalSettings>"#,
+            None,
+        )
+        .unwrap();
+        assert_eq!((restored.count, restored.omitted), (2, 0));
+        let incoming = restored.contents.unwrap();
+        let merged = merge_java_window_settings(None, &incoming, &Default::default())
+            .unwrap()
+            .unwrap();
+        WindowSettings::validate_backup(&merged).unwrap();
+        let settings = WindowSettings::decode(&merged).unwrap();
+        let choice = settings.java_backup_defaults;
+        assert_eq!(
+            choice,
+            JavaDefaults {
+                retention: Some(0),
+                interval: Some(Interval::Daily)
+            }
+        );
+
+        let migrated = crate::snippets::tests::Profile::new();
+        choice.adopt(&migrated.0).unwrap();
+        let expected = Preferences {
+            retention: 0,
+            interval: Interval::Daily,
+            ..Preferences::default()
+        };
+        assert_eq!(
+            preferences::load(&migrated.0).unwrap(),
+            (expected.clone(), Progress::default())
+        );
+        JavaDefaults {
+            retention: Some(100),
+            interval: Some(Interval::Off),
+        }
+        .adopt(&migrated.0)
+        .unwrap();
+        assert_eq!(preferences::load(&migrated.0).unwrap().0, expected);
+
+        let native = crate::snippets::tests::Profile::new();
+        let defaults = Preferences::default();
+        preferences::save(&native.0, &defaults, defaults.clone()).unwrap();
+        choice.adopt(&native.0).unwrap();
+        assert_eq!(preferences::load(&native.0).unwrap().0, defaults);
+
+        let local = br#"{"java_backup_defaults":{"retention":12}}"#;
+        let merged = merge_java_window_settings(Some(local), &incoming, &Default::default())
+            .unwrap()
+            .unwrap();
+        let settings = WindowSettings::decode(&merged).unwrap();
+        assert_eq!(settings.java_backup_defaults.retention, Some(12));
+        assert_eq!(
+            settings.java_backup_defaults.interval,
+            Some(Interval::Daily)
+        );
+    }
+
+    #[test]
+    fn java_snippet_ai_fonts_use_independent_bounds_and_preserve_local_choices() {
+        let imported = portable_java_preferences(
+            b"<globalSettings><aiAlternativesFontSize>-4</aiAlternativesFontSize><aiDiffFontSize>80</aiDiffFontSize><aiReviewFontSize>7</aiReviewFontSize><aiDescribeFontSize>70</aiDescribeFontSize><securityReportFontSize>21</securityReportFontSize><aiResultFontSize>32</aiResultFontSize></globalSettings>",
+            None,
+        )
+        .unwrap();
+        assert_eq!((imported.count, imported.omitted), (6, 0));
+        let merged = merge_java_window_settings(
+            Some(br#"{"snippet_ai_alternatives_font_size":22}"#),
+            &imported.contents.unwrap(),
+            &Default::default(),
+        )
+        .unwrap()
+        .unwrap();
+        WindowSettings::validate_backup(&merged).unwrap();
+        let settings = WindowSettings::decode(&merged).unwrap();
+        assert_eq!(settings.snippet_ai_font(FontView::Alternatives), 22);
+        assert_eq!(settings.snippet_ai_font(FontView::Diff), 72);
+        assert_eq!(settings.snippet_ai_font(FontView::Review), 9);
+        assert_eq!(settings.snippet_ai_font(FontView::Description), 32);
+        assert_eq!(settings.snippet_ai_font(FontView::SecurityReport), 21);
+        assert_eq!(settings.ai_result_font(), 32);
+        assert!(WindowSettings::validate_backup(br#"{"snippet_ai_review_font_size":8}"#).is_err());
+        assert!(WindowSettings::validate_backup(br#"{"ai_result_font_size":33}"#).is_err());
+
+        let invalid = portable_java_preferences(
+            b"<globalSettings><aiResultFontSize>33</aiResultFontSize></globalSettings>",
+            None,
+        )
+        .unwrap();
+        assert_eq!((invalid.count, invalid.omitted), (0, 1));
+        assert!(invalid.contents.is_none());
+    }
+
+    #[test]
+    fn java_quick_connect_appearance_imports_only_display_fields() {
+        let java = portable_java_preferences(
+            br##"<globalSettings><lastQuickConnectTerminalSettings>
+                <themeId>nord</themeId><fontFamily>Monospaced</fontFamily><fontSize>26</fontSize>
+                <foregroundColor>#AFB3C7</foregroundColor><backgroundColor>#0D161F</backgroundColor>
+                <terminalColorsEnabled>false</terminalColorsEnabled><closeWithoutConfirmation>true</closeWithoutConfirmation>
+                </lastQuickConnectTerminalSettings></globalSettings>"##,
+            None,
+        ).unwrap();
+        assert_eq!((java.count, java.omitted), (1, 0));
+        let incoming = java.contents.unwrap();
+        let merged = merge_java_window_settings(None, &incoming, &Default::default())
+            .unwrap()
+            .unwrap();
+        let style = WindowSettings::decode(&merged)
+            .unwrap()
+            .quick_connect_appearance
+            .unwrap();
+        assert!(style.theme.is_some());
+        assert_eq!(style.font_size, Some(26));
+        assert_eq!(
+            style.background,
+            Some(crate::terminal_theme::Rgb::from_hex(0x0D161F))
+        );
+        assert_eq!(style.sgr_enabled, Some(false));
+        assert_eq!(style.display_overrides(None).confirm_close, None);
+        assert!(
+            merge_java_window_settings(
+                Some(br#"{"quick_connect_appearance":{}}"#),
+                &incoming,
+                &Default::default(),
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn java_quick_connect_sections_are_typed_and_an_explicit_native_empty_set_wins() {
+        use super::super::quick_connect::{ExpandedSections, Section};
+
+        let read = |xml: &str| portable_java_preferences(xml.as_bytes(), None).unwrap();
+        let imported = read(
+            "<globalSettings><quickConnectExpandedSections>
+             <section>terminalAppearance</section><section>terminalLog</section>
+             <section>terminalLog</section><section>ai</section><section>unknown</section>
+             </quickConnectExpandedSections><lastQuickConnectTerminalEffectAnimationSpeed>2.5</lastQuickConnectTerminalEffectAnimationSpeed></globalSettings>",
+        );
+        assert_eq!((imported.count, imported.omitted), (2, 1));
+        let incoming = imported.contents.unwrap();
+        let merge = |local: Option<&[u8]>| {
+            let merged = merge_java_window_settings(local, &incoming, &Default::default())
+                .unwrap()
+                .unwrap();
+            WindowSettings::validate_backup(&merged).unwrap();
+            WindowSettings::decode(&merged).unwrap()
+        };
+        assert_eq!(
+            merge(None).quick_connect_expanded_sections,
+            Some(ExpandedSections::from([
+                Section::Appearance,
+                Section::Logging,
+                Section::Ai
+            ]))
+        );
+        assert_eq!(
+            merge(None).quick_connect_effect_speed,
+            Some(crate::terminal_effects::Speed::try_from(2.5).unwrap())
+        );
+        assert!(
+            merge_java_window_settings(
+                Some(br#"{"quick_connect_expanded_sections":[],"quick_connect_effect_speed":4}"#),
+                &incoming,
+                &Default::default(),
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        let empty = read("<globalSettings><quickConnectExpandedSections/></globalSettings>");
+        assert_eq!((empty.count, empty.omitted), (1, 0));
+        let malformed = read(
+            "<globalSettings><quickConnectExpandedSections><section><bad/></section></quickConnectExpandedSections></globalSettings>",
+        );
+        assert_eq!((malformed.count, malformed.omitted), (0, 1));
+    }
+
+    #[test]
+    fn java_agent_presentation_keeps_fractional_values_and_native_choices() {
+        let imported = portable_java_preferences(
+            b"<globalSettings><terminalAgentPanelFontSize>15.5</terminalAgentPanelFontSize><terminalAgentPlanFontSize>24.5</terminalAgentPlanFontSize><terminalAgentRememberPanelLayout>true</terminalAgentRememberPanelLayout><terminalAgentPanelHeight>287.5</terminalAgentPanelHeight><terminalAgentPanelKeepCollapsed>true</terminalAgentPanelKeepCollapsed><terminalAgentPanelExpandAll>true</terminalAgentPanelExpandAll></globalSettings>",
+            None,
+        )
+        .unwrap();
+        assert_eq!((imported.count, imported.omitted), (6, 0));
+        let incoming = imported.contents.unwrap();
+        let restore = |local: Option<&[u8]>| {
+            let merged = merge_java_window_settings(local, &incoming, &Default::default())
+                .unwrap()
+                .unwrap();
+            WindowSettings::validate_backup(&merged).unwrap();
+            WindowSettings::decode(&merged).unwrap()
+        };
+        let settings = restore(None);
+        assert_eq!(settings.agent_activity_font_size, Some(15.5));
+        assert_eq!(settings.agent_plan_font_size, Some(22.0));
+        assert_eq!(settings.agent_remember_activity_font, Some(true));
+        assert_eq!(settings.agent_activity_height, Some(287.5));
+        assert_eq!(settings.agent_activity_keep_collapsed, Some(true));
+        assert_eq!(settings.agent_activity_expand_all, Some(true));
+        let settings = restore(Some(
+            br#"{"agent_activity_font_size":19.5,"agent_remember_activity_font":false,"agent_activity_expand_all":false}"#,
+        ));
+        assert_eq!(settings.agent_activity_font_size, Some(19.5));
+        assert_eq!(settings.agent_plan_font_size, Some(22.0));
+        assert_eq!(settings.agent_remember_activity_font, Some(false));
+        assert_eq!(settings.agent_activity_height, Some(287.5));
+        assert_eq!(settings.agent_activity_expand_all, Some(false));
+        assert!(WindowSettings::validate_backup(br#"{"agent_activity_font_size":21}"#).is_err());
+
+        let invalid = portable_java_preferences(
+            b"<globalSettings><terminalAgentPlanFontSize>NaN</terminalAgentPlanFontSize></globalSettings>",
+            None,
+        ).unwrap();
+        assert_eq!((invalid.count, invalid.omitted), (0, 1));
+    }
+
+    #[test]
+    fn java_snippet_completion_shortcut_merges_only_when_unset() {
+        let read = |value| {
+            portable_java_preferences(
+            format!("<globalSettings><snippetCompletionShortcut>{value}</snippetCompletionShortcut></globalSettings>").as_bytes(),
+            None,
+        ).unwrap()
+        };
+        let imported = read("Ctrl+Alt+K");
+        assert_eq!((imported.count, imported.omitted), (1, 0));
+        let incoming = imported.contents.unwrap();
+        let merged = merge_java_window_settings(None, &incoming, &Default::default())
+            .unwrap()
+            .unwrap();
+        WindowSettings::validate_backup(&merged).unwrap();
+        let expected = super::super::SnippetCompletionChord::from_java("Ctrl+Alt+K");
+        assert_eq!(
+            WindowSettings::decode(&merged)
+                .unwrap()
+                .snippet_completion_shortcut,
+            expected
+        );
+        let local = serde_json::to_vec(&WindowSettings {
+            snippet_completion_shortcut: Some(Default::default()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            merge_java_window_settings(Some(&local), &incoming, &Default::default())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(read("Ctrl+Unknown").omitted, 1);
+    }
+
+    #[test]
+    fn java_snippet_instruction_setting_preserves_explicit_native_choice() {
+        let read = |value| {
+            portable_java_preferences(
+                format!("<globalSettings><aiSnippetEditorAdditionalInstructionsEnabled>{value}</aiSnippetEditorAdditionalInstructionsEnabled></globalSettings>").as_bytes(),
+                None,
+            ).unwrap()
+        };
+        for (value, expected, native) in [
+            (
+                "true",
+                true,
+                br#"{"snippet_ai_additional_instructions":false}"#.as_slice(),
+            ),
+            (
+                "false",
+                false,
+                br#"{"snippet_ai_additional_instructions":true}"#.as_slice(),
+            ),
+        ] {
+            let imported = read(value);
+            assert_eq!((imported.count, imported.omitted), (1, 0));
+            let incoming = imported.contents.unwrap();
+            let restored = merge_java_window_settings(None, &incoming, &Default::default())
+                .unwrap()
+                .unwrap();
+            let settings = WindowSettings::decode(&restored).unwrap();
+            assert_eq!(settings.snippet_ai_additional_instructions, Some(expected));
+            assert_eq!(settings.snippet_ai_additional_instructions(), expected);
+            assert!(
+                merge_java_window_settings(Some(native), &incoming, &Default::default())
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(!WindowSettings::default().snippet_ai_additional_instructions());
+        assert_eq!(read("invalid").omitted, 1);
+    }
+
+    #[test]
     fn java_scheduler_journal_divider_import_reopens_the_layout_and_preserves_native_choice() {
         let read = |value| {
             portable_java_preferences(
@@ -1945,6 +3013,38 @@ mod tests {
 
         let invalid = read("unknown", "maybe");
         assert_eq!((invalid.count, invalid.omitted), (0, 2));
+    }
+
+    #[test]
+    fn java_system_sleep_preference_preserves_an_explicit_native_choice() {
+        for (value, expected) in [("true", true), ("false", false)] {
+            let xml = format!(
+                "<globalSettings><preventSystemSleep>{value}</preventSystemSleep></globalSettings>"
+            );
+            let incoming = portable_java_preferences(xml.as_bytes(), None).unwrap();
+            assert_eq!((incoming.count, incoming.omitted), (1, 0));
+            let incoming = incoming.contents.unwrap();
+            let merged = merge_java_window_settings(None, &incoming, &Default::default())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                WindowSettings::decode(&merged)
+                    .unwrap()
+                    .prevent_system_sleep,
+                expected
+            );
+            let local = format!(r#"{{"prevent_system_sleep":{}}}"#, !expected);
+            assert!(
+                merge_java_window_settings(Some(local.as_bytes()), &incoming, &Default::default())
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                merge_java_window_settings(Some(&merged), &incoming, &Default::default())
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 
     #[test]

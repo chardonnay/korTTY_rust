@@ -1,8 +1,8 @@
-use iced::advanced::widget::{Operation, Tree, operation};
+use iced::advanced::widget::{Id, Operation, Tree, operation};
 use iced::advanced::{Layout, clipboard, layout};
 use iced::futures::{StreamExt, executor::block_on};
 use iced::keyboard::{self, Location, key};
-use iced::{Event, Font, Renderer, Theme, event, mouse};
+use iced::{Event, Font, Point, Rectangle, Renderer, Theme, event, mouse};
 use iced_runtime::{Action, UserInterface, task, user_interface::Cache};
 
 use super::*;
@@ -215,6 +215,31 @@ fn ai_manager_escape_dismisses_focused_document_find_before_requesting_close() {
 
 #[test]
 fn ai_manager_general_picker_consumes_escape_before_the_close_guard() {
+    #[derive(Default)]
+    struct PickerLabel(Option<Rectangle>);
+
+    impl Operation for PickerLabel {
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+            operate(self);
+        }
+
+        fn text(&mut self, _id: Option<&Id>, bounds: Rectangle, label: &str) {
+            if label == "AI chat code blocks in the terminal" {
+                self.0 = Some(bounds);
+            }
+        }
+    }
+
+    fn picker_center(layout: Layout<'_>, label: Rectangle) -> Option<Point> {
+        let mut children = layout.children();
+        if children.next().is_some_and(|child| child.bounds() == label) {
+            return children.next().map(|child| child.bounds().center());
+        }
+        layout
+            .children()
+            .find_map(|child| picker_center(child, label))
+    }
+
     let (workspace, _, id) = manager(false);
     let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
     let mut view = workspace.ai_manager_view(id).unwrap();
@@ -222,16 +247,11 @@ fn ai_manager_general_picker_consumes_escape_before_the_close_guard() {
     let node =
         view.as_widget_mut()
             .layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, SIZE));
-    let body = Layout::new(&node).children().nth(2).unwrap();
-    let general = body.children().next().unwrap();
-    let actions = general
-        .children()
-        .nth(6)
-        .unwrap()
-        .children()
-        .next()
-        .unwrap();
-    let picker = actions.children().nth(1).unwrap().bounds().center();
+    let mut label = PickerLabel::default();
+    view.as_widget_mut()
+        .operate(&mut tree, Layout::new(&node), &renderer, &mut label);
+    let label = label.0.expect("AI chat terminal actions label");
+    let picker = picker_center(Layout::new(&node), label).expect("picker next to its label");
     let mut interface = UserInterface::build(view, SIZE, Cache::default(), &mut renderer);
     let messages = dispatch(
         &mut interface,

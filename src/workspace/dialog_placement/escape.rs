@@ -2,24 +2,35 @@
 
 use iced::advanced::widget::{Operation, Tree, tree};
 use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, overlay, renderer};
-use iced::keyboard::{self, Key, key::Named};
+use iced::keyboard::{self, Key, Modifiers, key::Named};
 use iced::{Element, Event, Length, Rectangle, Renderer, Size, Theme, Vector, mouse};
 
 pub(in crate::workspace) fn on_escape<'a, Message: Clone + 'a>(
     content: Element<'a, Message>,
     action: Message,
 ) -> Element<'a, Message> {
-    Element::new(Escape { content, action })
+    on_key_press(content, move |key, _| {
+        (*key == Key::Named(Named::Escape)).then(|| action.clone())
+    })
 }
 
-/// Handle Escape before a focused text input consumes it to blur.
-/// Iced dispatches to the forwarded overlays before updating the base view.
-struct Escape<'a, Message> {
+pub(in crate::workspace) fn on_key_press<'a, Message: 'a>(
     content: Element<'a, Message>,
-    action: Message,
+    action: impl Fn(&Key, Modifiers) -> Option<Message> + 'a,
+) -> Element<'a, Message> {
+    Element::new(KeyPress { content, action })
 }
 
-impl<Message: Clone> Widget<Message, Theme, Renderer> for Escape<'_, Message> {
+/// Handle a key before a focused text input consumes it.
+/// Iced dispatches to the forwarded overlays before updating the base view.
+struct KeyPress<'a, Message, Action> {
+    content: Element<'a, Message>,
+    action: Action,
+}
+
+impl<Message, Action: Fn(&Key, Modifiers) -> Option<Message>> Widget<Message, Theme, Renderer>
+    for KeyPress<'_, Message, Action>
+{
     fn tag(&self) -> tree::Tag {
         self.content.as_widget().tag()
     }
@@ -77,15 +88,10 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for Escape<'_, Message> {
         viewport: &Rectangle,
     ) {
         if !shell.is_event_captured()
-            && matches!(
-                event,
-                Event::Keyboard(keyboard::Event::KeyPressed {
-                    key: Key::Named(Named::Escape),
-                    ..
-                })
-            )
+            && let Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event
+            && let Some(action) = (self.action)(key, *modifiers)
         {
-            shell.publish(self.action.clone());
+            shell.publish(action);
             shell.capture_event();
             return;
         }

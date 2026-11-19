@@ -1,0 +1,695 @@
+# MDN data 7d81f7981cc1c7074b887bb2d16aab66b493dc13 (CC0-1.0)
+# https://github.com/mdn/data/tree/7d81f7981cc1c7074b887bb2d16aab66b493dc13/css
+# Regenerate with python scripts/update-css-completion-data.py
+P	accent-color	auto
+P	align-content	normal
+P	align-items	normal stretch anchor-center
+P	align-self	auto normal stretch anchor-center
+P	alignment-baseline	baseline alphabetic ideographic middle central mathematical text-before-edge text-after-edge
+P	all	initial inherit unset revert revert-layer
+P	anchor-name	none
+P	anchor-scope	none all
+P	animation
+P	animation-composition
+P	animation-delay
+P	animation-direction
+P	animation-duration	auto
+P	animation-fill-mode
+P	animation-iteration-count
+P	animation-name	none
+P	animation-play-state
+P	animation-range
+P	animation-range-end	normal
+P	animation-range-start	normal
+P	animation-timeline
+P	animation-timing-function
+P	animation-trigger	none
+P	appearance	none auto
+P	aspect-ratio	auto
+P	backdrop-filter	none
+P	backface-visibility	visible hidden
+P	background
+P	background-attachment
+P	background-blend-mode
+P	background-clip
+P	background-color
+P	background-image
+P	background-origin
+P	background-position
+P	background-position-x	center left right x-start x-end
+P	background-position-y	center top bottom y-start y-end
+P	background-repeat
+P	background-size
+P	baseline-shift	sub super baseline
+P	baseline-source	auto first last
+P	block-size
+P	border
+P	border-block
+P	border-block-color
+P	border-block-end
+P	border-block-end-color
+P	border-block-end-style
+P	border-block-end-width
+P	border-block-start
+P	border-block-start-color
+P	border-block-start-style
+P	border-block-start-width
+P	border-block-style
+P	border-block-width
+P	border-bottom
+P	border-bottom-color
+P	border-bottom-left-radius
+P	border-bottom-right-radius
+P	border-bottom-style
+P	border-bottom-width
+P	border-collapse	separate collapse
+P	border-color
+P	border-end-end-radius
+P	border-end-start-radius
+P	border-image
+P	border-image-outset
+P	border-image-repeat	stretch repeat round space
+P	border-image-slice	fill
+P	border-image-source	none
+P	border-image-width	auto
+P	border-inline
+P	border-inline-color
+P	border-inline-end
+P	border-inline-end-color
+P	border-inline-end-style
+P	border-inline-end-width
+P	border-inline-start
+P	border-inline-start-color
+P	border-inline-start-style
+P	border-inline-start-width
+P	border-inline-style
+P	border-inline-width
+P	border-left
+P	border-left-color
+P	border-left-style
+P	border-left-width
+P	border-radius
+P	border-right
+P	border-right-color
+P	border-right-style
+P	border-right-width
+P	border-shape	none
+P	border-spacing
+P	border-start-end-radius
+P	border-start-start-radius
+P	border-style
+P	border-top
+P	border-top-color
+P	border-top-left-radius
+P	border-top-right-radius
+P	border-top-style
+P	border-top-width
+P	border-width
+P	bottom	auto
+P	box-decoration-break	slice clone
+P	box-shadow	none
+P	box-sizing	content-box border-box
+P	break-after	auto avoid always all avoid-page page left right recto verso avoid-column column avoid-region region
+P	break-before	auto avoid always all avoid-page page left right recto verso avoid-column column avoid-region region
+P	break-inside	auto avoid avoid-page avoid-column avoid-region
+P	caption-side	top bottom
+P	caret
+P	caret-animation	auto manual
+P	caret-color	auto
+P	caret-shape	auto bar block underscore
+P	clear	none left right both inline-start inline-end
+P	clip-path	none
+P	clip-rule	nonzero evenodd
+P	color
+P	color-interpolation	auto sRGB linearRGB
+P	color-interpolation-filters	auto sRGB linearRGB
+P	color-scheme	normal light dark only
+P	column-count	auto
+P	column-fill	auto balance
+P	column-gap	normal
+P	column-height	auto
+P	column-rule
+P	column-rule-color
+P	column-rule-style
+P	column-rule-width
+P	column-span	none all
+P	column-width	auto
+P	column-wrap	auto nowrap wrap
+P	columns
+P	contain	none strict content size inline-size layout style paint
+P	contain-intrinsic-block-size	auto none
+P	contain-intrinsic-height	auto none
+P	contain-intrinsic-inline-size	auto none
+P	contain-intrinsic-size	auto none
+P	contain-intrinsic-width	auto none
+P	container
+P	container-name	none
+P	container-type	normal size inline-size scroll-state
+P	content	normal none
+P	content-visibility	visible auto hidden
+P	corner-block-end-shape
+P	corner-block-start-shape
+P	corner-bottom-left-shape
+P	corner-bottom-right-shape
+P	corner-bottom-shape
+P	corner-end-end-shape
+P	corner-end-start-shape
+P	corner-inline-end-shape
+P	corner-inline-start-shape
+P	corner-left-shape
+P	corner-right-shape
+P	corner-shape
+P	corner-start-end-shape
+P	corner-start-start-shape
+P	corner-top-left-shape
+P	corner-top-right-shape
+P	corner-top-shape
+P	counter-increment	none
+P	counter-reset	none
+P	counter-set	none
+P	cursor
+P	cx
+P	cy
+P	d	none
+P	direction	ltr rtl
+P	display
+P	dominant-baseline	auto text-bottom alphabetic ideographic middle central mathematical hanging text-top
+P	dynamic-range-limit	standard no-limit constrained
+P	empty-cells	show hide
+P	field-sizing	content fixed
+P	fill
+P	fill-opacity
+P	fill-rule	nonzero evenodd
+P	filter	none
+P	flex	none
+P	flex-basis	content
+P	flex-direction	row row-reverse column column-reverse
+P	flex-flow
+P	flex-grow
+P	flex-line-count
+P	flex-shrink
+P	flex-wrap	nowrap wrap wrap-reverse balance
+P	float	left right none inline-start inline-end
+P	flood-color
+P	flood-opacity
+P	font
+P	font-family
+P	font-feature-settings	normal
+P	font-kerning	auto normal none
+P	font-language-override	normal
+P	font-optical-sizing	auto none
+P	font-palette	normal light dark
+P	font-size	math
+P	font-size-adjust	none ex-height cap-height ch-width ic-width ic-height from-font
+P	font-style	normal italic oblique
+P	font-synthesis	none weight style small-caps position
+P	font-synthesis-position	auto none
+P	font-synthesis-small-caps	auto none
+P	font-synthesis-style	auto none
+P	font-synthesis-weight	auto none
+P	font-variant	normal none historical-forms small-caps all-small-caps petite-caps all-petite-caps unicase titling-caps ordinal slashed-zero ruby
+P	font-variant-alternates	normal historical-forms
+P	font-variant-caps	normal small-caps all-small-caps petite-caps all-petite-caps unicase titling-caps
+P	font-variant-east-asian	normal ruby
+P	font-variant-emoji	normal text emoji unicode
+P	font-variant-ligatures	normal none
+P	font-variant-numeric	normal ordinal slashed-zero
+P	font-variant-position	normal sub super
+P	font-variation-settings	normal
+P	font-weight	bolder lighter
+P	font-width	normal ultra-condensed extra-condensed condensed semi-condensed semi-expanded expanded extra-expanded ultra-expanded
+P	forced-color-adjust	auto none preserve-parent-color
+P	frame-sizing	auto content-width content-height content-block-size content-inline-size
+P	gap
+P	grid	auto-flow dense
+P	grid-area
+P	grid-auto-columns
+P	grid-auto-flow	row column dense
+P	grid-auto-rows
+P	grid-column
+P	grid-column-end
+P	grid-column-start
+P	grid-row
+P	grid-row-end
+P	grid-row-start
+P	grid-template	none
+P	grid-template-areas	none
+P	grid-template-columns	none subgrid
+P	grid-template-rows	none subgrid
+P	hanging-punctuation	none first force-end allow-end last
+P	height	auto min-content max-content fit-content
+P	hyphenate-character	auto
+P	hyphenate-limit-chars	auto
+P	hyphens	none manual auto
+P	image-orientation	from-image flip
+P	image-rendering	auto crisp-edges pixelated smooth
+P	image-resolution	from-image snap
+P	initial-letter	normal
+P	initial-letter-align	auto alphabetic hanging ideographic
+P	inline-size
+P	inset
+P	inset-block
+P	inset-block-end
+P	inset-block-start
+P	inset-inline
+P	inset-inline-end
+P	inset-inline-start
+P	interactivity	auto inert
+P	interest-delay
+P	interest-delay-end	normal
+P	interest-delay-start	normal
+P	interpolate-size	numeric-only allow-keywords
+P	isolation	auto isolate
+P	justify-content	normal left right
+P	justify-items	normal stretch left right legacy center anchor-center
+P	justify-self	auto normal stretch left right anchor-center
+P	left	auto
+P	letter-spacing	normal
+P	lighting-color
+P	line-break	auto loose normal strict anywhere
+P	line-clamp	none
+P	line-height	normal
+P	line-height-step
+P	link-parameters	none
+P	list-style
+P	list-style-image	none
+P	list-style-position	inside outside
+P	list-style-type	none
+P	margin
+P	margin-block
+P	margin-block-end
+P	margin-block-start
+P	margin-bottom	auto
+P	margin-inline
+P	margin-inline-end
+P	margin-inline-start
+P	margin-left	auto
+P	margin-right	auto
+P	margin-top	auto
+P	margin-trim	none block block-start block-end
+P	marker	none
+P	marker-end	none
+P	marker-mid	none
+P	marker-start	none
+P	mask
+P	mask-border
+P	mask-border-mode	luminance alpha
+P	mask-border-outset
+P	mask-border-repeat	stretch repeat round space
+P	mask-border-slice	fill
+P	mask-border-source	none
+P	mask-border-width	auto
+P	mask-clip	no-clip
+P	mask-composite
+P	mask-image
+P	mask-mode
+P	mask-origin
+P	mask-position
+P	mask-repeat
+P	mask-size
+P	mask-type	luminance alpha
+P	math-depth	auto-add
+P	math-shift	normal compact
+P	math-style	normal compact
+P	max-block-size
+P	max-height	none min-content max-content fit-content
+P	max-inline-size
+P	max-lines	none
+P	max-width	none min-content max-content fit-content
+P	min-block-size
+P	min-height	auto min-content max-content fit-content
+P	min-inline-size
+P	min-width	auto min-content max-content fit-content
+P	mix-blend-mode	plus-darker plus-lighter
+P	object-fit	fill contain cover none scale-down
+P	object-position
+P	object-view-box	none
+P	offset
+P	offset-anchor	auto
+P	offset-distance
+P	offset-path	none
+P	offset-position	normal auto
+P	offset-rotate	auto reverse
+P	opacity
+P	order
+P	orphans
+P	outline
+P	outline-color	auto
+P	outline-offset
+P	outline-style	auto
+P	outline-width
+P	overflow	visible hidden clip scroll auto
+P	overflow-anchor	auto none
+P	overflow-block	visible hidden clip scroll auto
+P	overflow-clip-margin
+P	overflow-inline	visible hidden clip scroll auto
+P	overflow-wrap	normal break-word anywhere
+P	overflow-x	visible hidden clip scroll auto
+P	overflow-y	visible hidden clip scroll auto
+P	overlay	none auto
+P	overscroll-behavior	contain none auto
+P	overscroll-behavior-block	contain none auto
+P	overscroll-behavior-inline	contain none auto
+P	overscroll-behavior-x	contain none auto
+P	overscroll-behavior-y	contain none auto
+P	padding
+P	padding-block
+P	padding-block-end
+P	padding-block-start
+P	padding-bottom
+P	padding-inline
+P	padding-inline-end
+P	padding-inline-start
+P	padding-left
+P	padding-right
+P	padding-top
+P	page	auto
+P	paint-order	normal fill stroke markers
+P	path-length	none
+P	perspective	none
+P	perspective-origin
+P	place-content
+P	place-items
+P	place-self
+P	pointer-events	auto none visiblePainted visibleFill visibleStroke visible painted fill stroke all inherit
+P	position	static relative absolute sticky fixed
+P	position-anchor	normal auto none match-parent
+P	position-area	none
+P	position-try
+P	position-try-fallbacks	none
+P	position-try-order	normal
+P	position-visibility	always anchors-valid anchors-visible no-overflow
+P	print-color-adjust	economy exact
+P	quotes	none auto
+P	r
+P	reading-flow	normal source-order flex-visual flex-flow grid-rows grid-columns grid-order
+P	reading-order
+P	resize	none both horizontal vertical block inline
+P	right	auto
+P	rotate	none x y z
+P	row-gap	normal
+P	ruby-align	start center space-between space-around
+P	ruby-merge	separate collapse auto
+P	ruby-overhang	auto none
+P	ruby-position	alternate over under inter-character
+P	rx	auto
+P	ry	auto
+P	scale	none
+P	scroll-axis-lock	auto none
+P	scroll-behavior	auto smooth
+P	scroll-initial-target	none nearest
+P	scroll-margin
+P	scroll-margin-block
+P	scroll-margin-block-end
+P	scroll-margin-block-start
+P	scroll-margin-bottom
+P	scroll-margin-inline
+P	scroll-margin-inline-end
+P	scroll-margin-inline-start
+P	scroll-margin-left
+P	scroll-margin-right
+P	scroll-margin-top
+P	scroll-marker-group	none before after
+P	scroll-padding	auto
+P	scroll-padding-block	auto
+P	scroll-padding-block-end	auto
+P	scroll-padding-block-start	auto
+P	scroll-padding-bottom	auto
+P	scroll-padding-inline	auto
+P	scroll-padding-inline-end	auto
+P	scroll-padding-inline-start	auto
+P	scroll-padding-left	auto
+P	scroll-padding-right	auto
+P	scroll-padding-top	auto
+P	scroll-snap-align	none start end center
+P	scroll-snap-stop	normal always
+P	scroll-snap-type	none x y block inline both mandatory proximity
+P	scroll-target-group	none auto
+P	scroll-timeline
+P	scroll-timeline-axis	block inline x y
+P	scroll-timeline-name	none
+P	scrollbar-color	auto
+P	scrollbar-gutter	auto stable both-edges
+P	scrollbar-width	auto thin none
+P	shape-image-threshold
+P	shape-margin
+P	shape-outside	none
+P	shape-rendering	auto optimizeSpeed crispEdges geometricPrecision
+P	speak-as	normal spell-out digits literal-punctuation no-punctuation
+P	stop-color
+P	stop-opacity
+P	stroke
+P	stroke-color
+P	stroke-dasharray	none
+P	stroke-dashoffset
+P	stroke-linecap	butt round square
+P	stroke-linejoin	miter miter-clip round bevel arcs
+P	stroke-miterlimit
+P	stroke-opacity
+P	stroke-width
+P	tab-size
+P	table-layout	auto fixed
+P	text-align	start end left right center justify match-parent
+P	text-align-last	auto start end left right center justify
+P	text-anchor	start middle end
+P	text-autospace	normal auto
+P	text-box	normal
+P	text-box-edge	auto
+P	text-box-trim	none trim-start trim-end trim-both
+P	text-combine-upright	none all digits
+P	text-decoration
+P	text-decoration-color
+P	text-decoration-inset	auto
+P	text-decoration-line	none underline overline line-through blink spelling-error grammar-error
+P	text-decoration-skip	none objects spaces leading-spaces trailing-spaces edges box-decoration
+P	text-decoration-skip-ink	auto all none
+P	text-decoration-style	solid double dotted dashed wavy
+P	text-decoration-thickness	auto from-font
+P	text-emphasis
+P	text-emphasis-color
+P	text-emphasis-position	auto over under right left
+P	text-emphasis-style	none filled open dot circle double-circle triangle sesame
+P	text-fit	none grow shrink consistent per-line per-line-all
+P	text-indent	hanging each-line
+P	text-justify	auto inter-character inter-word none
+P	text-orientation	mixed upright sideways
+P	text-overflow	clip ellipsis
+P	text-rendering	auto optimizeSpeed optimizeLegibility geometricPrecision
+P	text-shadow	none
+P	text-size-adjust	none auto
+P	text-spacing-trim	space-all normal space-first trim-start
+P	text-transform	none capitalize uppercase lowercase full-width full-size-kana math-auto
+P	text-underline-offset	auto
+P	text-underline-position	auto from-font under left right
+P	text-wrap
+P	text-wrap-mode	wrap nowrap
+P	text-wrap-style	auto balance stable pretty
+P	timeline-scope	none
+P	timeline-trigger	none
+P	timeline-trigger-activation-range
+P	timeline-trigger-activation-range-end	normal
+P	timeline-trigger-activation-range-start	normal
+P	timeline-trigger-active-range
+P	timeline-trigger-active-range-end	auto normal
+P	timeline-trigger-active-range-start	auto normal
+P	timeline-trigger-name	none
+P	timeline-trigger-source
+P	top	auto
+P	touch-action	auto none pan-x pan-left pan-right pan-y pan-up pan-down pinch-zoom manipulation
+P	transform	none
+P	transform-box	content-box border-box fill-box stroke-box view-box
+P	transform-origin	left center right top bottom
+P	transform-style	flat preserve-3d
+P	transition
+P	transition-behavior
+P	transition-delay
+P	transition-duration
+P	transition-property	none
+P	transition-timing-function
+P	translate	none
+P	trigger-scope	none all
+P	unicode-bidi	normal embed isolate bidi-override isolate-override plaintext
+P	user-select	auto text none all
+P	vector-effect	none non-scaling-stroke non-scaling-size non-rotation fixed-position
+P	vertical-align	baseline sub super text-top text-bottom middle top bottom
+P	view-timeline
+P	view-timeline-axis	block inline x y
+P	view-timeline-inset	auto
+P	view-timeline-name	none
+P	view-transition-class	none
+P	view-transition-name	none match-element
+P	view-transition-scope	none all
+P	visibility	visible hidden collapse
+P	white-space	normal pre pre-wrap pre-line
+P	white-space-collapse	collapse preserve preserve-breaks preserve-spaces break-spaces
+P	widows
+P	width	auto min-content max-content fit-content
+P	will-change	auto
+P	window-drag	none move
+P	word-break	normal break-all keep-all break-word auto-phrase
+P	word-spacing	normal
+P	word-wrap	normal break-word
+P	writing-mode	horizontal-tb vertical-rl vertical-lr sideways-rl sideways-lr
+P	x
+P	y
+P	z-index	auto
+P	zoom	normal reset
+A	charset
+A	container
+A	counter-style
+D	@counter-style	additive-symbols
+D	@counter-style	fallback
+D	@counter-style	negative
+D	@counter-style	pad
+D	@counter-style	prefix
+D	@counter-style	range	infinite auto
+D	@counter-style	speak-as	auto bullets numbers words spell-out
+D	@counter-style	suffix
+D	@counter-style	symbols
+D	@counter-style	system	cyclic numeric alphabetic symbolic additive fixed extends
+A	font-face
+D	@font-face	ascent-override	normal
+D	@font-face	descent-override	normal
+D	@font-face	font-display	auto block swap fallback optional
+D	@font-face	font-family
+D	@font-face	font-feature-settings	normal
+D	@font-face	font-style	normal italic oblique
+D	@font-face	font-variation-settings	normal
+D	@font-face	font-weight
+D	@font-face	line-gap-override	normal
+D	@font-face	size-adjust
+D	@font-face	src
+D	@font-face	unicode-range
+A	font-feature-values
+A	font-palette-values
+D	@font-palette-values	base-palette	light dark
+D	@font-palette-values	font-family
+D	@font-palette-values	override-colors
+A	import
+A	keyframes
+A	layer
+A	media
+A	namespace
+A	page
+D	@page	bleed	auto
+D	@page	marks	none crop cross
+D	@page	page-margin-safety	none clamp add
+D	@page	page-orientation	upright rotate-left rotate-right
+D	@page	size	auto portrait landscape
+A	position-try
+A	property
+D	@property	inherits	true false
+D	@property	initial-value
+D	@property	syntax
+A	scope
+A	starting-style
+A	supports
+A	view-transition
+D	@view-transition	navigation	auto none
+D	@view-transition	types	none
+E	after
+E	backdrop
+E	before
+E	checkmark
+E	cue
+E	cue()
+E	cue-region
+E	cue-region()
+E	details-content
+E	file-selector-button
+E	first-letter
+E	first-line
+E	grammar-error
+E	highlight()
+E	marker
+E	part()
+E	picker()
+E	picker-icon
+E	placeholder
+E	scroll-marker
+E	scroll-marker-group
+E	selection
+E	slotted()
+E	spelling-error
+E	target-text
+E	view-transition
+E	view-transition-group()
+E	view-transition-image-pair()
+E	view-transition-new()
+E	view-transition-old()
+C	active
+C	active-view-transition
+C	active-view-transition-type()
+C	any-link
+C	autofill
+C	blank
+C	buffering
+C	checked
+C	current
+C	default
+C	defined
+C	dir()
+C	disabled
+C	empty
+C	enabled
+C	first
+C	first-child
+C	first-of-type
+C	focus
+C	focus-visible
+C	focus-within
+C	fullscreen
+C	future
+C	has()
+C	has-slotted
+C	host
+C	host()
+C	host-context()
+C	hover
+C	in-range
+C	indeterminate
+C	invalid
+C	is()
+C	lang()
+C	last-child
+C	last-of-type
+C	left
+C	link
+C	local-link
+C	modal
+C	muted
+C	not()
+C	nth-child()
+C	nth-last-child()
+C	nth-last-of-type()
+C	nth-of-type()
+C	only-child
+C	only-of-type
+C	open
+C	optional
+C	out-of-range
+C	past
+C	paused
+C	picture-in-picture
+C	placeholder-shown
+C	playing
+C	popover-open
+C	read-only
+C	read-write
+C	required
+C	right
+C	root
+C	scope
+C	seeking
+C	stalled
+C	state()
+C	target
+C	target-current
+C	target-within
+C	user-invalid
+C	user-valid
+C	valid
+C	visited
+C	volume-locked
+C	where()
+C	xr-overlay

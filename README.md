@@ -734,15 +734,26 @@ authenticated connection and review the destination and draft. Server
 publication requires OpenSSH-compatible no-replace hard links. Private SFTP
 comparisons use local or managed AI profiles.
 
-**Review replacement of the right server file…** uses the native Linux
-`kortty-server-archive` helper on the original authenticated route. Review
+**Review replacement of the right server file…** uses the native
+`kortty-server-archive` helper on the original authenticated SSH route.
+Install the Linux or macOS helper at `/usr/local/bin/kortty-server-archive`
+or the Windows helper at `C:\ProgramData\korTTY\kortty-server-archive.exe`
+in a directory protected from untrusted writes. Review
 the exact compared bytes and generated draft, and optionally keep a new
 `.bak` copy. The helper preserves the reviewed access mode and supported file
 metadata. It rejects links, shared-write targets, unsupported metadata and
-existing backups. Publication moves the checked original into private recovery
-before claiming the vacant destination. After a lost acknowledgement, check
+existing backups. The macOS helper copies and verifies extended file ACLs and
+supported extended attributes. Publication moves the checked original into
+private recovery before claiming the vacant destination. After a lost acknowledgement, check
 the destination and reported recovery path before retrying. On success the
 comparison reloads the original pair and verifies the saved bytes.
+
+The Windows helper accepts canonical drive-qualified SFTP paths such as
+`/C:/Users/alex/config.txt` on local NTFS or ReFS volumes. The SSH account
+must control the file and its parent. The replacement and backup retain
+the reviewed Windows DACL and supported attributes. The SFTP review uses
+the native permissions checked by the helper.
+[Windows OpenSSH command shells](https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh-server-configuration#configuring-the-default-shell-for-openssh-in-windows).
 
 **Compare shown folders…** reviews the displayed roots before reading their trees. You can also compare two selected folders from one pane or one folder from each pane. Exclude patterns apply to both roots. The result compares relative paths, file type, size and modification time. A metadata match and a byte comparison are separate results.
 
@@ -1262,6 +1273,17 @@ The handoff directory and its root-owned ancestors need search access for the
 login. Protect the configuration, helper and permitted directory paths from
 unprivileged changes.
 
+The Linux helper reclaims marked upload and download stages left by a
+terminated helper when preparing a later transfer for that account. A live
+helper holds a lock on the stage's root-owned marker. Reserve
+`.kortty-rsync-lock` and `.kortty-rsync-private-*` for the helper. The handoff
+filesystem must support atomic no-replace renames and advisory locks shared
+by all helpers using that directory. Inspect
+unmarked stages left by older helper versions after stopping the corresponding
+transfers.
+[Linux locking](https://man7.org/linux/man-pages/man2/flock.2.html) ·
+[Linux rename operations](https://man7.org/linux/man-pages/man2/rename.2.html).
+
 ```json
 {
   "version": 1,
@@ -1611,6 +1633,10 @@ Enable shell command marks in **Settings → Terminal** and set up integration f
 Turn off **Show terminal agent setup for submitted aliases** to start Run and Ask aliases directly. A direct Ask sends its question alone. A direct Run opens the environment probe review and requires approval. A local Windows Run first asks you to confirm an absolute working directory. Plan aliases and menu actions open their setup dialogs.
 
 **Plugins → AI Agent Design** selects Standard, Classic, Floating, or a custom design. Custom designs can choose the activity view, status placement, approval placement, and window style. Preview a design before saving it as the default. A saved SSH connection or local shell profile can inherit the default or choose a design under its terminal settings.
+
+**Preview a module** tries a single role in the selected combination. **Reset preview** returns to the combination. The sample shows the selected history, status, approval, and arrangement. In Adaptive Dock, the sample terminal size can be changed independently of the workspace.
+
+The status display stays for six seconds after a run by default. Set a delay from 0 to 60 seconds in **AI Agent Design**. Zero keeps the status visible. The activity history remains accessible after the status disappears. **View → AI Agent Panel → Show or Hide Status Bar** changes visibility for the current run. **Reduce Agent design animations** keeps the demo and live status timing and disables decorative motion in the Agent preview and terminal presentation.
 
 Docked history layouts place activity beside or below the terminal. Select an
 activity entry to read its details, or expand the status drawer for live run

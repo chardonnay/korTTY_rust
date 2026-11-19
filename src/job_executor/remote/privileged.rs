@@ -14,7 +14,6 @@ use kortty_ssh::{
 };
 
 use crate::clipboard_policy::ClipboardPolicy;
-use crate::connection_store::Store as ConnectionStore;
 use crate::job_executor::{Credentials, connection};
 use crate::profile;
 use crate::scheduler_window::{ConnectionRef, SshCommand, SudoMode, privileged, sync};
@@ -53,6 +52,16 @@ enum LocalFile {
     ReplaceUpload(upload_replace::Source),
 }
 
+fn reviewed_pins(
+    reference: &ConnectionRef,
+    trust: &TrustStore,
+) -> io::Result<Vec<(Endpoint, HostKey)>> {
+    let reviewed = reference
+        .strict_trust(trust.clone())
+        .map_err(io::Error::other)?;
+    sync::pins(reference, &reviewed)
+}
+
 pub(super) fn run_archive(
     request: &RunRequest<SshCommand>,
     policy: &ExecutionPolicy,
@@ -79,7 +88,7 @@ pub(super) fn run_archive(
         return Err(Failure::blocked(ARCHIVE_DENIED));
     }
     let trust = trust_store().map_err(|_| Failure::blocked(ARCHIVE_REVIEW))?;
-    let pins = sync::pins(reference, &trust).map_err(|_| Failure::blocked(ARCHIVE_REVIEW))?;
+    let pins = reviewed_pins(reference, &trust).map_err(|_| Failure::blocked(ARCHIVE_REVIEW))?;
     let review_action = Arc::clone(&request.action);
     let review_policy = policy.clone();
     let review_reference = reference.clone();
@@ -88,14 +97,7 @@ pub(super) fn run_archive(
     let review_current = move || {
         review_policy.require_target_groups(&review_action).is_ok()
             && profile::connections_path()
-                .and_then(ConnectionStore::open)
-                .is_ok_and(|store| {
-                    store
-                        .get(review_reference.id)
-                        .map(ConnectionRef::from)
-                        .as_ref()
-                        == Some(&review_reference)
-                })
+                .is_ok_and(|path| privileged::saved_route_current(&path, &review_reference))
             && sync::pins(&review_reference, &trust).is_ok_and(|current| current == review_pins)
             && context
                 .authorize_archive(
@@ -354,14 +356,12 @@ pub(super) fn run_file_action(
     let mut saved_auth = saved_auth.map_err(Failure::blocked)?;
     let auth = authorization(request.action.sudo, saved_auth.as_mut())?;
     let trust = trust_store().map_err(|_| Failure::blocked(FILE_ACTION_REVIEW))?;
-    let pins = sync::pins(reference, &trust).map_err(|_| Failure::blocked(FILE_ACTION_REVIEW))?;
+    let pins =
+        reviewed_pins(reference, &trust).map_err(|_| Failure::blocked(FILE_ACTION_REVIEW))?;
     let review_current = || {
         policy.require_target_groups(&request.action).is_ok()
             && profile::connections_path()
-                .and_then(ConnectionStore::open)
-                .is_ok_and(|store| {
-                    store.get(reference.id).map(ConnectionRef::from).as_ref() == Some(reference)
-                })
+                .is_ok_and(|path| privileged::saved_route_current(&path, reference))
             && sync::pins(reference, &trust).is_ok_and(|current| current == pins)
             && context
                 .authorize_file_action(action, reference, request.action.sudo, &pins)
@@ -449,7 +449,7 @@ pub(super) fn run(
     let mut saved_auth = saved_auth.map_err(Failure::blocked)?;
     let auth = authorization(request.action.sudo, saved_auth.as_mut())?;
     let trust = trust_store().map_err(|_| Failure::blocked(APPROVAL_REQUIRED))?;
-    let pins = sync::pins(reference, &trust).map_err(|_| Failure::blocked(APPROVAL_REQUIRED))?;
+    let pins = reviewed_pins(reference, &trust).map_err(|_| Failure::blocked(APPROVAL_REQUIRED))?;
     let receipt = context
         .authorize(transfer, reference, request.action.sudo, &pins)
         .map_err(|_| Failure::blocked(APPROVAL_REQUIRED))?;
@@ -693,7 +693,7 @@ pub(crate) fn preview_file_upload(
     cancelled: Arc<AtomicBool>,
     trust: TrustStore,
 ) -> Result<privileged::ReviewedDestination, String> {
-    let pins = sync::pins(&request.reference, &trust)
+    let pins = reviewed_pins(&request.reference, &trust)
         .map_err(|_| "Verify the SSH host keys for the complete saved route before review.")?;
     if sync::fingerprints(&pins) != request.pins {
         return Err("The verified SSH host keys changed. Review the route again.".into());
@@ -836,10 +836,14 @@ pub(super) fn preview_tree(
 ) -> Result<sync::Review, String> {
     let deadline = Instant::now() + Duration::from_secs(5 * 60);
     let reference = request.connection;
+    let checked_reference = reference.clone();
     let cancelled = request.cancelled;
     let allowed = move || {
-        !cancelled.load(Ordering::Acquire) && Instant::now() < deadline && allowed_now(&reference)
+        !cancelled.load(Ordering::Acquire)
+            && Instant::now() < deadline
+            && allowed_now(&checked_reference)
     };
+    reference.require_installed_shared_route()?;
     let auth = authorization(request.sudo, Some(&mut credentials)).map_err(|error| error.detail)?;
     let copy = request.copy;
     let mut plan = (copy.direction == sync::Direction::Upload)
@@ -857,8 +861,26 @@ pub(super) fn preview_tree(
         }
     }
     let (target, jumps) = credentials.into_route().map_err(|error| error.detail)?;
-    let mut session = super::sync::open_pinned(target, jumps, pins, || !allowed())
-        .map_err(|error| error.detail)?;
+    let mut session = if reference.shared_identity().is_some() {
+        super::sync::open_pinned_with(target, jumps, pins, |target, jumps, pinned| {
+            super::open_guarded_subsystem(
+                target,
+                jumps,
+                pinned,
+                false,
+                || !allowed(),
+                || {
+                    reference
+                        .require_installed_shared_route()
+                        .map_err(Failure::blocked)
+                },
+            )
+        })
+    } else {
+        super::sync::open_pinned(target, jumps, pins, || !allowed())
+    }
+    .map_err(|error| error.detail)?;
+    reference.require_installed_shared_route()?;
     let opener = tree_opener(&session).map_err(|error| error.detail)?;
     let preview = if let Some(plan) = plan {
         if copy.replace_changed || copy.standing.is_some() {
@@ -881,6 +903,7 @@ pub(super) fn preview_tree(
     };
     let _ = session.close();
     let (preview, receiver) = preview.map_err(tree_detail)?;
+    reference.require_installed_shared_route()?;
     Ok(sync::Review {
         preview,
         pins: sync::fingerprints(pins),
@@ -946,7 +969,7 @@ pub(super) fn run_tree(
         )
     };
     let trust = trust_store().map_err(|_| Failure::blocked(TREE_REVIEW))?;
-    let pins = sync::pins(reference, &trust).map_err(|_| Failure::blocked(TREE_REVIEW))?;
+    let pins = reviewed_pins(reference, &trust).map_err(|_| Failure::blocked(TREE_REVIEW))?;
     let reviewed_pins = tree_receipt
         .as_ref()
         .map(|receipt| &receipt.approval.pins)

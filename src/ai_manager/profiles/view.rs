@@ -831,6 +831,11 @@ impl Editor {
                     })
                     .on_toggle_maybe((editable && profile.trusted_remote_endpoint).then_some(Message::ReviewedAgentHttps))
             ),
+            profile.supports_reviewed_planning_https().then(||
+                checkbox(profile.permits_reviewed_planning_https())
+                    .label("Allow reviewed AI Planning requests over HTTPS")
+                    .on_toggle_maybe((editable && profile.trusted_remote_endpoint).then_some(Message::ReviewedPlanningHttps))
+            ),
             text(if profile.is_cli() {
                 "CLI requests inherit the timeout set in General and have a 30-minute maximum. The fixed CLI test uses 30 seconds."
             } else {

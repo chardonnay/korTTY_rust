@@ -15,9 +15,12 @@ use crate::clipboard_policy::ClipboardPolicy;
 use crate::connection_store::import::{JavaLibrarySettings, Preview as ConnectionPreview};
 use crate::recording_window::preferences as recording_preferences;
 use crate::session_journal::markers;
+use crate::snippet_window::session as snippet_session;
 use crate::snippets::recipients;
+use crate::terminal_agent::history as agent_history;
 use crate::workspace::backup_data::java_toolbar;
 use crate::workspace::environment_access::java_backup as environments;
+use crate::workspace::question_history::{self, Kind as QuestionKind};
 use crate::workspace::saved_chats;
 use crate::{profile::projects, snippets, terminal_highlight, workspace::backup_data};
 
@@ -42,7 +45,9 @@ pub(super) struct Report {
 
 pub(super) struct SchedulerSource {
     pub(super) review: java_scheduler::Review,
+    pub(super) teamwork_origins: BTreeMap<String, crate::connection_store::teamwork::Origin>,
     pub(super) connections: Arc<Zeroizing<Vec<u8>>>,
+    pub(super) target_review: Option<super::JavaSchedulerReview>,
 }
 
 pub(super) struct ToolbarSource {
@@ -189,6 +194,7 @@ pub(super) fn convert(
     }
 
     let mut journal_profiles = None;
+    let mut scheduler_teamwork_origins = BTreeMap::new();
     let mut toolbar = None;
     if let Some(bytes) = content("global-settings.xml") {
         let themes = snapshot
@@ -197,6 +203,79 @@ pub(super) fn convert(
         match backup_data::portable_java_preferences(bytes, themes) {
             Ok(import) => {
                 toolbar = import.toolbar;
+                if let Some((bytes, count)) = import.manual_questions {
+                    snapshot.insert(question_history::MANUAL_FILE.into(), Zeroizing::new(bytes));
+                    report.entries.push(format!(
+                        "Masked manual questions for available history slots ({count})"
+                    ));
+                }
+                if let Some((bytes, count)) = import.terminal_questions {
+                    snapshot.insert(
+                        question_history::TERMINAL_FILE.into(),
+                        Zeroizing::new(bytes),
+                    );
+                    report.entries.push(format!(
+                        "Masked terminal questions for available history slots ({count})"
+                    ));
+                }
+                if let Some((bytes, count)) = import.workflow_instructions {
+                    snapshot.insert(
+                        question_history::WORKFLOW_FILE.into(),
+                        Zeroizing::new(bytes),
+                    );
+                    report.entries.push(format!(
+                        "Masked workflow instructions for available history slots ({count})"
+                    ));
+                }
+                if let Some((bytes, count)) = import.agent_history {
+                    snapshot.insert(agent_history::BACKUP_PATH.into(), Zeroizing::new(bytes));
+                    report.entries.push(format!(
+                        "Masked Agent prompts ({count}) and a history limit for an unset store"
+                    ));
+                }
+                if import.recent_projects != 0 {
+                    report.entries.push(format!(
+                        "Recent Java project paths to open individually ({})",
+                        import.recent_projects
+                    ));
+                }
+                if import.recent_list_cutoff {
+                    report
+                        .entries
+                        .push("Java Open Recent clear time for an unset local history.".into());
+                }
+                let tabs = import.snippet_tabs;
+                if !tabs.ids.is_empty() {
+                    if snapshot.contains_key(snippets::FILE_NAME) {
+                        snapshot.insert(
+                            snippet_session::FILE_NAME.into(),
+                            Zeroizing::new(tabs.encode()?),
+                        );
+                        report.entries.push(format!(
+                            "Snippet tabs with Java library references ({})",
+                            tabs.ids.len()
+                        ));
+                    } else {
+                        report.note_count(
+                            tabs.ids.len(),
+                            "Java snippet tabs without a backed snippet library omitted",
+                        );
+                    }
+                }
+                if import.workflow_header_defaults != 0 {
+                    if snapshot.contains_key(snippets::FILE_NAME) {
+                        report.entries.push(format!(
+                            "Workflow header defaults to match against the restored snippet library ({})",
+                            import.workflow_header_defaults
+                        ));
+                    } else {
+                        report.note_count(
+                            import.workflow_header_defaults,
+                            "Java workflow header defaults without a backed snippet library omitted",
+                        );
+                    }
+                }
+                scheduler_teamwork_origins = import.scheduler_teamwork_origins;
                 if let Some(contents) = import.contents {
                     snapshot.insert(data::WINDOW_SETTINGS.into(), Zeroizing::new(contents));
                     if import.count != 0 {
@@ -220,6 +299,12 @@ pub(super) fn convert(
                 }
                 if import.java_update_opt_in {
                     report.entries.push("Java automatic update checks are available for review in Rust update settings.".into());
+                }
+                if import.session_restore_preferences != 0 {
+                    report.entries.push(format!(
+                        "Inactive Java session restore preferences for review in Window settings ({})",
+                        import.session_restore_preferences
+                    ));
                 }
                 if import.java_log_directory {
                     report.omissions.push(
@@ -377,6 +462,12 @@ pub(super) fn convert(
                         "Invalid Java Journal semantic search preference was omitted.".into(),
                     );
                 }
+                if imported.request_timeout_omitted {
+                    report.omissions.push("Java global AI timeout is outside the native range of 0 to 1,440 minutes or is invalid.".into());
+                }
+                if imported.code_text_language_omitted {
+                    report.omissions.push("Java's default AI code text language is invalid or unavailable in the native language list.".into());
+                }
                 if imported.journal_evidence_omitted {
                     report.omissions.push(
                         "Invalid or unsupported Java Session Journal evidence limits were omitted."
@@ -388,6 +479,7 @@ pub(super) fn convert(
                     + imported.embedded_imported
                     + imported.cli_imported;
                 if count != 0
+                    || imported.general_preferences
                     || imported.role_hints != 0
                     || imported.journal_profile_hints != 0
                     || imported.journal_evidence_hint
@@ -402,6 +494,11 @@ pub(super) fn convert(
                 {
                     if ClipboardPolicy::load().ai_profile_creation_allowed() {
                         snapshot.insert(ai::SETTINGS.into(), Zeroizing::new(bytes));
+                        if imported.general_preferences {
+                            report.entries.push(
+                                "Global AI timeout or code text language for unset fields".into(),
+                            );
+                        }
                         if imported.https_imported != 0 {
                             report.entries.push(format!(
                                 "HTTPS AI profiles requiring destination review ({})",
@@ -496,6 +593,9 @@ pub(super) fn convert(
                         journal_profiles = Some(imported);
                     } else {
                         report.note_count(count, "Java AI profiles omitted by managed policy");
+                        if imported.general_preferences {
+                            report.omissions.push("The Java global AI timeout and code text language were omitted by managed policy.".into());
+                        }
                         report.note_count(
                             imported.web_hints,
                             "Java web provider suggestions omitted by managed policy",
@@ -1025,6 +1125,8 @@ pub(super) fn convert(
         .map(|(review, connections)| SchedulerSource {
             review,
             connections,
+            teamwork_origins: scheduler_teamwork_origins,
+            target_review: None,
         });
     if has_passwords || has_keys {
         report
@@ -1131,6 +1233,16 @@ pub(super) fn merge_catalogue(
         data::WINDOW_SETTINGS => {
             backup_data::merge_java_window_settings(local, incoming, highlight_set_ids)
         }
+        question_history::MANUAL_FILE => {
+            question_history::merge_java_history(local, incoming, QuestionKind::Manual)
+        }
+        question_history::TERMINAL_FILE => {
+            question_history::merge_java_history(local, incoming, QuestionKind::Terminal)
+        }
+        question_history::WORKFLOW_FILE => {
+            question_history::merge_java_history(local, incoming, QuestionKind::Workflow)
+        }
+        agent_history::BACKUP_PATH => agent_history::merge_java_backup(local, incoming),
         recording_preferences::FILE => backup_data::recording::merge(local, incoming),
         markers::FILE => markers::java::merge(local, incoming),
         environments::PATH => environments::merge(local, incoming),
@@ -1149,6 +1261,10 @@ pub(super) fn is_catalogue(path: &str) -> bool {
         CONNECTIONS
             | snippets::FILE_NAME
             | data::WINDOW_SETTINGS
+            | question_history::MANUAL_FILE
+            | question_history::TERMINAL_FILE
+            | question_history::WORKFLOW_FILE
+            | agent_history::BACKUP_PATH
             | recording_preferences::FILE
             | markers::FILE
             | terminal_highlight::FILE

@@ -8,8 +8,8 @@ use zeroize::Zeroizing;
 
 use super::policy_profile::{EchoMask, redact_echo};
 use super::{
-    Client, DEFAULT_TIMEOUT, Error, MAX_RESPONSE_BYTES, RemoteProtocol, RequestMessage, Target,
-    Usage, UsageAttempt, chat_messages, completion_status, is_event_stream, providers,
+    Client, Error, MAX_RESPONSE_BYTES, RemoteProtocol, RequestMessage, Target, Usage, UsageAttempt,
+    chat_messages, completion_status, is_event_stream, providers,
 };
 
 mod harmony;
@@ -205,8 +205,7 @@ impl Client {
         self.require_text_for_mlx(messages)?;
         let response_format = response_format && !self.profile.is_mlx();
         let deadline = if structured && self.profile.starts_sidecar() {
-            let limit = Instant::now() + self.profile.options.timeout.unwrap_or(DEFAULT_TIMEOUT);
-            Some(deadline.map_or(limit, |deadline| deadline.min(limit)))
+            self.profile.options.request_deadline(deadline)
         } else {
             deadline
         };
@@ -236,7 +235,7 @@ impl Client {
                 before_dispatch,
                 attempt,
             )?;
-            (response, None, Some(deadline))
+            (response, None, deadline)
         } else {
             let body = providers::lm_request(self, messages, response_format, true)?;
             let response = self.completion_response(transport, &body, deadline, attempt)?;
@@ -287,7 +286,7 @@ impl Client {
                 Some(bytes) => bytes,
                 None => self.cancellable_response_bytes(
                     &mut response,
-                    deadline.is_some() || self.profile.options.timeout.is_some(),
+                    deadline.is_some() || self.profile.options.has_explicit_timeout(),
                 )?,
             };
             let answer = match protocol {

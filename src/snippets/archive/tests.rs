@@ -280,6 +280,16 @@ fn java_private_snippet_library_import_preserves_owners_digests_and_stale_ranges
     let library = Library::open(profile.path()).unwrap();
     let entry = library.get(owner).unwrap();
     assert_eq!(entry.name(), "Deploy α");
+    assert!(entry.favorite());
+    assert_eq!(entry.usage_count(), 1);
+    assert_eq!(
+        entry.stats.last_used,
+        Some(jiff::Timestamp::from_millisecond(1700000003000).unwrap())
+    );
+    assert_eq!(
+        entry.last_modified(),
+        Some(jiff::Timestamp::from_millisecond(1700000001000).unwrap())
+    );
     assert_eq!(
         entry.content(),
         "# header\r\nprintf '%s' '東京 & <db>'\r\n# footer\r\n"

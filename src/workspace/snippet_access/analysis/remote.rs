@@ -656,6 +656,7 @@ mod tests {
         })).unwrap();
         let mut workspace = Workspace::default();
         workspace.set_test_ai_configuration(configuration.clone());
+        workspace.window_settings.snippet_ai_additional_instructions = Some(true);
         workspace.window_settings.snippet_analysis_auto_diagram = true;
         let (owner, _) = workspace.open_window(false);
         let window = SnippetWindow::open(profile.path()).unwrap();

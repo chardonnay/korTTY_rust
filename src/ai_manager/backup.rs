@@ -207,6 +207,9 @@ pub(crate) fn portable_java_model_hints(
 }
 
 pub(crate) struct JavaProfileReport {
+    pub(crate) general_preferences: bool,
+    pub(crate) request_timeout_omitted: bool,
+    pub(crate) code_text_language_omitted: bool,
     pub(crate) https_imported: usize,
     pub(crate) loopback_imported: usize,
     pub(crate) embedded_imported: usize,
@@ -253,6 +256,7 @@ pub(crate) fn portable_java_profiles(bytes: &[u8]) -> io::Result<(Vec<u8>, JavaP
     let (profiles, report) = java_backup::decode(bytes)?;
     let settings = Configuration {
         profiles,
+        java_general_preferences: report.general_preferences,
         java_journal_profiles: report.journal_profiles,
         java_roles: report.roles,
         java_memory_tokens: report.memory_tokens,
@@ -268,6 +272,9 @@ pub(crate) fn portable_java_profiles(bytes: &[u8]) -> io::Result<(Vec<u8>, JavaP
     Ok((
         encoded,
         JavaProfileReport {
+            general_preferences: !settings.java_general_preferences.is_empty(),
+            request_timeout_omitted: report.request_timeout_omitted,
+            code_text_language_omitted: report.code_text_language_omitted,
             https_imported: report.https_imported,
             loopback_imported: report.loopback_imported,
             embedded_imported: report.embedded_imported,
@@ -336,10 +343,12 @@ pub(crate) fn merge_java_profiles(
     if !policy.ai_profile_creation_allowed() {
         return Ok(None);
     }
-    let mut local = local
+    let saved = local;
+    let mut local = saved
         .map(Configuration::decode)
         .transpose()?
         .unwrap_or_default();
+    let general_added = merge_java_general(&mut local, saved, incoming.java_general_preferences)?;
     let toolpack_hints_added = policy.ai_profile_edit_allowed()
         && local
             .profiles
@@ -425,6 +434,7 @@ pub(crate) fn merge_java_profiles(
         }
     }
     if added == 0
+        && !general_added
         && !confirmation_added
         && !execution_added
         && !memory_preferences_added
@@ -441,6 +451,33 @@ pub(crate) fn merge_java_profiles(
         return Ok(None);
     }
     encode_java_profiles(&local).map(Some)
+}
+
+fn merge_java_general(
+    config: &mut Configuration,
+    saved: Option<&[u8]>,
+    incoming: super::JavaGeneralPreferences,
+) -> io::Result<bool> {
+    if incoming.is_empty() {
+        return Ok(false);
+    }
+    let saved: Option<serde_json::Value> = saved.map(serde_json::from_slice).transpose()?;
+    let general = saved.as_ref().and_then(|saved| saved.get("general"));
+    let unset = |key| general.is_none_or(|general| general.get(key).is_none());
+    let mut changed = false;
+    if let Some(minutes) = incoming.timeout_minutes
+        && unset("timeout_minutes")
+    {
+        config.general.timeout_minutes = minutes;
+        changed = true;
+    }
+    if let Some(language) = incoming.code_text_language
+        && unset("code_text_language")
+    {
+        config.general.code_text_language = language;
+        changed = true;
+    }
+    Ok(changed)
 }
 
 fn encode_java_profiles(settings: &Configuration) -> io::Result<Vec<u8>> {
@@ -546,6 +583,73 @@ pub(crate) fn safe_memory(path: &str, bytes: &[u8]) -> bool {
 
 #[cfg(test)]
 mod java_profile_tests {
+    #[test]
+    fn java_general_ai_preferences_fill_only_unset_native_fields() {
+        use crate::ai_manager::CodeTextLanguage;
+
+        let xml = br#"<globalSettings><aiRequestTimeoutMinutes>23</aiRequestTimeoutMinutes>
+            <aiCodeTextDefaultLanguage>DE</aiCodeTextDefaultLanguage></globalSettings>"#;
+        let (incoming, report) = portable_java_profiles(xml).unwrap();
+        assert!(report.general_preferences);
+        assert!(!report.request_timeout_omitted);
+        assert!(!report.code_text_language_omitted);
+        let policy = ClipboardPolicy::default();
+        let merged = merge_java_profiles(None, &incoming, &policy)
+            .unwrap()
+            .unwrap();
+        let settings = Configuration::decode(&merged).unwrap();
+        assert_eq!(settings.general.timeout_minutes, 23);
+        assert_eq!(
+            settings.general.code_text_language,
+            CodeTextLanguage::German
+        );
+        assert!(settings.java_general_preferences.is_empty());
+        assert!(
+            merge_java_profiles(Some(&merged), &incoming, &policy)
+                .unwrap()
+                .is_none()
+        );
+
+        let local = br#"{"general":{"timeout_minutes":1,"features_enabled":false}}"#;
+        let merged = merge_java_profiles(Some(local), &incoming, &policy)
+            .unwrap()
+            .unwrap();
+        let settings = Configuration::decode(&merged).unwrap();
+        assert_eq!(settings.general.timeout_minutes, 1);
+        assert_eq!(
+            settings.general.code_text_language,
+            CodeTextLanguage::German
+        );
+        assert!(!settings.general.features_enabled);
+
+        let local = br#"{"general":{"code_text_language":"auto"}}"#;
+        let merged = merge_java_profiles(Some(local), &incoming, &policy)
+            .unwrap()
+            .unwrap();
+        let settings = Configuration::decode(&merged).unwrap();
+        assert_eq!(settings.general.timeout_minutes, 23);
+        assert_eq!(settings.general.code_text_language, CodeTextLanguage::Auto);
+
+        let (unlimited, report) = portable_java_profiles(br#"<globalSettings>
+            <aiRequestTimeoutMinutes>0</aiRequestTimeoutMinutes><aiCodeTextDefaultLanguage>cs</aiCodeTextDefaultLanguage>
+            </globalSettings>"#).unwrap();
+        assert!(report.general_preferences);
+        assert!(!report.request_timeout_omitted);
+        assert!(report.code_text_language_omitted);
+        let merged = merge_java_profiles(None, &unlimited, &policy)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            Configuration::decode(&merged)
+                .unwrap()
+                .general
+                .timeout_minutes,
+            0
+        );
+        let (_, report) = portable_java_profiles(br#"<globalSettings><aiRequestTimeoutMinutes>1441</aiRequestTimeoutMinutes></globalSettings>"#).unwrap();
+        assert!(report.request_timeout_omitted);
+    }
+
     #[test]
     fn java_skill_preferences_are_inactive_additive_and_report_invalid_siblings() {
         use crate::ai_manager::skills::Preference;

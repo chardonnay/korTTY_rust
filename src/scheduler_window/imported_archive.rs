@@ -95,19 +95,18 @@ impl Draft {
     pub(super) fn require_current_route(
         &self,
         store: &Store,
+        shared: &super::SharedTargets,
         trust: &kortty_ssh::TrustStore,
         policy: &ClipboardPolicy,
     ) -> Result<(), &'static str> {
-        let saved = store
-            .get(self.route.id)
-            .ok_or("The imported SSH route is no longer saved.")?;
-        if ConnectionRef::from(saved) != self.route {
-            return Err("The saved SSH route no longer matches the imported archive.");
-        }
-        if saved.incognito || !saved.isolation.is_none() {
-            return Err("This saved connection requires privacy or isolation unavailable to jobs.");
-        }
-        let pins = super::sync::pins(&self.route, trust)
+        shared.require_for_adoption(
+            store,
+            &self.route,
+            policy,
+            "The saved SSH route no longer matches the imported archive.",
+        )?;
+        let reviewed_trust = self.route.strict_trust(trust.clone())?;
+        let pins = super::sync::pins(&self.route, &reviewed_trust)
             .map_err(|_| "Verify the saved SSH route host keys before adopting the archive.")?;
         if self.settings.java_sudo && !policy.scheduler_sudo_allowed {
             return Err("Application policy forbids Scheduler sudo for this archive.");

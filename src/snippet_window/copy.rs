@@ -9,11 +9,18 @@ use super::{SnippetWindow, Update};
 #[derive(Clone)]
 pub enum Message {
     Begin,
+    BeginInsert(EditorTarget, SnippetId),
     Enter(u64, usize, Zeroizing<String>),
     Remember(u64, usize, bool),
     Confirm(u64),
     Cancel,
     ClipboardLoaded(u64, Option<Zeroizing<String>>),
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct EditorTarget {
+    pub(crate) owner: iced::window::Id,
+    pub(crate) editor: iced::window::Id,
 }
 
 pub(super) struct Pending {
@@ -22,6 +29,7 @@ pub(super) struct Pending {
     requirements: resolve::CopyRequirements,
     fields: Vec<FieldOptions>,
     awaiting_clipboard: bool,
+    target: Option<EditorTarget>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -31,6 +39,17 @@ struct FieldOptions {
 }
 
 impl SnippetWindow {
+    pub(crate) fn deny_snippet_clipboard(&mut self, token: u64) {
+        if self
+            .copy
+            .as_ref()
+            .is_some_and(|pending| pending.token == token && pending.awaiting_clipboard)
+        {
+            self.copy = None;
+            self.status = Some("Managed policy blocks reading the clipboard.".into());
+        }
+    }
+
     pub(super) fn copy_snippet_command(&mut self, mode: one_liner::Mode) -> Update {
         match one_liner::convert(&self.draft.content.text(), &self.draft.language, mode) {
             Ok(command) => {
@@ -50,8 +69,13 @@ impl SnippetWindow {
 
     pub(super) fn update_copy(&mut self, message: Message) -> Update {
         match message {
-            Message::Begin if self.copy.is_none() && !self.draft.dirty => {
-                let Some(snippet) = self.draft.id.and_then(|id| self.library.get(id)) else {
+            Message::Begin | Message::BeginInsert(..) if self.copy.is_none() => {
+                let (id, target) = match message {
+                    Message::Begin if !self.draft.dirty => (self.draft.id, None),
+                    Message::BeginInsert(target, snippet) => (Some(snippet), Some(target)),
+                    _ => return Update::None,
+                };
+                let Some(snippet) = id.and_then(|id| self.library.get(id)) else {
                     return Update::None;
                 };
                 self.next_copy_token = self.next_copy_token.wrapping_add(1);
@@ -66,6 +90,7 @@ impl SnippetWindow {
                     requirements,
                     fields,
                     awaiting_clipboard: false,
+                    target,
                 });
                 if !needs_prompt {
                     return self.continue_copy(token);
@@ -131,6 +156,35 @@ impl SnippetWindow {
         let Some(pending) = self.copy.take() else {
             return Update::None;
         };
+        if let Some(target) = pending.target {
+            let result = self
+                .library
+                .get(pending.snippet)
+                .ok_or("The snippet no longer exists")
+                .and_then(|snippet| {
+                    resolve::interactive_insertion(
+                        snippet.content(),
+                        self.library.variables(),
+                        &pending.requirements.missing,
+                        clipboard,
+                    )
+                });
+            return match result {
+                Ok(resolved) => {
+                    if let Err(error) = self
+                        .library
+                        .remember_missing_defaults(pending.selected_defaults())
+                    {
+                        self.status = Some(format!("Could not save selected defaults ({error})"));
+                    }
+                    Update::InsertSaved(target, pending.snippet, resolved)
+                }
+                Err(error) => {
+                    self.status = Some(error.into());
+                    Update::None
+                }
+            };
+        }
         match pending.resolve(&self.library, clipboard) {
             Ok(value) => {
                 self.status = Some(
@@ -145,7 +199,7 @@ impl SnippetWindow {
                         }
                     },
                 );
-                Update::CopyResolved(value)
+                Update::CopySaved(pending.snippet, value)
             }
             Err(error) => {
                 self.status = Some(error.into());
@@ -184,6 +238,7 @@ impl Pending {
     pub(super) fn view(&self) -> Element<'_, Message> {
         let mut fields = column![].spacing(8);
         let token = self.token;
+        let inserting = self.target.is_some();
         for (index, (field, options)) in self
             .requirements
             .missing
@@ -193,7 +248,7 @@ impl Pending {
         {
             let mut entry = column![
                 text(&field.name),
-                text_input("Value for this copy", &field.value)
+                text_input("Value for this snippet", &field.value)
                     .secure(true)
                     .on_input(move |value| Message::Enter(token, index, Zeroizing::new(value))),
                 checkbox(options.remember)
@@ -207,14 +262,18 @@ impl Pending {
             fields = fields.push(entry);
         }
         let content = if self.awaiting_clipboard {
-            column![text("Reading the clipboard for this copy…")]
+            column![text("Reading the clipboard for this snippet…")]
         } else {
             column![
-                text("Enter values for this copy").size(19),
+                text("Enter values for this snippet").size(19),
                 text("Remembered defaults are saved in plain text."),
                 scrollable(fields).height(Length::Fill),
-                button("Copy resolved text")
-                    .on_press_maybe(self.valid().then_some(Message::Confirm(token))),
+                button(if inserting {
+                    "Insert resolved text"
+                } else {
+                    "Copy resolved text"
+                })
+                .on_press_maybe(self.valid().then_some(Message::Confirm(token))),
             ]
             .spacing(10)
         };

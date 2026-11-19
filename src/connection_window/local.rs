@@ -6,6 +6,7 @@ use kortty_pty::{LocalShell, available_local_shells};
 use kortty_terminal::TerminalProfile;
 
 use crate::connection_store::LocalProfile;
+use crate::terminal_effects::{Effect, editor::EffectDraft};
 
 use super::{ConnectionWindow, Message, Persisted, Scope, terminal_overrides};
 
@@ -24,6 +25,8 @@ pub enum Edit {
     Argument(usize, String),
     RemoveArgument(usize),
     Terminal(terminal_overrides::Edit),
+    Effect(Option<Effect>),
+    EffectSpeed(String),
 }
 
 pub(super) struct Draft {
@@ -38,6 +41,7 @@ pub(super) struct Draft {
     program: String,
     arguments: Vec<String>,
     terminal: terminal_overrides::Draft,
+    effect: EffectDraft,
 }
 
 impl Draft {
@@ -54,6 +58,7 @@ impl Draft {
             program: String::new(),
             arguments: Vec::new(),
             terminal: terminal_overrides::Draft::new(&Default::default()),
+            effect: EffectDraft::default(),
         };
         if let Some(profile) = profile {
             draft.id = if duplicate { 0 } else { profile.id };
@@ -70,6 +75,7 @@ impl Draft {
             draft.shell = profile.shell;
             draft.integration = profile.shell_integration;
             draft.terminal = terminal_overrides::Draft::new(&profile.terminal);
+            draft.effect = EffectDraft::new(profile.terminal_effect);
             if let Some(command) = profile.command {
                 let mut words = command.into_iter();
                 draft.custom = true;
@@ -98,6 +104,7 @@ impl Draft {
             working_directory: (!self.directory.is_empty()).then(|| PathBuf::from(&self.directory)),
             shell_integration: self.integration,
             emulation: self.emulation.term_name().into(),
+            terminal_effect: self.effect.selection(),
             terminal: self.terminal.value()?,
         };
         profile.validate().map_err(|error| error.to_string())?;
@@ -136,6 +143,8 @@ impl Draft {
                 self.changed |= self.terminal.update(edit);
                 return;
             }
+            Edit::Effect(effect) => self.effect.effect = effect,
+            Edit::EffectSpeed(value) => self.effect.set_speed(value),
             _ => return,
         }
         self.changed = true;
@@ -209,6 +218,11 @@ impl Draft {
         );
         if let Err(error) = integration {
             form = form.push(text(error.to_string()).size(12));
+        }
+        if let Some(effects) = choices.terminal_effects {
+            form = form
+                .push(text("Terminal Effect").size(16))
+                .push(self.effect.view(effects, Edit::Effect, Edit::EffectSpeed));
         }
         form.push(self.terminal.view(choices).map(Edit::Terminal))
             .into()

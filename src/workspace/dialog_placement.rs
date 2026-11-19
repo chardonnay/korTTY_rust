@@ -1294,6 +1294,42 @@ mod tests {
     }
 
     #[test]
+    fn quick_connect_applies_imported_java_class_geometry_when_opened() {
+        use super::super::backup_data::{merge_java_window_settings, portable_java_preferences};
+        use super::super::tab_titles::WindowSettings;
+
+        let xml = br#"<globalSettings><windowGeometries>
+          <window key="de.kortty.ui.QuickConnectDialog">
+            <geometry><width>1050</width><height>390</height><x>-450</x><y>85</y></geometry>
+          </window>
+        </windowGeometries></globalSettings>"#;
+        let imported = portable_java_preferences(xml, None)
+            .unwrap()
+            .contents
+            .unwrap();
+        let settings = merge_java_window_settings(None, &imported, &Default::default())
+            .unwrap()
+            .unwrap();
+        let mut workspace = Workspace {
+            window_settings: WindowSettings::decode(&settings).unwrap(),
+            ..Workspace::default()
+        };
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.show_quick_connect(owner);
+        let opened = workspace
+            .dialog_placement
+            .open
+            .values()
+            .find(|live| live.kind == Kind::QuickConnect)
+            .unwrap();
+        assert_eq!(
+            (opened.preferred.width, opened.preferred.height),
+            (1050.0, 400.0)
+        );
+        assert_eq!(opened.preferred.position, SavedPosition::new(-450.0, 85.0));
+    }
+
+    #[test]
     fn journal_manager_applies_imported_bounds_until_native_bounds_exist() {
         use super::super::journal_access::{Message as JournalMessage, dialog_geometry::Geometry};
 

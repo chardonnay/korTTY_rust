@@ -152,12 +152,16 @@ impl Snapshot {
     }
 
     fn single_header(&self) -> String {
+        self.single_header_for(None, None)
+    }
+
+    fn single_header_for(&self, path: Option<&str>, language: Option<&str>) -> String {
         let file = &self.files[0];
         format!(
             "File: {} ({})\nSnippet language: {}\nLine-numbered snippet:\n",
-            file.path,
+            path.unwrap_or(&file.path),
             executable(file),
-            file.language,
+            language.unwrap_or(&file.language),
         )
     }
 

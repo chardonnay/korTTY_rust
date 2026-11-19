@@ -86,7 +86,10 @@ impl Workspace {
     }
 
     pub(super) fn refresh_backup_preferences(&mut self) {
-        match profile::root().and_then(|root| preferences::load(&root)) {
+        match profile::root().and_then(|root| {
+            self.window_settings.java_backup_defaults.adopt(&root)?;
+            preferences::load(&root)
+        }) {
             Ok((preferences, progress)) => {
                 if !self.backup_runner.available || self.backup_preferences != preferences {
                     self.backup_runner.revision = self.backup_runner.revision.wrapping_add(1);

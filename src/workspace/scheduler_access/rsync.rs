@@ -7,7 +7,7 @@ use iced::{Task, window};
 
 use crate::job_executor::rsync::PrivilegedPreviewMode;
 use crate::scheduler_window::rsync::UploadReceiverPreview;
-use crate::scheduler_window::{ConnectionRef, TargetGroups};
+use crate::scheduler_window::{ConnectionRef, SharedTargets, TargetGroups};
 use kortty_server_archive::rsync_tree::RecurringReceiver;
 
 use super::{ClipboardPolicy, ConnectionStore, Message, Workspace, job_executor, profile};
@@ -28,19 +28,12 @@ impl Workspace {
             );
         };
         let targets = request.existing_targets();
-        let local_targets = request.local_existing_targets();
         let mixed_targets = request.mixed_targets();
         let privileged_targets = request.privileged_targets();
         let mut credentials = VecDeque::new();
         let mut mixed_credentials = VecDeque::new();
         let mut privileged_credentials = VecDeque::new();
-        let reviewed = if targets.is_empty()
-            && local_targets.is_empty()
-            && mixed_targets.is_empty()
-            && privileged_targets.is_empty()
-        {
-            None
-        } else {
+        let reviewed = {
             let result = (|| -> Result<ReviewedRoutes, String> {
                 let installed = ClipboardPolicy::load();
                 if !self.scheduler_sync_allowed()
@@ -63,14 +56,7 @@ impl Workspace {
                 let reviewed = ReviewedRoutes {
                     path: profile::connections_path().map_err(|error| error.to_string())?,
                     groups: view.rsync_review_groups(),
-                    references: targets
-                        .iter()
-                        .map(|(reference, _)| reference)
-                        .chain(local_targets.iter().map(|(reference, _)| reference))
-                        .chain(mixed_targets.iter().map(|target| &target.reference))
-                        .chain(privileged_targets.iter().map(|(reference, _)| reference))
-                        .cloned()
-                        .collect(),
+                    references: request.references().cloned().collect(),
                 };
                 let store = reviewed.open().map_err(|error| error.to_string())?;
                 for reference in &reviewed.references {
@@ -88,58 +74,56 @@ impl Workspace {
                         return Err("Managed policy blocks a selected rsync route.".into());
                     }
                 }
-                for (reference, destination) in targets {
+                let teamwork = if reviewed.has_teamwork() {
+                    Some(self.scheduler_shared_targets(&store)?)
+                } else {
+                    None
+                };
+                let authenticate = |reference: &ConnectionRef| {
+                    if let Some(identity) = reference.shared_identity() {
+                        let (catalog, shared) = teamwork
+                            .as_ref()
+                            .ok_or("The Teamwork catalogue is unavailable.")?;
+                        shared.require(reference)?;
+                        let entry = catalog
+                            .get(identity)
+                            .ok_or("The Teamwork rsync route is unavailable.")?;
+                        return self
+                            .scheduler_shared_credentials(reference, entry, &store, false, false);
+                    }
                     let connection = store
                         .get(reference.id)
                         .ok_or("The saved rsync route is unavailable.")?;
-                    let auth = job_executor::Credentials::resolve_directory_browser(
-                        &reference,
-                        connection,
-                        installed.server_access(),
-                        |id, kind, endpoint| self.vault_credential(id, kind, endpoint),
-                    )?;
-                    credentials.push_back((reference, destination, auth));
-                }
-                for target in &mixed_targets {
-                    let reference = &target.reference;
-                    let connection = store
-                        .get(reference.id)
-                        .ok_or("The saved mixed rsync route is unavailable.")?;
-                    let auth = job_executor::Credentials::resolve_directory_browser(
+                    job_executor::Credentials::resolve_directory_browser(
                         reference,
                         connection,
                         installed.server_access(),
                         |id, kind, endpoint| self.vault_credential(id, kind, endpoint),
-                    )?;
-                    mixed_credentials.push_back((reference.clone(), auth));
+                    )
+                };
+                for (reference, destination) in targets {
+                    let auth = authenticate(&reference)?;
+                    credentials.push_back((reference, destination, auth));
+                }
+                for target in &mixed_targets {
+                    let reference = &target.reference;
+                    mixed_credentials.push_back((reference.clone(), authenticate(reference)?));
                 }
                 for (reference, spec) in privileged_targets {
-                    let connection = store
-                        .get(reference.id)
-                        .ok_or("The saved privileged rsync route is unavailable.")?;
-                    let auth = job_executor::Credentials::resolve_directory_browser(
-                        &reference,
-                        connection,
-                        installed.server_access(),
-                        |id, kind, endpoint| self.vault_credential(id, kind, endpoint),
-                    )?;
+                    let auth = authenticate(&reference)?;
                     privileged_credentials.push_back((reference, spec, auth));
                 }
                 Ok(reviewed)
             })();
             match result {
-                Ok(reviewed) => Some(Arc::new(reviewed)),
+                Ok(reviewed) => Arc::new(reviewed),
                 Err(error) => return self.report_scheduler_group_error(id, error),
             }
         };
         let Some(view) = self.scheduler_views.get_mut(&id) else {
             return Task::none();
         };
-        let local_review = if local_targets.is_empty() && mixed_targets.is_empty() {
-            None
-        } else {
-            reviewed.clone()
-        };
+        let completed_review = Arc::clone(&reviewed);
         let mixed_review = reviewed.clone();
         let privileged_review = reviewed.clone();
         view.begin_rsync_review(
@@ -151,10 +135,7 @@ impl Workspace {
                 if &expected != reference || &path != target.destination() {
                     return Err("The rsync route or receiver changed before review.".into());
                 }
-                let reviewed = reviewed
-                    .as_ref()
-                    .cloned()
-                    .ok_or("The rsync destination review is unavailable.")?;
+                let reviewed = Arc::clone(&reviewed);
                 let current = move || reviewed.open().map(|_| ());
                 match target {
                     UploadReceiverPreview::ExistingDirectory(destination) => {
@@ -187,10 +168,7 @@ impl Workspace {
                 if reference != target.reference {
                     return Err("The mixed rsync route changed before review.".into());
                 }
-                let reviewed = mixed_review
-                    .as_ref()
-                    .cloned()
-                    .ok_or("The mixed rsync route review is unavailable.")?;
+                let reviewed = Arc::clone(&mixed_review);
                 job_executor::rsync::preview_mixed(
                     auth,
                     target,
@@ -206,10 +184,7 @@ impl Workspace {
                 if &expected != reference || &reviewed_spec != spec {
                     return Err("The privileged rsync route or path changed before review.".into());
                 }
-                let routes = privileged_review
-                    .as_ref()
-                    .cloned()
-                    .ok_or("The privileged rsync review is unavailable.")?;
+                let routes = Arc::clone(&privileged_review);
                 let mode = match (review_vacant_server_upload, &spec.operation) {
                     (
                         true,
@@ -232,23 +207,19 @@ impl Workspace {
                 )
             },
             move || {
-                if let Some(routes) = local_review {
-                    routes.open().map_err(|error| error.to_string())?;
-                    let policy = ClipboardPolicy::load();
-                    if policy.problem.is_some()
-                        || !policy.file_transfer_allowed
-                        || !policy.minimum_isolation.is_none()
-                        || routes.references.iter().any(|reference| {
-                            policy
-                                .server_access()
-                                .first_blocked(reference.target.servers(reference.jump.as_ref()))
-                                .is_some()
-                        })
-                    {
-                        return Err(
-                            "Managed policy forbids existing-directory rsync review.".into()
-                        );
-                    }
+                completed_review.open().map_err(|error| error.to_string())?;
+                let policy = ClipboardPolicy::load();
+                if policy.problem.is_some()
+                    || !policy.file_transfer_allowed
+                    || !policy.minimum_isolation.is_none()
+                    || completed_review.references.iter().any(|reference| {
+                        policy
+                            .server_access()
+                            .first_blocked(reference.target.servers(reference.jump.as_ref()))
+                            .is_some()
+                    })
+                {
+                    return Err("Managed policy forbids this rsync review.".into());
                 }
                 Ok(())
             },
@@ -264,6 +235,12 @@ struct ReviewedRoutes {
 }
 
 impl ReviewedRoutes {
+    fn has_teamwork(&self) -> bool {
+        self.references
+            .iter()
+            .any(|reference| reference.shared_identity().is_some())
+    }
+
     fn open(&self) -> io::Result<ConnectionStore> {
         let changed = || {
             io::Error::other(
@@ -271,13 +248,22 @@ impl ReviewedRoutes {
             )
         };
         let store = ConnectionStore::open(self.path.clone())?;
-        if self.references.iter().any(|reference| {
-            store.get(reference.id).map(ConnectionRef::from).as_ref() != Some(reference)
-        }) || self.groups.as_ref().is_some_and(|groups| {
-            !groups
-                .resolve(&store, false)
-                .is_ok_and(|resolved| resolved == self.references)
-        }) {
+        let shared = if self.has_teamwork() {
+            SharedTargets::load_reviewed(&store, self.references.iter().cloned())
+                .map_err(io::Error::other)?
+        } else {
+            SharedTargets::default()
+        };
+        if self
+            .references
+            .iter()
+            .any(|reference| shared.require_saved(&store, reference).is_err())
+            || self.groups.as_ref().is_some_and(|groups| {
+                !groups
+                    .resolve(&store, &shared, false)
+                    .is_ok_and(|resolved| resolved == self.references)
+            })
+        {
             return Err(changed());
         }
         Ok(store)

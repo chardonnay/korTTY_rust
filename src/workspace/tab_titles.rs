@@ -96,6 +96,46 @@ pub(super) struct WindowSettings {
     pub(super) snippet_translation_target_language: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) snippet_alternative_count: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) snippet_completion_shortcut: Option<super::SnippetCompletionChord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) snippet_ai_additional_instructions: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) snippet_ai_alternatives_font_size: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) snippet_ai_diff_font_size: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) snippet_ai_diff_summary_divider: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) snippet_ai_review_font_size: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) snippet_ai_description_font_size: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) snippet_security_report_font_size: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) ai_result_font_size: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) quick_connect_expanded_sections: Option<super::quick_connect::ExpandedSections>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) quick_connect_effect_speed: Option<crate::terminal_effects::Speed>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) quick_connect_appearance: Option<crate::connection_store::TerminalAppearance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) agent_activity_font_size: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) agent_plan_font_size: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) agent_remember_activity_font: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) agent_activity_height: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) agent_activity_keep_collapsed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) agent_activity_expand_all: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) snippet_library_divider: Option<u16>,
+    #[serde(skip_serializing_if = "crate::snippet_window::library_columns::Widths::is_empty")]
+    pub(super) snippet_library_columns: crate::snippet_window::library_columns::Widths,
     #[serde(
         skip_serializing_if = "crate::session_journal::export_branding::Preferences::is_default"
     )]
@@ -119,7 +159,15 @@ pub(super) struct WindowSettings {
     pub(super) sftp_archive: crate::sftp_window::ArchivePreferences,
     pub(super) manual_scale: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) agent_history_popup_width: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) agent_history_popup_height: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) ascii_art_preview_font_size: Option<f64>,
+    #[serde(skip_serializing_if = "super::ascii_art::ImportedPreferences::is_empty")]
+    pub(super) ascii_art_java: super::ascii_art::ImportedPreferences,
+    #[serde(skip_serializing_if = "crate::profile_backup::preferences::JavaDefaults::is_empty")]
+    pub(super) java_backup_defaults: crate::profile_backup::preferences::JavaDefaults,
     #[serde(skip_serializing_if = "crate::editor_window::caret::Preferences::is_default")]
     pub(super) editor_caret: crate::editor_window::caret::Preferences,
     #[serde(skip_serializing_if = "crate::snippet_window::structure::Preferences::is_default")]
@@ -210,6 +258,8 @@ pub(super) struct WindowSettings {
     pub(super) application_updates: crate::application_update::Preferences,
     #[serde(skip_serializing_if = "super::session_restore::OutputPreferences::is_default")]
     pub(super) restore_output: super::session_restore::OutputPreferences,
+    #[serde(skip_serializing_if = "super::backup_data::session_recovery::Preferences::is_empty")]
+    pub(super) java_session_restore: super::backup_data::session_recovery::Preferences,
     pub(super) coding_agent_dock_automatic: bool,
     pub(super) coding_agent_dock: super::coding_agent_dock::Preferences,
     #[serde(skip_serializing_if = "crate::terminal_agent::design::Preset::is_default")]
@@ -218,6 +268,10 @@ pub(super) struct WindowSettings {
     pub(super) ai_agent_designs: crate::terminal_agent::design::Catalog,
     #[serde(skip_serializing_if = "super::terminal_agent::design::DockPreferences::is_empty")]
     pub(super) ai_agent_panel: super::terminal_agent::design::DockPreferences,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) ai_agent_design_auto_hide_seconds: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) ai_agent_design_reduced_animations: Option<bool>,
     #[serde(skip_serializing_if = "BoldTextMode::is_default")]
     pub(super) terminal_bold_text_mode: BoldTextMode,
     pub(super) hide_terminal_scrollbars_in_fullscreen: bool,
@@ -279,6 +333,26 @@ impl Default for WindowSettings {
             journal_note_translation_language: String::new(),
             snippet_translation_target_language: None,
             snippet_alternative_count: None,
+            snippet_completion_shortcut: None,
+            snippet_ai_additional_instructions: None,
+            snippet_ai_alternatives_font_size: None,
+            snippet_ai_diff_font_size: None,
+            snippet_ai_diff_summary_divider: None,
+            snippet_ai_review_font_size: None,
+            snippet_ai_description_font_size: None,
+            snippet_security_report_font_size: None,
+            ai_result_font_size: None,
+            quick_connect_expanded_sections: None,
+            quick_connect_effect_speed: None,
+            quick_connect_appearance: None,
+            agent_activity_font_size: None,
+            agent_plan_font_size: None,
+            agent_remember_activity_font: None,
+            agent_activity_height: None,
+            agent_activity_keep_collapsed: None,
+            agent_activity_expand_all: None,
+            snippet_library_divider: None,
+            snippet_library_columns: Default::default(),
             journal_marker_geometry: None,
             journal_manager_geometry: None,
             journal_viewer_geometry: None,
@@ -298,7 +372,11 @@ impl Default for WindowSettings {
             sftp_idle_minutes: None,
             sftp_archive: Default::default(),
             manual_scale: DEFAULT_MANUAL_SCALE,
+            agent_history_popup_width: None,
+            agent_history_popup_height: None,
             ascii_art_preview_font_size: None,
+            ascii_art_java: Default::default(),
+            java_backup_defaults: Default::default(),
             editor_caret: crate::editor_window::caret::Preferences::default(),
             snippet_structure: crate::snippet_window::structure::Preferences::default(),
             snippet_analysis_panel: Default::default(),
@@ -356,11 +434,14 @@ impl Default for WindowSettings {
             terminal_notifications: Default::default(),
             application_updates: Default::default(),
             restore_output: Default::default(),
+            java_session_restore: Default::default(),
             coding_agent_dock_automatic: true,
             coding_agent_dock: super::coding_agent_dock::Preferences::default(),
             ai_agent_design: Default::default(),
             ai_agent_designs: Default::default(),
             ai_agent_panel: Default::default(),
+            ai_agent_design_auto_hide_seconds: None,
+            ai_agent_design_reduced_animations: None,
             terminal_bold_text_mode: BoldTextMode::default(),
             hide_terminal_scrollbars_in_fullscreen: false,
             terminal_transparency: 0,
@@ -386,6 +467,90 @@ impl Default for WindowSettings {
 }
 
 impl WindowSettings {
+    pub(super) fn agent_status_auto_hide_seconds(&self) -> u8 {
+        use super::terminal_agent::design::{AUTO_HIDE_SECONDS, DEFAULT_AUTO_HIDE_SECONDS};
+        self.ai_agent_design_auto_hide_seconds
+            .unwrap_or(DEFAULT_AUTO_HIDE_SECONDS)
+            .min(*AUTO_HIDE_SECONDS.end())
+    }
+
+    pub(super) fn agent_animations(&self) -> bool {
+        self.appearance.animations() && !self.ai_agent_design_reduced_animations.unwrap_or_default()
+    }
+
+    pub(super) fn snippet_ai_additional_instructions(&self) -> bool {
+        self.snippet_ai_additional_instructions.unwrap_or_default()
+    }
+
+    pub(super) fn snippet_ai_font(&self, view: crate::snippet_window::ai_assist::FontView) -> u8 {
+        use crate::snippet_window::ai_assist::FontView;
+        let size = match view {
+            FontView::Alternatives => self.snippet_ai_alternatives_font_size,
+            FontView::Diff => self.snippet_ai_diff_font_size,
+            FontView::Review => self.snippet_ai_review_font_size,
+            FontView::Description => self.snippet_ai_description_font_size.or_else(|| {
+                self.snippet_ai_diff_font_size
+                    .filter(|size| FontView::Diff.bounds().contains(size))
+                    .map(|size| size.min(*view.bounds().end()))
+            }),
+            FontView::SecurityReport => self
+                .snippet_security_report_font_size
+                .or(self.snippet_ai_review_font_size),
+        };
+        size.filter(|size| view.bounds().contains(size))
+            .unwrap_or(FontView::DEFAULT)
+    }
+
+    pub(super) fn ai_result_font(&self) -> u8 {
+        self.ai_result_font_size
+            .filter(|size| super::terminal_ai::CHAT_RESULT_FONT_RANGE.contains(size))
+            .unwrap_or(super::terminal_ai::DEFAULT_CHAT_RESULT_FONT)
+    }
+
+    fn validate_ai_fonts(&self) -> io::Result<()> {
+        use crate::snippet_window::ai_assist::FontView;
+        for (view, size) in [
+            (
+                FontView::Alternatives,
+                self.snippet_ai_alternatives_font_size,
+            ),
+            (FontView::Diff, self.snippet_ai_diff_font_size),
+            (FontView::Review, self.snippet_ai_review_font_size),
+            (FontView::Description, self.snippet_ai_description_font_size),
+            (
+                FontView::SecurityReport,
+                self.snippet_security_report_font_size,
+            ),
+        ] {
+            if size.is_some_and(|size| !view.bounds().contains(&size)) {
+                return Err(io::Error::other("Invalid snippet AI font size"));
+            }
+        }
+        if self
+            .ai_result_font_size
+            .is_some_and(|size| !super::terminal_ai::CHAT_RESULT_FONT_RANGE.contains(&size))
+        {
+            return Err(io::Error::other("Invalid AI result font size"));
+        }
+        use super::terminal_agent::font::View;
+        if self
+            .agent_activity_font_size
+            .is_some_and(|size| !View::Activity.valid(size))
+            || self
+                .agent_plan_font_size
+                .is_some_and(|size| !View::Plan.valid(size))
+        {
+            return Err(io::Error::other("Invalid Agent text size"));
+        }
+        if self
+            .agent_activity_height
+            .is_some_and(|size| !super::terminal_agent::design::Height::valid(size))
+        {
+            return Err(io::Error::other("Invalid Agent activity height"));
+        }
+        Ok(())
+    }
+
     pub(super) fn ssh_keepalive(&self) -> kortty_ssh::KeepAlive {
         use kortty_ssh::KeepAlive;
 
@@ -546,6 +711,13 @@ impl WindowSettings {
         settings.manual_scale = settings
             .manual_scale
             .clamp(MIN_MANUAL_SCALE, MAX_MANUAL_SCALE);
+        use super::terminal_agent::shortcut::{HISTORY_POPUP_HEIGHT, HISTORY_POPUP_WIDTH};
+        settings.agent_history_popup_width = settings
+            .agent_history_popup_width
+            .map(|width| width.clamp(*HISTORY_POPUP_WIDTH.start(), *HISTORY_POPUP_WIDTH.end()));
+        settings.agent_history_popup_height = settings
+            .agent_history_popup_height
+            .map(|height| height.clamp(*HISTORY_POPUP_HEIGHT.start(), *HISTORY_POPUP_HEIGHT.end()));
         settings.workflow_script_font = settings
             .workflow_script_font
             .clamp(MIN_WORKFLOW_FONT, MAX_WORKFLOW_FONT);
@@ -574,6 +746,9 @@ impl WindowSettings {
             !name.trim().is_empty() && name != MONOSPACED && !name.chars().any(char::is_control)
         });
         settings.snippet_appearance.normalize();
+        settings
+            .custom_snippet_code_languages
+            .retain(|language| language != "css");
         if !crate::snippet_window::languages::valid(&settings.custom_snippet_code_languages) {
             settings.custom_snippet_code_languages.clear();
         }
@@ -607,6 +782,16 @@ impl WindowSettings {
 
     pub(super) fn validate_backup(bytes: &[u8]) -> io::Result<()> {
         let settings = Self::decode(bytes)?;
+        if let Some(appearance) = &settings.quick_connect_appearance {
+            appearance.validate()?;
+        }
+        if !settings.ascii_art_java.valid() {
+            return Err(io::Error::other("Invalid imported ASCII Art preferences"));
+        }
+        if !settings.java_backup_defaults.valid() {
+            return Err(io::Error::other("Invalid imported backup preferences"));
+        }
+        settings.validate_ai_fonts()?;
         if settings
             .ascii_art_preview_font_size
             .is_some_and(|size| !super::ascii_art::valid_preview_font(size))
@@ -628,6 +813,21 @@ impl WindowSettings {
                 "Invalid Scheduler journal divider position",
             ));
         }
+        if settings
+            .snippet_library_divider
+            .is_some_and(|parts| !crate::snippet_window::LIBRARY_DIVIDER_RANGE.contains(&parts))
+        {
+            return Err(io::Error::other("Invalid snippet library divider position"));
+        }
+        if !settings.snippet_library_columns.valid() {
+            return Err(io::Error::other("Invalid snippet library column widths"));
+        }
+        if settings
+            .snippet_ai_diff_summary_divider
+            .is_some_and(|parts| !crate::snippet_window::diff_summary::valid(parts))
+        {
+            return Err(io::Error::other("Invalid AI diff summary divider position"));
+        }
         if let Some(proposals) = &settings.java_teamwork {
             proposals.validate()?;
         }
@@ -638,6 +838,14 @@ impl WindowSettings {
         settings.java_local_dock.validate()?;
         if !settings.ai_agent_panel.valid() {
             return Err(io::Error::other("Invalid Agent panel width"));
+        }
+        if settings
+            .ai_agent_design_auto_hide_seconds
+            .is_some_and(|seconds| {
+                !super::terminal_agent::design::AUTO_HIDE_SECONDS.contains(&seconds)
+            })
+        {
+            return Err(io::Error::other("Invalid Agent status auto-hide delay"));
         }
         if !crate::terminal_highlight::valid_id(&settings.logfile_presentation.keyword_set) {
             return Err(io::Error::other("Invalid logfile highlight set ID"));
@@ -655,6 +863,11 @@ impl WindowSettings {
         {
             return Err(io::Error::other(
                 "profile backup contains an invalid session output line limit",
+            ));
+        }
+        if !settings.java_session_restore.valid() {
+            return Err(io::Error::other(
+                "Invalid imported session restore preferences",
             ));
         }
         settings.validate_sftp()?;
@@ -723,6 +936,10 @@ impl WindowSettings {
     }
 
     fn encoded(&self) -> io::Result<Vec<u8>> {
+        if let Some(appearance) = &self.quick_connect_appearance {
+            appearance.validate()?;
+        }
+        self.validate_ai_fonts()?;
         self.validate_analysis_retention()?;
         self.validate_job_journal_retention()?;
         self.validate_sftp()?;

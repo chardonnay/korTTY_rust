@@ -72,6 +72,7 @@ pub(super) fn run(
             ));
         }
         if require_route
+            && saved_reference.shared_identity().is_none()
             && (!sync::pins(&saved_reference, &trust_check)
                 .is_ok_and(|current| current == current_pins)
                 || !profile::connections_path()

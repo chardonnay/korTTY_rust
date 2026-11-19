@@ -1,5 +1,8 @@
 //! Parses portable job definitions from Java KorTTY's Scheduler repository.
 
+mod targets;
+pub(crate) use targets::Review as TargetReview;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::num::NonZeroU32;
@@ -17,10 +20,10 @@ use crate::ai_manager::JavaProfileSource;
 use crate::connection_store::{import::normalize_java_group_path, valid_group_path};
 use crate::job_executor::virtual_terminal::Options as TerminalOptions;
 use crate::scheduler_window::{
-    ArchiveFormat, ConnectionRef, ImportedAiAction, JournalDetail, MAX_ARCHIVE_EXCLUDES,
-    MAX_ARCHIVE_SOURCES, MAX_SELECTED_GROUPS, MAX_TARGETS, RemoteAction, RemotePath, SnippetLink,
-    SshCommand, SudoMode, SymbolicMode, TargetGroups, agent::Kind, imported_archive,
-    imported_privileged, imported_transfer, mode_from_text, owner_id_from_text,
+    ArchiveFormat, ConnectionGroup, ConnectionRef, ImportedAiAction, JournalDetail,
+    MAX_ARCHIVE_EXCLUDES, MAX_ARCHIVE_SOURCES, MAX_SELECTED_GROUPS, MAX_TARGETS, RemoteAction,
+    RemotePath, SnippetLink, SshCommand, SudoMode, SymbolicMode, TargetGroups, agent::Kind,
+    imported_archive, imported_privileged, imported_transfer, mode_from_text, owner_id_from_text,
 };
 use crate::session_journal::automation::{Closing, Keep, MAX_DAYS, Options, Retention};
 use crate::snippets::SnippetId;
@@ -168,12 +171,30 @@ impl Action {
     }
 }
 
+pub(super) type ResolvedGroup = (Vec<ConnectionGroup>, Vec<(String, ConnectionRef)>, bool);
+
 impl ImportedJob {
-    /// The caller resolves source IDs and complete groups against the reviewed restored routes.
+    #[cfg(test)]
     fn bind(
         self,
-        mut connection: impl FnMut(&str) -> Option<ConnectionRef>,
+        connection: impl FnMut(&str) -> Option<ConnectionRef>,
         mut group: impl FnMut(&str) -> Option<Vec<(String, ConnectionRef)>>,
+        rsync_folder: impl FnMut(&str) -> Option<String>,
+        has_snippet: impl FnOnce(SnippetId) -> bool,
+    ) -> ParseResult<Vec<Job<SshCommand>>> {
+        self.bind_scoped(
+            connection,
+            |path| group(path).map(|members| (vec![path.into()], members, false)),
+            rsync_folder,
+            has_snippet,
+        )
+    }
+
+    /// The caller resolves source IDs and complete groups against the reviewed restored routes.
+    fn bind_scoped(
+        self,
+        mut connection: impl FnMut(&str) -> Option<ConnectionRef>,
+        mut group: impl FnMut(&str) -> Option<ResolvedGroup>,
         mut rsync_folder: impl FnMut(&str) -> Option<String>,
         has_snippet: impl FnOnce(SnippetId) -> bool,
     ) -> ParseResult<Vec<Job<SshCommand>>> {
@@ -194,10 +215,18 @@ impl ImportedJob {
         } else {
             let explicit: Vec<_> = targets.iter().map(|(_, route)| route.clone()).collect();
             let limit = self.action.target_limit();
+            let mut groups = Vec::new();
+            let mut preserve_archive_order = false;
             for path in &self.source_groups {
-                let members = group(path)
-                    .filter(|members| !members.is_empty())
+                let (native_groups, members, reordered) = group(path)
+                    .filter(|(_, members, _)| !members.is_empty())
                     .ok_or(Omission::GroupTargets)?;
+                preserve_archive_order |= reordered;
+                for native in native_groups {
+                    if !groups.contains(&native) {
+                        groups.push(native);
+                    }
+                }
                 for (id, route) in members {
                     if ids.insert(route.id) {
                         if targets.len() == limit {
@@ -207,9 +236,22 @@ impl ImportedJob {
                     }
                 }
             }
+            let group_order = if preserve_archive_order
+                || groups
+                    .iter()
+                    .any(|group| matches!(group, ConnectionGroup::Teamwork(_)))
+            {
+                targets[explicit.len()..]
+                    .iter()
+                    .map(|(_, route)| route.id)
+                    .collect()
+            } else {
+                Vec::new()
+            };
             Some(TargetGroups {
-                groups: self.source_groups,
+                groups,
                 explicit,
+                group_order,
             })
         };
         if self.virtual_terminal.is_some() && targets.len() > 1 {
@@ -536,10 +578,26 @@ impl Review {
             .count()
     }
 
+    #[cfg(test)]
     pub(super) fn bind_all(
         self,
-        mut connection: impl FnMut(&str) -> Option<ConnectionRef>,
+        connection: impl FnMut(&str) -> Option<ConnectionRef>,
         mut group: impl FnMut(&str) -> Option<Vec<(String, ConnectionRef)>>,
+        rsync_folder: impl FnMut(&str) -> Option<String>,
+        has_snippet: impl FnMut(SnippetId) -> bool,
+    ) -> io::Result<BoundReview> {
+        self.bind_all_scoped(
+            connection,
+            |path| group(path).map(|members| (vec![path.into()], members, false)),
+            rsync_folder,
+            has_snippet,
+        )
+    }
+
+    pub(super) fn bind_all_scoped(
+        self,
+        mut connection: impl FnMut(&str) -> Option<ConnectionRef>,
+        mut group: impl FnMut(&str) -> Option<ResolvedGroup>,
         mut rsync_folder: impl FnMut(&str) -> Option<String>,
         mut has_snippet: impl FnMut(SnippetId) -> bool,
     ) -> io::Result<BoundReview> {
@@ -547,7 +605,7 @@ impl Review {
         let mut omitted = self.omitted;
         for incoming in self.jobs {
             let source = incoming.definition.id.clone();
-            match incoming.bind(
+            match incoming.bind_scoped(
                 &mut connection,
                 &mut group,
                 &mut rsync_folder,
@@ -1607,6 +1665,7 @@ mod tests {
 
     fn connection(id: u64, host: &str) -> ConnectionRef {
         ConnectionRef {
+            teamwork: None,
             id,
             target: LoginTarget {
                 host: host.into(),
@@ -1765,7 +1824,10 @@ mod tests {
             .pop()
             .unwrap();
         let selection = grouped.action().target_groups.as_ref().unwrap();
-        assert_eq!(selection.groups, ["Ops/Hosts"]);
+        assert_eq!(
+            selection.groups,
+            [crate::scheduler_window::ConnectionGroup::from("Ops/Hosts")]
+        );
         assert!(selection.explicit.is_empty());
         assert_eq!(grouped.action().connection.as_ref().unwrap().id, 33);
         let agent = agent
@@ -1843,7 +1905,10 @@ mod tests {
         );
         let groups = action.target_groups.as_ref().unwrap();
         assert_eq!(groups.explicit.as_slice(), std::slice::from_ref(&explicit));
-        assert_eq!(groups.groups, ["Ops/Hosts", "Ops/Other"]);
+        assert_eq!(
+            groups.groups,
+            ["Ops/Hosts", "Ops/Other"].map(crate::scheduler_window::ConnectionGroup::from)
+        );
 
         let root = inspect(xml(&targets, "<groupName> / / </groupName>", false).as_bytes())?;
         assert_eq!(root.omitted, BTreeMap::from([(Omission::GroupTargets, 1)]));

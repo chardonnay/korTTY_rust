@@ -554,6 +554,57 @@ impl Workspace {
         (tab.close.is_none() && editor.can_cut() && remote_allowed).then_some(id)
     }
 
+    pub(in crate::workspace) fn project_file_is_editor(&self, id: window::Id) -> bool {
+        self.project_files.get(&id).is_some_and(|tab| {
+            matches!(
+                tab.source,
+                Source::Local {
+                    tool: LocalFileTool::Editor,
+                    ..
+                } | Source::Remote {
+                    tool: RemoteProjectTool::File {
+                        tool: LocalFileTool::Editor,
+                        ..
+                    },
+                    ..
+                }
+            )
+        })
+    }
+
+    pub(in crate::workspace) fn insert_snippet_in_project_editor(
+        &mut self,
+        id: window::Id,
+        resolved: crate::snippets::resolve::Resolved,
+    ) -> Result<Task<Desktop>, &'static str> {
+        if self.hosted_close_locks(id) || self.project_remote_denial(id).is_some() {
+            return Err("The selected file editor is no longer available.");
+        }
+        let tab = self
+            .project_files
+            .get_mut(&id)
+            .ok_or("The selected file editor closed.")?;
+        if tab.remote_source().is_some()
+            && self.clipboard.policy.remote_editor
+                != crate::clipboard_policy::RemoteEditorPolicy::Allow
+        {
+            return Err("Managed policy blocks editing this remote file.");
+        }
+        let Content::Editor(editor) = &mut tab.content else {
+            return Err("The selected file editor is no longer available.");
+        };
+        if tab.close.is_some() {
+            return Err("The selected file editor is closing.");
+        }
+        let task = editor
+            .insert_snippet(resolved)?
+            .map(move |message| Desktop::ProjectFile(id, Message::Editor(message)));
+        Ok(self
+            .focus_hosted_tool(id)
+            .unwrap_or_else(Task::none)
+            .chain(task))
+    }
+
     pub(in crate::workspace) fn note_project_sftp_activity(&mut self, id: window::Id) {
         let project_idle = self
             .project_files
@@ -628,6 +679,9 @@ impl Workspace {
         id: window::Id,
         message: Message,
     ) -> Task<Desktop> {
+        if let Message::Editor(editor_window::Message::AiToolFallback(action, revision)) = message {
+            return self.open_file_tool_fallback(id, action, revision);
+        }
         if let Message::RemoteLoaded(ticket, result) = message {
             return self.finish_project_remote_file(id, ticket, result);
         }

@@ -604,18 +604,30 @@ pub(crate) fn exchange_draft_replace(
 ) -> io::Result<draft_replace::Reply> {
     let mut frame = Vec::new();
     draft_replace::write_request(&mut frame, request, draft)?;
+    let spec = match request {
+        draft_replace::Request::Review { spec } | draft_replace::Request::Apply { spec, .. } => {
+            spec
+        }
+    };
+    let windows = draft_replace::windows_drive_path(spec.destination.as_bytes());
     exchange_fixed(
         opener,
-        Helper::DraftReplace,
+        Helper::DraftReplace { windows },
         &frame,
         matches!(request, draft_replace::Request::Apply { .. }),
         cancelled,
         authorize,
         |output, code| match code {
             0 if output.diagnostics == 0 => draft_replace::read_reply(output.data.as_slice()),
-            126 | 127 if output.data.is_empty() => Err(io::Error::other(
-                "The server draft replacement helper could not start. Check that /usr/local/bin/kortty-server-archive is installed and up to date.",
-            )),
+            126 | 127 | 9009 | 1
+                if output.data.is_empty() && (windows || matches!(code, 126 | 127)) =>
+            {
+                Err(io::Error::other(if windows {
+                    "The server draft replacement helper could not start. Check the installation in C:\\ProgramData\\korTTY."
+                } else {
+                    "The server draft replacement helper could not start. Check that /usr/local/bin/kortty-server-archive is installed and up to date."
+                }))
+            }
             _ => Err(invalid_output()),
         },
     )
@@ -624,7 +636,7 @@ pub(crate) fn exchange_draft_replace(
 #[derive(Clone, Copy)]
 enum Helper {
     Extract,
-    DraftReplace,
+    DraftReplace { windows: bool },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -643,8 +655,12 @@ fn exchange_fixed<T>(
             if applying { 1800 } else { 300 },
             "The server archive publication outcome is unknown. Check the reviewed destination before retrying.",
         ),
-        Helper::DraftReplace => (
-            draft_replace::COMMAND,
+        Helper::DraftReplace { windows } => (
+            if windows {
+                draft_replace::WINDOWS_COMMAND
+            } else {
+                draft_replace::COMMAND
+            },
             100,
             "The server file replacement outcome is unknown. Check the reviewed destination before retrying.",
         ),
@@ -672,7 +688,7 @@ fn exchange_fixed<T>(
                     || {
                         submitted = matches!(helper, Helper::Extract);
                         input.write_all(frame)?;
-                        if matches!(helper, Helper::DraftReplace) {
+                        if matches!(helper, Helper::DraftReplace { .. }) {
                             authorize()?;
                             running(&stopped)?;
                         }
@@ -686,7 +702,9 @@ fn exchange_fixed<T>(
             ExecOpener::Worker(opener) => {
                 let mut channel = match helper {
                     Helper::Extract => opener.open_archive_extract(&stopped),
-                    Helper::DraftReplace => opener.open_draft_replace(&stopped),
+                    Helper::DraftReplace { windows } => {
+                        opener.open_draft_replace(windows, &stopped)
+                    }
                 }
                 .map_err(io::Error::other)?;
                 let mut input = channel.take_writer().ok_or_else(closed)?;
@@ -700,7 +718,7 @@ fn exchange_fixed<T>(
                     || {
                         submitted = matches!(helper, Helper::Extract);
                         input.write_all(frame)?;
-                        if matches!(helper, Helper::DraftReplace) {
+                        if matches!(helper, Helper::DraftReplace { .. }) {
                             authorize()?;
                             running(&stopped)?;
                         }

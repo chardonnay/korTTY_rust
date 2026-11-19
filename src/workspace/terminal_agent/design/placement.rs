@@ -123,6 +123,12 @@ pub(in crate::workspace) fn status_slot(status: Status) -> Slot {
     }
 }
 
+pub(in crate::workspace) struct DockExtents {
+    pub(in crate::workspace) left: f32,
+    pub(in crate::workspace) right: f32,
+    pub(in crate::workspace) bottom: Option<f32>,
+}
+
 pub(in crate::workspace) fn compose<'a, M: 'a>(
     terminal: Element<'a, M>,
     history: Option<Element<'a, M>>,
@@ -130,7 +136,7 @@ pub(in crate::workspace) fn compose<'a, M: 'a>(
     history_slot: Option<Slot>,
     status_slot: Slot,
     bounds: Size,
-    side_widths: (f32, f32),
+    extents: DockExtents,
 ) -> Element<'a, M> {
     let mut center = column![container(terminal).width(Length::Fill).height(Length::Fill)]
         .width(Length::Fill)
@@ -150,9 +156,11 @@ pub(in crate::workspace) fn compose<'a, M: 'a>(
             Some(Slot::Left) => left = Some(history),
             _ => {
                 center = center.push(
-                    container(history)
-                        .width(Length::Fill)
-                        .height((bounds.height * 0.4).min(260.0)),
+                    container(history).width(Length::Fill).height(
+                        extents
+                            .bottom
+                            .unwrap_or_else(|| (bounds.height * 0.4).min(260.0)),
+                    ),
                 )
             }
         }
@@ -191,7 +199,7 @@ pub(in crate::workspace) fn compose<'a, M: 'a>(
         if let Some(left) = left {
             content = content.push(
                 container(left)
-                    .width(fitted_side_width(bounds.width, side_widths.0, both))
+                    .width(fitted_side_width(bounds.width, extents.left, both))
                     .height(Length::Fill),
             );
         }
@@ -199,7 +207,7 @@ pub(in crate::workspace) fn compose<'a, M: 'a>(
         if has_right {
             content = content.push(
                 container(right)
-                    .width(fitted_side_width(bounds.width, side_widths.1, both))
+                    .width(fitted_side_width(bounds.width, extents.right, both))
                     .height(Length::Fill),
             );
         }

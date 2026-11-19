@@ -647,7 +647,10 @@ impl Sidecar {
         &self.authorization
     }
 
-    pub(in crate::local_ai) fn agent(self: &Arc<Self>, timeout: Duration) -> ureq::Agent {
+    pub(in crate::local_ai) fn agent(
+        self: &Arc<Self>,
+        timeout: impl Into<Option<Duration>>,
+    ) -> ureq::Agent {
         super::loopback::agent(self, timeout)
     }
 

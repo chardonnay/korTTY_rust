@@ -2,6 +2,7 @@ use iced::Task;
 
 use crate::connection_store::SerialProfile;
 use crate::serial_dialog::{self, SerialDialog};
+use crate::terminal_effects::editor::EffectDraft;
 
 use super::{ConnectionWindow, Message, Persisted, Scope, journal_settings};
 
@@ -16,6 +17,9 @@ pub(super) struct Draft {
     pub(super) paste_line_delay: String,
     pub(super) strict_terminal_mode: Option<bool>,
     pub(super) highlight_set: Option<String>,
+    pub(super) effect: EffectDraft,
+    terminal_ai: crate::connection_store::AiAssignments,
+    appearance: Option<Box<crate::connection_store::TerminalAppearance>>,
 }
 
 impl Draft {
@@ -30,6 +34,9 @@ impl Draft {
             super::terminal_overrides::parse_paste_line_delay(&self.paste_line_delay)?;
         profile.strict_terminal_mode = self.strict_terminal_mode;
         profile.highlight_set.clone_from(&self.highlight_set);
+        profile.terminal_effect = self.effect.selection();
+        profile.terminal_ai.clone_from(&self.terminal_ai);
+        profile.appearance.clone_from(&self.appearance);
         profile.validate().map_err(|error| error.to_string())?;
         Ok(profile)
     }
@@ -47,43 +54,62 @@ impl ConnectionWindow {
             None => self.active_group(),
         }
         .map(str::to_owned);
-        let (id, name, tag, pinned, connection, emulation, journal, delay, strict, highlight_set) =
-            if let Some(profile) = profile {
-                let emulation = profile.profile().unwrap_or_default();
-                let mut name = if duplicate {
-                    profile.display_name()
-                } else {
-                    profile.name
-                };
-                if duplicate && name.len() <= 153 {
-                    name.push_str(" (copy)");
-                }
-                (
-                    if duplicate { 0 } else { profile.id },
-                    name,
-                    profile.tag,
-                    !duplicate && profile.pinned,
-                    profile.connection,
-                    emulation,
-                    profile.journal,
-                    profile.paste_line_delay_ms,
-                    profile.strict_terminal_mode,
-                    profile.highlight_set,
-                )
+        let (
+            id,
+            name,
+            tag,
+            pinned,
+            connection,
+            emulation,
+            journal,
+            delay,
+            strict,
+            highlight_set,
+            terminal_effect,
+            terminal_ai,
+            appearance,
+        ) = if let Some(profile) = profile {
+            let emulation = profile.profile().unwrap_or_default();
+            let mut name = if duplicate {
+                profile.display_name()
             } else {
-                (
-                    0,
-                    String::new(),
-                    String::new(),
-                    false,
-                    Default::default(),
-                    Default::default(),
-                    Default::default(),
-                    None,
-                    None,
-                    None,
-                )
+                profile.name
             };
+            if duplicate && name.len() <= 153 {
+                name.push_str(" (copy)");
+            }
+            (
+                if duplicate { 0 } else { profile.id },
+                name,
+                profile.tag,
+                !duplicate && profile.pinned,
+                profile.connection,
+                emulation,
+                profile.journal,
+                profile.paste_line_delay_ms,
+                profile.strict_terminal_mode,
+                profile.highlight_set,
+                profile.terminal_effect,
+                profile.terminal_ai,
+                profile.appearance,
+            )
+        } else {
+            (
+                0,
+                String::new(),
+                String::new(),
+                false,
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                None,
+                None,
+                None,
+                None,
+                Default::default(),
+                Default::default(),
+            )
+        };
         let mut form = SerialDialog::new(self.serial_generation, connection, emulation);
         let scan = form.refresh().map(Message::Serial);
         self.serial_draft = Some(Draft {
@@ -97,6 +123,9 @@ impl ConnectionWindow {
             paste_line_delay: delay.map_or_else(String::new, |value| value.to_string()),
             strict_terminal_mode: strict,
             highlight_set,
+            effect: EffectDraft::new(terminal_effect),
+            terminal_ai,
+            appearance,
         });
         self.badge_picker = None;
         self.dismiss_tree_context();

@@ -325,6 +325,7 @@ pub(super) fn label(entry: &Entry) -> String {
         Kind::Run => "Run",
         Kind::Ask => "Ask",
         Kind::Plan => "Plan",
+        Kind::Imported => "Imported",
     };
     let date = i64::try_from(entry.started_at)
         .ok()

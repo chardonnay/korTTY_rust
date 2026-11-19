@@ -62,6 +62,7 @@ impl Workspace {
         let config = self.ai_configuration();
         let approval = self.allocate();
         let auto_diagram = self.window_settings.snippet_analysis_auto_diagram;
+        let instructions_enabled = self.window_settings.snippet_ai_additional_instructions();
         let vault_revision = self.vault_change_revision();
         let Some(surface) = self.snippets.get_mut(&id) else {
             return Task::none();
@@ -82,7 +83,7 @@ impl Workspace {
                     page,
                     run_id,
                     config,
-                    auto_diagram,
+                    (auto_diagram, instructions_enabled),
                     (self.vault.as_ref(), vault_revision),
                     (&self.clipboard.policy, approval),
                 )
@@ -106,7 +107,7 @@ fn prepare(
     page: &Page,
     run_id: SnippetId,
     config: Arc<Configuration>,
-    auto_diagram: bool,
+    (auto_diagram, instructions_enabled): (bool, bool),
     vault: (Option<&VaultWindow>, std::sync::Weak<()>),
     (policy, approval): (&ClipboardPolicy, u64),
 ) -> Result<Review, String> {
@@ -146,7 +147,15 @@ fn prepare(
     let rendered = snapshot.render()?;
     let rendered_hash = content_hash(&rendered).map_err(|error| error.to_string())?;
     let guidance = config.reviewed_snippet_skill_guidance(&page.selected_skills);
-    let instructions = previous.provenance.additional_instructions.clone();
+    let instructions = if instructions_enabled {
+        previous
+            .provenance
+            .additional_instructions
+            .trim()
+            .to_owned()
+    } else {
+        String::new()
+    };
     let cli = profile
         .cli
         .then(|| {
@@ -377,6 +386,7 @@ mod tests {
         .unwrap();
         let mut workspace = Workspace::default();
         workspace.set_test_ai_configuration(configuration);
+        workspace.window_settings.snippet_ai_additional_instructions = Some(true);
         workspace.window_settings.snippet_analysis_auto_diagram = false;
         let (owner, _) = workspace.open_window(false);
         let (id, _) = workspace.install_snippet_surface(owner, window, true);

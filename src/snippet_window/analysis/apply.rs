@@ -1,15 +1,18 @@
 //! Selection and approval controls for applying a saved analysis.
 
 use iced::advanced::text::Wrapping;
-use iced::widget::{Column, button, checkbox, column, container, row, scrollable, text};
+use iced::widget::{Column, button, checkbox, column, container, pick_list, row, scrollable, text};
 use iced::{Alignment, Element, Font, Length};
 
 use crate::snippet_analysis::model::{ApplyRun, ApplyStatus, Record, Selection};
+use crate::snippet_window::ai_assist::migration;
+use crate::snippet_window::languages::mix::HostFormat;
 use crate::snippets::SnippetId;
 
 use super::hardening;
 use super::{Message, ProfileChoice, WindowMessage, action, notice, wrap};
 use crate::snippet_window::compare;
+use crate::snippet_window::diff_summary;
 
 #[derive(Clone)]
 pub enum Action {
@@ -17,6 +20,8 @@ pub enum Action {
     Dependency(SnippetId, String, bool),
     AllFindings(SnippetId, bool),
     Hardening(SnippetId, hardening::Edit),
+    MigrationLanguage(SnippetId, Option<migration::Language>),
+    MigrationPlatform(SnippetId, Option<HostFormat>),
     Plan(SnippetId, bool),
     Recover(SnippetId),
     DiscardRecovery(SnippetId),
@@ -28,6 +33,7 @@ pub enum Action {
     Open(SnippetId, SnippetId),
     RevealReason(SnippetId, Option<usize>),
     Diff(compare::Message),
+    SummaryDivider(SnippetId, diff_summary::Event),
     ExactPage(bool),
     ToggleExact,
     FolderFile(bool),
@@ -41,6 +47,39 @@ pub(crate) struct Controls<'a> {
     pub(crate) selection: Option<&'a Selection>,
     pub(crate) can_plan: bool,
     pub(crate) hardening: Option<hardening::Controls<'a>>,
+    pub(crate) migration: Option<Migration>,
+}
+
+pub(crate) struct Migration {
+    pub(crate) languages: Vec<migration::Language>,
+    pub(crate) platforms: Vec<HostFormat>,
+    pub(crate) plan: Option<migration::Plan>,
+}
+
+impl Migration {
+    fn view<'a>(&self, id: SnippetId) -> Column<'a, WindowMessage> {
+        let language = self.plan.and_then(migration::Plan::language);
+        let platform = self.plan.and_then(migration::Plan::destination);
+        column![
+            (!self.platforms.is_empty()).then(|| row![
+                pick_list(self.platforms.clone(), platform, move |value| {
+                    msg(Action::MigrationPlatform(id, Some(value)))
+                })
+                .placeholder("Keep current platform"),
+                platform.map(|_| control("Clear platform", Action::MigrationPlatform(id, None))),
+            ]
+            .spacing(6)),
+            (!self.languages.is_empty()).then(|| row![
+                pick_list(self.languages.clone(), language, move |value| {
+                    msg(Action::MigrationLanguage(id, Some(value)))
+                })
+                .placeholder("Keep current programming language"),
+                language.map(|_| control("Clear language", Action::MigrationLanguage(id, None))),
+            ]
+            .spacing(6))
+        ]
+        .spacing(6)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -66,6 +105,7 @@ pub(crate) struct Review<'a> {
     pub(crate) exact: Option<Exact<'a>>,
     pub(crate) can_install: bool,
     pub(crate) can_replan: bool,
+    pub(crate) summary_drag: Option<u16>,
 }
 
 #[derive(Clone, Copy)]
@@ -116,6 +156,9 @@ pub(super) fn controls<'a>(
             .wrap(),
         );
     } else if can_select {
+        if let Some(migration) = &controls.migration {
+            body = body.push(migration.view(id));
+        }
         if let Some(hardening) = &controls.hardening {
             body = body.push(hardening::view(hardening, id));
         }
@@ -223,11 +266,13 @@ pub(super) fn preview_body(preview: Preview<'_>) -> Column<'_, WindowMessage> {
 pub(super) fn review_body<'a>(
     review: Review<'a>,
     status: Option<&'a str>,
+    font_size: u8,
+    summary_divider: Option<u16>,
 ) -> Element<'a, WindowMessage> {
     let run = review.run;
     let proposed = run.status == ApplyStatus::Proposed;
     let restore = run.status == ApplyStatus::Accepted;
-    review_content(review, status)
+    review_content(review, status, font_size, summary_divider)
         .push((proposed && run.has_review_source() && !review.can_install).then(|| notice("The exact original revision must be active in an editable snippet before accepting this proposal.")))
         .push(row![
             control(if proposed { "Review later" } else { "Back to report" }, Action::Back),
@@ -244,6 +289,8 @@ pub(super) fn review_body<'a>(
 pub(super) fn folder_review_body<'a>(
     review: FolderReview<'a>,
     status: Option<&'a str>,
+    font_size: u8,
+    summary_divider: Option<u16>,
 ) -> Element<'a, WindowMessage> {
     let failures = (!review.failures.is_empty()).then(|| {
         scrollable(
@@ -281,7 +328,7 @@ pub(super) fn folder_review_body<'a>(
         (!review.failures.is_empty())
             .then(|| notice("Some files could not be proposed. They will stay as saved.")),
         failures,
-        review_content(review.change, status),
+        review_content(review.change, status, font_size, summary_divider),
         row![
             control("Discard proposals", Action::Back),
             button(text(format!("Save {} selected file(s)", review.selected)))
@@ -295,44 +342,86 @@ pub(super) fn folder_review_body<'a>(
     .into()
 }
 
-fn review_content<'a>(review: Review<'a>, status: Option<&'a str>) -> Column<'a, WindowMessage> {
+fn review_content<'a>(
+    review: Review<'a>,
+    status: Option<&'a str>,
+    font_size: u8,
+    summary_divider: Option<u16>,
+) -> Column<'a, WindowMessage> {
     let run = review.run;
-    let reasons = column(run.reasons.iter().zip(review.locations).enumerate().map(
-        |(index, (reason, location))| {
-            let jump = location.map(|location| {
-                let label = location.label();
-                button(text(label).size(12))
-                    .on_press(msg(Action::RevealReason(run.id, Some(index))))
-                    .style(if review.focused_reason == Some(index) {
-                        button::primary
-                    } else {
-                        button::secondary
-                    })
-            });
-            row![
-                text(format!("{} · {}", reason.id, reason.reason))
-                    .size(13)
-                    .wrapping(Wrapping::WordOrGlyph),
-                jump,
+    let summary = move || {
+        let reasons = column(run.reasons.iter().zip(review.locations).enumerate().map(
+            |(index, (reason, location))| {
+                let jump = location.map(|location| {
+                    let label = location.label();
+                    button(text(label).size(12))
+                        .on_press(msg(Action::RevealReason(run.id, Some(index))))
+                        .style(if review.focused_reason == Some(index) {
+                            button::primary
+                        } else {
+                            button::secondary
+                        })
+                });
+                row![
+                    text(format!("{} · {}", reason.id, reason.reason))
+                        .size(13)
+                        .wrapping(Wrapping::WordOrGlyph),
+                    jump,
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center)
+                .wrap()
+                .into()
+            },
+        ))
+        .spacing(4);
+        let migration = run.migration.map(|migration| {
+            column![
+                migration
+                    .destination()
+                    .map(|target| text(format!("Proposed platform · {target}")).size(13)),
+                migration
+                    .language()
+                    .map(|target| text(format!("Proposed language · {target}")).size(13)),
+                column(
+                    run.migration_notes
+                        .iter()
+                        .map(|note| text(note).size(13).into())
+                )
+                .spacing(4),
             ]
-            .spacing(6)
-            .align_y(Alignment::Center)
-            .wrap()
-            .into()
-        },
-    ))
-    .spacing(4);
-    let source = run.has_review_source().then(|| {
+            .spacing(4)
+        });
+        column![migration, reasons].spacing(6).into()
+    };
+    let source = move || {
         review.exact.map_or_else(
             || {
                 review
                     .comparison
-                    .review_body()
+                    .review_body_with_font(Some(font_size))
                     .map(|message| msg(Action::Diff(message)))
             },
-            exact,
+            |page| exact(page, font_size),
         )
-    });
+    };
+    let has_summary = !run.reasons.is_empty() || run.migration.is_some();
+    let content = match (has_summary, run.has_review_source()) {
+        (true, true) => {
+            let lines = run.reasons.len().saturating_add(run.migration_notes.len());
+            let estimate = 28.0 + lines.min(24) as f32 * 20.0;
+            Some(diff_summary::view(
+                review.summary_drag.or(summary_divider),
+                estimate,
+                summary,
+                source,
+                move |event| msg(Action::SummaryDivider(run.id, event)),
+            ))
+        }
+        (true, false) => Some(scrollable(summary()).height(Length::Fill).into()),
+        (false, true) => Some(source()),
+        (false, false) => None,
+    };
     column![
         row![
             text(run.status.label()).size(17),
@@ -344,6 +433,8 @@ fn review_content<'a>(review: Review<'a>, status: Option<&'a str>) -> Column<'a,
                 },
                 Action::ToggleExact
             )),
+            run.has_review_source()
+                .then(|| super::diff_font_controls(font_size)),
             review
                 .focused_reason
                 .map(|_| control("Show all changes", Action::RevealReason(run.id, None))),
@@ -357,20 +448,17 @@ fn review_content<'a>(review: Review<'a>, status: Option<&'a str>) -> Column<'a,
         (!run.has_review_source()).then(|| notice(
             "The analysis retention limit omitted source needed to review this change."
         )),
-        scrollable(reasons)
-            .height(Length::Fixed(90.0))
-            .width(Length::Fill),
-        source,
+        content,
     ]
     .spacing(8)
     .height(Length::Fill)
 }
 
-fn exact(page: Exact<'_>) -> Element<'_, WindowMessage> {
+fn exact(page: Exact<'_>, font_size: u8) -> Element<'_, WindowMessage> {
     column![
         row![
-            exact_side("Original", page.before),
-            exact_side("Proposed", page.after),
+            exact_side("Original", page.before, font_size),
+            exact_side("Proposed", page.after, font_size),
         ]
         .height(Length::Fill)
         .spacing(12),
@@ -389,7 +477,11 @@ fn exact(page: Exact<'_>) -> Element<'_, WindowMessage> {
     .into()
 }
 
-fn exact_side<'a>(title: &'static str, source: &'a str) -> Column<'a, WindowMessage> {
+fn exact_side<'a>(
+    title: &'static str,
+    source: &'a str,
+    font_size: u8,
+) -> Column<'a, WindowMessage> {
     let mut escaped = String::new();
     for character in source.chars() {
         escaped.extend(character.escape_debug());
@@ -403,7 +495,7 @@ fn exact_side<'a>(title: &'static str, source: &'a str) -> Column<'a, WindowMess
             container(
                 text(escaped)
                     .font(Font::MONOSPACE)
-                    .size(13)
+                    .size(u32::from(font_size))
                     .wrapping(Wrapping::WordOrGlyph)
             )
             .padding(6)

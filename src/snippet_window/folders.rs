@@ -277,6 +277,22 @@ impl State {
             MenuTarget::Snippet(id) => {
                 let subject = Subject::Snippet(id);
                 actions.extend([
+                    (
+                        "Send to terminal",
+                        Some(WindowMessage::RunInTerminal(id, false)),
+                    ),
+                    (
+                        "Send to terminal with parameters…",
+                        Some(WindowMessage::RunInTerminal(id, true)),
+                    ),
+                    (
+                        "Insert into editor…",
+                        Some(WindowMessage::InsertInEditor(id)),
+                    ),
+                    (
+                        "Toggle favorite",
+                        Some(WindowMessage::ToggleSelectedFavorites(Some(id))),
+                    ),
                     ("Full-code analysis…", Some(WindowMessage::Analyze(subject))),
                     (
                         "Export analysis reports…",

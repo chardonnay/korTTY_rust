@@ -66,14 +66,34 @@ pub(crate) fn open_directory_browser(
     cancelled: impl Fn() -> bool,
     trust_store: impl FnOnce() -> io::Result<TrustStore>,
 ) -> Result<SftpWorker, &'static str> {
+    let shared = credentials.shared_reference().cloned();
+    if let Some(reference) = &shared {
+        reference.require_installed_shared_route()?;
+    }
     let (target, jumps) = credentials.into_route().map_err(|failure| failure.detail)?;
     let trust = trust_store().map_err(|_| "Could not access SSH host-key trust store")?;
     let tcp =
         ssh_connection::connect_transport(&jumps.first().unwrap_or(&target).endpoint, &cancelled)
             .map_err(|error| connect_failure(error.into()).detail)?;
-    let session = SshSession::connect_subsystem_preconnected_cancellable(
-        tcp, target, jumps, trust, "sftp", &cancelled,
-    )
+    let session = if let Some(reference) = shared {
+        let trust = reference.strict_trust(trust)?;
+        SshSession::connect_preconnected_guarded(
+            tcp,
+            (target, jumps),
+            trust,
+            kortty_ssh::StartupChannel::Subsystem("sftp"),
+            &cancelled,
+            || {
+                reference
+                    .require_installed_shared_route()
+                    .map_err(io::Error::other)
+            },
+        )
+    } else {
+        SshSession::connect_subsystem_preconnected_cancellable(
+            tcp, target, jumps, trust, "sftp", &cancelled,
+        )
+    }
     .map_err(|error| connect_failure(error).detail)?;
     if cancelled() {
         return Err("Remote directory selection cancelled");
@@ -113,7 +133,9 @@ pub(crate) struct ExecutionPolicy {
 
 impl ExecutionPolicy {
     fn has_target_groups(&self, action: &SshCommand) -> bool {
-        self.group_scope.is_some() || action.target_groups.is_some()
+        self.group_scope.is_some()
+            || action.target_groups.is_some()
+            || action.has_teamwork_targets()
     }
 
     fn require_target_groups(&self, action: &SshCommand) -> Result<(), Failure> {
@@ -484,6 +506,7 @@ fn run_command(
     let (target, jumps) = connection::route(action, saved_auth, &policy.server_access)?;
     let trust =
         trust_store().map_err(|_| Failure::failed("Could not access SSH host-key trust store"))?;
+    let trust = connection::trust_for_action(action, trust)?;
     check_cancelled(cancellation)?;
     policy.require_target_groups(action)?;
     let cancelled = || cancellation.is_requested();

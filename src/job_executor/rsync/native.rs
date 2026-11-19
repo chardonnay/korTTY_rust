@@ -204,7 +204,10 @@ pub(in crate::job_executor) fn run(
     if !uploading && !action.directory && approval.batch.is_none() && approval.download.is_none() {
         return Err(review_required());
     }
-    let pins = sync::pins(reference, trust).map_err(|_| review_required())?;
+    let reviewed_trust = reference
+        .strict_trust(trust.clone())
+        .map_err(Failure::blocked)?;
+    let pins = sync::pins(reference, &reviewed_trust).map_err(|_| review_required())?;
     if sync::fingerprints(&pins) != approval.pins {
         return Err(Failure::blocked(
             "The approved rsync route host keys changed.",
@@ -245,7 +248,11 @@ pub(in crate::job_executor) fn run(
             .map(|member| Destination::prepare(member, uploading))
             .collect::<Result<Vec<_>, _>>()?
     };
-    let scoped = cfg!(windows) || grouped || batch.is_some() || current_review;
+    let scoped = cfg!(windows)
+        || grouped
+        || batch.is_some()
+        || current_review
+        || reference.shared_identity().is_some();
     let guard = (uploading || scoped).then(|| {
         let policy = policy.clone();
         let action = request.action.clone();

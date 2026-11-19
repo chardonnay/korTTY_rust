@@ -493,6 +493,7 @@ fn saved_https_analysis_opens_a_separate_split_review_and_revokes_on_vault_chang
     let _ = workspace.update_snippets(id, SnippetMessage::Open(snippet));
     let load = workspace.open_snippet_analysis(id, subject);
     let _ = complete(&mut workspace, load);
+    workspace.window_settings.snippet_ai_additional_instructions = Some(true);
     let config = workspace.ai_configuration().unwrap();
     let vault_revision = workspace.vault_change_revision();
     let surface = workspace.snippets.get_mut(&id).unwrap();

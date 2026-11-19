@@ -16,6 +16,7 @@ use super::{FolderSelection, Snippet, absolute, invalid, profile};
 use crate::snippets::recipients::Choice;
 
 mod layout;
+pub(crate) use layout::snippet_is_executable;
 mod openpgp;
 pub(crate) use layout::{AnalysisFile, analysis_files};
 pub(crate) use openpgp::{

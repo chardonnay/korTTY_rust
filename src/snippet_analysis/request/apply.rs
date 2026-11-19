@@ -17,6 +17,8 @@ use crate::snippet_analysis::model::{
     APPLY_PLAN_VERSION, Analysis, ApplyRecovery, ApplyRequestSnapshot, ApplyRun, ChangeReason,
     MAX_APPLY_CONTENT_BYTES, PartialApply, Selection, content_hash,
 };
+use crate::snippet_window::ai_assist::migration;
+use crate::snippet_window::languages::mix;
 
 const FULL_SCRIPT_LINES: usize = 400;
 const FULL_SCRIPT_BYTES: usize = 12 * 1024;
@@ -49,6 +51,7 @@ pub(crate) struct Request {
     selection: Selection,
     items: Vec<WorkItem>,
     edit_mode: bool,
+    migration: Option<migration::Plan>,
     instructions: String,
     guidance: String,
     project: Option<Arc<str>>,
@@ -79,6 +82,26 @@ impl Request {
         report_language: &str,
         code_text_language: CodeTextLanguage,
     ) -> Result<Self, String> {
+        Self::for_plan(
+            snapshot,
+            report,
+            selection,
+            instructions,
+            guidance,
+            (report_language, code_text_language),
+            None,
+        )
+    }
+
+    pub(crate) fn for_plan(
+        snapshot: Snapshot,
+        report: &Analysis,
+        selection: Selection,
+        instructions: String,
+        guidance: String,
+        (report_language, code_text_language): (&str, CodeTextLanguage),
+        migration: Option<migration::Plan>,
+    ) -> Result<Self, String> {
         if snapshot.project || snapshot.files.len() != 1 {
             return Err("Applying changes requires one editable snippet.".into());
         }
@@ -93,16 +116,6 @@ impl Request {
         if !selection.has_required_source() {
             return Err(
                 "The analysis retention limit omitted a script header needed for this request."
-                    .into(),
-            );
-        }
-        if selection
-            .requirements
-            .iter()
-            .any(|requirement| !requirement.supports(&snapshot.files[0].language))
-        {
-            return Err(
-                "A selected hardening option is unavailable for the current source language."
                     .into(),
             );
         }
@@ -154,23 +167,12 @@ impl Request {
             recommendation: requirement.instruction(),
             line: None,
         }));
-        let body = without_bom(before);
-        let lines = script_lines(body);
-        let ending = first_ending(&lines);
-        let edit_mode = lines.len() > FULL_SCRIPT_LINES
-            || before.len() > FULL_SCRIPT_BYTES
-            || lines
-                .iter()
-                .filter(|line| !line.ending.is_empty())
-                .any(|line| line.ending != ending)
-            || body
-                .chars()
-                .any(|ch| ch.is_control() && !matches!(ch, '\r' | '\n' | '\t'));
+        let edit_mode = uses_edits(before);
         let mut system = system_prompt(report_language, code_text_language);
         if !selection.requirements.is_empty() {
             system.push_str(" For a structured requirement already implemented in the supplied source, confirm in its change reason that you verified and retained it. Keep exact literals requested by structured requirements. Copy any approved header verbatim.");
         }
-        Ok(Self {
+        let request = Self {
             system,
             preset_base_len: None,
             report_language_code: effective_report_language(report_language).into(),
@@ -179,10 +181,47 @@ impl Request {
             selection,
             items,
             edit_mode,
+            migration: None,
             instructions,
             guidance,
             project: None,
-        })
+        };
+        if let Some(plan) = migration {
+            request.with_migration(plan)
+        } else {
+            request.require_supported_requirements()?;
+            Ok(request)
+        }
+    }
+
+    fn with_migration(mut self, plan: migration::Plan) -> Result<Self, String> {
+        let file = &self.snapshot.files[0];
+        let detected = mix::inspect(&file.language, &file.content);
+        if migration::Plan::new(&detected, plan.language(), plan.destination())? != plan {
+            return Err("The migration source or target changed.".into());
+        }
+        self.migration = Some(plan);
+        self.system.push_str("\nThe first migration stage is identified by its Migration stage heading. For that stage, perform only the language or platform migration, use the response schema in that stage, and preserve behavior, interfaces and placeholders while changing interpreter syntax as needed. In subsequent stages, keep the migrated language and platform. Finding line references refer to the pre-migration source. Locate the matching code by behavior.");
+        self.require_supported_requirements()?;
+        Ok(self)
+    }
+
+    fn require_supported_requirements(&self) -> Result<(), String> {
+        let language = self
+            .migration
+            .and_then(migration::Plan::result_language)
+            .unwrap_or(&self.snapshot.files[0].language);
+        if self
+            .selection
+            .requirements
+            .iter()
+            .any(|requirement| !requirement.supports(language))
+        {
+            return Err(
+                "A selected hardening option is unavailable for the target source language.".into(),
+            );
+        }
+        Ok(())
     }
 
     pub(crate) fn with_project(mut self, context: Arc<str>) -> Self {
@@ -211,12 +250,20 @@ impl Request {
         &self.snapshot.files[0].content
     }
 
+    pub(crate) fn instructions(&self) -> &str {
+        &self.instructions
+    }
+
     pub(crate) fn selection(&self) -> &Selection {
         &self.selection
     }
 
     pub(crate) fn stage_count(&self) -> usize {
-        self.items.len().div_ceil(self.batch_size())
+        self.items.len().div_ceil(self.batch_size()) + self.migration_stages()
+    }
+
+    fn migration_stages(&self) -> usize {
+        usize::from(self.migration.is_some())
     }
 
     pub(crate) fn recovery_snapshot(&self) -> Result<ApplyRequestSnapshot, String> {
@@ -237,6 +284,7 @@ impl Request {
             code_text_language: self.code_text_language,
             stage_width: self.batch_size(),
             total_stages: self.stage_count(),
+            migration: self.migration,
         })
     }
 
@@ -250,14 +298,14 @@ impl Request {
             .validate(report)
             .map_err(|error| error.to_string())?;
         let approved = &recovery.request;
-        let mut request = Self::new(
+        let mut request = Self::for_plan(
             snapshot,
             report,
             approved.selection.clone(),
             approved.instructions.clone(),
             approved.guidance.clone(),
-            &approved.report_language_code,
-            approved.code_text_language,
+            (&approved.report_language_code, approved.code_text_language),
+            approved.migration,
         )?;
         if let Some(system) = &approved.system_prompt {
             if !system.starts_with(&request.system) {
@@ -269,6 +317,10 @@ impl Request {
         if request.recovery_snapshot()? != *approved {
             return Err("The snippet or the approved apply plan changed.".into());
         }
+        if let (Some(plan), Some(checkpoint)) = (request.migration, recovery.checkpoint.as_deref())
+        {
+            request.validate_migrated_code(plan, &checkpoint.code)?;
+        }
         Ok(request)
     }
 
@@ -278,26 +330,35 @@ impl Request {
 
     pub(crate) fn preview_from(&self, checkpoint: Option<&Checkpoint>) -> Result<String, String> {
         require_checkpoint_source(checkpoint)?;
+        self.require_supported_requirements()?;
         let completed = checkpoint.map_or(0, Checkpoint::completed);
         let code = checkpoint.map_or_else(|| self.source(), |point| point.code.as_ref());
         let mut stages = self
             .items
             .chunks(self.batch_size())
             .enumerate()
-            .skip(completed);
-        let (index, stage) = stages.next().ok_or("No apply stages remain.")?;
-        let first = self.stage_input(code, stage, index)?;
-        let heading = if completed == 0 {
-            "First stage user prompt".into()
+            .skip(completed.saturating_sub(self.migration_stages()));
+        let mut preview = if let Some(plan) = self.migration.filter(|_| completed == 0) {
+            format!(
+                "System prompt\n{}\n\nFirst stage user prompt\n{}",
+                self.system,
+                self.migration_input(plan)?
+            )
         } else {
-            format!("Stage {} user prompt", completed + 1)
+            let (index, stage) = stages.next().ok_or("No apply stages remain.")?;
+            let first = self.stage_input(code, stage, index)?;
+            let heading = if completed == 0 {
+                "First stage user prompt".into()
+            } else {
+                format!("Stage {} user prompt", completed + 1)
+            };
+            format!("System prompt\n{}\n\n{heading}\n{first}", self.system)
         };
-        let mut preview = format!("System prompt\n{}\n\n{heading}\n{first}", self.system);
         for (index, stage) in stages {
             let _ = writeln!(
                 preview,
                 "\nStage {} uses the previous stage's proposed source with these items:\n{}",
-                index + 1,
+                index + 1 + self.migration_stages(),
                 work_json(stage)?
             );
             append_earlier_requirements(&mut preview, self.earlier_requirements(index))?;
@@ -354,7 +415,7 @@ impl Request {
     ) -> Result<ApplyRun, String> {
         let mut progress = self.initial();
         self.run_stages(client, &mut progress, observer, authorize, |_| Ok(()))?;
-        self.finish(progress, started, self.selection.clone())
+        self.finish(progress, started, self.selection.clone(), None)
     }
 
     pub(crate) fn completed(
@@ -366,7 +427,7 @@ impl Request {
         if checkpoint.completed != self.stage_count() {
             return Err("The apply checkpoint still has stages to run.".into());
         }
-        self.finish(checkpoint.clone(), started, self.selection.clone())
+        self.finish(checkpoint.clone(), started, self.selection.clone(), None)
     }
 
     pub(crate) fn partial(
@@ -376,24 +437,29 @@ impl Request {
     ) -> Result<ApplyRun, String> {
         require_checkpoint_source(Some(checkpoint))?;
         let total_stages = self.stage_count();
-        if checkpoint.completed == 0 || checkpoint.completed >= total_stages {
+        if !self.can_review_partial(checkpoint) {
             return Err(
                 "A partial proposal requires a completed stage and a stage still to run.".into(),
             );
         }
-        if degenerate_partial(self.source(), &checkpoint.code) {
+        if checkpoint.completed > self.migration_stages()
+            && degenerate_partial(self.source(), &checkpoint.code)
+        {
             return Err("The completed stages produced an incomplete replacement.".into());
         }
         let selected = self
             .selection
-            .through(checkpoint.completed * self.batch_size());
-        let mut proposal = self.finish(checkpoint.clone(), started, selected)?;
-        proposal.partial = Some(PartialApply {
+            .through((checkpoint.completed - self.migration_stages()) * self.batch_size());
+        let partial = PartialApply {
             completed_stages: checkpoint.completed,
             total_stages,
             total_items: self.selection.len(),
-        });
-        Ok(proposal)
+        };
+        self.finish(checkpoint.clone(), started, selected, Some(partial))
+    }
+
+    pub(crate) fn can_review_partial(&self, checkpoint: &Checkpoint) -> bool {
+        checkpoint.completed > 0 && checkpoint.completed < self.stage_count()
     }
 
     fn initial(&self) -> Checkpoint {
@@ -403,6 +469,7 @@ impl Request {
             code_sha256: String::new(),
             reasons: Vec::new(),
             completed: 0,
+            migration_notes: Vec::new(),
         }
     }
 
@@ -414,12 +481,44 @@ impl Request {
         authorize: &dyn Fn(&[&str]) -> Result<(), String>,
         mut persist: impl FnMut(&Checkpoint) -> Result<(), String>,
     ) -> Result<(), String> {
+        self.require_supported_requirements()?;
         let mut structured = true;
+        let offset = self.migration_stages();
+        if let Some(plan) = self.migration.filter(|_| progress.completed == 0) {
+            let input = self.migration_input(plan)?;
+            let answer = send(
+                client,
+                &self.system,
+                &input,
+                &mut structured,
+                authorize,
+                observer.attempt(1, self.stage_count(), &[], false),
+            )?;
+            authorize(&[&answer])?;
+            let answer: migration::Response =
+                serde_json::from_str(local_ai::reply::strip_fence(answer.trim()))
+                    .map_err(|_| "The first stage did not return a complete migration result.")?;
+            let code = plan.result(self.source(), answer.text)?;
+            if code.len() > MAX_APPLY_CONTENT_BYTES
+                || code.contains('\0')
+                || code == self.source()
+                || !migration::Response::notes_valid(&answer.notes)
+                || !crate::snippets::resolve::same_placeholders(self.source(), &code)
+            {
+                return Err("The migration returned invalid source, placeholders or notes.".into());
+            }
+            authorize(&[&code])?;
+            progress.code_sha256 = content_hash(&code).map_err(|error| error.to_string())?;
+            progress.code = code.into();
+            progress.migration_notes = answer.notes;
+            progress.completed = 1;
+            persist(progress)?;
+        }
         for (index, stage) in self
             .items
             .chunks(self.batch_size())
             .enumerate()
-            .skip(progress.completed)
+            .skip(progress.completed.saturating_sub(offset))
         {
             if !client.active() {
                 return Err(local_ai::Error::Cancelled.message());
@@ -432,7 +531,7 @@ impl Request {
                 &input,
                 &mut structured,
                 authorize,
-                observer.attempt(index + 1, self.stage_count(), stage, false),
+                observer.attempt(index + 1 + offset, self.stage_count(), stage, false),
             )?;
             authorize(&[&answer])?;
             let proposal = match self.parse_stage(&answer, &progress.code, stage, index) {
@@ -446,14 +545,16 @@ impl Request {
                         &input,
                         &mut structured,
                         authorize,
-                        observer.attempt(index + 1, self.stage_count(), stage, true),
+                        observer.attempt(index + 1 + offset, self.stage_count(), stage, true),
                     )?;
                     authorize(&[&answer])?;
                     self.parse_stage(&answer, &progress.code, stage, index)
-                        .map_err(|error| format!("Apply stage {} failed: {error}", index + 1))?
+                        .map_err(|error| {
+                            format!("Apply stage {} failed: {error}", index + 1 + offset)
+                        })?
                 }
             };
-            if index + 1 == self.stage_count() && proposal.code == self.source() {
+            if index + 1 + offset == self.stage_count() && proposal.code == self.source() {
                 return Err("The completed stages returned the original source.".into());
             }
             if !client.active() {
@@ -464,7 +565,7 @@ impl Request {
                 content_hash(&proposal.code).map_err(|error| error.to_string())?;
             progress.code = proposal.code.into();
             progress.reasons.extend(proposal.changes);
-            progress.completed = index + 1;
+            progress.completed = index + 1 + offset;
             persist(progress)?;
         }
         if !client.active() {
@@ -478,17 +579,23 @@ impl Request {
         progress: Checkpoint,
         started: u64,
         selected: Selection,
+        partial: Option<PartialApply>,
     ) -> Result<ApplyRun, String> {
         let Checkpoint {
-            code, mut reasons, ..
+            code,
+            mut reasons,
+            migration_notes,
+            ..
         } = progress;
         retain_present_anchors(&code, &mut reasons);
-        let mut run = ApplyRun::new(
+        let mut run = ApplyRun::new_for_stages(
             self.source().to_owned(),
             code.to_string(),
             selected,
             reasons,
             started,
+            partial,
+            self.migration.map(|plan| (plan, migration_notes)),
         )
         .map_err(|error| error.to_string())?;
         run.code_text_language = Some(self.code_text_language);
@@ -496,7 +603,39 @@ impl Request {
     }
 
     fn batch_size(&self) -> usize {
-        if self.edit_mode { 6 } else { 3 }
+        if self.edit_mode && self.migration.is_none() {
+            6
+        } else {
+            3
+        }
+    }
+
+    fn edit_mode_for(&self, code: &str) -> bool {
+        if self.migration.is_some() {
+            uses_edits(code)
+        } else {
+            self.edit_mode
+        }
+    }
+
+    fn migration_input(&self, plan: migration::Plan) -> Result<String, String> {
+        let mut input = format!(
+            "Migration stage\n{}\nReturn one JSON object with a string field text and a notes array of strings.\n\n{}",
+            plan.instruction(),
+            self.snapshot.render()?,
+        );
+        if !self.instructions.trim().is_empty() {
+            let _ = writeln!(
+                input,
+                "\nApproved user instructions:\n{}",
+                self.instructions
+            );
+        }
+        if !self.guidance.trim().is_empty() {
+            let _ = writeln!(input, "\nSelected AI skill guidance:\n{}", self.guidance);
+        }
+        limit(&input)?;
+        Ok(input)
     }
 
     fn parse_stage(
@@ -506,7 +645,10 @@ impl Request {
         items: &[WorkItem],
         index: usize,
     ) -> Result<Proposal, String> {
-        let proposal = parse(answer, before, items, self.edit_mode)?;
+        let proposal = parse(answer, before, items, self.edit_mode_for(before))?;
+        if let Some(plan) = self.migration {
+            self.validate_migrated_code(plan, &proposal.code)?;
+        }
         for requirement in self
             .selection
             .requirements_through((index + 1) * self.batch_size())
@@ -518,9 +660,13 @@ impl Request {
                 ));
             }
             if matches!(requirement, Requirement::Header { .. })
-                && let Some(shebang) = source_lines(self.source())
-                    .next()
-                    .filter(|line| line.starts_with("#!"))
+                && let Some(shebang) = source_lines(if self.migration.is_some() {
+                    before
+                } else {
+                    self.source()
+                })
+                .next()
+                .filter(|line| line.starts_with("#!"))
                 && source_lines(&proposal.code).next() != Some(shebang)
             {
                 return Err("it moved or replaced the existing shebang.".into());
@@ -529,20 +675,36 @@ impl Request {
         Ok(proposal)
     }
 
+    fn validate_migrated_code(&self, plan: migration::Plan, code: &str) -> Result<(), String> {
+        plan.retains_destination(self.source(), code)?;
+        if !crate::snippets::resolve::same_placeholders(self.source(), code) {
+            return Err("The proposal changes the original snippet placeholders.".into());
+        }
+        Ok(())
+    }
+
     fn earlier_requirements(&self, index: usize) -> &[WorkItem] {
         let start = index * self.batch_size();
         &self.items[start - self.selection.requirements_through(start).len()..start]
     }
 
     fn stage_input(&self, code: &str, items: &[WorkItem], index: usize) -> Result<String, String> {
-        let mut input = self.snapshot.single_header();
+        let path = self
+            .migration
+            .map(|plan| plan.result_file_name(Some(&self.snapshot.files[0].path)))
+            .transpose()?
+            .flatten();
+        let mut input = self.snapshot.single_header_for(
+            path.as_deref(),
+            self.migration.and_then(migration::Plan::result_language),
+        );
         input.push_str("Each numbered line is a JSON string. Line endings and a leading BOM are preserved by the editor.\n");
         for (index, line) in script_lines(without_bom(code)).iter().enumerate() {
             let line = serde_json::to_string(line.text)
                 .map_err(|_| "Could not encode the source line.")?;
             let _ = writeln!(input, "{} | {line}", index + 1);
         }
-        let contract = if self.edit_mode {
+        let contract = if self.edit_mode_for(code) {
             EDIT_CONTRACT
         } else {
             FULL_CONTRACT
@@ -572,6 +734,21 @@ impl Request {
         limit(&input)?;
         Ok(input)
     }
+}
+
+fn uses_edits(source: &str) -> bool {
+    let body = without_bom(source);
+    let lines = script_lines(body);
+    let ending = first_ending(&lines);
+    lines.len() > FULL_SCRIPT_LINES
+        || source.len() > FULL_SCRIPT_BYTES
+        || lines
+            .iter()
+            .filter(|line| !line.ending.is_empty())
+            .any(|line| line.ending != ending)
+        || body
+            .chars()
+            .any(|ch| ch.is_control() && !matches!(ch, '\r' | '\n' | '\t'))
 }
 
 fn require_checkpoint_source(checkpoint: Option<&Checkpoint>) -> Result<(), String> {

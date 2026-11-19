@@ -349,6 +349,8 @@ impl Workspace {
         let inherits_font_size = old.inherits_font_size;
         let (strict, typeahead) = (old.reconnect_strict_escapes(), old.typeahead_enabled);
         let effect = old.effect;
+        let quick_ai = old.quick_ai.clone();
+        let quick_appearance = old.quick_appearance.clone();
         let Some(next) = self.sessions.get_mut(&candidate) else {
             return Task::none();
         };
@@ -372,6 +374,8 @@ impl Workspace {
         next.font_baseline = baseline;
         next.inherits_font_size = inherits_font_size;
         next.effect = effect;
+        next.quick_ai = quick_ai;
+        next.quick_appearance = quick_appearance;
         next.project_initial_size = project_initial_size;
         next.project_terminal_appearance = project_terminal_appearance;
         let styled = next.project_terminal_appearance.is_some();

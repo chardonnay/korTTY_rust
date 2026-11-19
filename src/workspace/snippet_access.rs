@@ -30,6 +30,7 @@ pub(super) use run::{PaletteTarget, RunMessage, RunPrompt};
 pub(super) const TITLE: &str = "Snippet Manager";
 const MAX_COMPARISONS: usize = 4;
 const STRUCTURE_PREFERENCE_DELAY: Duration = Duration::from_millis(350);
+const INLINE_COMPLETION_DELAY: Duration = Duration::from_millis(900);
 
 pub(super) struct ComparisonSurface {
     source: window::Id,
@@ -40,7 +41,11 @@ pub(super) struct Surface {
     pub(super) window: SnippetWindow,
     pub(super) transfer: Option<transfer::State>,
     analysis: analysis::Tabs,
+    overview_pending: bool,
     assist: ai_assist::State,
+    automatic_completion: Option<ai_assist::AutomaticCompletion>,
+    inline_completion: Option<ai_assist::AutomaticCompletion>,
+    inline_completion_due: Option<Instant>,
     placement: Placement,
     focused_at: u64,
     close_after_work: bool,
@@ -57,7 +62,11 @@ impl Surface {
             window,
             transfer: None,
             analysis: analysis::Tabs::default(),
+            overview_pending: false,
             assist: ai_assist::State::default(),
+            automatic_completion: None,
+            inline_completion: None,
+            inline_completion_due: None,
             placement: Placement::Native { source },
             focused_at: 0,
             close_after_work: false,
@@ -67,10 +76,29 @@ impl Surface {
     pub(super) fn cancel_analysis(&mut self) {
         self.analysis = analysis::Tabs::default();
         self.assist = ai_assist::State::default();
+        self.automatic_completion = None;
+        self.inline_completion = None;
+        self.cancel_inline_completion();
+    }
+
+    fn cancel_inline_completion(&mut self) {
+        self.inline_completion_due = None;
+        if self.assist.is_inline_completion() {
+            self.assist.cancel_completion(&mut self.window);
+        }
+        self.window.dismiss_inline_completion();
     }
 }
 
 impl Workspace {
+    fn save_snippet_diff_summary(&mut self, id: window::Id, position: u16) {
+        let preference = &mut self.window_settings.snippet_ai_diff_summary_divider;
+        if *preference != Some(position) {
+            *preference = Some(position);
+            self.save_window_settings(Some(id));
+        }
+    }
+
     pub(super) fn show_snippets(&mut self, source: window::Id) -> Task<Message> {
         self.show_snippet_manager(source, None)
     }
@@ -218,6 +246,7 @@ impl Workspace {
                 opened,
                 self.poll_snippet_structure(id, Instant::now()),
                 self.reopen_snippet_analysis_panel(id),
+                self.poll_snippet_analysis_overview(id),
             ]),
         )
     }
@@ -297,7 +326,9 @@ impl Workspace {
         }
         self.snippets.get(&id).map(|surface| {
             if surface.window.can_open_assist()
-                && let Some(page) = surface.assist.view(&surface.window)
+                && let Some(page) = surface
+                    .assist
+                    .view(&surface.window, Some(&self.window_settings))
             {
                 return page.map(move |event| {
                     Message::Snippets(id, snippet_window::Message::Assist(event))
@@ -322,6 +353,19 @@ impl Workspace {
                                 .snippet_appearance
                                 .word_wrap
                                 .unwrap_or(true),
+                            completion_shortcut: self
+                                .window_settings
+                                .snippet_completion_shortcut
+                                .unwrap_or_default(),
+                            ai_completion_available: self.ai_configuration().is_some()
+                                && surface.window.can_open_assist(),
+                            ai_completion_running: surface.assist.completion_running(),
+                            ai_completion_automatic: surface.automatic_completion.is_some(),
+                            ai_inline_enabled: surface.inline_completion.is_some(),
+                            ai_inline_running: surface.assist.is_inline_completion()
+                                && surface.assist.completion_running(),
+                            library_divider: self.window_settings.snippet_library_divider,
+                            library_columns: &self.window_settings.snippet_library_columns,
                         },
                         surface.window.selected_id().is_some_and(|snippet| {
                             self.snippet_editor_elsewhere(id, snippet).is_some()
@@ -332,8 +376,14 @@ impl Workspace {
                         },
                         surface.analysis.view(
                             analysis::Presentation {
+                                snippet_instructions_enabled: self
+                                    .window_settings
+                                    .snippet_ai_additional_instructions(),
                                 side_panel: self.window_settings.snippet_analysis_panel,
-                                side_space: snippet_window::analysis_available_width(size.width),
+                                side_space: surface.window.analysis_available_width(
+                                    size.width,
+                                    self.window_settings.snippet_library_divider,
+                                ),
                                 apply_progress_dock: self
                                     .window_settings
                                     .snippet_apply_progress_dock
@@ -343,6 +393,12 @@ impl Workspace {
                                     .window_settings
                                     .snippet_analysis_auto_modularization,
                                 report_font: self.window_settings.snippet_analysis_report_font_size,
+                                ai_diff_font: self
+                                    .window_settings
+                                    .snippet_ai_font(snippet_window::ai_assist::FontView::Diff),
+                                ai_diff_summary_divider: self
+                                    .window_settings
+                                    .snippet_ai_diff_summary_divider,
                                 diagram_options_expanded: self
                                     .window_settings
                                     .snippet_analysis_diagram_options_expanded
@@ -504,14 +560,30 @@ impl Workspace {
         {
             return Task::none();
         }
+        if !message.is_async_completion()
+            && !matches!(
+                message,
+                snippet_window::Message::Assist(_)
+                    | snippet_window::Message::StepInlineCompletion(_)
+            )
+            && let Some(surface) = self.snippets.get_mut(&id)
+        {
+            surface.cancel_inline_completion();
+        }
         let message = match message {
             snippet_window::Message::Assist(action) => {
                 return self.update_snippet_assist(id, action);
             }
             snippet_window::Message::Analyze(subject) => {
+                if let Some(surface) = self.snippets.get_mut(&id) {
+                    surface.assist.cancel_completion(&mut surface.window);
+                }
                 return self.open_snippet_analysis(id, subject);
             }
             snippet_window::Message::Analysis(action) => {
+                if let Some(surface) = self.snippets.get_mut(&id) {
+                    surface.assist.cancel_completion(&mut surface.window);
+                }
                 return self.update_snippet_analysis(id, action);
             }
             snippet_window::Message::AnalysisReports(subject) => {
@@ -567,6 +639,36 @@ impl Workspace {
         if matches!(message, snippet_window::Message::Close) {
             return self.request_snippet_close(id);
         }
+        let message = match message {
+            snippet_window::Message::RunInTerminal(snippet, parameterized) => {
+                return self.run_library_snippet(id, snippet, parameterized);
+            }
+            snippet_window::Message::InsertInEditor(snippet) => {
+                let Some(target) = self.snippet_insert_target(id) else {
+                    if let Some(surface) = self.snippets.get_mut(&id) {
+                        surface.window.assist_status(
+                            "Open a file editor in this window to insert the snippet.".into(),
+                        );
+                    }
+                    return Task::none();
+                };
+                snippet_window::Message::Copy(snippet_window::copy::Message::BeginInsert(
+                    target, snippet,
+                ))
+            }
+            snippet_window::Message::Copy(snippet_window::copy::Message::ClipboardLoaded(
+                token,
+                _,
+            )) if !self.clipboard.policy.read_allowed
+                || self.clipboard.policy.problem.is_some() =>
+            {
+                if let Some(surface) = self.snippets.get_mut(&id) {
+                    surface.window.deny_snippet_clipboard(token);
+                }
+                return Task::none();
+            }
+            message => message,
+        };
         if let Some(snippet) = self
             .snippets
             .get(&id)
@@ -624,6 +726,10 @@ impl Workspace {
                 | snippet_window::Message::Folders(snippet_window::folders::Message::KeepContents)
         )
         .then(|| analysis::subjects(snippets));
+        let opened_completion = matches!(message, snippet_window::Message::Complete);
+        let inline_revision = (surface.inline_completion.is_some()
+            && matches!(&message, snippet_window::Message::Edit(action) if action.is_edit()))
+        .then(|| snippets.inline_revision());
         if locked && snippets.hosted_close().is_none() && !message.is_async_completion() {
             return Task::none();
         }
@@ -667,6 +773,17 @@ impl Workspace {
             snippets.apply_pending_library();
         }
         surface.assist.revalidate_source(snippets);
+        if inline_revision.is_some_and(|before| !Arc::ptr_eq(&before, &snippets.inline_revision()))
+            && snippets.can_schedule_inline_completion()
+        {
+            surface.inline_completion_due = Some(Instant::now() + INLINE_COMPLETION_DELAY);
+        }
+        if opened_completion && surface.automatic_completion.is_some() {
+            return self.update_snippet_assist(
+                id,
+                snippet_window::ai_assist::Message::StartAutomaticCompletion,
+            );
+        }
         let task = match update {
             Update::LineNumbers(enabled) | Update::WordWrap(enabled) => {
                 let mut next = self.window_settings.clone();
@@ -704,6 +821,27 @@ impl Workspace {
             Update::EditorTool(job) => job
                 .task()
                 .map(move |message| Message::Snippets(id, snippet_window::Message::Tools(message))),
+            Update::LibraryDivider(parts) => {
+                if self.window_settings.snippet_library_divider != Some(parts) {
+                    self.window_settings.snippet_library_divider = Some(parts);
+                    self.save_window_settings(Some(id));
+                }
+                Task::none()
+            }
+            Update::LibraryColumnWidth(column, width) => {
+                if self
+                    .window_settings
+                    .snippet_library_columns
+                    .save(column, width)
+                {
+                    self.save_window_settings(Some(id));
+                }
+                Task::none()
+            }
+            Update::AiToolFallback(action) => self.update_snippet_assist(
+                id,
+                snippet_window::ai_assist::Message::OpenToolFallback(action),
+            ),
             Update::DeleteFolder(folder, snippets) => {
                 return self.delete_snippet_folder(id, folder, &snippets);
             }
@@ -730,14 +868,59 @@ impl Workspace {
                 .window
                 .reveal_library_selection()
                 .map(move |message| Message::Snippets(id, message)),
-            Update::ReadClipboard(token) => self.read_clipboard().map(move |value| {
-                let message = snippet_window::copy::Message::ClipboardLoaded(
-                    token,
-                    value.map(zeroize::Zeroizing::new),
-                );
-                Message::Snippets(id, snippet_window::Message::Copy(message))
-            }),
+            Update::ReadClipboard(token) => {
+                if !self.clipboard.policy.read_allowed || self.clipboard.policy.problem.is_some() {
+                    self.snippets
+                        .get_mut(&id)
+                        .unwrap()
+                        .window
+                        .deny_snippet_clipboard(token);
+                    return Task::none();
+                }
+                self.read_clipboard().map(move |value| {
+                    let message = snippet_window::copy::Message::ClipboardLoaded(
+                        token,
+                        value.map(zeroize::Zeroizing::new),
+                    );
+                    Message::Snippets(id, snippet_window::Message::Copy(message))
+                })
+            }
             Update::CopyResolved(value) => self.write_clipboard(value),
+            Update::CopySaved(snippet, value) => {
+                if !self.clipboard.policy.write_allowed || self.clipboard.policy.problem.is_some() {
+                    self.snippets
+                        .get_mut(&id)
+                        .unwrap()
+                        .window
+                        .assist_status("Managed policy blocks writing the clipboard.".into());
+                    return Task::none();
+                }
+                let path = self.snippets[&id].window.latest_library().path().to_owned();
+                self.record_snippet_use(id, path, snippet);
+                self.write_clipboard(value)
+            }
+            Update::InsertSaved(target, snippet, resolved) => {
+                let result = self.insert_saved_snippet_in_editor(id, target, resolved);
+                match result {
+                    Ok(task) => {
+                        let path = self.snippets[&id].window.latest_library().path().to_owned();
+                        self.record_snippet_use(id, path, snippet);
+                        self.notice(
+                            target.owner,
+                            "Inserted snippet into the file editor.".into(),
+                        );
+                        task
+                    }
+                    Err(error) => {
+                        self.snippets
+                            .get_mut(&id)
+                            .unwrap()
+                            .window
+                            .assist_status(error.into());
+                        Task::none()
+                    }
+                }
+            }
             Update::ReviewCompactCommand => {
                 if self.ai_features_enabled() {
                     return self.update_snippet_assist(
@@ -782,6 +965,20 @@ impl Workspace {
                     Message::Snippets(id, snippet_window::Message::ExportRecipients(result))
                 },
             ),
+            Update::ReadJsonSchema(read) => {
+                let ticket = read.ticket.clone();
+                file_task(
+                    move || read.run(),
+                    move |result| {
+                        Message::Snippets(
+                            id,
+                            snippet_window::Message::JsonSchema(
+                                snippet_window::json_schema::Message::Ready(ticket.clone(), result),
+                            ),
+                        )
+                    },
+                )
+            }
             Update::None | Update::CloseCancelled => Task::none(),
         };
         let resume = if self.hosted_close_locks(id) {
@@ -889,6 +1086,7 @@ impl Workspace {
         let pending = self.snippet_structure_save_at.is_some()
             || self.snippets.iter().any(|(&id, surface)| {
                 surface.window.history_needs_tick()
+                    || surface.inline_completion_due.is_some()
                     || (surface.window.structure_needs_tick()
                         && self.snippet_structure_surface_visible(id))
             });
@@ -900,15 +1098,95 @@ impl Workspace {
         }
     }
 
+    pub(super) fn snippet_overview_subscription(&self) -> Subscription<Message> {
+        let visible = self
+            .snippets
+            .keys()
+            .any(|&id| self.snippet_structure_surface_visible(id));
+        if visible && !self.exiting && !self.scheduler_draining {
+            super::scheduler_access::desktop_clock(Duration::from_secs(3))
+                .map(|()| Message::SnippetOverviewTick)
+        } else {
+            Subscription::none()
+        }
+    }
+
+    pub(super) fn poll_snippet_analysis_overviews(&mut self) -> Task<Message> {
+        let ids: Vec<_> = self
+            .snippets
+            .keys()
+            .copied()
+            .filter(|&id| self.snippet_structure_surface_visible(id))
+            .collect();
+        Task::batch(
+            ids.into_iter()
+                .map(|id| self.poll_snippet_analysis_overview(id)),
+        )
+    }
+
+    fn poll_snippet_analysis_overview(&mut self, id: window::Id) -> Task<Message> {
+        let Some(surface) = self.snippets.get_mut(&id) else {
+            return Task::none();
+        };
+        let library = surface.window.latest_library();
+        if surface.overview_pending || library.entries().is_empty() {
+            return Task::none();
+        }
+        let Some(root) = library.path().parent().map(std::path::Path::to_path_buf) else {
+            return Task::none();
+        };
+        let library = library.clone();
+        let previous = surface.window.library_overview();
+        surface.overview_pending = true;
+        file_task(
+            move || {
+                crate::snippet_analysis::store::Store::new(root)
+                    .library_overview(&library, &previous)
+                    .map(Arc::new)
+            },
+            move |result| Message::SnippetAnalysis(id, AnalysisEvent::Overview(result)),
+        )
+    }
+
     pub(super) fn poll_snippet_structures(&mut self, now: Instant) -> Task<Message> {
         if self.snippet_structure_save_at.is_some_and(|due| now >= due) {
             self.flush_snippet_structure_preferences();
         }
         let ids: Vec<_> = self.snippets.keys().copied().collect();
-        Task::batch(
-            ids.into_iter()
-                .map(|id| self.poll_snippet_structure(id, now)),
-        )
+        Task::batch(ids.into_iter().map(|id| {
+            Task::batch([
+                self.poll_snippet_structure(id, now),
+                self.poll_inline_completion(id, now),
+            ])
+        }))
+    }
+
+    fn poll_inline_completion(&mut self, id: window::Id, now: Instant) -> Task<Message> {
+        let visible = self.snippet_structure_surface_visible(id);
+        let Some(surface) = self.snippets.get_mut(&id) else {
+            return Task::none();
+        };
+        if surface.inline_completion_due.is_none_or(|due| now < due) {
+            return Task::none();
+        }
+        surface.inline_completion_due = None;
+        if visible {
+            self.update_snippet_assist(
+                id,
+                snippet_window::ai_assist::Message::StartInlineCompletion,
+            )
+        } else {
+            Task::none()
+        }
+    }
+
+    pub(super) fn cancel_unfocused_inline_completion(&mut self, id: window::Id) {
+        let snippet = self.focused_snippet_surface(id);
+        for target in [Some(id), snippet].into_iter().flatten() {
+            if let Some(surface) = self.snippets.get_mut(&target) {
+                surface.cancel_inline_completion();
+            }
+        }
     }
 
     fn poll_snippet_structure(&mut self, id: window::Id, now: Instant) -> Task<Message> {
@@ -981,6 +1259,111 @@ impl Workspace {
         opened
     }
 
+    fn snippet_source_owner(&self, manager: window::Id) -> Option<window::Id> {
+        match self.snippets.get(&manager)?.placement {
+            Placement::Native { source } => self.windows.contains_key(&source).then_some(source),
+            Placement::Hosted => self.hosted_tool_owner(manager),
+        }
+    }
+
+    fn snippet_insert_target(
+        &self,
+        manager: window::Id,
+    ) -> Option<snippet_window::copy::EditorTarget> {
+        let owner = self.snippet_source_owner(manager)?;
+        let window = self.windows.get(&owner)?;
+        let editor_tab = |entry: &super::TabEntry| match entry {
+            super::TabEntry::Tool(tab)
+                if tab.kind == Kind::ProjectFile && self.project_file_is_editor(tab.instance) =>
+            {
+                Some(tab.instance)
+            }
+            _ => None,
+        };
+        let hosted = window
+            .active_entry()
+            .and_then(editor_tab)
+            .or_else(|| {
+                window.tab_mru.iter().find_map(|&tab_id| {
+                    window
+                        .tabs
+                        .iter()
+                        .find(|entry| entry.id() == tab_id)
+                        .and_then(editor_tab)
+                })
+            })
+            .or_else(|| {
+                let mut editors = window.tabs.iter().filter_map(editor_tab);
+                let editor = editors.next()?;
+                editors.next().is_none().then_some(editor)
+            });
+        let editor = hosted.or_else(|| {
+            self.snippet_editor_owners
+                .iter()
+                .filter(|(id, (source, _))| *source == owner && self.editors.contains_key(*id))
+                .max_by_key(|(_, (_, focused))| *focused)
+                .map(|(&id, _)| id)
+        })?;
+        Some(snippet_window::copy::EditorTarget { owner, editor })
+    }
+
+    fn insert_saved_snippet_in_editor(
+        &mut self,
+        manager: window::Id,
+        target: snippet_window::copy::EditorTarget,
+        resolved: snippets::resolve::Resolved,
+    ) -> Result<Task<Message>, &'static str> {
+        if self.exiting
+            || self.scheduler_draining
+            || self.snippet_source_owner(manager) != Some(target.owner)
+        {
+            return Err("The selected file editor is no longer in this window.");
+        }
+        let id = target.editor;
+        if self.hosted_tool_owner(id) == Some(target.owner) {
+            return self.insert_snippet_in_project_editor(id, resolved);
+        }
+        if self
+            .snippet_editor_owners
+            .get(&id)
+            .is_none_or(|(source, _)| *source != target.owner)
+        {
+            return Err("The selected file editor closed.");
+        }
+        let editor = self
+            .editors
+            .get_mut(&id)
+            .ok_or("The selected file editor closed.")?;
+        if editor.remote_editor().is_some()
+            && (self.clipboard.policy.problem.is_some()
+                || self.clipboard.policy.remote_editor
+                    != crate::clipboard_policy::RemoteEditorPolicy::Allow)
+        {
+            return Err("Managed policy blocks editing this remote file.");
+        }
+        let task = editor
+            .insert_snippet(resolved)?
+            .map(move |message| Message::Editor(id, message));
+        Ok(window::gain_focus(id).chain(task))
+    }
+
+    fn record_snippet_use(
+        &mut self,
+        owner: window::Id,
+        path: std::path::PathBuf,
+        snippet: snippets::SnippetId,
+    ) {
+        match snippets::Library::record_use(path, snippet) {
+            Ok(Some(library)) => {
+                for surface in self.snippets.values_mut() {
+                    surface.window.refresh_usage(library.clone());
+                }
+            }
+            Ok(None) => {}
+            Err(error) => self.notice(owner, format!("Could not save snippet usage ({error}).")),
+        }
+    }
+
     fn snippet_library_changed(&mut self, id: window::Id) {
         let Some(surface) = self.snippets.get_mut(&id) else {
             return;
@@ -1022,6 +1405,18 @@ impl Workspace {
     ) -> Option<Task<Message>> {
         use iced::keyboard::{Key, key::Named};
         let surface = self.focused_snippet_surface(id)?;
+        if (modifiers.command() || modifiers.control()) && !modifiers.alt() {
+            let zoom = match key {
+                Key::Character(value) if matches!(value.as_str(), "+" | "=") => Some(true),
+                Key::Character(value) if value.as_str() == "-" => Some(false),
+                _ => None,
+            };
+            if let Some(increase) = zoom
+                && let Some(task) = self.snippet_ai_zoom(surface, increase)
+            {
+                return Some(task);
+            }
+        }
         let message = if modifiers.control() && !modifiers.alt() && *key == Key::Named(Named::Tab) {
             snippet_window::Message::CycleTab(modifiers.shift())
         } else if modifiers.command() && !modifiers.alt() && !modifiers.shift() {
@@ -1233,6 +1628,118 @@ fn file_task<T: Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snippet_insertion_stays_bound_to_the_editor_selected_before_variable_review() {
+        let profile = snippets::tests::Profile::new();
+        let mut library = snippets::Library::open(profile.path()).unwrap();
+        library
+            .save_variable(
+                None,
+                snippets::Variable {
+                    name: "value".into(),
+                    value: String::new(),
+                },
+            )
+            .unwrap();
+        let snippet = library
+            .save(
+                None,
+                snippets::Input {
+                    name: "Insertion".into(),
+                    language: "plain".into(),
+                    category: String::new(),
+                    content: "${value}${cursor}!".into(),
+                },
+            )
+            .unwrap();
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let (other_owner, _) = workspace.open_window(false);
+        let _ = workspace.open_native_editor(owner, None);
+        let chosen = workspace
+            .snippet_editor_owners
+            .iter()
+            .find(|(_, (root, _))| *root == owner)
+            .map(|(&id, _)| id)
+            .unwrap();
+        let _ = workspace.open_native_editor(other_owner, None);
+        let (manager, _) = workspace.install_snippet_surface(
+            owner,
+            SnippetWindow::open(profile.path()).unwrap(),
+            false,
+        );
+        let _ =
+            workspace.update_snippets(manager, snippet_window::Message::InsertInEditor(snippet));
+        let _ = workspace.open_native_editor(owner, None);
+        use snippet_window::copy::Message as CopyMessage;
+        let _ = workspace.update_snippets(
+            manager,
+            snippet_window::Message::Copy(CopyMessage::Enter(
+                1,
+                0,
+                zeroize::Zeroizing::new("entered".into()),
+            )),
+        );
+        let _ = workspace.update_snippets(
+            manager,
+            snippet_window::Message::Copy(CopyMessage::Confirm(1)),
+        );
+        assert!(workspace.editors[&chosen].needs_close_decision());
+        assert!(
+            workspace
+                .editors
+                .iter()
+                .filter(|(id, _)| **id != chosen)
+                .all(|(_, editor)| !editor.needs_close_decision())
+        );
+        library.reload().unwrap();
+        assert_eq!(library.get(snippet).unwrap().usage_count(), 1);
+    }
+
+    #[test]
+    fn resolved_copy_records_usage_only_when_clipboard_writes_are_allowed() {
+        let profile = snippets::tests::Profile::new();
+        let mut library = snippets::Library::open(profile.path()).unwrap();
+        let snippet = library
+            .save(
+                None,
+                snippets::Input {
+                    name: "Usage fixture".into(),
+                    language: "plain".into(),
+                    category: String::new(),
+                    content: "resolved copy".into(),
+                },
+            )
+            .unwrap();
+        let mut workspace = Workspace::default();
+        workspace.clipboard.policy.internal = true;
+        let (owner, _) = workspace.open_window(false);
+        let (manager, _) = workspace.install_snippet_surface(
+            owner,
+            SnippetWindow::open(profile.path()).unwrap(),
+            false,
+        );
+        let copy = || snippet_window::Message::Copy(snippet_window::copy::Message::Begin);
+        workspace.clipboard.policy.write_allowed = false;
+        let _ = workspace.update_snippets(manager, copy());
+        library.reload().unwrap();
+        assert_eq!(library.get(snippet).unwrap().usage_count(), 0);
+
+        workspace.clipboard.policy.write_allowed = true;
+        let _ = workspace.update_snippets(manager, copy());
+        library.reload().unwrap();
+        assert_eq!(library.get(snippet).unwrap().usage_count(), 1);
+        assert_eq!(
+            workspace.snippets[&manager]
+                .window
+                .latest_library()
+                .get(snippet)
+                .unwrap()
+                .usage_count(),
+            1
+        );
+    }
 
     #[test]
     fn closing_the_manager_preserves_the_last_saved_editor_session() {

@@ -460,6 +460,7 @@ fn lm_studio_reasoning_rechecks_review_after_a_metadata_lookup() {
         "review-fixture",
         ProfileOptions {
             reasoning_effort: Some("low".into()),
+            timeout: Some(Duration::ZERO),
             ..ProfileOptions::default()
         },
     )
@@ -592,6 +593,66 @@ fn malformed_openai_choices_keep_reported_usage_and_remain_invalid() {
         );
     }
     assert_eq!(server.join().unwrap().len(), malformed.len());
+}
+
+#[test]
+fn unlimited_http_profile_keeps_caller_deadlines_and_cancellation() {
+    let (server, profile) = listener();
+    let default_client = Client::new(profile);
+    let config = default_client
+        .transport(None)
+        .unwrap()
+        .connection
+        .agent
+        .config();
+    assert_eq!(config.timeouts().global, Some(DEFAULT_TIMEOUT));
+    let profile = Profile::configured(
+        &server.local_addr().unwrap().to_string(),
+        "fixture:local",
+        ProfileOptions {
+            timeout: Some(Duration::ZERO),
+            ..ProfileOptions::default()
+        },
+    )
+    .unwrap();
+    let (client, cancel) = Client::new_cancellable(profile);
+    let config = client.transport(None).unwrap().connection.agent.config();
+    assert_eq!(config.timeouts().global, None);
+    assert_eq!(config.timeouts().connect, Some(Duration::from_secs(3)));
+
+    let worker = thread::spawn(move || {
+        let mut cancel = Some(cancel);
+        for request_index in 0..2 {
+            let mut stream = accept(&server);
+            let _ = request(&mut stream);
+            if request_index == 1 {
+                drop(cancel.take());
+            }
+            match stream.read(&mut [0_u8; 1]) {
+                Ok(0) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                    ) => {}
+                result => panic!("expected a closed request socket: {result:?}"),
+            }
+        }
+    });
+    assert!(matches!(
+        client.complete_before(
+            "fixture",
+            "bounded",
+            false,
+            Instant::now() + Duration::from_secs(1)
+        ),
+        Err(Error::TimedOut)
+    ));
+    assert!(matches!(
+        client.complete("fixture", "cancelled"),
+        Err(Error::Cancelled)
+    ));
+    worker.join().unwrap();
 }
 
 #[test]

@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::terminal_theme::{Appearance, CursorStyle, Rgb};
 
+pub(crate) mod editor;
 mod mother;
 mod retro;
 mod signal;

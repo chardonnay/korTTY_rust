@@ -692,15 +692,15 @@ impl Workspace {
             return Err("Agent command execution is disabled in AI Manager.".into());
         }
         if profile.server_default.is_some()
-            && (run.binding.private()
-                || run.binding.saved().is_some()
-                || run.swarm
-                || !matches!(run.mode, Mode::Ask | Mode::Run))
+            && (run.binding.private() || run.binding.saved().is_some() || run.swarm)
         {
-            return Err("Server-selected agent profiles require a standalone, non-private terminal Ask or Run session.".into());
+            return Err("Server-selected agent profiles require a standalone, non-private terminal session.".into());
         }
+        let planning_https = run.mode == Mode::Plan
+            && profile.server_default.is_some()
+            && profile.reviewed_https.is_some();
         if profile.is_reviewed_outbound()
-            && (run.binding.private() || !matches!(run.mode, Mode::Ask | Mode::Run))
+            && (run.binding.private() || (run.mode == Mode::Plan && !planning_https))
         {
             return Err(
                 "Reviewed HTTPS and CLI agent profiles require a non-private Ask or Run session."
@@ -712,7 +712,7 @@ impl Workspace {
         {
             return Err("Managed policy blocks the configured CLI.".into());
         }
-        let (mut transport, limit) = profile.transport(&config)?;
+        let (mut transport, limit) = profile.transport_for_mode(&config, run.mode)?;
         if run.binding.private() {
             transport = transport.without_usage_account();
         }

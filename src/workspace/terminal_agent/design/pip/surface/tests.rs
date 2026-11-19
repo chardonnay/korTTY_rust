@@ -14,6 +14,89 @@ enum Message {
     Terminal,
 }
 
+#[test]
+fn floating_panel_paints_over_terminal_canvas_batches() {
+    use iced::Color;
+    use iced::advanced::graphics::Viewport;
+    use iced::widget::canvas;
+
+    struct TerminalCanvas;
+    impl canvas::Program<Message> for TerminalCanvas {
+        type State = ();
+
+        fn draw(
+            &self,
+            _: &(),
+            renderer: &Renderer,
+            _: &Theme,
+            bounds: Rectangle,
+            _: mouse::Cursor,
+        ) -> Vec<canvas::Geometry> {
+            let mut frame = canvas::Frame::new(renderer, bounds.size());
+            frame.fill_rectangle(Point::ORIGIN, bounds.size(), Color::from_rgb8(255, 0, 255));
+            vec![frame.into_geometry()]
+        }
+    }
+
+    let terminal = canvas(TerminalCanvas)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into();
+    let panel = container(text(""))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|_| container::Style {
+            background: Some(Color::from_rgb8(0, 192, 0).into()),
+            ..container::Style::default()
+        })
+        .into();
+    let mut surface = view(
+        terminal,
+        panel,
+        window::Id::unique(),
+        Corner::TopLeft,
+        Size::new(80.0, 64.0),
+        Options {
+            draggable: true,
+            reduced_motion: true,
+        },
+        Message::Snap,
+    );
+    let viewport = Viewport::with_physical_size(Size::new(220, 142), 1.0);
+    let size = viewport.logical_size();
+    let bounds = Rectangle::with_size(size);
+    let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
+    let mut tree = Tree::new(surface.as_widget());
+    let layout =
+        surface
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &layout::Limits::new(size, size));
+    surface.as_widget().draw(
+        &tree,
+        &mut renderer,
+        &Theme::Dark,
+        &renderer::Style::default(),
+        Layout::new(&layout),
+        mouse::Cursor::Unavailable,
+        &bounds,
+    );
+    let mut pixels = tiny_skia::Pixmap::new(220, 142).unwrap();
+    let mut mask = tiny_skia::Mask::new(220, 142).unwrap();
+    renderer.draw(
+        &mut pixels.as_mut(),
+        &mut mask,
+        &viewport,
+        &[bounds],
+        Color::BLACK,
+    );
+    let rgb = |x, y| {
+        let pixel = pixels.pixel(x, y).unwrap();
+        [pixel.red(), pixel.green(), pixel.blue()]
+    };
+    assert_eq!(rgb(3, 3), [255, 0, 255]);
+    assert_eq!(rgb(30, 35), [0, 192, 0]);
+}
+
 fn panel() -> Element<'static, Message> {
     container(column![
         row![

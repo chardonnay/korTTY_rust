@@ -1849,7 +1849,8 @@ mod tests {
         let saved = store.get(reference.id).unwrap().clone();
         store.save_in_group(saved.clone(), Some(&group)).unwrap();
         action.target_groups = Some(TargetGroups {
-            groups: vec![group.clone()],
+            group_order: Vec::new(),
+            groups: vec![group.clone().into()],
             explicit: vec![],
         });
         assert!(require_agent_scope(action, &context.connection_store).is_ok());

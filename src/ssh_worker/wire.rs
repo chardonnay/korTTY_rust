@@ -471,6 +471,7 @@ pub enum Open {
     FolderUsage(Vec<Vec<u8>>),
     AccountNames(DisplayQuery),
     DraftReplace,
+    WindowsDraftReplace,
 }
 
 impl std::fmt::Debug for Open {
@@ -489,6 +490,7 @@ impl std::fmt::Debug for Open {
             Self::FolderUsage(..) => "FolderUsage",
             Self::AccountNames(..) => "AccountNames",
             Self::DraftReplace => "DraftReplace",
+            Self::WindowsDraftReplace => "WindowsDraftReplace",
         })
     }
 }
@@ -676,6 +678,7 @@ impl Frame {
                         }
                     }
                     Open::DraftReplace => out.write_all(&[11])?,
+                    Open::WindowsDraftReplace => out.write_all(&[13])?,
                     Open::SudoPty { nonce } => {
                         out.write_all(&[12])?;
                         out.write_all(&nonce)?;
@@ -760,6 +763,7 @@ impl Frame {
                     9 => Open::FolderUsage(recv_folder_usage(input)?),
                     10 => Open::AccountNames(recv_account_names(input)?),
                     11 => Open::DraftReplace,
+                    13 => Open::WindowsDraftReplace,
                     12 => {
                         let mut nonce = [0; 16];
                         input.read_exact(&mut nonce)?;
@@ -876,6 +880,17 @@ mod tests {
         assert!(matches!(
             Frame::recv(&mut input),
             Ok(Frame::Open(3, Open::DraftReplace))
+        ));
+        assert!(input.is_empty());
+        let mut bytes = Vec::new();
+        Frame::Open(3, Open::WindowsDraftReplace)
+            .send(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, [5, 0, 0, 0, 3, 13]);
+        let mut input = bytes.as_slice();
+        assert!(matches!(
+            Frame::recv(&mut input),
+            Ok(Frame::Open(3, Open::WindowsDraftReplace))
         ));
         assert!(input.is_empty());
     }

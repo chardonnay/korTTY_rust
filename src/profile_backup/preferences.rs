@@ -157,6 +157,53 @@ pub(crate) fn load(root: &Path) -> io::Result<(Preferences, Progress)> {
     Ok((read_preferences(&directory)?, read_progress(&directory)?))
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct JavaDefaults {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) retention: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) interval: Option<Interval>,
+}
+
+impl JavaDefaults {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.retention.is_none() && self.interval.is_none()
+    }
+
+    pub(crate) fn valid(self) -> bool {
+        self.retention.is_none_or(|value| value <= MAX_RETENTION)
+    }
+
+    pub(crate) fn adopt(self, root: &Path) -> io::Result<()> {
+        if self.is_empty() || Directory::open(root, false)?.has_entry(SETTINGS)? {
+            return Ok(());
+        }
+        let operation = Operation::acquire(root)?;
+        let directory = &operation.directory;
+        if directory.has_entry(SETTINGS)? {
+            return Ok(());
+        }
+        let mut settings = Preferences::default();
+        if let Some(retention) = self.retention {
+            settings.retention = retention;
+        }
+        if let Some(interval) = self.interval {
+            settings.interval = interval;
+        }
+        settings.validate()?;
+        let bytes = serde_json::to_vec_pretty(&SettingsDocument {
+            version: VERSION,
+            settings,
+        })
+        .map_err(invalid)?;
+        match directory.publish_copy(SETTINGS, &bytes) {
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+            result => result.and_then(|()| directory.sync()),
+        }
+    }
+}
+
 pub(crate) fn save(root: &Path, current: &Preferences, draft: Preferences) -> io::Result<bool> {
     draft.validate()?;
     let operation = Operation::acquire(root)?;

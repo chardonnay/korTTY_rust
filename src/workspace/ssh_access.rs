@@ -37,7 +37,7 @@ mod password_command;
 mod reconnect;
 mod registered_keys;
 mod reopen;
-mod teamwork_auth;
+pub(super) mod teamwork_auth;
 use control_create::ControlLaunch;
 pub(super) use control_create::CreateOptions;
 use reconnect::ReconnectLaunch;
@@ -202,6 +202,9 @@ pub(super) struct PendingSsh {
     key_snapshots: KeySnapshots,
     group: VecDeque<u64>,
     font: Option<u8>,
+    quick_effect: Option<Option<Selection>>,
+    quick_ai: Option<crate::connection_store::AiAssignments>,
+    quick_appearance: Option<crate::connection_store::TerminalAppearance>,
     duplicate_tab: Option<u64>,
     stage: Stage,
 }
@@ -397,6 +400,9 @@ pub(super) struct QuickLaunch {
     pub(super) incognito: bool,
     pub(super) group: VecDeque<u64>,
     pub(super) font: Option<u8>,
+    pub(super) effect: Option<Option<Selection>>,
+    pub(super) ai: Option<crate::connection_store::AiAssignments>,
+    pub(super) appearance: Option<crate::connection_store::TerminalAppearance>,
     pub(super) split: Option<SplitTarget>,
 }
 
@@ -925,6 +931,9 @@ impl Workspace {
                 key_snapshots: Default::default(),
                 group: VecDeque::new(),
                 font: None,
+                quick_effect: None,
+                quick_ai: None,
+                quick_appearance: None,
                 duplicate_tab: None,
                 stage: Stage::Form(Box::new(form)),
             });
@@ -1006,6 +1015,9 @@ impl Workspace {
             key_snapshots: Default::default(),
             group: VecDeque::new(),
             font,
+            quick_effect: None,
+            quick_ai: None,
+            quick_appearance: None,
             duplicate_tab: Some(source_tab),
             stage: Stage::Form(Box::new(form)),
         });
@@ -1120,6 +1132,9 @@ impl Workspace {
             key_snapshots: Default::default(),
             group: VecDeque::new(),
             font: None,
+            quick_effect: None,
+            quick_ai: None,
+            quick_appearance: None,
             duplicate_tab: None,
             stage: Stage::Form(Box::new(form)),
         });
@@ -1276,6 +1291,9 @@ impl Workspace {
             key_snapshots: Default::default(),
             group: VecDeque::new(),
             font: None,
+            quick_effect: None,
+            quick_ai: None,
+            quick_appearance: None,
             duplicate_tab: None,
             stage: Stage::Form(Box::new(form)),
         });
@@ -1372,6 +1390,9 @@ impl Workspace {
             incognito,
             group,
             font,
+            effect,
+            ai,
+            appearance,
             split,
         } = launch;
         let token = reopen.as_ref().map(|reopen| reopen.token);
@@ -1434,6 +1455,9 @@ impl Workspace {
             key_snapshots: Default::default(),
             group,
             font,
+            quick_effect: effect,
+            quick_ai: ai,
+            quick_appearance: appearance,
             duplicate_tab: None,
             stage: Stage::Form(Box::new(form)),
         });
@@ -1513,6 +1537,9 @@ impl Workspace {
             key_snapshots: Default::default(),
             group: VecDeque::new(),
             font: None,
+            quick_effect: None,
+            quick_ai: None,
+            quick_appearance: None,
             duplicate_tab: None,
             stage: Stage::Form(Box::new(form)),
         };
@@ -1927,6 +1954,8 @@ impl Workspace {
                 || pending.reopen.is_some()
             {
                 None
+            } else if let Some(effect) = pending.quick_effect {
+                effect
             } else {
                 current
                     .as_ref()
@@ -2079,6 +2108,9 @@ impl Workspace {
             sftp,
             incognito,
             font,
+            quick_effect,
+            quick_ai,
+            quick_appearance,
             duplicate_tab,
             reopen,
             reconnect,
@@ -2121,6 +2153,9 @@ impl Workspace {
         });
         let saved_journal = *journal_config;
         let split = *split;
+        let inherit_effect = quick_effect.is_none();
+        let quick_ai = quick_ai.clone();
+        let quick_appearance = quick_appearance.clone();
         let reopen = reopen.as_ref().map(|reopen| reopen.token);
         let reconnect_source = reconnect.as_ref().map(|reconnect| reconnect.target.source);
         let environment_credential = environment_credential.clone();
@@ -2220,6 +2255,8 @@ impl Workspace {
                     .tunnel_openers()
                     .map(|(direct, remote)| super::tunnel_access::Forwarding::new(direct, remote));
                 let overrides = self.saved_terminal_preferences.terminal(&target);
+                let quick_appearance =
+                    quick_appearance.map(|style| style.display_overrides(overrides));
                 let saved_strict = overrides
                     .and_then(|settings| settings.strict_terminal_mode)
                     .or_else(|| {
@@ -2238,7 +2275,7 @@ impl Workspace {
                     })
                     .unwrap_or_default();
                 let appearance = project_terminal_appearance.as_deref().map_or_else(
-                    || self.terminal_base_appearance(overrides),
+                    || self.terminal_base_appearance(quick_appearance.as_ref().or(overrides)),
                     |project| self.project_base_appearance(project),
                 );
                 let appearance = terminal_effect
@@ -2291,6 +2328,8 @@ impl Workspace {
                 .then(|| target.clone());
                 if let Some(pane) = self.sessions.get_mut(&session_id) {
                     pane.ssh = Some(target);
+                    pane.quick_ai = quick_ai;
+                    pane.quick_appearance = quick_appearance;
                     pane.project_initial_size = project_initial_size;
                     pane.project_terminal_appearance = project_terminal_appearance;
                     pane.journal_config = journal_config;
@@ -2365,7 +2404,7 @@ impl Workspace {
                         self.stop_session(session_id);
                     }
                 } else if let Some(target) = split {
-                    self.attach_split_connection(window, target, session_id);
+                    self.attach_split_connection(window, target, session_id, inherit_effect);
                 } else {
                     self.add_configured_tab(
                         window,

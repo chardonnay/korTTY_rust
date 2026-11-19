@@ -1,6 +1,6 @@
 //! Java d19: adopt the history without taking space from the terminal or its status.
 
-use iced::widget::{button, column, container, row, space, text, tooltip};
+use iced::widget::{button, column, container, row, text, tooltip};
 use iced::{Element, Length, Size, Task, window};
 
 use crate::session::SessionId;
@@ -30,7 +30,7 @@ pub(crate) enum Message {
 pub(in crate::workspace::terminal_agent) struct Panel {
     pub(in crate::workspace::terminal_agent) detached: Option<window::Id>,
     corner: Corner,
-    folded: bool,
+    pub(super) folded: bool,
     hidden: bool,
 }
 
@@ -47,17 +47,57 @@ fn action(message: Message) -> AgentMessage {
     AgentMessage::Pip(message)
 }
 
-fn size(run: &Run) -> Size {
-    let adopted = !matches!(run.design.history, History::Transcript | History::StepCards);
+fn panel_size(history: History, folded: bool) -> Size {
+    let adopted = !matches!(history, History::Transcript | History::StepCards);
     Size::new(
         if adopted { 460.0 } else { 300.0 },
-        if run.presentation.pip.folded {
+        if folded {
             36.0
         } else if adopted {
             320.0
         } else {
             240.0
         },
+    )
+}
+
+fn size(run: &Run) -> Size {
+    panel_size(run.design.history, run.presentation.pip.folded)
+}
+
+fn title(panel: &Panel, can_detach: bool) -> iced::widget::Row<'static, AgentMessage> {
+    row![
+        container(text("⠿ Agent history").size(13)).width(Length::Fill),
+        can_detach.then(|| {
+            button(if panel.detached.is_some() {
+                "Attach"
+            } else {
+                "Detach"
+            })
+            .on_press(action(Message::Detach))
+            .padding([3, 5])
+        }),
+        button(if panel.folded { "+" } else { "−" })
+            .on_press(action(Message::Fold))
+            .padding([3, 7]),
+        button("×").on_press(action(Message::Hide)).padding([3, 7]),
+    ]
+    .spacing(4)
+    .align_y(iced::Alignment::Center)
+    .height(32)
+}
+
+fn panel_view<'a>(
+    content: iced::widget::Column<'a, AgentMessage>,
+    palette: Option<Palette>,
+) -> Element<'a, AgentMessage> {
+    palette::panel(
+        palette,
+        container(content)
+            .id("agent-picture-in-picture")
+            .padding(2)
+            .width(Length::Fill)
+            .height(Length::Fill),
     )
 }
 
@@ -68,24 +108,7 @@ fn body<'a>(
     palette: Option<Palette>,
 ) -> Element<'a, AgentMessage> {
     let panel = &run.presentation.pip;
-    let title = row![
-        container(text("⠿ Agent history").size(13)).width(Length::Fill),
-        button(if panel.detached.is_some() {
-            "Attach"
-        } else {
-            "Detach"
-        })
-        .on_press(action(Message::Detach))
-        .padding([3, 5]),
-        button(if panel.folded { "+" } else { "−" })
-            .on_press(action(Message::Fold))
-            .padding([3, 7]),
-        button("×").on_press(action(Message::Hide)).padding([3, 7]),
-    ]
-    .spacing(4)
-    .align_y(iced::Alignment::Center)
-    .height(32);
-    let mut content = column![title].spacing(4);
+    let mut content = column![title(panel, true)].spacing(4);
     if !panel.folded {
         let source = run
             .binding
@@ -126,14 +149,7 @@ fn body<'a>(
             .push(history::view(run, palette))
             .push(super::controls(run));
     }
-    palette::panel(
-        palette,
-        container(content)
-            .id("agent-picture-in-picture")
-            .padding(2)
-            .width(Length::Fill)
-            .height(Length::Fill),
-    )
+    panel_view(content, palette)
 }
 
 pub(super) fn decorate<'a>(
@@ -423,20 +439,53 @@ impl Workspace {
     }
 }
 
-/// A static preview uses the same floating surface and dimensions, without actions.
-pub(in crate::workspace) fn preview<'a, M: 'a>(
-    terminal: Element<'a, M>,
-    history: Element<'a, M>,
-) -> Element<'a, M> {
-    surface::preview(
+pub(super) fn sample<'a>(
+    terminal: Element<'a, Desktop>,
+    content: Element<'a, AgentMessage>,
+    history: History,
+    panel: &Panel,
+    id: window::Id,
+    reduced_motion: bool,
+    map: impl Fn(AgentMessage) -> Desktop + Copy + 'a,
+) -> Element<'a, Desktop> {
+    let (view, size) = if panel.hidden {
+        (
+            button("Show agent history")
+                .on_press(action(Message::Show))
+                .into(),
+            Size::new(180.0, 36.0),
+        )
+    } else {
+        (
+            panel_view(
+                column![title(panel, false), (!panel.folded).then_some(content)].spacing(4),
+                None,
+            ),
+            panel_size(history, panel.folded),
+        )
+    };
+    surface::view(
         terminal,
-        container(column![
-            text("Agent history").size(13),
-            history,
-            space::vertical()
-        ])
-        .padding(6)
-        .style(container::bordered_box)
-        .into(),
+        view.map(map),
+        id,
+        panel.corner,
+        size,
+        surface::Options {
+            draggable: !panel.hidden,
+            reduced_motion,
+        },
+        move |corner| map(action(Message::Corner(corner))),
     )
+}
+
+impl Panel {
+    pub(super) fn update_sample(&mut self, message: Message) {
+        match message {
+            Message::Corner(corner) => self.corner = corner,
+            Message::Fold => self.folded = !self.folded,
+            Message::Hide => self.hidden = true,
+            Message::Show => self.hidden = false,
+            Message::Detach | Message::Select(_) => {}
+        }
+    }
 }

@@ -345,12 +345,18 @@ impl Opener {
 
     pub(crate) fn open_draft_replace(
         &self,
+        windows: bool,
         cancelled: impl Fn() -> bool,
     ) -> Result<Channel, ConnectError> {
         if self.verified_host_key().is_none() || self.is_closed() {
             return Err(closed().into());
         }
-        self.open_channel(Open::DraftReplace, cancelled)
+        let request = if windows {
+            Open::WindowsDraftReplace
+        } else {
+            Open::DraftReplace
+        };
+        self.open_channel(request, cancelled)
     }
 
     #[cfg(test)]
@@ -483,6 +489,7 @@ impl Opener {
                 | Open::FileExec
                 | Open::ArchiveExtract
                 | Open::DraftReplace
+                | Open::WindowsDraftReplace
                 | Open::FolderUsage(..)
         ) {
             Duration::from_secs(31)

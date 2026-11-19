@@ -1,14 +1,12 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
-use kortty_ssh::{Authentication, Endpoint, SshTarget};
+use kortty_ssh::{Authentication, Endpoint, SshTarget, TrustStore};
 use kortty_vault::Secret;
 
 use crate::clipboard_policy::ServerAccess;
-#[cfg(test)]
-use crate::connection_store::Auth;
-use crate::connection_store::{ActiveAuth, Connection, SavedLogin, Store};
-use crate::scheduler_window::{ConnectionRef, SshCommand};
+use crate::connection_store::{ActiveAuth, Auth, Connection, SavedLogin, Store};
+use crate::scheduler_window::{ConnectionRef, SharedAuth, SshCommand};
 use crate::ssh_connection;
 use crate::ssh_dialog::{LoginTarget, Password};
 use crate::ssh_key_catalog::Catalog;
@@ -60,6 +58,7 @@ pub(crate) struct Credentials {
     jump: Option<Login>,
     server_access: ServerAccess,
     sudo_password: Option<Secret>,
+    shared_vault_revision: Option<Weak<()>>,
 }
 
 struct Login {
@@ -78,6 +77,10 @@ enum LoginAuth {
 }
 
 impl Credentials {
+    pub(super) fn shared_reference(&self) -> Option<&ConnectionRef> {
+        self.reference.shared_identity().map(|_| &self.reference)
+    }
+
     pub(super) fn take_sudo_password(&mut self) -> Option<Secret> {
         self.sudo_password.take()
     }
@@ -116,6 +119,15 @@ impl Credentials {
     }
 
     pub(super) fn into_route(self) -> Result<(SshTarget, Vec<SshTarget>), Failure> {
+        if self
+            .shared_vault_revision
+            .as_ref()
+            .is_some_and(|revision| revision.strong_count() == 0)
+        {
+            return Err(Failure::blocked(
+                "The vault changed or was locked after resolving Teamwork authentication.",
+            ));
+        }
         let target = self.target.endpoint()?;
         let jump = self.jump.as_ref().map(Login::endpoint).transpose()?;
         if jump
@@ -199,12 +211,57 @@ impl Credentials {
         recording: bool,
         keys: &mut KeyCatalog,
         server_access: &ServerAccess,
-        mut secret: impl FnMut(&str, Kind, &LoginTarget) -> Result<Secret, &'static str>,
+        secret: impl FnMut(&str, Kind, &LoginTarget) -> Result<Secret, &'static str>,
     ) -> Result<Self, &'static str> {
         let reference = ConnectionRef::from(current);
         if reviewed != Some(&reference) {
             return Err("The saved SSH route changed. Choose the connection again in this job.");
         }
+        Self::resolve_current(reference, current, recording, keys, server_access, secret)
+    }
+
+    pub(crate) fn bind_shared_vault_revision(&mut self, revision: Weak<()>) {
+        self.shared_vault_revision = Some(revision);
+    }
+
+    pub(crate) fn resolve_shared(
+        reference: &ConnectionRef,
+        entry: &crate::connection_store::teamwork::Entry,
+        store: &Store,
+        recording: bool,
+        server_access: &ServerAccess,
+        secret: impl FnMut(&str, Kind, &LoginTarget) -> Result<Secret, &'static str>,
+    ) -> Result<Self, &'static str> {
+        reference.require_shared_route(entry)?;
+        let mut current = entry.connection.clone();
+        current.login.endpoint = reference.target.clone();
+        current.jump = reference.shared_jump_login(entry, store)?.cloned();
+        current.login.auth = match reference.shared_auth() {
+            Some(SharedAuth::Password { credential }) => Auth::VaultPassword(credential.clone()),
+            Some(SharedAuth::Key { id, .. }) => Auth::StoredKey(*id),
+            None => {
+                return Err("Local authentication for this Teamwork connection is unavailable.");
+            }
+        };
+        current.login.keyboard_interactive = false;
+        Self::resolve_current(
+            reference.clone(),
+            &current,
+            recording,
+            &mut None,
+            server_access,
+            secret,
+        )
+    }
+
+    fn resolve_current(
+        reference: ConnectionRef,
+        current: &Connection,
+        recording: bool,
+        keys: &mut KeyCatalog,
+        server_access: &ServerAccess,
+        mut secret: impl FnMut(&str, Kind, &LoginTarget) -> Result<Secret, &'static str>,
+    ) -> Result<Self, &'static str> {
         if !reference_allowed(&reference, server_access) {
             return Err(SERVER_BLOCKED);
         }
@@ -266,6 +323,7 @@ impl Credentials {
             jump: current.jump.as_ref().map(resolve).transpose()?,
             server_access: server_access.clone(),
             sudo_password: None,
+            shared_vault_revision: None,
         })
     }
 }
@@ -311,6 +369,17 @@ pub(super) fn reference_allowed(reference: &ConnectionRef, server_access: &Serve
     server_access
         .first_blocked(route.map(|login| (login.host.as_str(), login.port)))
         .is_none()
+}
+
+pub(super) fn trust_for_action(
+    action: &SshCommand,
+    trust: TrustStore,
+) -> Result<TrustStore, Failure> {
+    if let Some(reference) = &action.connection {
+        reference.strict_trust(trust).map_err(Failure::blocked)
+    } else {
+        Ok(trust)
+    }
 }
 
 pub(super) fn check_action_route(

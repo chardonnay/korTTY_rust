@@ -207,6 +207,14 @@ pub(in crate::workspace) fn action(id: &str) -> Option<Action> {
 }
 
 fn parse_chord(raw: &str) -> Option<Chord> {
+    parse_chord_with(raw, false)
+}
+
+pub(super) fn parse_completion_chord(raw: &str) -> Option<Chord> {
+    parse_chord_with(raw, true)
+}
+
+fn parse_chord_with(raw: &str, control_is_shortcut: bool) -> Option<Chord> {
     if raw.len() > 128 {
         return None;
     }
@@ -216,6 +224,7 @@ fn parse_chord(raw: &str) -> Option<Chord> {
         let modifier = match part.trim().to_ascii_lowercase().as_str() {
             "" => continue,
             "shortcut" | "mod" | "ctrlcmd" | "cmd" | "command" | "meta" => &mut shortcut,
+            "ctrl" | "control" if control_is_shortcut => &mut shortcut,
             "ctrl" | "control" => &mut control,
             "shift" => &mut shift,
             "alt" | "option" | "opt" => &mut alt,

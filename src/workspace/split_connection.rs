@@ -17,6 +17,7 @@ pub(super) struct SplitTarget {
 pub(super) struct PendingSplitConnection {
     owner: window::Id,
     target: SplitTarget,
+    inherit_effect: bool,
 }
 
 impl Workspace {
@@ -167,6 +168,16 @@ impl Workspace {
         target: SplitTarget,
         session: SessionId,
     ) {
+        self.start_split_worker_with_effect(owner, target, session, true);
+    }
+
+    pub(super) fn start_split_worker_with_effect(
+        &mut self,
+        owner: window::Id,
+        target: SplitTarget,
+        session: SessionId,
+        inherit_effect: bool,
+    ) {
         if self.split_target_pane(owner, target).is_none()
             || self.windows[&owner].pending_split_connection.is_some()
         {
@@ -176,7 +187,11 @@ impl Workspace {
         if let Some(pane) = self.sessions.get_mut(&session)
             && let Some(window) = self.windows.get_mut(&owner)
         {
-            pane.pending_split_connection = Some(PendingSplitConnection { owner, target });
+            pane.pending_split_connection = Some(PendingSplitConnection {
+                owner,
+                target,
+                inherit_effect,
+            });
             window.pending_split_connection = Some(session);
             window.notice = None;
         }
@@ -232,7 +247,12 @@ impl Workspace {
         let Some(pane) = self.sessions.get(&session) else {
             return;
         };
-        let Some(PendingSplitConnection { owner, target }) = pane.pending_split_connection else {
+        let Some(PendingSplitConnection {
+            owner,
+            target,
+            inherit_effect,
+        }) = pane.pending_split_connection
+        else {
             return;
         };
         let valid = self.split_target_pane(owner, target).is_some();
@@ -252,7 +272,7 @@ impl Workspace {
             self.stop_session(session);
             self.notice(owner, failure);
         } else {
-            self.attach_split_connection(owner, target, session);
+            self.attach_split_connection(owner, target, session, inherit_effect);
         }
     }
 
@@ -261,6 +281,7 @@ impl Workspace {
         owner: window::Id,
         target: SplitTarget,
         session: SessionId,
+        inherit_effect: bool,
     ) {
         let attached = self.split_target_pane(owner, target).and_then(|source| {
             let tab = self.active_tab_mut(owner)?;
@@ -270,7 +291,9 @@ impl Workspace {
             Some(())
         });
         if attached.is_some() {
-            self.inherit_terminal_effect(target.source, session);
+            if inherit_effect {
+                self.inherit_terminal_effect(target.source, session);
+            }
             self.session_restore.changed(false);
             self.refresh_connection_counts();
         } else {

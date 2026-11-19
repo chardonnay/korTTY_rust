@@ -419,6 +419,7 @@ fn live_swarm_reviews_exact_masked_requests_and_scopes_pins_to_each_member() {
                 working_directory: None,
                 shell_integration: false,
                 emulation: "xterm-256color".into(),
+                terminal_effect: None,
                 terminal: TerminalOverrides {
                     ai_skills: vec![skill],
                     ..Default::default()

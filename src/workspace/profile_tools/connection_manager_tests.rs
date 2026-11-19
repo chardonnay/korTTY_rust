@@ -204,6 +204,7 @@ fn saved_local_profile_launches_from_manager_and_captures_only_a_private_referen
             working_directory: Some(scratch.0.clone()),
             shell_integration: false,
             emulation: crate::workspace::TerminalProfile::Xterm.term_name().into(),
+            terminal_effect: None,
             terminal: crate::connection_store::TerminalOverrides {
                 paste_line_delay_ms: Some(200),
                 strict_terminal_mode: Some(true),

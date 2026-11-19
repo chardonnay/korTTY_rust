@@ -13,11 +13,12 @@ use serde::{Deserialize, Serialize};
 use super::exchange::{escape_xml, xml_elements, xml_is};
 use super::folders;
 use super::{
-    Input, Library, MAX_LIBRARY_BYTES, MAX_SNIPPETS, MAX_TAGS, Metadata, Snippet, SnippetId,
-    invalid, profile,
+    Input, Library, LibraryStats, MAX_LIBRARY_BYTES, MAX_SNIPPETS, MAX_TAGS, Metadata, Snippet,
+    SnippetId, invalid, profile,
 };
 
 mod files;
+pub(crate) use files::snippet_is_executable;
 mod java_library;
 mod text_file;
 mod yaml;
@@ -52,6 +53,7 @@ pub(super) struct ImportedSnippet {
     pub(super) id: Option<SnippetId>,
     pub(super) input: Input,
     pub(super) metadata: Metadata,
+    pub(super) stats: LibraryStats,
     pub(super) history: Vec<super::history::Revision>,
 }
 
@@ -313,6 +315,8 @@ struct Portable {
     )]
     diagrams: Vec<diagrams::Saved>,
     #[serde(skip)]
+    stats: LibraryStats,
+    #[serde(skip)]
     history_max_size: Option<u8>,
     #[serde(skip)]
     history: Vec<super::history::Revision>,
@@ -415,11 +419,13 @@ impl Portable {
             tags: self.tags,
             diagrams: self.diagrams,
             history_max_size: self.history_max_size,
+            json_schema: None,
         };
         Ok(ImportedSnippet {
             id,
             input,
             metadata,
+            stats: self.stats,
             history: self.history,
         })
     }
@@ -440,6 +446,7 @@ impl From<&Snippet> for Portable {
             executable: metadata.executable,
             tags: metadata.tags.clone(),
             diagrams: metadata.diagrams.clone(),
+            stats: LibraryStats::default(),
             history_max_size: None,
             history: Vec::new(),
         }

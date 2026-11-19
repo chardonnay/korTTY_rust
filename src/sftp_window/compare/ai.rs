@@ -132,7 +132,8 @@ pub enum Event {
     Progress(u64, Arc<live::Preview>),
     ToggleReasoning(u64),
     Finished(u64, Result<Arc<Outcome>, String>),
-    Preview(DiffMessage),
+    SelectPair(u64, Pair),
+    Preview(u64, Pair, DiffMessage),
     OpenDraft(u64),
     OpenSnippet(u64),
     Refreshed(u64, Result<Arc<super::Review>, String>),
@@ -144,7 +145,7 @@ impl Event {
     pub(super) fn available_during_refresh(&self) -> bool {
         matches!(
             self,
-            Self::Preview(_) | Self::OpenDraft(_) | Self::OpenSnippet(_)
+            Self::SelectPair(..) | Self::Preview(..) | Self::OpenDraft(_) | Self::OpenSnippet(_)
         )
     }
 }
@@ -361,7 +362,7 @@ impl Review {
                     return Err("The comparison response exceeds the 48 KiB limit.".into());
                 }
                 let masked = authority.mask(&vault, &answer)?;
-                let [_, (label, right)] = diff.sources();
+                let [left, right] = diff.sources();
                 if mode == Mode::Draft && masked != answer.replace("\r\n", "\n").replace('\r', "\n")
                 {
                     return Err(
@@ -369,9 +370,16 @@ impl Review {
                         .into(),
                 );
                 }
-                let safe_label = authority.mask(&vault, label)?;
-                let safe_right = authority.mask(&vault, right)?;
-                Outcome::parse(mode, &masked, &safe_label, &safe_right, right).map(Arc::new)
+                Outcome::parse(mode, &masked, right.1, || {
+                    let mask = |(label, text): (&str, &str)| -> Result<_, String> {
+                        Ok((
+                            authority.mask(&vault, label)?,
+                            authority.mask(&vault, text)?,
+                        ))
+                    };
+                    Ok([mask(left)?, mask(right)?])
+                })
+                .map(Arc::new)
             })?;
         let events = updates
             .map(move |preview| Event::Progress(ticket, preview))
@@ -395,16 +403,54 @@ pub struct Outcome {
 
 struct Draft {
     content: Arc<str>,
-    preview: Option<Arc<Comparison>>,
+    comparisons: [Result<Arc<Comparison>, &'static str>; 3],
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum Pair {
+    Originals,
+    RightDraft,
+    LeftDraft,
+}
+
+impl Pair {
+    const ALL: [Self; 3] = [Self::Originals, Self::RightDraft, Self::LeftDraft];
+}
+
+impl fmt::Display for Pair {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Originals => "Left file ↔ Right file",
+            Self::RightDraft => "Right file ↔ New draft",
+            Self::LeftDraft => "Left file ↔ New draft",
+        })
+    }
+}
+
+struct DraftPreview {
+    pair: Pair,
+    views: [DiffView; 3],
+}
+
+impl DraftPreview {
+    fn new(draft: &Draft) -> Self {
+        Self {
+            pair: Pair::RightDraft,
+            views: draft.comparisons.clone().map(|comparison| {
+                let mut view = DiffView::default();
+                let _ = view.update(DiffMessage::Loaded(comparison));
+                view
+            }),
+        }
+    }
 }
 
 impl Outcome {
     fn parse(
         mode: Mode,
         answer: &str,
-        right_label: &str,
-        safe_right: &str,
         right: &str,
+        sources: impl FnOnce() -> Result<[(String, String); 2], String>,
     ) -> Result<Self, String> {
         if answer.trim().is_empty() {
             return Err("The AI profile returned an empty answer.".into());
@@ -412,19 +458,20 @@ impl Outcome {
         if mode == Mode::Draft
             && let Some((answer, content)) = complete_draft(answer)
         {
-            let content = with_right_endings(content, right);
-            let preview = Request::texts(
-                (right_label.to_owned(), safe_right.to_owned()),
-                ("New draft".into(), content.clone()),
-            )
-            .compare()
-            .ok()
-            .map(Arc::new);
+            let content: Arc<str> = with_right_endings(content, right).into();
+            let [left, right] = sources()?.map(|(label, text)| (label, Arc::<str>::from(text)));
+            let generated = ("New draft".into(), Arc::clone(&content));
+            let comparisons = [
+                [left.clone(), right.clone()],
+                [right, generated.clone()],
+                [left, generated],
+            ]
+            .map(|pair| Request::shared(pair).compare().map(Arc::new));
             return Ok(Self {
                 answer,
                 draft: Some(Draft {
-                    content: content.into(),
-                    preview,
+                    content,
+                    comparisons,
                 }),
             });
         }
@@ -447,7 +494,7 @@ enum Phase {
     Result {
         authority: Arc<Authority>,
         outcome: Arc<Outcome>,
-        preview: Option<Box<DiffView>>,
+        preview: Option<Box<DraftPreview>>,
         local: Box<local::State>,
         server: server::State,
     },
@@ -624,12 +671,7 @@ impl Panel {
                         let preview = outcome
                             .draft
                             .as_ref()
-                            .and_then(|draft| draft.preview.as_ref())
-                            .map(|diff| {
-                                let mut view = DiffView::default();
-                                let _ = view.update(DiffMessage::Loaded(Ok(Arc::clone(diff))));
-                                Box::new(view)
-                            });
+                            .map(|draft| Box::new(DraftPreview::new(draft)));
                         self.status = (self.mode == Mode::Draft && outcome.draft.is_none())
                             .then(|| "The reply contains no complete new file. Review the instructions and try again.".into());
                         self.phase = Phase::Result {
@@ -652,13 +694,26 @@ impl Panel {
                 self.phase = Phase::Configure;
                 self.status = running.then(|| "The AI request was cancelled.".into());
             }
-            Event::Preview(event) => {
+            Event::SelectPair(ticket, pair) if ticket == self.ticket => {
                 if let Phase::Result {
                     preview: Some(preview),
                     ..
                 } = &mut self.phase
                 {
-                    return Update::Task(preview.update(event).map(Event::Preview));
+                    preview.pair = pair;
+                }
+            }
+            Event::Preview(ticket, pair, event) if ticket == self.ticket => {
+                if let Phase::Result {
+                    preview: Some(preview),
+                    ..
+                } = &mut self.phase
+                {
+                    return Update::Task(
+                        preview.views[pair as usize]
+                            .update(event)
+                            .map(move |event| Event::Preview(ticket, pair, event)),
+                    );
                 }
             }
             Event::OpenDraft(ticket) if ticket == self.ticket => {
@@ -1000,7 +1055,17 @@ impl Panel {
                     );
                 }
                 if let Some(preview) = preview {
-                    body = body.push(preview.review_body().map(Event::Preview));
+                    let pair = preview.pair;
+                    let ticket = self.ticket;
+                    body = body
+                        .push(pick_list(Pair::ALL, Some(pair), move |pair| {
+                            Event::SelectPair(ticket, pair)
+                        }))
+                        .push(
+                            preview.views[pair as usize]
+                                .review_body()
+                                .map(move |event| Event::Preview(ticket, pair, event)),
+                        );
                 }
                 if outcome.draft.is_some() {
                     body = body.push(
@@ -1343,18 +1408,38 @@ mod tests {
     #[test]
     fn sftp_ai_draft_requires_a_complete_fence_and_keeps_the_right_line_endings() {
         let reply = "Explanation\n~~~txt\nshort\n~~~\n\n````ini\nport=1\nname=café\n````\nAfter";
-        let draft = Outcome::parse(Mode::Draft, reply, "Right", "x\ny", "x\r\ny").unwrap();
-        let content = draft.draft.unwrap().content;
-        assert_eq!(content.as_ref(), "port=1\r\nname=café");
-        assert!(draft.answer.contains("After"));
-        assert!(!draft.answer.contains("port=1"));
+        let outcome = Outcome::parse(Mode::Draft, reply, "x\r\ny", || {
+            Ok([
+                ("Left".into(), "left=[redacted]".into()),
+                ("Right".into(), "right=[redacted]".into()),
+            ])
+        })
+        .unwrap();
+        let draft = outcome.draft.unwrap();
+        assert_eq!(draft.content.as_ref(), "port=1\r\nname=café");
+        assert!(outcome.answer.contains("After"));
+        assert!(!outcome.answer.contains("port=1"));
+        let expected = [
+            [("Left", "left=[redacted]"), ("Right", "right=[redacted]")],
+            [("Right", "right=[redacted]"), ("New draft", &draft.content)],
+            [("Left", "left=[redacted]"), ("New draft", &draft.content)],
+        ];
+        for (pair, expected) in Pair::ALL.into_iter().zip(expected) {
+            assert_eq!(
+                draft.comparisons[pair as usize].as_ref().unwrap().sources(),
+                expected
+            );
+        }
+        assert!(DraftPreview::new(&draft).pair == Pair::RightDraft);
         assert!(complete_draft("```\nshort\n```\n~~~txt\ntruncated").is_none());
         assert!(complete_draft("```\n\n```").is_none());
         assert!(
-            Outcome::parse(Mode::Explain, reply, "Right", "", "")
-                .unwrap()
-                .draft
-                .is_none()
+            Outcome::parse(Mode::Explain, reply, "", || {
+                panic!("explanations do not prepare draft comparisons")
+            })
+            .unwrap()
+            .draft
+            .is_none()
         );
     }
 
@@ -1482,6 +1567,43 @@ mod tests {
             panic!("the SFTP AI worker produced no result");
         };
         let _ = update(&mut panel, event, &policy, &mut counter);
+        for pair in [Pair::LeftDraft, Pair::Originals, Pair::RightDraft] {
+            assert!(matches!(
+                update(
+                    &mut panel,
+                    Event::SelectPair(ticket, pair),
+                    &policy,
+                    &mut counter
+                ),
+                Update::None
+            ));
+            let Phase::Result {
+                outcome,
+                preview: Some(preview),
+                ..
+            } = &panel.phase
+            else {
+                panic!("the completed draft did not have a comparison");
+            };
+            assert!(preview.pair == pair);
+            let compared = outcome.draft.as_ref().unwrap().comparisons[pair as usize]
+                .as_ref()
+                .unwrap();
+            for (_, content) in compared.sources() {
+                assert!(!content.contains("file-secret"));
+            }
+            no_request();
+        }
+        let _ = update(
+            &mut panel,
+            Event::SelectPair(revoked_ticket, Pair::LeftDraft),
+            &policy,
+            &mut counter,
+        );
+        assert!(matches!(
+            &panel.phase,
+            Phase::Result { preview: Some(preview), .. } if preview.pair == Pair::RightDraft
+        ));
         assert!(
             matches!(update(&mut panel, Event::OpenDraft(ticket), &policy, &mut counter),
             Update::Draft(contents) if contents.as_ref() == "left=1\r\nright=2\r\n")

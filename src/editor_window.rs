@@ -38,7 +38,7 @@ pub(crate) mod structure;
 pub(crate) mod tools;
 
 use line_endings::Conversion;
-pub(crate) use search::{MAX_QUERY_BYTES, literal_cursor, source_selection};
+pub(crate) use search::{MAX_QUERY_BYTES, literal_cursor, position_after_edit, source_selection};
 
 const MAX_OUTLINE_ITEMS: usize = 256;
 const MAX_HISTORY_STEPS: usize = 32;
@@ -84,6 +84,7 @@ pub enum Message {
     ChooseLua(&'static str),
     DismissLua,
     Tools(tools::Message),
+    AiToolFallback(tools::Action, u64),
     ShowFind,
     HideFind,
     SetFind(String),
@@ -387,6 +388,64 @@ impl EditorWindow {
         Some(selection)
     }
 
+    pub(crate) fn insert_snippet(
+        &mut self,
+        resolved: crate::snippets::resolve::Resolved,
+    ) -> Result<Task<Message>, &'static str> {
+        use text_editor::{Action, Cursor, Edit};
+
+        if !self.available() || !self.writable() {
+            return Err("The file editor is busy or read-only.");
+        }
+        if resolved.text.is_empty() {
+            return Err("The resolved snippet is empty.");
+        }
+        let incoming = self.endings.convert_inserted(&resolved.text)?;
+        let bytes = self
+            .content
+            .lines()
+            .map(|line| line.text.len() + line.ending.as_str().len())
+            .sum::<usize>();
+        if bytes.saturating_add(incoming.as_ref().map_or(resolved.text.len(), String::len))
+            > MAX_FILE_BYTES
+        {
+            return Err("The inserted snippet would exceed the file editor size limit.");
+        }
+        let origin = self.content.cursor().position;
+        let caret = resolved
+            .caret
+            .and_then(|offset| resolved.text.get(..offset))
+            .map(|prefix| {
+                let mut position = origin;
+                let mut tail = 0;
+                for (separator, _) in line_endings::separators(prefix) {
+                    position.line += 1;
+                    position.column = 0;
+                    tail = separator.end;
+                }
+                position.column += prefix.len() - tail;
+                Cursor {
+                    position,
+                    selection: None,
+                }
+            });
+        let at = Cursor {
+            position: origin,
+            selection: None,
+        };
+        if !self.perform_at(Action::Edit(Edit::Paste(Arc::new(resolved.text))), Some(at)) {
+            return Err("Could not insert the resolved snippet.");
+        }
+        if let Some(caret) = caret {
+            self.content.move_to(caret);
+        }
+        if self.tools.active() {
+            let context = self.tool_context();
+            self.tools.invalidate(context);
+        }
+        Ok(widget::operation::focus(self.editor_id.clone()))
+    }
+
     pub fn update(&mut self, message: Message) -> Task<Message> {
         let task = self.update_inner(message);
         if self.tools.active() {
@@ -487,6 +546,7 @@ impl EditorWindow {
             }
             Message::DismissLua => self.lua_completion = None,
             Message::Tools(message) => return self.update_tools(message),
+            Message::AiToolFallback(..) => {}
             Message::OutlineReady(revision, outline) if revision == self.revision => {
                 self.outline = outline;
                 self.outline_revision = Some(revision);
@@ -614,6 +674,14 @@ impl EditorWindow {
     }
 
     fn perform(&mut self, action: text_editor::Action) {
+        self.perform_at(action, None);
+    }
+
+    fn perform_at(
+        &mut self,
+        action: text_editor::Action,
+        insert_at: Option<text_editor::Cursor>,
+    ) -> bool {
         self.lua_completion = None;
         if action.is_edit() {
             let pasted_endings = matches!(&action, text_editor::Action::Edit(text_editor::Edit::Paste(text))
@@ -622,11 +690,11 @@ impl EditorWindow {
                 Ok(action) => action,
                 Err(error) => {
                     self.status = Some(error.into());
-                    return;
+                    return false;
                 }
             };
             let old_count = self.content.line_count();
-            let cursor = self.content.cursor();
+            let cursor = insert_at.unwrap_or_else(|| self.content.cursor());
             let selected_lines = cursor
                 .selection
                 .is_some_and(|anchor| anchor.line != cursor.position.line);
@@ -642,6 +710,14 @@ impl EditorWindow {
             self.remember_edit(group);
             self.search.invalidate_scope();
             self.mark_edited();
+            if insert_at.is_some() {
+                if self.content.cursor().selection.is_some() {
+                    // The backend moves the cursor without clearing an existing selection.
+                    self.content
+                        .perform(text_editor::Action::Move(text_editor::Motion::Left));
+                }
+                self.content.move_to(cursor);
+            }
             self.content.perform(action);
             self.endings
                 .observe_edit(&self.content, old_count, selected_lines, pasted_endings);
@@ -649,6 +725,7 @@ impl EditorWindow {
             self.edit_group = None;
             self.content.perform(action);
         }
+        true
     }
 
     fn remember_edit(&mut self, group: Option<EditGroup>) {
@@ -930,7 +1007,10 @@ impl EditorWindow {
     }
 
     fn tool_context(&self) -> Option<tools::Context> {
-        if !self.available() || self.remote_editor().is_some_and(RemoteEditor::is_closed) {
+        if self.document.is_none()
+            || !self.available()
+            || self.remote_editor().is_some_and(RemoteEditor::is_closed)
+        {
             return None;
         }
         let path = self.source_path();
@@ -939,11 +1019,12 @@ impl EditorWindow {
         } else if let Some(language) = tools::Language::extension(path) {
             language
         } else {
-            let first = self.content.line(0)?;
-            if Language::detect(path, &first.text) != Language::Shell {
-                return None;
+            match self.content.line(0) {
+                Some(first) if Language::detect(path, &first.text) == Language::Shell => {
+                    tools::Language::Shell
+                }
+                _ => tools::Language::Other,
             }
-            tools::Language::Shell
         };
         Some(tools::Context {
             revision: self.revision,
@@ -964,6 +1045,13 @@ impl EditorWindow {
             tools::Update::None => {}
             tools::Update::Notice(notice) => self.status = Some(notice),
             tools::Update::Job(job) => return job.task().map(Message::Tools),
+            tools::Update::UseAi(action) => {
+                return Task::done(Message::AiToolFallback(action, self.revision));
+            }
+            tools::Update::RevealDiagnostic(bytes) => {
+                caret::reveal_diagnostic(&mut self.content, bytes);
+                return widget::operation::focus(self.editor_id.clone());
+            }
             tools::Update::Apply(formatted) => {
                 let converted = match self
                     .endings
@@ -1059,7 +1147,7 @@ impl EditorWindow {
                 editor_key_binding(event, inherited, writable)
             });
         }
-        let editor = caret::view(
+        let editor = caret::view_decorated(
             editor.highlight_with::<lua::Lua>(
                 lua::Settings::new(is_lua, appearance, self.syntax_source),
                 lua::format,
@@ -1068,6 +1156,11 @@ impl EditorWindow {
             appearance,
             font_size,
             caret_preferences,
+            caret::Decorations {
+                diagnostics: (!self.tools.marks().is_empty())
+                    .then_some((&self.content, self.tools.marks())),
+                ..caret::Decorations::default()
+            },
         );
         let zoom = row![
             button("−").on_press_maybe(
@@ -2757,6 +2850,40 @@ mod tests {
         std::os::unix::fs::symlink(&real, &alias).unwrap();
         assert!(open_document(&alias).is_err());
         assert!(open_regular_editor_file(&alias).is_err());
+    }
+
+    #[test]
+    fn snippet_insertion_keeps_selection_text_and_places_the_unicode_caret() {
+        let (mut editor, _) = EditorWindow::with_unsaved_draft("ä→end");
+        let selection = text_editor::Cursor {
+            position: text_editor::Position {
+                line: 0,
+                column: "ä".len(),
+            },
+            selection: Some(text_editor::Position { line: 0, column: 0 }),
+        };
+        editor.content.move_to(selection);
+        let _ = editor.update(Message::ConvertLineEndings(Conversion::CrLf));
+        let resolved = crate::snippets::resolve::interactive_insertion(
+            "東京\nβ${cursor}tail${cursor} $${cursor}",
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+        let _ = editor.insert_snippet(resolved).unwrap();
+        assert_eq!(editor.content.text(), "ä東京\r\nβtail ${cursor}→end");
+        assert_eq!(
+            editor.content.cursor().position,
+            text_editor::Position {
+                line: 1,
+                column: "β".len()
+            }
+        );
+        assert!(editor.content.cursor().selection.is_none());
+        let _ = editor.update(Message::Undo);
+        assert_eq!(editor.content.text(), "ä→end");
+        assert_eq!(editor.content.cursor(), selection);
     }
 
     #[test]

@@ -23,7 +23,8 @@ const MAX_CLOSED_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_OUTPUT_ENCODED: usize = kortty_vault::MAX_SEALED_RECOVERY_OUTPUT_BYTES.div_ceil(3) * 4;
 const MAX_SNAPSHOT_BYTES: u64 = MAX_BYTES + MAX_OUTPUT_ENCODED as u64 + 128;
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum RestoreMode {
     #[default]
     Ask,

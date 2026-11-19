@@ -163,7 +163,8 @@ impl Editor for EditorWindow {
     }
 
     fn supports_ai_action(&self, action: Action) -> bool {
-        action != Action::CorrectDescription && (!action.edits_file() || self.writable())
+        !matches!(action, Action::CorrectDescription | Action::MigrateScript)
+            && (!action.edits_file() || self.writable())
     }
 
     fn assistant_title(&self) -> &'static str {

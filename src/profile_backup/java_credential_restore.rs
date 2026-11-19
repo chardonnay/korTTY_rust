@@ -14,7 +14,7 @@ use super::java_secrets::{
 use crate::clipboard_policy::ClipboardPolicy;
 use crate::connection_store::import::{
     JavaConnectionBindings, JavaImportedRoute, JavaLibrarySettings, JavaManagedKeyBinding,
-    JavaPasswordBinding, JavaSourceGroups,
+    JavaPasswordBinding, JavaSourceGroups, JavaTargetReuse,
 };
 use crate::ssh_key_catalog::{Catalog, ManagedAddition, PreparedManagedAdditions};
 
@@ -54,6 +54,7 @@ pub(super) fn prepare(
     password: Option<&Secret>,
     vault: Option<&Vault>,
     needs_route_lineage: bool,
+    reuse: JavaTargetReuse,
     library: &JavaLibrarySettings,
 ) -> io::Result<Review> {
     if password.is_some() && vault.is_none() {
@@ -213,7 +214,9 @@ pub(super) fn prepare(
         .map(|(index, identity)| (index, identity.id))
         .collect();
     let (contents, routes, memory_ids, profile_ids, groups) = if needs_route_lineage {
-        let import = routes.bind_with_routes(&password_ids, &key_ids, policy.server_access())?;
+        let mut import =
+            routes.bind_with_routes(&password_ids, &key_ids, policy.server_access())?;
+        import.reuse_targets(current.as_deref().map(Vec::as_slice), reuse);
         (
             import.contents,
             import.routes,

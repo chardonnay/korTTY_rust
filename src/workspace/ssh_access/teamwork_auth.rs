@@ -97,7 +97,11 @@ impl AuthSnapshot {
     }
 }
 
-fn eligible_password(workspace: &Workspace, id: &str, login: &LoginTarget) -> Option<LoginTarget> {
+pub(in crate::workspace) fn eligible_password(
+    workspace: &Workspace,
+    id: &str,
+    login: &LoginTarget,
+) -> Option<LoginTarget> {
     let password = workspace
         .credential_choices(Kind::Password)
         .into_iter()
@@ -112,7 +116,7 @@ fn eligible_password(workspace: &Workspace, id: &str, login: &LoginTarget) -> Op
         .then_some(target)
 }
 
-fn set_username(login: &mut LoginTarget, username: &str) {
+pub(in crate::workspace) fn set_username(login: &mut LoginTarget, username: &str) {
     let username = username.trim();
     if !username.is_empty() {
         login.username = username.to_owned();

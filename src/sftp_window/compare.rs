@@ -810,7 +810,7 @@ impl SftpWindow {
         }
         if let Some(saved) = panel.take_remote_save() {
             let path = Location::Remote(saved.path);
-            if view.files[1] == path {
+            if view.files.contains(&path) {
                 return view.start_refresh(
                     path,
                     saved.note,
@@ -1383,6 +1383,19 @@ struct Snapshot {
     bytes: Vec<u8>,
 }
 
+pub(super) fn read_remote_draft_original(
+    client: &mut Sftp<impl Read, impl Write>,
+    path: &[u8],
+    cancelled: &impl Fn() -> bool,
+) -> Result<kortty_server_archive::draft_replace::Original, worker::Failure> {
+    Snapshot::read(client, Location::Remote(path.to_vec()), cancelled)?
+        .remote_origin()?
+        .map(|origin| origin.original)
+        .ok_or_else(|| {
+            io::Error::other("The server file has unsupported ownership or permissions").into()
+        })
+}
+
 enum Source {
     Local(LocalSource),
     Remote { path: Vec<u8>, stamp: Attributes },
@@ -1393,12 +1406,22 @@ impl Snapshot {
         let Source::Remote { path, stamp } = &self.source else {
             return Ok(None);
         };
-        let (Some(uid), Some(gid), Some(mode)) = (stamp.uid, stamp.gid, stamp.permissions) else {
-            return Ok(None);
-        };
-        if std::str::from_utf8(path).is_err() || mode & 0o7022 != 0 {
+        if std::str::from_utf8(path).is_err() {
             return Ok(None);
         }
+        let (uid, gid, mode) = if kortty_server_archive::draft_replace::windows_drive_path(path) {
+            // Win32-OpenSSH's synthetic POSIX fields do not represent native ACLs.
+            (0, 0, 0)
+        } else {
+            let (Some(uid), Some(gid), Some(mode)) = (stamp.uid, stamp.gid, stamp.permissions)
+            else {
+                return Ok(None);
+            };
+            if mode & 0o7022 != 0 {
+                return Ok(None);
+            }
+            (uid, gid, mode & 0o777)
+        };
         Ok(Some(RemoteDraftOrigin {
             path: path.clone(),
             original: kortty_server_archive::draft_replace::Original {
@@ -1406,7 +1429,7 @@ impl Snapshot {
                 digest: worker::draft_file::digest(&self.bytes)?,
                 uid,
                 gid,
-                mode: mode & 0o777,
+                mode,
             },
         }))
     }

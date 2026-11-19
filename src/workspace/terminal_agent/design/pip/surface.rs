@@ -83,17 +83,6 @@ pub(super) fn view<'a, M: 'a>(
     })
 }
 
-pub(super) fn preview<'a, M: 'a>(base: Element<'a, M>, panel: Element<'a, M>) -> Element<'a, M> {
-    Element::new(Surface {
-        children: [base, panel],
-        run: window::Id::unique(),
-        corner: Corner::BottomRight,
-        size: Size::new(360.0, 240.0),
-        snapped: None,
-        reduced_motion: true,
-    })
-}
-
 struct Surface<'a, M> {
     children: [Element<'a, M>; 2],
     run: window::Id,
@@ -459,15 +448,20 @@ impl<M> Widget<M, Theme, Renderer> for Surface<'_, M> {
                 );
             }
         }
-        self.children[1].as_widget().draw(
-            &tree.children[1],
-            renderer,
-            theme,
-            style,
-            panel,
-            cursor,
-            viewport,
-        );
+        if let Some(viewport) = panel.bounds().intersection(viewport) {
+            // Keep the panel background above the terminal's canvas and text batches.
+            renderer.with_layer(viewport, |renderer| {
+                self.children[1].as_widget().draw(
+                    &tree.children[1],
+                    renderer,
+                    theme,
+                    style,
+                    panel,
+                    cursor,
+                    &viewport,
+                );
+            });
+        }
     }
     fn mouse_interaction(
         &self,

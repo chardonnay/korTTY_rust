@@ -4,6 +4,7 @@ mod interchange;
 mod network;
 pub(crate) use interchange::{
     BackupImport as JavaBackupImport, BackupMerge as JavaBackupMerge,
+    bind_backup_review as bind_java_backup_review, bindings_digest as java_bindings_digest,
     merge_backup as merge_java_backup, read_backup as read_java_backup,
     resolve_backup_set as resolve_java_backup_set, validate_backup as validate_java_backup,
 };

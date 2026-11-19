@@ -1,13 +1,13 @@
 //! Inactive Teamwork proposals from Java global settings.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 
 use roxmltree::Node;
 use serde::{Deserialize, Serialize};
 
 use crate::connection_store::teamwork::{
-    GitUrl, MAX_CHECK_INTERVAL_MINUTES, MAX_LOCATION_BYTES, MAX_SOURCES, SourceKind,
+    GitUrl, MAX_CHECK_INTERVAL_MINUTES, MAX_LOCATION_BYTES, MAX_SOURCES, Origin, SourceKind,
 };
 
 use super::{java_flag, preference, preference_node, preference_text};
@@ -34,6 +34,31 @@ pub(crate) struct SourceProposal {
 }
 
 impl Proposals {
+    pub(super) fn scheduler_origins(&self) -> BTreeMap<String, Origin> {
+        let sources: Vec<_> = self
+            .sources
+            .iter()
+            .filter(|source| source.was_enabled)
+            .filter_map(|source| {
+                Some((
+                    source.id.as_ref()?,
+                    source.kind.parse_origin(&source.location).ok()?,
+                ))
+            })
+            .collect();
+        sources
+            .iter()
+            .filter(|(id, origin)| {
+                sources
+                    .iter()
+                    .filter(|(other_id, other_origin)| id == other_id || origin == other_origin)
+                    .count()
+                    == 1
+            })
+            .map(|(id, origin)| ((*id).clone(), origin.clone()))
+            .collect()
+    }
+
     pub(crate) fn count(&self) -> usize {
         self.sources.len()
             + [

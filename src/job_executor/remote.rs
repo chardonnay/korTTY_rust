@@ -96,7 +96,7 @@ pub(super) fn run(
             policy,
             target,
             jumps,
-            &trust,
+            &connection::trust_for_action(&request.action, trust)?,
             archive_password,
         )
         .map(|completion| (completion, None));
@@ -113,6 +113,7 @@ pub(super) fn run(
         )
         .map(|completion| (completion, None));
     }
+    let trust = connection::trust_for_action(&request.action, trust)?;
     let session = open_group_subsystem(target, jumps, trust, cancelled, &request.action, policy);
     check_cancelled(cancellation)?;
     policy.require_target_groups(&request.action)?;

@@ -30,6 +30,7 @@ use super::{
     Message as Desktop, Workspace,
     saved_chats::store,
     terminal_ai::{
+        ResultZoom,
         agent_follow_up::{StepKind, StepStatus},
         mask, metadata,
     },
@@ -310,6 +311,7 @@ pub enum Message {
     Synchronized(window::Id),
     Select(window::Id, text_editor::Action),
     Copy(window::Id),
+    Zoom(window::Id, ResultZoom),
     Close(window::Id),
 }
 
@@ -320,6 +322,7 @@ impl std::fmt::Debug for Message {
             Self::Synchronized(_) => f.write_str("Synchronized"),
             Self::Select(..) => f.write_str("Select"),
             Self::Copy(_) => f.write_str("Copy"),
+            Self::Zoom(..) => f.write_str("Zoom"),
             Self::Close(_) => f.write_str("Close"),
         }
     }
@@ -328,10 +331,11 @@ impl std::fmt::Debug for Message {
 pub(super) struct TranscriptTab {
     title: String,
     content: text_editor::Content,
+    font_size: u8,
 }
 
 impl TranscriptTab {
-    fn new(transcript: agent_chat::Transcript) -> Self {
+    fn new(transcript: agent_chat::Transcript, font_size: u8) -> Self {
         Self {
             title: if transcript.title.is_empty() {
                 "Recorded AI Chat".into()
@@ -339,6 +343,7 @@ impl TranscriptTab {
                 transcript.title
             },
             content: text_editor::Content::with_text(&transcript.text),
+            font_size,
         }
     }
 
@@ -465,6 +470,19 @@ impl Workspace {
                     Task::none()
                 };
             }
+            Message::Zoom(id, zoom) => {
+                if self.journal_transcript_interactive(id)
+                    && let Some(tab) = self.journal_chat_transcripts.get_mut(&id)
+                {
+                    let size = zoom.size(tab.font_size);
+                    tab.font_size = size;
+                    if self.window_settings.ai_result_font_size != Some(size) {
+                        self.window_settings.ai_result_font_size = Some(size);
+                        self.save_window_settings(self.hosted_tool_owner(id));
+                    }
+                }
+                return Task::none();
+            }
         };
         let Opened {
             request,
@@ -512,8 +530,10 @@ impl Workspace {
             return Task::none();
         }
         let id = window::Id::unique();
-        self.journal_chat_transcripts
-            .insert(id, TranscriptTab::new(transcript));
+        self.journal_chat_transcripts.insert(
+            id,
+            TranscriptTab::new(transcript, self.window_settings.ai_result_font()),
+        );
         self.host_tool(request.owner, Kind::JournalChatTranscript, id)
     }
 
@@ -542,7 +562,9 @@ impl Workspace {
                     close
                 ]
                 .spacing(8),
+                ResultZoom::controls(tab.font_size).map(move |zoom| Message::Zoom(id, zoom)),
                 text_editor(&tab.content)
+                    .size(f32::from(tab.font_size))
                     .on_action(move |action| Message::Select(id, action))
                     .key_binding(
                         move |key| match text_editor::Binding::from_key_press(key)? {

@@ -64,15 +64,16 @@ impl Flow {
         }
     }
 
-    pub(super) fn view(&self, run: &Run) -> Option<Element<'_, RunMessage>> {
+    pub(super) fn view<'a>(&'a self, run: &'a Run) -> Option<Element<'a, RunMessage>> {
         let message = RunMessage::Planning;
         let enabled = !run.paused && !run.cancel.requested();
+        let size = run.fonts.plan;
         match run.phase {
             Phase::PlanQuestions => {
                 let question = self.questions.get(self.answers.len())?;
                 let mut answers = row![].spacing(6);
                 for answer in &question.options {
-                    answers = answers.push(button(text(answer)).on_press_maybe(
+                    answers = answers.push(button(text(answer).size(size)).on_press_maybe(
                         enabled.then(|| message(Message::Answer(run.epoch, answer.clone()))),
                     ));
                 }
@@ -82,8 +83,8 @@ impl Flow {
                         self.answers.len() + 1,
                         self.questions.len()
                     ))
-                    .size(13),
-                    text(&question.question),
+                    .size(size - 1.0),
+                    text(&question.question).size(size),
                     answers.wrap(),
                 ]
                 .spacing(6);
@@ -91,6 +92,7 @@ impl Flow {
                     controls = controls.push(
                         row![
                             text_input("Your answer", &self.custom_answer)
+                                .size(size)
                                 .on_input(move |answer| message(Message::CustomAnswer(answer))),
                             button("Use answer").on_press_maybe(
                                 (enabled && !self.custom_answer.trim().is_empty()).then(
@@ -107,12 +109,13 @@ impl Flow {
                 Some(controls.into())
             }
             Phase::PlanOptions => {
-                let mut options = column![text("Choose an implementation approach")].spacing(8);
+                let mut options =
+                    column![text("Choose an implementation approach").size(size)].spacing(8);
                 for (index, option) in self.options.iter().enumerate() {
                     options = options.push(
                         column![
-                            text(&option.title).size(17),
-                            text(option.render()).size(13),
+                            text(&option.title).size(size + 3.0),
+                            text(option.render()).size(size),
                             button("Draft plan for this approach").on_press_maybe(
                                 enabled.then_some(message(Message::Choose(run.epoch, index))),
                             ),
@@ -126,25 +129,37 @@ impl Flow {
                         .into(),
                 )
             }
-            Phase::PlanReady if self.report.is_some() && !run.binding.private() => Some(
-                button(if self.saved {
-                    "Plan saved"
-                } else {
-                    "Save plan"
-                })
-                .on_press_maybe((enabled && !self.saved).then_some(message(Message::Save)))
-                .into(),
-            ),
+            Phase::PlanReady => {
+                let report = run.plan.as_deref()?;
+                Some(
+                    column![
+                        iced::widget::scrollable(text(report).size(size).width(iced::Length::Fill))
+                            .height(iced::Length::Fill),
+                        (self.report.is_some() && !run.binding.private()).then(|| {
+                            button(if self.saved {
+                                "Plan saved"
+                            } else {
+                                "Save plan"
+                            })
+                            .on_press_maybe(
+                                (enabled && !self.saved).then_some(message(Message::Save)),
+                            )
+                        })
+                    ]
+                    .spacing(6)
+                    .height(iced::Length::Fill)
+                    .into(),
+                )
+            }
             Phase::PlanLibrary => {
-                let mut records = column![text(format!(
-                    "Saved plans for {}",
-                    self.destination.label()
-                ))]
+                let mut records = column![
+                    text(format!("Saved plans for {}", self.destination.label())).size(size)
+                ]
                 .spacing(6);
                 for record in &self.records {
                     records = records.push(
                         row![
-                            button(text(&record.report.title))
+                            button(text(&record.report.title).size(size))
                                 .on_press(message(Message::Open(run.epoch, record.id.clone()))),
                             button("Delete…")
                                 .on_press(message(Message::Delete(run.epoch, record.id.clone()))),
@@ -153,12 +168,13 @@ impl Flow {
                     );
                 }
                 if self.records.is_empty() {
-                    records = records.push(text("There are no saved plans for this exact route."));
+                    records = records
+                        .push(text("There are no saved plans for this exact route.").size(size));
                 }
                 if let Some(record) = &self.deleting {
                     records = records.push(
                         row![
-                            text(format!("Delete ‘{}’?", record.report.title)),
+                            text(format!("Delete ‘{}’?", record.report.title)).size(size),
                             button("Delete plan")
                                 .on_press(message(Message::ConfirmDelete(run.epoch, true))),
                             button("Keep plan")

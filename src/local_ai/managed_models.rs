@@ -32,6 +32,7 @@ const LEASE: &str = ".use.lock";
 pub(crate) const BACKUP_MANIFEST: &str = "model-v1.json";
 const MANIFEST: &str = BACKUP_MANIFEST;
 const WEIGHTS: &str = "model.gguf";
+const VISION_ASSETS: &str = "vision-assets";
 pub(crate) const MAX_MODELS: usize = 256;
 pub(crate) const MAX_MANIFEST: u64 = 64 * 1024;
 pub(super) const MAX_MODEL_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
@@ -525,7 +526,7 @@ impl Registry {
         purpose: Purpose,
         cancelled: &AtomicBool,
     ) -> io::Result<Model> {
-        self.import_components(path, purpose, None, cancelled)
+        self.import_components(path, purpose, None, None, cancelled)
     }
 
     pub(crate) fn import_projector_pair(
@@ -536,7 +537,31 @@ impl Registry {
     ) -> io::Result<Model> {
         check_cancelled(cancelled)?;
         let projector = projector::Projector::open(projector_path, cancelled)?;
-        self.import_components(path, Purpose::Chat, Some(projector), cancelled)
+        self.import_components(path, Purpose::Chat, Some(projector), None, cancelled)
+    }
+
+    pub(crate) fn reattach_projector_pair(
+        &self,
+        expected: &Model,
+        path: &Path,
+        projector_path: &Path,
+        cancelled: &AtomicBool,
+    ) -> io::Result<Model> {
+        check_cancelled(cancelled)?;
+        self.check_reattachment(expected)?;
+        let projector = projector::Projector::open(projector_path, cancelled)?;
+        if expected.projector_bytes != Some(projector.bytes) {
+            return Err(invalid(
+                "The selected projector size differs from the registration",
+            ));
+        }
+        self.import_components(
+            path,
+            expected.purpose,
+            Some(projector),
+            Some(expected),
+            cancelled,
+        )
     }
 
     fn import_components(
@@ -544,6 +569,7 @@ impl Registry {
         path: &Path,
         purpose: Purpose,
         projector: Option<projector::Projector>,
+        restored: Option<&Model>,
         cancelled: &AtomicBool,
     ) -> io::Result<Model> {
         check_cancelled(cancelled)?;
@@ -551,7 +577,7 @@ impl Registry {
             let mut group = split::Group::open(path, cancelled)?;
             let mut model = Model::new(group.name.clone(), group.bytes, group.context, purpose)?;
             model.shard_bytes = group.sizes();
-            return self.publish_import(model, projector, cancelled, |stage| {
+            return self.publish_import(model, projector, restored, cancelled, |stage| {
                 group.copy_into(stage, cancelled)
             });
         }
@@ -565,7 +591,7 @@ impl Registry {
         let context = gguf::context(&mut source, bytes, cancelled)?;
         source.rewind()?;
         let model = Model::new(name, bytes, context, purpose)?;
-        self.publish_import(model, projector, cancelled, |stage| {
+        self.publish_import(model, projector, restored, cancelled, |stage| {
             stage.publish_with(WEIGHTS, |output| {
                 copy_model(&mut source, output, bytes, cancelled)?;
                 stamp.require_unchanged(&source)
@@ -577,11 +603,30 @@ impl Registry {
         &self,
         mut model: Model,
         mut projector: Option<projector::Projector>,
+        restored: Option<&Model>,
         cancelled: &AtomicBool,
         copy: impl FnOnce(&Directory) -> io::Result<()>,
     ) -> io::Result<Model> {
         model.projector_bytes = projector.as_ref().map(|projector| projector.bytes);
         model.validate_settings()?;
+        let write_assets = |stage: &Directory| {
+            copy(stage)?;
+            if let Some(projector) = &mut projector {
+                projector.copy_into(stage, cancelled)?;
+            }
+            Ok(())
+        };
+        if let Some(restored) = restored {
+            if model.bytes != restored.bytes
+                || model.shard_bytes != restored.shard_bytes
+                || model.projector_bytes != restored.projector_bytes
+            {
+                return Err(invalid(
+                    "The selected GGUF components differ in size or shard layout",
+                ));
+            }
+            return self.publish_restored_vision(restored, &model.id, cancelled, write_assets);
+        }
         let root = self.root(true)?;
         let _lock = lock(&root, REGISTRY_LOCK, false)?;
         let staging = prepare_staging(&root)?;
@@ -591,10 +636,7 @@ impl Registry {
         check_cancelled(cancelled)?;
         let stage = staging.create_private_subdirectory(OsStr::new(&model.id))?;
         let prepared = (|| {
-            copy(&stage)?;
-            if let Some(projector) = &mut projector {
-                projector.copy_into(&stage, cancelled)?;
-            }
+            write_assets(&stage)?;
             stage.publish_copy(
                 MANIFEST,
                 &serde_json::to_vec(&model).map_err(io::Error::other)?,
@@ -613,6 +655,38 @@ impl Registry {
         Ok(model)
     }
 
+    fn publish_restored_vision(
+        &self,
+        expected: &Model,
+        staging_id: &str,
+        cancelled: &AtomicBool,
+        copy: impl FnOnce(&Directory) -> io::Result<()>,
+    ) -> io::Result<Model> {
+        let root = self.root(false)?;
+        let _lock = lock(&root, REGISTRY_LOCK, false)?;
+        let directory = root.private_child(&expected.id, false)?;
+        let _lease = lock(&directory, LEASE, false)?;
+        check_detached_registration(&directory, expected)?;
+        let staging = prepare_staging(&root)?;
+        let stage = staging.create_private_subdirectory(OsStr::new(staging_id))?;
+        let published = (|| {
+            let assets = stage.create_private_subdirectory(OsStr::new(VISION_ASSETS))?;
+            copy(&assets)?;
+            assets.sync()?;
+            drop(assets);
+            check_cancelled(cancelled)?;
+            check_detached_registration(&directory, expected)?;
+            // One rename publishes the complete pair and leaves the manifest in place.
+            stage.move_subdirectory(VISION_ASSETS, &directory)
+        })();
+        drop(stage);
+        let cleanup = discard_stage(&staging, staging_id);
+        published?;
+        directory.sync()?;
+        cleanup?;
+        Ok(expected.clone())
+    }
+
     pub(crate) fn reference(
         &self,
         path: &Path,
@@ -621,9 +695,57 @@ impl Registry {
     ) -> io::Result<Model> {
         let (model, leases) = external::Reference::register_model(path, purpose, cancelled)?;
         let reference = model.external.clone().expect("registered external model");
-        self.publish_import(model, None, cancelled, |_| {
+        self.publish_import(model, None, None, cancelled, |_| {
             reference.revalidate(&leases, external::Authority::User)
         })
+    }
+
+    pub(crate) fn check_reattachment(&self, expected: &Model) -> io::Result<()> {
+        check_id(&expected.id)?;
+        let root = self.root(false)?;
+        let _lock = lock(&root, REGISTRY_LOCK, true)?;
+        let directory = root.private_child(&expected.id, false)?;
+        let _lease = lock(&directory, LEASE, true)?;
+        check_detached_registration(&directory, expected)
+    }
+
+    pub(crate) fn reattach(
+        &self,
+        expected: &Model,
+        path: &Path,
+        cancelled: &AtomicBool,
+    ) -> io::Result<Model> {
+        if expected.projector_bytes.is_some() {
+            return Err(invalid("Choose both GGUF weights and a vision projector"));
+        }
+        self.check_reattachment(expected)?;
+        let (candidate, leases) =
+            external::Reference::register_model(path, expected.purpose, cancelled)?;
+        if candidate.bytes != expected.bytes || candidate.shard_bytes != expected.shard_bytes {
+            return Err(invalid(
+                "The selected GGUF size or shard layout differs from the registration",
+            ));
+        }
+        let reference = candidate.external.expect("registered external model");
+        let mut model = expected.clone();
+        model.external = Some(reference.clone());
+        model.validate_settings()?;
+        let bytes = serde_json::to_vec(&model).map_err(io::Error::other)?;
+        let root = self.root(false)?;
+        let _lock = lock(&root, REGISTRY_LOCK, false)?;
+        let directory = root.private_child(&expected.id, false)?;
+        let _lease = lock(&directory, LEASE, false)?;
+        check_detached_registration(&directory, expected)?;
+        directory.replace_with(
+            MANIFEST,
+            |file| file.write_all(&bytes),
+            || {
+                check_cancelled(cancelled)?;
+                reference.revalidate(&leases, external::Authority::User)
+            },
+        )?;
+        directory.sync()?;
+        Ok(model)
     }
 
     pub(crate) fn open(&self, id: &str) -> io::Result<OpenedModel> {
@@ -646,6 +768,13 @@ impl Registry {
                 },
             });
         }
+        let mut path = self.profile.join(REGISTRY).join(id);
+        let directory = if model.projector_bytes.is_some() && directory.has_entry(VISION_ASSETS)? {
+            path.push(VISION_ASSETS);
+            directory.private_child(VISION_ASSETS, false)?
+        } else {
+            directory
+        };
         let mut components = if model.shard_bytes.is_empty() {
             vec![(WEIGHTS.to_owned(), model.bytes)]
         } else {
@@ -679,7 +808,7 @@ impl Registry {
             }
             weights.push(Weight { name, file, stamp });
         }
-        let path = self.profile.join(REGISTRY).join(id).join(&weights[0].name);
+        path.push(&weights[0].name);
         Ok(OpenedModel {
             model,
             path,
@@ -738,6 +867,26 @@ impl Registry {
     fn root(&self, create: bool) -> io::Result<Directory> {
         Directory::open(&self.profile, create)?.private_child(REGISTRY, create)
     }
+}
+
+fn check_detached_registration(directory: &Directory, expected: &Model) -> io::Result<()> {
+    let current = read_model(directory, &expected.id)?;
+    if current != *expected {
+        return Err(invalid(
+            "The selected GGUF registration changed. Refresh and review it again.",
+        ));
+    }
+    if current.external.is_some()
+        || directory
+            .names(split::MAX_SHARDS + 5)?
+            .iter()
+            .any(|name| name != OsStr::new(MANIFEST) && name != OsStr::new(LEASE))
+    {
+        return Err(invalid(
+            "Reattachment requires a metadata-only GGUF registration",
+        ));
+    }
+    Ok(())
 }
 
 fn read_model(directory: &Directory, id: &str) -> io::Result<Model> {
@@ -864,6 +1013,20 @@ fn prepare_staging(root: &Directory) -> io::Result<Directory> {
 fn discard_stage(staging: &Directory, id: &str) -> io::Result<()> {
     let directory = staging.private_child(id, false)?;
     let identity = directory.identity()?;
+    if directory.has_entry(VISION_ASSETS)? {
+        let assets = directory.private_child(VISION_ASSETS, false)?;
+        let asset_identity = assets.identity()?;
+        discard_model_files(&assets)?;
+        drop(assets);
+        directory.remove_deletion_entry(OsStr::new(VISION_ASSETS), asset_identity, true)?;
+    }
+    discard_model_files(&directory)?;
+    drop(directory);
+    staging.remove_deletion_entry(OsStr::new(id), identity, true)?;
+    staging.sync()
+}
+
+fn discard_model_files(directory: &Directory) -> io::Result<()> {
     for name in directory.names(split::MAX_SHARDS + 5)? {
         let name = name
             .to_str()
@@ -880,9 +1043,7 @@ fn discard_stage(staging: &Directory, id: &str) -> io::Result<()> {
         drop(file);
         directory.remove_unchanged(name, &stamp)?;
     }
-    drop(directory);
-    staging.remove_deletion_entry(OsStr::new(id), identity, true)?;
-    staging.sync()
+    Ok(())
 }
 
 pub(crate) fn valid_id(id: &str) -> bool {

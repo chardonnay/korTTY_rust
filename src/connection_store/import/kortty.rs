@@ -105,6 +105,23 @@ pub(super) fn parse(root: Node<'_, '_>, source: Source) -> io::Result<Preview> {
         if key_reference {
             preview.java_key_references += 1;
         }
+        // Keep shared members in the source group inventory. Their origin
+        // must be resolved against an active Teamwork source before adoption.
+        if track_lineage
+            && !rust_local
+            && (!binding_field(entry, "connectionSource")
+                .is_ok_and(|value| matches!(value.map(str::trim), None | Some("LOCAL")))
+                || !binding_field(entry, "teamworkSourceId")
+                    .is_ok_and(|value| value.is_none_or(|id| id.trim().is_empty())))
+        {
+            if let Some(id) = source_id
+                && let Ok(Some(route)) = shared_backup_route(entry, group, id)
+            {
+                preview.java_groups.record_shared(id, route);
+            }
+            preview.unsupported += 1;
+            continue;
+        }
         if rust_local
             || raw_scalar(entry, "protocol").is_ok_and(|value| {
                 value
@@ -166,6 +183,12 @@ pub(super) fn parse(root: Node<'_, '_>, source: Source) -> io::Result<Preview> {
                 profile.java_rsync_folder = rsync_folder(entry, id)?;
             }
             profile.java_favorite_id = favorite();
+            profile.java_target_reuse = skipped == 0
+                && !profile.has_password
+                && !profile.jump_has_password
+                && reusable_target_auth(entry)
+                && optional_child(entry, "jumpServer")
+                    .is_ok_and(|jump| jump.is_none_or(reusable_target_auth));
             profile.java_memory_id = declared_id.map(str::to_owned);
             if declared_id.is_some() {
                 profile.java_route = declared_route(entry, &profile.connection).ok().flatten();
@@ -188,6 +211,9 @@ pub(super) fn parse(root: Node<'_, '_>, source: Source) -> io::Result<Preview> {
         }
     }
     if !duplicate_ids.is_empty() {
+        for id in &duplicate_ids {
+            preview.java_groups.remove_shared(id);
+        }
         for entry in &mut preview.entries {
             if entry
                 .java_id
@@ -233,6 +259,51 @@ fn binding_field<'a, 'input: 'a>(
     ))
 }
 
+fn shared_backup_route(
+    node: Node<'_, '_>,
+    group: io::Result<String>,
+    id: &str,
+) -> io::Result<Option<super::java_bindings::JavaSharedRoute>> {
+    if binding_field(node, "connectionSource")?.map(str::trim) != Some("TEAMWORK")
+        || !matches!(
+            binding_field(node, "protocol")?.map(str::trim),
+            None | Some("SSH_TCP")
+        )
+        || temporary_identity(node)?
+    {
+        return Ok(None);
+    }
+    let Some(source) = binding_field(node, "teamworkSourceId")?
+        .map(str::trim)
+        .filter(|source| super::valid_teamwork_id(source))
+    else {
+        return Ok(None);
+    };
+    let Some(target) = binding_endpoint(node, true)? else {
+        return Ok(None);
+    };
+    let jump = if let Some(jump) = optional_child(node, "jumpServer")?
+        && boolean(jump, "enabled")?
+    {
+        if temporary_identity(jump)? {
+            return Ok(None);
+        }
+        let Some(endpoint) = binding_endpoint(jump, true)? else {
+            return Ok(None);
+        };
+        Some(endpoint)
+    } else {
+        None
+    };
+    Ok(Some(super::java_bindings::JavaSharedRoute {
+        source: source.to_owned(),
+        group: group?,
+        target,
+        jump,
+        rsync_folder: rsync_folder(node, id)?,
+    }))
+}
+
 fn declared_route(
     node: Node<'_, '_>,
     connection: &super::Connection,
@@ -247,7 +318,7 @@ fn declared_route(
     {
         return Ok(None);
     }
-    let Some(target) = binding_endpoint(node)? else {
+    let Some(target) = binding_endpoint(node, false)? else {
         return Ok(None);
     };
     let jump = if let Some(jump) = optional_child(node, "jumpServer")?
@@ -256,7 +327,7 @@ fn declared_route(
         if temporary_identity(jump)? {
             return Ok(None);
         }
-        let Some(endpoint) = binding_endpoint(jump)? else {
+        let Some(endpoint) = binding_endpoint(jump, false)? else {
             return Ok(None);
         };
         Some(endpoint)
@@ -276,12 +347,14 @@ fn temporary_identity(node: Node<'_, '_>) -> io::Result<bool> {
     )
 }
 
-fn binding_endpoint(node: Node<'_, '_>) -> io::Result<Option<LoginTarget>> {
-    let (Some(host), Some(username)) = (
-        binding_field(node, "host")?,
-        binding_field(node, "username")?,
-    ) else {
+fn binding_endpoint(node: Node<'_, '_>, shared: bool) -> io::Result<Option<LoginTarget>> {
+    let Some(host) = binding_field(node, "host")? else {
         return Ok(None);
+    };
+    let username = match binding_field(node, "username")? {
+        Some(username) => username,
+        None if shared => "",
+        None => return Ok(None),
     };
     let host = normalize_host(host.trim()).map_err(|_| invalid("invalid Java SSH binding host"))?;
     let port = match binding_field(node, "port")?.map(str::trim) {
@@ -293,7 +366,12 @@ fn binding_endpoint(node: Node<'_, '_>) -> io::Result<Option<LoginTarget>> {
         port,
         username: username.to_owned(),
     };
-    endpoint.validate().map_err(invalid)?;
+    if shared {
+        endpoint.validate_saved()
+    } else {
+        endpoint.validate()
+    }
+    .map_err(invalid)?;
     Ok(Some(endpoint))
 }
 
@@ -344,6 +422,7 @@ fn local_profile(
             .map(PathBuf::from),
         shell_integration: local_shell_integration(node)?,
         emulation: terminal_profile(node)?.term_name().into(),
+        terminal_effect: terminal_effect(node)?,
         terminal: terminal_overrides(node, supports_own_settings)?.0,
     };
     profile.validate()?;
@@ -422,7 +501,10 @@ fn serial_profile(
     profile.journal = terminal.journal;
     profile.paste_line_delay_ms = terminal.paste_line_delay_ms;
     profile.strict_terminal_mode = terminal.strict_terminal_mode;
+    let appearance = crate::connection_store::TerminalAppearance::from_terminal(&terminal);
+    profile.appearance = (!appearance.is_default()).then(|| Box::new(appearance));
     profile.highlight_set = terminal.highlight_set;
+    profile.terminal_effect = terminal_effect(node)?;
     profile.tag = raw_scalar(node, "tag")?
         .unwrap_or_default()
         .trim()
@@ -855,6 +937,18 @@ fn jump(node: Node<'_, '_>) -> io::Result<Option<(SavedLogin, bool)>> {
         },
         has_embedded_password(jump),
     )))
+}
+
+fn reusable_target_auth(node: Node<'_, '_>) -> bool {
+    binding_field(node, "sshKeyId").is_ok_and(|id| id.is_none())
+        && binding_field(node, "privateKeyPath")
+            .is_ok_and(|path| path.is_none_or(|path| path.trim().is_empty()))
+        && binding_field(node, "authMethod").is_ok_and(|method| {
+            matches!(
+                method.map(str::trim),
+                None | Some("PASSWORD" | "KEYBOARD_INTERACTIVE")
+            )
+        })
 }
 
 fn auth(node: Node<'_, '_>) -> io::Result<Auth> {

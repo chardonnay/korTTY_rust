@@ -203,6 +203,9 @@ impl Workspace {
             key_snapshots: Default::default(),
             group: VecDeque::new(),
             font: None,
+            quick_effect: None,
+            quick_ai: None,
+            quick_appearance: None,
             duplicate_tab: None,
             stage: Stage::Form(Box::new(form)),
         });

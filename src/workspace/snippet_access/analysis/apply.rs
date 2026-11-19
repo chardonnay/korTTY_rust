@@ -9,7 +9,9 @@ use crate::snippet_analysis::model::{ApplyRecovery, ApplyRun, ApplyStatus, Selec
 use crate::snippet_analysis::request::apply::{
     Checkpoint, Completion, MaskReason, Observer, Progress, Request,
 };
+use crate::snippet_window::ai_assist::migration;
 use crate::snippet_window::analysis::apply::{self as view, Action};
+use crate::snippet_window::languages::mix::{self, HostFormat, Inspection};
 use crate::terminal_logging::{Policy, Redactor, Secrets};
 use crate::vault_window::{JournalQuestionSecrets, VaultWindow};
 
@@ -299,6 +301,10 @@ impl Recovery {
         Phase::RecoverApply {
             completed: self.completed(),
             total: self.plan.request.stage_count(),
+            can_review: self.checkpoint.as_deref().is_some_and(|checkpoint| {
+                self.completed() == self.plan.request.stage_count()
+                    || self.plan.request.can_review_partial(checkpoint)
+            }),
             discard: self.revision.map(|_| self.plan.pre),
         }
     }
@@ -412,6 +418,7 @@ pub(super) struct Review {
     page: usize,
     before: Vec<Range<usize>>,
     after: Vec<Range<usize>>,
+    summary_drag: Option<u16>,
 }
 
 impl Review {
@@ -440,6 +447,7 @@ impl Review {
             page: 0,
             before: parts(&run.before),
             after: parts(&run.after),
+            summary_drag: None,
         }
     }
 
@@ -472,7 +480,22 @@ impl Review {
             }),
             can_install: can_install && self.run.has_review_source(),
             can_replan,
+            summary_drag: self.summary_drag,
         }
+    }
+
+    pub(super) fn summary_event(
+        &mut self,
+        run: SnippetId,
+        event: crate::snippet_window::diff_summary::Event,
+    ) -> Option<u16> {
+        if self.run.id != run
+            || !self.run.has_review_source()
+            || self.run.reasons.is_empty() && self.run.migration.is_none()
+        {
+            return None;
+        }
+        crate::snippet_window::diff_summary::update(&mut self.summary_drag, event)
     }
 
     pub(super) fn before(&self) -> &str {
@@ -564,6 +587,21 @@ impl Workspace {
     }
 
     pub(super) fn update_snippet_apply(&mut self, id: window::Id, action: Action) -> Task<Message> {
+        if let Action::SummaryDivider(run, event) = action {
+            let position = self
+                .snippets
+                .get_mut(&id)
+                .and_then(|surface| surface.analysis.current_mut())
+                .and_then(|page| match &mut page.state {
+                    State::ReviewApply(review) => review.summary_event(run, event),
+                    State::ReviewFolderApply(review) => review.summary_event(run, event),
+                    _ => None,
+                });
+            if let Some(position) = position {
+                self.save_snippet_diff_summary(id, position);
+            }
+            return Task::none();
+        }
         if let Action::Hardening(pre, edit) = action {
             return self.update_snippet_hardening(id, pre, edit);
         }
@@ -598,6 +636,48 @@ impl Workspace {
             return Task::none();
         };
         match action {
+            Action::MigrationLanguage(pre, _) | Action::MigrationPlatform(pre, _)
+                if matches!(page.state, State::Ready)
+                    && page.record().is_some_and(|record| {
+                        record.id == pre && record.apply_recovery.is_none()
+                    }) =>
+            {
+                let Some(detected) = migration_source(page, &surface.window) else {
+                    return Task::none();
+                };
+                let (language, platform) = match action {
+                    Action::MigrationLanguage(_, target) => (
+                        target,
+                        page.apply_migration.and_then(migration::Plan::destination),
+                    ),
+                    Action::MigrationPlatform(_, target) => (
+                        page.apply_migration
+                            .and_then(migration::Plan::language)
+                            .filter(|language| {
+                                target
+                                    .map_or_else(
+                                        || migration::Language::available(&detected),
+                                        migration::Language::platform_targets,
+                                    )
+                                    .contains(language)
+                            }),
+                        target,
+                    ),
+                    _ => unreachable!(),
+                };
+                page.apply_migration = if language.is_none() && platform.is_none() {
+                    None
+                } else {
+                    match migration::Plan::new(&detected, language, platform) {
+                        Ok(plan) => Some(plan),
+                        Err(error) => {
+                            page.status = Some(error);
+                            return page.reset_scroll();
+                        }
+                    }
+                };
+                page.status = None;
+            }
             Action::Finding(pre, item, checked) | Action::Dependency(pre, item, checked)
                 if matches!(page.state, State::Ready) =>
             {
@@ -693,6 +773,7 @@ impl Workspace {
         allow_stale: bool,
     ) -> Task<Message> {
         let config = self.ai_configuration();
+        let instructions_enabled = self.window_settings.snippet_ai_additional_instructions();
         let context = ApplyContext {
             policy: &self.clipboard.policy,
             vault: self.vault.as_ref(),
@@ -704,10 +785,10 @@ impl Workspace {
         let Some(page) = surface.analysis.current_mut() else {
             return Task::none();
         };
-        let review_selection = match &page.state {
-            State::Ready => None,
+        let (review_selection, migration) = match &page.state {
+            State::Ready => (None, current_migration(page, &surface.window)),
             State::ReviewApply(review) if review.pre == pre && allow_stale => {
-                Some(review.run.selected.clone())
+                (Some(review.run.selected.clone()), review.run.migration)
             }
             _ => return Task::none(),
         };
@@ -742,7 +823,9 @@ impl Workspace {
             let approval = Approval::new(config, page, &record.provenance.profile_id, context)?;
             approval.check_source(&snapshot.files()[0].content)?;
             let rendered = snapshot.render()?;
-            let instructions = page.instructions.clone();
+            let instructions = page
+                .additional_instructions(instructions_enabled)
+                .to_owned();
             let selection = match review_selection {
                 Some(selected) => selected,
                 None => {
@@ -750,7 +833,9 @@ impl Workspace {
                     selected.requirements = hardening::requirements(
                         &surface.window,
                         page,
-                        &snapshot.files()[0].language,
+                        migration
+                            .and_then(migration::Plan::result_language)
+                            .unwrap_or(&snapshot.files()[0].language),
                     )?;
                     selected
                 }
@@ -761,14 +846,17 @@ impl Workspace {
             let guidance = approval
                 .config
                 .reviewed_snippet_skill_guidance(&page.selected_skills);
-            let request = Request::new(
+            let request = Request::for_plan(
                 snapshot,
                 &record.analysis,
                 selection,
                 instructions.clone(),
                 guidance.text.clone(),
-                &record.source.report_language_code,
-                approval.config.code_text_language(),
+                (
+                    &record.source.report_language_code,
+                    approval.config.code_text_language(),
+                ),
+                migration,
             )?
             .with_profile(&approval.transport);
             let prompt = request.preview()?;
@@ -819,6 +907,7 @@ impl Workspace {
 
     fn preview_snippet_apply_recovery(&mut self, id: window::Id) -> Task<Message> {
         let config = self.ai_configuration();
+        let instructions_enabled = self.window_settings.snippet_ai_additional_instructions();
         let context = ApplyContext {
             policy: &self.clipboard.policy,
             vault: self.vault.as_ref(),
@@ -834,6 +923,15 @@ impl Workspace {
         let State::RecoverApply(recovery) = &page.state else {
             return Task::none();
         };
+        if !recovery.plan.request.instructions().trim().is_empty()
+            && !page.allows_additional_instructions(instructions_enabled)
+        {
+            page.status = Some(
+                "This saved apply request includes additional instructions. Enable the snippet editor setting to review it again."
+                    .into(),
+            );
+            return page.reset_scroll();
+        }
         if !recovery.plan.source_fresh(&surface.window, page) {
             page.status =
                 Some("Open the original snippet revision to recover this request.".into());
@@ -894,6 +992,7 @@ impl Workspace {
 
     fn start_snippet_apply(&mut self, id: window::Id) -> Task<Message> {
         let config = self.ai_configuration();
+        let instructions_enabled = self.window_settings.snippet_ai_additional_instructions();
         let token = self.allocate();
         let Some(surface) = self.snippets.get_mut(&id) else {
             return Task::none();
@@ -917,6 +1016,8 @@ impl Workspace {
         let plan = &recovery.plan;
         if !config.is_some_and(|config| Arc::ptr_eq(&config, &approval.config))
             || !plan.source_fresh(&surface.window, page)
+            || (!plan.request.instructions().trim().is_empty()
+                && !page.allows_additional_instructions(instructions_enabled))
         {
             if retrying {
                 page.state = State::RecoverApply(recovery);
@@ -1208,10 +1309,12 @@ impl Workspace {
             }
         };
         if status == ApplyStatus::Accepted
-            && let Err(error) =
-                surface
-                    .window
-                    .lock_analysis_apply(snippet, &review.run.before, &review.run.after)
+            && let Err(error) = surface.window.lock_analysis_apply(
+                snippet,
+                &review.run.before,
+                &review.run.after,
+                review.run.migration,
+            )
         {
             page.status = Some(error);
             return Task::none();
@@ -1268,15 +1371,17 @@ impl Workspace {
             page.status = Some(hardening::MANAGED_HEADER_CHANGED.into());
             return Task::none();
         }
-        if let Err(error) =
-            surface
-                .window
-                .lock_analysis_apply(snippet, &review.run.before, &review.run.after)
-        {
+        if let Err(error) = surface.window.lock_analysis_apply(
+            snippet,
+            &review.run.before,
+            &review.run.after,
+            review.run.migration,
+        ) {
             page.status = Some(error);
             return Task::none();
         }
         surface.window.finish_analysis_apply(true);
+        page.apply_migration = None;
         page.state = State::Ready;
         page.refresh_record_hash(&surface.window);
         surface.analysis.editor();
@@ -1483,6 +1588,9 @@ impl Workspace {
                     surface
                         .window
                         .finish_analysis_apply(result.is_ok() && header_current);
+                    if result.is_ok() && header_current {
+                        page.apply_migration = None;
+                    }
                 }
                 match result {
                     Ok(history) => {
@@ -1621,6 +1729,54 @@ pub(super) fn restore_saved(page: &mut Page, window: &SnippetWindow, pre: Snippe
     }
 }
 
+fn migration_source(page: &Page, window: &SnippetWindow) -> Option<Inspection> {
+    let Subject::Snippet(id) = page.subject else {
+        return None;
+    };
+    if !window.can_apply_analysis_to(id) {
+        return None;
+    }
+    let (_, language, source) = window.analysis_snippet(id)?;
+    (source.len() <= crate::snippet_analysis::model::MAX_APPLY_CONTENT_BYTES)
+        .then(|| mix::inspect(&language, &source))
+}
+
+fn migration_controls(page: &Page, window: &SnippetWindow) -> Option<view::Migration> {
+    if !matches!(page.state, State::Ready) {
+        return None;
+    }
+    let detected = migration_source(page, window)?;
+    let platforms: Vec<_> = HostFormat::CONVERTIBLE
+        .into_iter()
+        .filter(|target| {
+            detected
+                .host
+                .is_some_and(|host| HostFormat::CONVERTIBLE.contains(&host) && host != *target)
+        })
+        .collect();
+    let plan = matching_migration(page, &detected);
+    let languages = plan.and_then(migration::Plan::destination).map_or_else(
+        || migration::Language::available(&detected),
+        migration::Language::platform_targets,
+    );
+    (!platforms.is_empty() || !languages.is_empty()).then_some(view::Migration {
+        languages,
+        platforms,
+        plan,
+    })
+}
+
+fn current_migration(page: &Page, window: &SnippetWindow) -> Option<migration::Plan> {
+    page.apply_migration?;
+    matching_migration(page, &migration_source(page, window)?)
+}
+
+fn matching_migration(page: &Page, detected: &Inspection) -> Option<migration::Plan> {
+    page.apply_migration.filter(|plan| {
+        migration::Plan::new(detected, plan.language(), plan.destination()).ok() == Some(*plan)
+    })
+}
+
 pub(super) fn controls<'a>(
     page: &'a Page,
     window: &SnippetWindow,
@@ -1634,6 +1790,7 @@ pub(super) fn controls<'a>(
         selection: selected,
         can_plan: can_plan(page, window, profile),
         hardening: hardening::controls(page, window),
+        migration: migration_controls(page, window),
     }
 }
 

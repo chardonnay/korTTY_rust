@@ -15,6 +15,65 @@ pub(crate) const MAX_TERMINAL_COLUMNS: u16 = 500;
 pub(crate) const MIN_TERMINAL_ROWS: u16 = 10;
 pub(crate) const MAX_TERMINAL_ROWS: u16 = 200;
 pub(crate) const MAX_PASTE_LINE_DELAY_MS: u16 = 1000;
+pub(crate) const MAX_ASSIGNED_AI_SKILLS: usize = 32;
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct AiAssignments {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) profile: Option<ProfileRef>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) skills: Vec<u64>,
+}
+
+impl AiAssignments {
+    pub(crate) fn from_terminal(terminal: &TerminalOverrides) -> Self {
+        Self {
+            profile: terminal.ai_profile.clone(),
+            skills: terminal.ai_skills.clone(),
+        }
+    }
+
+    pub(crate) fn write_terminal(&self, terminal: &mut TerminalOverrides) {
+        terminal.ai_profile.clone_from(&self.profile);
+        terminal.ai_skills.clone_from(&self.skills);
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.profile.is_none() && self.skills.is_empty()
+    }
+
+    pub(crate) fn validate(&self) -> io::Result<()> {
+        if self
+            .profile
+            .as_ref()
+            .is_some_and(|profile| !profile.is_nonzero())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid AI profile reference.",
+            ));
+        }
+        validate_ai_skills(&self.skills)
+    }
+}
+
+fn validate_ai_skills(skills: &[u64]) -> io::Result<()> {
+    if skills.len() > MAX_ASSIGNED_AI_SKILLS
+        || skills.contains(&0)
+        || skills
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != skills.len()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid assigned AI skills.",
+        ));
+    }
+    Ok(())
+}
 
 /// Built-in IDs retain their original string representation in saved profiles.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -133,6 +192,66 @@ pub(crate) struct TerminalOverrides {
     pub(crate) journal: crate::session_journal::ConnectionConfig,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct TerminalAppearance {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) theme: Option<ThemeOverride>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) font_family: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) font_size: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) foreground: Option<Rgb>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) background: Option<Rgb>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) sgr_enabled: Option<bool>,
+}
+
+impl TerminalAppearance {
+    pub(crate) fn from_terminal(other: &TerminalOverrides) -> Self {
+        Self {
+            theme: other.theme.clone(),
+            font_family: other.font_family.clone(),
+            font_size: other.font_size,
+            foreground: other.foreground,
+            background: other.background,
+            sgr_enabled: other.sgr_enabled,
+        }
+    }
+
+    pub(crate) fn write_terminal(&self, terminal: &mut TerminalOverrides) {
+        terminal.theme.clone_from(&self.theme);
+        terminal.font_family.clone_from(&self.font_family);
+        terminal.font_size = self.font_size;
+        terminal.foreground = self.foreground;
+        terminal.background = self.background;
+        terminal.sgr_enabled = self.sgr_enabled;
+    }
+
+    pub(crate) fn display_overrides(&self, saved: Option<&TerminalOverrides>) -> TerminalOverrides {
+        let mut result = TerminalOverrides::default();
+        if let Some(saved) = saved {
+            result.cursor = saved.cursor;
+            result.cursor_style = saved.cursor_style;
+            result.selection = saved.selection;
+            result.ansi = saved.ansi;
+            result.bold = saved.bold;
+        }
+        self.write_terminal(&mut result);
+        result
+    }
+
+    pub(crate) fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    pub(crate) fn validate(&self) -> io::Result<()> {
+        self.display_overrides(None).validate()
+    }
+}
+
 fn no_ansi_colors(colors: &[Option<Rgb>; 16]) -> bool {
     colors.iter().all(Option::is_none)
 }
@@ -221,20 +340,7 @@ impl TerminalOverrides {
                 "Invalid AI agent design ID.",
             ));
         }
-        if self.ai_skills.len() > 32
-            || self.ai_skills.contains(&0)
-            || self
-                .ai_skills
-                .iter()
-                .collect::<std::collections::BTreeSet<_>>()
-                .len()
-                != self.ai_skills.len()
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Invalid assigned AI skills.",
-            ));
-        }
+        validate_ai_skills(&self.ai_skills)?;
         if self
             .highlight_set
             .as_deref()

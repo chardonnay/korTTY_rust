@@ -7,8 +7,8 @@ use ureq::{Body, http::Response};
 use zeroize::Zeroizing;
 
 use crate::local_ai::{
-    Client, DEFAULT_TIMEOUT, Error, Profile, RequestContent, RequestMessage, Transport,
-    UsageAttempt, VisionPart, completion_error_bytes,
+    Client, Error, Profile, RequestContent, RequestMessage, Transport, UsageAttempt, VisionPart,
+    completion_error_bytes,
 };
 
 use super::STRUCTURED_JSON_SYSTEM_SUFFIX;
@@ -275,15 +275,13 @@ impl Client {
         deadline: Option<Instant>,
         mut before_retry: impl FnMut() -> Result<(), String>,
         attempt: &mut UsageAttempt,
-    ) -> Result<(Response<Body>, Instant), Error> {
+    ) -> Result<(Response<Body>, Option<Instant>), Error> {
         let (messages, json_response, streaming) = input;
-        let cutoff = Instant::now() + self.profile.options.timeout.unwrap_or(DEFAULT_TIMEOUT);
-        let deadline = deadline.map_or(cutoff, |deadline| deadline.min(cutoff));
+        let deadline = self.profile.options.request_deadline(deadline);
         let mut request = Request::new(&self.profile, streaming);
         loop {
             let body = encode(self, messages, json_response, streaming, &request)?;
-            let mut response =
-                self.completion_response(transport, &body, Some(deadline), attempt)?;
+            let mut response = self.completion_response(transport, &body, deadline, attempt)?;
             let status = response.status().as_u16();
             if response.status().is_success() {
                 return Ok((response, deadline));
@@ -295,7 +293,7 @@ impl Client {
             if !self.active() {
                 return Err(Error::Cancelled);
             }
-            if Instant::now() >= deadline {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 return Err(Error::TimedOut);
             }
             let message = rejection.ok().and_then(|bytes| rejection_message(&bytes));
@@ -310,7 +308,7 @@ impl Client {
                 drop(Zeroizing::new(id));
             }
             attempt.reviewed_https_credential = Some(attempt.credential.clone());
-            self.before_completion_dispatch(transport, Some(deadline), &mut before_retry, attempt)?;
+            self.before_completion_dispatch(transport, deadline, &mut before_retry, attempt)?;
         }
     }
 }

@@ -1,0 +1,217 @@
+# HTML Living Standard, WHATWG July 2026 review draft
+# https://html.spec.whatwg.org/review-drafts/2026-07/#index
+# Vocabulary and explicit keyword values extracted from the index.
+# Regenerate with python scripts/update-html-completion-data.py
+G	accesskey autocapitalize autocorrect autofocus class contenteditable dir draggable enterkeyhint headingoffset headingreset hidden id inert inputmode is itemid itemprop itemref itemscope itemtype lang nonce onauxclick onbeforeinput onbeforematch onbeforetoggle onblur oncancel oncanplay oncanplaythrough onchange onclick onclose oncommand oncontextlost oncontextmenu oncontextrestored oncopy oncuechange oncut ondblclick ondrag ondragend ondragenter ondragleave ondragover ondragstart ondrop ondurationchange onemptied onended onerror onfocus onformdata oninput oninvalid onkeydown onkeypress onkeyup onload onloadeddata onloadedmetadata onloadstart onmousedown onmouseenter onmouseleave onmousemove onmouseout onmouseover onmouseup onpaste onpause onplay onplaying onprogress onratechange onreset onresize onscroll onscrollend onsecuritypolicyviolation onseeked onseeking onselect onslotchange onstalled onsubmit onsuspend ontimeupdate ontoggle onvolumechange onwaiting onwheel popover slot spellcheck style tabindex title translate writingsuggestions
+T	a	download href hreflang ping referrerpolicy rel target type
+T	abbr	title
+T	address
+T	area	alt coords download href ping referrerpolicy rel shape target
+T	article
+T	aside
+T	audio	autoplay controls crossorigin loading loop muted preload src
+T	b
+T	base	href target
+T	bdi
+T	bdo	dir
+T	blockquote	cite
+T	body	onafterprint onbeforeprint onbeforeunload onhashchange onlanguagechange onmessage onmessageerror onoffline ononline onpagehide onpagereveal onpageshow onpageswap onpopstate onrejectionhandled onstorage onunhandledrejection onunload
+T	br
+T	button	command commandfor disabled form formaction formenctype formmethod formnovalidate formtarget name popovertarget popovertargetaction type value
+T	canvas	height width
+T	caption
+T	cite
+T	code
+T	col	span
+T	colgroup	span
+T	data	value
+T	datalist
+T	dd
+T	del	cite datetime
+T	details	name open
+T	dfn	title
+T	dialog	closedby open
+T	div
+T	dl
+T	dt
+T	em
+T	embed	height src type width
+T	fieldset	disabled form name
+T	figcaption
+T	figure
+T	footer
+T	form	accept-charset action autocomplete enctype method name novalidate rel target
+T	h1
+T	h2
+T	h3
+T	h4
+T	h5
+T	h6
+T	head
+T	header
+T	hgroup
+T	hr
+T	html
+T	i
+T	iframe	allow allowfullscreen height loading name referrerpolicy sandbox src srcdoc width
+T	img	alt controls crossorigin decoding fetchpriority height ismap loading referrerpolicy sizes src srcset usemap width
+T	input	accept alpha alt autocomplete checked colorspace dirname disabled form formaction formenctype formmethod formnovalidate formtarget height list max maxlength min minlength multiple name pattern placeholder popovertarget popovertargetaction readonly required size src step title type value width
+T	ins	cite datetime
+T	kbd
+T	label	for
+T	legend
+T	li	value
+T	link	as blocking color crossorigin disabled fetchpriority href hreflang imagesizes imagesrcset integrity media referrerpolicy rel sizes title type
+T	main
+T	map	name
+T	mark
+T	math
+T	menu
+T	meta	charset content http-equiv media name
+T	meter	high low max min optimum value
+T	nav
+T	noscript
+T	object	data form height name type width
+T	ol	reversed start type
+T	optgroup	disabled label
+T	option	disabled label selected value
+T	output	for form name
+T	p
+T	picture	height width
+T	pre
+T	progress	max value
+T	q	cite
+T	rp
+T	rt
+T	ruby
+T	s
+T	samp
+T	script	async blocking crossorigin defer fetchpriority integrity nomodule referrerpolicy src type
+T	search
+T	section
+T	select	autocomplete disabled form multiple name required size
+T	selectedcontent
+T	slot	name
+T	small
+T	source	height media sizes src srcset type width
+T	span
+T	strong
+T	style	blocking media title
+T	sub
+T	summary
+T	sup
+T	svg
+T	table
+T	tbody
+T	td	colspan headers rowspan
+T	template	shadowrootclonable shadowrootcustomelementregistry shadowrootdelegatesfocus shadowrootmode shadowrootserializable shadowrootslotassignment
+T	textarea	autocomplete cols dirname disabled form maxlength minlength name placeholder readonly required rows wrap
+T	tfoot
+T	th	abbr colspan headers rowspan scope
+T	thead
+T	time	datetime
+T	title
+T	tr
+T	track	default kind label src srclang
+T	u
+T	ul
+T	var
+T	video	autoplay controls crossorigin height loading loop muted playsinline poster preload src width
+T	wbr
+V	*	autocapitalize	characters none off on sentences words
+V	*	autocorrect	off on
+V	*	contenteditable	false plaintext-only true
+V	*	dir	auto ltr rtl
+V	*	draggable	false true
+V	*	enterkeyhint	done enter go next previous search send
+V	*	hidden	hidden until-found
+V	*	inputmode	decimal email none numeric search tel text url
+V	*	popover	auto hint manual
+V	*	spellcheck	false true
+V	*	translate	no yes
+V	*	writingsuggestions	false true
+V	area	shape	circle default poly rect
+V	audio	crossorigin	anonymous use-credentials
+V	audio	loading	eager lazy
+V	audio	preload	auto metadata none
+V	bdo	dir	ltr rtl
+V	button	formenctype	application/x-www-form-urlencoded multipart/form-data text/plain
+V	button	formmethod	dialog get post
+V	button	popovertargetaction	hide show toggle
+V	button	type	button reset submit
+V	form	autocomplete	off on
+V	form	enctype	application/x-www-form-urlencoded multipart/form-data text/plain
+V	form	method	dialog get post
+V	iframe	loading	eager lazy
+V	img	crossorigin	anonymous use-credentials
+V	img	decoding	async auto sync
+V	img	fetchpriority	auto high low
+V	img	loading	eager lazy
+V	input	colorspace	display-p3 limited-srgb
+V	input	formenctype	application/x-www-form-urlencoded multipart/form-data text/plain
+V	input	formmethod	dialog get post
+V	input	popovertargetaction	hide show toggle
+V	link	crossorigin	anonymous use-credentials
+V	link	fetchpriority	auto high low
+V	meta	charset	utf-8
+V	meta	http-equiv	content-security-policy content-type default-style refresh x-ua-compatible
+V	ol	type	1 A I a i
+V	script	crossorigin	anonymous use-credentials
+V	script	fetchpriority	auto high low
+V	template	shadowrootmode	closed open
+V	template	shadowrootslotassignment	manual named
+V	textarea	wrap	hard soft
+V	th	scope	col colgroup row rowgroup
+V	track	kind	captions chapters descriptions metadata subtitles
+V	video	crossorigin	anonymous use-credentials
+V	video	loading	eager lazy
+V	video	preload	auto metadata none
+# WAI-ARIA 1.2, W3C Recommendation (6 June 2023)
+# https://www.w3.org/TR/2023/REC-wai-aria-1.2-20230606/
+A	aria-activedescendant
+A	aria-atomic	false true
+A	aria-autocomplete	both inline list none
+A	aria-busy	true
+A	aria-checked	false mixed true undefined
+A	aria-colcount
+A	aria-colindex
+A	aria-colspan
+A	aria-controls
+A	aria-current	date false location page step time true
+A	aria-describedby
+A	aria-details
+A	aria-disabled	false true
+A	aria-errormessage
+A	aria-expanded	false true undefined
+A	aria-flowto
+A	aria-haspopup	dialog false grid listbox menu tree true
+A	aria-hidden	false true undefined
+A	aria-invalid	false grammar spelling true
+A	aria-keyshortcuts
+A	aria-label
+A	aria-labelledby
+A	aria-level
+A	aria-live	assertive off polite
+A	aria-modal	false true
+A	aria-multiline	false true
+A	aria-multiselectable	false true
+A	aria-orientation	horizontal undefined vertical
+A	aria-owns
+A	aria-placeholder
+A	aria-posinset
+A	aria-pressed	false mixed true undefined
+A	aria-readonly	false true
+A	aria-relevant	additions all removals text
+A	aria-required	false true
+A	aria-roledescription
+A	aria-rowcount
+A	aria-rowindex
+A	aria-rowspan
+A	aria-selected	false true undefined
+A	aria-setsize
+A	aria-sort	ascending descending none other
+A	aria-valuemax
+A	aria-valuemin
+A	aria-valuenow
+A	aria-valuetext
+V	*	role	alert alertdialog application article banner blockquote button caption cell checkbox code columnheader combobox complementary contentinfo definition deletion dialog directory document emphasis feed figure form generic grid gridcell group heading img insertion link list listbox listitem log main marquee math menu menubar menuitem menuitemcheckbox menuitemradio meter navigation none note option paragraph presentation progressbar radio radiogroup region row rowgroup rowheader scrollbar search searchbox separator slider spinbutton status strong subscript superscript switch tab table tablist tabpanel term textbox time timer toolbar tooltip tree treegrid treeitem

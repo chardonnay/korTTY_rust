@@ -4,11 +4,10 @@ use iced::widget::{
     button, checkbox, column, container, pick_list, row, rule, scrollable, space, text, text_input,
 };
 use iced::{Alignment, Color, Element, Length, Theme, window};
-use kortty_pty::available_local_shells;
 
 use super::{
-    Connection, Desktop, Dialog, IbmKind, Message, Protocol, Store, TerminalProfile, Workspace,
-    profile, wrap,
+    Connection, Desktop, Dialog, IbmKind, Message, Protocol, Section, Store, TerminalProfile,
+    Workspace, wrap,
 };
 use crate::ssh_dialog::{self, LoginMessage};
 use crate::vault_window::Kind;
@@ -101,6 +100,8 @@ impl Workspace {
         .align_y(Alignment::Center);
         let status = if dialog.saving {
             Some("Saving connection…")
+        } else if dialog.section_visible(Section::Appearance) && !dialog.appearance.valid() {
+            Some("Enter colors as #RRGGBB or leave them empty.")
         } else {
             dialog.status.as_deref()
         };
@@ -120,6 +121,21 @@ impl Workspace {
 
     fn quick_individual_view<'a>(&'a self, dialog: &'a Dialog) -> Element<'a, Message> {
         let mut body = column![dialog.saved_view()].spacing(9);
+        let section = |section, title| {
+            let expanded = self
+                .window_settings
+                .quick_connect_expanded_sections
+                .as_ref()
+                .is_some_and(|sections| sections.contains(&section));
+            let icon = if expanded { "▾" } else { "▸" };
+            (
+                button(text(format!("{icon} {title}")))
+                    .style(neutral_button)
+                    .on_press(Message::ToggleSection(section))
+                    .width(Length::Fill),
+                expanded,
+            )
+        };
         if dialog.protocol.is_ssh() {
             body = body.push(dialog.ssh.identity_view(LABEL_WIDTH).map(Message::Ssh));
         }
@@ -131,20 +147,15 @@ impl Workspace {
                 Message::Protocol,
             ),
         ));
-        let saved_local = (dialog.protocol == Protocol::Local)
-            .then(|| dialog.selected_local())
-            .flatten();
-        if let Some(emulation) = saved_local.and_then(|saved| saved.profile()) {
-            body = body.push(labeled("Terminal emulation", text(emulation.to_string())));
-        } else if dialog.protocol.ibm_models().is_none() && dialog.protocol != Protocol::Sftp {
+        if dialog.protocol.ibm_models().is_none() && dialog.protocol != Protocol::Sftp {
             body = body.push(labeled(
                 "Terminal emulation",
                 pick_list(
                     TerminalProfile::ALL,
-                    Some(if dialog.protocol == Protocol::Serial {
-                        dialog.serial.profile()
-                    } else {
-                        dialog.ssh.profile()
+                    Some(match dialog.protocol {
+                        Protocol::Serial => dialog.serial.profile(),
+                        Protocol::Local => dialog.local_emulation,
+                        _ => dialog.ssh.profile(),
                     }),
                     Message::Profile,
                 ),
@@ -204,17 +215,10 @@ impl Workspace {
                         ));
                     }
                 }
-                body = body.push(
-                    button(if dialog.options {
-                        "▾ Connection settings"
-                    } else {
-                        "▸ Connection settings"
-                    })
-                    .style(neutral_button)
-                    .on_press(Message::ShowOptions)
-                    .width(Length::Fill),
-                );
-                if dialog.options {
+                let (header, expanded) =
+                    section(Section::ConnectionSettings, "Connection settings");
+                body = body.push(header);
+                if expanded {
                     body = body
                         .push(
                             dialog
@@ -223,7 +227,11 @@ impl Workspace {
                                 .map(Message::Ssh),
                         )
                         .push(text("Host-key verification is required.").size(13));
-                    if dialog.protocol == Protocol::Ssh {
+                }
+                if dialog.section_visible(Section::Logging) {
+                    let (header, expanded) = section(Section::Logging, "Terminal log");
+                    body = body.push(header);
+                    if expanded {
                         body = body.push(
                             dialog
                                 .ssh
@@ -239,34 +247,19 @@ impl Workspace {
                     body = body.push(text(notice).size(13));
                 }
             }
-            Protocol::Local if dialog.selected_local.is_some() => {
-                let name = saved_local.map_or_else(
-                    || "This saved shell no longer exists.".into(),
-                    |profile| profile.display_name(),
-                );
-                body = body
-                    .push(labeled("Profile", text(name)))
-                    .push(button("Use an unsaved shell").on_press(Message::AdHocLocal));
-            }
             Protocol::Local => {
-                let integration =
-                    self.quick_shell_integration(dialog.ssh.profile(), dialog.local_shell);
-                let shell = pick_list(
-                    available_local_shells(),
-                    Some(dialog.local_shell),
-                    Message::LocalShell,
+                body = body.push(self.quick_local_view(dialog));
+                body = body.push(
+                    checkbox(dialog.save)
+                        .label("Save as a new connection")
+                        .on_toggle(Message::SaveConnection),
                 );
-                body = body.push(labeled("Shell", shell)).push(labeled(
-                    "Shell integration",
-                    checkbox(dialog.shell_integration)
-                        .label("Add shell integration automatically")
-                        .on_toggle_maybe(
-                            (dialog.shell_integration || integration.is_ok())
-                                .then_some(Message::ShellIntegration),
-                        ),
-                ));
-                if let Err(reason) = integration {
-                    body = body.push(text(reason).size(13));
+                if dialog.save {
+                    body = body.push(labeled(
+                        "Connection name",
+                        text_input("Local shell profile name (optional)", &dialog.name)
+                            .on_input(Message::ConnectionName),
+                    ));
                 }
             }
             Protocol::Serial => {
@@ -290,34 +283,11 @@ impl Workspace {
                 }
             }
         }
-        let terminal = match dialog.protocol {
-            Protocol::Local => saved_local.map(|profile| &profile.terminal),
-            Protocol::Ssh => dialog.selected().map(|profile| &profile.terminal),
-            _ => None,
-        };
-        let saved_font = terminal
-            .is_some_and(|settings| settings.font_size.is_some() || settings.theme.is_some());
-        if dialog.protocol != Protocol::Sftp && !saved_font {
-            body = body.push(
-                button(if dialog.appearance {
-                    "▾ Terminal Appearance"
-                } else {
-                    "▸ Terminal Appearance"
-                })
-                .style(neutral_button)
-                .on_press(Message::ShowAppearance)
-                .width(Length::Fill),
-            );
-            if dialog.appearance {
-                body = body.push(labeled(
-                    "Font size",
-                    pick_list(
-                        (profile::MIN_TERMINAL_FONT..=profile::MAX_TERMINAL_FONT)
-                            .collect::<Vec<_>>(),
-                        Some(dialog.font.unwrap_or(self.window_settings.terminal_font)),
-                        Message::Font,
-                    ),
-                ));
+        if dialog.section_visible(Section::Appearance) {
+            let (header, expanded) = section(Section::Appearance, "Terminal Appearance");
+            body = body.push(header);
+            if expanded {
+                body = body.push(self.quick_appearance_view(dialog));
             }
             body = body.push(row![
                 space::horizontal(),
@@ -325,6 +295,31 @@ impl Workspace {
                     .style(neutral_button)
                     .on_press(Message::Reset)
             ]);
+        }
+        if self.terminal_effects_enabled() && dialog.section_visible(Section::Effect) {
+            let (header, expanded) = section(Section::Effect, "Terminal Effect");
+            body = body.push(header);
+            if expanded {
+                let available: Vec<_> = crate::terminal_effects::Effect::ALL
+                    .into_iter()
+                    .filter(|effect| self.allowed_terminal_effect(*effect))
+                    .collect();
+                body = body.push(dialog.effect.view(
+                    &available,
+                    Message::Effect,
+                    Message::EffectSpeed,
+                ));
+            }
+        }
+        if dialog.section_visible(Section::Ai)
+            && let Some(config) = self.ai_configuration()
+            && let Some(ai) = dialog.ai_view(&config)
+        {
+            let (header, expanded) = section(Section::Ai, "AI");
+            body = body.push(header);
+            if expanded {
+                body = body.push(ai);
+            }
         }
         scrollable(
             container(body.padding(14))
@@ -515,7 +510,10 @@ fn tab(label: &str, selected: bool, message: Message) -> Element<'_, Message> {
         .into()
 }
 
-fn labeled<'a>(label: &'a str, field: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+pub(super) fn labeled<'a>(
+    label: &'a str,
+    field: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
     row![text(label).width(LABEL_WIDTH), field.into()]
         .spacing(8)
         .align_y(Alignment::Center)

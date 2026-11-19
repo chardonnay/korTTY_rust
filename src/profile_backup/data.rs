@@ -13,9 +13,12 @@ use zeroize::Zeroizing;
 use crate::private_files::Directory;
 use crate::recording_window::preferences as recording_preferences;
 use crate::session_journal::markers;
+use crate::snippet_window::session as snippet_session;
+use crate::terminal_agent::history as agent_history;
 use crate::terminal_highlight;
 use crate::terminal_view::background_image::{self, AssetId};
 use crate::workspace::backup_data;
+use crate::workspace::question_history::{self, Kind as QuestionKind};
 use crate::{connection_store, profile, scheduler_window::SshCommand, snippets, ssh_key_catalog};
 
 use super::Snapshot;
@@ -26,9 +29,13 @@ pub(super) mod analysis;
 mod tests;
 
 pub(super) const STATIC_PATHS: &[&str] = &[
+    agent_history::BACKUP_PATH,
     "connections.json",
     "environments.json",
     "jobs.json",
+    question_history::MANUAL_FILE,
+    question_history::TERMINAL_FILE,
+    question_history::WORKFLOW_FILE,
     markers::FILE,
     "openpgp-recipients.json",
     "snippets.json",
@@ -266,6 +273,7 @@ fn validate_entries(snapshot: &Snapshot, java: bool) -> io::Result<()> {
         let java_statistics = java && path == crate::ai_manager::backup::JAVA_STATISTICS;
         let java_recording_preferences = java && path == recording_preferences::FILE;
         let java_highlights = java && path == terminal_highlight::FILE;
+        let java_snippet_tabs = java && path == snippet_session::FILE_NAME;
         let limit = if java_statistics {
             crate::ai_manager::backup::MAX_STATISTICS_BYTES
         } else {
@@ -274,6 +282,7 @@ fn validate_entries(snapshot: &Snapshot, java: bool) -> io::Result<()> {
         if (!java_statistics
             && !java_recording_preferences
             && !java_highlights
+            && !java_snippet_tabs
             && !allowed_path(path))
             || bytes.len() > limit
         {
@@ -296,6 +305,16 @@ fn validate_entries(snapshot: &Snapshot, java: bool) -> io::Result<()> {
                 }
             }
             markers::FILE => markers::validate_backup(bytes)?,
+            question_history::MANUAL_FILE => {
+                question_history::validate(bytes, QuestionKind::Manual)?
+            }
+            question_history::TERMINAL_FILE => {
+                question_history::validate(bytes, QuestionKind::Terminal)?
+            }
+            question_history::WORKFLOW_FILE => {
+                question_history::validate(bytes, QuestionKind::Workflow)?
+            }
+            agent_history::BACKUP_PATH => agent_history::validate_backup(bytes)?,
             recording_preferences::FILE if java_recording_preferences => {
                 backup_data::recording::validate(bytes)?;
             }
@@ -307,6 +326,16 @@ fn validate_entries(snapshot: &Snapshot, java: bool) -> io::Result<()> {
             }
             "openpgp-recipients.json" => snippets::recipients::validate_backup(bytes)?,
             "snippets.json" => snippets::validate_backup(bytes)?,
+            snippet_session::FILE_NAME
+                if java_snippet_tabs && snapshot.contains_key(snippets::FILE_NAME) =>
+            {
+                snippet_session::decode(bytes)?;
+            }
+            snippet_session::FILE_NAME => {
+                return Err(invalid(
+                    "Missing Java snippet catalogue for the tab selection",
+                ));
+            }
             "ssh/known_hosts" => TrustStore::validate_backup(bytes)?,
             "vault/vault.bin" => Vault::validate_backup_envelope(bytes).map_err(invalid)?,
             KEY_CATALOG => {}
@@ -374,6 +403,11 @@ pub(super) fn file_limit(path: &str) -> usize {
             crate::workspace::environment_access::java_backup::MAX_BACKUP_BYTES
         }
         "snippets.json" => 64 * 1024 * 1024,
+        snippet_session::FILE_NAME => snippet_session::MAX_BYTES,
+        question_history::MANUAL_FILE => QuestionKind::Manual.max_bytes(),
+        question_history::TERMINAL_FILE => QuestionKind::Terminal.max_bytes(),
+        question_history::WORKFLOW_FILE => QuestionKind::Workflow.max_bytes(),
+        agent_history::BACKUP_PATH => agent_history::MAX_BYTES,
         "jobs.json" => 16 * 1024 * 1024,
         markers::FILE => markers::MAX_FILE_BYTES,
         recording_preferences::FILE => recording_preferences::MAX_BYTES,
@@ -390,6 +424,13 @@ pub(super) fn file_limit(path: &str) -> usize {
 
 fn open_path(directory: &Directory, path: &str) -> io::Result<File> {
     match path.split_once('/') {
+        Some((parent, name)) if path == agent_history::BACKUP_PATH => {
+            let file = directory
+                .private_child(parent, false)?
+                .open_private_file(name)?;
+            crate::private_files::require_single_link(&file)?;
+            Ok(file)
+        }
         Some((parent, name)) => directory.subdirectory(parent, false)?.open_file(name),
         None => directory.open_file(path),
     }

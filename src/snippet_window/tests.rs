@@ -6,6 +6,460 @@ use crate::snippets::tests::Profile;
 
 use super::*;
 
+fn selected_completion(window: &SnippetWindow) -> Option<usize> {
+    match window.draft.completion.as_ref()? {
+        completion::Completion::Local(popup) => popup.selected(),
+        completion::Completion::Lua(_) => None,
+    }
+}
+
+#[test]
+fn local_snippet_completion_inserts_into_the_editor_and_refocuses_it() {
+    let profile = Profile::new();
+    let mut window = SnippetWindow::open(profile.path()).unwrap();
+    window.update(Message::New);
+    window.update(Message::Language("python".into()));
+    window.update(Message::Edit(text_editor::Action::Edit(
+        text_editor::Edit::Paste(Arc::new("for entry in ra".into())),
+    )));
+    window.update(Message::Complete);
+    assert!(matches!(
+        window.draft.completion,
+        Some(completion::Completion::Local(_))
+    ));
+    let selected = selected_completion(&window).unwrap();
+    window.update(Message::Edit(text_editor::Action::Edit(
+        text_editor::Edit::Insert('x'),
+    )));
+    assert!(selected_completion(&window).is_none());
+    assert!(window.draft.completion.is_some());
+    window.update(Message::Edit(text_editor::Action::Edit(
+        text_editor::Edit::Backspace,
+    )));
+    assert_eq!(selected_completion(&window), Some(selected));
+    assert_eq!(
+        window.update(Message::ChooseCompletion(selected)),
+        Update::FocusEditor
+    );
+    assert_eq!(window.draft.content.text(), "for entry in range(10)");
+    assert_eq!(window.draft.content.selection().as_deref(), Some("10"));
+    assert!(window.draft.dirty);
+    assert!(window.draft.completion.is_none());
+}
+
+#[test]
+fn loaded_json_schema_stays_with_the_requesting_snippet_across_save_and_reopen() {
+    let profile = Profile::new();
+    let schema_path = profile.path().with_file_name("snippet-test.schema.json");
+    let related_path = schema_path.with_file_name("regions.json");
+    std::fs::write(
+        &schema_path,
+        br##"{"$id":"http://schemas.example.invalid/catalog/root.json","$ref":"regions.json#/$defs/region-object"}"##,
+    )
+    .unwrap();
+    std::fs::write(
+        &related_path,
+        br#"{"$defs":{"region-object":{"properties":{"region":{"const":"local"}}}}}"#,
+    )
+    .unwrap();
+    let mut window = SnippetWindow::open(profile.path()).unwrap();
+    window.update(Message::New);
+    window.update(Message::Name("Schema fixture".into()));
+    window.update(Message::Language("json".into()));
+    window.update(Message::Edit(text_editor::Action::Edit(
+        text_editor::Edit::Paste(Arc::new("{\"reg".into())),
+    )));
+    let origin = window.tabs.active();
+    let schema = Message::JsonSchema;
+    window.update(schema(json_schema::Message::Show));
+    window.update(schema(json_schema::Message::IncludeRelated(true)));
+    window.update(schema(json_schema::Message::Path(
+        schema_path.to_str().unwrap().to_owned(),
+    )));
+    let Update::ReadJsonSchema(read) = window.update(schema(json_schema::Message::Load)) else {
+        panic!("expected a request to read the local schema");
+    };
+    let ticket = read.ticket.clone();
+    window.update(Message::New);
+    window.update(Message::Language("json".into()));
+    window.update(schema(json_schema::Message::Ready(
+        ticket,
+        Ok(read.run().unwrap()),
+    )));
+    assert!(window.draft.metadata.json_schema.is_none());
+    window.update(Message::SelectTab(origin));
+    window.update(Message::Complete);
+    let selected = selected_completion(&window).unwrap();
+    window.update(Message::ChooseCompletion(selected));
+    assert_eq!(window.draft.content.text(), "{\"region\": ");
+    assert_eq!(window.update(Message::Save), Update::Changed);
+    let id = window.draft.id.unwrap();
+    let stored = std::fs::read_to_string(profile.path()).unwrap();
+    assert!(stored.contains("json_schema"));
+    assert!(!stored.contains("snippet-test.schema.json"));
+    drop(window);
+    std::fs::remove_file(schema_path).unwrap();
+    std::fs::remove_file(related_path).unwrap();
+
+    let mut reopened = SnippetWindow::open(profile.path()).unwrap();
+    reopened.update(Message::Open(id));
+    assert!(reopened.draft.metadata.json_schema.is_some());
+    let validation = crate::snippets::json_schema::check(
+        r#"{"region":"local"}"#,
+        reopened.draft.metadata.json_schema.as_deref(),
+        &std::sync::atomic::AtomicBool::new(false),
+        4096,
+    )
+    .unwrap();
+    assert_eq!(
+        validation.notice, "JSON matches the schema.",
+        "{}",
+        validation.diagnostics
+    );
+    reopened
+        .draft
+        .content
+        .perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
+    reopened.update(Message::Edit(text_editor::Action::Edit(
+        text_editor::Edit::Paste(Arc::new("lo".into())),
+    )));
+    reopened.update(Message::Complete);
+    let value = selected_completion(&reopened).unwrap();
+    reopened.update(Message::ChooseCompletion(value));
+    assert_eq!(reopened.draft.content.text(), "{\"region\": \"local\"");
+    reopened.update(schema(json_schema::Message::Clear));
+    assert!(reopened.draft.metadata.json_schema.is_none());
+    assert_eq!(reopened.update(Message::Save), Update::Changed);
+    assert!(
+        Library::open(profile.path())
+            .unwrap()
+            .get(id)
+            .unwrap()
+            .metadata()
+            .json_schema
+            .is_none()
+    );
+}
+
+#[test]
+fn snippet_template_rebases_later_fields_and_returns_to_the_end() {
+    let profile = Profile::new();
+    let mut window = SnippetWindow::open(profile.path()).unwrap();
+    let paste = |value: &str| {
+        Message::Edit(text_editor::Action::Edit(text_editor::Edit::Paste(
+            Arc::new(value.into()),
+        )))
+    };
+    window.update(Message::New);
+    window.update(Message::Language("perl".into()));
+    window.update(paste("foreach (split"));
+    window.update(Message::Complete);
+    let selected = selected_completion(&window).unwrap();
+    assert_eq!(
+        window.update(Message::ChooseCompletion(selected)),
+        Update::FocusEditor
+    );
+    assert_eq!(window.draft.content.selection().as_deref(), Some(","));
+
+    window.update(paste("|é|"));
+    window.update(Message::StepCompletionField(true));
+    assert_eq!(window.draft.content.selection().as_deref(), Some("line"));
+    window.update(Message::StepCompletionField(false));
+    assert_eq!(window.draft.content.selection().as_deref(), Some("|é|"));
+    window.update(Message::StepCompletionField(true));
+    window.update(paste("record"));
+    window.update(Message::StepCompletionField(true));
+    assert_eq!(
+        window.draft.content.text(),
+        "foreach (split(/|é|/, $record)"
+    );
+    assert!(window.draft.content.selection().is_none());
+    assert_eq!(
+        window.draft.content.cursor().position.column,
+        window.draft.content.text().len()
+    );
+    assert!(window.draft.completion_fields.is_none());
+}
+
+#[test]
+fn analysis_apply_updates_migration_metadata_only_after_acceptance() {
+    use ai_assist::migration::{Language, Plan};
+
+    let profile = Profile::new();
+    let original = "#!/usr/bin/env bash\npython3 -c 'print(\"hello\")'";
+    let migrated = "#!/usr/bin/env python3\nprint(\"hello\")";
+    let mut library = Library::open(profile.path()).unwrap();
+    let snippet = library
+        .save_with_metadata(
+            None,
+            snippets::Input {
+                name: "Fixture".into(),
+                language: "bash".into(),
+                category: String::new(),
+                content: original.into(),
+            },
+            Some(snippets::Metadata {
+                file_name: Some("fixture.sh".into()),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+    let mut window = SnippetWindow::open(profile.path()).unwrap();
+    window.update(Message::Open(snippet));
+    let target = Some(Plan::WholeScript(Language::Python));
+    assert!(
+        window
+            .lock_analysis_apply(snippet, original, original, target)
+            .is_err()
+    );
+    window
+        .lock_analysis_apply(snippet, original, migrated, target)
+        .unwrap();
+    window.finish_analysis_apply(false);
+    assert_eq!(window.draft.content.text(), original);
+    assert_eq!(
+        window.draft.metadata.file_name.as_deref(),
+        Some("fixture.sh")
+    );
+
+    window
+        .lock_analysis_apply(snippet, original, migrated, target)
+        .unwrap();
+    window.finish_analysis_apply(true);
+    assert_eq!(window.draft.content.text(), migrated);
+    assert_eq!(window.draft.language, "python");
+    assert_eq!(
+        window.draft.metadata.file_name.as_deref(),
+        Some("fixture.py")
+    );
+    assert_eq!(window.library.get(snippet).unwrap().content(), original);
+}
+
+#[test]
+fn snippet_library_scroll_layout_keeps_header_and_rows_aligned() {
+    use iced::advanced::{layout::Limits, widget::Tree};
+    use iced::{Font, Pixels, Size};
+
+    let profile = Profile::new();
+    let mut window = SnippetWindow::open(profile.path()).unwrap();
+    window
+        .library
+        .save(
+            None,
+            snippets::Input {
+                name: "Example".into(),
+                language: "bash".into(),
+                category: "Operations".into(),
+                content: Arc::from("echo test"),
+            },
+        )
+        .unwrap();
+    window.search();
+    let widths = library_columns::Widths::default();
+    let mut table = folders::drag::scope(|zone| window.snippet_rows(&zone, false, &widths));
+    let mut tree = Tree::new(table.as_widget());
+    let renderer = iced_tiny_skia::Renderer::new(Font::MONOSPACE, Pixels(14.0));
+    let viewport = Size::new(260.0, 170.0);
+    let node =
+        table
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &Limits::new(Size::ZERO, viewport));
+    assert_eq!(node.size(), viewport);
+    let column = &node.children()[0];
+    let header = &column.children()[0];
+    let rows = &column.children()[1];
+    assert!(header.size().width > viewport.width);
+    assert_eq!(rows.children()[0].size().width, header.size().width);
+    assert!(rows.bounds().y >= header.size().height);
+}
+
+#[test]
+fn analysis_filters_compose_with_snippet_search() {
+    use crate::snippet_analysis::model::{Analysis, Finding, Provenance, Purpose, Record, Source};
+    use crate::snippet_analysis::store::Store;
+
+    let profile = Profile::new();
+    let mut library = Library::open(profile.path()).unwrap();
+    let mut save = |name: &str| {
+        library
+            .save(
+                None,
+                snippets::Input {
+                    name: name.into(),
+                    language: "Bash".into(),
+                    category: String::new(),
+                    content: "echo test".into(),
+                },
+            )
+            .unwrap()
+    };
+    let analyzed = save("Analysed example");
+    save("Plain example");
+    let store = Store::new(profile.0.clone());
+    let report = Record::new(
+        Purpose::Analysis,
+        None,
+        Source::new("echo test", "Bash", "en", "en", "Analysed example").unwrap(),
+        Provenance::default(),
+        Analysis {
+            improvements: vec![Finding {
+                id: "I1".into(),
+                title: "Example".into(),
+                ..Finding::default()
+            }],
+            ..Analysis::default()
+        },
+    )
+    .unwrap();
+    store
+        .append(AnalysisSubject::Snippet(analyzed), report)
+        .unwrap();
+    let mut window = SnippetWindow::open(profile.path()).unwrap();
+    let overview = store
+        .library_overview(&library, &window.library_overview())
+        .unwrap();
+    window.refresh_library_overview(Arc::new(overview));
+    assert_eq!(window.matches.len(), 2);
+    window.update(Message::FilterLibraryAnalysis(AnalysisFilter::Open));
+    assert_eq!(window.search_target(), Some(analyzed));
+    assert_eq!(window.matches.len(), 1);
+    window.update(Message::Search("Plain".into()));
+    assert!(window.matches.is_empty());
+    window.update(Message::FilterLibraryAnalysis(AnalysisFilter::All));
+    assert_eq!(window.matches.len(), 1);
+}
+
+#[test]
+fn library_headers_cycle_sort_and_usage_refresh_keeps_default_row_positions() {
+    use library_columns::Column;
+
+    let profile = Profile::new();
+    let path = profile.path();
+    let mut library = Library::open(path.clone()).unwrap();
+    let mut save = |name: &str, content: &str| {
+        library
+            .save(
+                None,
+                snippets::Input {
+                    name: name.into(),
+                    language: "plain".into(),
+                    category: String::new(),
+                    content: content.into(),
+                },
+            )
+            .unwrap()
+    };
+    let first = save("Zulu", "one\ntwo");
+    let second = save("Alpha", "single");
+    let third = save("Beta", "one\ntwo\nthree");
+    library.toggle_favorites(&[first]).unwrap();
+    let mut window = SnippetWindow::open(path.clone()).unwrap();
+    let visible = |window: &SnippetWindow| {
+        window
+            .matches
+            .iter()
+            .map(|&index| window.library.entries()[index].id())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(visible(&window), [first, second, third]);
+    window.update(Message::Select(second));
+    window.update(Message::MarkSnippet(second, true));
+    window.refresh_usage(Library::record_use(path, third).unwrap().unwrap());
+    assert_eq!(visible(&window), [first, second, third]);
+    assert_eq!(window.library_selection, Some(second));
+    assert_eq!(window.marked_snippets, [second]);
+
+    window.update(Message::SortLibrary(Column::Name));
+    assert_eq!(visible(&window), [second, third, first]);
+    window.update(Message::SortLibrary(Column::Name));
+    assert_eq!(visible(&window), [first, third, second]);
+    window.update(Message::SortLibrary(Column::Name));
+    assert_eq!(visible(&window), [first, third, second]);
+    window.update(Message::SortLibrary(Column::LineCount));
+    assert_eq!(visible(&window), [second, first, third]);
+    window.update(Message::SortLibrary(Column::UsageCount));
+    assert_eq!(visible(&window), [first, second, third]);
+
+    window.update(Message::MarkSnippet(first, true));
+    assert_eq!(
+        window.update(Message::ToggleSelectedFavorites(Some(second))),
+        Update::Changed
+    );
+    assert!(!window.library.get(first).unwrap().favorite());
+    assert!(window.library.get(second).unwrap().favorite());
+    assert!(!window.library.get(third).unwrap().favorite());
+}
+
+#[test]
+fn snippet_library_column_drag_commits_only_the_matching_column() {
+    use library_columns::Column;
+
+    let profile = Profile::new();
+    let mut window = SnippetWindow::open(profile.path()).unwrap();
+    assert_eq!(
+        window.update(Message::ResizeLibraryColumn(Column::Name, 241.7)),
+        Update::None
+    );
+    assert_eq!(window.library_column_drag, Some((Column::Name, 242)));
+    assert_eq!(
+        window.update(Message::FinishLibraryColumnResize(Column::Language)),
+        Update::None
+    );
+    assert_eq!(
+        window.update(Message::FinishLibraryColumnResize(Column::Name)),
+        Update::LibraryColumnWidth(Column::Name, 242)
+    );
+    assert_eq!(
+        window.update(Message::FinishLibraryColumnResize(Column::Name)),
+        Update::None
+    );
+    assert_eq!(
+        window.update(Message::ResizeLibraryColumn(Column::Name, -50.0)),
+        Update::None
+    );
+    assert_eq!(
+        window.update(Message::FinishLibraryColumnResize(Column::Name)),
+        Update::LibraryColumnWidth(Column::Name, 78)
+    );
+}
+
+#[test]
+fn snippet_library_divider_drags_then_commits_and_preserves_wide_preference_when_narrow() {
+    let profile = Profile::new();
+    let mut window = SnippetWindow::open(profile.path()).unwrap();
+    let wide = 1232.0;
+    let narrow = 632.0;
+    let available = workspace_pane_width(wide);
+    let saved = Some(400);
+    assert_eq!(window.analysis_available_width(wide, saved), 720.0);
+    assert_eq!(window.analysis_available_width(narrow, Some(600)), 340.0);
+
+    assert_eq!(
+        window.update(Message::ResizeLibrary {
+            width: 540.0,
+            available,
+            saved
+        }),
+        Update::None
+    );
+    assert_eq!(window.analysis_available_width(wide, saved), 660.0);
+    assert_eq!(
+        window.update(Message::FinishLibraryResize),
+        Update::LibraryDivider(450)
+    );
+    assert_eq!(window.update(Message::FinishLibraryResize), Update::None);
+    assert_eq!(window.analysis_available_width(wide, Some(450)), 660.0);
+
+    let saved = Some(600);
+    window.update(Message::ResizeLibrary {
+        width: 500.0,
+        available: workspace_pane_width(narrow),
+        saved,
+    });
+    assert_eq!(window.update(Message::FinishLibraryResize), Update::None);
+    assert_eq!(window.analysis_available_width(wide, saved), 480.0);
+}
+
 #[test]
 fn remembered_language_rechecks_the_active_draft_and_normalizes_the_choice() {
     let profile = Profile::new();
@@ -568,8 +1022,11 @@ fn copy_prompts_once_and_rejects_stale_clipboard_replies() {
         second,
         Some(Zeroizing::new("copied".into())),
     )));
-    assert_eq!(completed, Update::CopyResolved("A-17:A-17:copied:".into()));
-    assert_eq!(format!("{completed:?}"), "CopyResolved");
+    assert_eq!(
+        completed,
+        Update::CopySaved(window.draft.id.unwrap(), "A-17:A-17:copied:".into())
+    );
+    assert_eq!(format!("{completed:?}"), "CopySaved");
     assert!(
         Library::open(profile.path()).unwrap().variables()[0]
             .default_value()
@@ -643,7 +1100,7 @@ fn copy_remembers_only_checked_nonblank_valid_values() {
     window.update(remember(2));
     assert_eq!(
         window.update(Message::Copy(copy::Message::Confirm(token))),
-        Update::CopyResolved("persisted:one use: ".into())
+        Update::CopySaved(window.draft.id.unwrap(), "persisted:one use: ".into())
     );
     let reopened = Library::open(profile.path()).unwrap();
     for entry in reopened.variables() {
@@ -686,7 +1143,7 @@ fn conflicting_remember_batch_preserves_current_defaults_and_still_copies_once()
         .unwrap();
     assert_eq!(
         window.update(Message::Copy(copy::Message::Confirm(token))),
-        Update::CopyResolved("stale first:stale second".into())
+        Update::CopySaved(window.draft.id.unwrap(), "stale first:stale second".into())
     );
     assert!(
         window

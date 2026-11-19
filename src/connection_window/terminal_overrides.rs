@@ -439,8 +439,8 @@ impl Draft {
 }
 
 #[derive(Clone, Eq, PartialEq)]
-struct ThemeChoice {
-    value: Option<ThemeOverride>,
+pub(crate) struct ThemeChoice {
+    pub(crate) value: Option<ThemeOverride>,
     label: String,
 }
 
@@ -450,7 +450,7 @@ impl fmt::Display for ThemeChoice {
     }
 }
 
-fn theme_choices(
+pub(crate) fn theme_choices(
     themes: &Themes,
     stored: Option<&ThemeOverride>,
 ) -> (Vec<ThemeChoice>, ThemeChoice) {
@@ -566,7 +566,7 @@ fn highlight_choices(
 }
 
 #[derive(Clone, PartialEq, Eq)]
-struct AiChoice(Option<ProfileRef>, String);
+pub(crate) struct AiChoice(pub(crate) Option<ProfileRef>, String);
 
 #[test]
 fn imported_ai_profile_adoption_requires_matching_provenance_and_replaces_the_hint() {
@@ -599,7 +599,7 @@ fn imported_ai_profile_adoption_requires_matching_provenance_and_replaces_the_hi
     assert!(saved.java_ai_profile_dismissed);
 }
 
-fn ai_profile_choices(
+pub(crate) fn ai_profile_choices(
     profiles: &[(Option<u64>, ProfileRef, String)],
     saved: Option<&ProfileRef>,
 ) -> (Vec<AiChoice>, AiChoice) {

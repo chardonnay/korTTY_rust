@@ -34,6 +34,7 @@ mod policy_profile;
 mod prompt_preset;
 mod providers;
 pub(crate) mod reply;
+pub(crate) mod request_activity;
 pub(crate) mod runtime_index;
 pub(crate) mod runtime_package;
 mod streaming;
@@ -105,9 +106,28 @@ static WORKERS: AtomicUsize = AtomicUsize::new(0);
 pub(crate) struct ProfileOptions {
     pub(crate) tokenizer: Tokenizer,
     pub(crate) max_output_tokens: Option<u32>,
+    /// None uses the transport default. An explicit zero disables the request timeout.
     pub(crate) timeout: Option<Duration>,
     pub(crate) reasoning_effort: Option<String>,
     pub(crate) credential_env: Option<String>,
+}
+
+impl ProfileOptions {
+    fn request_timeout(&self) -> Option<Duration> {
+        Some(self.timeout.unwrap_or(DEFAULT_TIMEOUT)).filter(|timeout| !timeout.is_zero())
+    }
+
+    fn request_deadline(&self, deadline: Option<Instant>) -> Option<Instant> {
+        self.request_timeout()
+            .map(|timeout| Instant::now() + timeout)
+            .map_or(deadline, |cutoff| {
+                Some(deadline.map_or(cutoff, |end| end.min(cutoff)))
+            })
+    }
+
+    fn has_explicit_timeout(&self) -> bool {
+        self.timeout.is_some_and(|timeout| !timeout.is_zero())
+    }
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -684,9 +704,9 @@ impl Profile {
         }
         if options
             .timeout
-            .is_some_and(|timeout| timeout.is_zero() || timeout > Duration::from_secs(86_400))
+            .is_some_and(|timeout| timeout > Duration::from_secs(86_400))
         {
-            return Err("Request timeout must be greater than zero and at most 24 hours".into());
+            return Err("Request timeout must be at most 24 hours".into());
         }
         if options.reasoning_effort.as_deref().is_some_and(|effort| {
             !matches!(
@@ -935,12 +955,7 @@ impl Session {
     pub(crate) fn trust_test_server(&mut self, certificate_der: &[u8]) -> Result<(), Error> {
         let certificate = ureq::tls::Certificate::from_der(certificate_der).to_owned();
         let roots = RootCerts::new_with_certs(&[certificate]);
-        let timeout = self
-            .client
-            .profile
-            .options
-            .timeout
-            .unwrap_or(DEFAULT_TIMEOUT);
+        let timeout = self.client.profile.options.request_timeout();
         let config = connection_config_with_roots(timeout, roots);
         let activity = Arc::clone(&self.client.activity);
         let connection = match &self.client.profile.target {
@@ -1060,17 +1075,17 @@ struct Connection {
     activity: Arc<Activity>,
 }
 
-fn connection_config(timeout: Duration) -> Config {
+fn connection_config(timeout: impl Into<Option<Duration>>) -> Config {
     connection_config_with_roots(timeout, RootCerts::PlatformVerifier)
 }
 
-fn connection_config_with_roots(timeout: Duration, roots: RootCerts) -> Config {
+fn connection_config_with_roots(timeout: impl Into<Option<Duration>>, roots: RootCerts) -> Config {
     Config::builder()
         .proxy(None)
         .max_redirects(0)
         .max_response_header_size(16 * 1024)
         .timeout_connect(Some(Duration::from_secs(3)))
-        .timeout_global(Some(timeout))
+        .timeout_global(timeout.into())
         .tls_config(
             TlsConfig::builder()
                 .provider(TlsProvider::NativeTls)
@@ -1102,11 +1117,11 @@ fn connection_agent(config: Config) -> Agent {
 }
 
 impl Connection {
-    fn new(address: SocketAddr, timeout: Duration) -> Self {
+    fn new(address: SocketAddr, timeout: impl Into<Option<Duration>>) -> Self {
         Self::with_base(format!("http://{address}"), timeout)
     }
 
-    fn with_base(base: String, timeout: Duration) -> Self {
+    fn with_base(base: String, timeout: impl Into<Option<Duration>>) -> Self {
         let agent = connection_agent(connection_config(timeout));
         let activity = Arc::new(Activity::default());
         Self::attach(base, agent, activity).expect("new connection activity is active")
@@ -1248,7 +1263,7 @@ impl Client {
 
     pub(crate) fn new(profile: Profile) -> Self {
         let transport = OnceLock::new();
-        let timeout = profile.options.timeout.unwrap_or(DEFAULT_TIMEOUT);
+        let timeout = profile.options.request_timeout();
         let connection = match &profile.target {
             Target::External(address) => Some(Connection::new(*address, timeout)),
             Target::LmStudio(endpoint) | Target::LoopbackAnthropic(endpoint) => {
@@ -1340,6 +1355,7 @@ impl Client {
             }
         });
         let result = {
+            let _activity = request_activity::RequestActivity::begin();
             #[cfg(target_os = "macos")]
             let _power = kortty_macos::AppNapActivity::begin();
             complete(&mut attempt)
@@ -1413,8 +1429,8 @@ impl Client {
         let transport = self
             .transport
             .get_or_init(|| {
-                let timeout = self.profile.options.timeout.unwrap_or(DEFAULT_TIMEOUT);
-                let request_limit = Instant::now() + timeout;
+                let timeout = self.profile.options.request_timeout();
+                let request_limit = Instant::now() + timeout.unwrap_or(DEFAULT_TIMEOUT);
                 let deadline =
                     deadline.map_or(request_limit, |deadline| deadline.min(request_limit));
                 let lease = match &self.profile.target {
@@ -1488,7 +1504,10 @@ impl Client {
     ) -> Result<String, Error> {
         self.run_cli(
             request,
-            self.profile.options.timeout.unwrap_or(DEFAULT_TIMEOUT),
+            self.profile
+                .options
+                .request_timeout()
+                .unwrap_or(cli::MAX_DURATION),
             true,
             before_dispatch,
             emit,
@@ -1515,8 +1534,11 @@ impl Client {
         deadline: Instant,
         before_dispatch: impl Fn() -> Result<(), String>,
     ) -> Result<String, Error> {
-        let timeout = self.profile.options.timeout.unwrap_or(DEFAULT_TIMEOUT);
-        let deadline = deadline.min(Instant::now() + timeout);
+        let deadline = self
+            .profile
+            .options
+            .request_deadline(Some(deadline))
+            .unwrap_or(deadline);
         self.run_cli_before(request, deadline, false, before_dispatch, |_| {})
     }
 
@@ -1549,6 +1571,7 @@ impl Client {
             return Err(Error::Service);
         };
         cli::require_policy(chat)?;
+        let _activity = request_activity::RequestActivity::begin();
         #[cfg(target_os = "macos")]
         let _power = kortty_macos::AppNapActivity::begin();
         cli::run(
@@ -1850,7 +1873,7 @@ impl Client {
             + self
                 .profile
                 .options
-                .timeout
+                .request_timeout()
                 .unwrap_or(LM_STUDIO_METADATA_TIMEOUT)
                 .min(LM_STUDIO_METADATA_TIMEOUT);
         let deadline = deadline.map_or(limit, |deadline| deadline.min(limit));
@@ -2042,8 +2065,7 @@ impl Client {
             ));
         }
         let deadline = if self.profile.starts_sidecar() {
-            let limit = Instant::now() + self.profile.options.timeout.unwrap_or(DEFAULT_TIMEOUT);
-            Some(deadline.map_or(limit, |deadline| deadline.min(limit)))
+            self.profile.options.request_deadline(deadline)
         } else {
             deadline
         };
@@ -2078,14 +2100,14 @@ impl Client {
                 attempt.agent_completion.as_mut(),
             )
         } else if self.profile.uses_anthropic_protocol() {
-            let (mut response, _) = self.anthropic_completion(
+            let (mut response, deadline) = self.anthropic_completion(
                 transport,
                 (messages, response_format, false),
                 deadline,
                 before_dispatch,
                 attempt,
             )?;
-            let bytes = self.cancellable_response_bytes(&mut response, true)?;
+            let bytes = self.cancellable_response_bytes(&mut response, deadline.is_some())?;
             providers::anthropic_response_with_stop(
                 &bytes,
                 require_complete,
@@ -2270,8 +2292,7 @@ impl Client {
         attempt: &UsageAttempt,
     ) -> Result<Option<Instant>, Error> {
         let deadline = if let Some(resolved) = &self.profile.lm_studio_auto {
-            let limit = Instant::now() + self.profile.options.timeout.unwrap_or(DEFAULT_TIMEOUT);
-            let deadline = Some(deadline.map_or(limit, |deadline| deadline.min(limit)));
+            let deadline = self.profile.options.request_deadline(deadline);
             let credential = self.completion_credential(attempt)?;
             resolved.require_current_model(
                 &transport.connection,
@@ -2292,8 +2313,7 @@ impl Client {
             .as_ref()
             .and_then(PolicyProfileAuthority::auto_model)
         {
-            let limit = Instant::now() + self.profile.options.timeout.unwrap_or(DEFAULT_TIMEOUT);
-            let deadline = Some(deadline.map_or(limit, |deadline| deadline.min(limit)));
+            let deadline = self.profile.options.request_deadline(deadline);
             let credential = self.completion_credential(attempt)?;
             resolved.require_current_model(
                 &transport.connection,
@@ -2373,10 +2393,8 @@ impl Client {
         attempt: &mut UsageAttempt,
     ) -> Result<OpenAiResponse, Error> {
         let detect_format = deadline.is_some() && request.response_format.is_some();
-        let limit = self.profile.options.timeout.unwrap_or(DEFAULT_TIMEOUT);
         let deadline = if request.thinking.is_some() {
-            let cutoff = Instant::now() + limit;
-            Some(deadline.map_or(cutoff, |deadline| deadline.min(cutoff)))
+            self.profile.options.request_deadline(deadline)
         } else {
             deadline
         };
@@ -2446,7 +2464,7 @@ impl Client {
         require_complete: bool,
         attempt: &mut UsageAttempt,
     ) -> Result<String, Error> {
-        let bounded = response.deadline.is_some() || self.profile.options.timeout.is_some();
+        let bounded = response.deadline.is_some() || self.profile.options.has_explicit_timeout();
         let bytes = match response.buffered {
             Some(bytes) => bytes,
             None => response_bytes(&mut response.response, bounded)?,
@@ -2529,10 +2547,11 @@ impl Client {
                 self.profile
                     .options
                     .timeout
+                    .filter(|timeout| !timeout.is_zero())
                     .map_or(remaining, |timeout| timeout.min(remaining)),
             ));
         }
-        let bounded = deadline.is_some() || self.profile.options.timeout.is_some();
+        let bounded = deadline.is_some() || self.profile.options.has_explicit_timeout();
         if !self.active() {
             return Err(Error::Cancelled);
         }

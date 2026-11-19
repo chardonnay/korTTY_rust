@@ -38,6 +38,7 @@ impl Action {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Language {
+    Other,
     Lua,
     Shell,
     Rust,
@@ -129,6 +130,7 @@ impl Language {
                 ],
             ),
             (Self::Json, Action::Format) => return Some(Tool::BuiltIn(builtin::Format::Json)),
+            (Self::Json, Action::CheckSyntax) => return Some(Tool::JsonSyntax),
             (Self::Ini, Action::Format) => return Some(Tool::BuiltIn(builtin::Format::Ini)),
             (Self::Groovy, Action::Format) => return Some(Tool::BuiltIn(builtin::Format::Groovy)),
             (Self::Xml, Action::Format) => (
@@ -207,6 +209,7 @@ impl Language {
 #[derive(Clone, Copy)]
 enum Tool {
     BuiltIn(builtin::Format),
+    JsonSyntax,
     External(ExternalTool),
 }
 
@@ -214,6 +217,7 @@ impl Tool {
     fn action(self) -> Action {
         match self {
             Self::BuiltIn(_) => Action::Format,
+            Self::JsonSyntax => Action::CheckSyntax,
             Self::External(tool) => tool.action,
         }
     }
@@ -221,6 +225,7 @@ impl Tool {
     fn name(self) -> &'static str {
         match self {
             Self::BuiltIn(format) => format.name(),
+            Self::JsonSyntax => "JSON validation",
             Self::External(tool) => tool.name,
         }
     }
@@ -245,7 +250,7 @@ pub(crate) struct Context {
 
 impl Context {
     fn supports(self, action: Action) -> bool {
-        (self.writable || action == Action::CheckSyntax) && self.language.tool(action).is_some()
+        self.writable || action == Action::CheckSyntax
     }
 }
 
@@ -254,6 +259,7 @@ struct Source {
     tool: Tool,
     text: String,
     remote: Option<RemoteEditor>,
+    schema: Option<Arc<crate::snippets::json_schema::Schema>>,
 }
 
 impl Source {
@@ -269,6 +275,8 @@ pub enum Message {
     Approve(u64),
     Completed(u64, Result<Report, String>),
     Apply(u64),
+    RevealDiagnostic(u64, usize),
+    UseAi(u64),
     Cancel,
 }
 
@@ -291,6 +299,7 @@ pub struct Plan {
 
 enum Operation {
     BuiltIn(builtin::Format),
+    JsonSyntax,
     External(Box<ExternalPlan>),
 }
 
@@ -304,6 +313,7 @@ pub struct Report {
     notice: String,
     diagnostics: String,
     formatted: Option<Arc<str>>,
+    marks: Vec<crate::snippets::json_schema::Mark>,
 }
 
 struct Stop(Arc<AtomicBool>);
@@ -336,7 +346,15 @@ struct Request {
 #[derive(Default)]
 pub(crate) struct Panel {
     request: Option<Request>,
+    fallback: Option<Fallback>,
     next_token: u64,
+}
+
+struct Fallback {
+    token: u64,
+    context: Context,
+    action: Action,
+    reason: String,
 }
 
 pub(crate) enum Update {
@@ -344,6 +362,8 @@ pub(crate) enum Update {
     Job(Job),
     Notice(String),
     Apply(Arc<str>),
+    RevealDiagnostic(std::ops::Range<usize>),
+    UseAi(Action),
 }
 
 pub(crate) struct Job {
@@ -409,8 +429,15 @@ fn job_ended(token: u64, running: bool) -> Message {
 }
 
 impl Panel {
+    pub(crate) fn marks(&self) -> &[crate::snippets::json_schema::Mark] {
+        match self.request.as_ref().map(|request| &request.phase) {
+            Some(Phase::Outcome(report)) => &report.marks,
+            _ => &[],
+        }
+    }
+
     pub(crate) fn active(&self) -> bool {
-        self.request.is_some()
+        self.request.is_some() || self.fallback.is_some()
     }
 
     pub(crate) fn invalidate(&mut self, current: Option<Context>) {
@@ -421,6 +448,13 @@ impl Panel {
         {
             self.request = None;
         }
+        if self
+            .fallback
+            .as_ref()
+            .is_some_and(|fallback| Some(fallback.context) != current)
+        {
+            self.fallback = None;
+        }
     }
 
     pub(crate) fn update(
@@ -430,34 +464,65 @@ impl Panel {
         remote: Option<&RemoteEditor>,
         read: impl FnOnce() -> String,
     ) -> Update {
+        self.update_with_schema(message, current, remote, None, read)
+    }
+
+    pub(crate) fn update_with_schema(
+        &mut self,
+        message: Message,
+        current: Option<Context>,
+        remote: Option<&RemoteEditor>,
+        schema: Option<&Arc<crate::snippets::json_schema::Schema>>,
+        read: impl FnOnce() -> String,
+    ) -> Update {
         self.invalidate(current);
         match message {
             Message::Cancel => {
                 self.request = None;
+                self.fallback = None;
             }
-            Message::Open(action) if self.request.is_none() => {
+            Message::UseAi(token)
+                if self
+                    .fallback
+                    .as_ref()
+                    .is_some_and(|fallback| fallback.token == token) =>
+            {
+                let fallback = self.fallback.take().expect("matching fallback");
+                return Update::UseAi(fallback.action);
+            }
+            Message::Open(action) if !self.active() => {
                 let Some(context) = current.filter(|context| context.supports(action)) else {
                     return Update::None;
                 };
-                let tool = context.language.tool(action).expect("supported tool");
-                if let Err(reason) = allowed(tool, remote) {
-                    return Update::Notice(reason);
-                }
                 let text = read();
                 if text.len() > context.limit || text.contains('\0') || text.trim().is_empty() {
                     return Update::Notice(
                         "Enter nonempty UTF-8 source within the editor size limit.".into(),
                     );
                 }
+                self.next_token = self.next_token.wrapping_add(1);
+                let token = self.next_token;
+                let Some(tool) = context.language.tool(action) else {
+                    self.fallback = Some(Fallback {
+                        token,
+                        context,
+                        action,
+                        reason: "No local tool supports this action for the editor language."
+                            .into(),
+                    });
+                    return Update::None;
+                };
+                if let Err(reason) = allowed(tool, remote) {
+                    return Update::Notice(reason);
+                }
                 let source = Arc::new(Source {
                     context,
                     tool,
                     text,
                     remote: remote.cloned(),
+                    schema: schema.filter(|_| matches!(tool, Tool::JsonSyntax)).cloned(),
                 });
                 let stop = Stop::default();
-                self.next_token = self.next_token.wrapping_add(1);
-                let token = self.next_token;
                 let cancel = Arc::clone(&stop.0);
                 self.request = Some(Request {
                     token,
@@ -483,8 +548,13 @@ impl Panel {
                         match result {
                             Ok(plan) => request.phase = Phase::Review(plan),
                             Err(reason) => {
+                                self.fallback = Some(Fallback {
+                                    token,
+                                    context: request.source.context,
+                                    action: request.source.tool.action(),
+                                    reason,
+                                });
                                 self.request = None;
-                                return Update::Notice(reason);
                             }
                         }
                     }
@@ -529,11 +599,30 @@ impl Panel {
                             Err(reason) => Update::Notice(reason),
                         };
                     }
+                    Message::RevealDiagnostic(id, index)
+                        if id == token
+                            && let Phase::Outcome(report) = &request.phase
+                            && let Some(mark) = report.marks.get(index) =>
+                    {
+                        return Update::RevealDiagnostic(mark.bytes.clone());
+                    }
                     _ => {}
                 }
             }
         }
         Update::None
+    }
+
+    pub(crate) fn invalidate_schema(
+        &mut self,
+        schema: Option<&Arc<crate::snippets::json_schema::Schema>>,
+    ) {
+        if self.request.as_ref().is_some_and(|request| {
+            matches!(request.source.tool, Tool::JsonSyntax)
+                && request.source.schema.as_ref() != schema
+        }) {
+            self.request = None;
+        }
     }
 
     pub(crate) fn actions(
@@ -549,6 +638,20 @@ impl Panel {
     }
 
     pub(crate) fn view(&self) -> Option<Element<'_, Message>> {
+        if let Some(fallback) = &self.fallback {
+            return Some(
+                column![
+                    text(&fallback.reason),
+                    row![
+                        button("Continue with AI…").on_press(Message::UseAi(fallback.token)),
+                        button("Cancel").on_press(Message::Cancel),
+                    ]
+                    .spacing(8)
+                ]
+                .spacing(8)
+                .into(),
+            );
+        }
         let request = self.request.as_ref()?;
         let cancel = button("Cancel").on_press(Message::Cancel);
         let content: Element<'_, Message> = match &request.phase {
@@ -562,6 +665,8 @@ impl Panel {
                 text(&plan.review).size(12),
                 text(match (&plan.operation, request.source.context.remote) {
                     (Operation::BuiltIn(_), _) => "The buffer is formatted in korTTY. Review the proposed result before applying it.",
+                    (Operation::JsonSyntax, _) if request.source.schema.is_some() => "Check JSON syntax and the saved or loaded schema in korTTY.",
+                    (Operation::JsonSyntax, _) => "Check JSON syntax in korTTY.",
                     (Operation::External(_), true) => "The exact remote file buffer will be passed to this local program on standard input.",
                     (Operation::External(_), false) => "The exact editor buffer will be passed to this local program on standard input.",
                 }).size(13),
@@ -571,6 +676,14 @@ impl Panel {
                 let mut body = column![text(&report.notice)];
                 if !report.diagnostics.is_empty() {
                     body = body.push(scrollable(text(&report.diagnostics).size(13)).height(90));
+                }
+                if !report.marks.is_empty() {
+                    let locations = row(report.marks.iter().enumerate().map(|(index, mark)| {
+                        let label: String = mark.label.chars().take(60).collect();
+                        button(text(label).size(12))
+                            .on_press(Message::RevealDiagnostic(request.token, index)).into()
+                    })).spacing(5).wrap();
+                    body = body.push(locations);
                 }
                 let mut choices = row![];
                 if let Some(formatted) = &report.formatted {
@@ -602,6 +715,9 @@ fn allowed(tool: Tool, remote: Option<&RemoteEditor>) -> Result<(), String> {
 }
 
 fn inspect(tool: Tool, cancel: &AtomicBool) -> Result<Plan, String> {
+    if matches!(tool, Tool::JsonSyntax | Tool::BuiltIn(_)) {
+        return inspect_paths(tool, &[], cancel);
+    }
     let path = std::env::var_os("PATH");
     let home = if cfg!(windows) {
         std::env::var_os("USERPROFILE")
@@ -622,6 +738,12 @@ fn inspect_paths(tool: Tool, search: &[PathBuf], cancel: &AtomicBool) -> Result<
             return Ok(Plan {
                 operation: Operation::BuiltIn(format),
                 review: format.name().into(),
+            });
+        }
+        Tool::JsonSyntax => {
+            return Ok(Plan {
+                operation: Operation::JsonSyntax,
+                review: "Built-in JSON validation".into(),
             });
         }
         Tool::External(tool) => tool,
@@ -702,6 +824,22 @@ fn search_paths(path: Option<&OsStr>, home: Option<&Path>, macos: bool) -> Vec<P
 }
 
 fn run_tool(source: &Source, plan: &Plan, cancel: &AtomicBool) -> Result<Report, String> {
+    if matches!(plan.operation, Operation::JsonSyntax) {
+        source.allowed()?;
+        let checked = crate::snippets::json_schema::check(
+            &source.text,
+            source.schema.as_deref(),
+            cancel,
+            MAX_PREVIEW,
+        )?;
+        source.allowed()?;
+        return Ok(Report {
+            notice: checked.notice.into(),
+            diagnostics: checked.diagnostics,
+            formatted: None,
+            marks: checked.marks,
+        });
+    }
     if let Operation::BuiltIn(format) = &plan.operation {
         return run_builtin(source, *format, cancel);
     }
@@ -751,6 +889,7 @@ fn run_tool_at(
             notice: format!("{} reported an error.", source.tool.name()),
             diagnostics: output.diagnostics,
             formatted: None,
+            marks: Vec::new(),
         });
     }
     format_report(source, output.stdout, output.diagnostics)
@@ -783,6 +922,7 @@ fn format_report(source: &Source, stdout: String, diagnostics: String) -> Result
         notice: notice.into(),
         diagnostics,
         formatted,
+        marks: Vec::new(),
     })
 }
 
@@ -833,6 +973,7 @@ mod tests {
             tool: Language::Lua.tool(Action::Format).unwrap(),
             text: "return 1".into(),
             remote: None,
+            schema: None,
         });
         let stop = Stop::default();
         let canceled = Arc::clone(&stop.0);
@@ -845,6 +986,7 @@ mod tests {
             notice: "fixture".into(),
             diagnostics: String::new(),
             formatted: Some("return 1\n".into()),
+            marks: Vec::new(),
         };
         let changed = Context {
             revision: 2,
@@ -860,6 +1002,115 @@ mod tests {
             Update::None
         ));
         assert!(canceled.load(Ordering::Acquire));
+        assert!(!panel.active());
+    }
+
+    #[test]
+    fn json_syntax_tool_reviews_the_schema_and_reports_paths_without_editing() {
+        let schema = Arc::new(
+            crate::snippets::json_schema::Schema::parse(
+                br##"{
+            "properties": {"limit": {"$ref": "#/$defs/count"}},
+            "$defs": {"count": {"type": "integer"}}
+        }"##,
+            )
+            .unwrap(),
+        );
+        let context = Context {
+            revision: 1,
+            language: Language::Json,
+            limit: 4096,
+            remote: false,
+            writable: false,
+        };
+        let mut panel = Panel::default();
+        let input = r#"{"limit":"sensitive input value"}"#;
+        let Update::Job(inspect) = panel.update_with_schema(
+            Message::Open(Action::CheckSyntax),
+            Some(context),
+            None,
+            Some(&schema),
+            || input.into(),
+        ) else {
+            panic!("expected built-in validation review");
+        };
+        panel.update(inspect.run(), Some(context), None, String::new);
+        let Update::Job(approved) =
+            panel.update(Message::Approve(1), Some(context), None, String::new)
+        else {
+            panic!("expected the approved validation job");
+        };
+        let Message::Completed(_, Ok(report)) = approved.run() else {
+            panic!("expected a validation report");
+        };
+        assert_eq!(report.notice, "JSON does not match the schema.");
+        assert!(report.diagnostics.contains("/limit"));
+        assert!(!report.diagnostics.contains("sensitive input value"));
+        assert!(report.formatted.is_none());
+        panel.update(
+            Message::Completed(1, Ok(report)),
+            Some(context),
+            None,
+            String::new,
+        );
+        let Update::RevealDiagnostic(range) = panel.update(
+            Message::RevealDiagnostic(1, 0),
+            Some(context),
+            None,
+            String::new,
+        ) else {
+            panic!("expected the selected diagnostic location");
+        };
+        assert_eq!(&input[range], "\"sensitive input value\"");
+        panel.invalidate_schema(None);
+        assert!(!panel.active());
+    }
+
+    #[test]
+    fn editor_tool_fallback_requires_current_explicit_selection() {
+        let context = Context {
+            revision: 1,
+            language: Language::Other,
+            limit: 100,
+            remote: false,
+            writable: true,
+        };
+        let mut panel = Panel::default();
+        let open = |panel: &mut Panel, context| {
+            panel.update(Message::Open(Action::Format), Some(context), None, || {
+                "source".into()
+            })
+        };
+        assert!(matches!(open(&mut panel, context), Update::None));
+        assert!(panel.active());
+        let changed = Context {
+            revision: 2,
+            ..context
+        };
+        assert!(matches!(
+            panel.update(Message::UseAi(1), Some(changed), None, String::new),
+            Update::None
+        ));
+        assert!(!panel.active());
+
+        let native = Context {
+            language: Language::Lua,
+            ..changed
+        };
+        assert!(matches!(open(&mut panel, native), Update::Job(_)));
+        assert!(matches!(
+            panel.update(
+                Message::Inspected(2, Err("Formatter unavailable.".into())),
+                Some(native),
+                None,
+                String::new
+            ),
+            Update::None
+        ));
+        assert!(matches!(
+            panel.update(Message::UseAi(2), Some(native), None, String::new),
+            Update::UseAi(Action::Format)
+        ));
         assert!(!panel.active());
     }
 
@@ -914,6 +1165,7 @@ mod tests {
         let plan = approved.plan.as_deref().unwrap();
         let report = match &plan.operation {
             Operation::BuiltIn(format) => run_builtin(&approved.source, *format, &approved.cancel),
+            Operation::JsonSyntax => run_tool(&approved.source, plan, &approved.cancel),
             Operation::External(_) => run_tool_at(&approved.source, plan, &root, &approved.cancel),
         }
         .unwrap();

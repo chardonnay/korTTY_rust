@@ -7,7 +7,9 @@ use std::io;
 use roxmltree::Node;
 
 use crate::clipboard_policy::ClipboardPolicy;
-use crate::connection_store::import::visit_java_connection_records;
+use crate::connection_store::import::{
+    JavaLibrarySettings, existing_java_profile_matches, visit_java_connection_records,
+};
 use crate::session_journal::is_display_character;
 
 use super::{MappedScopes, eligible, java_connection_candidate, java_credential_restore, memory};
@@ -36,6 +38,7 @@ struct Scope {
     label: String,
     kind: Kind,
     selected: Option<u64>,
+    exact: Option<u64>,
 }
 
 pub(crate) struct Review {
@@ -79,12 +82,20 @@ impl Review {
     pub(in crate::profile_backup) fn read(
         source: &memory::Source,
         bytes: &[u8],
+        library: JavaLibrarySettings,
     ) -> io::Result<Option<Self>> {
         let policy = ClipboardPolicy::load();
         if !super::data::ai::policy_allows(memory::ARCHIVE, &policy) {
             return Ok(None);
         }
         let store = java_connection_candidate(bytes)?;
+        let matches = existing_java_profile_matches(
+            &store,
+            &source.connections,
+            policy.server_access(),
+            library,
+        )
+        .unwrap_or_default();
         let mut targets = std::array::from_fn(|_| {
             vec![Target {
                 id: None,
@@ -166,6 +177,11 @@ impl Review {
                 label: format!("{name}{detail} · Java ID {}", label(id)),
                 kind,
                 selected: None,
+                exact: matches.get(id).copied().filter(|expected| {
+                    targets[kind as usize]
+                        .iter()
+                        .any(|target| target.id == Some(*expected))
+                }),
             };
             ids.entry(scope.id.clone()).or_insert(scopes.len() as u64);
             scopes.push(scope);
@@ -205,6 +221,41 @@ impl Review {
             choices,
             choices.iter().find(|choice| choice.id == scope.selected),
         )
+    }
+
+    pub(crate) fn exact(&self, index: usize) -> Option<&Target> {
+        let scope = self.scopes.get(index)?;
+        let id = scope.exact?;
+        self.targets[scope.kind as usize]
+            .iter()
+            .find(|target| target.id == Some(id))
+    }
+
+    pub(crate) fn can_select_exact(&self) -> bool {
+        let assigned: BTreeSet<_> = self
+            .scopes
+            .iter()
+            .filter_map(|scope| scope.selected)
+            .collect();
+        self.scopes.iter().any(|scope| {
+            scope.selected.is_none() && scope.exact.is_some_and(|id| !assigned.contains(&id))
+        })
+    }
+
+    pub(crate) fn select_exact(&mut self) {
+        let mut assigned: BTreeSet<_> = self
+            .scopes
+            .iter()
+            .filter_map(|scope| scope.selected)
+            .collect();
+        for scope in &mut self.scopes {
+            if scope.selected.is_none()
+                && let Some(id) = scope.exact
+                && assigned.insert(id)
+            {
+                scope.selected = Some(id);
+            }
+        }
     }
 
     pub(crate) fn select(&mut self, index: usize, id: Option<u64>) -> io::Result<()> {

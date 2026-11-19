@@ -76,6 +76,10 @@ Choose the default design for newly opened AI agent activity. A saved connection
 
 Custom designs can change activity history, terminal status, approval controls and activity window arrangement. Rename or remove a custom design in this page. Removing it makes connections that used it follow the default. **Save** applies the draft catalog and default.
 
+**Preview a module** substitutes one role in the demo. **Reset preview** returns to the selected combination. The demo uses the same history, status, and floating presenters as a terminal run. **Replay** starts the sample again. For Adaptive Dock, select a sample terminal size to see its narrow, medium, or wide layout.
+
+Set how long the status stays after a run. The default is six seconds and zero keeps it visible. **View → AI Agent Panel → Show or Hide Status Bar** restores or hides the current pane's status. **Reduce Agent design animations** stops decorative motion in the preview and in terminal Agent designs. **Save** also applies these two preferences.
+
 ## Settings · Updates
 
 Enable **Check automatically for Rust updates** and choose an interval from 1 to 30 days. Automatic checks are off by default. A managed policy can disable update checks.

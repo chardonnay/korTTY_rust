@@ -52,6 +52,53 @@ fn snippets_keep_their_ids_and_concurrent_writes_do_not_clobber() {
 }
 
 #[test]
+fn snippet_favorite_persists_and_metadata_edits_keep_it() {
+    let profile = Profile::new();
+    let path = profile.path();
+    let mut library = Library::open(path.clone()).unwrap();
+    let id = library.save(None, input("Check host")).unwrap();
+    let created = library.get(id).unwrap().last_modified();
+    assert!(created.is_some());
+    library.toggle_favorites(&[id]).unwrap();
+    let mut reopened = Library::open(path.clone()).unwrap();
+    let entry = reopened.get(id).unwrap();
+    assert!(entry.favorite());
+    assert_eq!(entry.last_modified(), created);
+    reopened.save(Some(id), input("Renamed")).unwrap();
+    let library = Library::open(path).unwrap();
+    let entry = library.get(id).unwrap();
+    assert!(entry.favorite());
+    assert!(entry.stats.modified_at.is_some());
+}
+
+#[test]
+fn recording_use_updates_the_latest_library_without_invalidating_reviewed_source() {
+    let profile = Profile::new();
+    let path = profile.path();
+    let mut first = Library::open(path.clone()).unwrap();
+    let id = first.save(None, input("Check host")).unwrap();
+    let snapshot = first.get(id).unwrap().clone();
+    let mut used = Library::record_use(path.clone(), id).unwrap().unwrap();
+    assert!(used.get(id).unwrap().same_source_revision(&snapshot));
+    assert_eq!(
+        used.get(id).unwrap().last_modified(),
+        snapshot.last_modified()
+    );
+    used.save(Some(id), input("Updated name")).unwrap();
+    let used = Library::record_use(path.clone(), id).unwrap().unwrap();
+    let entry = used.get(id).unwrap();
+    assert_eq!(entry.usage_count(), 2);
+    assert_eq!(entry.name(), "Updated name");
+    assert!(entry.stats.last_used.is_some());
+    assert!(!entry.same_source_revision(&snapshot));
+    assert!(
+        Library::record_use(path, SnippetId::new().unwrap())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn custom_header_policy_checks_new_identities_on_every_store_write() {
     let profile = Profile::new();
     let path = profile.path();
@@ -83,12 +130,14 @@ fn custom_header_policy_checks_new_identities_on_every_store_write() {
                 id: None,
                 input: input("Allowed entry"),
                 metadata: Metadata::default(),
+                stats: Default::default(),
                 history: Vec::new(),
             },
             archive::ImportedSnippet {
                 id: None,
                 input: header("Imported header"),
                 metadata: Metadata::default(),
+                stats: Default::default(),
                 history: Vec::new(),
             },
         ],

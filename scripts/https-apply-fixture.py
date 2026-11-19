@@ -75,6 +75,17 @@ def run(command, scenario):
             responses = [(expected, True, {"findings": [
                 {"citation": 1, "quote": "The deploy failed with exit 7."},
             ]})]
+        elif scenario == "--planning":
+            endpoint_path = "/tenant/v1/planning/"
+            responses = [(expected, False, {
+                "status": "questions",
+                "summary": "Identify the documentation audience",
+                "userMessage": "Choose the intended readers",
+                "questions": [{
+                    "id": "audience", "question": "Who will read the documentation?",
+                    "options": ["Users", "Maintainers"], "allowCustomAnswer": False,
+                }],
+            })]
         else:
             responses = [(expected, True, {"lines": ["echo 'gamma'"], "changes": [
                 {"id": "F3", "reason": "Quote the command argument.", "anchor": "echo 'gamma'"}
@@ -100,6 +111,8 @@ def run(command, scenario):
                         if scenario == "--journal-question":
                             assert "fixture-secret" not in actual[1] and TOKEN not in actual[1], "protected evidence transmitted"
                             assert "The deploy failed with exit 7. ***" in actual[1], "masked evidence missing"
+                        if scenario == "--planning":
+                            assert TOKEN not in actual[1] and "reference ***" in actual[1], "credential masking changed"
                     elif not streaming:
                         assert actual[1] == "{}", "probe contains journal evidence"
                     else:
@@ -158,7 +171,7 @@ def run(command, scenario):
 
 if __name__ == "__main__":
     arguments = sys.argv[1:]
-    scenarios = {"--analysis-split", "--journal-summary", "--journal-question"}
+    scenarios = {"--analysis-split", "--journal-summary", "--journal-question", "--planning"}
     scenario = arguments.pop(0) if arguments and arguments[0] in scenarios else None
     if not arguments:
         sys.exit("Pass the compiled acceptance test command and its arguments.")

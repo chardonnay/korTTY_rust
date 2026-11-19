@@ -336,8 +336,27 @@ impl ProfileChoice {
                 .is_some_and(|endpoint| !endpoint.is_https())
     }
 
+    pub(crate) fn pins_server_default(&self) -> bool {
+        self.model.is_empty()
+            && matches!(self.id, ProfileRef::Numeric(id) if id != 0)
+            && self.policy_model_fingerprint.is_none()
+            && self.binding().is_none()
+    }
+
+    pub(crate) fn pins_inherited_model(&self) -> bool {
+        self.pins_lm_studio_auto() || self.pins_server_default()
+    }
+
+    pub(crate) fn display_model(&self) -> &str {
+        if self.pins_server_default() {
+            "Server selects the model"
+        } else {
+            &self.model
+        }
+    }
+
     pub(crate) fn valid(&self) -> bool {
-        !self.model.trim().is_empty()
+        (!self.model.trim().is_empty() || self.pins_server_default())
             && self.model.len() <= 256
             && !self.model.chars().any(char::is_control)
             && !self.destination.trim().is_empty()
@@ -792,7 +811,7 @@ impl Queue {
             || unbound.raw_only
             || unbound.profile.is_some()
             || unbound.source_approval.is_some()
-            || !profile.pins_lm_studio_auto()
+            || !profile.pins_inherited_model()
         {
             return Err(invalid("Invalid inherited journal model binding"));
         }

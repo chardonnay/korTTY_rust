@@ -51,7 +51,7 @@ pub(crate) struct Source {
     pub(crate) check_interval_minutes: u16,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum SourceKind {
     #[default]
@@ -298,7 +298,7 @@ impl Source {
 }
 
 impl SourceKind {
-    fn parse_origin(self, location: &str) -> io::Result<Origin> {
+    pub(crate) fn parse_origin(self, location: &str) -> io::Result<Origin> {
         if self == Self::Git {
             return GitUrl::parse(location).map(Origin::Git);
         }
@@ -451,6 +451,55 @@ impl Catalog {
         }
         control.check()?;
         Ok(next)
+    }
+
+    /// Re-read enabled files and use the last published Git cache without fetching.
+    /// An unreadable file has no usable entries for unattended jobs.
+    pub(crate) fn load_for_scheduler(
+        root: &Path,
+        policy: &crate::clipboard_policy::ClipboardPolicy,
+    ) -> io::Result<Self> {
+        if policy.problem.is_some() || !policy.teamwork_allowed {
+            return Ok(Self::default());
+        }
+        let settings = if policy.custom_teamwork_sources_allowed {
+            Settings::load()?
+        } else {
+            Settings::default()
+        };
+        let active = settings.active_sources(
+            policy.custom_teamwork_sources_allowed,
+            &policy.teamwork_sources,
+        )?;
+        let git = ActiveSources(
+            active
+                .0
+                .iter()
+                .filter(|(origin, _)| matches!(origin, Origin::Git(_)))
+                .map(|(origin, period)| (origin.clone(), *period))
+                .collect(),
+        );
+        let mut catalog = Self::load_cached(root, &git)?;
+        for origin in active.0.into_keys() {
+            let Origin::File(path) = &origin else {
+                continue;
+            };
+            let Ok(entries) = read_teamwork(path) else {
+                continue;
+            };
+            let origin = Arc::new(origin);
+            catalog.sources.insert(
+                Arc::clone(&origin),
+                Snapshot {
+                    entries: entries
+                        .into_iter()
+                        .map(|entry| Entry::from_source(Arc::clone(&origin), entry))
+                        .collect(),
+                    branch: None,
+                },
+            );
+        }
+        Ok(catalog)
     }
 
     pub(crate) fn entries(&self) -> impl Iterator<Item = &Entry> {
