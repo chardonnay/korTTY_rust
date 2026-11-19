@@ -626,7 +626,7 @@ impl Workspace {
                         match browser.activate(displayed, index) {
                             Open::None => Task::none(),
                             Open::Directory(path) => browser.load(path, Navigation::Visit),
-                            Open::File(path) => return self.open_native_editor(Some(path)),
+                            Open::File(path) => return self.open_native_editor(id, Some(path)),
                         }
                     }
                     Message::Listed(request, navigation, result) => {
@@ -657,12 +657,19 @@ impl Workspace {
         }
     }
 
-    pub(super) fn open_native_editor(&mut self, path: Option<PathBuf>) -> Task<WorkspaceMessage> {
+    pub(super) fn open_native_editor(
+        &mut self,
+        owner: window::Id,
+        path: Option<PathBuf>,
+    ) -> Task<WorkspaceMessage> {
         let (editor, loaded) = path.map_or_else(
             || (EditorWindow::new(), Task::none()),
             EditorWindow::with_file,
         );
-        self.show_native_editor(editor, loaded)
+        let (id, task) = self.insert_native_editor(editor, loaded);
+        let focused = self.allocate();
+        self.snippet_editor_owners.insert(id, (owner, focused));
+        task
     }
 
     pub(super) fn local_dock_view<'a>(

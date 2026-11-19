@@ -26,8 +26,9 @@ pub(super) fn controls<'a>(page: &'a Page, window: &SnippetWindow) -> Option<Con
         id: None,
         name: "No header".into(),
     }];
-    let language = window
-        .analysis_language(subject)
+    let language = current_migration(page, window)
+        .and_then(migration::Plan::result_language)
+        .or_else(|| window.analysis_language(subject))
         .unwrap_or(&record.source.language);
     if applies_to(language, Language::Bash) {
         headers.extend(
@@ -194,9 +195,9 @@ impl Workspace {
         else {
             return Task::none();
         };
-        let language = surface
-            .window
-            .analysis_language(subject)
+        let language = current_migration(page, &surface.window)
+            .and_then(migration::Plan::result_language)
+            .or_else(|| surface.window.analysis_language(subject))
             .unwrap_or(&record.source.language);
         let input_supported = !is_declarative(language);
         match edit {

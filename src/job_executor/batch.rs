@@ -82,7 +82,7 @@ fn execute(
     single.additional_connections.clear();
     single.target_groups = None;
     let mut scoped_policy = policy.clone();
-    if action.target_groups.is_some() || rsync.is_some() {
+    if action.target_groups.is_some() || action.has_teamwork_targets() || rsync.is_some() {
         scoped_policy.group_scope = Some(Arc::clone(action));
     }
     if rsync.is_some_and(|(transfer, upload)| {

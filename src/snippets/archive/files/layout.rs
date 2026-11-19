@@ -429,6 +429,10 @@ fn protect_device_name(name: String) -> String {
     if reserved { format!("_{name}") } else { name }
 }
 
+pub(crate) fn snippet_is_executable(snippet: &Snippet) -> bool {
+    mode(snippet, &file_name(snippet)) == 0o755
+}
+
 fn mode(snippet: &Snippet, file: &str) -> u32 {
     let executable = snippet.metadata().executable.unwrap_or_else(|| {
         let content = snippet.content();

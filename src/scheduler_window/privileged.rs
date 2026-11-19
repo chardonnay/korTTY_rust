@@ -411,9 +411,7 @@ impl RunContext {
 }
 
 pub(crate) fn saved_route_current(path: &Path, reference: &ConnectionRef) -> bool {
-    crate::connection_store::Store::open(path.to_owned()).is_ok_and(|store| {
-        store.get(reference.id).map(ConnectionRef::from).as_ref() == Some(reference)
-    })
+    reference.require_saved_at(path).is_ok()
 }
 
 #[cfg(all(test, target_os = "linux"))]

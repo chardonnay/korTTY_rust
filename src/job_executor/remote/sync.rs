@@ -60,7 +60,8 @@ pub(in crate::job_executor) fn preview_with_trust(
         .spawn(move || {
             let result = (|| {
                 let standing = request.copy.standing.is_some();
-                let guarded = standing || request.copy.replace_changed;
+                let shared = request.connection.shared_identity().is_some();
+                let guarded = standing || request.copy.replace_changed || shared;
                 let stopped_message = if standing {
                     STANDING_STOPPED
                 } else {
@@ -70,8 +71,10 @@ pub(in crate::job_executor) fn preview_with_trust(
                     return Err(stopped_message.into());
                 }
                 let trust = trust_store().map_err(|error| error.to_string())?;
-                let pins =
-                    sync::pins(&request.connection, &trust).map_err(|error| error.to_string())?;
+                request.connection.require_installed_shared_route()?;
+                let reviewed_trust = request.connection.strict_trust(trust.clone())?;
+                let pins = sync::pins(&request.connection, &reviewed_trust)
+                    .map_err(|error| error.to_string())?;
                 if request.sudo != crate::scheduler_window::SudoMode::Disabled {
                     return super::privileged::preview_tree(request, credentials, &pins);
                 }
@@ -79,6 +82,7 @@ pub(in crate::job_executor) fn preview_with_trust(
                 let cancelled = || request.cancelled.load(Ordering::Acquire);
                 let authorize = || {
                     if !sync_allowed(&request.connection)
+                        || request.connection.require_installed_shared_route().is_err()
                         || !sync::pins(&request.connection, &trust)
                             .is_ok_and(|current| current == pins)
                     {
@@ -164,7 +168,11 @@ pub(super) fn run(
     };
     let trust =
         trust_store().map_err(|_| Failure::failed("Could not access SSH host-key trust store"))?;
-    let pins = sync::pins(reference, &trust).map_err(|_| Failure::blocked(REVIEW_REQUIRED))?;
+    let reviewed_trust = reference
+        .strict_trust(trust.clone())
+        .map_err(Failure::blocked)?;
+    let pins =
+        sync::pins(reference, &reviewed_trust).map_err(|_| Failure::blocked(REVIEW_REQUIRED))?;
     if &sync::fingerprints(&pins) != expected_pins {
         return Err(Failure::blocked(
             "The reviewed SSH host keys changed. Compare the folders again.",
@@ -174,7 +182,7 @@ pub(super) fn run(
     let (target, jumps) = connection::route(&request.action, saved_auth, &policy.server_access)?;
     let cancelled = || request.cancellation.is_requested();
     let standing = copy.standing.is_some();
-    let guarded = standing || copy.replace_changed;
+    let guarded = standing || copy.replace_changed || request.action.has_teamwork_targets();
     let stopped_message = if standing {
         STANDING_STOPPED
     } else {
@@ -213,7 +221,7 @@ pub(super) fn run(
             return true;
         }
         match &authority {
-            Authority::OneUse(_) if !copy.replace_changed => return false,
+            Authority::OneUse(_) if !guarded => return false,
             Authority::Standing(approval, _) if !approval.active_at(SystemTime::now()) => {
                 return true;
             }

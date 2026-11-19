@@ -11,6 +11,7 @@ use rustix::process::umask;
 
 mod download;
 pub(crate) mod file_replace;
+mod handoff;
 mod policy;
 pub(crate) mod tree_merge;
 mod upload;

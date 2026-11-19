@@ -394,7 +394,7 @@ impl Worker {
                     };
                     let extracting = command.operation.is_server_extract();
                     let publishing_draft = matches!(&command.operation, Operation::ReviewDraftFile(..) | Operation::PublishDraftFile(..));
-                    let browsing_draft = matches!(&command.operation, Operation::BrowseDraftDestination(_));
+                    let browsing_draft = matches!(&command.operation, Operation::BrowseDraftDestination(..));
                     let reply = match client.as_mut() {
                         Ok(client) => match deadline::Guard::for_operation(
                             &command.operation,
@@ -711,7 +711,7 @@ pub(crate) enum Operation {
         remote: Option<Vec<u8>>,
     },
     Browse(Location),
-    BrowseDraftDestination(Vec<u8>),
+    BrowseDraftDestination(Vec<u8>, bool),
     MeasureFolders(Box<browser::SizeRequest>),
     SearchTree(Box<search::Request>),
     RevealSearchHit(Box<search::Hit>),
@@ -825,7 +825,7 @@ impl Operation {
             Self::ReviewServerArchive(request, _) => request.requires_transfer(),
             Self::ApplyServerArchive(plan, _) => plan.requires_transfer(),
             Self::CompareFiles(_)
-            | Self::BrowseDraftDestination(_)
+            | Self::BrowseDraftDestination(..)
             | Self::ReviewDraftFile(..)
             | Self::PublishDraftFile(..)
             | Self::CompareFolders(_)
@@ -1298,8 +1298,9 @@ fn execute(
             })
         }
         Operation::Browse(location) => list(client, &location).map(Reply::Listed),
-        Operation::BrowseDraftDestination(path) => {
-            draft_file::browse(client, &path, editor_policy, control).map(Reply::Listed)
+        Operation::BrowseDraftDestination(path, include_files) => {
+            draft_file::browse(client, &path, include_files, editor_policy, control)
+                .map(Reply::Listed)
         }
         Operation::MeasureFolders(request) => {
             browser::measure(client, *request, || control.is_closed()).map(Reply::MeasuredFolders)

@@ -3,7 +3,7 @@
 use iced::font::Style;
 use iced::keyboard::{self, key::Named};
 use iced::widget::canvas::{self, Geometry};
-use iced::{Color, Pixels, Point, Rectangle, Renderer, Size, window};
+use iced::{Color, Font, Pixels, Point, Rectangle, Renderer, Size, window};
 use kortty_terminal::Cursor;
 
 use super::{Metrics, TerminalView, default_background};
@@ -67,6 +67,30 @@ pub(super) struct Position {
     footer: f32,
 }
 
+pub(crate) fn paint_ghost(
+    frame: &mut canvas::Frame,
+    command: &str,
+    position: Point,
+    foreground: Color,
+    font: Font,
+    size: u8,
+) {
+    frame.fill_text(canvas::Text {
+        content: command.into(),
+        position,
+        color: Color {
+            a: 0.72,
+            ..foreground
+        },
+        size: Pixels(f32::from(size)),
+        font: Font {
+            style: Style::Italic,
+            ..font
+        },
+        ..canvas::Text::default()
+    });
+}
+
 impl Review<'_> {
     pub(super) fn position(&self, size: Size, cursor: Cursor, cell: Metrics) -> Option<Position> {
         let inset = super::INSET;
@@ -127,20 +151,14 @@ impl Review<'_> {
             .and_then(|cursor| self.position(size, cursor, cell));
         let (line, bottom) = if let Some(position) = position {
             let hint = self.hint();
-            frame.fill_text(canvas::Text {
-                content: self.command.into(),
-                position: position.ghost,
-                color: Color {
-                    a: 0.72,
-                    ..foreground
-                },
-                size: Pixels(f32::from(view.font_size)),
-                font: iced::Font {
-                    style: Style::Italic,
-                    ..view.font
-                },
-                ..canvas::Text::default()
-            });
+            paint_ghost(
+                &mut frame,
+                self.command,
+                position.ghost,
+                foreground,
+                view.font,
+                view.font_size,
+            );
             frame.fill_rectangle(
                 position.hint,
                 Size::new(

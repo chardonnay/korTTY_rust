@@ -10,12 +10,20 @@ use crate::protocol::{read_frame, read_message, write_frame};
 
 pub const ARGUMENT: &str = "--replace-draft-v1";
 pub const COMMAND: &str = "exec /usr/local/bin/kortty-server-archive --replace-draft-v1";
+pub const WINDOWS_COMMAND: &str =
+    r"C:\ProgramData\korTTY\kortty-server-archive.exe --replace-draft-v1";
 pub const MAX_DRAFT_BYTES: usize = 96 * 1024;
 pub const MAX_ORIGINAL_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_FRAME: usize = 32 * 1024;
 const TOKEN_LENGTH: usize = 96;
 const NONCE_LENGTH: usize = 32;
 const STAGE_PREFIX: &str = ".kortty-draft-";
+
+/// Win32-OpenSSH's drive-qualified SFTP namespace.
+pub fn windows_drive_path(path: &[u8]) -> bool {
+    matches!(path, [b'/', drive, b':', rest @ ..] if drive.is_ascii_alphabetic()
+        && (rest.is_empty() || rest.starts_with(b"/")))
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -65,7 +73,15 @@ impl Spec {
 
     pub fn parts(&self) -> io::Result<(&str, &str)> {
         let (parent, name) = path_parts(&self.destination)?;
+        let windows = windows_drive_path(self.destination.as_bytes());
         if self.destination.split('/').any(|part| {
+            let folded;
+            let part = if windows {
+                folded = part.to_ascii_lowercase();
+                folded.as_str()
+            } else {
+                part
+            };
             part.strip_prefix(STAGE_PREFIX)
                 .is_some_and(valid_stage_nonce)
         }) {
@@ -222,19 +238,27 @@ fn lowercase_hex(value: &str) -> bool {
 }
 
 fn path_parts(path: &str) -> io::Result<(&str, &str)> {
+    let windows = windows_drive_path(path.as_bytes());
     if path.len() <= MAX_PATH_BYTES
         && let Some(components) = path.strip_prefix('/')
-        && components.split('/').all(|part| {
-            !part.is_empty()
-                && part.len() <= MAX_COMPONENT_BYTES
-                && !matches!(part, "." | "..")
-                && !part.contains('\\')
-                && !part.chars().any(|character| {
-                    character.is_control()
-                        || matches!(character, '\u{061c}' | '\u{200b}'..='\u{200f}'
+        && (!windows || components.contains('/'))
+        && components
+            .split('/')
+            .skip(usize::from(windows))
+            .all(|part| {
+                !part.is_empty()
+                    && part.len() <= MAX_COMPONENT_BYTES
+                    && !matches!(part, "." | "..")
+                    && !part.contains('\\')
+                    && (!windows
+                        || (!part.contains([':', '<', '>', '"', '|', '?', '*'])
+                            && !part.ends_with([' ', '.'])))
+                    && !part.chars().any(|character| {
+                        character.is_control()
+                            || matches!(character, '\u{061c}' | '\u{200b}'..='\u{200f}'
                             | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}')
-                })
-        })
+                    })
+            })
         && let Some((parent, name)) = path.rsplit_once('/')
     {
         return Ok((if parent.is_empty() { "/" } else { parent }, name));

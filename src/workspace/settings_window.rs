@@ -241,6 +241,8 @@ pub enum Setting {
     SnippetAnalysisHistory,
     SnippetVersionHistory,
     SnippetAlternativeCount,
+    SnippetCompletionShortcut,
+    SnippetAiAdditionalInstructions,
     SnippetAnalysisContentLimit,
     AgentDesign,
     ApplicationUpdates,
@@ -335,6 +337,8 @@ impl Setting {
         Self::SnippetAnalysisHistory,
         Self::SnippetVersionHistory,
         Self::SnippetAlternativeCount,
+        Self::SnippetCompletionShortcut,
+        Self::SnippetAiAdditionalInstructions,
         Self::SnippetAnalysisContentLimit,
         Self::AgentDesign,
         Self::ApplicationUpdates,
@@ -441,6 +445,8 @@ impl Setting {
             Self::SnippetAnalysisHistory => "Saved analysis reports per snippet or folder",
             Self::SnippetVersionHistory => "Default saved snippet versions",
             Self::SnippetAlternativeCount => "AI alternative solutions per request",
+            Self::SnippetCompletionShortcut => "Completion shortcut",
+            Self::SnippetAiAdditionalInstructions => "Allow additional AI instructions in snippets",
             Self::SnippetAnalysisContentLimit => "Stored source per analysis field (bytes)",
             Self::AgentDesign => "Default AI agent design",
             Self::ApplicationUpdates => "Check automatically for Rust updates",
@@ -533,6 +539,8 @@ impl Setting {
             | Self::SnippetAnalysisHistory
             | Self::SnippetVersionHistory
             | Self::SnippetAlternativeCount
+            | Self::SnippetCompletionShortcut
+            | Self::SnippetAiAdditionalInstructions
             | Self::SnippetAnalysisContentLimit => Section::SnippetEditor,
         }
     }
@@ -674,11 +682,17 @@ impl Setting {
             Self::SnippetAnalysisHistory => "code analysis history retention limit pinned reports",
             Self::SnippetVersionHistory => "source version editing history snapshots",
             Self::SnippetAlternativeCount => "snippet AI code alternatives count",
+            Self::SnippetCompletionShortcut => {
+                "snippet code completion keyboard shortcut key binding"
+            }
+            Self::SnippetAiAdditionalInstructions => "snippet AI extra instructions",
             Self::SnippetAnalysisContentLimit => {
                 "script text UTF-8 maximum size checkpoint storage"
             }
             Self::Shortcuts => "key bindings accelerator record commands keymap",
-            Self::AgentDesign => "AI agent presentation activity status floating classic standard",
+            Self::AgentDesign => {
+                "AI agent presentation activity status floating classic standard auto hide delay reduced animations"
+            }
             Self::ApplicationUpdates => {
                 "software application release background GitHub stable check"
             }
@@ -711,6 +725,10 @@ pub enum Message {
     SnippetAnalysisHistory(window::Id, u8),
     SnippetVersionHistory(window::Id, u8),
     SnippetAlternativeCount(window::Id, u8),
+    RecordSnippetCompletionShortcut(window::Id),
+    SnippetCompletionKey(window::Id, Key, Modifiers),
+    ResetSnippetCompletionShortcut(window::Id),
+    SnippetAiAdditionalInstructions(window::Id, bool),
     SnippetAnalysisContentLimit(window::Id, String),
     SnippetAnalysisHistoryPreview(
         window::Id,
@@ -781,6 +799,7 @@ pub enum Message {
     Restore(window::Id, RestoreMode),
     RestoreOutput(window::Id, bool),
     RestoreOutputLines(window::Id, u16),
+    UseJavaSessionRestore(window::Id),
     KeyBinding(window::Id, Edit),
     Backup(window::Id, backup::Edit),
     Logging(window::Id, logging_settings::Edit),
@@ -847,6 +866,12 @@ impl Draft {
         if edit.ai_agent_panel.width != before.ai_agent_panel.width {
             current.ai_agent_panel.width = edit.ai_agent_panel.width;
         }
+        if edit.ai_agent_design_auto_hide_seconds != before.ai_agent_design_auto_hide_seconds {
+            current.ai_agent_design_auto_hide_seconds = edit.ai_agent_design_auto_hide_seconds;
+        }
+        if edit.ai_agent_design_reduced_animations != before.ai_agent_design_reduced_animations {
+            current.ai_agent_design_reduced_animations = edit.ai_agent_design_reduced_animations;
+        }
         if policy.problem.is_none() && policy.updates_allowed {
             if edit.application_updates.enabled != before.application_updates.enabled {
                 current.application_updates.enabled = edit.application_updates.enabled;
@@ -889,6 +914,12 @@ impl Draft {
         }
         if edit.snippet_alternative_count != before.snippet_alternative_count {
             current.snippet_alternative_count = edit.snippet_alternative_count;
+        }
+        if edit.snippet_completion_shortcut != before.snippet_completion_shortcut {
+            current.snippet_completion_shortcut = edit.snippet_completion_shortcut;
+        }
+        if edit.snippet_ai_additional_instructions != before.snippet_ai_additional_instructions {
+            current.snippet_ai_additional_instructions = edit.snippet_ai_additional_instructions;
         }
         if edit.snippet_analysis_content_limit != before.snippet_analysis_content_limit {
             current.snippet_analysis_content_limit = edit.snippet_analysis_content_limit;
@@ -1138,6 +1169,7 @@ impl Dialog {
         }
         self.revealed = None;
         self.keyboard.stop_recording();
+        self.snippet_appearance.stop_recording_shortcut();
     }
 
     fn reveal(&mut self, setting: Setting) -> Task<Desktop> {
@@ -1288,11 +1320,22 @@ impl Workspace {
         modifiers: Modifiers,
     ) -> bool {
         self.settings.dialog_mut(id).is_some_and(|dialog| {
-            !dialog.saving()
-                && dialog.section == Section::Keyboard
-                && dialog
-                    .keyboard
-                    .key(&mut dialog.draft.preferences.key_bindings, key, modifiers)
+            if dialog.saving() {
+                return false;
+            }
+            match dialog.section {
+                Section::Keyboard => {
+                    dialog
+                        .keyboard
+                        .key(&mut dialog.draft.preferences.key_bindings, key, modifiers)
+                }
+                Section::SnippetEditor => dialog.snippet_appearance.capture_shortcut(
+                    &mut dialog.draft.preferences.snippet_completion_shortcut,
+                    key,
+                    modifiers,
+                ),
+                _ => false,
+            }
         })
     }
 
@@ -1426,6 +1469,10 @@ impl Workspace {
             | Message::SnippetAnalysisHistory(id, _)
             | Message::SnippetVersionHistory(id, _)
             | Message::SnippetAlternativeCount(id, _)
+            | Message::RecordSnippetCompletionShortcut(id)
+            | Message::SnippetCompletionKey(id, _, _)
+            | Message::ResetSnippetCompletionShortcut(id)
+            | Message::SnippetAiAdditionalInstructions(id, _)
             | Message::SnippetAnalysisContentLimit(id, _)
             | Message::EditorCaret(id, _)
             | Message::Theme(id, _)
@@ -1487,6 +1534,7 @@ impl Workspace {
             | Message::Restore(id, _)
             | Message::RestoreOutput(id, _)
             | Message::RestoreOutputLines(id, _)
+            | Message::UseJavaSessionRestore(id)
             | Message::KeyBinding(id, _)) => (id, message),
         };
         let has_transparency =
@@ -1516,6 +1564,7 @@ impl Workspace {
                 dialog.search_selection = 0;
                 dialog.revealed = None;
                 dialog.keyboard.stop_recording();
+                dialog.snippet_appearance.stop_recording_shortcut();
                 return widget::operation::snap_to(
                     dialog.search_scroll.clone(),
                     widget::operation::RelativeOffset::START,
@@ -1645,6 +1694,33 @@ impl Workspace {
                     && crate::snippet_window::ai_assist::ALTERNATIVE_COUNTS.contains(&count) =>
             {
                 dialog.draft.preferences.snippet_alternative_count = Some(count);
+                dialog.problem = None;
+            }
+            Message::RecordSnippetCompletionShortcut(_)
+                if dialog.section == Section::SnippetEditor =>
+            {
+                dialog.snippet_appearance.record_shortcut();
+            }
+            Message::SnippetCompletionKey(_, key, modifiers)
+                if dialog.section == Section::SnippetEditor =>
+            {
+                dialog.snippet_appearance.capture_shortcut(
+                    &mut dialog.draft.preferences.snippet_completion_shortcut,
+                    &key,
+                    modifiers,
+                );
+            }
+            Message::ResetSnippetCompletionShortcut(_)
+                if dialog.section == Section::SnippetEditor =>
+            {
+                dialog.snippet_appearance.stop_recording_shortcut();
+                dialog.draft.preferences.snippet_completion_shortcut = Some(Default::default());
+                dialog.problem = None;
+            }
+            Message::SnippetAiAdditionalInstructions(_, enabled)
+                if dialog.section == Section::SnippetEditor =>
+            {
+                dialog.draft.preferences.snippet_ai_additional_instructions = Some(enabled);
                 dialog.problem = None;
             }
             Message::SnippetAnalysisContentLimit(_, value)
@@ -1927,6 +2003,14 @@ impl Workspace {
                     {
                         preferences.ai_agent_panel.width = Some(width);
                     }
+                    Edit::AutoHide(seconds)
+                        if super::terminal_agent::design::AUTO_HIDE_SECONDS.contains(&seconds) =>
+                    {
+                        preferences.ai_agent_design_auto_hide_seconds = Some(seconds);
+                    }
+                    Edit::ReducedAnimations(reduced) => {
+                        preferences.ai_agent_design_reduced_animations = Some(reduced);
+                    }
                     edit => dialog.agent_design.update(
                         &mut preferences.ai_agent_designs,
                         &mut preferences.ai_agent_design,
@@ -1997,6 +2081,23 @@ impl Workspace {
                     && session_restore::OutputPreferences::LINES.contains(&lines) =>
             {
                 dialog.draft.preferences.restore_output.lines = lines;
+            }
+            Message::UseJavaSessionRestore(_) if dialog.section == Section::Window => {
+                let imported = dialog.draft.preferences.java_session_restore;
+                if imported == self.window_settings.java_session_restore {
+                    imported
+                        .available(dialog.draft.restore.is_some(), &self.clipboard.policy)
+                        .apply(
+                            &mut dialog.draft.restore,
+                            &mut dialog.draft.preferences.restore_output,
+                        );
+                    dialog.problem = None;
+                } else {
+                    dialog.problem = Some(
+                        "The imported session settings changed. Reopen Settings to review them."
+                            .into(),
+                    );
+                }
             }
             Message::KeyBinding(_, edit) if dialog.section == Section::Keyboard => {
                 dialog
@@ -2452,7 +2553,9 @@ impl Workspace {
             }
         };
         let restore = draft.restore.filter(|mode| {
-            self.clipboard.policy.session_restore_mode.is_none() && Some(*mode) != initial.restore
+            self.clipboard.policy.problem.is_none()
+                && self.clipboard.policy.session_restore_mode.is_none()
+                && Some(*mode) != initial.restore
         });
         let session_journal = match dialog.logging.merge_journal(
             &initial.preferences.session_journal,
@@ -2628,7 +2731,12 @@ impl Workspace {
             if next.ai_agent_panel != self.window_settings.ai_agent_panel {
                 self.cancel_agent_dock_resizes();
             }
+            let agent_animations_changed =
+                next.agent_animations() != self.window_settings.agent_animations();
             self.window_settings = next;
+            if agent_animations_changed {
+                self.refresh_agent_inline_animations();
+            }
             if backgrounds_changed {
                 self.refresh_terminal_backgrounds();
             }
@@ -2929,9 +3037,7 @@ impl Workspace {
                     dialog,
                     Setting::AgentDesign,
                     dialog.agent_design.view(
-                        &preferences.ai_agent_designs,
-                        preferences.ai_agent_design,
-                        preferences.ai_agent_panel,
+                        preferences,
                         id,
                         dialog.input_target(Setting::AgentDesign, true),
                     ),
@@ -3041,7 +3147,19 @@ impl Workspace {
         ]
         .height(Length::Fill)
         .into();
-        let content = on_escape(content, msg(Message::Escape(id)));
+        let content = if dialog.section == Section::SnippetEditor
+            && dialog.snippet_appearance.recording_shortcut()
+        {
+            super::dialog_placement::escape::on_key_press(content, move |key, modifiers| {
+                Some(msg(Message::SnippetCompletionKey(
+                    id,
+                    key.clone(),
+                    modifiers,
+                )))
+            })
+        } else {
+            on_escape(content, msg(Message::Escape(id)))
+        };
         let modal = self
             .highlight_rules_for_settings(id)
             .map(|id| Desktop::Highlight(highlight::Message::Focus(id)));
@@ -3624,6 +3742,33 @@ impl Workspace {
             ]
             .spacing(6),
         );
+        let imported = dialog
+            .draft
+            .preferences
+            .java_session_restore
+            .available(dialog.draft.restore.is_some(), &self.clipboard.policy);
+        if !imported.is_empty() {
+            page = page.push(
+                column![
+                    text("Imported Java session settings").size(14),
+                    imported
+                        .mode
+                        .map(|mode| text(format!("Startup mode · {mode}")).size(13)),
+                    imported.output.map(|enabled| text(if enabled {
+                        "Restore encrypted terminal output"
+                    } else {
+                        "Keep terminal output restoration off"
+                    })
+                    .size(13)),
+                    imported
+                        .lines
+                        .map(|lines| text(format!("Lines per pane · {lines}")).size(13)),
+                    button("Use imported settings")
+                        .on_press(Desktop::Settings(Message::UseJavaSessionRestore(id))),
+                ]
+                .spacing(4),
+            );
+        }
         page = page.push(rule::horizontal(1)).push(highlighted(
             dialog,
             Setting::FixedGeometry,
@@ -4393,6 +4538,105 @@ mod tests {
     }
 
     #[test]
+    fn snippet_completion_shortcut_is_recorded_in_the_draft_and_persisted_on_save() {
+        use iced::advanced::clipboard;
+        use iced::keyboard::{self, Location, key};
+        use iced::{Event, Font, Renderer, event, mouse};
+        use iced_runtime::{UserInterface, user_interface::Cache};
+
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.update_settings(Message::OpenAt(owner, Section::SnippetEditor));
+        let id = workspace.settings.for_owner(owner).unwrap();
+        let _ = workspace.update_settings(Message::RecordSnippetCompletionShortcut(id));
+        let _ = workspace.update_settings(Message::SnippetCompletionKey(
+            id,
+            Key::Named(Named::Shift),
+            Modifiers::SHIFT,
+        ));
+        let _ = workspace.update_settings(Message::SnippetCompletionKey(
+            id,
+            Key::Named(Named::Escape),
+            Modifiers::empty(),
+        ));
+        assert!(
+            workspace
+                .settings
+                .0
+                .as_ref()
+                .unwrap()
+                .draft
+                .preferences
+                .snippet_completion_shortcut
+                .is_none()
+        );
+        let _ = workspace.update_settings(Message::RecordSnippetCompletionShortcut(id));
+        let key = Key::Character("k".into());
+        let modifiers = Modifiers::COMMAND | Modifiers::ALT;
+        let messages = {
+            let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+            let mut interface = UserInterface::build(
+                workspace.settings_view(id).unwrap(),
+                Size::new(800.0, 550.0),
+                Cache::default(),
+                &mut renderer,
+            );
+            let mut messages = Vec::new();
+            let (_, statuses) = interface.update(
+                &[Event::Keyboard(keyboard::Event::KeyPressed {
+                    modified_key: key.clone(),
+                    key: key.clone(),
+                    physical_key: key::Physical::Unidentified(key::NativeCode::Unidentified),
+                    location: Location::Standard,
+                    modifiers,
+                    text: None,
+                    repeat: false,
+                })],
+                mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            assert_eq!(statuses, [event::Status::Captured]);
+            messages
+        };
+        assert!(
+            matches!(messages.as_slice(), [Desktop::Settings(Message::SnippetCompletionKey(target, _, _))] if *target == id)
+        );
+        for message in messages {
+            let _ = workspace.update(message);
+        }
+        assert!(
+            workspace
+                .window_settings
+                .snippet_completion_shortcut
+                .is_none()
+        );
+        let mut saved = Vec::new();
+        let _ = workspace.save_settings_to(id, |settings| {
+            saved = serde_json::to_vec(settings)?;
+            Ok(())
+        });
+        let restored = WindowSettings::decode(&saved).unwrap();
+        assert_eq!(workspace.window_settings, restored);
+        assert!(
+            restored
+                .snippet_completion_shortcut
+                .unwrap()
+                .matches(&key, modifiers)
+        );
+
+        let _ = workspace.update_settings(Message::OpenAt(owner, Section::SnippetEditor));
+        let id = workspace.settings.for_owner(owner).unwrap();
+        let _ = workspace.update_settings(Message::ResetSnippetCompletionShortcut(id));
+        let _ = workspace.save_settings_to(id, |_| Ok(()));
+        assert_eq!(
+            workspace.window_settings.snippet_completion_shortcut,
+            Some(Default::default())
+        );
+    }
+
+    #[test]
     fn snippet_editor_appearance_inherits_and_only_applies_after_valid_save() {
         use crate::terminal_theme::Rgb;
         use snippet_editor_settings::{Color, Edit};
@@ -4943,6 +5187,72 @@ mod tests {
         assert!(!next.startup.require_master_password);
         let next = draft.merge_preferences(&initial, current, &ClipboardPolicy::default());
         assert!(next.startup.require_master_password);
+    }
+
+    #[test]
+    fn imported_java_session_settings_require_adoption_and_save_under_current_policy() {
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let hints = super::super::backup_data::session_recovery::Preferences {
+            mode: Some(RestoreMode::Auto),
+            output: Some(true),
+            lines: Some(1800),
+        };
+        workspace.window_settings.java_session_restore = hints;
+        let open = |workspace: &mut Workspace| {
+            let _ = workspace.update_settings(Message::OpenAt(owner, Section::Window));
+            let dialog = workspace.settings.0.as_mut().unwrap();
+            // Model an available native session writer without opening its device-local store.
+            dialog.initial.restore = Some(RestoreMode::Ask);
+            dialog.draft.restore = Some(RestoreMode::Ask);
+            dialog.id
+        };
+
+        let id = open(&mut workspace);
+        assert!(
+            !workspace
+                .settings
+                .0
+                .as_ref()
+                .unwrap()
+                .draft
+                .preferences
+                .restore_output
+                .enabled
+        );
+        workspace.clipboard.policy.session_restore_mode = Some(RestoreMode::Off);
+        workspace.clipboard.policy.session_restore_output = Some(false);
+        let _ = workspace.update_settings(Message::UseJavaSessionRestore(id));
+        let draft = &workspace.settings.0.as_ref().unwrap().draft;
+        assert_eq!(draft.restore, Some(RestoreMode::Ask));
+        assert_eq!(draft.preferences.restore_output, Default::default());
+
+        workspace.clipboard.policy.session_restore_mode = None;
+        workspace.clipboard.policy.session_restore_output = None;
+        workspace.window_settings.java_session_restore.lines = Some(2100);
+        let _ = workspace.update_settings(Message::UseJavaSessionRestore(id));
+        let dialog = workspace.settings.0.as_ref().unwrap();
+        assert!(dialog.problem.is_some());
+        assert_eq!(dialog.draft.restore, Some(RestoreMode::Ask));
+        assert!(!dialog.draft.preferences.restore_output.enabled);
+        let _ = workspace.update_settings(Message::Cancel(id));
+
+        workspace.window_settings.java_session_restore = hints;
+        let id = open(&mut workspace);
+        let _ = workspace.update_settings(Message::UseJavaSessionRestore(id));
+        let draft = &workspace.settings.0.as_ref().unwrap().draft;
+        assert_eq!(draft.restore, Some(RestoreMode::Auto));
+        assert!(draft.preferences.restore_output.enabled);
+        assert_eq!(draft.preferences.restore_output.lines, 1800);
+        assert!(!workspace.window_settings.restore_output.enabled);
+
+        let _ = workspace.save_settings_to(id, |settings| {
+            assert!(settings.restore_output.enabled);
+            assert_eq!(settings.restore_output.lines, 1800);
+            Ok(())
+        });
+        assert!(workspace.window_settings.restore_output.enabled);
+        assert_eq!(workspace.window_settings.restore_output.lines, 1800);
     }
 
     #[test]
@@ -5554,6 +5864,40 @@ mod tests {
                 .default_id(AgentDesign::Standard),
             choice.id
         );
+    }
+
+    #[test]
+    fn agent_design_display_options_are_saved_with_the_settings_draft() {
+        use agent_design_settings::Edit;
+
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.invoke_chrome(owner, super::super::chrome::Action::AgentDesign);
+        let id = workspace.settings.0.as_ref().unwrap().id;
+        for edit in [
+            Edit::AutoHide(0),
+            Edit::ReducedAnimations(true),
+            Edit::AutoHide(61),
+        ] {
+            let _ = workspace.update_settings(Message::AgentDesignCatalog(id, edit));
+        }
+        assert_eq!(
+            workspace.window_settings.agent_status_auto_hide_seconds(),
+            6
+        );
+        assert!(workspace.window_settings.agent_animations());
+        let _ = workspace.save_settings_to(id, |preferences| {
+            let encoded = serde_json::to_vec(preferences)?;
+            let reopened = WindowSettings::decode(&encoded)?;
+            assert_eq!(reopened.agent_status_auto_hide_seconds(), 0);
+            assert!(!reopened.agent_animations());
+            Ok(())
+        });
+        assert_eq!(
+            workspace.window_settings.agent_status_auto_hide_seconds(),
+            0
+        );
+        assert!(!workspace.window_settings.agent_animations());
     }
 
     #[test]

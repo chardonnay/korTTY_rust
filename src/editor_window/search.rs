@@ -378,7 +378,7 @@ fn ending(value: LineEnding, between: bool) -> &'static str {
     }
 }
 
-pub(super) fn position_after_edit(content: &text_editor::Content, raw: usize) -> Position {
+pub(crate) fn position_after_edit(content: &text_editor::Content, raw: usize) -> Position {
     let mut offset = 0;
     let mut last = Position { line: 0, column: 0 };
     for (line, value) in content.lines().enumerate() {

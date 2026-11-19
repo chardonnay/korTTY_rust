@@ -138,7 +138,7 @@ impl Workspace {
         {
             self.project_base_appearance(project)
         } else {
-            self.terminal_base_appearance(pane.and_then(|pane| self.terminal_overrides(pane)))
+            self.terminal_base_appearance(pane.and_then(|pane| self.terminal_presentation(pane)))
         };
         self.pane_effect(session)
             .map_or(base, |active| active.selection.effect.appearance(base))
@@ -150,7 +150,7 @@ impl Workspace {
         if let Some(project) = &pane.project_terminal_appearance {
             return project.theme_id(themes);
         }
-        self.terminal_overrides(pane)
+        self.terminal_presentation(pane)
             .and_then(|settings| settings.theme.as_ref())
             .and_then(|theme| theme.resolved_theme(themes))
             .map(|theme| theme.id)
@@ -205,6 +205,12 @@ impl Workspace {
         self.saved_terminal_preferences.terminal(pane.ssh.as_ref()?)
     }
 
+    fn terminal_presentation<'a>(&'a self, pane: &'a PaneSession) -> Option<&'a TerminalOverrides> {
+        pane.quick_appearance
+            .as_ref()
+            .or_else(|| self.terminal_overrides(pane))
+    }
+
     pub(in crate::workspace) fn terminal_scrollback(
         &self,
         settings: Option<&TerminalOverrides>,
@@ -252,7 +258,7 @@ impl Workspace {
                 font,
             );
         }
-        let settings = self.terminal_overrides(pane);
+        let settings = self.terminal_presentation(pane);
         let scheme = settings.and_then(|settings| settings.scheme(themes));
         let base = settings
             .and_then(|settings| settings.font_size)
@@ -285,6 +291,18 @@ impl Workspace {
             .get(&session)?
             .effect
             .filter(|active| self.allowed_terminal_effect(active.selection.effect))
+    }
+
+    pub(super) fn apply_terminal_effect_selection(
+        &mut self,
+        session: SessionId,
+        effect: Option<Selection>,
+    ) {
+        let effect = effect.filter(|selection| self.allowed_terminal_effect(selection.effect));
+        if let Some(pane) = self.sessions.get_mut(&session) {
+            pane.effect = effect.map(Active::from_saved);
+            self.sync_pane_appearance(session);
+        }
     }
 
     pub(super) fn select_terminal_effect(&mut self, session: SessionId, effect: Option<Effect>) {
@@ -584,6 +602,62 @@ mod tests {
     }
 
     #[test]
+    fn saved_local_effect_is_applied_on_launch_and_respects_current_effect_settings() {
+        use crate::connection_store::LocalProfile;
+        use kortty_terminal::TerminalProfile;
+
+        let scratch = crate::snippets::tests::Profile::new();
+        let path = scratch.0.join("connections.json");
+        let mut store = Store::open(path.clone()).unwrap();
+        let selection = Selection {
+            effect: Effect::DigitalRain,
+            speed: Speed::try_from(2.75).unwrap(),
+        };
+        let id = store
+            .save_local(LocalProfile {
+                id: 0,
+                name: "Saved effect fixture".into(),
+                #[cfg(windows)]
+                shell: kortty_pty::LocalShell::CommandPrompt,
+                #[cfg(not(windows))]
+                shell: Default::default(),
+                command: None,
+                working_directory: None,
+                shell_integration: false,
+                emulation: TerminalProfile::Xterm.term_name().into(),
+                terminal_effect: Some(selection),
+                terminal: Default::default(),
+            })
+            .unwrap();
+        let profile = Store::open(path).unwrap().local(id).unwrap().clone();
+        let mut workspace = Workspace::default();
+        let first = workspace
+            .store_saved_local_session(profile.clone(), None)
+            .unwrap();
+        assert_eq!(
+            workspace.pane_effect(first).map(|active| active.selection),
+            Some(selection)
+        );
+        workspace.stop_session(first);
+        let cleared = workspace
+            .store_saved_local_session_in_view(
+                profile.clone(),
+                None,
+                super::super::LocalLaunchView::QuickConnect(Some(None), None),
+            )
+            .unwrap();
+        assert!(workspace.pane_effect(cleared).is_none());
+        workspace.stop_session(cleared);
+        workspace
+            .window_settings
+            .terminal_effects
+            .set_effect_enabled(selection.effect, false);
+        let second = workspace.store_saved_local_session(profile, None).unwrap();
+        assert!(workspace.pane_effect(second).is_none());
+        workspace.stop_session(second);
+    }
+
+    #[test]
     fn saved_local_terminal_overrides_follow_edits_and_inherited_values() {
         use crate::connection_store::LocalProfile;
         use crate::terminal_theme::Rgb;
@@ -600,6 +674,7 @@ mod tests {
                 working_directory: None,
                 shell_integration: false,
                 emulation: TerminalProfile::Xterm.term_name().into(),
+                terminal_effect: None,
                 terminal: TerminalOverrides {
                     foreground: Some(Rgb::from_hex(0xC0FFEE)),
                     font_size: Some(23),
@@ -723,6 +798,7 @@ mod tests {
                 working_directory: None,
                 shell_integration: false,
                 emulation: TerminalProfile::Xterm.term_name().into(),
+                terminal_effect: None,
                 terminal: terminal.clone(),
             })
             .unwrap();

@@ -1,6 +1,6 @@
 //! Private, revisioned histories with one atomic file per analysis subject.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -16,7 +16,7 @@ use super::model::{
 use crate::clipboard_policy::ClipboardPolicy;
 use crate::private_files::{Directory, FileStamp, require_single_link};
 use crate::session_journal::export_output::valid_component;
-use crate::snippets::{Library, SnippetId};
+use crate::snippets::{Library, SavedApply, Snippet, SnippetId};
 
 const DIRECTORY_NAME: &str = "snippet-analyses";
 const LOCK_NAME: &str = ".history.lock";
@@ -25,6 +25,7 @@ pub(crate) const DEFAULT_HISTORY_LIMIT: u8 = 5;
 pub(crate) const HISTORY_LIMITS: std::ops::RangeInclusive<u8> = 1..=20;
 const MAX_RECORDS: usize = 128;
 const MAX_APPLY_RUNS: usize = 8;
+pub(crate) const MAX_SAVED_APPLY_RESULTS: usize = MAX_RECORDS * MAX_APPLY_RUNS;
 const MAX_APPLY_RECOVERIES: usize = 4;
 const MAX_EXPORT_ENTRIES: usize = 32;
 const MAX_FILE_BYTES: usize = 12 * MAX_CONTENT_BYTES;
@@ -40,6 +41,7 @@ pub(crate) struct RetentionPreview {
 
 pub(crate) mod java;
 mod modularization;
+pub(crate) mod overview;
 pub(crate) use modularization::ReviewedSplitRevision;
 
 #[cfg(test)]
@@ -110,6 +112,42 @@ impl Store {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error),
         }
+    }
+
+    pub(crate) fn saved_native_applies(
+        &self,
+        snippet: &Snippet,
+        next: &str,
+    ) -> io::Result<BTreeSet<SavedApply>> {
+        let history = self.load(Subject::Snippet(snippet.id()))?;
+        let accepted = history.records.iter().flat_map(|report| {
+            report.apply_runs.iter().filter_map(move |run| {
+                (run.status == ApplyStatus::Accepted).then_some((
+                    SavedApply {
+                        report: report.id,
+                        run: run.id,
+                    },
+                    &run.after_sha256,
+                ))
+            })
+        });
+        let mut accepted = accepted.peekable();
+        if accepted.peek().is_none() {
+            return Ok(BTreeSet::new());
+        }
+        // The old text also proves a save, including for libraries created before stamps existed.
+        let before = content_hash(snippet.content())?;
+        let after = if next == snippet.content() {
+            before.clone()
+        } else {
+            content_hash(next)?
+        };
+        Ok(accepted
+            .filter_map(|(key, hash)| {
+                (hash == &before || hash == &after || snippet.saved_apply_results().contains(&key))
+                    .then_some(key)
+            })
+            .collect())
     }
 
     pub(crate) fn preview_retention(
@@ -921,21 +959,23 @@ fn read(
     };
     require_single_link(&file)?;
     let before = FileStamp::read(&file)?;
+    Ok((read_stamped(&file, &before, subject)?, Some(before)))
+}
+
+fn read_stamped(file: &File, before: &FileStamp, subject: Subject) -> io::Result<History> {
     if file.metadata()?.len() > MAX_FILE_BYTES as u64 {
         return Err(invalid("The analysis history exceeds its storage limit"));
     }
     let mut bytes = Vec::new();
-    (&file)
-        .take(MAX_FILE_BYTES as u64 + 1)
+    file.take(MAX_FILE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)?;
-    before.require_unchanged(&file)?;
+    before.require_unchanged(file)?;
     if bytes.len() > MAX_FILE_BYTES {
         return Err(invalid("The analysis history exceeds its storage limit"));
     }
     let document: Document = serde_json::from_slice(&bytes)
         .map_err(|_| invalid("The analysis history is corrupt or uses an unsupported schema"))?;
-    let history = document.decode(subject)?;
-    Ok((history, Some(before)))
+    document.decode(subject)
 }
 
 impl Document {

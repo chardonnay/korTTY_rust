@@ -13,9 +13,10 @@ use crate::snippet_analysis::model::now_millis;
 
 use super::Mode;
 
-const FOLDER: &str = "terminal-agent-history";
+pub(crate) const FOLDER: &str = "terminal-agent-history";
 const FILE: &str = "prompts.json";
-const MAX_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const BACKUP_PATH: &str = "terminal-agent-history/prompts.json";
+pub(crate) const MAX_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const DEFAULT_LIMIT: usize = 20;
 pub(crate) const MIN_LIMIT: usize = 5;
 pub(crate) const MAX_LIMIT: usize = 100;
@@ -26,6 +27,7 @@ pub(crate) enum Kind {
     Run,
     Ask,
     Plan,
+    Imported,
 }
 
 impl From<Mode> for Kind {
@@ -217,8 +219,15 @@ fn read(directory: &Directory) -> io::Result<(Snapshot, Option<FileStamp>)> {
         return Err(invalid("The prompt history exceeds its storage limit"));
     }
     stamp.require_unchanged(&file)?;
+    Ok((decode(&bytes)?, Some(stamp)))
+}
+
+fn decode(bytes: &[u8]) -> io::Result<Snapshot> {
+    if bytes.len() > MAX_BYTES {
+        return Err(invalid("The prompt history exceeds its storage limit"));
+    }
     let document: Snapshot =
-        serde_json::from_slice(&bytes).map_err(|_| invalid("Invalid prompt history"))?;
+        serde_json::from_slice(bytes).map_err(|_| invalid("Invalid prompt history"))?;
     let mut prompts = HashSet::new();
     if document.version != 1
         || !(MIN_LIMIT..=MAX_LIMIT).contains(&document.limit)
@@ -230,7 +239,117 @@ fn read(directory: &Directory) -> io::Result<(Snapshot, Option<FileStamp>)> {
     {
         return Err(invalid("Invalid prompt history entries"));
     }
-    Ok((document, Some(stamp)))
+    Ok(document)
+}
+
+pub(crate) fn validate_backup(bytes: &[u8]) -> io::Result<()> {
+    decode(bytes).map(|_| ())
+}
+
+pub(crate) fn merge_java_backup(
+    local: Option<&[u8]>,
+    incoming: &[u8],
+) -> io::Result<Option<Vec<u8>>> {
+    let incoming = decode(incoming)?;
+    let Some(local) = local else {
+        return Ok(Some(serde_json::to_vec(&incoming)?));
+    };
+    let mut local = decode(local)?;
+    let count = local.entries.len();
+    for entry in incoming.entries {
+        if local.entries.len() == local.limit {
+            break;
+        }
+        if !local
+            .entries
+            .iter()
+            .any(|current| current.goal == entry.goal)
+        {
+            local.entries.push(entry);
+        }
+    }
+    if count == local.entries.len() {
+        return Ok(None);
+    }
+    let bytes = serde_json::to_vec(&local)?;
+    validate_backup(&bytes)?;
+    Ok(Some(bytes))
+}
+
+pub(crate) fn read_java_backup(
+    wrapper: Option<roxmltree::Node<'_, '_>>,
+    limit: Option<usize>,
+    omitted: &mut usize,
+) -> io::Result<Option<(Vec<u8>, usize)>> {
+    let mut snapshot = Snapshot {
+        limit: limit.unwrap_or(DEFAULT_LIMIT),
+        ..Snapshot::default()
+    };
+    if let Some(wrapper) = wrapper {
+        let policy = crate::clipboard_policy::ClipboardPolicy::load();
+        let redactor = crate::workspace::saved_chats::java_xml_redactor(&policy.terminal_logging)?;
+        for input in wrapper.children().filter(roxmltree::Node::is_element) {
+            let entry = (snapshot.entries.len() < snapshot.limit)
+                .then(|| java_entry(input, &redactor))
+                .flatten();
+            match entry {
+                Some(entry)
+                    if !snapshot
+                        .entries
+                        .iter()
+                        .any(|current| current.goal == entry.goal) =>
+                {
+                    snapshot.entries.push(entry);
+                }
+                _ => *omitted += 1,
+            }
+        }
+    }
+    if limit.is_none() && snapshot.entries.is_empty() {
+        return Ok(None);
+    }
+    let bytes = serde_json::to_vec(&snapshot)?;
+    validate_backup(&bytes)?;
+    Ok(Some((bytes, snapshot.entries.len())))
+}
+
+fn java_entry(
+    node: roxmltree::Node<'_, '_>,
+    redactor: &crate::terminal_logging::Redactor,
+) -> Option<Entry> {
+    if !node.has_tag_name("input")
+        || node.tag_name().namespace().is_some()
+        || node.attributes().next().is_some()
+    {
+        return None;
+    }
+    let value = |name| {
+        let mut nodes = node
+            .children()
+            .filter(|child| child.has_tag_name(name) && child.tag_name().namespace().is_none());
+        let child = nodes.next()?;
+        if nodes.next().is_some()
+            || child.attributes().next().is_some()
+            || !child.children().all(|content| content.is_text())
+        {
+            return None;
+        }
+        child.text().map(str::trim)
+    };
+    let prompt = value("prompt")?;
+    if prompt.len() > 8192 || prompt.is_empty() {
+        return None;
+    }
+    let entry = Entry {
+        goal: crate::workspace::mask_ai_prompt(redactor, prompt).ok()?,
+        kind: Kind::Imported,
+        started_at: value("lastUsedEpochMillis")?
+            .parse::<i64>()
+            .ok()?
+            .try_into()
+            .ok()?,
+    };
+    entry.valid().then_some(entry)
 }
 
 fn invalid(message: &'static str) -> io::Error {

@@ -2187,7 +2187,17 @@ impl Workspace {
                 match self.swarm_ai_policy(Mode::Ask) {
                     Ok(()) => {
                         group.workflow_generation += 1;
-                        group.workflow = Some(workflow::Form::new(group.workflow_generation));
+                        let private = group
+                            .owner
+                            .and_then(|owner| self.windows.get(&owner))
+                            .and_then(super::super::Window::tab)
+                            .is_some_and(|tab| tab.incognito);
+                        let config = self.ai_configuration();
+                        let history_root = (!private)
+                            .then(|| config.as_ref().and_then(|config| config.saved_root()))
+                            .flatten();
+                        group.workflow =
+                            Some(workflow::Form::new(group.workflow_generation, history_root));
                         group.notice.clear();
                     }
                     Err(error) => group.notice = error.into(),

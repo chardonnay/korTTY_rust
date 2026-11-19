@@ -33,6 +33,7 @@ mod cursor;
 pub(super) mod design;
 mod final_evidence;
 mod flow;
+pub(super) mod font;
 mod handoff;
 mod history;
 mod inline_history;
@@ -76,6 +77,14 @@ impl ProfileChoice {
         &self,
         config: &crate::ai_manager::Configuration,
     ) -> Result<(local_ai::Profile, usize), String> {
+        self.transport_for_mode(config, Mode::Ask)
+    }
+
+    fn transport_for_mode(
+        &self,
+        config: &crate::ai_manager::Configuration,
+        mode: Mode,
+    ) -> Result<(local_ai::Profile, usize), String> {
         if config.resolve_profile_reference(&self.reference) != Some(self.id) {
             return Err("The agent profile changed. Start a new review.".into());
         }
@@ -86,6 +95,7 @@ impl ProfileChoice {
                 &self.reference,
                 destination,
                 self.reviewed_https.is_some(),
+                mode == Mode::Plan,
             )
         } else if let Some(destination) = &self.reviewed_https {
             config.reviewed_agent_https_transport(&self.reference, destination)
@@ -116,6 +126,9 @@ pub enum Message {
     ActivityExport(activity_export::Message),
     Design(design::Message),
     DockResize(design::DockResize),
+    Zoom(font::View, bool),
+    RememberActivityFont(bool),
+    ActivityPanel(design::ActivityChange),
     ChatFollowUp(u64, String),
     ContinueInChat(u64),
     DismissChatHandoff(u64),
@@ -248,6 +261,7 @@ struct Run {
     swarm: bool,
     swarm_web: Option<swarm::web_evidence::Evidence>,
     design: AgentLayout,
+    fonts: font::Sizes,
     presentation: design::Presentation,
     started_order: u64,
     chat_handoff_id: Option<String>,
@@ -349,9 +363,10 @@ fn profile_choices(config: &crate::ai_manager::Configuration) -> Vec<ProfileChoi
 
 fn server_default_profile_choices(
     config: &crate::ai_manager::Configuration,
+    mode: Mode,
 ) -> impl Iterator<Item = ProfileChoice> {
     config
-        .foreground_agent_default_profiles()
+        .foreground_default_profiles(mode == Mode::Plan)
         .filter_map(|(id, name, destination, remote)| {
             Some(ProfileChoice {
                 id,
@@ -421,6 +436,7 @@ impl Run {
             swarm: setup.swarm,
             swarm_web: None,
             design: setup.design,
+            fonts: font::Sizes::default(),
             presentation: design::Presentation::default(),
             started_order: 0,
             chat_handoff_id: None,
@@ -516,6 +532,9 @@ impl Run {
 
     fn next(&mut self, phase: Phase, notice: &str) -> u64 {
         self.epoch += 1;
+        if phase.finished() && !self.phase.finished() {
+            self.presentation.finished(std::time::Instant::now());
+        }
         self.phase = phase;
         if phase.finished() {
             self.probe_reviewed = false;
@@ -566,6 +585,9 @@ impl Run {
         if self.phase.working() {
             self.notice = "Cancelling the active agent operation…".into();
         } else {
+            if !self.phase.finished() {
+                self.presentation.finished(std::time::Instant::now());
+            }
             self.phase = Phase::Cancelled;
             self.notice = notice.into();
             self.chat_handoff_notice = Some(notice.into());
@@ -1022,13 +1044,11 @@ impl Workspace {
                     .ai_configuration()
                     .ok_or("AI is unavailable under the current settings.")?;
                 let mut profiles = profile_choices(&config);
-                let connection = self
-                    .terminal_overrides(pane)
-                    .and_then(|settings| settings.ai_profile.as_ref());
+                let (connection, _) = self.terminal_ai_assignments(pane);
+                if !tab.incognito && !swarm {
+                    profiles.extend(server_default_profile_choices(&config, mode));
+                }
                 if !tab.incognito && matches!(mode, Mode::Ask | Mode::Run) {
-                    if !swarm {
-                        profiles.extend(server_default_profile_choices(&config));
-                    }
                     profiles.extend(https_profile_choices(&config));
                     if local_ai::cli::allowed(&policy, false)
                         && local_ai::cli::allowed(&self.clipboard.policy, false)
@@ -1158,6 +1178,8 @@ impl Workspace {
             redactor,
         });
         run.profile_pending = profile_pending;
+        run.fonts = font::Sizes::load(&self.window_settings);
+        run.presentation.load_activity(&self.window_settings);
         Ok(run)
     }
 
@@ -1211,6 +1233,21 @@ impl Workspace {
             } else {
                 Task::none()
             };
+        }
+        match message {
+            Message::Zoom(view, increase) => {
+                self.zoom_agent_font(id, view, increase);
+                return Task::none();
+            }
+            Message::RememberActivityFont(remember) => {
+                self.remember_agent_activity_font(id, remember);
+                return Task::none();
+            }
+            Message::ActivityPanel(change) => {
+                self.change_agent_activity_panel(id, change);
+                return Task::none();
+            }
+            _ => {}
         }
         if let Message::Pip(message) = message {
             return self.agent_pip_action(id, message);

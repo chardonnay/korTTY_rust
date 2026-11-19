@@ -347,6 +347,7 @@ pub enum Action {
     AgentPanelBottom,
     AgentPanelLeft,
     AgentPanelRight,
+    ToggleAgentStatus,
 }
 
 #[derive(Clone, Copy)]
@@ -458,6 +459,7 @@ impl Branch {
                 Item(AgentPanelRight),
                 Separator,
                 Item(AgentPanelDesign),
+                Item(ToggleAgentStatus),
             ],
             Self::RemoteSidebar => &[
                 Item(RemoteSidebarLeft),
@@ -910,6 +912,7 @@ impl Action {
             AgentPanelBottom => "Dock Bottom",
             AgentPanelLeft => "Dock Left",
             AgentPanelRight => "Dock Right",
+            ToggleAgentStatus => "Show or Hide Status Bar",
             TeamworkSettings => "Teamwork Settings…",
             LogfileManager => "Logfile Manager…",
             SessionProcesses => "Session Processes…",
@@ -1541,6 +1544,10 @@ impl Workspace {
                 self.sync_native_menus();
                 return Task::none();
             }
+            ToggleAgentStatus => {
+                self.toggle_agent_status(id);
+                return Task::none();
+            }
             QuickConnect => return self.show_quick_connect(id),
             QuickSelect => return self.start_quick_select(id),
             CodingAgentsLeft | CodingAgentsRight | ToggleCodingAgents => {
@@ -1657,6 +1664,7 @@ impl Workspace {
             | NextBlockedCodingAgent
             | HideTerminalScrollbarsFullscreen => self.windows.contains_key(&id),
             ToggleSessionJournal => self.journal_toggle_enabled(id),
+            ToggleAgentStatus => self.agent_status_available(id),
             SavedChats => self.windows.contains_key(&id) && self.ai_chat_enabled(),
             AgentSwarm => self.windows.contains_key(&id) && self.agent_swarm_available(),
             TerminalAgent | TerminalAgentAsk | TerminalAgentPlan => self
@@ -1886,7 +1894,7 @@ impl Workspace {
             Recordings => W::Recording(recording_access::Message::Open(id)),
             AiManager => W::AiManager(super::ai_access::Message::Open(id)),
             SavedChats => W::SavedChats(id, super::saved_chats::Message::Open),
-            Editor => W::OpenEditor,
+            Editor => W::OpenEditor(id),
             Diagrams => W::OpenDiagram,
             FilesLeft => W::LocalDock(id, local_dock::Message::Toggle(local_dock::Side::Left)),
             FilesRight => W::LocalDock(id, local_dock::Message::Toggle(local_dock::Side::Right)),
@@ -2722,6 +2730,7 @@ fn native_menu_requires_focused_owner(action: Action) -> bool {
             | AgentPanelBottom
             | AgentPanelLeft
             | AgentPanelRight
+            | ToggleAgentStatus
             | ToggleCodingAgents
             | NextBlockedCodingAgent
             | TerminalAgent

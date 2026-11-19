@@ -213,6 +213,28 @@ pub(crate) fn interactive_limited(
         &Builtins::new(clipboard),
         limit,
     )
+    .map(|resolved| resolved.text)
+}
+
+#[derive(PartialEq, Eq)]
+pub(crate) struct Resolved {
+    pub(crate) text: String,
+    pub(crate) caret: Option<usize>,
+}
+
+pub(crate) fn interactive_insertion(
+    source: &str,
+    variables: &[Variable],
+    entered: &[Entered],
+    clipboard: Option<&str>,
+) -> Result<Resolved, &'static str> {
+    resolve(
+        source,
+        variables,
+        Use::Interactive(entered),
+        &Builtins::new(clipboard),
+        super::MAX_CONTENT_BYTES,
+    )
 }
 
 pub(crate) fn headless(
@@ -227,6 +249,7 @@ pub(crate) fn headless(
         &Builtins::new(None),
         limit,
     )
+    .map(|resolved| resolved.text)
 }
 
 /// Resolve a local script header against the facts captured when it was reviewed.
@@ -242,7 +265,7 @@ pub(crate) fn workflow_header(
         username: OnceCell::from(creator.to_owned()),
         ..Builtins::new(None)
     };
-    resolve(source, variables, Use::WorkflowHeader, &builtins, limit)
+    resolve(source, variables, Use::WorkflowHeader, &builtins, limit).map(|resolved| resolved.text)
 }
 
 /// Identify the exact stored values a review depends on, in source order.
@@ -270,12 +293,13 @@ fn resolve(
     usage: Use<'_>,
     builtins: &Builtins<'_>,
     limit: usize,
-) -> Result<String, &'static str> {
+) -> Result<Resolved, &'static str> {
     if source.len() > limit {
         return Err("The snippet exceeds its text size limit");
     }
     let mut result = Zeroizing::new(String::with_capacity(source.len()));
     let mut offset = 0;
+    let mut caret = None;
     for placeholder in placeholders(source) {
         append(&mut result, &source[offset..placeholder.start], limit)?;
         offset = placeholder.end;
@@ -284,6 +308,9 @@ fn resolve(
         let replacement = if placeholder.escaped {
             &raw[1..]
         } else if let Some(builtin) = Builtin::parse(name) {
+            if matches!(builtin, Builtin::Cursor) {
+                caret.get_or_insert(result.len());
+            }
             if matches!(usage, Use::WorkflowHeader) && matches!(builtin, Builtin::Clipboard) {
                 return Err("Remove the clipboard placeholder from the saved script header.");
             }
@@ -309,7 +336,10 @@ fn resolve(
         append(&mut result, replacement, limit)?;
     }
     append(&mut result, &source[offset..], limit)?;
-    Ok(std::mem::take(&mut *result))
+    Ok(Resolved {
+        text: std::mem::take(&mut *result),
+        caret,
+    })
 }
 
 fn lookup<'a>(variables: &'a [Variable], name: &str) -> Option<&'a Variable> {
@@ -604,7 +634,9 @@ mod tests {
         }];
         let source = "${date}|${DATE}|${time}|${datetime}|${PATH}|${TICKET}|${cursor}|${clipboard}|$${path}|$$${path}|${1:-${_}}|${unknown}";
         assert_eq!(
-            resolve(source, &vars, Use::Interactive(&entered), &builtins, 4096).unwrap(),
+            resolve(source, &vars, Use::Interactive(&entered), &builtins, 4096)
+                .unwrap()
+                .text,
             "2026-11-06|custom|12:03:04|2026-11-06 12:03:04|${inner}|A-17||${clipboard}|${path}|$${path}|${1:-${_}}|${unknown}"
         );
         let needed = copy_requirements("${TiCkEt} ${TICKET} $${clipboard} ${date}", &vars);

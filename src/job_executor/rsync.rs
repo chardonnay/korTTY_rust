@@ -285,7 +285,8 @@ fn open_review_session(
     use super::{Failure, connection, remote};
 
     let stopped = move || cancelled.load(Ordering::Acquire);
-    let pins = sync::pins(reference, trust).map_err(|error| error.to_string())?;
+    let reviewed_trust = reference.strict_trust(trust.clone())?;
+    let pins = sync::pins(reference, &reviewed_trust).map_err(|error| error.to_string())?;
     let expected = pins.clone();
     let enrolled = reference.clone();
     let trust = trust.clone();

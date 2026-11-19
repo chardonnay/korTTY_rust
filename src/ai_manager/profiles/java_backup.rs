@@ -11,8 +11,8 @@ use super::{
     Reasoning, Vision, cli_profile,
 };
 use crate::ai_manager::{
-    JavaAgentShortcut, JavaAiProfileHint, JavaJournalEvidence, JavaJournalPreferences,
-    JavaJournalProfiles,
+    CodeTextLanguage, JavaAgentShortcut, JavaAiProfileHint, JavaGeneralPreferences,
+    JavaJournalEvidence, JavaJournalPreferences, JavaJournalProfiles,
 };
 use crate::local_ai::cli::{self, catalog::Provider};
 use crate::local_ai::web_search::{McpMode, McpSettings};
@@ -156,6 +156,9 @@ impl From<JavaEmbeddedModel> for EmbeddedModelRecord {
 
 #[derive(Default)]
 pub(in crate::ai_manager) struct Report {
+    pub(in crate::ai_manager) general_preferences: JavaGeneralPreferences,
+    pub(in crate::ai_manager) request_timeout_omitted: bool,
+    pub(in crate::ai_manager) code_text_language_omitted: bool,
     pub(in crate::ai_manager) roles: crate::ai_manager::java_roles::Hints,
     pub(in crate::ai_manager) roles_omitted: usize,
     pub(in crate::ai_manager) https_imported: usize,
@@ -441,6 +444,35 @@ pub(in crate::ai_manager) fn decode(bytes: &[u8]) -> io::Result<(Catalog, Report
     match agent_shortcut(root) {
         Ok(shortcut) => report.agent_shortcut = shortcut,
         Err(()) => report.agent_shortcut_omitted = true,
+    }
+    match scalar(root, "aiRequestTimeoutMinutes").and_then(|value| {
+        value
+            .map(|text| text.parse::<u16>().map_err(|_| ()))
+            .transpose()
+    }) {
+        Ok(None) => {}
+        Ok(Some(minutes @ 0..=crate::ai_manager::MAX_TIMEOUT_MINUTES)) => {
+            report.general_preferences.timeout_minutes = Some(minutes);
+        }
+        Ok(Some(_)) | Err(()) => report.request_timeout_omitted = true,
+    }
+    match scalar(root, "aiCodeTextDefaultLanguage").and_then(|value| {
+        value
+            .map(|code| {
+                CodeTextLanguage::ALL
+                    .into_iter()
+                    .find(|language| {
+                        language
+                            .explicit_code()
+                            .unwrap_or("auto")
+                            .eq_ignore_ascii_case(code)
+                    })
+                    .ok_or(())
+            })
+            .transpose()
+    }) {
+        Ok(language) => report.general_preferences.code_text_language = language,
+        Err(()) => report.code_text_language_omitted = true,
     }
     report.journal_profiles = JavaJournalProfiles {
         preferences: match journal_preferences(root) {

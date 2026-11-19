@@ -28,8 +28,13 @@ impl Server {
         self.exec_verified_helper(flow, kortty_server_archive::protocol::COMMAND)
     }
 
-    pub(super) fn exec_draft_replace(&self, flow: &Flow) -> Result<(), ConnectError> {
-        self.exec_verified_helper(flow, kortty_server_archive::draft_replace::COMMAND)
+    pub(super) fn exec_draft_replace(
+        &self,
+        flow: &Flow,
+        windows: bool,
+    ) -> Result<(), ConnectError> {
+        use kortty_server_archive::draft_replace::{COMMAND, WINDOWS_COMMAND};
+        self.exec_verified_helper(flow, if windows { WINDOWS_COMMAND } else { COMMAND })
     }
 
     fn exec_verified_helper(&self, flow: &Flow, command: &str) -> Result<(), ConnectError> {

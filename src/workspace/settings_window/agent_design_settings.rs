@@ -1,14 +1,13 @@
 //! Edits the profile-local design catalog and previews an isolated sample run.
 
-use iced::widget::{button, column, container, pick_list, row, slider, text, text_input};
-use iced::{Element, Length, Size, window};
+use iced::widget::{button, checkbox, column, pick_list, row, slider, text, text_input};
+use iced::{Element, window};
 
 use crate::terminal_agent::design::{
     Approval, Arrangement, Catalog, History, Layout, Preset, Status,
 };
-use crate::workspace::terminal_agent::design::{
-    DockPlacement, DockPreferences, compose, status_indicator, status_slot,
-};
+use crate::workspace::tab_titles::WindowSettings;
+use crate::workspace::terminal_agent::design::{AUTO_HIDE_SECONDS, DockPlacement, DockPreferences};
 
 use super::{Desktop, Message};
 
@@ -25,16 +24,51 @@ pub(crate) enum Edit {
     Remove(String),
     ConfirmRemove(String, bool),
     Module(String, Module),
+    Preview(Option<Module>),
     DockPlacement(DockPlacement),
     DockWidth(u16),
+    AutoHide(u8),
+    ReducedAnimations(bool),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Module {
     History(History),
     Status(Status),
     Approval(Approval),
     Arrangement(Arrangement),
+}
+
+impl Module {
+    fn apply(self, layout: &mut Layout) {
+        match self {
+            Self::History(value) => layout.history = value,
+            Self::Status(value) => layout.status = value,
+            Self::Approval(value) => layout.approval = value,
+            Self::Arrangement(value) => layout.arrangement = value,
+        }
+    }
+
+    fn choices() -> Vec<Self> {
+        History::ALL
+            .into_iter()
+            .map(Self::History)
+            .chain(Status::ALL.into_iter().map(Self::Status))
+            .chain(Approval::ALL.into_iter().map(Self::Approval))
+            .chain(Arrangement::ALL.into_iter().map(Self::Arrangement))
+            .collect()
+    }
+}
+
+impl std::fmt::Display for Module {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::History(value) => write!(formatter, "History · {value}"),
+            Self::Status(value) => write!(formatter, "Status · {value}"),
+            Self::Approval(value) => write!(formatter, "Approval · {value}"),
+            Self::Arrangement(value) => write!(formatter, "Arrangement · {value}"),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -44,6 +78,7 @@ pub(super) struct Editor {
     removing: Option<String>,
     notice: &'static str,
     demo: preview::Demo,
+    preview_module: Option<Module>,
 }
 
 impl Editor {
@@ -54,6 +89,16 @@ impl Editor {
             .unwrap_or_else(|| catalog.default_id(preset))
     }
 
+    fn preview_layout(&self, catalog: &Catalog, preset: Preset) -> Layout {
+        let mut layout = catalog
+            .layout(self.selected(catalog, preset))
+            .unwrap_or_default();
+        if let Some(module) = self.preview_module {
+            module.apply(&mut layout);
+        }
+        layout
+    }
+
     pub(super) fn update(&mut self, catalog: &mut Catalog, preset: &mut Preset, edit: Edit) {
         if let Edit::Demo(action) = edit {
             self.demo.update(action);
@@ -61,7 +106,7 @@ impl Editor {
         }
         let before = (
             self.selected(catalog, *preset).to_owned(),
-            catalog.layout(self.selected(catalog, *preset)),
+            self.preview_layout(catalog, *preset),
         );
         match edit {
             Edit::Select(id) if catalog.layout(&id).is_some() => {
@@ -69,6 +114,7 @@ impl Editor {
                 self.name = None;
                 self.removing = None;
                 self.notice = "";
+                self.preview_module = None;
             }
             Edit::Default(id) => {
                 if let Some(selected) = Preset::from_id(&id) {
@@ -84,6 +130,7 @@ impl Editor {
                     self.name = None;
                     self.removing = None;
                     self.notice = "";
+                    self.preview_module = None;
                 }
             }
             Edit::Name(id, name) if self.selected(catalog, *preset) == id => {
@@ -116,25 +163,23 @@ impl Editor {
                     catalog.remove(&id);
                     self.selected = None;
                     self.name = None;
+                    self.preview_module = None;
                     self.notice = "Design removed. Connections that used it will use the default.";
                 }
             }
             Edit::Module(id, change) if self.selected(catalog, *preset) == id => {
                 if let Some(mut layout) = catalog.layout(&id) {
-                    match change {
-                        Module::History(value) => layout.history = value,
-                        Module::Status(value) => layout.status = value,
-                        Module::Approval(value) => layout.approval = value,
-                        Module::Arrangement(value) => layout.arrangement = value,
-                    }
+                    change.apply(&mut layout);
                     catalog.set_layout(&id, layout);
+                    self.preview_module = None;
                 }
             }
+            Edit::Preview(module) => self.preview_module = module,
             _ => {}
         }
         let after = (
             self.selected(catalog, *preset).to_owned(),
-            catalog.layout(self.selected(catalog, *preset)),
+            self.preview_layout(catalog, *preset),
         );
         if before != after {
             self.demo.replay();
@@ -143,13 +188,14 @@ impl Editor {
 
     pub(super) fn view<'a>(
         &'a self,
-        catalog: &'a Catalog,
-        preset: Preset,
-        dock: DockPreferences,
+        preferences: &'a WindowSettings,
         id: window::Id,
         target: Option<&iced::widget::Id>,
     ) -> Element<'a, Desktop> {
         let msg = move |edit| Desktop::Settings(Message::AgentDesignCatalog(id, edit));
+        let catalog = &preferences.ai_agent_designs;
+        let preset = preferences.ai_agent_design;
+        let dock = preferences.ai_agent_panel;
         let choices = catalog.choices();
         let default = choices
             .iter()
@@ -238,76 +284,48 @@ impl Editor {
                 .spacing(5),
             );
         }
+        let delay = preferences.agent_status_auto_hide_seconds();
+        if !self.notice.is_empty() {
+            editor = editor.push(text(self.notice).size(14));
+        }
         editor
-            .push(text(self.notice).size(14))
-            .push(preview::view(&self.demo, layout, dock, id))
+            .push(text(if delay == 0 {
+                "Keep status visible after a run".to_owned()
+            } else {
+                format!("Hide status {delay} s after a run")
+            }))
+            .push(slider(AUTO_HIDE_SECONDS, delay, move |seconds| {
+                msg(Edit::AutoHide(seconds))
+            }))
+            .push(
+                checkbox(
+                    preferences
+                        .ai_agent_design_reduced_animations
+                        .unwrap_or_default(),
+                )
+                .label("Reduce Agent design animations")
+                .on_toggle(move |reduced| msg(Edit::ReducedAnimations(reduced))),
+            )
+            .push(
+                row![
+                    pick_list(Module::choices(), self.preview_module, move |module| {
+                        msg(Edit::Preview(Some(module)))
+                    })
+                    .placeholder("Preview a module"),
+                    button("Reset preview")
+                        .on_press_maybe(self.preview_module.map(|_| msg(Edit::Preview(None)))),
+                ]
+                .spacing(6)
+                .wrap(),
+            )
+            .push(preview::view(
+                &self.demo,
+                self.preview_layout(catalog, preset),
+                dock,
+                delay,
+                !preferences.agent_animations(),
+                id,
+            ))
             .into()
     }
-}
-
-fn preview_static(
-    layout: Layout,
-    dock: DockPreferences,
-    parts: Element<'static, Desktop>,
-    terminal: Element<'static, Desktop>,
-    phase: &'static str,
-    stage: usize,
-) -> Element<'static, Desktop> {
-    let history_position = dock.history_slot(layout);
-    let (history, activity_window, floating) =
-        if layout.arrangement == Arrangement::PictureInPicture {
-            (None, None, Some(parts))
-        } else if history_position.is_some() {
-            (
-                Some(
-                    container(parts)
-                        .padding(8)
-                        .style(container::bordered_box)
-                        .height(Length::Fill)
-                        .width(Length::Fill)
-                        .into(),
-                ),
-                None,
-                None,
-            )
-        } else if layout.history.inline_style().is_some() {
-            (None, None, None)
-        } else {
-            (None, Some(parts), None)
-        };
-    let status = if layout.arrangement == Arrangement::Adaptive {
-        Status::Powerline
-    } else {
-        layout.status
-    };
-    let side_width = dock.side_width(260.0);
-    let rail = status == Status::Minimap
-        && history_position != Some(crate::workspace::terminal_agent::design::Slot::Right);
-    let terminal = compose(
-        terminal,
-        history,
-        status_indicator(status, phase, stage),
-        history_position,
-        status_slot(status),
-        Size::new(650.0, 320.0),
-        (side_width, if rail { 84.0 } else { side_width }),
-    );
-    let terminal = if let Some(floating) = floating {
-        crate::workspace::terminal_agent::design::pip::preview(terminal, floating)
-    } else {
-        terminal
-    };
-    container(
-        column![
-            text("Design preview").size(17),
-            text(layout.arrangement.to_string()).size(13),
-            container(terminal).height(320).width(Length::Fill),
-            activity_window,
-        ]
-        .spacing(7),
-    )
-    .style(container::bordered_box)
-    .padding(10)
-    .width(Length::Fill)
-    .into()
 }

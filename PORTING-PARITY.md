@@ -16,6 +16,279 @@ open until a result is recorded for the tested revision and environment. Both
 Mosh modes are out of scope. The editor has a reduced native scope with structure
 navigation for classes, functions, variables, and placeholders.
 
+## November 19 Java release source comparison
+
+The published Java release is [v2.26.0](https://github.com/chardonnay/korTTY/releases/tag/v2.26.0),
+tagged at `b235d91f20356f8a9b33ad5398550a043cc21ed2`. The comparison used
+files from that tag and the Rust worktree based on `68d3093f`, including
+uncommitted changes. The table identifies source differences. The native
+results below it refer to their respective builds.
+
+| Area | Java v2.26.0 behavior | Rust evidence and outstanding work |
+| --- | --- | --- |
+| A2 · Agent designs | The [design reference](https://github.com/chardonnay/korTTY/blob/v2.26.0/app-docs/site/docs/en/features/ai-agent-designs.md) specifies the in-terminal Spotlight input, pill progress, timed toasts, Orbit progress ring, Adaptive Dock finish countdown and run/step menus. [AgentDesignHost](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignHost.java) binds menu actions to the displayed run or step. | The [status presenters](src/workspace/terminal_agent/design/status.rs) show the phase in the Spotlight pill, the last three activities in Toasts and a text representation of Orbit. The [visibility timer](src/workspace/terminal_agent/design/presentation.rs) implements auto-hide. The [PiP title and body](src/workspace/terminal_agent/design/pip.rs) support detach, fold, hide and shared controls. Add the Spotlight prompt with profile and history, the missing progress and countdown displays and the contextual run/step actions. Existing chat handoff and export formats can be reused. |
+| D4 · AI Manager search | [SettingsSearchBar](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SettingsSearchBar.java) walks labeled controls on constructed pages. [RagKnowledgeStorePane](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/RagKnowledgeStorePane.java) exposes actions to create stores and update their indexes. | [Search results](src/ai_manager/search.rs) include page names and individual General, Profile, role and embedding settings. The [knowledge controls](src/ai_manager/local.rs) exist but lack individual search destinations. Check label-level coverage on the other pages and preserve editor-local Find. |
+| D2/Q1 · Connection and job target selection | [ConnectionManagerTreeView](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ConnectionManagerTreeView.java) shares move history across tree and map edits. The [Scheduler target dialog](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/JobSchedulerTargetSelectionDialog.java) filters by name, host and group and accepts multiple selections. | The [map](src/connection_window/network_map.rs) retains one undoable move. The [connection tree](src/connection_window/view.rs) needs drag-to-folder and shared multi-level Undo. The [Scheduler form](src/scheduler_window/form.rs) adds targets individually. The [Java Scheduler](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/JobSchedulerDialog.java) supplies locally configured connections to its picker. Scheduling directly from the live Teamwork catalog is a requested Rust extension. The [native job validation](src/scheduler_window.rs) still excludes shared targets for Agent/Swarm. |
+| T2 · SFTP partial files | [SFTPManagerTab](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SFTPManagerTab.java) lists leftover parts in the displayed folder of either pane, skips active transfers, confirms deletion and reports failures. | The [native queue](src/sftp_window.rs) offers `DiscardPartial` for a known retained transfer. Add discovery, review and cleanup for the displayed folder, preserving active transfers and rechecking the selected entries before removal. |
+| D4 · Log folders | [TerminalLogCatalog](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/core/TerminalLogCatalog.java) combines the default folder, configured connection folders and remembered folders by real path. | The [native catalog](src/logfile_window/catalog.rs) scans the default and a set of saved paths. The [logger](src/terminal_logging/writer.rs) registers a directory through the same operation as manual addition. Include existing configured directories before first use and retain their origin for Forget. |
+| U1 · Update prompts | [UpdateCheckService](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/update/UpdateCheckService.java) persists ignore and snooze per version, suppresses prompts after download and uses distinct startup and periodic prompt intervals. | [Rust cadence](src/workspace/application_updates.rs) remembers the last notice by version and time. The [About dialog](src/workspace/chrome/about.rs) offers check and download. Add the two choices, persist them for Rust releases and keep manual checks available. |
+| M1 · Custom OS badges | [CustomOsBadge](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/model/CustomOsBadge.java) stores ID, name and filename in global settings. [BackupManager](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/core/BackupManager.java) archives the settings and omits the image directory. | [Connection import](src/connection_store/import/kortty.rs) retains valid badge references. The [local badge catalog](src/connection_store/custom_os_badges.rs) validates supplied images and allocates native IDs. Restore the available metadata and review any local image or ID mapping before binding imported connections. |
+
+The [PR #8 verification record](https://github.com/chardonnay/korTTY_rust/pull/8)
+covers full native suites and release builds on Windows ARM64, Apple Silicon
+and Fedora ARM64 at `fb8870149949`. The later [November 19 Windows portable
+ZIP](#november-19-windows-arm64-portable-release) and [Agent Design desktop
+check](#agent-design-module-preview-and-status-preferences) concern different
+builds. That desktop check confirms PiP layering and reattachment and all
+three Adaptive Dock placements. A repeat on another desktop and a release
+built from the final source remain open.
+
+## Java terminal Agent prompt history
+
+The Java v2.26.0 profile preview lists masked
+`terminalAgentInputHistory` entries and the proposed history limit. The
+import preserves the prompt text after masking, its original timestamp
+and the archive's order. Java stores prompt and timestamp without a
+mode. Rust labels the restored entries as imported. Composer selection
+and shell alias completion can recall those entries for review.
+
+Startup restore appends distinct prompts to available slots in an existing
+native history. Its local ordering, entries and limit take precedence.
+A new store adopts the Java limit with the existing 5–100 bounds and
+20-entry default. Native encrypted backups also carry this private store.
+Private sessions have no access to it. The terminal Tab history chooser
+uses Java's 460 × 260 defaults and width and height limits. Resize grips
+on the top and right edges save changes in the profile when released.
+Small splits constrain the displayed size while preserving the profile
+preferences. Java backup restore imports each dimension into its unset
+native field. The composer offers entry removal and confirmed clearing.
+Those actions still need to be wired into the terminal Tab chooser.
+Verify interactive recall and resizing on native desktops.
+[Java history record](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/model/TerminalAgentInputHistoryEntry.java)
+· [Java completion popup](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/TerminalAgentCompletionPopup.java)
+· [Rust Agent history](src/terminal_agent/history.rs)
+· [Rust terminal chooser](src/workspace/terminal_agent/shortcut/completion.rs)
+
+Windows ARM64 passed 167 targeted restore, Agent history and shell shortcut
+tests with one ignored. The encrypted backup fixture covers masking,
+timestamp preservation, Java limit clamping in a new store, local order and
+limit preservation, idempotent replay, private-session exclusion and a
+native encrypted backup round trip. Clippy passed for the application and
+its tests with warnings denied.
+[Windows test log](target/verification/20261119-java-agent-history-windows.log)
+· [Clippy log](target/verification/20261119-java-agent-history-clippy-windows.log)
+
+## November 19 Windows ARM64 portable release
+
+The worktree built in the native `aarch64-pc-windows-msvc` release profile
+with Rust 1.99.1, `rust-lld` and the static C runtime. The pre-build and
+post-check source fingerprints match across 2,675 files using the method
+described in the workspace verification below.
+`64f505367778074ef751704de80984ac40d2ad96a15c98ef1674d2aa331be23d`
+
+The ZIP measures 41,425,391 bytes (39.51 MiB). Its SHA-256 is
+`f205e60628de756265276e0dd2eef9aac867f562bebb4585afbabcb686854486`.
+The extracted desktop, CLI and sibling SSH worker match the built files.
+All three are ARM64 PE32+ executables. Their import tables require no
+Visual C++ Redistributable DLLs. The desktop executable measures
+98,573,824 bytes (94.01 MiB). The ZIP contains the application license
+and LaTeX third-party notices and data. The CLI reports version 0.1.0 and
+protocol 1. The extracted SSH worker reported LPAC readiness to the
+existing native worker harness.
+
+A separate opt-in test used the extracted desktop and its sibling worker.
+The sandboxed relay reached the fixture bound to Windows loopback, passed
+both SSH version banners and shut down promptly when the desktop
+cancelled the pending connection. This case ends before key exchange.
+[Packaged relay test](target/verification/20261119-windows-arm64-packaged-relay.log)
+
+The same source passed the complete native Windows ARM64 workspace
+suite on November 19. Among 74 reported test binaries, 4,526 tests
+passed, 96 were ignored and zero failed. The application suite accounted
+for 3,859 passes and 91 ignored cases. Strict workspace Clippy passed
+with all targets enabled. The source fingerprint matched the ZIP build
+before and after the workspace suite.
+[Matching workspace test log](target/verification/20261119-portable-release-source-workspace-windows.log)
+· [Matching workspace Clippy log](target/verification/20261119-portable-release-source-clippy-windows.log)
+
+The desktop showed its normal main window from an empty profile. The
+default window-close request stayed open with an active terminal,
+consistent with the window-close confirmation in the source. A second
+private profile with `skip_terminal_group_close_confirmation` enabled
+verified native start, restart and window close with exit 0. The fresh
+and restart window samples took 208 and 345 ms, with working sets of
+38.70 and 34.48 MiB sampled 3.5 seconds after the window appeared.
+These are smoke samples. The interactive close confirmation, p95 input
+latency, MSI installation and upgrade, and Authenticode verification
+remain open.
+
+[Release build record](target/verification/20261119-windows-arm64-release-worktree.log)
+· [Default profile diagnostic](target/verification/20261119-windows-arm64-release-smoke-retry.log)
+· [Startup and close record](target/verification/20261119-windows-arm64-release-smoke-window-close.log)
+· [Packaged worker test](target/verification/20261119-windows-arm64-packaged-worker.log)
+
+## Swarm workflow instruction history
+
+Java v2.26.0 keeps ten distinct additional instructions for the Swarm
+workflow script dialog. Rust uses a multiline editor and a separate
+instruction history. Choosing an entry fills the editor for a fresh
+review. Starting an approved generation stores the masked instructions
+from that request. The history file contains the instruction text.
+
+Java backup review lists importable `workflowInstructionsHistory` entries.
+Startup restore preserves the order of local entries and appends distinct
+masked entries into available slots. Native encrypted backups include the
+history. A workflow opened from an incognito tab has no history access.
+Verify the chooser and backup preview on native desktops.
+[Java workflow dialog](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SwarmWorkflowScriptDialog.java)
+· [Rust workflow dialog](src/workspace/terminal_agent/swarm/workflow.rs)
+
+Windows ARM64 passed 109 targeted Swarm, history and backup tests. The
+loopback fixture checks masking, persistence after approval and recall
+after reopening the form. The backup fixture checks Java import and native
+encrypted restore. Clippy passed for the application and its tests with
+warnings denied.
+[Windows test log](target/verification/20261119-swarm-workflow-history-windows.log)
+· [Clippy log](target/verification/20261119-swarm-workflow-history-clippy-windows.log)
+
+## Terminal Chat prompt history
+
+Java v2.26.0 keeps ten distinct prompts in the terminal-output **Ask**
+dialog and lets users recall or clear them. Rust offers a separate prompt
+history in Terminal Chat. Approved requests record their masked question,
+and a recalled prompt opens in the editor for a fresh review. Private
+chats have no access to this history.
+
+The Java backup preview lists masked `aiPromptHistory` entries for
+available slots. Startup restore preserves local ordering and adds
+distinct imported prompts, including multiline text. Encrypted native
+profile backups include the separate terminal prompt history file.
+Verify the chooser, clearing and restart on native desktops.
+[Java Ask dialog](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/MainWindow.java)
+· [Rust prompt history](src/workspace/question_history.rs)
+
+Windows ARM64 passed 171 targeted Chat, Manual and backup tests. The loopback
+Chat fixture covers approval before persistence, masking, recall without
+sending and clearing from a regular chat. Its private-chat case checks that
+the regular history cannot be cleared there. The encrypted Java fixture
+covers masked multiline prompt import into its own store. Clippy passed for
+the application and its tests with warnings denied.
+[Windows test log](target/verification/20261119-terminal-prompt-history-windows.log)
+· [Clippy log](target/verification/20261119-terminal-prompt-history-clippy-windows.log)
+
+## Java Open Recent project history
+
+Java v2.26.0 stores its ten recent project paths and list-clear timestamp in
+global settings. The Rust backup preview lists compatible paths and reports
+the saved clear time. Additive restore fills an unset Open Recent preference.
+The imported paths retain their order, with duplicate paths removed and
+relative or unsupported filenames omitted. A saved native preference takes
+precedence.
+
+The menu labels these entries as imported and checks the filesystem when
+the user selects one. The usual project review controls opening the layout.
+An applied project becomes an ordinary recent entry. A path that is absent
+on this device can stay visible as an imported entry until the list is
+cleared. Native menu interaction and the restore preview still need desktop
+acceptance.
+[Java project history](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/core/RecentProjects.java)
+· [Rust recent projects](src/workspace/open_recent.rs)
+
+Windows ARM64 passed 133 focused backup, settings, recent-list and project
+file tests. The migration regression covers the imported clear time, path
+order, rejected entries, existing native settings and replacing an imported
+entry after its path resolves to a different canonical spelling. Clippy
+passed for the application and its tests with warnings denied.
+[Windows test log](target/verification/20261119-java-open-recent-windows.log)
+· [Clippy log](target/verification/20261119-java-open-recent-clippy-windows.log)
+
+## Manual question history
+
+Java v2.26.0 keeps the ten most recent distinct questions in the Ask panel
+and lets users recall a question for editing. Rust keeps the same bounded,
+newest-first history in the current profile's local `manual-questions.json`.
+It records the masked version when an approved request starts. Recalling an
+entry fills and focuses the input. Enter opens the existing review, which
+still requires a separate approval to start the request.
+
+The saved history survives closing the manual and restarting kortty. If the
+file cannot be read, the current manual window can still keep a history in
+memory. The Java backup preview lists the count of masked `guideAskHistory`
+entries proposed for restore. Startup replay appends distinct imported
+questions in their original order while preserving local entries and the
+ten-question limit. Portable native backups carry the same history file and
+restore it when the target profile lacks one.
+[Java Ask panel](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/GuideAskPanel.java)
+· [Rust history store](src/workspace/question_history.rs)
+
+On 2026-11-19, Windows ARM64 passed all 19 manual tests. The history test
+checks the ten-entry bound, duplicate promotion and reopening the file.
+The reviewed request tests check that editing and review alone produce no
+history entry, and that submitting an approved question records its masked
+text. Clippy passed for the application and its tests with warnings
+denied. Verify the Java backup review and history selection and focus on
+native desktops.
+[Windows test log](target/verification/20261119-manual-question-history-windows.log)
+· [Clippy log](target/verification/20261119-manual-question-history-clippy-windows.log)
+
+The follow-up Windows ARM64 verification passed 169 backup and manual tests.
+An encrypted Java ZIP fixture verifies redaction before staging, additive
+startup replay, local ordering and idempotent reimport. A native encrypted
+archive round trip verifies that the resulting history is portable.
+Clippy passed for the application and its tests with warnings denied.
+[Java import and native backup test log](target/verification/20261119-java-manual-history-windows.log)
+· [Clippy log](target/verification/20261119-java-manual-history-clippy-windows.log)
+
+## Quick Connect local shell commands and directories
+
+Java v2.26.0 lets Quick Connect select a shell, enter a custom command
+and set a starting directory. Selecting a saved connection loads those
+values and supports a one-use edit. Rust now offers the same launch
+choices with a separate executable field and individual argument fields.
+The existing local launch path applies the current terminal and isolation
+settings. One-use launch changes leave the source profile intact and
+omit its saved identity from the new pane. **Save as a new connection**
+creates a separate local shell profile.
+
+The native Windows ARM64 Quick Connect suite passed all 12 tests on
+2026-11-19. A test selects a saved shell, rejects a relative path and
+starts the edited command through the native PTY. The program reads a
+marker file with a spaced filename from the new directory. The test also
+checks the inherited terminal policy and confirms that the original
+profile retains its command and directory. The separate Connection Manager
+regression passed and confirmed that an unchanged saved shell still records
+its profile reference. Clippy passed for the application and its tests
+with warnings denied. Desktop interaction, saving and reopening a new
+profile, and execution on macOS and Linux still need acceptance.
+[Windows test log](target/verification/20261119-quick-connect-local-windows.log)
+· [Clippy log](target/verification/20261119-quick-connect-local-clippy-windows.log)
+
+[Java Quick Connect](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/QuickConnectDialog.java)
+· [Rust local launch form](src/workspace/quick_connect/local.rs)
+
+## November 19 Windows ARM64 workspace verification
+
+The cumulative `kortty-portierung` worktree passed the full native Windows
+ARM64 workspace suite on 2026-11-19 with Rust 1.99.1
+(`aarch64-pc-windows-msvc`) and `rust-lld`. The Windows test wrapper ran
+`cargo test --locked --workspace --all-targets --no-fail-fast` using isolated
+test directories. Across 74 test binaries, 4,522 passed, 96 were ignored and
+zero failed. The application binary accounted for 3,855 passes and 91 ignored
+cases. The ignored cases include opt-in live runtime tests, benchmark fixtures
+and subprocess entry points used by other tests.
+
+`cargo clippy --locked --workspace --all-targets -- -D warnings` also passed.
+The source fingerprint matched before and after both runs. Its SHA-256 is
+`9e22ee62f48fddd0bb1dfdb1bc5acac638439bcd5cdd1cb75ba332f7a0dc9ad5`,
+computed from 2,673 existing tracked or non-ignored working files in path order
+using each UTF-8 relative path, a NUL separator and the binary SHA-256 of its
+contents. The two porting documents are excluded. This result covers the local
+worktree. Interactive, cross-platform and package acceptance still require
+the [release gates](PORTING-PLAN.md#native-acceptance-and-release-gates).
+
+[Test log](target/verification/20261119-full-workspace-windows.log) ·
+[Clippy log](target/verification/20261119-full-workspace-clippy-windows.log)
+
 ## Porting plan source audit on 2026-11-18
 
 The audit compared Java tag `v2.26.0` (`b235d91f2035`) with the Rust working
@@ -24,14 +297,675 @@ and checked the existing native records. The [implementation backlog](PORTING-PL
 records the Java controls, Rust entry points and remaining user-visible work.
 
 - All 15 values of Java `JobActionType` reach the Rust importer dispatch.
-  Target and option support vary. Java resolves shared Teamwork connections
-  for jobs. The native interactive route records the shared source, while the
-  Scheduler persists a local numeric ID and endpoints. [Java resolver](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/jobscheduler/JobSchedulerConnectionResolver.java) · [Native importer](src/profile_backup/java_scheduler.rs) · [Native target](src/scheduler_window/connection.rs)
+  Target and option support vary. The Java resolver applies Teamwork
+  authentication defaults to a locally resolved record already marked as
+  shared. The November 19 comparison traces the picker separately and records
+  subsequent Rust support for live source-qualified routes and groups.
+  [Java resolver](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/jobscheduler/JobSchedulerConnectionResolver.java) · [Native importer](src/profile_backup/java_scheduler.rs) · [Native target](src/scheduler_window/connection.rs)
 - The tagged editor has a programming-language migration action and lets
   the user choose individual findings from the standalone security report.
-  Rust can read historical migration options and request fixes for the entire
-  standalone report. The SFTP draft stores one preview against the right
-  file. Java also offers the left file against the draft. [Java snippet actions](https://github.com/chardonnay/korTTY/blob/v2.26.0/app-docs/site/docs/en/features/snippets.md) · [Native security action](src/workspace/snippet_access/ai_assist.rs) · [Native draft](src/sftp_window/compare/ai.rs)
+  Rust can read historical migration options. The standalone report sorts
+  structured findings by severity and lets users select which findings to
+  include in the reviewed fix request. That selection applies to the
+  exact reviewed source. The SFTP draft now offers all three comparison
+  pairs. [Java snippet actions](https://github.com/chardonnay/korTTY/blob/v2.26.0/app-docs/site/docs/en/features/snippets.md) · [Native security action](src/workspace/snippet_access/ai_assist.rs) · [Native draft](src/sftp_window/compare/ai.rs)
+  The Windows ARM64 snippet and file assistance tests passed 71 cases,
+  including severity ordering, masking, selected-only request content
+  and rejection after a source revision change. Native desktop acceptance
+  with a configured provider remains open.
+- In the snippet and file editors, an unsupported or unavailable local
+  formatter or syntax checker offers an explicit AI fallback. Formatting
+  uses the marked range or the whole source, and the proposal uses the
+  existing diff and Apply review. AI syntax review reads the whole source
+  and returns an advisory report. Both paths require approval of the masked
+  request before invoking the configured provider. Windows ARM64 passed 163
+  snippet and file editor tests with five ignored, including explicit fallback
+  entry, stale revisions, selection-only formatting and advisory results.
+  Desktop acceptance with a configured provider remains open.
+- The Snippet Manager now uses a draggable divider between the library
+  and the editor. It saves the preferred ratio after the drag ends and
+  uses the fitted width when placing the analysis panel. Temporarily
+  narrowing the window preserves the saved preference. Additive Java
+  restore imports `snippetWorkspaceLibraryDividerPosition` when the native
+  preference is unset. Windows ARM64 passed the 176 focused snippet and
+  backup tests with two ignored. The checks cover drag updates, commit on
+  release, narrow-window fitting, and imported values alongside existing
+  native settings. Live dragging and reopening on native desktops remain
+  open.
+- Java backup restore resolves saved open snippet tabs and the active tab
+  against the effective native library. An exact match of name, language,
+  category, source, and metadata can use an existing native ID. Missing
+  or divergent entries are skipped. Restore publishes the tab list only
+  when a native tab session is absent, and the existing editor session
+  reader reopens the resolved tabs. Windows ARM64 passed 184 backup and
+  session tests, including a password-protected Java ZIP restored at
+  startup with direct, remapped, conflicting and missing snippet IDs.
+  Replaying the import preserved the native session byte for byte. Visual
+  desktop acceptance remains open.
+- The Snippet Editor settings control whether single-snippet AI requests
+  include additional instructions. The setting defaults to off. Assistance,
+  translation, analysis, apply, verification, and modularization respect
+  it. Pending reviews that include additional instructions require a fresh
+  review after the option is disabled. Java backup restore fills the setting
+  only when the native value is unset. Windows ARM64 passed 194 focused tests
+  with two ignored, including import precedence, rejection of a stale CLI
+  approval, and omission of the instruction from a fresh review.
+  Native desktop acceptance with a configured provider remains open.
+  [Windows verification](target/verification/20261118-snippet-additional-instructions-windows.log)
+- Snippet AI alternatives, diffs, and syntax reviews remember
+  independent font sizes. Java backup restore fills unset values and clamps
+  them to the reference bounds. Each alternative shows a read-only code
+  preview that can expand and copy selected text through the application
+  clipboard policy. Selecting a proposal opens the existing diff review.
+  Windows ARM64 passed 204 focused tests with two ignored. Coverage includes
+  the Java font bounds and local preference precedence, the diff zoom
+  shortcut, and preview expansion and clipboard policy enforcement.
+  Native desktop acceptance with a configured provider remains open.
+  [Windows verification](target/verification/20261118-snippet-ai-zoom-windows.log)
+- Description drafts and standalone security reports have independent
+  font preferences with ranges of 8–32 px and 9–32 px. Java restore uses
+  those bounds for `aiDescribeFontSize` and `securityReportFontSize`.
+  Native profiles with existing diff or review preferences use them as
+  initial fallbacks for the new views. New AI Chat tabs and recorded chat
+  transcripts use the saved `aiResultFontSize` of 10–32 px, defaulting to
+  13 px. Restore omits out-of-range chat values and preserves existing native
+  settings. Private chat zoom is scoped to the open chat. Verify the result
+  views and restart persistence on native desktops.
+  Windows ARM64 passed 183 focused tests covering backup restore, snippet
+  views, terminal chat and the journal chat workflow.
+  [Windows verification](target/verification/20261119-java-ai-fonts-windows.log)
+- Agent activity and plans have independent text sizes. The activity
+  controls in the main dialog also set the transcript size in the terminal
+  dock and floating history. The remember option controls persistence.
+  Planning applies its own zoom to questions, approaches and completed reports.
+  Java backups preserve fractional values within the reference bounds
+  and fill unset settings. Private runs keep zoom changes in memory. Native
+  desktop acceptance includes both views, the plan keyboard shortcuts
+  and reopening after a restart.
+  Windows ARM64 passed 330 tests, including the compact transcript layout,
+  zoom isolation and Java backup precedence. The private HTTPS and live
+  SSH fixtures were ignored.
+  [Windows verification](target/verification/20261119-agent-text-windows-layout.log)
+- The Agent activity dock has a vertical resize grip and commits its
+  height on release. Remembering activity size covers height and text
+  size. The main, bottom and floating activity surfaces can start
+  collapsed. Selectable history views support expanding all details.
+  Java backup restore fills unset values for `terminalAgentPanelHeight`,
+  `terminalAgentPanelKeepCollapsed` and `terminalAgentPanelExpandAll`.
+  Native desktop acceptance includes dragging, collapse, detail expansion
+  and reopening from restored settings.
+  Windows ARM64 passed 332 tests, with two network fixtures ignored.
+  The focused checks cover drag preview and commit, fitted heights, restored
+  options, and older details in all five selectable history layouts.
+  [Windows verification](target/verification/20261119-agent-activity-layout-windows.log)
+- Quick Connect saves the expanded sections for connection settings,
+  terminal appearance and terminal logging. Java migration reads the
+  stable section keys and respects an existing native set, including an
+  explicitly empty set. The Java AI key restores the AI section.
+  Desktop verification after reopening and restart is pending.
+  Windows ARM64 passed 106 tests. The checks covered valid, empty and
+  malformed Java lists, protocol-specific visibility and dialog reopening.
+  [Windows verification](target/verification/20261119-quick-connect-sections-windows.log)
+- Quick Connect's Terminal Effect section offers the enabled native effects
+  and the shared fractional speed controls. It preloads effects from selected
+  SSH or serial profiles and applies the draft to the new terminal.
+  A quick split can pick an effect independently of the original pane.
+  New SSH and serial profiles can retain the choice. The Java last-used speed
+  fills an unset native preference. Pending desktop verification covers
+  visible animation, serial hardware and deployed SSH routes.
+  Windows ARM64 passed 255 tests, including a live local shell split with
+  a different effect than its source pane and the Java fractional-speed
+  restore. The unrelated loopback Git daemon fixture was ignored.
+  [Windows verification](target/verification/20261119-quick-connect-effects-windows.log)
+- Connection Manager can save effects and fractional speeds on local shell
+  and serial profiles. New local sessions use the allowed saved effect when
+  configuring terminal appearance at launch. Quick Connect preloads a saved
+  local effect and can override or clear it for one launch. The korTTY XML
+  export and import preserve effect and speed for both profile types.
+  Interactive desktop acceptance and live serial hardware remain open.
+  Windows ARM64 passed 195 tests. The checks covered live local startup,
+  one-launch clearing, disabled effects, and local and serial XML round trips.
+  The loopback Git daemon fixture was ignored.
+  [Windows verification](target/verification/20261119-saved-local-effects-windows.log)
+- The Quick Connect AI section selects an interactive AI profile and
+  connection skills. A saved profile seeds the dialog, and explicit edits
+  apply to the newly opened terminal. New SSH and serial profiles can retain
+  the selection. AI Chat and Agent request review use the pane's effective
+  assignments. Agent review still checks the saved connection baseline.
+  Interactive desktop verification with an enabled provider remains open.
+  Windows ARM64 passed 447 tests, including a live local split and the
+  rejection of a reviewed request after the saved connection changed.
+  Three tests that require Git daemon, HTTPS, or SSH fixtures were ignored.
+  [Windows verification](target/verification/20261119-quick-connect-ai-windows-final.log)
+- Quick Connect offers theme, font family and size, foreground and background
+  colors, and the application color switch. Existing profiles seed the
+  form. Changes can apply to one launch, and a new SSH or serial profile can
+  retain the selected appearance. Java backup restore fills an unset last
+  appearance from the supported display fields. Serial XML interchange
+  preserves those fields. Interactive desktop verification remains open.
+  Windows ARM64 passed 280 tests, covering the saved Java defaults, serial
+  XML round trip, and a live local split with pane-specific appearance.
+  The loopback Git daemon fixture was ignored.
+  [Windows verification](target/verification/20261119-quick-appearance-windows-verified.log)
+- The Snippet AI assistant identifies embedded programs locally and reports
+  their source lines. Azure Pipelines, GitHub Actions, GitLab CI, Jenkins,
+  Ansible, Puppet, and Dockerfiles are recognized as orchestration formats.
+  The assistant reports a mix of step languages for those formats. Windows
+  ARM64 passed 91 focused tests with two ignored. The checks cover heredoc
+  bodies, inline programs, shell calls, uniform host documents, and shell
+  selection within an individual GitHub Actions step.
+  [Windows verification](target/verification/20261118-snippet-language-mix-windows.log)
+- Whole-script migration in the Snippet AI assistant requires a detected
+  mix, an explicit target, a reviewed request, and approval of the proposed
+  diff. It presents migration notes and checks the interpreter header,
+  masking, placeholders, and remaining detected language mixes. Apply
+  updates the source, language, and extension of an existing filename.
+  Undo restores those values. Windows ARM64 passed 95 focused tests
+  with two ignored, including target binding, rejected results, protected
+  source, stale filename metadata, and Apply and Undo. Desktop acceptance
+  with a configured provider remains open.
+  [Windows verification](target/verification/20261118-snippet-whole-language-migration-windows.log)
+- The Snippet AI assistant can unify mixed script steps in Azure Pipelines,
+  GitHub Actions, and Jenkins. The format limits the target choices. The
+  response must retain the original pipeline bytes outside detected step
+  bodies and their interpreter selectors. GitHub Actions can add a missing
+  shell selector next to its original step. Apply and Undo preserve the
+  snippet language and filename. Windows ARM64 passed 99 focused tests
+  with two ignored. The tests cover CRLF, step counts, unrelated pipeline
+  bytes, scope of an added shell selector, existing shell options, Jenkins
+  invocation parameters, and Apply and Undo.
+  [Windows verification](target/verification/20261118-snippet-step-migration-windows.log)
+- The Snippet AI assistant supports explicit conversion among Azure Pipelines,
+  GitHub Actions, GitLab CI, both Jenkinsfile styles, Ansible, and Puppet.
+  The assistant starts with the current platform and requires choosing a
+  different destination. The reviewed response must be recognized as the
+  requested format and satisfy any selected step language. Platform-only
+  conversion can replace shell commands with native target tasks. Apply updates
+  the document language and filename, and Undo restores the original values.
+  The result shows notes for manual or lossy mappings. Windows ARM64 passed
+  103 focused tests with two ignored, covering explicit destination binding,
+  rejected formats and interpreters, native Ansible tasks, and Apply and
+  Undo of the converted document. Desktop acceptance remains open.
+  [Windows verification](target/verification/20261118-snippet-platform-conversion-windows.log)
+- Selected snippet security fixes can start with a programming-language or
+  platform migration. The migration diff leads to a second reviewed request
+  with the migrated source and the findings selected from the original
+  review. Each provider dispatch uses its reviewed payload. The editor
+  applies the final diff and the target metadata together, and Undo restores
+  the original source and metadata. Windows ARM64 regressions cover both
+  dispatches over loopback, the separate send approvals, rejection of an
+  intermediate Apply, and the final Apply and Undo. The native workspace
+  suite passed 4,417 tests with 95 ignored. Workspace Clippy passed with
+  warnings denied. Desktop and configured-provider acceptance remain open.
+  [Windows verification](target/verification/20261119-worktree-native-windows-arm64-verified.log)
+- Full-analysis Apply can start with an optional language or platform
+  migration. The reviewed plan sends migration first. Later stages calculate
+  their response format from the current migrated source and use the target
+  language and filename. The saved checkpoint retains the plan, migrated
+  source and notes for recovery or partial review. Accepting a proposal
+  installs the final source and target metadata in the editor draft.
+  The Windows ARM64 suite passed 235 focused tests with two ignored. The
+  new tests cover interruption after migration, partial review, resumed
+  loopback dispatch with the migrated source, and metadata changes only
+  after acceptance. A pre-existing one-line command test failed once in
+  the initial parallel run and passed on two parallel reruns and one serial
+  run. Desktop and configured-provider acceptance remain open.
+  [Windows verification](target/verification/20261119-analysis-apply-migration-windows-verified.log)
+- The native snippet editor now suggests local bindings, identifiers and
+  language idioms on request. Embedded programs use their detected language
+  and scope. Selecting a candidate replaces the current token, and idiom
+  insertion selects the first editable template field. The new list supports
+  mouse selection and keyboard navigation. Lua continues to offer its
+  standard library members. Windows ARM64 passed 167 focused tests with two
+  ignored, including exact CRLF replacement, embedded Python, Perl imports
+  and list contexts, PowerShell iteration, template selection, and the
+  editor's insertion path.
+  [Windows verification](target/verification/20261119-snippet-local-completion-windows.log)
+- Snippet Editor settings can record and reset a separate completion chord.
+  Java profile restore fills an unset chord and preserves a saved native
+  choice. Java's Ctrl spelling uses the primary modifier of the destination
+  platform. Completion templates retain later field positions when edited,
+  support forward and backward navigation, and place the caret after the
+  insertion on leaving the last field. Windows ARM64 passed 118 focused
+  tests covering key capture in the settings widget, saving and resetting,
+  Java restore precedence, and field movement after a UTF-8 edit. App and
+  test-target Clippy passed with warnings denied. Model candidates, inline
+  suggestions and native desktop acceptance remain open.
+  [Windows verification](target/verification/20261119-snippet-completion-settings-windows.log)
+- The native multi-language completion list stays open while the active
+  token changes. It filters the existing candidates, allows Backspace to
+  recover from an empty list, and blocks stale selections. Enter or Tab
+  accepts the highlighted candidate. The macOS bindings also recognize
+  Cmd+I and Option+Escape. Lua retains its dedicated completion list.
+  Windows ARM64 passed 170 focused tests with two ignored, including
+  filtering, recovery with Backspace, stale selection rejection, Tab
+  handling, and platform-specific modifier matching. Clippy passed with
+  warnings denied. A live macOS key check remains open.
+  [Windows verification](target/verification/20261119-snippet-live-filter-windows.log)
+- The multi-language completion list can add up to five reviewed model
+  suggestions. Local candidates remain available while the model runs.
+  The approved request uses a bounded, masked code window, the exact token
+  range, and known symbols. Local duplicates and unmatched candidates are
+  omitted. Choosing a candidate rechecks the source, profile and request
+  authority, places the caret after the insertion, and records a reversible
+  AI change. By default, each request opens the standard review.
+  Configured-provider desktop acceptance remains open. Windows ARM64
+  passed 170 focused tests with two ignored.
+  The loopback test covers exact preview-to-wire dispatch, symbol and range
+  fields, local duplicate removal, rejection of hidden candidates, CRLF,
+  caret placement and Undo. App and test-target Clippy passed.
+  [Windows verification](target/verification/20261119-snippet-ai-list-windows.log)
+- The completion review can also approve automatic requests whenever the
+  list opens for the current Snippet Manager session. Each request rebuilds
+  the bounded prompt from the current token and checks the approved
+  profile, policy, credentials, and CLI revision where applicable. The
+  list can cancel a running request or revoke the session approval.
+  Windows ARM64 passed 171 focused tests with two ignored. The loopback
+  test verifies explicit approval, a second request with the edited token
+  and the same model, and no dispatch after turning the feature off.
+  App and test-target Clippy passed.
+  [Windows verification](target/verification/20261119-snippet-auto-list-windows.log)
+- Inline AI has a separate session approval and waits for a pause after
+  editing a nonblank line. It can cycle up to three continuations and
+  uses the existing guarded AI change and Undo path. Edits, caret changes,
+  loss of focus, and competing AI work clear the pending inline request.
+  Live desktop acceptance remains open. Windows ARM64 passed 176 focused
+  tests with two ignored. The loopback test covers the typing pause,
+  cancellation on focus loss,
+  alternative selection, and Undo. The renderer test verifies that the
+  focused caret shows the preview without modifying the source. Clippy
+  passed for the app and test target.
+  [Windows verification](target/verification/20261119-snippet-inline-windows.log)
+- Multiline inline suggestions draw the continuation on its own rows
+  within the editor viewport. Source rows and their gutter numbers move
+  together, and clicks on shifted rows map back to the original source.
+  The preview uses the editor's clipping and leaves source text untouched
+  until accepted. Windows ARM64 passed 176 focused tests with two ignored.
+  The renderer test covers both added rows, gutter alignment, click
+  mapping, and hiding the preview when unfocused. The loopback test
+  verifies multiline insertion and an exact Undo. Live desktop acceptance
+  remains open.
+  [Windows verification](target/verification/20261119-snippet-multiline-windows.log)
+- JavaScript, TypeScript, JSON, CSS, and HTML contribute local candidates
+  to the same native completion list. The suggestions use the cursor
+  context, existing JSON property names, common HTML tags and attributes,
+  CSS properties and values, and recognized script receivers. CSS is a
+  built-in language and older custom CSS entries remain readable. Richer
+  script inference, broader CSS and HTML language data, and live desktop
+  acceptance remain open. Windows ARM64
+  passed 179 focused tests with two ignored, including contextual
+  completion for all five languages and exact replacement in script and
+  JSON snippets.
+  [Windows verification](target/verification/20261119-snippet-web-language-windows.log)
+- A JSON snippet tab can load or remove a local schema for the current
+  editing session. The completion list follows nested properties and
+  array positions and uses schema keys, constants, enumerations, defaults,
+  and examples. It uses local JSON Pointer references and composition
+  branches as completion hints. Network schema resolution and live
+  desktop acceptance remain open. Windows ARM64 passed 181 focused tests
+  with two ignored. The
+  schema tests cover nested properties, array positions, cyclic local
+  references, exact quoted-token replacement, and delivering a loaded
+  schema to the requesting tab after a tab switch.
+  [Windows verification](target/verification/20261119-snippet-json-schema-windows.log)
+- Saving a JSON snippet stores its schema snapshot in the native library
+  and makes the same completion hints available when the snippet is
+  reopened. Saving after removing the association drops the snapshot.
+  The source path is used only when explicitly loading a schema file.
+  Windows ARM64 passed 234 focused tests with two ignored. The persistence
+  test saves, removes the original file, reopens, and applies a schema
+  suggestion before removing the saved association and reopening again.
+  [Windows verification](target/verification/20261119-snippet-schema-persistence-windows.log)
+- The native Check Syntax action reports JSON parse errors and can check
+  an attached schema. The report identifies failing JSON instance paths,
+  masks instance values in validation messages, and leaves the editor
+  buffer unchanged. The validator uses its embedded resources and the
+  selected schema offline. External schema loading and live desktop
+  acceptance remain open. Windows ARM64 passed 323 focused
+  tests with seven ignored, including syntax positions, internal schema
+  references, unresolved external references, masked instance values,
+  and invalidation when the selected schema changes.
+  [Windows verification](target/verification/20261119-snippet-json-diagnostics-windows.log)
+- JSON diagnostics with source locations underline the relevant token in
+  the native editor. Selecting a location in the report reveals that
+  token without changing the buffer. JSON Pointer escapes, array indexes,
+  Unicode keys, CRLF, and duplicate keys use the same source revision as
+  the report. Changing the source or attached schema invalidates the
+  locations. Windows ARM64 passed 325 focused tests with seven ignored.
+  The renderer test verifies underline placement and exact selection.
+  The location and tool tests verify escaped paths, duplicate keys, and
+  selection from the report. Live desktop acceptance remains open.
+  [Windows verification](target/verification/20261119-snippet-json-markers-windows.log)
+- The schema loader can include local referenced documents on request.
+  It resolves references within the selected folder, persists the loaded
+  resource set with the snippet, and uses that set for completion and
+  validation after reopening. Remote schema retrieval and live desktop
+  acceptance remain open. Windows ARM64 passed 326 focused tests with
+  seven ignored. The tests cover completion and validation after deleting
+  both original files, and rejection of references outside the selected
+  folder or URI origin. HTTP and HTTPS schema identifiers are accepted as
+  local lookup identifiers.
+  [Windows verification](target/verification/20261119-snippet-related-schema-windows.log)
+- TypeScript member completion follows explicitly annotated variables
+  through same-document interfaces, aliases, and inline object types.
+  Nested properties and optional chaining use the type of the current
+  receiver. Windows ARM64 passed 328 focused tests with seven ignored.
+  The added tests exercise exact replacement, strings and comments,
+  closed block scopes, and cyclic aliases.
+  [Windows verification](target/verification/20261119-snippet-typescript-windows.log)
+- TypeScript uses explicitly annotated parameters in function and arrow
+  function blocks, including optional, defaulted, and rest parameters.
+  Local bindings and nested function parameters take precedence over
+  matching outer bindings. Windows ARM64 passed 330 focused tests with
+  seven ignored. The tests cover nested member lookup, exact replacement,
+  generic function signatures, and scope boundaries.
+  [Windows verification](target/verification/20261119-snippet-typescript-parameters-windows.log)
+- Arrow functions with expression bodies use the same local parameter
+  lookup. The editor checks nested calls, object literals, conditional
+  expressions and statement boundaries before using a parameter.
+  Function type annotations do not introduce a value binding in the
+  surrounding initializer. Windows ARM64 passed 332 focused tests with
+  seven ignored.
+  [Windows verification](target/verification/20261119-snippet-typescript-arrow-expressions-windows.log)
+- TypeScript suggests public instance fields, getters and methods from
+  local classes. It resolves explicit class annotations, aliases, typed
+  parameters and direct constructor calls. Typed fields and getters
+  supply nested member suggestions. Windows ARM64 passed 344 focused
+  tests with seven ignored, including exact insertion and exclusion of
+  private, protected and static members.
+  [Windows verification](target/verification/20261119-snippet-typescript-classes-windows.log)
+- TypeScript completion follows local base classes in the scope of each
+  derived declaration. Public instance members are inherited and a
+  nearer instance override determines the type of a nested receiver.
+  Static members do not shadow instance members. Windows ARM64 passed
+  346 focused tests with seven ignored. Coverage includes multilevel
+  inheritance, generic base syntax, shadowed base names, and forward
+  base references.
+  [Windows verification](target/verification/20261119-snippet-typescript-inheritance-windows.log)
+- TypeScript completion includes public and readonly constructor
+  parameter properties in instance and inherited member suggestions.
+  It uses the annotations on the implementation, including optional or
+  defaulted parameters, and leaves ordinary, protected, and private
+  parameters out of public suggestions. Windows ARM64 passed 348
+  focused tests with seven ignored, including overloads, nested members,
+  and exact replacement.
+  [Windows verification](target/verification/20261119-snippet-typescript-constructor-windows.log)
+  [TypeScript parameter properties](https://www.typescriptlang.org/docs/handbook/2/classes.html#parameter-properties)
+- TypeScript completion substitutes explicit type arguments and declared
+  defaults in local classes, interfaces and aliases. The bindings follow
+  generic base classes and nested property paths. Windows ARM64 passed
+  350 focused tests with seven ignored, including inherited substitutions,
+  nested argument lists, defaults referencing earlier parameters, and
+  unbound-parameter shadowing. Imported types, inferred type arguments,
+  and live desktop acceptance remain open.
+  [Windows verification](target/verification/20261119-snippet-typescript-generics-windows.log)
+- Annotated TypeScript destructuring follows object keys and tuple or
+  array positions through local declarations and function parameters.
+  The editor follows aliases and nested bindings and preserves local
+  shadowing. Windows ARM64 passed 353 focused tests with seven ignored.
+  Coverage includes labeled tuple elements, omitted positions,
+  readonly arrays, defaults, and exact replacement.
+  [Windows verification](target/verification/20261119-snippet-typescript-destructure-windows.log)
+- TypeScript completion resolves unescaped string-literal computed keys.
+  Structural object rest keeps only the remaining properties and their
+  substituted types. Array and fixed-tuple rest produce a fresh mutable
+  sequence and preserve the offset for subsequent nested selections.
+  Windows ARM64 passed 355 focused tests with seven ignored. The tests
+  cover exact insertion, excluded keys, dynamic-key shadowing, and nested
+  rest bindings.
+  [Windows verification](target/verification/20261119-snippet-typescript-rest-windows.log)
+- TypeScript member completion follows literal bracket access, including
+  optional chains, through typed objects, arrays and tuples. Generic
+  fixed-length tuple spreads are expanded, and trailing array spreads
+  supply the element type to direct access and rest bindings. A
+  variable-width spread followed by a suffix can make a position
+  ambiguous. The editor leaves those positions unresolved. Dynamic
+  keys, object rest on class instances, and live desktop acceptance
+  remain open. Windows ARM64 passed 134 editor and completion tests
+  with five ignored. The regression checks the exact replacement, an
+  out-of-range index, an ambiguous suffix and a cyclic spread.
+  [Windows verification](target/verification/20261119-typescript-variadic-windows.log)
+- Same-document TypeScript unions offer common members and intersections
+  combine members. The same rules apply through nested fields, indexed
+  tuple access, parentheses, and generic aliases. An unresolved union
+  constituent blocks suggestions for that union. Nullable and
+  discriminated control-flow narrowing remains open. Windows ARM64
+  passed 301 focused tests with seven ignored,
+  including checks for operator precedence, nested completion, unresolved
+  alternatives and preservation of the source outside the replacement.
+  [Windows verification](target/verification/20261119-typescript-composition-windows-final.log)
+- Local TypeScript completion derives finite keys from literal unions
+  and `keyof` on structural types. It follows property types through
+  mapped declarations and `Pick`, `Omit`, `Record`, `Partial`,
+  `Required` and `Readonly`. Locally declared aliases of the same name
+  retain precedence. Dot completion lists identifier keys, and literal
+  bracket access can follow other saved keys.
+  Windows ARM64 passed 302 focused tests with seven ignored. The new
+  regression checks exact replacement, bracket access, generic aliases,
+  readonly array methods and empty suggestions for open key domains.
+  [Windows verification](target/verification/20261119-typescript-mapped-windows-final.log)
+- Same-document TypeScript completion follows known keys through string
+  and number index signatures, open mapped declarations and generic
+  `Record` aliases. Declared properties take precedence. A numeric key
+  selects the number signature when both signatures are present. Open
+  dictionaries supply value types after known keys and list only declared
+  members at the dictionary itself. Dynamic keys and general
+  key-dependent and conditional types remain open.
+  Windows ARM64 passed 323 focused tests with two HTTPS fixtures ignored.
+  The regression covers dot and literal bracket access, optional chaining,
+  explicit property precedence and distinct string and number lookups.
+  [Windows verification](target/verification/20261119-typescript-index-windows.log)
+- Finite TypeScript mapped types accept `as K`, `as never`, a fixed string
+  and a template with one key interpolation. A renamed property resolves to
+  its original value type. Several original keys mapped to the same name
+  expose the shared members of their value types. The editor uses the
+  generated names in dot and bracket lookups, `keyof` and the supported
+  utility types, and annotated destructuring. Multiple interpolations and
+  intrinsic string transformations remain open. Windows ARM64 passed 281
+  focused tests with two private HTTPS fixtures ignored. TypeScript 7.0.2
+  verified the fixture with `--strict --noEmit`, including three expected
+  errors.
+  [TypeScript verification](target/verification/20261119-typescript-key-remapping-tsc.log)
+  [Windows verification](target/verification/20261119-typescript-key-remapping-windows-final.log)
+- TypeScript bracket access follows preceding local constants and alias
+  chains initialized with literal keys. The same lookup applies after
+  optional chaining and for integer tuple indices. Mutable bindings and
+  unresolved shadowing declarations keep the key unresolved.
+  Windows ARM64 passed 278 focused tests with two HTTPS fixtures ignored.
+  The regression covers exact replacement, local aliases, closed scopes,
+  multi-variable declarations and shadowing by parameters and catch bindings.
+  [Windows verification](target/verification/20261119-typescript-key-aliases-windows.log)
+- TypeScript member lookup converts signed decimal and exponent literals
+  and based literals within the safe integer range to their numeric property
+  names. Literal constants use the same conversion. Explicit numeric
+  properties take precedence over the index signature. Array and tuple
+  lookups require canonical nonnegative integer indices.
+  Windows ARM64 passed 279 focused tests with two HTTPS fixtures ignored.
+  The regression verifies normalization, property precedence,
+  numeric constant aliases, and rejection of expressions and BigInt keys.
+  [Windows verification](target/verification/20261119-typescript-numeric-keys-windows.log)
+- TypeScript completion follows explicit BigInt `.toString()` keys
+  through literals and local aliases. Decimal conversion preserves the
+  exact integer above the safe Number range. The installed TypeScript
+  7.0.2 compiler accepted the conversion and diagnosed a direct BigInt
+  subscript with TS2538.
+  [Compiler evidence](target/verification/20261119-typescript-bigint-reference.log)
+  Windows ARM64 passed 280 focused tests with two HTTPS fixtures ignored.
+  The regression distinguishes adjacent large integers and covers negative
+  hexadecimal literals, local aliases and shadowed bindings.
+  [Windows verification](target/verification/20261119-typescript-bigint-keys-windows.log)
+- CSS completion uses bundled MDN data for 533 property names, explicit
+  value keywords, 18 at-rules, pseudo-classes, pseudo-elements, and 35
+  rule-specific descriptors. The pinned refresh script reproduces the
+  snapshot byte for byte. Cargo and the editor read the checked-in catalog
+  offline. Windows ARM64 passed 333 focused tests with seven ignored.
+  The CSS regression covers exact insertion, nested directives, and
+  descriptor and selector contexts. Broader HTML data and more complete
+  CSS grammar and nesting analysis remain open.
+  [Windows verification](target/verification/20261119-snippet-css-catalog-windows.log)
+  [MDN snapshot](https://github.com/mdn/data/tree/7d81f7981cc1c7074b887bb2d16aab66b493dc13/css)
+- CSS completion keeps the active rule and declaration context across
+  nested blocks. It distinguishes style blocks and top-level group rules,
+  handles delimiters in comments, strings and custom property values,
+  and restricts custom property names to the first var() argument.
+  Windows ARM64 passed 338 focused tests with seven ignored. The
+  regressions cover block recovery, selector and descriptor context,
+  nested variable references, and fallback values.
+  [Windows verification](target/verification/20261119-snippet-css-context-windows.log)
+  [CSS Nesting](https://www.w3.org/TR/css-nesting-1/)
+- HTML completion uses a checked-in snapshot of 115 element names,
+  102 global attributes, element-specific attributes, and 48 entries
+  for enumerated attribute values from the WHATWG index. Generation
+  reproduces the catalog byte for byte. The editor recognizes the matching
+  end tag in raw-text content and resumes tag suggestions after it.
+  Windows ARM64 passed 335 focused tests with seven ignored. Tests cover
+  exact replacement, attribute scope, and raw-text boundaries.
+  [Windows verification](target/verification/20261119-snippet-html-catalog-windows.log)
+  [WHATWG HTML index](https://html.spec.whatwg.org/review-drafts/2026-07/#index)
+- The offline HTML catalog supplies 82 concrete roles and 46 state and
+  property names from WAI-ARIA 1.2, plus explicitly listed keyword values.
+  The editor skips already entered tokens in quoted role fallback lists
+  and the aria-relevant token list. Windows ARM64 passed 336 focused
+  tests with seven ignored. The regression covers exact replacement,
+  repeated tokens, and exclusion of abstract roles and deprecated names.
+  Host-element and role-specific ARIA constraints, SVG, MathML, and
+  broader HTML attribute-value coverage remain open.
+  [Windows verification](target/verification/20261119-snippet-aria-catalog-windows.log)
+  [WAI-ARIA 1.2](https://www.w3.org/TR/2023/REC-wai-aria-1.2-20230606/)
+- Embedded SVG and MathML use offline catalogs with 63 SVG elements
+  and 30 MathML elements, their scoped attributes, and selected keyword
+  values. The editor inserts canonical SVG spelling and follows HTML
+  integration points, self-closing elements and foreign CDATA. Windows
+  ARM64 passed 340 focused tests with seven ignored. The pinned W3C
+  snapshots reproduced the checked-in vocabulary byte for byte.
+  [Windows verification](target/verification/20261119-snippet-foreign-markup-windows.log)
+  [SVG 2 index](https://www.w3.org/TR/2026/CR-SVG2-20261006/eltindex.html)
+  [MathML Core](https://www.w3.org/TR/2025/CR-mathml-core-20250624/)
+- HTML completion tracks common omitted end tags for paragraphs, lists,
+  select options, ruby annotations, and table cells, rows and sections.
+  Start tags that break out of foreign content restore the appropriate
+  HTML context. The editor treats an HTML non-void element with a
+  trailing slash as open and preserves self-closing behavior in foreign
+  content. Windows ARM64 passed 342 focused tests with seven ignored.
+  Full adoption-agency and table foster-parenting behavior remain open.
+  [Windows verification](target/verification/20261119-snippet-html-tree-windows.log)
+  [HTML parser](https://html.spec.whatwg.org/multipage/parsing.html)
+- Java ASCII Art restore supplies independent generated-picture and local
+  image sizes, comment and print styles, and the copy gap. Native values,
+  including zero gap and the selected copy style, take precedence. When both
+  incoming styles are active, the print style wins as it does in Java.
+  Windows ARM64 passed 125 focused tests covering additive restore,
+  repeated import, the size mapping, and individual native overrides.
+  Native desktop acceptance remains open.
+  [Windows verification](target/verification/20261118-java-ascii-art-preferences-windows.log)
+- Java backup retention and the automatic backup interval restore as portable
+  defaults. Desktop startup writes them to the native backup settings when
+  that file is absent. A saved native file takes precedence, including saved
+  default values. The migrated settings start with empty destination and
+  credential fields. Backup progress remains device-local. Windows ARM64
+  passed 190 focused tests, including additive Java restore, adoption on an
+  empty profile, and precedence of a previously saved native configuration.
+  Desktop acceptance after restart remains open.
+  [Windows verification](target/verification/20261118-java-backup-defaults-windows.log)
+- Native portable restore leaves GGUF model registrations without locally
+  approved assets. In the AI Manager, select the restored registration and
+  enter a local GGUF path, then review and confirm reattachment. A split
+  model requires the complete ordered shard set. Reattachment verifies the
+  GGUF structure, total bytes and per-shard sizes, then records fresh local
+  file identities. The restored model ID and settings are retained. The
+  portable record contains no content hash of the original files. Existing
+  active registrations and registrations containing partial private assets
+  are preserved. Windows ARM64 verified the AI Manager review and
+  cancellation flow, single-file and split GGUF reattachment and a registry
+  reopen.
+  [Windows verification](target/verification/20261118-gguf-reattachment-windows.log)
+- GGUF vision registrations also accept reattachment. Review the weights
+  path and the projector path together in the AI Manager. Both components
+  are validated against the saved sizes and shard layout, copied privately,
+  and published in one directory move under the existing model ID. The
+  Windows ARM64 regression verifies that an interrupted copy leaves the
+  registration detached, that the copy can be retried, and that reopening
+  the registry finds the original ID with both sets of files. The focused
+  Windows ARM64 suite passed 177 tests with three opt-in probes skipped.
+  Native desktop acceptance remains open.
+  [Windows verification](target/verification/20261118-gguf-vision-reattachment-windows.log)
+- MLX registrations restored from native backups also support reattachment.
+  Select the original model and review a local directory. The AI Manager
+  lists the data files before confirmation. The registry matches the saved
+  filenames and sizes, compares the copied contents to the SHA-256 digests
+  from the local review, and publishes the complete private copy under the
+  original ID. The restored name and idle timeout are retained. Windows
+  ARM64 passed 220 focused tests with one opt-in probe skipped. The MLX
+  regression covers equal-size source edits, changes to the registration
+  after review, and reopening the original ID. Apple Silicon desktop review
+  and actual MLX inference after cross-host restore remain open.
+  [Windows verification](target/verification/20261118-mlx-reattachment-windows.log)
+- Java backup review shows how highlight sets with ambiguous source IDs
+  are handled. An existing local set and its references are preserved.
+  Imported references use a separately identified copy when it can be
+  installed. A confirmed legacy content-derived ID still upgrades in place.
+  The reviewed mapping is rechecked before queueing and before startup
+  publication. A changed mapping leaves an unstarted restore available for
+  explicit discard. Windows ARM64 passed 170 focused tests, including
+  additive and transactional restore, cancellation of a stale additive
+  restore, and idempotent replay. Native desktop inspection remains open.
+  [Windows verification](target/verification/20261119-java-highlight-review-windows.log)
+- Java toolbar restore binds unique existing SSH, local shell, and serial
+  profiles with matching settings and group paths. SSH reuse requires the
+  exact main and jump routes and a supported authentication match. A
+  group button requires the complete set of direct members. The startup
+  transaction checks the saved catalogue revision and preserves its exact
+  bytes when no profiles are added. Windows ARM64 passed 245 focused
+  tests, including a changed-route rejection, duplicate source aliases,
+  and rejection of a catalogue edit after queueing. Desktop inspection
+  remains open.
+  [Windows verification](target/verification/20261119-java-toolbar-existing-windows.log)
+- The toolbar editor can assign an unresolved Java connection button to a
+  saved profile and an unresolved Java group button to a populated saved
+  group. The selected button is replaced in place in its editing draft.
+  Finish saves the assignment. Cancel discards it. Saved-target labels show
+  the group and transport details needed to distinguish similar profiles.
+  Windows ARM64 passed 76 focused tests, including position and persistence,
+  cancellation, target type checks, and stale messages after a catalogue
+  refresh. Native desktop inspection of the picker remains open.
+  [Windows verification](target/verification/20261119-java-toolbar-assignment-windows.log)
+- Java Scheduler restore can use a unique, exact saved SSH profile in a
+  disabled draft. It verifies the full membership of each selected group
+  and keeps the source order when the saved catalogue has a different
+  order. An unchanged catalogue is reused byte for byte and its revision
+  is checked at startup. Windows ARM64 passed 388 focused tests, including
+  catalogue changes before startup, disabled group targets, and replay.
+  One opt-in OpenSSH browser test was skipped. Desktop adoption of these
+  drafts remains open.
+  [Windows verification](target/verification/20261119-java-scheduler-existing-windows.log)
+- The Java backup preview allows manual assignment of unresolved Scheduler
+  references to saved SSH profiles with matching main and jump routes.
+  This includes unresolved members of archived groups. The group path and
+  complete membership are still verified. The selected catalogue revision
+  is checked when the user queues the restore, and startup rechecks the
+  sealed catalogue before publishing disabled drafts. Windows ARM64 passed
+  398 focused tests, including rejection of a different route and an edit
+  after review. One opt-in OpenSSH browser test was skipped. Native desktop
+  acceptance remains open.
+  [Windows verification](target/verification/20261119-java-scheduler-target-review-windows.log)
+- Java Scheduler review can assign an archived local group to a different
+  saved path. Each archived SSH route, including its jump route, must match
+  a unique member of the complete saved group. The selected group also
+  resolves direct Scheduler references to those source connections.
+  Conflicting assignments are rejected before queueing. Shared groups
+  continue to use Teamwork source identity. Windows ARM64 passed 399
+  focused tests, including the renamed group, rejection of an incomplete
+  group, and consistent reuse by a direct job. One opt-in OpenSSH browser
+  test was skipped. Native desktop acceptance remains open.
+  [Windows verification](target/verification/20261119-java-scheduler-group-review-windows.log)
+- The Java AI Memory preview marks unique exact saved-profile matches.
+  Select exact matches fills unassigned review rows while preserving
+  individual choices. The normal restart review protects the selected
+  catalogue revision. Windows ARM64 passed 186 focused tests, including
+  explicit selection, preservation of a locally edited document and
+  withdrawal of the suggestion after a profile rename. Native desktop
+  inspection remains open.
+  [Windows verification](target/verification/20261119-java-memory-exact-review-windows.log)
 - A repeat of the field-name inventory covered the original 42 readers plus
   the six additional files in `src/workspace/backup_data/`. Of 346 declared
   Java fields, 197 appeared as quoted names in those reader prefixes and
@@ -298,6 +1232,134 @@ passed 35 focused backup, candidate and assistant tests.
 [Windows ARM64 Clippy](target/verification/20261118-snippet-alternatives-windows.log)
 passed for the app and test targets. The interactive workflow with a
 configured provider remains open.
+
+### AI comparison summary divider
+
+Snippet alternatives, migration results and staged snippet or folder
+proposals can resize the scrollable summary above the source comparison.
+The initial height estimates the summary content and reserves space for
+the comparison. The app stores the relative position after a drag and
+shares it across supported review surfaces. Java restore fills an unset
+value from `aiDiffDialogSummaryDividerPosition`. A saved native position
+takes precedence. Windows ARM64 passed 252 tests with two ignored,
+including compact-height bounds, drag completion, import clamping and
+additive replay. Native desktop drag, resize and reopen acceptance
+remains open.
+[Windows verification](target/verification/20261119-ai-diff-summary-windows.log)
+
+### Snippet library column widths
+
+The native library displays name, language, category, operating system,
+tags and the effective export executable state in separate columns.
+Each header has its own resize grip. The table scrolls horizontally
+and keeps its header visible while the rows scroll vertically. The
+workspace preserves single and multi-selection, context actions,
+opening and drag operations on the row. A completed drag saves its
+column width. Java restore fills matching unset widths from
+`snippetManagerColumnWidths`. Windows ARM64 passed 278 tests with two
+ignored. The native layout test aligned the header and rows inside a
+260-point viewport with horizontal overflow. The backup and state tests
+covered duplicate fields, native precedence, bounds and drag completion.
+[Windows verification](target/verification/20261119-snippet-columns-windows-final.log)
+
+The Favorite column toggles a persisted per-snippet flag. Private Java
+library imports keep the flag and both timestamps. The Modified column
+shows the last modification or creation time in UTC. The Lines column
+follows Java line counting for CR, LF and CRLF. A trailing delimiter
+does not add a line.
+Java backup restore also accepts the widths for these three columns.
+The Windows ARM64 focused suite passed 383 tests with two HTTPS
+fixture tests ignored. Coverage includes favorite persistence, the
+Java library import, line counting, column widths and table layout.
+Desktop interaction stays open.
+[Windows verification](target/verification/20261119-snippet-library-stats-windows.log)
+
+The Uses column displays the persisted count. Private Java imports keep
+the count and last-used timestamp, and Java window restore accepts the
+column width. The native count advances when a resolved saved snippet
+is copied or a terminal session accepts its input. Incognito terminal
+sends leave the count untouched. The store applies the increment to the
+current library under the write lock. Usage updates leave the reviewed
+source and modification timestamp intact.
+The Windows ARM64 focused suite passed 385 tests with two HTTPS
+fixture tests ignored. Coverage includes Java usage import, width
+restore, usage persistence and policy-aware copy. The updated Unix PTY
+test asserts a single increment after a confirmed send. It awaits a
+native Unix run.
+[Windows verification](target/verification/20261119-snippet-usage-windows.log)
+
+The table starts with favorites first and higher usage first within each
+group. Rows with equal priority remain alphabetical. Clicking a header
+cycles that column through ascending, descending and default order.
+A usage refresh keeps the visible rows in place under the default order.
+The toolbar and row context menu toggle the marked snippets in one write.
+The per-row star still toggles only its own snippet. Selection is tracked
+by snippet ID through sort and refresh operations.
+The Windows ARM64 focused suite passed 386 tests with two HTTPS fixture
+tests ignored. It covered sorting, the usage refresh, mixed favorite
+selection, folder filtering and the comparison order.
+[Windows verification](target/verification/20261119-snippet-sorting-windows-final.log)
+
+The sortable Analysis status column compares the newest report with the
+saved snippet. Open findings, stale analyses and pending reviews can be
+filtered alongside the search and folder scope. Older pending reviews
+and retained unsaved results remain visible in the review filter. The
+library reads private histories in a worker and reuses unchanged file
+snapshots. Java restore accepts the saved analysis column width and
+imported Java apply runs retain their explicit save stamps. Native
+snippet saves persist the identities of matching accepted results in
+the same atomic write as their source. This evidence survives edits,
+reopening the library and expiration of the matching source version.
+Legacy reports can also use current or retained content to recognize
+applied findings.
+The Windows ARM64 focused suite passed 412 tests with two HTTPS fixture
+tests ignored. It covered older pending reviews, unsaved and applied
+results, stale and removed reports, filter composition and width restore.
+[Windows verification](target/verification/20261119-snippet-analysis-overview-windows-final.log)
+
+The follow-up Windows ARM64 suite passed 412 tests with two HTTPS fixture
+tests ignored. The storage regression checked that accepting alone did
+not record a save, then reopened the library after saving and editing
+the snippet with no retained source versions. The analysis remained
+applied, and removing the report allowed the next save to prune its
+evidence. [Windows verification](target/verification/20261119-snippet-save-evidence-windows.log)
+
+### Insert a saved snippet into a file editor
+
+The Snippet Manager offers Insert into editor from the saved snippet
+actions and the library context menu. It resolves the same variables
+and built-ins as Copy resolved and binds the chosen editor before any
+prompt. It targets file editor tabs in the associated main window or
+native editors opened through that window. The normal writable editor
+route inserts at the caret, converts line endings to the current
+preference and preserves the insertion as a single undo step. The first
+unescaped `${cursor}` positions the caret after expansion. Usage advances
+after a successful insertion. Interactive desktop focus transfer remains
+open for acceptance.
+The Windows ARM64 rerun passed 428 tests across the editor, Snippet
+Manager, Scheduler and Teamwork. It covered the editor binding when
+focus changes during variable review and the Teamwork Scheduler
+round-trip with group membership and host-pin checks. Eight tests were
+ignored. They require a loopback Git daemon, native formatter or
+compiler tools, or a disposable Windows OpenSSH SFTP fixture.
+[Windows verification](target/verification/20261119-teamwork-editor-windows.log)
+
+### Run a saved snippet with positional arguments
+
+The native library offers ordinary and parameterized terminal actions.
+The parameter dialog prefills declared variables and accepts one
+positional argument per nonblank line. The POSIX command quotes each
+argument independently, including spaces and literal apostrophes. Bash,
+Python, Perl and Ruby use the same pinned terminal route as the command
+palette, with source and variable revalidation and any required paste
+review. The action keeps the existing one-line input limit and rejects
+terminal control characters in arguments. Incognito
+runs leave usage and default values unchanged. The native desktop dialog
+and delivery to a POSIX shell and an SSH pane remain open for acceptance.
+The Windows ARM64 focused suite passed 296 tests with two HTTPS fixture
+tests ignored. Coverage includes literal argument quoting, the input
+limit, prefilled defaults, target selection and cancellation.
+[Windows verification](target/verification/20261119-snippet-terminal-parameters-windows.log)
 
 ### Custom snippet language choices
 
@@ -851,6 +1913,48 @@ denied for project code.
 [Apple Silicon result](target/verification/20261117-agent-dock-interaction-macos.log)
 and [Windows Clippy result](target/verification/20261117-agent-dock-interaction-windows.log).
 
+### Agent Design module preview and status preferences
+
+The Agent Design page can preview a single history, status, approval, or
+arrangement inside the selected combination. Its sample uses the terminal
+Agent's history and status presenters, cursor command styling, picture-in-picture
+surface, and adaptive thresholds. A preview choice stays outside the saved
+design catalog. Preview controls act on the example activity.
+
+The status auto-hide delay defaults to six seconds and accepts 0 to 60 seconds.
+Zero keeps completed status visible. The View menu can hide or restore the
+current pane's status, and the history stays accessible after the status
+disappears. Agent-specific reduced motion applies to the demo's decorative
+frames, live inline activity, and picture-in-picture snapping. Java restore
+fills each unset preference independently.
+
+On November 19, Windows ARM64 passed 203 focused application tests,
+including the ConPTY cursor-review binding, Settings persistence,
+status expiry, and live layout and detachment state transitions.
+In the native desktop Settings window, the module picker changed the
+preview without changing the saved design. The preview kept status at
+zero, hid it after a run at two seconds, and showed all three adaptive
+placements. Both settings were saved to a private profile. The user
+confirmed the live d14 proposal at the terminal cursor and cancelled it
+with Escape.
+
+The PiP preview snapped to a new corner during the desktop check and
+revealed a drawing-order problem. After the layer fix, seven focused
+Windows ARM64 surface tests passed. The same pixel test reproduced the
+problem with the old drawing order. The corrected application built
+natively for ARM64 and Clippy passed for the application and tests.
+The Windows ARM64 desktop follow-up verified the corrected PiP layering
+over terminal text, snap to the top left, detachment, and reattachment of
+the same live history. Adaptive Dock moved from the bottom Powerline to
+the right-side timeline on maximize, returned to Powerline on restore,
+and showed the floating pill after splitting the terminal downward.
+[Application tests](target/verification/20261119-agent-design-tests-windows.log)
+· [Desktop check](target/verification/20261119-agent-design-desktop-windows.log)
+· [PiP renderer tests](target/verification/20261119-agent-design-pip-renderer-windows.log)
+· [Live desktop follow-up](target/verification/20261119-agent-design-live-desktop-windows.log)
+· [ARM64 build](target/verification/20261119-agent-design-build-final-windows.log)
+· [Clippy](target/verification/20261119-agent-design-clippy-windows.log)
+
 ### Java local file browser defaults
 
 Java backup restore retains local browser placement, width and hidden-file
@@ -909,6 +2013,19 @@ are reported as omissions. Native remembered bounds and existing
 per-dialog fallbacks take precedence. The import uses the shared native
 placement path for detached windows and respects the preference to
 disable remembered geometry. Native desktop acceptance remains open.
+
+The follow-up restores the explicit Agent workflow script bounds and 22
+additional named bounds. Java's automatically generated names use the
+fully qualified dialog class. The mappings cover Settings, Quick Connect,
+connection management, credentials, Teamwork, OS badges, known hosts,
+SSH keys, log files, recording management and replay, session processes,
+shell integration, environments, terminal effects, and snippet comparison.
+Highlight Rules uses its explicit `highlight.rules` key. The importer
+keeps the bounds independent and matches the exact case. Windows ARM64
+passed 130 focused tests. The Quick Connect opening path used the
+imported signed coordinates and enforced its native minimum height.
+Separate checks covered precedence, additive replay and rejected aliases.
+[Windows verification](target/verification/20261119-java-dialog-geometry-windows.log)
 
 Apple Silicon passed 33 focused tests covering backup conversion,
 placement precedence, Journal geometry compatibility, and window settings.
@@ -1077,17 +2194,67 @@ ARM64 strict application/test-target Clippy passed.
 [Apple Silicon fallback record](target/verification/20261117-teamwork-fallback-macos.log)
 and [Windows Clippy record](target/verification/20261117-teamwork-fallback-windows-clippy.log).
 
-The Java Scheduler additionally resolves Teamwork password and registered-key
-defaults. Rust's saved Scheduler references currently resolve through the local
-connection store. Teamwork route identities and Scheduler adoption are tracked
-separately in the porting plan.
+Rust now resolves explicit Teamwork routes and source-qualified groups in the
+Scheduler for commands, scripts, snippets and SFTP actions including reviewed
+folder sync. Jobs with local targets retain their existing stored format. Teamwork jobs bind
+the effective login, local authentication reference and verified host key to
+the reviewed source route. Changed, unavailable or hidden routes and changed
+group membership block launch until the selection is reviewed again. The
+Scheduler uses an eligible scoped vault password first and a registered key
+as the fallback. Temporary-key authentication remains interactive.
 
-Interactive Teamwork SSH and SFTP now bind the selected route to its source
+Rsync previews and saved approvals use the same source-qualified Teamwork
+routes, including local and shared targets within a transfer. The runtime
+checks current visibility, group membership and host-key pins before using
+reviewed receivers. Windows ARM64 passed 74 rsync tests and 299 Scheduler
+tests in separate filtered runs. The Teamwork regression confirms that
+changing the local key invalidates the approval at the same endpoint.
+[Windows test record](target/verification/20261118-teamwork-rsync-windows.log).
+Protected file, folder, metadata and archive jobs accept a reviewed
+Teamwork target with passwordless or exact-account vault sudo. Ownership
+lookup and protected previews check the source-qualified route and approved
+host key. Windows ARM64 passed 321 Scheduler and protected-action tests.
+The Teamwork regression saves a protected chmod job through a single-member
+shared group and checks its route, pin and sudo binding.
+[Windows protected-action test record](target/verification/20261118-teamwork-protected-windows.log).
+Native OpenSSH, rsync and protected-helper acceptance remains open for these
+routes. Agent/Swarm still requires shared-route approval
+support. Shared routes with a jump host use a unique direct local SSH
+profile matching the declared endpoint and authentication method. The
+scheduler requires unattended authentication and pins both host keys.
+Missing, ambiguous or changed local bindings prevent execution. The Windows
+ARM64 Scheduler and Teamwork run passed 364 tests with three ignored, and
+strict Clippy passed. Native OpenSSH acceptance for this route remains open.
+Java backups can mark a connection as Teamwork or include its Teamwork source
+ID. Restore keeps those rows out of the local catalogue and retains their
+membership in the import group inventory.
+Groups with unresolved shared members stay unavailable. Windows ARM64
+passed all 44 Java connection-binding, scheduler and library-restore tests
+in the focused run. Java Scheduler restore can now stage a disabled job
+when the backed Teamwork source ID identifies the same active origin and
+the shared connection ID, raw SSH endpoints and group match its current
+entry. Local unattended authentication and an approved host key are
+required. Groups can span local and shared targets and retain the Java
+order after their complete membership has been checked. Windows ARM64
+passed 52 focused tests and 363 broader import and Scheduler tests.
+Two fixture-dependent tests were ignored in the broader run.
+[Windows Teamwork restore record](target/verification/20261118-java-teamwork-restore-windows.log).
+Managed server and isolation restrictions also apply during staging.
+Imported Java archive and sudo drafts support adoption against the exact
+current shared route and pinned host keys. Adoption preserves the disabled
+job state and existing native action reviews. Windows ARM64 passed 300
+Scheduler and adoption tests. Two OpenSSH fixtures were skipped.
+[Windows Teamwork adoption record](target/verification/20261118-java-teamwork-adoption-windows.log).
+Native restore acceptance,
+Java backups without source metadata and Agent/Swarm shared-route adoption
+remain open.
+[Windows Java Teamwork lineage test record](target/verification/20261118-java-teamwork-lineage-windows.log).
+
+Interactive Teamwork SSH and SFTP bind the selected route to its source
 origin and external ID, exact group, target and jump endpoints, authentication
 methods and default-auth eligibility. The serializable reference keeps foreign
-credential IDs out of the binding. The login still revalidates visibility and
-the complete connection settings. The Scheduler picker, job persistence and
-execution paths still need integration with this reference.
+credential IDs out of the binding. The login revalidates visibility and the
+complete connection settings.
 
 The final Apple Silicon run passed the new route round-trip fixture, 61 Teamwork
 tests and 34 SSH access tests. One Git-daemon and two external SSH fixtures
@@ -1341,6 +2508,43 @@ remained. Disk usage is 6.7 GiB for the checkout, 6.5 GiB for `target` and 62 Mi
 for the existing private scratch directory. Its source archive was reused.
 Previously rejected old scratch cleanup remains unresolved; those files were
 preserved. Existing release packages were not rebuilt for this change.
+
+### Java global AI timeout and code text language
+
+Java global preferences restore bounded request timeouts and the
+supported language codes used for prose in generated or edited code.
+Restore fills the two settings independently and preserves any explicit
+native value, including the one-minute timeout and Auto language.
+The preview reports out-of-range timeouts and languages outside the
+native list. An explicit zero now disables the HTTP profile timeout.
+The default HTTP transport and connection setup still have their own
+budgets. Managed runtime startup, provider metadata probes, explicitly
+reviewed operation deadlines and the CLI process ceiling retain their
+limits.
+
+Windows ARM64 passed 734 focused transport, AI Manager and backup tests
+with 22 ignored. The loopback fixture verified the distinct default
+and unlimited HTTP configurations, a caller-supplied deadline, and
+cancellation after dispatch. The LM Studio fixture checked metadata
+review with a zero timeout. The restore regression checked field
+precedence, replay, zero and out-of-range values, and an unsupported
+language code. Configured providers on the other native platforms
+remain open.
+[Windows verification](target/verification/20261119-ai-unlimited-timeout-windows-final.log)
+
+### Java system sleep preference and AI activity
+
+The Java `preventSystemSleep` preference fills an unset native value.
+An explicit native choice is preserved. On Windows and macOS, enabled
+system sleep prevention now includes active model, CLI and embedding
+requests. Request lifetime notifications wake the desktop only when
+the process becomes active or idle. Overlapping requests share the
+work signal. Existing terminal and Scheduler activity still contribute.
+Windows ARM64 passed 363 focused tests with 12 ignored. The tests
+verified profile precedence, replay, standalone AI work and active/idle
+transitions with overlapping requests. Native desktop assertion and
+release acceptance remains open.
+[Windows verification](target/verification/20261119-java-sleep-ai-activity-windows.log)
 
 ### Java AI skill preferences after PR #7
 
@@ -2991,6 +4195,22 @@ uses the regular bounds and maximized flag even if a stored geometry record
 contains fullscreen metadata. The additive importer applies the same bounds
 and maximized state. J `ui/MainWindowGeometrySupport.java`.
 
+Java session recovery preferences import as inactive suggestions for Ask,
+Automatic or Off, encrypted output restoration, and 100–5,000 output
+lines per pane. The preview counts them separately from active defaults.
+Additive restore fills individual missing suggestions. In **Settings →
+Window**, **Use imported settings** copies eligible values into the current
+draft. **Save** applies the normal managed policy checks. Output remains
+subject to the native vault and device-local recovery rules. Native desktop
+adoption, restart, and vault interaction remain open.
+Windows ARM64 passed 180 focused tests and strict Clippy. The encrypted
+backup fixture verifies the preview and additive import. Settings tests
+cover explicit adoption, managed restrictions, stale suggestions and Save.
+[Java restore modes](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/model/SessionRestoreMode.java)
+· [Java line limits](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/core/ScrollbackSnapshotCodec.java)
+· [Windows tests](target/verification/20261119-java-session-recovery-windows-final.log)
+· [Windows Clippy](target/verification/20261119-java-session-recovery-clippy.log).
+
 Java snippet analysis defaults for automatic diagram generation,
 modularization proposals, and source-code export fill unset native fields.
 The restore preview identifies the source-code export default.
@@ -3489,6 +4709,26 @@ passed on both native platforms. The app and tests passed the Apple Silicon
 cross-check. Native macOS and configured-deployment editor acceptance remain
 open.
 [Verification](target/verification/20261115-protected-file-rsync-acceptance.md).
+
+### Recovery after a privileged rsync helper terminates
+
+The Linux helper now holds an exclusive lock on the root-owned marker of
+each private upload or download stage. Later preparations inspect a bounded
+set of entries under the same pinned account handoff root and reclaim stages
+whose lock was released. Protected markers distinguish upload cleanup as
+the ordinary login from descriptor-checked cleanup of sealed downloads. The helper
+also recognizes its own interrupted allocation and cleanup steps. The
+published rsync address keeps its existing format. Unmarked legacy stages
+require administrator review.
+
+The Linux x86-64 cross-target Clippy check compiled the helper and its
+process-termination regression. Windows ARM64 passed all 30 shared crate
+tests. The application suite passed 3,843 tests with 91 ignored. Native
+Linux execution of the regression and deployment through pinned OpenSSH
+and sudo remain open.
+[Linux cross-target check](target/verification/20261119-rsync-abandoned-linux-clippy.log)
+· [Windows crate tests](target/verification/20261119-rsync-abandoned-windows.log)
+· [Windows application suite](target/verification/20261119-rsync-abandoned-app-windows.log).
 
 ## Scheduler recurring passwordless rsync
 
@@ -5238,8 +6478,28 @@ ad hoc app and SSH worker signature, CLI startup, Seatbelt, and packaged
 backup startup checks.
 [Apple Silicon terminal Agent tests](target/verification/20261117-native-agent-coding-fallback-macos-67b9870c35e3-tests.log).
 [Apple Silicon package checks](target/verification/20261117-native-agent-coding-fallback-macos-67b9870c35e3-package.log).
-The request review remains in the send path, and planning, Swarm and
-private sessions use their existing eligible profile routes.
+Advisory Planning can now select a loopback server-default profile,
+including the binding on a saved local or SSH connection. Its review
+shows the destination and who selects the model. The Windows ARM64
+loopback fixture confirmed explicit approval before transmission,
+exact reviewed messages, omission of the model field, and arrival at the
+Questions stage without an execution target. The focused suite passed
+180 tests with one live SSH fixture ignored in serial and parallel
+reruns. The first run had a ConPTY startup timeout in the existing
+native shell prompt test.
+[Windows verification](target/verification/20261119-planning-server-model-windows.log)
+Advisory Planning also accepts trusted OpenAI-compatible HTTPS
+server-selected profiles after its own saved opt-in. Ask and Run
+permission alone does not grant Planning access. Backups clear the
+Planning opt-in, as do endpoint, trust, and model-mode changes.
+Windows ARM64 passed 192 focused tests with three ignored. The
+revocation test blocks a pending review before dispatch. The separately
+run private TLS fixture confirmed TLS 1.3, the exact approved endpoint
+and masked messages, credential delivery in the authorization header,
+and omission of the model field. Live desktop acceptance with a configured
+HTTPS provider remains open.
+[Windows verification](target/verification/20261119-planning-https-windows.log)
+[TLS fixture](target/verification/20261119-planning-https-tls-windows.log)
 Apple Silicon passed the Java Agent adoption and persistence, standalone
 loopback Ask, and HTTPS opt-in and revocation regressions. Windows ARM64
 passed test compilation. On the source manifest `368e0d68bdd9`, the native
@@ -8574,6 +9834,13 @@ the profile header, section tabs, and fields share a scrollable area
 above the editor actions. The wizard's open pick list consumes Escape
 and closes before Escape can reach the enclosing wizard.
 
+The November 19 Windows ARM64 application suite exposed an Escape test
+that addressed the General page's terminal actions picker by its old
+row number. The test now finds the picker by its visible setting label.
+It verifies that the first Escape dismisses the picker and the second
+reaches the window close guard.
+[Windows verification](target/verification/20261119-native-windows-arm64-app-final.log)
+
 Windows ARM64 passed rustfmt, workspace Clippy, and 1,898 tests across
 61 targets with four test threads. Fedora ARM64 passed rustfmt,
 application Clippy, and 1,534 application tests. The macOS ARM64
@@ -11053,6 +12320,19 @@ placeholders, and rejects executable batch comment syntax. It rechecks
 selected snippets and only the variables they reference. The per-language
 default save preserves other settings already on disk and detects a
 conflicting edit to the same language.
+
+Java backup restore reads `workflowHeaderDefaults` and resolves each
+archived snippet UUID against the installed snippet catalogue. The
+mapping can reuse an identical local header under its native ID. It
+skips changed or missing headers, mismatched languages, and additions
+blocked by custom-header policy. An existing default for a language
+takes precedence. The restored setting follows the same header
+validation and review as a native choice. Windows ARM64 passed 254
+focused tests. The encrypted Java backup fixture verified fresh and
+remapped IDs, existing defaults, mismatch handling, policy denial and
+additive replay. The native desktop workflow with imported defaults
+remains open.
+[Windows verification](target/verification/20261119-java-workflow-headers-windows.log)
 
 The dialog lets the user edit and copy a draft, open an unsaved snippet,
 or open the native script diagram. Private drafts can be edited and
@@ -14091,8 +15371,19 @@ and Scheduler summaries retain their separate authorization and routing.
 AI Manager exposes the preserved Java `sessionJournalAiProfileId` as an
 inactive role suggestion. The suggestion resolves the exact imported profile
 provenance and requires the reviewed profile to be saved before the role can
-be adopted. Saving the role affects question selection. The separate Java
+be adopted. The role affects question selection. The separate Java
 automation assignment stays in Journal summary settings.
+
+Automatic text summaries can inherit an explicitly assigned, saved HTTP
+loopback Journal profile that lets the server select the model. The queue
+stores the profile and exact destination. If the destination or model mode
+changes, the saved pass pauses until the matching route is restored. The
+text worker omits the model field, and screenshot summaries continue to
+require a vision profile. The Windows ARM64 loopback fixture verified
+the model field was absent from the readiness, streaming and closing
+requests. It reopened the receipt from disk, confirmed the saved
+summary, and then verified that an endpoint change paused the receipt.
+The focused run passed 69 tests with one private TLS fixture ignored.
 
 LM Studio-compatible HTTPS loopback profiles use the existing reviewed HTTPS
 route for journal questions and summaries. The loopback TLS fixture confirms
@@ -14830,10 +16121,66 @@ The expanded Qdrant receipt binds the covered source positions without
 changing the legacy receipt or standing route encoding.
 
 The SFTP AI comparison offers a review to replace the right server file
-through the native Linux helper, optionally keeping a new `.bak`. The helper
-checks the exact original and draft bytes, permissions and identity, claims
-the output names without overwriting other entries, and reports recovery
-after an uncertain result. The same comparison reloads the exact saved bytes.
+or another existing server file through the native Linux helper. The user
+can select a regular file in the server listing or enter its folder and
+name, then choose whether to keep a new `.bak`. Review of a selected path
+binds the current file bytes and access metadata. The helper checks the
+exact original and draft bytes, permissions and identity, claims the output
+names without overwriting other entries and reports recovery after an
+uncertain result. Saving over either compared file reloads the exact pair.
+Fedora ARM64 passed the native OpenSSH test through both direct and
+process-isolated routes. The fixture exercised exact-byte replacement, the
+optional backup, mode preservation, stale inode rejection, and rejection
+of missing files and symbolic links. The Windows ARM64 SFTP suite passed
+250 tests with seven ignored, and strict Clippy passed.
+The macOS helper now uses the same reviewed publication protocol and fixed
+command. Its descriptor-relative no-replace rename retains the conflict
+and recovery behavior. It copies and checks the original's owner, group,
+POSIX mode, extended ACL and supported extended attributes on both the draft
+and optional backup. Clippy with warnings denied passed for Apple Silicon,
+Intel macOS and Linux x86-64 cross-targets. Windows ARM64 passed 30 shared
+component tests. Native macOS helper tests, pinned OpenSSH paths and desktop
+interaction remain open.
+[Apple no-replace rename](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/man/man2/rename.2)
+· [Apple Silicon cross-check](target/verification/20261119-macos-sftp-draft-apple-silicon-check.log)
+· [Intel macOS cross-check](target/verification/20261119-macos-sftp-draft-apple-intel-check.log)
+· [Linux cross-check](target/verification/20261119-macos-sftp-draft-linux-check.log)
+· [Windows component tests](target/verification/20261119-macos-sftp-draft-windows-arm64.log).
+
+The Windows helper accepts the drive-qualified paths returned by Windows
+OpenSSH SFTP. The client selects a fixed Windows helper command for these
+paths on both direct and process-isolated routes. The helper binds the
+review to the original bytes, native file and parent identities, and
+Windows DACL and supported attributes. It publishes with handle-relative
+no-replace renames. A name occupied during publication is preserved along
+with the checked original in the reported recovery directory. A requested
+backup retains the original bytes and DACL. Windows ARM64 passed 32
+component tests, including a binary stdio review/apply and a late
+destination collision. The application passed 250 SFTP tests with seven
+ignored, and the isolated SSH worker passed 12 protocol tests. Clippy
+passed for the helper on Windows ARM64 and the Windows x64, Linux x86-64
+and Apple Silicon cross-targets. The Windows OpenSSH SFTP executable returned the
+original and saved bytes around a local `cmd.exe` helper invocation.
+End-to-end review and publication through an authenticated Windows OpenSSH
+connection remain to be verified.
+[Windows helper tests](target/verification/20261119-windows-sftp-helper-native.log)
+· [Windows application tests](target/verification/20261119-windows-sftp-draft-application-final.log)
+· [SSH worker protocol tests](target/verification/20261119-windows-sftp-draft-ssh-wire.log)
+· [Windows helper Clippy](target/verification/20261119-windows-sftp-draft-windows-arm64-clippy.log)
+· [Windows x64 helper cross-check](target/verification/20261119-windows-sftp-draft-windows-x64-clippy.log)
+· [Linux helper cross-check](target/verification/20261119-windows-sftp-draft-linux-clippy.log)
+· [macOS helper cross-check](target/verification/20261119-windows-sftp-draft-macos-arm64-clippy.log)
+· [Native SFTP and helper processes](target/verification/20261119-windows-sftp-independent-lanes.log)
+· [Windows OpenSSH configuration](https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh-server-configuration).
+
+After a complete AI draft arrives, the comparison can show left versus right,
+right versus draft or left versus draft. Both source snapshots use the
+existing masking policy in this view. The draft opens against the right
+file and retains that file's line endings. Switching pairs uses the loaded
+result and keeps each pair's page separately. The Windows ARM64 SFTP suite
+passed 250 tests with seven ignored. The loopback provider fixture verified
+all three selections with masked snapshots and no repeated request. Native
+desktop acceptance with a configured provider remains open.
 
 See the [verification record](target/verification/20261113-journal-desktop-knowledge.md).
 

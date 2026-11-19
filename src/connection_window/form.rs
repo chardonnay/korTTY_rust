@@ -15,15 +15,13 @@ use crate::session_security::IsolationLevel;
 use crate::ssh_dialog::{
     KeepAliveEdit, KeyChoice, LoginTarget, StartupField, StartupFields, normalize_host,
 };
-use crate::terminal_effects::Effect;
+use crate::terminal_effects::{Effect, editor::EffectDraft};
 
 use super::color::ColorDraft;
 use super::view::ViewChoices;
 use super::{CredentialChoice, Message, os_badge, terminal_overrides};
 
-mod effects;
 mod geometry;
-use effects::EffectDraft;
 
 #[derive(Clone, Debug)]
 pub enum Edit {
@@ -492,7 +490,17 @@ impl Draft {
         .push(self.terminal.view(choices).map(|edit| Message::Edit(Edit::Terminal(edit))))
         .push(self.window_geometry.view().map(|edit| Message::Edit(Edit::WindowGeometry(edit))));
         if let Some(effects) = choices.terminal_effects {
-            editor = editor.push(self.terminal_effect.view(effects));
+            editor = editor.push(
+                column![
+                    text("Terminal Effect").size(16),
+                    self.terminal_effect.view(
+                        effects,
+                        |effect| Message::Edit(Edit::TerminalEffect(effect)),
+                        |speed| Message::Edit(Edit::TerminalEffectSpeed(speed)),
+                    ),
+                ]
+                .spacing(6),
+            );
         }
         editor = editor
             .push(text("Destination").size(16))

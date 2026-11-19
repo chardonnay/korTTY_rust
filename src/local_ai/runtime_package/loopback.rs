@@ -20,7 +20,7 @@ use super::process::Sidecar;
 
 const CONNECTION_BUDGET: Duration = Duration::from_secs(1);
 
-pub(super) fn agent(sidecar: &Arc<Sidecar>, timeout: Duration) -> Agent {
+pub(super) fn agent(sidecar: &Arc<Sidecar>, timeout: impl Into<Option<Duration>>) -> Agent {
     Agent::with_parts(
         connection_config(timeout),
         OwnedEndpoint(Arc::downgrade(sidecar)),

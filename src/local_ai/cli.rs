@@ -72,7 +72,7 @@ pub(crate) const CODEX_STDIN: &[&str] = &[
 const MAX_INPUT: usize = 1024 * 1024;
 const MAX_OUTPUT: usize = 64 * 1024;
 const MAX_DIAGNOSTICS: usize = 8 * 1024;
-const MAX_DURATION: Duration = Duration::from_secs(30 * 60);
+pub(super) const MAX_DURATION: Duration = Duration::from_secs(30 * 60);
 const POLL: Duration = Duration::from_millis(15);
 
 #[derive(Clone, Copy)]

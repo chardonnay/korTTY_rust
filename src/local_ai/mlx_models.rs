@@ -3,12 +3,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::private_files::{
     Directory, EntryIdentity, FileLock, FileStamp, nonce, require_single_link,
@@ -24,6 +25,7 @@ pub(crate) use reasoning::UNSUPPORTED as UNSUPPORTED_REASONING;
 pub(crate) const BACKUP_DIRECTORY: &str = "mlx-models";
 const ROOT: &str = BACKUP_DIRECTORY;
 const STAGING: &str = "staging";
+const RESTORED_ASSETS: &str = "assets";
 pub(crate) const BACKUP_MANIFEST: &str = "model.json";
 const MANIFEST: &str = BACKUP_MANIFEST;
 const LOCK: &str = "registry.lock";
@@ -50,6 +52,7 @@ pub(crate) struct Review {
     source: PathBuf,
     identity: EntryIdentity,
     stamps: BTreeMap<String, FileStamp>,
+    digests: BTreeMap<String, [u8; 32]>,
     model: Model,
 }
 
@@ -89,14 +92,26 @@ impl Review {
         };
         let stamps = stamps(&files)?;
         validate_assets(&model, &mut files)?;
-        for (name, file) in &files {
+        let mut digests = BTreeMap::new();
+        let mut buffer = vec![0; 128 * 1024];
+        for (name, file) in &mut files {
+            file.rewind()?;
+            let digest = stream_asset(
+                file,
+                &mut io::sink(),
+                model.assets[name],
+                &mut buffer,
+                cancelled,
+            )?;
             stamps[name].require_unchanged(file)?;
+            digests.insert(name.clone(), digest);
         }
         check_cancelled(cancelled)?;
         Ok(Self {
             source,
             identity,
             stamps,
+            digests,
             model,
         })
     }
@@ -149,38 +164,85 @@ impl<'a> Registry<'a> {
         let _lock = lock(&root, LOCK, true)?;
         let directory = root.private_child(id, false)?;
         let _lease = lock(&directory, LEASE, true)?;
-        ReasoningControls::read(&directory)
+        match restored_assets(&directory)? {
+            Some(assets) => ReasoningControls::read(&assets),
+            None => ReasoningControls::read(&directory),
+        }
     }
 
     pub(crate) fn import(&self, review: &Review, cancelled: &AtomicBool) -> io::Result<Model> {
+        self.install(review, None, cancelled)
+    }
+
+    pub(crate) fn detached_model(&self, id: &str) -> io::Result<Model> {
+        require_id(id)?;
+        let root = self.root(false)?;
+        let _lock = lock(&root, LOCK, true)?;
+        let directory = root.private_child(id, false)?;
+        let _lease = lock(&directory, LEASE, true)?;
+        read_detached_model(&directory, id)
+    }
+
+    pub(crate) fn review_reattachment(
+        &self,
+        id: &str,
+        source: &Path,
+        cancelled: &AtomicBool,
+    ) -> io::Result<(Model, Review)> {
+        let expected = self.detached_model(id)?;
+        let review = Review::prepare(source, cancelled)?;
+        check_asset_layout(&review, &expected)?;
+        Ok((expected, review))
+    }
+
+    pub(crate) fn reattach(
+        &self,
+        expected: &Model,
+        review: &Review,
+        cancelled: &AtomicBool,
+    ) -> io::Result<Model> {
+        self.install(review, Some(expected), cancelled)
+    }
+
+    fn install(
+        &self,
+        review: &Review,
+        restored: Option<&Model>,
+        cancelled: &AtomicBool,
+    ) -> io::Result<Model> {
+        check_cancelled(cancelled)?;
         let source = Directory::open(&review.source, false)?;
         if source.identity()? != review.identity {
             return Err(invalid("The reviewed MLX model directory changed"));
         }
-        let root = self.root(true)?;
+        let root = self.root(restored.is_none())?;
         let _lock = lock(&root, LOCK, false)?;
+        let target = if let Some(expected) = restored {
+            require_id(&expected.id)?;
+            check_asset_layout(review, expected)?;
+            let directory = root.private_child(&expected.id, false)?;
+            let lease = lock(&directory, LEASE, false)?;
+            check_restore_target(&directory, expected)?;
+            Some((directory, lease))
+        } else {
+            if ids(&root)?.len() >= MAX_MODELS {
+                return Err(invalid("The MLX model registry is full"));
+            }
+            None
+        };
         let staging = prepare_staging(&root)?;
         let model = &review.model;
-        if ids(&root)?.len() >= MAX_MODELS {
-            return Err(invalid("The MLX model registry is full"));
-        }
         let stage = staging.create_private_subdirectory(OsStr::new(&model.id))?;
         let prepared = (|| {
-            let mut buffer = vec![0; 128 * 1024];
-            for (name, bytes) in &model.assets {
-                let mut file = source.open_file(name)?;
-                require_single_link(&file)?;
-                let stamp = &review.stamps[name];
-                stamp.require_unchanged(&file)?;
-                stage.publish_with(name, |output| {
-                    copy(&mut file, output, *bytes, &mut buffer, cancelled)?;
-                    stamp.require_unchanged(&file)
-                })?;
+            if let (Some(expected), Some((directory, _))) = (restored, &target) {
+                let assets = stage.create_private_subdirectory(OsStr::new(RESTORED_ASSETS))?;
+                copy_reviewed_assets(review, &source, &assets, cancelled)?;
+                drop(assets);
+                check_restore_target(directory, expected)?;
+                stage.move_subdirectory(RESTORED_ASSETS, directory)?;
+                return directory.sync();
             }
-            // Check the complete reviewed set again before publishing the private copy.
-            for (name, stamp) in &review.stamps {
-                stamp.require_unchanged(&source.open_file(name)?)?;
-            }
+            copy_reviewed_assets(review, &source, &stage, cancelled)?;
             stage.publish_copy(
                 MANIFEST,
                 &serde_json::to_vec(model).map_err(io::Error::other)?,
@@ -189,6 +251,12 @@ impl<'a> Registry<'a> {
             check_cancelled(cancelled)
         })();
         drop(stage);
+        if let Some(expected) = restored {
+            let cleanup = discard_stage(&staging, &model.id);
+            prepared?;
+            cleanup?;
+            return Ok(expected.clone());
+        }
         if let Err(error) = prepared.and_then(|()| staging.move_subdirectory(&model.id, &root)) {
             discard_stage(&staging, &model.id)?;
             return Err(error);
@@ -205,22 +273,22 @@ impl<'a> Registry<'a> {
         let directory = root.private_child(id, false)?;
         let lease = lock(&directory, LEASE, true)?;
         let model = read_model(&directory, id)?;
-        let mut files = BTreeMap::new();
-        for (name, bytes) in &model.assets {
-            let file = directory.open_private_file(name)?;
-            require_single_link(&file)?;
-            if file.metadata()?.len() != *bytes {
-                return Err(invalid("An installed MLX model file changed size"));
-            }
-            files.insert(name.clone(), file);
+        let mut path = self.0.join(ROOT).join(id);
+        let assets = restored_assets(&directory)?;
+        let nested_assets = assets.is_some();
+        if nested_assets {
+            path.push(RESTORED_ASSETS);
         }
+        let directory = assets.unwrap_or(directory);
+        let mut files = open_private_assets(&directory, &model)?;
         let stamps = stamps(&files)?;
         validate_assets(&model, &mut files)?;
         let reasoning_controls = ReasoningControls::from_files(&mut files).unwrap_or_default();
         let opened = Opened {
             model,
             reasoning_controls,
-            path: self.0.join(ROOT).join(id),
+            path,
+            nested_assets,
             directory,
             files,
             stamps,
@@ -291,6 +359,7 @@ pub(crate) struct Opened {
     files: BTreeMap<String, File>,
     stamps: BTreeMap<String, FileStamp>,
     _lease: Option<FileLock>,
+    nested_assets: bool,
 }
 
 impl Opened {
@@ -321,11 +390,13 @@ impl Opened {
         if !self.directory.same_as(&reopened)? {
             return Err(invalid("The installed MLX model directory changed"));
         }
-        let names = self.directory.names(MAX_FILES + 2)?;
-        if names.len() != self.files.len() + 2
+        let metadata_files = if self.nested_assets { 0 } else { 2 };
+        let names = self.directory.names(MAX_FILES + metadata_files)?;
+        if names.len() != self.files.len() + metadata_files
             || names.iter().any(|name| {
                 !name.to_str().is_some_and(|name| {
-                    matches!(name, MANIFEST | LEASE) || self.files.contains_key(name)
+                    (!self.nested_assets && matches!(name, MANIFEST | LEASE))
+                        || self.files.contains_key(name)
                 })
             })
         {
@@ -409,6 +480,7 @@ pub(super) fn open_policy_model(
         files,
         stamps,
         _lease: None,
+        nested_assets: false,
     };
     opened.revalidate()?;
     Ok(opened)
@@ -611,24 +683,26 @@ fn stamps(files: &BTreeMap<String, File>) -> io::Result<BTreeMap<String, FileSta
         .collect()
 }
 
-fn copy(
+fn stream_asset(
     source: &mut File,
-    output: &mut File,
+    output: &mut impl Write,
     mut bytes: u64,
     buffer: &mut [u8],
     cancelled: &AtomicBool,
-) -> io::Result<()> {
+) -> io::Result<[u8; 32]> {
+    let mut digest = Sha256::new();
     while bytes > 0 {
         check_cancelled(cancelled)?;
         let count = bytes.min(buffer.len() as u64) as usize;
         source.read_exact(&mut buffer[..count])?;
+        digest.update(&buffer[..count]);
         output.write_all(&buffer[..count])?;
         bytes -= count as u64;
     }
     if source.read(&mut [0])? != 0 {
-        return Err(invalid("The reviewed MLX file grew during import"));
+        return Err(invalid("The MLX file grew during review or import"));
     }
-    Ok(())
+    Ok(digest.finalize().into())
 }
 
 fn ids(root: &Directory) -> io::Result<Vec<String>> {
@@ -662,6 +736,99 @@ fn lock(directory: &Directory, name: &str, shared: bool) -> io::Result<FileLock>
     Ok(FileLock::new(file))
 }
 
+fn read_detached_model(directory: &Directory, id: &str) -> io::Result<Model> {
+    let model = read_model(directory, id)?;
+    if directory
+        .names(MAX_FILES + 3)?
+        .iter()
+        .any(|name| name != OsStr::new(MANIFEST) && name != OsStr::new(LEASE))
+    {
+        return Err(invalid(
+            "Reattachment requires a metadata-only MLX registration",
+        ));
+    }
+    Ok(model)
+}
+
+fn check_restore_target(directory: &Directory, expected: &Model) -> io::Result<()> {
+    if read_detached_model(directory, &expected.id)? != *expected {
+        return Err(invalid(
+            "The selected MLX registration changed. Review it again.",
+        ));
+    }
+    Ok(())
+}
+
+fn check_asset_layout(review: &Review, expected: &Model) -> io::Result<()> {
+    if review.model.assets != expected.assets {
+        return Err(invalid(
+            "The reviewed MLX filenames or sizes differ from the registration",
+        ));
+    }
+    Ok(())
+}
+
+fn restored_assets(directory: &Directory) -> io::Result<Option<Directory>> {
+    if !directory.has_entry(RESTORED_ASSETS)? {
+        return Ok(None);
+    }
+    let names = directory.names(3)?;
+    if names.len() != 3
+        || names.iter().any(|name| {
+            !name
+                .to_str()
+                .is_some_and(|name| matches!(name, MANIFEST | LEASE | RESTORED_ASSETS))
+        })
+    {
+        return Err(invalid("The installed MLX registration inventory changed"));
+    }
+    directory.private_child(RESTORED_ASSETS, false).map(Some)
+}
+
+fn copy_reviewed_assets(
+    review: &Review,
+    source: &Directory,
+    destination: &Directory,
+    cancelled: &AtomicBool,
+) -> io::Result<()> {
+    let mut buffer = vec![0; 128 * 1024];
+    for (name, bytes) in &review.model.assets {
+        let mut file = source.open_file(name)?;
+        require_single_link(&file)?;
+        let stamp = &review.stamps[name];
+        stamp.require_unchanged(&file)?;
+        destination.publish_with(name, |output| {
+            let digest = stream_asset(&mut file, output, *bytes, &mut buffer, cancelled)?;
+            if digest != review.digests[name] {
+                return Err(invalid(
+                    "A reviewed MLX file changed. Review the directory again.",
+                ));
+            }
+            stamp.require_unchanged(&file)
+        })?;
+    }
+    for (name, stamp) in &review.stamps {
+        stamp.require_unchanged(&source.open_file(name)?)?;
+    }
+    let mut files = open_private_assets(destination, &review.model)?;
+    validate_assets(&review.model, &mut files)?;
+    destination.sync()?;
+    check_cancelled(cancelled)
+}
+
+fn open_private_assets(directory: &Directory, model: &Model) -> io::Result<BTreeMap<String, File>> {
+    let mut files = BTreeMap::new();
+    for (name, bytes) in &model.assets {
+        let file = directory.open_private_file(name)?;
+        require_single_link(&file)?;
+        if file.metadata()?.len() != *bytes {
+            return Err(invalid("A private MLX model file changed size"));
+        }
+        files.insert(name.clone(), file);
+    }
+    Ok(files)
+}
+
 fn prepare_staging(root: &Directory) -> io::Result<Directory> {
     let staging = root.private_child(STAGING, true)?;
     for name in staging.names(MAX_MODELS)? {
@@ -677,6 +844,20 @@ fn prepare_staging(root: &Directory) -> io::Result<Directory> {
 fn discard_stage(staging: &Directory, id: &str) -> io::Result<()> {
     let directory = staging.private_child(id, false)?;
     let identity = directory.identity()?;
+    if directory.has_entry(RESTORED_ASSETS)? {
+        let assets = directory.private_child(RESTORED_ASSETS, false)?;
+        let identity = assets.identity()?;
+        discard_files(&assets)?;
+        drop(assets);
+        directory.remove_deletion_entry(OsStr::new(RESTORED_ASSETS), identity, true)?;
+    }
+    discard_files(&directory)?;
+    drop(directory);
+    staging.remove_deletion_entry(OsStr::new(id), identity, true)?;
+    staging.sync()
+}
+
+fn discard_files(directory: &Directory) -> io::Result<()> {
     for name in directory.names(MAX_FILES + 3)? {
         let name = name
             .to_str()
@@ -693,9 +874,7 @@ fn discard_stage(staging: &Directory, id: &str) -> io::Result<()> {
         drop(file);
         directory.remove_unchanged(name, &stamp)?;
     }
-    drop(directory);
-    staging.remove_deletion_entry(OsStr::new(id), identity, true)?;
-    staging.sync()
+    Ok(())
 }
 
 fn require_id(id: &str) -> io::Result<()> {
@@ -738,6 +917,77 @@ mod tests {
         std::fs::write(source.join("model.safetensors"), &weights).unwrap();
         std::fs::write(source.join("model.py"), b"must never be imported").unwrap();
         source
+    }
+
+    #[test]
+    fn restored_mlx_model_binds_the_reviewed_assets_to_its_original_registration() {
+        let fixture_root = crate::snippets::tests::Profile::new();
+        let root = fixture_root.0.canonicalize().unwrap();
+        let source = fixture(&root);
+        let cancelled = AtomicBool::new(false);
+        let registry = Registry::new(&root);
+        let reviewed = Review::prepare(&source, &cancelled).unwrap();
+        let imported = registry.import(&reviewed, &cancelled).unwrap();
+        let original = registry.configure(&imported.id, "Restored MLX", 0).unwrap();
+        let portable = serde_json::to_vec(&original).unwrap();
+        validate_registration(&portable, &original.id).unwrap();
+        assert!(registry.detached_model(&original.id).is_err());
+        registry.remove(&original.id).unwrap();
+        let model_dir = registry
+            .root(false)
+            .unwrap()
+            .private_child(&original.id, true)
+            .unwrap();
+        model_dir.publish_copy(MANIFEST, &portable).unwrap();
+        assert!(registry.open(&original.id).is_err());
+
+        let tokenizer = source.join("tokenizer.json");
+        std::fs::write(&tokenizer, br#"{"version":1}"#).unwrap();
+        assert!(
+            registry
+                .review_reattachment(&original.id, &source, &cancelled)
+                .is_err()
+        );
+        std::fs::write(&tokenizer, b"{}").unwrap();
+        let (expected, stale) = registry
+            .review_reattachment(&original.id, &source, &cancelled)
+            .unwrap();
+        assert_eq!(expected, original);
+        std::fs::write(&tokenizer, b"[]").unwrap();
+        assert!(registry.reattach(&expected, &stale, &cancelled).is_err());
+        assert!(!model_dir.has_entry(RESTORED_ASSETS).unwrap());
+        let staging = registry
+            .root(false)
+            .unwrap()
+            .private_child(STAGING, false)
+            .unwrap();
+        assert!(staging.names(MAX_MODELS).unwrap().is_empty());
+        std::fs::write(&tokenizer, b"{}").unwrap();
+
+        let (_, review) = registry
+            .review_reattachment(&original.id, &source, &cancelled)
+            .unwrap();
+        let changed = registry
+            .configure(&original.id, "Locally renamed", 15)
+            .unwrap();
+        assert!(registry.reattach(&expected, &review, &cancelled).is_err());
+        let installed = registry.reattach(&changed, &review, &cancelled).unwrap();
+        assert_eq!(installed, changed);
+        let reopened = Registry::new(&root).open(&original.id).unwrap();
+        assert_eq!(reopened.model, changed);
+        assert_eq!(reopened.path.file_name(), Some(OsStr::new(RESTORED_ASSETS)));
+        assert!(!reopened.path.join("model.py").exists());
+        assert_eq!(
+            std::fs::read(reopened.path.join("tokenizer.json")).unwrap(),
+            b"{}"
+        );
+        reopened.revalidate().unwrap();
+        drop(reopened);
+        assert!(registry.detached_model(&original.id).is_err());
+        drop(model_dir);
+        registry.remove(&original.id).unwrap();
+        assert!(registry.list().unwrap().is_empty());
+        assert!(source.join("model.safetensors").is_file());
     }
 
     #[test]

@@ -141,6 +141,8 @@ pub(crate) struct PresentationPreferences {
 pub(crate) struct BackupData {
     presentation: PresentationPreferences,
     sets: Vec<RuleSet>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reviewed_bindings: Option<[u8; 32]>,
 }
 
 impl PresentationPreferences {
@@ -181,6 +183,7 @@ pub(crate) fn read_backup(root: Node<'_, '_>) -> io::Result<BackupImport> {
     let mut backup = BackupData {
         presentation: PresentationPreferences::read(root, &mut report),
         sets: Vec::new(),
+        reviewed_bindings: None,
     };
     if report.preferences != 0 {
         report.contents = bounded_json(&backup)?;
@@ -240,7 +243,9 @@ pub(crate) fn validate_backup(bytes: &[u8]) -> io::Result<BackupData> {
                 sets: backup.sets,
                 ..Configuration::default()
             };
-            return without_actions(configuration, backup.presentation);
+            let mut validated = without_actions(configuration, backup.presentation)?;
+            validated.reviewed_bindings = backup.reviewed_bindings;
+            return Ok(validated);
         }
         // Older pending Java backups stored an ordinary configuration with defaults.
         Err(_) => Configuration::decode(bytes.to_vec())?,
@@ -272,6 +277,7 @@ fn without_actions(
     Ok(BackupData {
         presentation,
         sets: configuration.sets,
+        reviewed_bindings: None,
     })
 }
 
@@ -279,6 +285,8 @@ fn without_actions(
 pub(crate) struct BackupMerge {
     pub(crate) contents: Option<Vec<u8>>,
     pub(crate) set_ids: BTreeMap<String, String>,
+    pub(crate) conflicts: Vec<String>,
+    pub(crate) reviewed: bool,
 }
 
 pub(crate) fn merge_backup(local: Option<Vec<u8>>, incoming: &[u8]) -> io::Result<BackupMerge> {
@@ -292,7 +300,10 @@ pub(crate) fn merge_backup(local: Option<Vec<u8>>, incoming: &[u8]) -> io::Resul
         .transpose()?
         .unwrap_or_default();
     let backup = validate_backup(incoming)?;
-    let mut result = BackupMerge::default();
+    let mut result = BackupMerge {
+        reviewed: backup.reviewed_bindings.is_some(),
+        ..BackupMerge::default()
+    };
     let mut added = false;
     let mut sets_changed = false;
     for mut set in backup.sets {
@@ -334,7 +345,11 @@ pub(crate) fn merge_backup(local: Option<Vec<u8>>, incoming: &[u8]) -> io::Resul
             .sets
             .iter()
             .find(|candidate| candidate.id == remapped_id);
-        if remapped.is_some() || existing.is_some_and(|candidate| *candidate != set) {
+        let conflicting_source = existing.is_some_and(|candidate| *candidate != set);
+        if conflicting_source {
+            result.conflicts.push(source_id.clone());
+        }
+        if remapped.is_some() || conflicting_source {
             set.id = remapped_id;
         }
         match local.sets.iter().find(|candidate| candidate.id == set.id) {
@@ -351,6 +366,13 @@ pub(crate) fn merge_backup(local: Option<Vec<u8>>, incoming: &[u8]) -> io::Resul
             }
         }
         result.set_ids.insert(source_id, set.id);
+    }
+    if let Some(reviewed) = backup.reviewed_bindings
+        && reviewed != bindings_digest(&result.set_ids)?
+    {
+        return Err(invalid(
+            "Terminal highlight selections changed after the Java restore review.",
+        ));
     }
     let preferences = backup.presentation;
     for (key, value) in [
@@ -382,6 +404,23 @@ pub(crate) fn merge_backup(local: Option<Vec<u8>>, incoming: &[u8]) -> io::Resul
         );
     }
     Ok(result)
+}
+
+pub(crate) fn bind_backup_review(
+    incoming: &[u8],
+    ids: &BTreeMap<String, String>,
+) -> io::Result<Vec<u8>> {
+    let mut backup = validate_backup(incoming)?;
+    backup.reviewed_bindings = Some(bindings_digest(ids)?);
+    let bytes = serde_json::to_vec(&backup)?;
+    if bytes.len() as u64 > MAX_BYTES {
+        return Err(invalid("Highlighting file exceeds 1 MiB."));
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn bindings_digest(ids: &BTreeMap<String, String>) -> io::Result<[u8; 32]> {
+    Ok(Sha256::digest(serde_json::to_vec(ids)?).into())
 }
 
 pub(crate) fn resolve_backup_set(ids: &BTreeMap<String, String>, id: &str) -> Option<String> {
@@ -611,6 +650,7 @@ mod tests {
         let incoming = serde_json::to_vec(&BackupData {
             sets: vec![legacy.clone()],
             presentation: PresentationPreferences::default(),
+            reviewed_bindings: None,
         })
         .unwrap();
         let mut remapped = legacy.clone();
@@ -633,6 +673,46 @@ mod tests {
         assert!(saved.sets[1].rules[0].java_regex);
         let replay = merge_backup(Some(bytes), &incoming).unwrap();
         assert_eq!(replay.set_ids, merged.set_ids);
+        assert!(replay.contents.is_none());
+    }
+
+    #[test]
+    fn java_backup_review_separates_ambiguous_legacy_sets_and_binds_references() {
+        let legacy = RuleSet {
+            id: "ops".into(),
+            name: "Ops".into(),
+            rules: vec![Rule {
+                id: Some("literal".into()),
+                pattern: "foo".into(),
+                whole_word: true,
+                ..Rule::default()
+            }],
+        };
+        let local = Configuration {
+            default_set: Some(legacy.id.clone()),
+            sets: vec![legacy.clone()],
+            ..Configuration::default()
+        };
+        let incoming = serde_json::to_vec(&BackupData {
+            sets: vec![legacy.clone()],
+            presentation: PresentationPreferences::default(),
+            reviewed_bindings: None,
+        })
+        .unwrap();
+        let reviewed = merge_backup(Some(serde_json::to_vec(&local).unwrap()), &incoming).unwrap();
+        assert_eq!(reviewed.conflicts, ["ops"]);
+        let destination = &reviewed.set_ids["ops"];
+        assert!(destination.starts_with("java-"));
+
+        let bound = bind_backup_review(&incoming, &reviewed.set_ids).unwrap();
+        assert!(merge_backup(None, &bound).is_err());
+        let saved = Configuration::decode(reviewed.contents.clone().unwrap()).unwrap();
+        assert_eq!(saved.default_set, local.default_set);
+        assert_eq!(saved.sets[0], legacy);
+        assert_eq!(&saved.sets[1].id, destination);
+        assert!(saved.sets[1].rules[0].java_regex);
+        let replay = merge_backup(reviewed.contents, &bound).unwrap();
+        assert_eq!(replay.set_ids, reviewed.set_ids);
         assert!(replay.contents.is_none());
     }
 

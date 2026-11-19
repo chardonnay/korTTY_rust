@@ -143,6 +143,7 @@ impl Server {
                     | Open::AccountLookup { .. }
                     | Open::ArchiveExtract
                     | Open::DraftReplace
+                    | Open::WindowsDraftReplace
                     | Open::FolderUsage(..)
                     | Open::AccountNames(..)
             )
@@ -177,7 +178,8 @@ impl Server {
                     server.exec_account_lookup(&active, kind, &name)
                 }
                 Open::ArchiveExtract => server.exec_archive_extract(&active),
-                Open::DraftReplace => server.exec_draft_replace(&active),
+                Open::DraftReplace => server.exec_draft_replace(&active, false),
+                Open::WindowsDraftReplace => server.exec_draft_replace(&active, true),
                 Open::FolderUsage(paths) => server.exec_folder_usage(&active, &paths),
                 Open::AccountNames(query) => server.exec_account_names(&active, &query),
             };

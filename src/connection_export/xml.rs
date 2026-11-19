@@ -9,7 +9,7 @@ use crate::connection_store::{
     TunnelTarget, valid_os_badge_reference,
 };
 use crate::session_security::IsolationLevel;
-use crate::terminal_effects::Speed;
+use crate::terminal_effects::{Selection, Speed};
 use crate::terminal_theme::{CursorStyle, Id, Themes};
 
 use super::{Entry, LocalEntry, Options, SerialEntry, java_emulation, java_local_profile};
@@ -45,19 +45,7 @@ pub(super) fn kortty(
         );
         field(&mut xml, "    ", "authMethod", auth(&login.auth));
         field(&mut xml, "    ", "protocol", "SSH_TCP");
-        if let Some(selection) = connection.terminal_effect
-            && let Ok(serde_json::Value::String(id)) = serde_json::to_value(selection.effect)
-        {
-            field(&mut xml, "    ", "terminalEffectPluginId", id);
-            if selection.speed != Speed::DEFAULT {
-                field(
-                    &mut xml,
-                    "    ",
-                    "terminalEffectAnimationSpeed",
-                    selection.speed,
-                );
-            }
-        }
+        terminal_effect(&mut xml, connection.terminal_effect);
         if let Some(profile) = connection.profile() {
             field(
                 &mut xml,
@@ -144,6 +132,7 @@ pub(super) fn kortty(
         };
         let _ = writeln!(xml, "  <{node}>");
         field(&mut xml, "    ", "name", &profile.name);
+        terminal_effect(&mut xml, profile.terminal_effect);
         if compatible {
             field(&mut xml, "    ", "protocol", "LOCAL_SHELL");
             if let Some(command) = &profile.command {
@@ -201,13 +190,24 @@ pub(super) fn kortty(
         let _ = writeln!(xml, "  </{node}>");
     }
     for entry in serials {
-        serial_profile(&mut xml, entry);
+        serial_profile(&mut xml, entry, themes);
     }
     xml.push_str("</connections>\n");
     Ok(xml)
 }
 
-fn serial_profile(xml: &mut String, entry: &SerialEntry<'_>) {
+fn terminal_effect(xml: &mut String, selection: Option<Selection>) {
+    if let Some(selection) = selection
+        && let Ok(serde_json::Value::String(id)) = serde_json::to_value(selection.effect)
+    {
+        field(xml, "    ", "terminalEffectPluginId", id);
+        if selection.speed != Speed::DEFAULT {
+            field(xml, "    ", "terminalEffectAnimationSpeed", selection.speed);
+        }
+    }
+}
+
+fn serial_profile(xml: &mut String, entry: &SerialEntry<'_>, themes: Option<&Themes>) {
     use crate::session::{SerialFlowControl, SerialLineEnding, SerialStopBits};
     let profile = entry.profile;
     let connection = &profile.connection;
@@ -215,6 +215,7 @@ fn serial_profile(xml: &mut String, entry: &SerialEntry<'_>) {
     xml.push_str("  <connection>\n");
     field(xml, "    ", "name", &profile.name);
     field(xml, "    ", "protocol", "SERIAL");
+    terminal_effect(xml, profile.terminal_effect);
     if !profile.tag.is_empty() {
         field(xml, "    ", "tag", &profile.tag);
     }
@@ -275,20 +276,18 @@ fn serial_profile(xml: &mut String, entry: &SerialEntry<'_>) {
         },
     );
     xml.push_str("    </serial>\n");
-    terminal_settings(
-        xml,
-        &TerminalOverrides {
-            encoding: connection.encoding,
-            journal: profile.journal,
-            paste_line_delay_ms: profile.paste_line_delay_ms,
-            strict_terminal_mode: profile.strict_terminal_mode,
-            highlight_set: profile.highlight_set.clone(),
-            ..TerminalOverrides::default()
-        },
-        None,
-        None,
-        None,
-    );
+    let mut terminal = profile
+        .appearance
+        .as_deref()
+        .map_or_else(TerminalOverrides::default, |appearance| {
+            appearance.display_overrides(None)
+        });
+    terminal.encoding = connection.encoding;
+    terminal.journal = profile.journal;
+    terminal.paste_line_delay_ms = profile.paste_line_delay_ms;
+    terminal.strict_terminal_mode = profile.strict_terminal_mode;
+    terminal.highlight_set.clone_from(&profile.highlight_set);
+    terminal_settings(xml, &terminal, None, None, themes);
     xml.push_str("  </connection>\n");
 }
 

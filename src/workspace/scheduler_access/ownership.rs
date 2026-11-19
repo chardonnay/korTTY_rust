@@ -1,13 +1,10 @@
 use iced::{Task, window};
 
-use crate::job_executor::Credentials;
 use crate::scheduler_window::{
     SchedulerWindow, SudoMode,
     ownership::{DENIED, Message as Ownership},
 };
 use crate::workspace::{Message, Workspace};
-
-const NO_ROUTE: &str = "The saved SSH connection is missing or unavailable.";
 
 impl Workspace {
     pub(super) fn update_scheduler_ownership(
@@ -29,14 +26,15 @@ impl Workspace {
                     }
                     return Task::none();
                 }
-                let saved = self.saved_connection(reference.id);
+                let saved = reference
+                    .shared_identity()
+                    .is_none()
+                    .then(|| self.saved_connection(reference.id))
+                    .flatten();
                 let Some(view) = self.scheduler_views.get_mut(&id) else {
                     return Task::none();
                 };
-                let result = saved
-                    .as_ref()
-                    .ok_or_else(|| NO_ROUTE.to_owned())
-                    .and_then(|saved| view.begin_ownership_review(kind, saved));
+                let result = view.begin_ownership_review(kind, saved.as_ref());
                 if let Err(error) = result {
                     view.report_status(error);
                 }
@@ -49,16 +47,7 @@ impl Workspace {
                     .ownership_target()
                     .is_some_and(|(_, sudo)| self.scheduler_ownership_allowed(sudo))
                 {
-                    self.saved_connection(reference.id)
-                        .ok_or(NO_ROUTE)
-                        .and_then(|connection| {
-                            Credentials::resolve_directory_browser(
-                                reference,
-                                &connection,
-                                self.clipboard.policy.server_access(),
-                                |id, kind, endpoint| self.vault_credential(id, kind, endpoint),
-                            )
-                        })
+                    self.scheduler_transfer_review_credentials(reference, SudoMode::Disabled)
                 } else {
                     Err(DENIED)
                 };

@@ -17,22 +17,34 @@ use crate::connection_store::import::{
     JavaImportedRoute, check_java_imported_routes, java_connection_candidate,
 };
 use crate::private_files::{FileStamp, require_single_link};
-use crate::scheduler_window::{ConnectionRef, SshCommand, imported_privileged};
+use crate::scheduler_window::{
+    ConnectionGroup, ConnectionRef, SharedTargets, SshCommand, TargetGroups, imported_privileged,
+};
 use crate::snippets;
 
-/// Resolves source identities only against the connections this restore adds.
+/// Local routes require a matching reviewed catalogue. Shared routes require active sources.
 pub(super) fn stage(
     directory: &Directory,
     snapshot: &Snapshot,
     connections: Option<&java_credential_restore::Connections>,
     source: SchedulerSource,
+    shared: &SharedTargets,
+    policy: &ClipboardPolicy,
     notes: &mut Vec<String>,
 ) -> io::Result<Option<Zeroizing<Vec<u8>>>> {
-    let policy = ClipboardPolicy::load();
     let source_omissions = source.review.omitted.clone();
     let Some(catalogue) = connections else {
+        if source
+            .target_review
+            .as_ref()
+            .is_some_and(|review| review.assignment_count() != 0)
+        {
+            return Err(invalid(
+                "Saved connections changed. Open the backup again to review Scheduler targets.",
+            ));
+        }
         notes.push(format!(
-            "Scheduler jobs omitted because no new SSH routes matched ({})",
+            "Scheduler jobs omitted because no exact SSH routes matched ({})",
             source.review.jobs.len()
         ));
         return Ok(None);
@@ -48,26 +60,69 @@ pub(super) fn stage(
         Default::default()
     };
     let candidate = java_connection_candidate(&catalogue.contents)?;
-    let bound = source.review.bind_all(
-        |id| catalogue.routes.get(id).map(connection_reference),
+    let selected = source
+        .target_review
+        .as_ref()
+        .map(|review| review.bindings(catalogue.before, &candidate, policy))
+        .transpose()?
+        .unwrap_or_default();
+    let resolve = |id: &str| {
+        selected
+            .get(id)
+            .map(connection_reference)
+            .or_else(|| resolve_target(catalogue, &source.teamwork_origins, shared, policy, id))
+    };
+    let bound = source.review.bind_all_scoped(
+        resolve,
         |group| {
-            let routes = catalogue.groups.resolve(group, &catalogue.routes)?;
-            // Check each group independently. An explicit target or overlapping group
-            // can mask a membership difference in the combined list.
-            candidate
-                .in_group(group)
-                .map(|connection| connection.id)
-                .eq(routes.iter().map(|(_, route)| route.id))
-                .then(|| {
-                    routes
-                        .into_iter()
-                        .map(|(source_id, route)| {
-                            (source_id.to_owned(), connection_reference(route))
-                        })
-                        .collect()
+            let local_path = source
+                .target_review
+                .as_ref()
+                .map_or(group, |review| review.group_path(group));
+            let mut groups = Vec::new();
+            let members = catalogue
+                .groups
+                .member_ids(group)?
+                .into_iter()
+                .map(|id| {
+                    let route = resolve(id)?;
+                    let native = route.shared_identity().map_or_else(
+                        || ConnectionGroup::from(local_path),
+                        |identity| ConnectionGroup::from_shared(identity.source(), group),
+                    );
+                    if !groups.contains(&native) {
+                        groups.push(native);
+                    }
+                    Some((id.to_owned(), route))
                 })
+                .collect::<Option<Vec<_>>>()?;
+            // Each source group must equal the restored membership.
+            // Overlapping groups and explicit targets must not mask extra members.
+            let expanded = TargetGroups {
+                groups: groups.clone(),
+                explicit: Vec::new(),
+                group_order: Vec::new(),
+            }
+            .resolve(&candidate, shared, true)
+            .ok()?;
+            let same_members = expanded.len() == members.len()
+                && expanded
+                    .iter()
+                    .all(|member| members.iter().any(|(_, route)| route == member));
+            let preserve_archive_order =
+                !expanded.iter().eq(members.iter().map(|(_, route)| route));
+            same_members.then_some((groups, members, preserve_archive_order))
         },
-        |id| catalogue.routes.get(id)?.rsync_folder.clone(),
+        |id| {
+            if let Some(route) = catalogue.groups.shared(id) {
+                return route.rsync_folder.clone();
+            }
+            selected
+                .get(id)
+                .or_else(|| catalogue.routes.get(id))?
+                .rsync_folder
+                .clone()
+        },
         |id| snippets.contains(&id),
     )?;
     for (reason, count) in bound.omitted {
@@ -79,7 +134,7 @@ pub(super) fn stage(
     if bound.jobs.jobs().is_empty() {
         return Ok(None);
     }
-    check_routes(&candidate, &bound.jobs, &policy)?;
+    check_routes(&candidate, &bound.jobs, policy, Some(shared))?;
     let current = read_jobs(directory)?;
     let additions = prepare_additions(current.as_ref(), &bound.jobs)?;
     for (count, label) in [
@@ -115,8 +170,31 @@ pub(super) fn stage(
     Ok(Some(jobs))
 }
 
+fn resolve_target(
+    catalogue: &java_credential_restore::Connections,
+    origins: &std::collections::BTreeMap<String, crate::connection_store::teamwork::Origin>,
+    shared: &SharedTargets,
+    policy: &ClipboardPolicy,
+    id: &str,
+) -> Option<ConnectionRef> {
+    if let Some(route) = catalogue.groups.shared(id) {
+        return shared
+            .java_target(
+                origins.get(&route.source)?,
+                id,
+                &route.group,
+                &route.target,
+                route.jump.as_ref(),
+            )
+            .filter(|reference| reference.require_shared_policy(policy).is_ok())
+            .cloned();
+    }
+    catalogue.routes.get(id).map(connection_reference)
+}
+
 fn connection_reference(route: &JavaImportedRoute) -> ConnectionRef {
     ConnectionRef {
+        teamwork: None,
         id: route.id,
         target: route.target.clone(),
         jump: route.jump.clone(),
@@ -170,11 +248,13 @@ fn check_routes(
     candidate: &Store,
     jobs: &JobGraph<SshCommand>,
     policy: &ClipboardPolicy,
+    shared: Option<&SharedTargets>,
 ) -> io::Result<()> {
     let routes: Vec<_> = jobs
         .jobs()
         .iter()
         .flat_map(|job| job.action().targets())
+        .filter(|route| route.shared_identity().is_none())
         .map(|route| JavaImportedRoute {
             id: route.id,
             target: route.target.clone(),
@@ -184,9 +264,15 @@ fn check_routes(
         .collect();
     check_java_imported_routes(candidate, &routes, policy.server_access())?;
     for job in jobs.jobs() {
-        job.action()
-            .require_current_target_groups(candidate)
-            .map_err(invalid)?;
+        if let Some(shared) = shared {
+            job.action()
+                .require_current_targets(candidate, shared)
+                .map_err(invalid)?;
+        } else if !job.action().has_teamwork_targets() {
+            job.action()
+                .require_current_target_groups(candidate)
+                .map_err(invalid)?;
+        }
     }
     Ok(())
 }
@@ -224,9 +310,37 @@ impl Pending {
         updates: &JavaUpdates<'_>,
         connections: &[u8],
         jobs: JobGraph<SshCommand>,
-        policy: &ClipboardPolicy,
+        initial_policy: Option<&ClipboardPolicy>,
     ) -> io::Result<Self> {
-        check_routes(&java_connection_candidate(connections)?, &jobs, policy)?;
+        let candidate = java_connection_candidate(connections)?;
+        let shared = if initial_policy.is_some()
+            && jobs
+                .jobs()
+                .iter()
+                .any(|job| job.action().has_teamwork_targets())
+        {
+            Some(
+                SharedTargets::load_reviewed(
+                    &candidate,
+                    jobs.jobs()
+                        .iter()
+                        .flat_map(|job| job.action().targets())
+                        .cloned(),
+                )
+                .map_err(invalid)?,
+            )
+        } else {
+            None
+        };
+        // Once publication starts, replay the disabled definitions. Their
+        // launch checks the current policy and source membership again.
+        let replay_policy = ClipboardPolicy::default();
+        check_routes(
+            &candidate,
+            &jobs,
+            initial_policy.unwrap_or(&replay_policy),
+            shared.as_ref(),
+        )?;
         let links: Vec<_> = jobs
             .jobs()
             .iter()

@@ -59,6 +59,79 @@ pub(super) fn desktop_clock(interval: Duration) -> Subscription<()> {
 }
 
 impl Workspace {
+    pub(super) fn scheduler_shared_targets(
+        &self,
+        store: &ConnectionStore,
+    ) -> Result<
+        (
+            crate::connection_store::teamwork::Catalog,
+            scheduler_window::SharedTargets,
+        ),
+        &'static str,
+    > {
+        use super::ssh_access::teamwork_auth::{eligible_password, set_username};
+        use crate::connection_store::teamwork::{Catalog, DefaultAuth};
+        use scheduler_window::{SharedAuth, SharedTargets};
+
+        if !self.teamwork_sync_allowed() {
+            return Ok((Catalog::default(), SharedTargets::default()));
+        }
+        let root = profile::root().map_err(|_| "The Teamwork profile is unavailable.")?;
+        let policy = ClipboardPolicy::load();
+        let catalog = Catalog::load_for_scheduler(&root, &policy)
+            .map_err(|_| "The current Teamwork sources are unavailable.")?;
+        if catalog.entries().next().is_none() {
+            return Ok((catalog, SharedTargets::default()));
+        }
+        let ordered = DefaultAuth::load(&root)
+            .map_err(|_| "The current Teamwork authentication settings are unavailable.")?
+            .ordered();
+        let key = ordered.key.filter(|id| {
+            crate::ssh_key_catalog::Catalog::open_profile()
+                .is_ok_and(|catalog| catalog.get(*id).is_some())
+        });
+        let trust = crate::ssh_connection::trust_store()
+            .map_err(|_| "The SSH host-key store is unavailable.")?;
+        let targets = SharedTargets::new(&catalog, store, &trust, |entry| {
+            if !entry.default_auth_eligible {
+                return None;
+            }
+            let login = &entry.connection.login.endpoint;
+            if let Some(credential) = &ordered.credential
+                && let Some(target) = eligible_password(self, credential, login)
+            {
+                return Some((
+                    target,
+                    SharedAuth::Password {
+                        credential: credential.clone(),
+                    },
+                ));
+            }
+            let mut target = login.clone();
+            set_username(&mut target, &ordered.username);
+            target.validate().ok()?;
+            Some((
+                target,
+                SharedAuth::Key {
+                    id: key?,
+                    password_preference: ordered.credential.clone(),
+                },
+            ))
+        });
+        Ok((catalog, targets))
+    }
+
+    fn refresh_scheduler_connections(&mut self, connections: Option<&ConnectionStore>) {
+        let targets = connections
+            .and_then(|store| self.scheduler_shared_targets(store).ok())
+            .map(|(_, targets)| targets)
+            .unwrap_or_default();
+        if let Some(scheduler) = self.scheduler.as_mut() {
+            scheduler.set_shared_targets(targets);
+            scheduler.set_connections(connections);
+        }
+    }
+
     pub(super) fn scheduler_journal_output_allowed(&self) -> bool {
         self.clipboard.policy.recording_allowed && self.automation_journal_capture_allowed()
     }
@@ -124,9 +197,9 @@ impl Workspace {
             return Err("Could not open JobScheduler.".into());
         }
         let allow_cli = self.scheduler_cli_allowed(&installed);
+        self.refresh_scheduler_connections(Some(&connections));
         let scheduler = self.scheduler.as_mut().expect("initialized scheduler");
         scheduler.refresh_snippets();
-        scheduler.set_connections(Some(&connections));
         scheduler.set_agent_profiles(Some(&config), allow_cli);
         self.refresh_scheduler_credentials();
         self.place_scheduler_swarm_handoff(source, handoff)
@@ -192,9 +265,9 @@ impl Workspace {
         let connections = profile::connections_path()
             .and_then(ConnectionStore::open)
             .ok();
+        self.refresh_scheduler_connections(connections.as_ref());
         if let Some(scheduler) = self.scheduler.as_mut() {
             scheduler.refresh_snippets();
-            scheduler.set_connections(connections.as_ref());
         }
         self.refresh_scheduler_credentials();
         self.refresh_scheduler_agent_profiles();
@@ -930,6 +1003,24 @@ impl Workspace {
             }
             return Task::none();
         }
+        let refresh_targets = match &message {
+            scheduler_window::Message::RefreshConnectionGroups
+            | scheduler_window::Message::ConnectionGroupAdded(
+                scheduler_window::ConnectionGroup::Teamwork(_),
+            ) => true,
+            scheduler_window::Message::Save
+            | scheduler_window::Message::Run(_)
+            | scheduler_window::Message::ConnectionGroupRemoved(_) => self
+                .scheduler_views
+                .get(&id)
+                .is_some_and(SchedulerView::has_teamwork_targets),
+            _ => false,
+        };
+        if refresh_targets
+            && let Ok(connections) = profile::connections_path().and_then(ConnectionStore::open)
+        {
+            self.refresh_scheduler_connections(Some(&connections));
+        }
         let swarm_chats_allowed = self.swarm_chat_access_allowed();
         let Some((scheduler, view)) = self
             .scheduler
@@ -1088,17 +1179,7 @@ impl Workspace {
         };
         let path = path.to_owned();
         let target = reference.target.label();
-        let credentials = self
-            .saved_connection(reference.id)
-            .ok_or("The saved SSH connection is missing or unavailable.")
-            .and_then(|profile| {
-                job_executor::Credentials::resolve_directory_browser(
-                    reference,
-                    &profile,
-                    self.clipboard.policy.server_access(),
-                    |id, kind, endpoint| self.vault_credential(id, kind, endpoint),
-                )
-            });
+        let credentials = self.scheduler_transfer_review_credentials(reference, SudoMode::Disabled);
         let Some(view) = self.scheduler_views.get_mut(&id) else {
             return Task::none();
         };
@@ -1174,19 +1255,12 @@ impl Workspace {
             {
                 return Err("Managed policy blocks this SSH route.".into());
             }
-            let current = profile::connections_path()
-                .and_then(ConnectionStore::open)
+            let path = profile::connections_path()
                 .map_err(|_| "The saved SSH connections are unavailable.")?;
-            if current
-                .get(reference.id)
-                .map(scheduler_window::ConnectionRef::from)
-                .as_ref()
-                != Some(reference)
-            {
-                return Err("The saved SSH route changed. Select the connection again.".into());
-            }
+            reference.require_saved_at(&path)?;
             let trust = crate::ssh_connection::trust_store()
                 .map_err(|_| "The SSH host-key store is unavailable.")?;
+            let trust = reference.strict_trust(trust)?;
             let pins = scheduler_window::sync::pins(reference, &trust).map_err(
                 |_| "Verify the SSH host keys for the complete saved route before review.",
             )?;
@@ -1222,23 +1296,41 @@ impl Workspace {
         let store = profile::connections_path()
             .and_then(ConnectionStore::open)
             .map_err(|_| "The saved SSH connections are unavailable.")?;
-        let profile = store
-            .get(reference.id)
-            .ok_or("The saved SSH connection is missing or unavailable.")?;
-        let credentials = job_executor::Credentials::resolve_directory_browser(
-            reference,
-            profile,
-            self.clipboard.policy.server_access(),
-            |id, kind, endpoint| self.vault_credential(id, kind, endpoint),
-        )?;
+        let (credentials, sudo_group) = if let Some(identity) = reference.shared_identity() {
+            let (catalog, shared) = self.scheduler_shared_targets(&store)?;
+            shared.require(reference)?;
+            let entry = catalog
+                .get(identity)
+                .ok_or("The Teamwork connection is unavailable.")?;
+            (
+                self.scheduler_shared_credentials(
+                    reference,
+                    entry,
+                    &store,
+                    false,
+                    sudo == SudoMode::Vault,
+                )?,
+                None,
+            )
+        } else {
+            let profile = store
+                .get(reference.id)
+                .ok_or("The saved SSH connection is missing or unavailable.")?;
+            let credentials = job_executor::Credentials::resolve_directory_browser(
+                reference,
+                profile,
+                self.clipboard.policy.server_access(),
+                |id, kind, endpoint| self.vault_credential(id, kind, endpoint),
+            )?;
+            (credentials, store.group_of(reference.id))
+        };
         if sudo != SudoMode::Vault {
             return Ok(credentials);
         }
-        let job_executor::JobAuth::Saved(saved) =
-            job_executor::JobAuth::Saved(Ok(Box::new(credentials))).with_sudo_passwords(
-                |reference| self.scheduler_sudo_password(reference, store.group_of(reference.id)),
-            )
-        else {
+        let job_executor::JobAuth::Saved(saved) = job_executor::JobAuth::Saved(Ok(Box::new(
+            credentials,
+        )))
+        .with_sudo_passwords(|reference| self.scheduler_sudo_password(reference, sudo_group)) else {
             unreachable!();
         };
         saved.map(|value| *value)
@@ -3022,6 +3114,9 @@ impl Workspace {
         let Some(reference) = &action.connection else {
             return job_executor::JobAuth::Manual;
         };
+        if action.has_teamwork_targets() {
+            return self.scheduler_teamwork_auth(action);
+        }
         let store = profile::connections_path()
             .and_then(ConnectionStore::open)
             .map_err(|_| "The saved SSH connections are unavailable.")
@@ -3061,6 +3156,122 @@ impl Workspace {
                 .and_then(|store| store.group_of(reference.id));
             self.scheduler_sudo_password(reference, group)
         })
+    }
+
+    fn scheduler_teamwork_auth(&self, action: &SshCommand) -> job_executor::JobAuth {
+        let prepare = || {
+            action.validate_target_selection()?;
+            let store = profile::connections_path()
+                .and_then(ConnectionStore::open)
+                .map_err(|_| "The saved SSH connections are unavailable.")?;
+            let (catalog, shared) = self.scheduler_shared_targets(&store)?;
+            action.require_current_targets(&store, &shared)?;
+            for reference in action
+                .targets()
+                .filter(|reference| reference.shared_identity().is_none())
+            {
+                if store
+                    .get(reference.id)
+                    .map(scheduler_window::ConnectionRef::from)
+                    .as_ref()
+                    != Some(reference)
+                {
+                    return Err("A selected local SSH route changed or is unavailable.");
+                }
+            }
+            let server_access = self.clipboard.policy.server_access();
+            let secret = |id: &str, kind, endpoint: &crate::ssh_dialog::LoginTarget| {
+                self.vault_credential(id, kind, endpoint)
+            };
+            let credentials = action
+                .targets()
+                .map(|reference| {
+                    if let Some(identity) = reference.shared_identity() {
+                        let entry = catalog
+                            .get(identity)
+                            .ok_or("The Teamwork connection is unavailable.")?;
+                        self.scheduler_shared_credentials(
+                            reference,
+                            entry,
+                            &store,
+                            action.virtual_terminal.is_some(),
+                            action.sudo == SudoMode::Vault,
+                        )
+                    } else {
+                        let current = store
+                            .get(reference.id)
+                            .ok_or("The saved SSH connection is unavailable.")?;
+                        job_executor::Credentials::resolve_directory_browser(
+                            reference,
+                            current,
+                            server_access,
+                            secret,
+                        )
+                    }
+                })
+                .collect::<Vec<_>>();
+            let auth = if action.additional_connections.is_empty() {
+                job_executor::JobAuth::Saved(
+                    credentials
+                        .into_iter()
+                        .next()
+                        .ok_or("The saved SSH connection is unavailable.")?
+                        .map(Box::new),
+                )
+            } else {
+                job_executor::JobAuth::Batch(Ok(credentials))
+            };
+            Ok(if action.sudo == SudoMode::Vault {
+                auth.with_sudo_passwords(|reference| {
+                    // Local folder-based sudo scopes do not apply to shared paths.
+                    let group = if reference.shared_identity().is_some() {
+                        None
+                    } else {
+                        store.group_of(reference.id)
+                    };
+                    self.scheduler_sudo_password(reference, group)
+                })
+            } else {
+                auth
+            })
+        };
+        prepare().unwrap_or_else(|error| {
+            if action.additional_connections.is_empty() {
+                job_executor::JobAuth::Saved(Err(error))
+            } else {
+                job_executor::JobAuth::Batch(Err(error))
+            }
+        })
+    }
+
+    fn scheduler_shared_credentials(
+        &self,
+        reference: &scheduler_window::ConnectionRef,
+        entry: &crate::connection_store::teamwork::Entry,
+        store: &ConnectionStore,
+        recording: bool,
+        mut uses_vault: bool,
+    ) -> Result<job_executor::Credentials, &'static str> {
+        let mut credentials = job_executor::Credentials::resolve_shared(
+            reference,
+            entry,
+            store,
+            recording,
+            self.clipboard.policy.server_access(),
+            |id, kind, endpoint| {
+                uses_vault = true;
+                self.vault_credential(id, kind, endpoint)
+            },
+        )?;
+        if uses_vault {
+            let revision = self
+                .vault
+                .as_ref()
+                .and_then(|vault| vault.credential_revision())
+                .ok_or(crate::vault_window::VAULT_LOCKED)?;
+            credentials.bind_shared_vault_revision(revision);
+        }
+        Ok(credentials)
     }
 
     fn scheduler_sudo_password(

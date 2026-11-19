@@ -51,6 +51,139 @@ fn snapshot() -> Snapshot {
 }
 
 #[test]
+fn java_manual_question_history_restores_masked_and_preserves_local_order() {
+    use crate::terminal_agent::{
+        Mode,
+        history::{self as agent_history, Kind},
+    };
+    use crate::workspace::question_history::{MANUAL_FILE, TERMINAL_FILE, WORKFLOW_FILE};
+    use zip::{AesMode, ZipWriter, write::SimpleFileOptions};
+
+    let source = Scratch::new();
+    let path = source.0.join("java-manual-questions.zip");
+    let password = Secret::new("fixture archive password".into());
+    let mut archive = ZipWriter::new(File::create(&path).unwrap());
+    archive
+        .start_file(
+            "global-settings.xml",
+            SimpleFileOptions::default()
+                .with_aes_encryption_bytes(AesMode::Aes256, password.as_str().as_bytes()),
+        )
+        .unwrap();
+    archive
+        .write_all(
+            r#"<globalSettings><guideAskHistory>
+                <question>Archive &amp; copies?</question>
+                <question>How does Scheduler work? password=fixture-secret</question>
+                <question>How does Scheduler work? password=other-secret</question>
+                <question><markup>Invalid</markup></question>
+                <question>ö 東京</question>
+            </guideAskHistory><aiPromptHistory>
+                <prompt>Explain the output
+password=fixture-secret</prompt>
+            </aiPromptHistory><workflowInstructionsHistory>
+                <entry>Summarize the status
+password=fixture-secret</entry>
+            </workflowInstructionsHistory>
+            <terminalAgentInputHistorySize>101</terminalAgentInputHistorySize>
+            <terminalAgentInputHistory>
+                <input><prompt>Existing agent prompt</prompt><lastUsedEpochMillis>1234000</lastUsedEpochMillis></input>
+                <input><prompt>Inspect the status password=fixture-secret</prompt><lastUsedEpochMillis>1233000</lastUsedEpochMillis></input>
+                <input><prompt>Malformed timestamp</prompt><lastUsedEpochMillis>-1</lastUsedEpochMillis></input>
+            </terminalAgentInputHistory></globalSettings>"#
+                .as_bytes(),
+        )
+        .unwrap();
+    archive.finish().unwrap();
+    let preview = || super::super::inspect_java_password(&path, &password).unwrap();
+
+    let target = Scratch::new();
+    let installed = target.0.join(MANUAL_FILE);
+    let local = br#"["Native guide question","Archive & copies?"]"#;
+    Directory::open(&target.0, false)
+        .unwrap()
+        .publish_copy(MANUAL_FILE, local)
+        .unwrap();
+    agent_history::remember(&target.0, "Existing agent prompt".into(), Mode::Ask, false).unwrap();
+    let before = agent_history::list(&target.0, false).unwrap();
+    agent_history::set_limit(&target.0, &before, 5, false).unwrap();
+    let reviewed = preview();
+    let (_, entries, _) = reviewed.java_review().unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|line| line == "Masked manual questions for available history slots (3)")
+    );
+    let staged = &reviewed.snapshot[MANUAL_FILE];
+    assert!(
+        !std::str::from_utf8(staged)
+            .unwrap()
+            .contains("fixture-secret")
+    );
+    assert_eq!(
+        serde_json::from_slice::<Vec<String>>(&reviewed.snapshot[TERMINAL_FILE]).unwrap(),
+        ["Explain the output\npassword=***"]
+    );
+    let workflow = serde_json::to_vec(&["Summarize the status\npassword=***"]).unwrap();
+    assert_eq!(reviewed.snapshot[WORKFLOW_FILE].as_slice(), workflow);
+    assert!(
+        entries
+            .iter()
+            .any(|line| line == "Masked Agent prompts (2) and a history limit for an unset store")
+    );
+    let staged: agent_history::Snapshot =
+        serde_json::from_slice(&reviewed.snapshot[agent_history::BACKUP_PATH]).unwrap();
+    assert_eq!(staged.limit, 100);
+    assert_eq!(staged.entries[1].goal, "Inspect the status password=***");
+    super::super::queue_restore_at(&target.0, reviewed, RestoreMode::JavaAdditive).unwrap();
+    assert_eq!(fs::read(&installed).unwrap(), local);
+    drop(ProfileLease::acquire(&target.0, || false).unwrap());
+    let history = fs::read(&installed).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Vec<String>>(&history).unwrap(),
+        [
+            "Native guide question",
+            "Archive & copies?",
+            "How does Scheduler work? password=***",
+            "ö 東京"
+        ]
+    );
+    let portable = data::collect(&target.0).unwrap();
+    assert_eq!(portable[MANUAL_FILE].as_slice(), history);
+    assert!(portable.contains_key(TERMINAL_FILE));
+    assert_eq!(portable[WORKFLOW_FILE].as_slice(), workflow);
+    let agent = agent_history::list(&target.0, false).unwrap();
+    assert_eq!(agent.limit, 5);
+    assert_eq!(agent.entries.len(), 2);
+    assert!(agent.entries[0] == before.entries[0] && agent.entries[0].kind == Kind::Ask);
+    assert!(agent.entries[1].kind == Kind::Imported);
+    assert_eq!(agent.entries[1].started_at, 1233000);
+    assert!(
+        agent_history::list(&target.0, true)
+            .unwrap()
+            .entries
+            .is_empty()
+    );
+    let native_path = source.0.join("native-manual-questions.zip");
+    archive::write(&native_path, &portable, &password).unwrap();
+    let native = super::super::inspect_backup(&native_path, &password).unwrap();
+    let reopened = Scratch::new();
+    super::super::queue_restore_at(&reopened.0, native, RestoreMode::KeepExisting).unwrap();
+    drop(ProfileLease::acquire(&reopened.0, || false).unwrap());
+    assert_eq!(fs::read(reopened.0.join(MANUAL_FILE)).unwrap(), history);
+    assert_eq!(fs::read(reopened.0.join(WORKFLOW_FILE)).unwrap(), workflow);
+    assert!(agent_history::list(&reopened.0, false).unwrap() == agent);
+    let fresh = Scratch::new();
+    super::super::queue_restore_at(&fresh.0, preview(), RestoreMode::JavaAdditive).unwrap();
+    drop(ProfileLease::acquire(&fresh.0, || false).unwrap());
+    assert!(agent_history::list(&fresh.0, false).unwrap() == staged);
+    super::super::queue_restore_at(&target.0, preview(), RestoreMode::JavaAdditive).unwrap();
+    drop(ProfileLease::acquire(&target.0, || false).unwrap());
+    assert_eq!(fs::read(installed).unwrap(), history);
+    assert!(agent_history::list(&target.0, false).unwrap() == agent);
+}
+
+#[test]
 fn java_openpgp_catalogue_restores_only_inactive_full_fingerprints() {
     use crate::snippets::recipients::{Action, FILE_NAME};
     use zip::{AesMode, ZipWriter, write::SimpleFileOptions};
@@ -978,7 +1111,12 @@ fn java_memory_binds_new_serial_profiles_and_retains_existing_documents() {
         assert!(choices.iter().any(|choice| choice.id == Some(1)));
         assert_eq!(default.unwrap().id, None);
         assert!(preview.select_java_memory(0, Some(99)).is_err());
-        preview.select_java_memory(0, Some(1)).unwrap();
+        let review = preview.java_memory_review_mut().unwrap();
+        assert_eq!(review.exact(0).unwrap().id, Some(1));
+        assert!(review.can_select_exact());
+        review.select_exact();
+        assert_eq!(review.assignment_count(), 1);
+        assert!(!review.can_select_exact());
         preview
     };
     let stale = reviewed();
@@ -1012,6 +1150,13 @@ fn java_memory_binds_new_serial_profiles_and_retains_existing_documents() {
     let error = ProfileLease::acquire(&local.0, || false).err().unwrap();
     assert!(error.to_string().contains("Saved connections changed"));
     assert!(!history.exists());
+    let mut changed = inspect();
+    changed.prepare_java_memory_review_at(&local.0).unwrap();
+    let review = changed.java_memory_review_mut().unwrap();
+    assert!(review.exact(0).is_none());
+    assert!(!review.can_select_exact());
+    review.select(0, Some(1)).unwrap();
+    assert_eq!(review.assignment_count(), 1);
 }
 
 #[test]
@@ -1194,6 +1339,216 @@ fn java_skill_statistics_restore_resolves_current_builtin_and_preserves_existing
     super::super::queue_restore_at(&target.0, inspect(), RestoreMode::JavaAdditive).unwrap();
     ProfileLease::acquire(&target.0, || false).unwrap();
     assert_eq!(fs::read(target.0.join(STATISTICS)).unwrap(), damaged);
+}
+
+#[test]
+fn java_snippet_workspace_restores_exact_tabs_and_preserves_a_native_session_on_replay() {
+    use crate::snippet_window::{SnippetWindow, session as tabs};
+    use zip::{AesMode, ZipWriter, write::SimpleFileOptions};
+
+    const DIRECT: &str = "4c4a5560-46ba-4570-b589-107496e994b9";
+    const REMAPPED: &str = "c1017ef1-b5bb-4392-a22a-90826ce01a0e";
+    const CONFLICT: &str = "c0c2a9bc-8f44-4eeb-876d-98206b9ccffe";
+    const MISSING: &str = "a8a311fd-3f7a-474c-97fe-59ead4247f7c";
+    let snippet = |id, name, content| {
+        format!(
+            "<snippet><id>{id}</id><name>{name}</name><language>bash</language><content>{content}</content></snippet>"
+        )
+    };
+    let xml = format!(
+        "<snippets>{}{}{}</snippets>",
+        snippet(DIRECT, "Direct", "echo original"),
+        snippet(REMAPPED, "Exact existing", "echo same"),
+        snippet(CONFLICT, "Edited locally", "echo old"),
+    );
+    let settings = format!(
+        "<globalSettings><snippetWorkspaceOpenTabs>
+        <snippetId>{MISSING}</snippetId><snippetId>{REMAPPED}</snippetId>
+        <snippetId>{CONFLICT}</snippetId><snippetId>{DIRECT}</snippetId>
+        </snippetWorkspaceOpenTabs><snippetWorkspaceActiveTab>{REMAPPED}</snippetWorkspaceActiveTab></globalSettings>"
+    );
+    let source = Scratch::new();
+    let path = source.0.join("java-tabs.zip");
+    let mut zip = ZipWriter::new(File::create(&path).unwrap());
+    let options = SimpleFileOptions::default().with_aes_encryption_bytes(AesMode::Aes256, b"pw");
+    for (name, content) in [("snippets.xml", &xml), ("global-settings.xml", &settings)] {
+        zip.start_file(name, options).unwrap();
+        zip.write_all(content.as_bytes()).unwrap();
+    }
+    zip.finish().unwrap();
+    let inspect = || super::super::inspect_java_password(&path, &Secret::new("pw".into())).unwrap();
+    let target = Scratch::new();
+    let library_path = target.0.join(snippets::FILE_NAME);
+    let tab_path = target.0.join(tabs::FILE_NAME);
+    let mut library = snippets::Library::open(library_path.clone()).unwrap();
+    let mut save = |name: &str, content: &str| {
+        library
+            .save(
+                None,
+                snippets::Input {
+                    name: name.into(),
+                    language: "bash".into(),
+                    category: String::new(),
+                    content: content.into(),
+                },
+            )
+            .unwrap()
+    };
+    let remapped = save("Exact existing", "echo same");
+    let conflict = save("Edited locally", "echo local");
+    let direct = snippets::SnippetId::from_java_uuid(DIRECT).unwrap();
+    let restore = || {
+        super::super::queue_restore_at(&target.0, inspect(), RestoreMode::JavaAdditive).unwrap();
+        ProfileLease::acquire(&target.0, || false).unwrap();
+    };
+    restore();
+
+    let expected = tabs::State {
+        ids: vec![remapped, direct],
+        active: Some(remapped),
+    };
+    assert_eq!(tabs::load(&tab_path).unwrap(), expected);
+    let mut reopened = SnippetWindow::open(library_path).unwrap();
+    reopened.restore_tabs(&[]);
+    assert_eq!(reopened.tab_session(), expected);
+    assert_eq!(
+        snippets::Library::open(target.0.join(snippets::FILE_NAME))
+            .unwrap()
+            .get(conflict)
+            .unwrap()
+            .content(),
+        "echo local"
+    );
+
+    let native = tabs::State {
+        ids: vec![conflict],
+        active: Some(conflict),
+    };
+    native.write(&tab_path).unwrap();
+    let before = fs::read(&tab_path).unwrap();
+    restore();
+    assert_eq!(fs::read(&tab_path).unwrap(), before);
+}
+
+#[test]
+fn java_workflow_header_defaults_follow_exact_restored_snippets_and_policy() {
+    use zip::{AesMode, ZipWriter, write::SimpleFileOptions};
+
+    let saved = [
+        (
+            "BASH",
+            "4c4a5560-46ba-4570-b589-107496e994b9",
+            "Bash Header",
+            "bash",
+            "# Same",
+        ),
+        (
+            "PYTHON",
+            "c1017ef1-b5bb-4392-a22a-90826ce01a0e",
+            "Python Header",
+            "python",
+            "# Python",
+        ),
+        (
+            "RUBY",
+            "c0c2a9bc-8f44-4eeb-876d-98206b9ccffe",
+            "Ruby Header",
+            "ruby",
+            "# Archived",
+        ),
+        (
+            "POWERSHELL",
+            "a8a311fd-3f7a-474c-97fe-59ead4247f7c",
+            "Other Header",
+            "bash",
+            "# Bash",
+        ),
+        (
+            "PERL",
+            "a8a311fd-3f7a-474c-97fe-59ead4247f7e",
+            "Perl Header",
+            "perl",
+            "# Perl",
+        ),
+    ];
+    let mut catalog = String::from("<snippets>");
+    let mut settings = String::from("<globalSettings><workflowHeaderDefaults>");
+    for (language, id, name, metadata, content) in saved {
+        catalog.push_str(&format!(
+            "<snippet><id>{id}</id><name>{name}</name><category>Script-Header</category><language>{metadata}</language><content>{content}</content></snippet>"
+        ));
+        settings.push_str(&format!(
+            "<headerDefault><language>{language}</language><headerSnippetId>{id}</headerSnippetId></headerDefault>"
+        ));
+    }
+    catalog.push_str("</snippets>");
+    settings.push_str("</workflowHeaderDefaults></globalSettings>");
+    let source = Scratch::new();
+    let archive = source.0.join("java-workflow-headers.zip");
+    let mut zip = ZipWriter::new(File::create(&archive).unwrap());
+    let options = SimpleFileOptions::default().with_aes_encryption_bytes(AesMode::Aes256, b"pw");
+    for (path, contents) in [("snippets.xml", catalog), ("global-settings.xml", settings)] {
+        zip.start_file(path, options).unwrap();
+        zip.write_all(contents.as_bytes()).unwrap();
+    }
+    zip.finish().unwrap();
+    let inspect =
+        || super::super::inspect_java_password(&archive, &Secret::new("pw".into())).unwrap();
+    let target = Scratch::new();
+    let mut library = snippets::Library::open(target.0.join(snippets::FILE_NAME)).unwrap();
+    let mut save = |name: &str, language: &str, content: &str| {
+        library
+            .save(
+                None,
+                snippets::Input {
+                    name: name.into(),
+                    language: language.into(),
+                    category: "Script-Header".into(),
+                    content: content.into(),
+                },
+            )
+            .unwrap()
+    };
+    let remapped = save("Bash Header", "bash", "# Same");
+    let _ = save("Ruby Header", "ruby", "# Edited");
+    let native = save("Locally chosen", "perl", "# Kept");
+    let path = target.0.join(data::WINDOW_SETTINGS);
+    fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::json!({
+            "workflow_header_defaults": {"perl": native}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let restore = || {
+        super::super::queue_restore_at(&target.0, inspect(), RestoreMode::JavaAdditive).unwrap();
+        ProfileLease::acquire_with_header_policy(&target.0, || false, || true).unwrap();
+    };
+    restore();
+    let raw = fs::read(&path).unwrap();
+    let result: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    let direct = snippets::SnippetId::from_java_uuid(saved[1].1).unwrap();
+    assert_eq!(
+        result["workflow_header_defaults"],
+        serde_json::json!({
+            "bash": remapped, "python": direct, "perl": native
+        })
+    );
+    assert!(result.get("java_display_preferences").is_none());
+    restore();
+    assert_eq!(fs::read(&path).unwrap(), raw);
+
+    let denied = Scratch::new();
+    let directory = Directory::open(&denied.0, false).unwrap();
+    let backup = inspect();
+    assert!(
+        prepare_java_updates(&directory, &backup.snapshot, &|| false)
+            .unwrap()
+            .catalogues
+            .is_empty()
+    );
 }
 
 #[test]
@@ -1514,6 +1869,9 @@ fn java_display_preferences_add_only_unset_fields_and_keep_theme_replay_safe() {
         </terminalQuickSelectPatterns>
         <rememberWindowGeometry>false</rememberWindowGeometry>
         <rememberDashboardState>false</rememberDashboardState>
+        <sessionRestoreMode>auto</sessionRestoreMode>
+        <sessionRestoreScrollback>true</sessionRestoreScrollback>
+        <sessionRestoreScrollbackLines>1600</sessionRestoreScrollbackLines>
         <useFixedWindowGeometry>true</useFixedWindowGeometry>
         <fixedWindowGeometry>
             <x>-128.5</x><y>-80</y><width>1400</width><height>900</height>
@@ -1602,6 +1960,7 @@ fn java_display_preferences_add_only_unset_fields_and_keep_theme_replay_safe() {
         "session_journal":{"directory":"/fixture/native-journals","clickable_links":true},
         "export_branding":{"footer_text":"Local footer"},
         "paste_warning":"always","quick_select":{"alphabet":"xy"},
+        "restore_output":{"enabled":false,"lines":900},
         "startup":{"remember_geometry":true,"fixed":{"height":820}},
         "snippet_analysis_auto_diagram":true,
         "editor_caret":{"shape":"block"},"snippet_appearance":{"font_size":26,"background":[1,2,3]},
@@ -1641,6 +2000,9 @@ fn java_display_preferences_add_only_unset_fields_and_keep_theme_replay_safe() {
     assert!(entries.iter().any(|line| {
         line.contains("SFTP conflict default in this backup is Replace regular files")
     }));
+    assert!(entries.iter().any(|line| {
+        line == "Inactive Java session restore preferences for review in Window settings (3)"
+    }));
     let pending: serde_json::Value =
         serde_json::from_slice(&preview.snapshot[data::WINDOW_SETTINGS]).unwrap();
     assert_eq!(pending["java_display_preferences"]["manual_scale"], 210);
@@ -1659,6 +2021,11 @@ fn java_display_preferences_add_only_unset_fields_and_keep_theme_replay_safe() {
         ("terminal_drag_drop", json!(false)),
         ("command_timestamps_enabled", json!(true)),
         ("terminal_link_detection_enabled", json!(true)),
+        ("restore_output", json!({"enabled":false,"lines":900})),
+        (
+            "java_session_restore",
+            json!({"mode":"auto","output":true,"lines":1600}),
+        ),
         ("job_menu_status_enabled", json!(false)),
         ("terminal_transparency", json!(24)),
         ("terminal_silence_seconds", json!(110)),
@@ -2078,8 +2445,15 @@ fn java_highlight_restore_remaps_live_connections_and_logfile_selection() {
         )
         .unwrap();
         let queue = || {
-            let preview = super::super::inspect_java_password(path, &password).unwrap();
+            let mut preview = super::super::inspect_java_password(path, &password).unwrap();
+            preview.prepare_java_highlight_review_at(&local.0).unwrap();
             let (_, entries, omissions) = preview.java_review().unwrap();
+            assert_eq!(
+                entries.iter().any(|line| line.starts_with(
+                    "Highlight set service-alerts already exists locally. Backup references will use the separate set java-",
+                )),
+                collision
+            );
             assert!(
                 entries
                     .iter()
@@ -2096,13 +2470,18 @@ fn java_highlight_restore_remaps_live_connections_and_logfile_selection() {
         };
         queue();
         let connection_path = local.0.join(CONNECTIONS);
-        if transaction {
+        if collision {
             let original = fs::read(&highlights).unwrap();
             fs::write(&highlights, "{}").unwrap();
             let error = ProfileLease::acquire(&local.0, || false).err().unwrap();
             assert!(error.to_string().contains("highlight selections changed"));
             assert!(!connection_path.exists());
+            let cancellation = pending_java_cancellation(&local.0).unwrap().unwrap();
             fs::write(&highlights, original).unwrap();
+            if !transaction {
+                discard_pending_java(&cancellation).unwrap();
+                queue();
+            }
         }
         drop(ProfileLease::acquire(&local.0, || false).unwrap());
         let saved_bytes = fs::read(&highlights).unwrap();
@@ -2401,6 +2780,12 @@ fn java_connection_library_restore_remaps_only_unambiguous_insertions() {
         .map(|entry| entry.name.as_str())
         .collect();
     assert_eq!(favorites, ["Local favorite", "Java SSH"]);
+    assert!(
+        !store
+            .connections()
+            .iter()
+            .any(|entry| entry.login.endpoint.host == "team.example")
+    );
     let serial = store
         .serial_profiles()
         .iter()

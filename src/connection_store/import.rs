@@ -26,8 +26,9 @@ mod xml;
 
 pub(crate) use java_bindings::{
     JavaConnectionBindings, JavaImportedRoute, JavaManagedKeyBinding, JavaPasswordBinding,
-    JavaSourceGroups, check_java_connection_routes, check_java_imported_routes,
-    java_connection_candidate, prepare_java_connection_import_with_library,
+    JavaSchedulerSource, JavaSourceGroups, JavaTargetReuse, check_java_connection_routes,
+    check_java_imported_routes, existing_java_profile_matches, java_connection_candidate,
+    prepare_java_connection_import_with_library,
 };
 pub(crate) use java_library::JavaLibrarySettings;
 pub(crate) use kortty::normalize_java_group_path;
@@ -69,6 +70,7 @@ struct ImportedProfile {
     connection: Connection,
     java_id: Option<String>,
     java_favorite_id: Option<String>,
+    java_target_reuse: bool,
     java_memory_id: Option<String>,
     java_key_id: Option<String>,
     java_route: Option<(LoginTarget, Option<LoginTarget>)>,
@@ -101,6 +103,7 @@ impl ImportedProfile {
             connection,
             java_id: None,
             java_favorite_id: None,
+            java_target_reuse: false,
             java_memory_id: None,
             java_key_id: None,
             java_route: None,

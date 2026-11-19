@@ -1,7 +1,11 @@
-#![cfg(all(feature = "decoder", target_os = "linux"))]
+#![cfg(all(
+    feature = "decoder",
+    any(target_os = "linux", target_os = "macos", windows)
+))]
 
 use std::fs;
 use std::io::Write as _;
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -46,28 +50,56 @@ fn draft_replace_stdio_requires_exact_draft_and_eof_and_publishes_once() {
         .canonicalize()
         .unwrap()
         .join(format!("kortty-draft-stdio-{}", hex::encode(nonce)));
+    #[cfg(unix)]
     fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+    #[cfg(windows)]
+    kortty_files::tree::Directory::open_path(root.parent().unwrap())
+        .unwrap()
+        .create_child(root.file_name().unwrap())
+        .unwrap();
     let root = Scratch(root);
     let path = root.0.join("original.txt");
     fs::write(&path, ORIGINAL).unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
-    let metadata = fs::metadata(&path).unwrap();
+    #[cfg(unix)]
+    let (destination, uid, gid, mode) = {
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        (
+            path.to_str().unwrap().to_owned(),
+            metadata.uid(),
+            metadata.gid(),
+            0o640,
+        )
+    };
+    #[cfg(windows)]
+    let (destination, uid, gid, mode) = (
+        format!(
+            "/{}",
+            path.to_str()
+                .unwrap()
+                .trim_start_matches(r"\\?\")
+                .replace('\\', "/")
+        ),
+        0,
+        0,
+        0,
+    );
     let spec = Spec {
-        destination: path.to_str().unwrap().into(),
+        destination,
         original: Original {
             bytes: ORIGINAL.len() as u64,
             digest: Sha256::digest(ORIGINAL).into(),
-            uid: metadata.uid(),
-            gid: metadata.gid(),
-            mode: 0o640,
+            uid,
+            gid,
+            mode,
         },
         draft_bytes: DRAFT.len(),
         draft_digest: Sha256::digest(DRAFT).into(),
         backup: true,
     };
-    let Reply::Reviewed { review } = exchange(&Request::Review { spec: spec.clone() }, &[], &[])
-    else {
-        panic!("expected a server draft review");
+    let response = exchange(&Request::Review { spec: spec.clone() }, &[], &[]);
+    let Reply::Reviewed { review } = response else {
+        panic!("expected a server draft review, received {response:?}");
     };
     review.validate_for(&spec).unwrap();
     let apply = Request::Apply {
@@ -83,12 +115,13 @@ fn draft_replace_stdio_requires_exact_draft_and_eof_and_publishes_once() {
     ));
     assert_eq!(fs::read(&path).unwrap(), ORIGINAL);
     assert_eq!(fs::read_dir(&root.0).unwrap().count(), 1);
-    assert!(matches!(
-        exchange(&apply, DRAFT, &[]),
-        Reply::Applied { recovery: None, .. }
-    ));
+    let result = exchange(&apply, DRAFT, &[]);
+    assert!(
+        matches!(result, Reply::Applied { recovery: None, .. }),
+        "{result:?}"
+    );
     assert_eq!(fs::read(&path).unwrap(), DRAFT);
-    assert_eq!(fs::read(review.backup.unwrap()).unwrap(), ORIGINAL);
+    assert_eq!(fs::read(root.0.join("original.txt.bak")).unwrap(), ORIGINAL);
     assert!(matches!(
         exchange(&apply, DRAFT, &[]),
         Reply::Failed {

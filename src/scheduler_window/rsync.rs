@@ -1110,7 +1110,9 @@ fn review(
     require_review_running(cancelled)?;
     let review_ordinary_receiver = request.review_ordinary_receiver();
     super::remote::validate_local_path(&request.program)?;
-    let pins = super::sync::pins(&request.reference, trust).map_err(|error| error.to_string())?;
+    let reviewed_trust = request.reference.strict_trust(trust.clone())?;
+    let pins = super::sync::pins(&request.reference, &reviewed_trust)
+        .map_err(|error| error.to_string())?;
     if request.privileged.is_some()
         && request.existing_download.is_none()
         && !request.vacant_file_download

@@ -23,6 +23,8 @@ pub(crate) struct LocalProfile {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) shell_integration: bool,
     pub(crate) emulation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) terminal_effect: Option<crate::terminal_effects::Selection>,
     #[serde(default, skip_serializing_if = "TerminalOverrides::is_default")]
     pub(crate) terminal: TerminalOverrides,
 }

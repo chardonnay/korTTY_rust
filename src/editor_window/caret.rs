@@ -2,7 +2,7 @@ use std::fmt;
 
 use iced::advanced::text::{self, Highlighter, Renderer as _};
 use iced::advanced::widget::{Operation, Tree, tree};
-use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, renderer};
+use iced::advanced::{Clipboard, Layout, Renderer as _, Shell, Widget, layout, renderer};
 use iced::widget::{TextEditor, text_editor};
 use iced::{
     Element, Event, Font, Length, Padding, Pixels, Point, Rectangle, Renderer, Size, Theme, mouse,
@@ -69,24 +69,25 @@ impl Preferences {
     }
 }
 
-pub(crate) fn view<'a, H: Highlighter, Message: 'a>(
+#[cfg(test)]
+fn view<'a, H: Highlighter, Message: 'a>(
     editor: TextEditor<'a, H, Message>,
     content_theme: Theme,
     appearance: Appearance,
     font_size: u8,
     preferences: Preferences,
 ) -> Element<'a, Message> {
-    view_with_layout(
+    view_decorated(
         editor,
         content_theme,
         appearance,
         font_size,
         preferences,
-        None,
-        None,
+        Decorations::default(),
     )
 }
 
+#[cfg(test)]
 pub(crate) fn view_with_layout<'a, H: Highlighter, Message: 'a>(
     editor: TextEditor<'a, H, Message>,
     content_theme: Theme,
@@ -96,6 +97,43 @@ pub(crate) fn view_with_layout<'a, H: Highlighter, Message: 'a>(
     numbered_content: Option<&'a text_editor::Content>,
     word_wrap: Option<bool>,
 ) -> Element<'a, Message> {
+    view_decorated(
+        editor,
+        content_theme,
+        appearance,
+        font_size,
+        preferences,
+        Decorations {
+            numbered_content,
+            word_wrap,
+            ..Decorations::default()
+        },
+    )
+}
+
+#[derive(Default)]
+pub(crate) struct Decorations<'a> {
+    pub(crate) numbered_content: Option<&'a text_editor::Content>,
+    pub(crate) word_wrap: Option<bool>,
+    pub(crate) diagnostics: Option<(
+        &'a text_editor::Content,
+        &'a [crate::snippets::json_schema::Mark],
+    )>,
+}
+
+pub(crate) fn view_decorated<'a, H: Highlighter, Message: 'a>(
+    editor: TextEditor<'a, H, Message>,
+    content_theme: Theme,
+    appearance: Appearance,
+    font_size: u8,
+    preferences: Preferences,
+    decorations: Decorations<'a>,
+) -> Element<'a, Message> {
+    let Decorations {
+        numbered_content,
+        word_wrap,
+        diagnostics,
+    } = decorations;
     let gutter = numbered_content.map(|content| Gutter {
         content,
         font: appearance.font,
@@ -126,6 +164,22 @@ pub(crate) fn view_with_layout<'a, H: Highlighter, Message: 'a>(
         editor: editor.into(),
         padding,
         gutter,
+        diagnostics: diagnostics.map(|(content, marks)| {
+            let positions = marks
+                .iter()
+                .map(|mark| {
+                    (
+                        super::position_after_edit(content, mark.bytes.start),
+                        super::position_after_edit(content, mark.bytes.end),
+                    )
+                })
+                .collect();
+            (content, positions)
+        }),
+        editor_geometry: |tree| {
+            let state = tree.state.downcast_ref::<text_editor::State<H>>();
+            (state.inline_gap(), state.horizontal_offset())
+        },
         caret: TextEditorCaret {
             foreground: appearance.foreground.color(),
             color: preferences.color.color(),
@@ -173,6 +227,87 @@ struct CaretEditor<'a, Message> {
     caret: TextEditorCaret,
     padding: Padding,
     gutter: Option<Gutter<'a>>,
+    diagnostics: Option<(&'a text_editor::Content, Vec<DiagnosticPosition>)>,
+    editor_geometry: fn(&Tree) -> (Option<text_editor::InlineGap>, f32),
+}
+
+type DiagnosticPosition = (text_editor::Position, text_editor::Position);
+
+pub(crate) fn reveal_diagnostic(content: &mut text_editor::Content, bytes: std::ops::Range<usize>) {
+    let start = super::position_after_edit(content, bytes.start);
+    let end = super::position_after_edit(content, bytes.end);
+    content.move_to(text_editor::Cursor {
+        position: end,
+        selection: (start != end).then_some(start),
+    });
+}
+
+fn draw_diagnostics(
+    renderer: &mut Renderer,
+    content: &text_editor::Content,
+    positions: &[DiagnosticPosition],
+    bounds: Rectangle,
+    viewport: Rectangle,
+    (gap, horizontal): (Option<text_editor::InlineGap>, f32),
+    color: iced::Color,
+) {
+    let editor = content.editor();
+    let buffer = editor.buffer();
+    let height = buffer.metrics().line_height;
+    let mut paint = |x: f32, y: f32, width: f32| {
+        let line = Rectangle::new(
+            Point::new(bounds.x + x - horizontal, bounds.y + y + height - 2.0),
+            Size::new(width.max(2.0), 2.0),
+        );
+        if let Some(bounds) = line.intersection(&viewport) {
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds,
+                    ..renderer::Quad::default()
+                },
+                color,
+            );
+        }
+    };
+    for run in buffer.layout_runs() {
+        let y = gap.map_or(run.line_top, |gap| gap.row_top(run.line_top));
+        for &(start, end) in positions {
+            if run.line_i != start.line {
+                continue;
+            }
+            if start == end {
+                if let Some(glyph) = run
+                    .glyphs
+                    .iter()
+                    .find(|glyph| (glyph.start..glyph.end).contains(&start.column))
+                {
+                    paint(glyph.x, y, glyph.w);
+                } else if run.glyphs.iter().map(|glyph| glyph.end).max().unwrap_or(0)
+                    == start.column
+                {
+                    let right = run
+                        .glyphs
+                        .iter()
+                        .map(|glyph| glyph.x + glyph.w)
+                        .fold(0.0, f32::max);
+                    paint(right, y, 6.0);
+                }
+            } else {
+                let end = if start.line == end.line {
+                    end.column
+                } else {
+                    usize::MAX
+                };
+                for glyph in run
+                    .glyphs
+                    .iter()
+                    .filter(|glyph| glyph.end > start.column && glyph.start < end)
+                {
+                    paint(glyph.x, y, glyph.w);
+                }
+            }
+        }
+    }
 }
 
 struct Gutter<'a> {
@@ -189,6 +324,7 @@ impl Gutter<'_> {
         bounds: Rectangle,
         viewport: &Rectangle,
         color: iced::Color,
+        inline_gap: Option<text_editor::InlineGap>,
     ) {
         let mut gutter = bounds.shrink(PADDING);
         gutter.width = gutter.width.min(self.width - PADDING);
@@ -229,7 +365,8 @@ impl Gutter<'_> {
             previous = Some(run.line_i);
             // The iterator can begin on a wrapped continuation after scrolling.
             if run.line_i != scroll.line || run.line_top <= -scroll.vertical {
-                paint(renderer, run.line_i, run.line_top);
+                let top = inline_gap.map_or(run.line_top, |gap| gap.row_top(run.line_top));
+                paint(renderer, run.line_i, top);
             }
         }
         if previous.is_none() && buffer.lines.len() <= 1 {
@@ -311,8 +448,31 @@ impl<Message> Widget<Message, Theme, Renderer> for CaretEditor<'_, Message> {
                 .as_widget()
                 .draw(tree, renderer, theme, style, layout, cursor, viewport);
         });
+        let geometry = (self.editor_geometry)(tree);
+        if let Some((content, positions)) = &self.diagnostics
+            && let Some(clip) = caret.clip_bounds
+        {
+            let bounds = layout.bounds().shrink(self.padding);
+            renderer.with_layer(clip, |renderer| {
+                draw_diagnostics(
+                    renderer,
+                    content,
+                    positions,
+                    bounds,
+                    clip,
+                    geometry,
+                    theme.extended_palette().danger.base.color,
+                )
+            });
+        }
         if let Some(gutter) = &self.gutter {
-            gutter.draw(renderer, layout.bounds(), viewport, self.caret.foreground);
+            gutter.draw(
+                renderer,
+                layout.bounds(),
+                viewport,
+                self.caret.foreground,
+                geometry.0,
+            );
         }
     }
 
@@ -333,12 +493,188 @@ impl<Message> Widget<Message, Theme, Renderer> for CaretEditor<'_, Message> {
 #[cfg(test)]
 mod tests {
     use iced::advanced::graphics::Viewport;
-    use iced::advanced::renderer::Renderer as _;
     use iced::advanced::widget::operation::focusable;
     use iced::widget::{self, text_editor};
     use iced::{Background, Color, Font, Pixels};
 
     use super::*;
+
+    #[test]
+    fn diagnostic_marks_draw_on_their_source_line_and_reveal_the_exact_token() {
+        let source = "{\r\n  \"é\": false\r\n}";
+        let mut content = text_editor::Content::with_text(source);
+        let start = source.find("false").unwrap();
+        let bytes = start..start + 5;
+        let marks = [crate::snippets::json_schema::Mark {
+            label: "/é".into(),
+            bytes: bytes.clone(),
+        }];
+        let appearance = Appearance {
+            font: Font::MONOSPACE,
+            size: 16,
+            foreground: Rgb::from_hex(0xffffff),
+            background: Rgb::from_hex(0x000000),
+        };
+        let mut renderer = Renderer::new(Font::MONOSPACE, Pixels(16.0));
+        let bounds = Rectangle::with_size(Size::new(200.0, 100.0));
+        let mut editor = view_decorated(
+            text_editor(&content).height(Length::Fill).on_action(|_| ()),
+            Theme::Dark,
+            appearance,
+            16,
+            Preferences::default(),
+            Decorations {
+                diagnostics: Some((&content, &marks)),
+                ..Decorations::default()
+            },
+        );
+        let mut tree = Tree::new(editor.as_widget());
+        let node = editor.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, bounds.size()),
+        );
+        renderer.reset(bounds);
+        editor.as_widget().draw(
+            &tree,
+            &mut renderer,
+            &Theme::Dark,
+            &renderer::Style::default(),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &bounds,
+        );
+        let danger = Background::Color(Theme::Dark.extended_palette().danger.base.color);
+        let row = content.editor().buffer().metrics().line_height;
+        let underlines: Vec<_> = renderer
+            .layers()
+            .iter()
+            .flat_map(|layer| &layer.quads)
+            .filter_map(|(quad, color)| (*color == danger).then_some(quad.bounds))
+            .collect();
+        assert!(!underlines.is_empty());
+        assert!(
+            underlines
+                .iter()
+                .all(|area| (area.y - (PADDING + row * 2.0 - 2.0)).abs() < 0.1 && area.x > PADDING)
+        );
+        drop(editor);
+        reveal_diagnostic(&mut content, bytes);
+        assert_eq!(content.selection().as_deref(), Some("false"));
+        assert_eq!(content.text(), source);
+    }
+
+    #[test]
+    fn multiline_inline_suggestion_moves_source_rows_and_maps_clicks_without_editing() {
+        let viewport = Viewport::with_physical_size(Size::new(220, 110), 1.0);
+        let bounds = Rectangle::with_size(viewport.logical_size());
+        let mut renderer = Renderer::new(Font::MONOSPACE, Pixels(16.0));
+        let mut content = text_editor::Content::with_text("ra\nEND");
+        content.move_to(text_editor::Cursor {
+            position: text_editor::Position { line: 0, column: 2 },
+            selection: None,
+        });
+        let appearance = Appearance {
+            font: Font::MONOSPACE,
+            size: 16,
+            foreground: Rgb::from_hex(0xffffff),
+            background: Rgb::from_hex(0x000000),
+        };
+        let mut render = |suggestion, focused| {
+            let id = widget::Id::unique();
+            let mut editor = view_with_layout(
+                text_editor(&content)
+                    .id(id.clone())
+                    .height(Length::Fill)
+                    .inline_suggestion(suggestion)
+                    .on_action(|action| action),
+                Theme::Dark,
+                appearance,
+                appearance.size,
+                Preferences::default(),
+                Some(&content),
+                Some(false),
+            );
+            let mut tree = Tree::new(editor.as_widget());
+            let limits = layout::Limits::new(Size::ZERO, bounds.size());
+            let node = editor.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            let layout = Layout::new(&node);
+            if focused {
+                editor.as_widget_mut().operate(
+                    &mut tree,
+                    layout,
+                    &renderer,
+                    &mut focusable::focus::<()>(id),
+                );
+            }
+            renderer.reset(bounds);
+            editor.as_widget().draw(
+                &tree,
+                &mut renderer,
+                &Theme::Dark,
+                &renderer::Style::default(),
+                layout,
+                mouse::Cursor::Unavailable,
+                &bounds,
+            );
+            let mut pixmap = tiny_skia::Pixmap::new(220, 110).unwrap();
+            let mut mask = tiny_skia::Mask::new(220, 110).unwrap();
+            renderer.draw(
+                &mut pixmap.as_mut(),
+                &mut mask,
+                &viewport,
+                &[bounds],
+                Color::TRANSPARENT,
+            );
+            let row_height = content.editor().buffer().metrics().line_height;
+            let mut messages = Vec::new();
+            let mut clipboard = iced::advanced::clipboard::Null;
+            let mouse = mouse::Cursor::Available(Point::new(70.0, PADDING + 3.5 * row_height));
+            editor.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                layout,
+                mouse,
+                &renderer,
+                &mut clipboard,
+                &mut Shell::new(&mut messages),
+                &bounds,
+            );
+            (pixmap, messages, row_height)
+        };
+        let suggestion = "nge(20):\n    SECOND\n    THIRD";
+        let (focused, click, row_height) = render(Some(suggestion), true);
+        let (baseline, _, _) = render(None, true);
+        let bright = |image: &tiny_skia::Pixmap, row: u32, columns: std::ops::Range<u32>| {
+            let top = (PADDING + row as f32 * row_height).ceil() as u32;
+            let bottom = (PADDING + (row + 1) as f32 * row_height).floor() as u32;
+            (top..bottom).any(|y| {
+                columns
+                    .clone()
+                    .any(|x| image.pixel(x, y).unwrap().red() > 230)
+            })
+        };
+        assert!((8..28).any(|y| (50..180).any(|x| focused.pixel(x, y) != baseline.pixel(x, y))));
+        for columns in [4..22, 26..62] {
+            assert!(bright(&baseline, 1, columns.clone()));
+            assert!(!bright(&focused, 1, columns.clone()));
+            assert!(bright(&focused, 3, columns));
+        }
+        let top = (PADDING + 2.0 * row_height).ceil() as u32;
+        let bottom = (PADDING + 3.0 * row_height).floor() as u32;
+        assert!(
+            (top..bottom).any(|y| (70..170).any(|x| focused.pixel(x, y) != baseline.pixel(x, y)))
+        );
+        let [text_editor::Action::Click(point)] = click.as_slice() else {
+            panic!("expected an editor click");
+        };
+        assert!((point.y - row_height * 1.5).abs() < 0.1);
+        assert_eq!(
+            render(Some(suggestion), false).0.data(),
+            render(None, false).0.data()
+        );
+        assert_eq!(content.text(), "ra\nEND");
+    }
 
     #[test]
     fn unwrapped_editor_scrolls_beyond_its_width_and_translates_clicks() {

@@ -1004,6 +1004,7 @@ impl Draft {
     pub(super) fn adopt_imported_privileged(
         &mut self,
         store: &ConnectionStore,
+        shared: &super::SharedTargets,
         trust: &kortty_ssh::TrustStore,
         policy: &crate::clipboard_policy::ClipboardPolicy,
         snippets: &Path,
@@ -1021,8 +1022,8 @@ impl Draft {
             self.connection.iter().chain(&self.additional_connections),
             self.target_groups.is_some(),
         )?;
-        self.require_current_groups(store)?;
-        imported.require_current_routes(store, trust, policy)?;
+        self.require_current_groups(store, shared)?;
+        imported.require_current_routes(store, shared, trust, policy)?;
         if let Settings::Snippet { link, .. } = &imported.settings {
             link.command(snippets)?;
         }
@@ -1104,6 +1105,7 @@ impl Draft {
     pub(super) fn adopt_imported_archive(
         &mut self,
         store: &ConnectionStore,
+        shared: &super::SharedTargets,
         trust: &kortty_ssh::TrustStore,
         policy: &crate::clipboard_policy::ClipboardPolicy,
         passwords: &[CredentialChoice],
@@ -1118,7 +1120,7 @@ impl Draft {
         {
             return Err("Keep the exact saved SSH route for the imported archive.");
         }
-        imported.require_current_route(store, trust, policy)?;
+        imported.require_current_route(store, shared, trust, policy)?;
         let password = self.archive_password.as_ref().filter(|id| {
             imported.settings.format == ArchiveFormat::ZipPassword
                 && passwords.iter().any(|choice| &choice.id == *id)
@@ -2257,7 +2259,7 @@ impl Draft {
             self.connection = connection.cloned();
             if let Some(reference) = connection {
                 self.additional_connections
-                    .retain(|other| other.id != reference.id);
+                    .retain(|other| !other.same_identity(reference));
                 self.rsync_destinations.remove(&reference.id);
             } else {
                 self.additional_connections.clear();
@@ -2266,10 +2268,37 @@ impl Draft {
         }
     }
 
+    pub(super) fn load_reviewed_shared_targets(
+        &self,
+        store: &ConnectionStore,
+    ) -> Result<super::SharedTargets, &'static str> {
+        if self.has_teamwork_targets() {
+            return super::SharedTargets::load_reviewed(
+                store,
+                self.connection
+                    .iter()
+                    .chain(&self.additional_connections)
+                    .cloned(),
+            );
+        }
+        Ok(super::SharedTargets::default())
+    }
+
+    pub(super) fn require_current_shared_targets(
+        &self,
+        shared: &super::SharedTargets,
+    ) -> Result<(), &'static str> {
+        for reference in self.connection.iter().chain(&self.additional_connections) {
+            shared.require(reference)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn add_group_connection(
         &mut self,
         choice: ConnectionChoice,
         store: &ConnectionStore,
+        shared: &super::SharedTargets,
     ) -> Result<bool, &'static str> {
         let mut source = self
             .target_groups
@@ -2279,19 +2308,20 @@ impl Draft {
         if let Some(selected) = source
             .explicit
             .iter_mut()
-            .find(|target| target.id == reference.id)
+            .find(|target| target.same_identity(reference))
         {
             selected.clone_from(reference);
         } else {
             source.explicit.push(reference.clone());
         }
-        self.apply_target_groups(source, store)
+        self.apply_target_groups(source, store, shared)
     }
 
     pub(super) fn remove_group_connection(
         &mut self,
         id: u64,
         store: &ConnectionStore,
+        shared: &super::SharedTargets,
     ) -> (bool, Option<&'static str>) {
         let Some(mut source) = self.target_groups.clone() else {
             return (false, None);
@@ -2301,7 +2331,18 @@ impl Draft {
         if source.explicit.len() == before {
             return (false, None);
         }
-        self.remove_group_selection(source, store)
+        self.remove_group_selection(source, store, shared)
+    }
+
+    pub(super) fn has_teamwork_targets(&self) -> bool {
+        self.connection
+            .iter()
+            .chain(&self.additional_connections)
+            .any(|reference| reference.shared_identity().is_some())
+            || self
+                .target_groups
+                .as_ref()
+                .is_some_and(TargetGroups::has_teamwork_groups)
     }
 
     pub(super) fn has_connection_groups(&self) -> bool {
@@ -2311,9 +2352,11 @@ impl Draft {
     pub(super) fn require_current_groups(
         &self,
         store: &ConnectionStore,
+        shared: &super::SharedTargets,
     ) -> Result<(), &'static str> {
         if let Some(source) = &self.target_groups {
-            let resolved = source.resolve(store, self.source == Source::SwarmDiagnostics)?;
+            let resolved =
+                source.resolve(store, shared, self.source == Source::SwarmDiagnostics)?;
             if !resolved
                 .iter()
                 .eq(self.connection.iter().chain(&self.additional_connections))
@@ -2326,10 +2369,12 @@ impl Draft {
 
     pub(super) fn add_connection_group(
         &mut self,
-        group: String,
+        group: super::ConnectionGroup,
         store: &ConnectionStore,
+        shared: &super::SharedTargets,
     ) -> Result<bool, &'static str> {
         let mut source = self.target_groups.clone().unwrap_or_else(|| TargetGroups {
+            group_order: Vec::new(),
             groups: Vec::new(),
             explicit: self
                 .connection
@@ -2342,13 +2387,14 @@ impl Draft {
             return Ok(false);
         }
         source.groups.push(group);
-        self.apply_target_groups(source, store)
+        self.apply_target_groups(source, store, shared)
     }
 
     pub(super) fn remove_connection_group(
         &mut self,
-        group: &str,
+        group: &super::ConnectionGroup,
         store: &ConnectionStore,
+        shared: &super::SharedTargets,
     ) -> (bool, Option<&'static str>) {
         let Some(mut source) = self.target_groups.clone() else {
             return (false, None);
@@ -2358,25 +2404,27 @@ impl Draft {
         if source.groups.len() == before {
             return (false, None);
         }
-        self.remove_group_selection(source, store)
+        self.remove_group_selection(source, store, shared)
     }
 
     pub(super) fn refresh_connection_groups(
         &mut self,
         store: &ConnectionStore,
+        shared: &super::SharedTargets,
     ) -> Result<bool, &'static str> {
         let Some(source) = self.target_groups.clone() else {
             return Ok(false);
         };
-        self.apply_target_groups(source, store)
+        self.apply_target_groups(source, store, shared)
     }
 
     fn apply_target_groups(
         &mut self,
         source: TargetGroups,
         store: &ConnectionStore,
+        shared: &super::SharedTargets,
     ) -> Result<bool, &'static str> {
-        let targets = self.resolve_group_selection(&source, store)?;
+        let targets = self.resolve_group_selection(&source, store, shared)?;
         Ok(self.set_group_selection(source, targets, false))
     }
 
@@ -2384,8 +2432,9 @@ impl Draft {
         &mut self,
         source: TargetGroups,
         store: &ConnectionStore,
+        shared: &super::SharedTargets,
     ) -> (bool, Option<&'static str>) {
-        match self.resolve_group_selection(&source, store) {
+        match self.resolve_group_selection(&source, store, shared) {
             Ok(targets) => (self.set_group_selection(source, targets, false), None),
             Err(error) => (
                 self.set_group_selection(source, Vec::new(), true),
@@ -2398,11 +2447,12 @@ impl Draft {
         &self,
         source: &TargetGroups,
         store: &ConnectionStore,
+        shared: &super::SharedTargets,
     ) -> Result<Vec<ConnectionRef>, &'static str> {
         if source.groups.is_empty() {
             Ok(source.explicit.clone())
         } else {
-            source.resolve(store, self.source == Source::SwarmDiagnostics)
+            source.resolve(store, shared, self.source == Source::SwarmDiagnostics)
         }
     }
 
@@ -2453,13 +2503,13 @@ impl Draft {
         let (Some(primary), Some(reference)) = (&self.connection, choice.reference()) else {
             return Err("Choose a primary saved SSH connection before adding targets");
         };
-        if primary.id == reference.id {
+        if primary.same_identity(reference) {
             return Err("This SSH connection is already the primary target");
         }
         if let Some(current) = self
             .additional_connections
             .iter_mut()
-            .find(|other| other.id == reference.id)
+            .find(|other| other.same_identity(reference))
         {
             if current == reference {
                 return Ok(false);
@@ -3112,7 +3162,7 @@ impl Draft {
         &'a self,
         graph: &'a JobGraph<SshCommand>,
         connections: &'a [ConnectionChoice],
-        connection_groups: &'a [String],
+        connection_groups: &'a [super::ConnectionGroup],
         can_browse: bool,
     ) -> Element<'a, Message> {
         let mut dependencies = graph
@@ -3695,19 +3745,26 @@ impl Draft {
         fields.into()
     }
 
-    fn connection_groups_view<'a>(&'a self, groups: &'a [String]) -> Element<'a, Message> {
+    fn connection_groups_view<'a>(
+        &'a self,
+        groups: &'a [super::ConnectionGroup],
+    ) -> Element<'a, Message> {
         let mut fields = column![].spacing(6);
         if !groups.is_empty() && !self.has_unresolved_imported_ai() {
             fields = fields.push(
-                pick_list(groups, None::<String>, Message::ConnectionGroupAdded)
-                    .placeholder("Add a saved connection group"),
+                pick_list(
+                    groups,
+                    None::<super::ConnectionGroup>,
+                    Message::ConnectionGroupAdded,
+                )
+                .placeholder("Add a saved connection group"),
             );
         }
         if let Some(source) = &self.target_groups {
             for group in &source.groups {
                 fields = fields.push(
                     row![
-                        text(group).width(Length::Fill),
+                        text(group.to_string()).width(Length::Fill),
                         button("Remove").on_press(Message::ConnectionGroupRemoved(group.clone())),
                     ]
                     .spacing(6),

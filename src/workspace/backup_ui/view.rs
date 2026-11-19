@@ -369,12 +369,22 @@ impl Dialog {
             let start = review.page * MEMORY_SCOPE_PAGE_SIZE;
             let end = (start + MEMORY_SCOPE_PAGE_SIZE).min(review.len());
             entries = entries.push(text("Choose the saved profiles that should receive these Java AI Memory notes. Terminal AI can use the notes in requests for the selected profile.").size(13));
+            entries = entries.push(
+                button("Select exact matches").on_press_maybe(
+                    review
+                        .can_select_exact()
+                        .then_some(Message::SelectExactJavaMemory(self.revision)),
+                ),
+            );
             for index in start..end {
                 let (source, choices, selected) = review.row(index);
                 let revision = self.revision;
                 entries = entries.push(
                     column![
                         text(source).size(13),
+                        review
+                            .exact(index)
+                            .map(|target| text(format!("Exact match · {target}")).size(13)),
                         pick_list(
                             choices,
                             selected.cloned(),
@@ -397,6 +407,55 @@ impl Dialog {
                         button("Next").on_press_maybe(
                             (end < review.len())
                                 .then_some(Message::JavaMemoryPage(self.revision, true))
+                        ),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                );
+            }
+        }
+        if let Some(review) = preview.java_scheduler_review().filter(|review| review.open) {
+            let start = review.page * SCHEDULER_TARGET_PAGE_SIZE;
+            let end = (start + SCHEDULER_TARGET_PAGE_SIZE).min(review.len());
+            entries = entries.push(text("Choose saved SSH profiles or groups for the Scheduler targets. Jobs will be imported disabled.").size(13));
+            for index in start..end {
+                let revision = self.revision;
+                if let Some((source, choices, selected)) = review.group_row(index) {
+                    entries = entries.push(
+                        column![
+                            text(format!("Java group {source}")).size(13),
+                            pick_list(choices, selected, move |target| {
+                                Message::SelectJavaSchedulerGroup(revision, index, target.0)
+                            })
+                            .width(Length::Fill),
+                        ]
+                        .spacing(4),
+                    );
+                } else {
+                    let (source, choices, selected) = review.row(index);
+                    entries = entries.push(
+                        column![
+                            text(source).size(13),
+                            pick_list(choices, selected, move |target| {
+                                Message::SelectJavaSchedulerTarget(revision, index, target.id)
+                            })
+                            .width(Length::Fill),
+                        ]
+                        .spacing(4),
+                    );
+                }
+            }
+            if review.len() > SCHEDULER_TARGET_PAGE_SIZE {
+                entries = entries.push(
+                    row![
+                        button("Previous")
+                            .on_press_maybe((start > 0).then_some(
+                                Message::JavaSchedulerTargetsPage(self.revision, false)
+                            )),
+                        text(format!("{}–{} of {}", start + 1, end, review.len())),
+                        button("Next").on_press_maybe(
+                            (end < review.len())
+                                .then_some(Message::JavaSchedulerTargetsPage(self.revision, true))
                         ),
                     ]
                     .spacing(8)
@@ -460,6 +519,11 @@ impl Dialog {
                 button(if review.open { "Hide AI Memory Destinations" } else { "Review AI Memory Destinations…" })
                     .on_press(Message::ShowJavaMemory(self.revision)),
                 text(format!("Existing profiles selected: {}", review.assignment_count())).size(13),
+            ].spacing(8).align_y(Alignment::Center)),
+            preview.java_scheduler_review().map(|review| row![
+                button(if review.open { "Hide Scheduler Targets" } else { "Review Scheduler Targets…" })
+                    .on_press(Message::ShowJavaSchedulerTargets(self.revision)),
+                text(format!("Saved targets selected: {}", review.assignment_count())).size(13),
             ].spacing(8).align_y(Alignment::Center)),
             has_host_pins.then(|| button("Review SSH Host Keys…").on_press_maybe(host_import_allowed.then_some(Message::ReviewHostPins(self.revision)))),
             imported_host_pins.map(|report| text(format!("SSH host keys added: {}. Already trusted: {}. Conflicts: {}. Need fresh review: {}.", report.added.len(), report.already_trusted, report.conflicts.len(), report.needs_review)).size(13)),

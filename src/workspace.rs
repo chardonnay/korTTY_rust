@@ -76,6 +76,7 @@ mod journal_image_menu;
 mod journal_note_translation;
 mod journal_thumbnail;
 mod key_bindings;
+pub(crate) use key_bindings::SnippetCompletionChord;
 mod known_hosts;
 mod local_dock;
 mod logfile_access;
@@ -88,6 +89,7 @@ mod palette;
 mod paste_protection;
 mod profile_tools;
 mod project_access;
+pub(crate) mod question_history;
 mod quick_connect;
 mod recently_closed;
 mod reconnect;
@@ -256,13 +258,14 @@ pub enum Message {
     TerminalAgent(window::Id, terminal_agent::Message),
     SwarmStatusTick,
     AgentCursor(terminal_view::agent_cursor::Message),
+    AgentStatusClock,
     AgentInline(
         terminal_view::agent_cursor::Binding,
         crate::session::inline_history::Key,
     ),
     AgentShortcut(terminal_agent::shortcut::Message),
     AsciiArt(window::Id, ascii_art::Message),
-    OpenEditor,
+    OpenEditor(window::Id),
     Editor(window::Id, editor_window::Message),
     FileAssist(window::Id, crate::snippet_window::ai_assist::Message),
     ProjectFile(window::Id, project_access::local_files::Message),
@@ -362,6 +365,7 @@ pub enum Message {
     Snippets(window::Id, crate::snippet_window::Message),
     SnippetRecovery(snippet_access::recovery::Event),
     SnippetStructureTick,
+    SnippetOverviewTick,
     SnippetComparison(window::Id, crate::snippet_window::compare::Message),
     SnippetRun(window::Id, snippet_access::RunMessage),
     SnippetTransfer(window::Id, u64, crate::snippet_transfer::Event),
@@ -492,11 +496,13 @@ pub struct Workspace {
     terminal_agents: terminal_agent::State,
     ascii_art: HashMap<window::Id, ascii_art::Dialog>,
     editors: HashMap<window::Id, EditorWindow>,
+    snippet_editor_owners: HashMap<window::Id, (window::Id, u64)>,
     project_files: HashMap<window::Id, project_access::local_files::FileTab>,
     recording_windows: HashMap<window::Id, crate::recording_window::RecordingWindow>,
     video: recording_access::Video,
     ai_manager: ai_access::State,
     terminal_chats: HashMap<window::Id, terminal_ai::Chat>,
+    terminal_question_history: Option<(std::path::PathBuf, question_history::History)>,
     saved_chat_browsers: HashMap<window::Id, saved_chats::Browser>,
     saved_chat_mutations: HashMap<u64, window::Id>,
     saved_chat_library_revision: u64,
@@ -648,6 +654,8 @@ struct RestoredLayout {
 }
 
 struct PaneSession {
+    quick_ai: Option<crate::connection_store::AiAssignments>,
+    quick_appearance: Option<crate::connection_store::TerminalOverrides>,
     restored_output: Option<zeroize::Zeroizing<String>>,
     recovery_output_rows: Option<u16>,
     session: Session,
@@ -710,6 +718,10 @@ impl PaneSession {
 
 enum LocalLaunchView {
     Initial(InitialTerminalSize, Option<Appearance>),
+    QuickConnect(
+        Option<Option<crate::terminal_effects::Selection>>,
+        Option<crate::connection_store::TerminalAppearance>,
+    ),
     Existing(GridSize, Option<Appearance>),
 }
 
@@ -985,6 +997,7 @@ impl Workspace {
             ..Self::default()
         };
         workspace.clipboard.policy = policy;
+        workspace.window_settings = tab_titles::WindowSettings::load();
         workspace.refresh_backup_preferences();
         workspace.refresh_backup_recipients();
         workspace.chrome = chrome::Chrome::load();
@@ -998,7 +1011,6 @@ impl Workspace {
             Ok(writer) => workspace.snippet_session = Some(writer),
             Err(error) => eprintln!("kortty: could not start snippet workspace writer: {error}"),
         }
-        workspace.window_settings = tab_titles::WindowSettings::load();
         workspace.local_dock =
             local_dock::Preference::load(workspace.window_settings.java_local_dock);
         workspace.refresh_terminal_backgrounds();
@@ -1202,12 +1214,15 @@ impl Workspace {
                 self.application_update_subscription(),
                 self.snippet_recovery_subscription(),
                 self.snippet_structure_subscription(),
+                self.snippet_overview_subscription(),
                 self.backup_subscription(),
                 self.teamwork_subscription(),
                 self.recording_subscription(),
                 self.tab_watch_subscription(),
                 self.ai_manager_subscription(),
+                self.sleep_prevention_subscription(),
                 self.swarm_status_subscription(),
+                self.agent_status_subscription(),
                 self.journal_dock_subscription(),
                 self.coding_agent_dock_subscription(),
                 self.coding_agent_notification_subscription(),
@@ -1877,6 +1892,10 @@ impl Workspace {
             Message::Window(id, window::Event::Focused) => {
                 self.dialog_placement.focused(id);
                 self.snippet_window_focused(id);
+                if self.snippet_editor_owners.contains_key(&id) {
+                    let focused = self.allocate();
+                    self.snippet_editor_owners.get_mut(&id).unwrap().1 = focused;
+                }
                 self.native_focused_window = Some(id);
                 for (window_id, window) in &mut self.windows {
                     window.focused = id == *window_id;
@@ -1898,6 +1917,7 @@ impl Workspace {
                 ]);
             }
             Message::Window(id, window::Event::Unfocused) => {
+                self.cancel_unfocused_inline_completion(id);
                 if let Some(surface) = self.snippets.get_mut(&id) {
                     surface.window.dismiss_tab_context();
                 }
@@ -1928,7 +1948,10 @@ impl Workspace {
                 }
                 return self.drop_ascii_art_image(id, path);
             }
-            Message::Window(_, _) | Message::RepeatedKey(..) | Message::Noop => {}
+            Message::Window(_, _)
+            | Message::RepeatedKey(..)
+            | Message::AgentStatusClock
+            | Message::Noop => {}
             #[cfg(target_os = "macos")]
             Message::DockReopen(visible) => return self.dock_reopen(visible),
             #[cfg(target_os = "macos")]
@@ -2011,7 +2034,7 @@ impl Workspace {
                         .map(move |message| Message::Diagram(id, message));
                 }
             }
-            Message::OpenEditor => return self.open_native_editor(None),
+            Message::OpenEditor(owner) => return self.open_native_editor(owner, None),
             Message::TerminalFileLoaded(ticket, result) => {
                 return self.finish_terminal_file(ticket, result);
             }
@@ -2042,6 +2065,9 @@ impl Workspace {
                 return self.update_project_sftp_idle(std::time::Instant::now());
             }
             Message::FileAssist(id, action) => return self.update_file_assist(id, action),
+            Message::Editor(id, editor_window::Message::AiToolFallback(action, revision)) => {
+                return self.open_file_tool_fallback(id, action, revision);
+            }
             Message::Editor(id, editor_window::Message::RequestClose) => {
                 return self.close_window(id);
             }
@@ -2600,6 +2626,7 @@ impl Workspace {
             Message::SnippetStructureTick => {
                 return self.poll_snippet_structures(std::time::Instant::now());
             }
+            Message::SnippetOverviewTick => return self.poll_snippet_analysis_overviews(),
             Message::SnippetComparison(id, message) => {
                 return self.update_snippet_comparison(id, message);
             }
@@ -3519,20 +3546,26 @@ impl Workspace {
         saved: crate::connection_store::LocalProfile,
         font: Option<u8>,
     ) -> std::io::Result<SessionId> {
+        self.store_saved_local_session_in_view(
+            saved,
+            font,
+            LocalLaunchView::Initial(InitialTerminalSize::default(), None),
+        )
+    }
+
+    fn store_saved_local_session_in_view(
+        &mut self,
+        saved: crate::connection_store::LocalProfile,
+        font: Option<u8>,
+        view: LocalLaunchView,
+    ) -> std::io::Result<SessionId> {
         let terminal = saved.profile().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "Unsupported local terminal emulation",
             )
         })?;
-        self.launch_local_session(
-            terminal,
-            font,
-            None,
-            LocalLaunchView::Initial(InitialTerminalSize::default(), None),
-            false,
-            Some(saved),
-        )
+        self.launch_local_session(terminal, font, None, view, false, Some(saved))
     }
 
     fn launch_local_session(
@@ -3560,7 +3593,7 @@ impl Workspace {
                     "Unsupported local terminal emulation",
                 )
             })?;
-            settings.saved_profile = Some(local.id);
+            settings.saved_profile = (local.id != 0).then_some(local.id);
             settings.shell = local.shell;
             settings.command.clone_from(&local.command);
             settings
@@ -3578,19 +3611,37 @@ impl Workspace {
         let saved_strict = terminal.and_then(|settings| settings.strict_terminal_mode);
         let strict =
             saved_strict.unwrap_or(strict || settings.isolation == IsolationLevel::Sandbox);
-        let (grid, appearance) = match view {
+        let (grid, appearance, effect_override, quick_style) = match view {
             LocalLaunchView::Initial(size, appearance) => (
                 self.configured_initial_grid(profile, terminal, size),
                 appearance,
+                None,
+                None,
             ),
-            LocalLaunchView::Existing(grid, appearance) => (grid, appearance),
+            LocalLaunchView::QuickConnect(effect, style) => (
+                self.configured_initial_grid(profile, terminal, InitialTerminalSize::default()),
+                None,
+                effect,
+                style,
+            ),
+            LocalLaunchView::Existing(grid, appearance) => (grid, appearance, None, None),
         };
+        let effect = effect_override
+            .unwrap_or_else(|| local.as_ref().and_then(|profile| profile.terminal_effect))
+            .filter(|selection| self.allowed_terminal_effect(selection.effect));
+        let quick_appearance = quick_style.map(|style| style.display_overrides(terminal));
+        let appearance = appearance.unwrap_or_else(|| {
+            self.terminal_base_appearance(quick_appearance.as_ref().or(terminal))
+        });
+        let appearance = effect.map_or(appearance, |selection| {
+            selection.effect.appearance(appearance)
+        });
         let session = Session::start_local_with_strict(
             grid,
             profile,
             options,
             self.window_settings.prompt_navigation_enabled,
-            appearance.unwrap_or_else(|| self.terminal_base_appearance(terminal)),
+            appearance,
             crate::session::StreamOptions {
                 strict_escapes: Some(strict),
                 encoding: terminal.and_then(|settings| settings.encoding),
@@ -3610,12 +3661,16 @@ impl Workspace {
         pane.strict_escapes = strict;
         pane.saved_strict_escapes = saved_strict.is_some();
         pane.local_security = Some(settings);
-        pane.local_use_pending = local.is_some();
+        pane.local_use_pending = local.as_ref().is_some_and(|profile| profile.id != 0);
         pane.journal_config = local
             .as_ref()
             .map(|profile| profile.terminal.journal)
             .unwrap_or_default();
-        pane.saved_local = local;
+        pane.saved_local = local.filter(|profile| profile.id != 0);
+        pane.quick_appearance = quick_appearance;
+        if effect.is_some() {
+            self.apply_terminal_effect_selection(id, effect);
+        }
         Ok(id)
     }
 
@@ -3650,6 +3705,8 @@ impl Workspace {
         self.sessions.insert(
             session_id,
             PaneSession {
+                quick_ai: None,
+                quick_appearance: None,
                 restored_output: None,
                 recovery_output_rows: None,
                 frame: session.frame(),
@@ -3883,13 +3940,16 @@ impl Workspace {
     }
 
     fn connect_serial(&mut self, window: window::Id) -> Task<Message> {
-        self.connect_serial_with_privacy(window, false)
+        self.connect_serial_with_privacy(window, false, None, None, None)
     }
 
     fn connect_serial_with_privacy(
         &mut self,
         window: window::Id,
         incognito: bool,
+        effect: Option<Option<crate::terminal_effects::Selection>>,
+        ai: Option<crate::connection_store::AiAssignments>,
+        style: Option<crate::connection_store::TerminalAppearance>,
     ) -> Task<Message> {
         if !self.allow_in_process_transport(window, "Serial connections") {
             return Task::none();
@@ -3915,6 +3975,19 @@ impl Workspace {
             .as_ref()
             .filter(|saved| saved.matches(&connection, profile))
             .cloned();
+        let effect = effect.or_else(|| {
+            saved
+                .as_ref()
+                .and_then(|profile| profile.terminal_effect)
+                .map(Some)
+        });
+        let quick_appearance = style
+            .or_else(|| {
+                saved
+                    .as_ref()
+                    .and_then(|profile| profile.appearance.as_deref().cloned())
+            })
+            .map(|appearance| appearance.display_overrides(None));
         let font = pending.font;
         let split = pending.split;
         if let Some(target) = split
@@ -3948,7 +4021,7 @@ impl Workspace {
             grid,
             profile,
             self.window_settings.prompt_navigation_enabled,
-            self.window_settings.terminal_appearance(),
+            self.terminal_base_appearance(quick_appearance.as_ref()),
             crate::session::StreamOptions {
                 strict_escapes: Some(strict),
                 encoding: Some(self.window_settings.serial_default_encoding),
@@ -3982,8 +4055,13 @@ impl Workspace {
                 .map(|profile| profile.journal)
                 .unwrap_or_default();
             pane.saved_serial = saved;
+            pane.quick_ai = ai;
+            pane.quick_appearance = quick_appearance;
         }
         self.refresh_highlight(new_id);
+        if let Some(effect) = effect {
+            self.apply_terminal_effect_selection(new_id, effect);
+        }
         if let Some((tab, pane, old)) = replacement {
             if let Some(slot) = self
                 .windows
@@ -3999,7 +4077,7 @@ impl Workspace {
                 self.stop_session(new_id);
             }
         } else if let Some(target) = split {
-            self.start_split_worker(window, target, new_id);
+            self.start_split_worker_with_effect(window, target, new_id, effect.is_none());
         } else {
             self.add_tab_with_privacy(window, new_id, incognito);
         }
@@ -4051,7 +4129,7 @@ impl Workspace {
             split: None,
             font: None,
         });
-        self.connect_serial_with_privacy(window, incognito)
+        self.connect_serial_with_privacy(window, incognito, None, None, None)
     }
 
     fn store_disconnected_serial(
@@ -4091,6 +4169,16 @@ impl Workspace {
     }
 
     fn connect_ibm(&mut self, window: window::Id) -> Task<Message> {
+        self.connect_ibm_with_effect(window, None, None, None)
+    }
+
+    fn connect_ibm_with_effect(
+        &mut self,
+        window: window::Id,
+        effect: Option<crate::terminal_effects::Selection>,
+        ai: Option<crate::connection_store::AiAssignments>,
+        style: Option<crate::connection_store::TerminalAppearance>,
+    ) -> Task<Message> {
         if !self.allow_in_process_transport(window, "IBM") {
             return Task::none();
         }
@@ -4168,6 +4256,13 @@ impl Workspace {
         );
         if let Some(pane) = self.sessions.get_mut(&session) {
             pane.ibm_origin = Some(ibm_origin.clone());
+            pane.quick_ai = ai;
+            pane.quick_appearance = style.map(|appearance| appearance.display_overrides(None));
+        }
+        if effect.is_some() {
+            self.apply_terminal_effect_selection(session, effect);
+        } else {
+            self.sync_pane_appearance(session);
         }
         if let Some(target) = reconnect {
             return self.start_reconnect_worker(window, target, session, None, Default::default());
@@ -4645,6 +4740,8 @@ impl Workspace {
             return Task::none();
         }
         self.editors.remove(&id);
+        self.snippet_editor_owners
+            .retain(|editor, (owner, _)| *editor != id && *owner != id);
         self.close_terminal_file_editor(id);
         self.diagrams.remove(&id);
         self.recording_windows.remove(&id);
@@ -5600,6 +5697,9 @@ impl Workspace {
             return task;
         }
         if let Some(task) = self.snippet_shortcut(id, &key, modifiers) {
+            return task;
+        }
+        if let Some(task) = self.agent_plan_zoom_shortcut(id, &key, modifiers) {
             return task;
         }
         let app_shortcut = modifiers.command()
@@ -6931,7 +7031,7 @@ impl Workspace {
                     scale_factor: window.scale_factor,
                     background_transparency: transparency,
                     focused: focus && window.focused,
-                    reduced_motion: !self.window_settings.appearance.animations(),
+                    reduced_motion: !self.window_settings.agent_animations(),
                     typeahead_enabled: session_state.typeahead_enabled && !mirrored,
                     owner: id,
                     agent_cursor: self.agent_cursor_review(id, session_id, frame),
@@ -7027,30 +7127,30 @@ impl Workspace {
                 } else {
                     view
                 };
-                self.decorate_agent_terminal(
+                let view = self.decorate_agent_terminal(
                     session_id,
                     session_state.stream_generation,
                     view,
                     bounds,
                     terminal_view::cell_size(font_size, font),
-                    !self.window_settings.appearance.animations(),
-                )
+                    !self.window_settings.agent_animations(),
+                );
+                if let Some(draft) = session_state.agent_shortcut_preview(id, tab.incognito, bounds)
+                {
+                    iced::widget::stack![
+                        view,
+                        column![
+                            space::vertical(),
+                            transparency::chrome(horizontal(draft)).padding([2, 6]),
+                        ]
+                        .height(Length::Fill),
+                    ]
+                    .into()
+                } else {
+                    view
+                }
             })
             .into();
-            let view = if let Some(draft) = session_state.agent_shortcut_preview(id, tab.incognito)
-            {
-                iced::widget::stack![
-                    view,
-                    column![
-                        space::vertical(),
-                        transparency::chrome(horizontal(draft)).padding([2, 6]),
-                    ]
-                    .height(Length::Fill),
-                ]
-                .into()
-            } else {
-                view
-            };
             pane_grid::Content::new(self.with_restored_output(session_id, view)).title_bar(bar)
         };
         let panes = pane_grid(&tab.grid, pane_content)
@@ -7359,6 +7459,7 @@ mod tests {
             working_directory: None,
             shell_integration: false,
             emulation: profile.term_name().into(),
+            terminal_effect: None,
             terminal: TerminalOverrides {
                 background: Some(Rgb::from_hex(0x112233)),
                 ..TerminalOverrides::default()

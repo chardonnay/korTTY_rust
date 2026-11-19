@@ -48,7 +48,7 @@ pub(super) fn phase(run: &Run) -> (&'static str, usize) {
 }
 
 fn station(
-    run: &Run,
+    run: history::Activity<'_>,
     index: usize,
     vertical: bool,
     palette: Option<Palette>,
@@ -101,9 +101,26 @@ pub(super) fn view(
     status: Status,
     palette: Option<Palette>,
 ) -> Element<'_, AgentMessage> {
-    let (phase, stage) = phase(run);
+    render(
+        run.into(),
+        phase(run),
+        matches!(run.phase, Phase::Failed | Phase::Blocked),
+        status,
+        palette,
+        || super::controls(run),
+    )
+}
+
+pub(super) fn render<'a>(
+    run: history::Activity<'a>,
+    (phase, stage): (&'static str, usize),
+    failed: bool,
+    status: Status,
+    palette: Option<Palette>,
+    controls: impl FnOnce() -> Element<'a, AgentMessage>,
+) -> Element<'a, AgentMessage> {
     let accent = palette.map(|palette| palette.accent.color());
-    let heading_color = if matches!(run.phase, Phase::Failed | Phase::Blocked) {
+    let heading_color = if failed {
         palette.map(|palette| palette.error.color())
     } else {
         None
@@ -231,7 +248,7 @@ pub(super) fn view(
             text(format!("Agent · {phase}"))
                 .size(14)
                 .style(heading_style),
-            text(history::summary(&run.goal)).size(12),
+            text(history::summary(run.goal)).size(12),
             text(
                 run.activity
                     .back()
@@ -313,12 +330,15 @@ pub(super) fn view(
             )
             .height(140),
         );
-        panel = panel.push(super::controls(run));
+        panel = panel.push(controls());
     }
     palette::panel(palette, container(panel).padding(5))
 }
 
-fn usage_label(run: &Run, palette: Option<Palette>) -> Option<Element<'_, AgentMessage>> {
+fn usage_label(
+    run: history::Activity<'_>,
+    palette: Option<Palette>,
+) -> Option<Element<'_, AgentMessage>> {
     let compact = run.presentation.model_usage.compact()?;
     let label = run.presentation.model_usage.label()?;
     let muted = palette.map(|palette| palette.muted.color());

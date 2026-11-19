@@ -250,6 +250,7 @@ fn local_shell_integration_xml_round_trip_retains_opt_in_and_native_presets() {
             working_directory: None,
             shell_integration: shell != kortty_pty::LocalShell::Wsl,
             emulation: "xterm-256color".into(),
+            terminal_effect: None,
             terminal: Default::default(),
         });
     }
@@ -304,6 +305,10 @@ fn local_shell_xml_round_trip_keeps_java_compatible_and_exact_rust_launches() {
         working_directory: Some(directory),
         shell_integration: false,
         emulation: "vt100".into(),
+        terminal_effect: Some(Selection {
+            effect: Effect::DigitalRain,
+            speed: Speed::try_from(2.75).unwrap(),
+        }),
         terminal: crate::connection_store::TerminalOverrides {
             font_size: Some(22),
             terminal_columns: Some(132),
@@ -349,6 +354,16 @@ fn local_shell_xml_round_trip_keeps_java_compatible_and_exact_rust_launches() {
     assert_eq!(xml.matches("<protocol>LOCAL_SHELL</protocol>").count(), 1);
     assert_eq!(xml.matches("<rustLocalConnection>").count(), 1);
     assert!(xml.contains("<localShellWorkingDirectory>"));
+    assert_eq!(
+        xml.matches("<terminalEffectPluginId>digital-rain</terminalEffectPluginId>")
+            .count(),
+        2
+    );
+    assert_eq!(
+        xml.matches("<terminalEffectAnimationSpeed>2.75</terminalEffectAnimationSpeed>")
+            .count(),
+        2
+    );
     assert_eq!(
         xml.matches("<terminalColumns>132</terminalColumns>")
             .count(),
@@ -416,6 +431,15 @@ fn java_serial_xml_round_trips_device_line_settings_encoding_and_folder() {
     profile.paste_line_delay_ms = Some(125);
     profile.strict_terminal_mode = Some(false);
     profile.highlight_set = Some("builtin.network".into());
+    profile.terminal_effect = Some(Selection {
+        effect: Effect::Mother,
+        speed: Speed::try_from(1.5).unwrap(),
+    });
+    profile.appearance = Some(Box::new(crate::connection_store::TerminalAppearance {
+        background: Some(crate::terminal_theme::Rgb::from_hex(0x132435)),
+        font_size: Some(19),
+        ..Default::default()
+    }));
     let serials = [SerialEntry {
         profile: &profile,
         group: "Hardware/Lab",
@@ -430,6 +454,8 @@ fn java_serial_xml_round_trips_device_line_settings_encoding_and_folder() {
         "<flowControl>DSR_DTR</flowControl>",
         "<lineEnding>CRLF</lineEnding>",
         "<highlightRuleSetId>builtin.network</highlightRuleSetId>",
+        "<terminalEffectPluginId>mother</terminalEffectPluginId>",
+        "<terminalEffectAnimationSpeed>1.5</terminalEffectAnimationSpeed>",
         "Lab &lt;bench&gt;",
     ] {
         assert!(text.contains(expected), "missing {expected}");

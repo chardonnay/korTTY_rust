@@ -106,28 +106,168 @@ impl Default for Preferences {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub(super) struct ImportedPreferences {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ai_size: Option<picture::Size>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_size: Option<picture::Size>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    comment: Option<Comment>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<Output>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gap: Option<u8>,
+}
+
+impl ImportedPreferences {
+    pub(super) fn read(root: roxmltree::Node<'_, '_>, omitted: &mut usize) -> Self {
+        use super::backup_data::preference;
+
+        let size = |text: &str| match text {
+            "SMALL" => Some(picture::Size::Small),
+            "MEDIUM" => Some(picture::Size::Medium),
+            "LARGE" => Some(picture::Size::Large),
+            "XL" => Some(picture::Size::ExtraLarge),
+            _ => None,
+        };
+        let ai_size = preference(root, "asciiArtPictureSize", omitted, size);
+        let image_size = preference(root, "asciiArtImageSize", omitted, size);
+        let comment = preference(root, "asciiArtCopyCommentStyle", omitted, |value| {
+            Some(match value {
+                "NONE" => Comment::None,
+                "HASH" => Comment::Hash,
+                "DOUBLE_SLASH" => Comment::Slash,
+                "DOUBLE_DASH" => Comment::Dash,
+                "SEMICOLON" => Comment::Semicolon,
+                "PERCENT" => Comment::Percent,
+                "APOSTROPHE" => Comment::Quote,
+                "REM" => Comment::Rem,
+                "C_BLOCK" => Comment::CBlock,
+                "XML_BLOCK" => Comment::XmlBlock,
+                "JSON_STRINGS" => Comment::Json,
+                _ => return None,
+            })
+        });
+        let output = preference(root, "asciiArtCopyPrintStyle", omitted, |value| {
+            Some(match value {
+                "NONE" => Output::None,
+                "BASH_HEREDOC" => Output::Heredoc,
+                "BASH_ECHO" => Output::Bash,
+                "SH_PRINTF" => Output::Sh,
+                "PERL" => Output::Perl,
+                "PYTHON" => Output::Python,
+                "RUBY" => Output::Ruby,
+                "PHP" => Output::Php,
+                "JAVASCRIPT" => Output::JavaScript,
+                "JAVA" => Output::Java,
+                "C" => Output::C,
+                "CSHARP" => Output::CSharp,
+                "GO" => Output::Go,
+                "RUST" => Output::Rust,
+                "KOTLIN" => Output::Kotlin,
+                "SWIFT" => Output::Swift,
+                "LUA" => Output::Lua,
+                "POWERSHELL" => Output::PowerShell,
+                "BATCH" => Output::Batch,
+                _ => return None,
+            })
+        });
+        let gap = preference(root, "asciiArtCopyGap", omitted, |value| {
+            value.parse::<i32>().ok().map(|gap| gap.clamp(0, 20) as u8)
+        });
+        Self {
+            ai_size,
+            image_size,
+            comment,
+            output,
+            gap,
+        }
+    }
+
+    pub(super) fn count(self) -> usize {
+        [
+            self.ai_size.is_some(),
+            self.image_size.is_some(),
+            self.comment.is_some(),
+            self.output.is_some(),
+            self.gap.is_some(),
+        ]
+        .into_iter()
+        .filter(|present| *present)
+        .count()
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.count() == 0
+    }
+
+    pub(super) fn valid(self) -> bool {
+        self.gap.is_none_or(|gap| gap <= 20)
+    }
+
+    fn apply(self, prefs: &mut Preferences, saved: &serde_json::Value) {
+        if saved.get("ai_size").is_none()
+            && let Some(size) = self.ai_size
+        {
+            prefs.ai_size = size;
+        }
+        if saved.get("image_size").is_none()
+            && let Some(size) = self.image_size
+        {
+            prefs.image_size = size;
+        }
+        let format = &saved["format"];
+        if format.get("gap").is_none()
+            && let Some(gap) = self.gap
+        {
+            prefs.format.gap = gap.min(20);
+        }
+        if format.get("output").is_none()
+            && prefs.format.comment == Comment::None
+            && let Some(output) = self.output
+        {
+            prefs.format.output(output);
+        }
+        if format.get("comment").is_none()
+            && prefs.format.output == Output::None
+            && let Some(comment) = self.comment
+        {
+            prefs.format.comment(comment);
+        }
+    }
+}
+
 impl Preferences {
     fn path() -> io::Result<PathBuf> {
         Ok(profile::root()?.join("ascii-art.json"))
     }
 
-    fn load() -> Self {
-        let Ok(file) = Self::path().and_then(|path| profile::open_preference(&path)) else {
-            return Self::default();
-        };
-        if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
-            return Self::default();
+    fn read_saved() -> io::Result<Vec<u8>> {
+        let file = Self::path().and_then(|path| profile::open_preference(&path))?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::other("ASCII Art preferences must be a file"));
         }
         let mut bytes = Vec::new();
-        if file
-            .take(MAX_PREFERENCES + 1)
-            .read_to_end(&mut bytes)
-            .is_err()
-            || bytes.len() as u64 > MAX_PREFERENCES
-        {
-            return Self::default();
+        file.take(MAX_PREFERENCES + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_PREFERENCES {
+            return Err(io::Error::other(
+                "ASCII Art preferences exceed the size limit",
+            ));
         }
-        let mut prefs = serde_json::from_slice::<Self>(&bytes).unwrap_or_default();
+        Ok(bytes)
+    }
+
+    fn decode(bytes: &[u8], imported: ImportedPreferences) -> Self {
+        let (mut prefs, saved) = serde_json::from_slice::<serde_json::Value>(bytes)
+            .ok()
+            .and_then(|saved| {
+                serde_json::from_value::<Self>(saved.clone())
+                    .ok()
+                    .map(|prefs| (prefs, saved))
+            })
+            .unwrap_or_default();
         if !WindowPlacement::valid_size(prefs.placement.width, prefs.placement.height) {
             prefs.placement = DEFAULT_PLACEMENT;
         }
@@ -144,6 +284,7 @@ impl Preferences {
         if prefs.format.output != Output::None {
             prefs.format.comment = Comment::None;
         }
+        imported.apply(&mut prefs, &saved);
         prefs
     }
 
@@ -584,7 +725,8 @@ impl Workspace {
         if let Some(id) = self.ascii_art_for_owner(owner) {
             return window::gain_focus(id);
         }
-        let mut preferences = Preferences::load();
+        let saved = Preferences::read_saved().unwrap_or_default();
+        let mut preferences = Preferences::decode(&saved, self.window_settings.ascii_art_java);
         preferences.apply_imported_zoom(self.window_settings.ascii_art_preview_font_size);
         let (id, open) = self.open_placed_dialog_with_fallback(
             DialogKind::AsciiArt,
@@ -871,6 +1013,49 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn java_ascii_art_choices_fill_individual_unset_native_preferences() {
+        use crate::workspace::{backup_data, tab_titles::WindowSettings};
+
+        let imported = backup_data::portable_java_preferences(
+            br#"<globalSettings>
+                <asciiArtPictureSize>XL</asciiArtPictureSize>
+                <asciiArtImageSize>SMALL</asciiArtImageSize>
+                <asciiArtCopyCommentStyle>DOUBLE_SLASH</asciiArtCopyCommentStyle>
+                <asciiArtCopyPrintStyle>PYTHON</asciiArtCopyPrintStyle>
+                <asciiArtCopyGap>99</asciiArtCopyGap>
+            </globalSettings>"#,
+            None,
+        )
+        .unwrap();
+        assert_eq!((imported.count, imported.omitted), (5, 0));
+        let incoming = imported.contents.unwrap();
+        let bytes = backup_data::merge_java_window_settings(None, &incoming, &Default::default())
+            .unwrap()
+            .unwrap();
+        let settings = WindowSettings::decode(&bytes).unwrap();
+        let suggestions = settings.ascii_art_java;
+        let fresh = Preferences::decode(b"{}", suggestions);
+        assert_eq!(fresh.ai_size, picture::Size::ExtraLarge);
+        assert_eq!(fresh.image_size, picture::Size::Small);
+        assert_eq!(fresh.format.output, Output::Python);
+        assert_eq!(fresh.format.comment, Comment::None);
+        assert_eq!(fresh.format.gap, 20);
+
+        let saved = br#"{"image_size":"medium","format":{"comment":"hash","gap":0}}"#;
+        let native = Preferences::decode(saved, suggestions);
+        assert_eq!(native.ai_size, picture::Size::ExtraLarge);
+        assert_eq!(native.image_size, picture::Size::Medium);
+        assert_eq!(native.format.output, Output::None);
+        assert_eq!(native.format.comment, Comment::Hash);
+        assert_eq!(native.format.gap, 0);
+        assert!(
+            backup_data::merge_java_window_settings(Some(&bytes), &incoming, &Default::default())
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn imported_zoom_only_fills_an_unset_ascii_art_preference() {

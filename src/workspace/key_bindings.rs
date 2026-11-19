@@ -11,8 +11,10 @@ const MENU_BAR_SHORTCUT_REQUIRED: &str = "Keep a shortcut available to restore t
 
 mod editor;
 pub(in crate::workspace) mod java;
+mod snippet_completion;
 pub use editor::Edit;
 pub(super) use editor::Editor;
+pub(crate) use snippet_completion::SnippetCompletionChord;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]

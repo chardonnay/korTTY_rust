@@ -42,9 +42,14 @@ impl RunContext {
         }
         let store = ConnectionStore::open(self.connection_store.clone())
             .map_err(|_| "The saved rsync connections are unavailable.")?;
-        if store.get(reference.id).map(ConnectionRef::from).as_ref() != Some(reference) {
-            return Err("The saved rsync route changed. Review the transfer again.");
-        }
+        let shared = if reference.shared_identity().is_some() {
+            super::SharedTargets::load_reviewed(&store, [reference.clone()])?
+        } else {
+            super::SharedTargets::default()
+        };
+        shared
+            .require_saved(&store, reference)
+            .map_err(|_| "The saved rsync route changed. Review the transfer again.")?;
         if let Some(standing) = &self.standing {
             standing.require_current().map_err(|_| REVOKED)?;
         }

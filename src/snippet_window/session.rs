@@ -16,8 +16,8 @@ use crate::snippets::SnippetId;
 pub(crate) const FILE_NAME: &str = "snippet-workspace.json";
 pub(crate) const MAX_RESTORED: usize = 12;
 const VERSION: u8 = 1;
-const MAX_BYTES: u64 = 64 * 1024;
-const MAX_IDS: usize = 1024;
+pub(crate) const MAX_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_IDS: usize = 1024;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct State {
@@ -52,7 +52,7 @@ impl State {
         })
     }
 
-    pub(crate) fn write(&self, path: &Path) -> io::Result<()> {
+    pub(crate) fn encode(&self) -> io::Result<Vec<u8>> {
         let state = self.normalized()?;
         let document = Document {
             version: VERSION,
@@ -60,9 +60,14 @@ impl State {
             active: state.active.map(String::from),
         };
         let bytes = serde_json::to_vec(&document).map_err(invalid)?;
-        if bytes.len() as u64 > MAX_BYTES {
+        if bytes.len() > MAX_BYTES {
             return Err(invalid("snippet workspace exceeds the size limit"));
         }
+        Ok(bytes)
+    }
+
+    pub(crate) fn write(&self, path: &Path) -> io::Result<()> {
+        let bytes = self.encode()?;
         match fs::symlink_metadata(path) {
             Ok(metadata) if !metadata.is_file() => {
                 return Err(invalid("snippet workspace requires a regular file"));
@@ -81,11 +86,15 @@ pub(crate) fn load(path: &Path) -> io::Result<State> {
         return Err(invalid("snippet workspace requires a regular file"));
     }
     let mut bytes = Vec::new();
-    file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_BYTES {
+    file.take((MAX_BYTES + 1) as u64).read_to_end(&mut bytes)?;
+    decode(&bytes)
+}
+
+pub(crate) fn decode(bytes: &[u8]) -> io::Result<State> {
+    if bytes.len() > MAX_BYTES {
         return Err(invalid("snippet workspace exceeds the size limit"));
     }
-    let document: Document = serde_json::from_slice(&bytes).map_err(invalid)?;
+    let document: Document = serde_json::from_slice(bytes).map_err(invalid)?;
     if document.version != VERSION {
         return Err(invalid("unsupported snippet workspace version"));
     }
@@ -230,7 +239,7 @@ mod tests {
             br#"{"version":2,"ids":[]}"#.to_vec(),
             br#"{"version":1,"ids":["bad-id"]}"#.to_vec(),
             br#"{"version":1,"ids":[],"content":"must not be stored"}"#.to_vec(),
-            vec![b' '; MAX_BYTES as usize + 1],
+            vec![b' '; MAX_BYTES + 1],
         ] {
             fs::write(&path, bytes).unwrap();
             assert_eq!(load(&path).unwrap_err().kind(), io::ErrorKind::InvalidData);

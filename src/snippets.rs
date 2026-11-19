@@ -1,6 +1,6 @@
 //! Bounded native storage for the shared snippet library.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 use std::fmt::Write as _;
 use std::fs::{self, File, TryLockError};
@@ -14,7 +14,9 @@ use crate::clipboard_policy::ClipboardPolicy;
 use crate::private_files::Directory;
 use crate::profile;
 use crate::snippet_analysis::model::hardening::HEADER_CATEGORY;
+use crate::snippet_analysis::store::{MAX_SAVED_APPLY_RESULTS, Store};
 
+pub(crate) mod json_schema;
 pub(crate) mod one_liner;
 
 const VERSION: u8 = 1;
@@ -50,7 +52,7 @@ pub(crate) fn is_script_header_category(category: &str) -> bool {
     category.trim().eq_ignore_ascii_case(HEADER_CATEGORY)
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct SnippetId([u8; 16]);
 
@@ -114,9 +116,68 @@ pub(crate) struct Snippet {
     metadata: Metadata,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     history: Vec<history::Revision>,
+    #[serde(default, skip_serializing_if = "LibraryStats::is_empty")]
+    stats: LibraryStats,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    saved_apply_results: BTreeSet<SavedApply>,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SavedApply {
+    pub(crate) report: SnippetId,
+    pub(crate) run: SnippetId,
+}
+
+#[derive(Clone, Copy, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub(super) struct LibraryStats {
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(super) favorite: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) created_at: Option<jiff::Timestamp>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) modified_at: Option<jiff::Timestamp>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(super) usage_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) last_used: Option<jiff::Timestamp>,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
+impl LibraryStats {
+    fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 impl Snippet {
+    pub(crate) fn saved_apply_results(&self) -> &BTreeSet<SavedApply> {
+        &self.saved_apply_results
+    }
+
+    pub(crate) fn usage_count(&self) -> u32 {
+        self.stats.usage_count
+    }
+
+    pub(crate) fn same_source_revision(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.name == other.name
+            && self.history == other.history
+            && matches_java_snippet(self, other)
+    }
+
+    pub(crate) fn favorite(&self) -> bool {
+        self.stats.favorite
+    }
+
+    pub(crate) fn last_modified(&self) -> Option<jiff::Timestamp> {
+        self.stats.modified_at.or(self.stats.created_at)
+    }
+
     pub(crate) fn history(&self) -> &[history::Revision] {
         &self.history
     }
@@ -158,11 +219,18 @@ impl Snippet {
             content: input.content,
             metadata,
             history: Vec::new(),
+            stats: LibraryStats::default(),
+            saved_apply_results: BTreeSet::new(),
         }
     }
 
     fn with_history(mut self, history: Vec<history::Revision>) -> Self {
         self.history = history;
+        self
+    }
+
+    fn with_library_stats(mut self, stats: LibraryStats) -> Self {
+        self.stats = stats;
         self
     }
 
@@ -176,6 +244,9 @@ impl Snippet {
 
     fn validate(&self) -> io::Result<()> {
         history::validate(&self.history)?;
+        if self.saved_apply_results.len() > MAX_SAVED_APPLY_RESULTS {
+            return Err(invalid("Too many saved analysis results"));
+        }
         if !valid_field(&self.name, MAX_NAME_BYTES) || self.name.is_empty() {
             return Err(invalid("Enter a snippet name up to 160 bytes"));
         }
@@ -232,6 +303,8 @@ pub(crate) struct Metadata {
     pub(crate) diagrams: Vec<diagrams::Saved>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) history_max_size: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) json_schema: Option<Arc<json_schema::Schema>>,
 }
 
 impl Metadata {
@@ -244,6 +317,7 @@ impl Metadata {
             && self.tags.is_empty()
             && self.diagrams.is_empty()
             && self.history_max_size.is_none()
+            && self.json_schema.is_none()
     }
 
     pub(crate) fn validate(&self) -> io::Result<()> {
@@ -505,6 +579,14 @@ impl Library {
         &mut self,
         selected: impl Iterator<Item = (&'a str, &'a str)>,
     ) -> io::Result<bool> {
+        self.remember_defaults(selected, None)
+    }
+
+    pub(crate) fn remember_defaults<'a>(
+        &mut self,
+        selected: impl Iterator<Item = (&'a str, &'a str)>,
+        expected: Option<&[Variable]>,
+    ) -> io::Result<bool> {
         let mut selected = selected
             .filter(|(_, value)| !value.trim().is_empty())
             .peekable();
@@ -519,8 +601,14 @@ impl Library {
             let variable = candidate
                 .variables
                 .iter_mut()
-                .find(|variable| variable.matches(name) && variable.default_value().is_none())
-                .ok_or_else(|| invalid("The variable no longer needs a stored default"))?;
+                .find(|variable| {
+                    variable.matches(name)
+                        && expected.map_or_else(
+                            || variable.default_value().is_none(),
+                            |reviewed| reviewed.contains(variable),
+                        )
+                })
+                .ok_or_else(|| invalid("The variable default changed before it could be saved"))?;
             variable.value = value.to_owned();
         }
         self.commit(candidate)?;
@@ -594,6 +682,41 @@ impl Library {
         Ok(())
     }
 
+    pub(crate) fn toggle_favorites(&mut self, ids: &[SnippetId]) -> io::Result<()> {
+        let mut pending: HashSet<_> = ids.iter().copied().collect();
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let mut candidate = self.document.as_ref().clone();
+        for snippet in &mut candidate.snippets {
+            if pending.remove(&snippet.id) {
+                snippet.stats.favorite = !snippet.stats.favorite;
+            }
+        }
+        if !pending.is_empty() {
+            return Err(invalid("A selected snippet no longer exists"));
+        }
+        self.commit(candidate)
+    }
+
+    pub(crate) fn record_use(path: PathBuf, id: SnippetId) -> io::Result<Option<Self>> {
+        let _lock = StoreLock::acquire(&path)?;
+        let mut document = read_document(&path)?;
+        let Some(snippet) = document.snippets.iter_mut().find(|entry| entry.id == id) else {
+            return Ok(None);
+        };
+        snippet.stats.usage_count = snippet.stats.usage_count.saturating_add(1);
+        let used = jiff::Timestamp::now();
+        snippet.stats.last_used = Some(snippet.stats.last_used.map_or(used, |last| last.max(used)));
+        profile::save_atomic(&path, &encode_document(&document)?)?;
+        Ok(Some(Self {
+            path,
+            document: Arc::new(document),
+            #[cfg(test)]
+            allow_custom_script_headers: None,
+        }))
+    }
+
     #[cfg(test)]
     pub(crate) fn save(
         &mut self,
@@ -622,12 +745,23 @@ impl Library {
                 return Err(invalid("Enter snippet text"));
             }
             diagrams::rebase(&mut snippet.metadata.diagrams, before, after);
-            snippet.content = after.into();
+            if before != after {
+                if let Some(results) = self.saved_apply_results(snippet, after) {
+                    snippet.saved_apply_results = results;
+                }
+                snippet.content = after.into();
+                snippet.stats.modified_at = Some(jiff::Timestamp::now());
+            }
         }
         if replaced.is_empty() {
             return Ok(());
         }
         self.commit(candidate)
+    }
+
+    fn saved_apply_results(&self, snippet: &Snippet, next: &str) -> Option<BTreeSet<SavedApply>> {
+        let store = Store::new(self.path.parent()?.to_path_buf());
+        store.saved_native_applies(snippet, next).ok()
     }
 
     #[cfg(test)]
@@ -701,14 +835,26 @@ impl Library {
             };
             diagrams::rebase(&mut metadata.diagrams, &previous.content, &input.content);
             let history = versions.unwrap_or_else(|| std::mem::take(&mut previous.history));
-            *previous = Snippet::from_input(id, input, metadata).with_history(history);
+            let saved_apply_results = self.saved_apply_results(previous, &input.content);
+            let mut updated = Snippet::from_input(id, input, metadata).with_history(history);
+            updated.stats = previous.stats;
+            updated.saved_apply_results = saved_apply_results
+                .unwrap_or_else(|| std::mem::take(&mut previous.saved_apply_results));
+            if previous.name != updated.name || !matches_java_snippet(previous, &updated) {
+                updated.stats.modified_at = Some(jiff::Timestamp::now());
+            }
+            *previous = updated;
         } else {
             if input.content.trim().is_empty() {
                 return Err(invalid("Enter snippet text"));
             }
             candidate.snippets.push(
                 Snippet::from_input(id, input, metadata.unwrap_or_default())
-                    .with_history(versions.unwrap_or_default()),
+                    .with_history(versions.unwrap_or_default())
+                    .with_library_stats(LibraryStats {
+                        created_at: Some(jiff::Timestamp::now()),
+                        ..LibraryStats::default()
+                    }),
             );
         }
         self.commit(candidate)?;
@@ -732,6 +878,7 @@ impl Library {
             input,
             metadata,
             history,
+            stats,
         } in imports.structured
         {
             if !names.insert(input.name.trim().to_lowercase()) {
@@ -741,9 +888,11 @@ impl Library {
                 Some(id) => id,
                 None => SnippetId::new()?,
             };
-            candidate
-                .snippets
-                .push(Snippet::from_input(id, input, metadata).with_history(history));
+            candidate.snippets.push(
+                Snippet::from_input(id, input, metadata)
+                    .with_history(history)
+                    .with_library_stats(stats),
+            );
         }
         for mut input in imports.text {
             let base = input.name.trim();
@@ -792,11 +941,7 @@ impl Library {
         candidate.validate()?;
         candidate.materialize_folders()?;
         candidate.preserve_displaced_folders()?;
-        let bytes = serde_json::to_vec(&candidate)
-            .map_err(|_| invalid("Could not encode snippet library"))?;
-        if bytes.len() as u64 > MAX_LIBRARY_BYTES {
-            return Err(invalid("The snippet library exceeds 64 MiB"));
-        }
+        let bytes = encode_document(&candidate)?;
         let _lock = StoreLock::acquire(&self.path)?;
         let previous = read_document(&self.path)?;
         if previous != *self.document {
@@ -953,10 +1098,13 @@ pub(crate) fn portable_java_backup(
         input,
         metadata,
         history,
+        stats,
     } in imports.structured
     {
         let id = id.map(Ok).unwrap_or_else(SnippetId::new)?;
-        let snippet = Snippet::from_input(id, input, metadata).with_history(history);
+        let snippet = Snippet::from_input(id, input, metadata)
+            .with_history(history)
+            .with_library_stats(stats);
         if snippet.is_script_header() && !custom_script_headers_allowed() {
             skipped_headers += 1;
         } else {
@@ -1031,12 +1179,72 @@ pub(crate) fn merge_java_backup(
     encode_java_backup(target).map(Some)
 }
 
+pub(crate) fn java_workspace_bindings(
+    incoming: &[u8],
+    installed: &[u8],
+) -> io::Result<std::collections::HashMap<SnippetId, SnippetId>> {
+    let incoming = decode_document(incoming)?;
+    let installed = decode_document(installed)?;
+    let by_name: std::collections::HashMap<_, _> = installed
+        .snippets
+        .iter()
+        .map(|entry| (&entry.name, entry))
+        .collect();
+    Ok(incoming
+        .snippets
+        .iter()
+        .filter_map(|entry| {
+            let saved = by_name.get(&entry.name)?;
+            (!saved.is_script_header() && matches_java_snippet(entry, saved))
+                .then_some((entry.id, saved.id))
+        })
+        .collect())
+}
+
+pub(crate) fn java_workflow_header_bindings(
+    incoming: &[u8],
+    installed: &[u8],
+) -> io::Result<std::collections::HashMap<SnippetId, (SnippetId, String)>> {
+    let incoming = decode_document(incoming)?;
+    let installed = decode_document(installed)?;
+    let by_name: std::collections::HashMap<_, _> = installed
+        .snippets
+        .iter()
+        .filter(|entry| entry.is_script_header())
+        .map(|entry| (&entry.name, entry))
+        .collect();
+    Ok(incoming
+        .snippets
+        .iter()
+        .filter_map(|entry| {
+            let saved = by_name.get(&entry.name)?;
+            let eligible = saved.category.eq_ignore_ascii_case(HEADER_CATEGORY)
+                && !saved.content.trim().is_empty()
+                && saved.content.len()
+                    <= crate::snippet_analysis::model::hardening::MAX_HEADER_BYTES;
+            (eligible && matches_java_snippet(entry, saved))
+                .then(|| (entry.id, (saved.id, saved.language.clone())))
+        })
+        .collect())
+}
+
+fn matches_java_snippet(archived: &Snippet, installed: &Snippet) -> bool {
+    archived.language == installed.language
+        && archived.category == installed.category
+        && archived.content == installed.content
+        && archived.metadata == installed.metadata
+}
+
 fn encode_java_backup(mut document: Document) -> io::Result<Vec<u8>> {
     document.validate()?;
     document.materialize_folders()?;
     document.preserve_displaced_folders()?;
+    encode_document(&document)
+}
+
+fn encode_document(document: &Document) -> io::Result<Vec<u8>> {
     let bytes =
-        serde_json::to_vec(&document).map_err(|_| invalid("Could not encode snippet library"))?;
+        serde_json::to_vec(document).map_err(|_| invalid("Could not encode snippet library"))?;
     if bytes.len() as u64 > MAX_LIBRARY_BYTES {
         return Err(invalid("The snippet library exceeds 64 MiB"));
     }

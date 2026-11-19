@@ -12,6 +12,35 @@ use crate::terminal_agent::design::{Arrangement, History, Status};
 
 use super::*;
 
+#[test]
+fn expired_status_releases_its_dock_without_removing_the_history() {
+    use std::time::{Duration, Instant};
+
+    let mut fixture = Fixture::new(false, false);
+    let id = fixture.open(Mode::Ask);
+    let stream = fixture.workspace.sessions[&fixture.session].stream_generation;
+    let size = Size::new(840.0, 540.0);
+    let run = fixture.run_mut(id);
+    run.design.history = History::LogTable;
+    run.design.status = Status::Minimap;
+    let shown = terminal_bounds(&fixture, stream, size);
+    assert!(shown.width < size.width);
+    assert!(shown.height < size.height);
+
+    let run = fixture.run_mut(id);
+    run.next(Phase::Finished, "Finished fixture");
+    run.presentation
+        .finished(Instant::now() - Duration::from_secs(10));
+    let hidden = terminal_bounds(&fixture, stream, size);
+    assert_eq!(hidden.width, size.width);
+    assert_eq!(hidden.height, shown.height);
+    let _ = fixture.workspace.invoke_chrome(
+        fixture.owner,
+        crate::workspace::chrome::Action::ToggleAgentStatus,
+    );
+    assert_eq!(terminal_bounds(&fixture, stream, size), shown);
+}
+
 pub(super) struct TerminalBounds(pub(super) Option<Rectangle>);
 
 impl Operation for TerminalBounds {

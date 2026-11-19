@@ -37,6 +37,7 @@ impl Draft {
     pub(super) fn require_current_routes(
         &self,
         store: &Store,
+        shared: &super::SharedTargets,
         trust: &TrustStore,
         policy: &ClipboardPolicy,
     ) -> Result<(), &'static str> {
@@ -48,18 +49,14 @@ impl Draft {
         }
         let access = policy.server_access();
         for route in &self.routes {
-            let saved = store
-                .get(route.id)
-                .ok_or("An imported SSH target is no longer saved.")?;
-            if ConnectionRef::from(saved) != *route {
-                return Err("A saved SSH target changed since the sudo action was imported.");
-            }
-            if saved.incognito || !saved.isolation.is_none() {
-                return Err(
-                    "This saved connection requires privacy or isolation unavailable to jobs.",
-                );
-            }
-            let pins = sync::pins(route, trust)
+            shared.require_for_adoption(
+                store,
+                route,
+                policy,
+                "A saved SSH target changed since the sudo action was imported.",
+            )?;
+            let reviewed_trust = route.strict_trust(trust.clone())?;
+            let pins = sync::pins(route, &reviewed_trust)
                 .map_err(|_| "Verify every saved SSH host key before adopting this sudo action.")?;
             if access
                 .first_blocked(

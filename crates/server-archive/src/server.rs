@@ -21,7 +21,6 @@ use sha2::{Digest, Sha256};
 mod create;
 #[cfg(target_os = "linux")]
 pub(super) use create::serve_update as serve_archive_update;
-#[cfg(target_os = "linux")]
 pub(super) mod draft_replace;
 #[cfg(target_os = "linux")]
 pub(super) mod privileged_archive;

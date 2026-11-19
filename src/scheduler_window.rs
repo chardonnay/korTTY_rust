@@ -59,8 +59,8 @@ mod working_directory;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use connection::TargetGroups;
 pub(crate) use connection::{ConnectionChoice, ConnectionRef, MAX_SELECTED_GROUPS, MAX_TARGETS};
+pub(crate) use connection::{ConnectionGroup, SharedAuth, SharedTargets, TargetGroups};
 use firing::RunProposalView;
 use form::{Draft, Field, Mode, Source};
 use journal_search::{JournalColumn, JournalSearchMode};
@@ -351,6 +351,9 @@ impl SshCommand {
 
     pub(crate) fn require_executable(&self) -> Result<(), &'static str> {
         self.require_resolved_action()?;
+        if self.has_teamwork_targets() {
+            self.validate_target_selection()?;
+        }
         if let Some((transfer, upload)) =
             self.remote.as_ref().and_then(RemoteAction::rsync_transfer)
             && (!self.additional_connections.is_empty() || !transfer.routes.is_empty())
@@ -498,6 +501,9 @@ impl SshCommand {
                 return Err("Choose each saved SSH connection only once");
             }
         }
+        if self.has_teamwork_targets() && (self.agent.is_some() || self.imported_ai.is_some()) {
+            return Err("This action requires approvals tied to a local saved SSH connection.");
+        }
         let rsync = self.remote.as_ref().and_then(RemoteAction::rsync_transfer);
         if let Some((transfer, upload)) = rsync {
             let primary = self
@@ -526,8 +532,24 @@ impl SshCommand {
         &self,
         store: &ConnectionStore,
     ) -> Result<(), &'static str> {
+        let shared = if self.has_teamwork_targets() {
+            SharedTargets::load_reviewed(store, self.targets().cloned())?
+        } else {
+            SharedTargets::default()
+        };
+        self.require_current_targets(store, &shared)
+    }
+
+    pub(crate) fn require_current_targets(
+        &self,
+        store: &ConnectionStore,
+        shared: &SharedTargets,
+    ) -> Result<(), &'static str> {
+        for target in self.targets() {
+            shared.require(target)?;
+        }
         if let Some(groups) = &self.target_groups {
-            let resolved = groups.resolve(store, self.uses_swarm_targets())?;
+            let resolved = groups.resolve(store, shared, self.uses_swarm_targets())?;
             if !resolved.iter().eq(self.targets()) {
                 return Err(connection::GROUP_TARGETS_CHANGED);
             }
@@ -535,8 +557,17 @@ impl SshCommand {
         Ok(())
     }
 
+    pub(crate) fn has_teamwork_targets(&self) -> bool {
+        self.targets()
+            .any(|target| target.shared_identity().is_some())
+            || self
+                .target_groups
+                .as_ref()
+                .is_some_and(TargetGroups::has_teamwork_groups)
+    }
+
     pub(crate) fn require_installed_target_groups(&self) -> Result<(), &'static str> {
-        if self.target_groups.is_none() {
+        if self.target_groups.is_none() && !self.has_teamwork_targets() {
             return Ok(());
         }
         let store = crate::profile::connections_path()
@@ -893,8 +924,8 @@ pub enum Message {
     ConnectionSelected(ConnectionChoice),
     ConnectionAdded(ConnectionChoice),
     ConnectionRemoved(u64),
-    ConnectionGroupAdded(String),
-    ConnectionGroupRemoved(String),
+    ConnectionGroupAdded(ConnectionGroup),
+    ConnectionGroupRemoved(ConnectionGroup),
     RefreshConnectionGroups,
     ScriptLanguage(Language),
     SnippetSelected(SnippetChoice),
@@ -1055,7 +1086,8 @@ pub struct SchedulerWindow {
     rsync_standing: rsync::standing::Store,
     snippet_choices: Vec<SnippetChoice>,
     connection_choices: Vec<ConnectionChoice>,
-    connection_group_choices: Vec<String>,
+    connection_group_choices: Vec<ConnectionGroup>,
+    shared_targets: SharedTargets,
     connection_store_path: Option<PathBuf>,
     archive_passwords: Vec<CredentialChoice>,
     webhook_choices: Vec<webhooks::Choice>,
@@ -1213,6 +1245,10 @@ impl SchedulerView {
         self.draft = draft;
         self.baseline = job.map(|job| (job.definition(), job.action().clone()));
         self.dirty = false;
+    }
+
+    pub(crate) fn has_teamwork_targets(&self) -> bool {
+        self.draft.has_teamwork_targets()
     }
 
     pub(crate) fn dirty(&self) -> bool {
@@ -1423,6 +1459,7 @@ impl SchedulerWindow {
             snippet_choices: Vec::new(),
             connection_choices: vec![ConnectionChoice::Manual],
             connection_group_choices: Vec::new(),
+            shared_targets: SharedTargets::default(),
             connection_store_path: None,
             archive_passwords: Vec::new(),
             webhook_choices: Vec::new(),
@@ -1580,13 +1617,17 @@ impl SchedulerWindow {
         self.snippet_choices = choices;
     }
 
+    pub(crate) fn set_shared_targets(&mut self, targets: SharedTargets) {
+        self.shared_targets = targets;
+    }
+
     pub(crate) fn set_connections(&mut self, store: Option<&ConnectionStore>) {
         self.connection_choices.truncate(1);
         self.connection_group_choices.clear();
         self.connection_store_path = store.map(|store| store.path().to_owned());
         if let Some(store) = store {
             self.connection_group_choices
-                .extend(store.groups().map(str::to_owned));
+                .extend(store.groups().map(ConnectionGroup::from));
             self.connection_choices
                 .extend(
                     store
@@ -1597,6 +1638,10 @@ impl SchedulerWindow {
                             name: profile.name.clone(),
                         }),
                 );
+            self.connection_group_choices
+                .extend(self.shared_targets.groups());
+            self.connection_choices
+                .extend(self.shared_targets.choices());
             self.connection_choices[1..]
                 .sort_by_cached_key(|choice| choice.to_string().to_lowercase());
         }
@@ -1624,15 +1669,21 @@ impl SchedulerWindow {
     pub(crate) fn require_current_draft_groups(&self, view: &SchedulerView) -> Result<(), String> {
         if view.draft.has_connection_groups() {
             view.draft
-                .require_current_groups(&self.current_connection_store()?)?;
+                .require_current_groups(&self.current_connection_store()?, &self.shared_targets)?;
         }
+        view.draft
+            .require_current_shared_targets(&self.shared_targets)?;
         Ok(())
     }
 
     fn change_connection_groups(
         &mut self,
         view: &mut SchedulerView,
-        change: impl FnOnce(&mut Draft, &ConnectionStore) -> (bool, Option<&'static str>),
+        change: impl FnOnce(
+            &mut Draft,
+            &ConnectionStore,
+            &SharedTargets,
+        ) -> (bool, Option<&'static str>),
     ) {
         let store = match self.current_connection_store() {
             Ok(store) => store,
@@ -1642,7 +1693,7 @@ impl SchedulerWindow {
             }
         };
         self.set_connections(Some(&store));
-        let (changed, problem) = change(&mut view.draft, &store);
+        let (changed, problem) = change(&mut view.draft, &store, &self.shared_targets);
         if changed {
             view.dirty = true;
             view.sync_review = sync::DraftReview::default();
@@ -2131,8 +2182,15 @@ impl SchedulerWindow {
                     let trust = crate::ssh_connection::trust_store()
                         .map_err(|_| "Could not access the SSH host-key trust store.")?;
                     let policy = crate::clipboard_policy::ClipboardPolicy::load();
+                    let shared = view.draft.load_reviewed_shared_targets(&store)?;
                     view.draft
-                        .adopt_imported_archive(&store, &trust, &policy, &self.archive_passwords)
+                        .adopt_imported_archive(
+                            &store,
+                            &shared,
+                            &trust,
+                            &policy,
+                            &self.archive_passwords,
+                        )
                         .map_err(str::to_owned)
                 });
                 match result {
@@ -2171,8 +2229,15 @@ impl SchedulerWindow {
                     let trust = crate::ssh_connection::trust_store()
                         .map_err(|_| "Could not access the SSH host-key trust store.")?;
                     let policy = crate::clipboard_policy::ClipboardPolicy::load();
+                    let shared = view.draft.load_reviewed_shared_targets(&store)?;
                     view.draft
-                        .adopt_imported_privileged(&store, &trust, &policy, &self.snippet_path)
+                        .adopt_imported_privileged(
+                            &store,
+                            &shared,
+                            &trust,
+                            &policy,
+                            &self.snippet_path,
+                        )
                         .map_err(str::to_owned)
                 });
                 match result {
@@ -2546,8 +2611,8 @@ impl SchedulerWindow {
                 view.dirty = true;
             }
             Message::ConnectionAdded(connection) if view.draft.has_connection_groups() => {
-                self.change_connection_groups(view, |draft, store| {
-                    group_change(draft.add_group_connection(connection, store))
+                self.change_connection_groups(view, |draft, store, shared| {
+                    group_change(draft.add_group_connection(connection, store, shared))
                 });
             }
             Message::ConnectionAdded(connection) => match view.draft.add_connection(connection) {
@@ -2555,26 +2620,26 @@ impl SchedulerWindow {
                 Err(error) => view.status = Some(error.into()),
             },
             Message::ConnectionRemoved(id) if view.draft.has_connection_groups() => {
-                self.change_connection_groups(view, |draft, store| {
-                    draft.remove_group_connection(id, store)
+                self.change_connection_groups(view, |draft, store, shared| {
+                    draft.remove_group_connection(id, store, shared)
                 });
             }
             Message::ConnectionRemoved(id) => {
                 view.dirty |= view.draft.remove_connection(id);
             }
             Message::ConnectionGroupAdded(group) if !view.draft.has_unresolved_imported_ai() => {
-                self.change_connection_groups(view, |draft, store| {
-                    group_change(draft.add_connection_group(group, store))
+                self.change_connection_groups(view, |draft, store, shared| {
+                    group_change(draft.add_connection_group(group, store, shared))
                 });
             }
             Message::ConnectionGroupRemoved(group) => {
-                self.change_connection_groups(view, |draft, store| {
-                    draft.remove_connection_group(&group, store)
+                self.change_connection_groups(view, |draft, store, shared| {
+                    draft.remove_connection_group(&group, store, shared)
                 });
             }
             Message::RefreshConnectionGroups => {
-                self.change_connection_groups(view, |draft, store| {
-                    group_change(draft.refresh_connection_groups(store))
+                self.change_connection_groups(view, |draft, store, shared| {
+                    group_change(draft.refresh_connection_groups(store, shared))
                 });
             }
             Message::ScriptLanguage(language) => {

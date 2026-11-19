@@ -214,7 +214,7 @@ fn uniform(mut endings: impl Iterator<Item = LineEnding>) -> Option<LineEnding> 
     (first != LineEnding::LfCr && endings.all(|ending| ending == first)).then_some(first)
 }
 
-fn separators(source: &str) -> impl Iterator<Item = (Range<usize>, LineEnding)> + '_ {
+pub(super) fn separators(source: &str) -> impl Iterator<Item = (Range<usize>, LineEnding)> + '_ {
     let mut offset = 0;
     std::iter::from_fn(move || {
         let start = offset + source[offset..].find(['\r', '\n'])?;

@@ -538,8 +538,12 @@ impl View {
     }
 
     pub(crate) fn review_body(&self) -> Element<'_, Message> {
+        self.review_body_with_font(None)
+    }
+
+    pub(crate) fn review_body_with_font(&self, font_size: Option<u8>) -> Element<'_, Message> {
         match &self.comparison {
-            Some(Ok(diff)) => self.diff(diff),
+            Some(Ok(diff)) => self.diff(diff, font_size),
             Some(Err(error)) => container(text(*error)).center(Length::Fill).into(),
             None => container(text("Comparing saved snippets…"))
                 .center(Length::Fill)
@@ -547,7 +551,7 @@ impl View {
         }
     }
 
-    fn diff<'a>(&'a self, diff: &'a Comparison) -> Element<'a, Message> {
+    fn diff<'a>(&'a self, diff: &'a Comparison, font_size: Option<u8>) -> Element<'a, Message> {
         let pages = self.pages();
         let rows = diff
             .rows
@@ -560,8 +564,15 @@ impl View {
                     .focused
                     .map(|change| (change.start..change.end).contains(&index));
                 let cells = row![
-                    cell(&diff.left, line.left, line.changed, true, focus),
-                    cell(&diff.right, line.right, line.changed, false, focus),
+                    cell(&diff.left, line.left, line.changed, true, focus, font_size),
+                    cell(
+                        &diff.right,
+                        line.right,
+                        line.changed,
+                        false,
+                        focus,
+                        font_size
+                    ),
                 ]
                 .spacing(6);
                 if self.focused.is_some_and(|change| change.start == index) {
@@ -610,6 +621,7 @@ fn cell(
     changed: bool,
     left: bool,
     focus: Option<bool>,
+    font_size: Option<u8>,
 ) -> Element<'_, Message> {
     let label = index.map_or_else(String::new, |index| format!("{:>5}", index + 1));
     let content = index.map_or("", |index| file.line(index));
@@ -620,11 +632,15 @@ fn cell(
     };
     container(
         row![
-            text(label).font(Font::MONOSPACE).size(12),
-            text(marker).font(Font::MONOSPACE).size(12),
+            text(label)
+                .font(Font::MONOSPACE)
+                .size(u32::from(font_size.unwrap_or(12))),
+            text(marker)
+                .font(Font::MONOSPACE)
+                .size(u32::from(font_size.unwrap_or(12))),
             text(content)
                 .font(Font::MONOSPACE)
-                .size(13)
+                .size(u32::from(font_size.unwrap_or(13)))
                 .width(Length::Fill),
         ]
         .spacing(6),

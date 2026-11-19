@@ -10,21 +10,20 @@ use zeroize::Zeroizing;
 
 use super::attachment;
 use super::attachment::remote::{self, browser};
-use super::{Chat, Desktop, Message as ChatMessage, Turn, Workspace, mask};
+use super::{
+    Chat, DEFAULT_CHAT_RESULT_FONT, Desktop, Message as ChatMessage, ResultZoom, Turn, Workspace,
+    mask,
+};
 use crate::private_files::{Directory, FileStamp, desktop::Document};
 use crate::terminal_logging::Redactor;
 use crate::workspace::saved_chats::store::Attachment;
 
-const DEFAULT_SIZE: u8 = 16;
-const MIN_SIZE: u8 = 10;
-const MAX_SIZE: u8 = 28;
 const MAX_EXPORT_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone)]
 pub enum Message {
     Retry,
-    Zoom(i8),
-    ResetZoom,
+    Zoom(ResultZoom),
     Export,
     Format(Format),
     Path(String),
@@ -103,7 +102,7 @@ struct AttachmentLoad {
 impl Default for State {
     fn default() -> Self {
         Self {
-            font_size: DEFAULT_SIZE,
+            font_size: DEFAULT_CHAT_RESULT_FONT,
             retry: None,
             path: None,
             format: Format::default(),
@@ -135,6 +134,10 @@ impl State {
 
     pub(super) fn font_size(&self) -> f32 {
         f32::from(self.font_size)
+    }
+
+    pub(super) fn set_font_size(&mut self, size: u8) {
+        self.font_size = size;
     }
 
     pub(super) fn set_usage(&mut self, usage: Option<crate::local_ai::Usage>) {
@@ -276,10 +279,7 @@ impl State {
                 .on_press_maybe((idle && has_turns).then_some(Message::Retry)),
             button("Export conversation…")
                 .on_press_maybe((idle && has_turns).then_some(Message::Export)),
-            button("A−").on_press_maybe((self.font_size > MIN_SIZE).then_some(Message::Zoom(-1))),
-            button("A+").on_press_maybe((self.font_size < MAX_SIZE).then_some(Message::Zoom(1))),
-            button("Reset text size").on_press(Message::ResetZoom),
-            text(format!("{} px", self.font_size)).size(13),
+            ResultZoom::controls(self.font_size).map(Message::Zoom),
             self.usage
                 .as_ref()
                 .and_then(crate::local_ai::Usage::token_label)
@@ -492,14 +492,18 @@ impl Workspace {
             return Task::none();
         }
         match message {
-            Message::Zoom(step) => {
-                chat.conversation.font_size = chat
-                    .conversation
-                    .font_size
-                    .saturating_add_signed(step.clamp(-1, 1))
-                    .clamp(MIN_SIZE, MAX_SIZE)
+            Message::Zoom(zoom) => {
+                let current = chat.conversation.font_size;
+                let size = zoom.size(current);
+                if size == current && !matches!(zoom, ResultZoom::Reset) {
+                    return Task::none();
+                }
+                chat.conversation.set_font_size(size);
+                if !chat.private_source && self.window_settings.ai_result_font_size != Some(size) {
+                    self.window_settings.ai_result_font_size = Some(size);
+                    self.save_window_settings(self.hosted_tool_owner(id).or(Some(id)));
+                }
             }
-            Message::ResetZoom => chat.conversation.font_size = DEFAULT_SIZE,
             Message::Attach if enabled && attachments_allowed && idle && chat.turns.is_empty() => {
                 chat.conversation.attachment_path = Some(AttachmentPath::Local(String::new()));
             }

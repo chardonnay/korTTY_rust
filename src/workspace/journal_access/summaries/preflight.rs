@@ -328,6 +328,12 @@ pub(super) fn recording_profile(
     if vision && choice.is_none() && !settings.vision_enabled {
         return None;
     }
+    if choice.is_none()
+        && !vision
+        && let Some(id) = config.journal_summary_server_default_id()
+    {
+        return config.journal_summary_server_default_transport(id).ok();
+    }
     match choice {
         Some(choice) if choice.binding().is_some() => {
             if vision {
@@ -340,6 +346,13 @@ pub(super) fn recording_profile(
             && choice.policy_model_matches(None))
         .then(legacy)
         .flatten(),
+        Some(choice) if choice.pins_server_default() => {
+            let id = config.resolve_profile_reference(&choice.id)?;
+            if vision || !config.journal_summary_server_default_matches(id, &choice.destination) {
+                return None;
+            }
+            config.journal_summary_server_default_transport(id).ok()
+        }
         Some(choice) => {
             let id = config.resolve_profile_reference(&choice.id)?;
             if !config.local_ai_profile_matches(id, &choice.model, &choice.destination) {

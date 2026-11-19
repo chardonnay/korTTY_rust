@@ -539,6 +539,12 @@ impl Reviewed {
 }
 
 impl ReviewRequests {
+    pub(crate) fn references(&self) -> impl Iterator<Item = &ConnectionRef> {
+        std::iter::once(&self.primary)
+            .chain(&self.additional)
+            .map(|request| &request.reference)
+    }
+
     pub(in crate::scheduler_window) fn for_transfer(
         transfer: &Transfer,
         primary: &ConnectionRef,
@@ -662,6 +668,7 @@ impl ReviewRequests {
             .collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn local_existing_targets(&self) -> Vec<(ConnectionRef, PathBuf)> {
         std::iter::once(&self.primary)
             .chain(&self.additional)

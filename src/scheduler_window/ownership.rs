@@ -35,23 +35,34 @@ pub enum Message {
 
 pub(super) struct Route {
     reference: ConnectionRef,
-    login: SavedLogin,
-    jump: Option<SavedLogin>,
+    local_logins: Option<(SavedLogin, Option<SavedLogin>)>,
     pins: Vec<(Endpoint, HostKey)>,
 }
 
 impl Route {
-    fn capture(reference: ConnectionRef, connection: &Connection) -> Result<Self, String> {
-        if ConnectionRef::from(connection) != reference {
-            return Err(CHANGED.into());
-        }
+    fn capture(reference: ConnectionRef, local: Option<&Connection>) -> Result<Self, String> {
+        let local_logins = if reference.shared_identity().is_some() {
+            reference.require_installed_shared_route()?;
+            None
+        } else {
+            let local = local
+                .filter(|local| ConnectionRef::from(*local) == reference)
+                .ok_or(CHANGED)?;
+            if local.incognito || !local.isolation.is_none() {
+                return Err(
+                    "This saved connection requires privacy or isolation unavailable to jobs."
+                        .into(),
+                );
+            }
+            Some((local.login.clone(), local.jump.clone()))
+        };
         let trust = ssh_connection::trust_store()
             .map_err(|_| "Could not access the SSH host-key trust store.")?;
+        let trust = reference.strict_trust(trust)?;
         let pins = sync::pins(&reference, &trust).map_err(|error| error.to_string())?;
         Ok(Self {
             reference,
-            login: connection.login.clone(),
-            jump: connection.jump.clone(),
+            local_logins,
             pins,
         })
     }
@@ -63,17 +74,26 @@ impl Route {
     pub(super) fn authorize(&self, sudo: SudoMode) -> Result<(), &'static str> {
         let policy = ClipboardPolicy::load();
         self.check_policy(&policy, sudo)?;
-        let store = profile::connections_path()
-            .and_then(Store::open)
-            .map_err(|_| CHANGED)?;
+        if let Some((login, jump)) = &self.local_logins {
+            let store = profile::connections_path()
+                .and_then(Store::open)
+                .map_err(|_| CHANGED)?;
+            let saved = store.get(self.reference.id).ok_or(CHANGED)?;
+            if &saved.login != login || &saved.jump != jump {
+                return Err(CHANGED);
+            }
+            if saved.incognito || !saved.isolation.is_none() {
+                return Err(
+                    "This saved connection requires privacy or isolation unavailable to jobs.",
+                );
+            }
+        } else {
+            self.reference
+                .require_installed_shared_route()
+                .map_err(|_| CHANGED)?;
+        }
         let trust = ssh_connection::trust_store().map_err(|_| CHANGED)?;
-        self.check_route(&store, &trust)
-    }
-
-    fn check_route(&self, store: &Store, trust: &TrustStore) -> Result<(), &'static str> {
-        let saved = store.get(self.reference.id).ok_or(CHANGED)?;
-        self.check_saved_logins(saved)?;
-        self.check_pins(trust)
+        self.check_pins(&trust)
     }
 
     fn check_policy(&self, policy: &ClipboardPolicy, sudo: SudoMode) -> Result<(), &'static str> {
@@ -96,16 +116,6 @@ impl Route {
                 .any(|(endpoint, _)| !access.allows(endpoint.wire_host().as_ref(), endpoint.port()))
         {
             return Err(DENIED);
-        }
-        Ok(())
-    }
-
-    fn check_saved_logins(&self, saved: &Connection) -> Result<(), &'static str> {
-        if saved.login != self.login || saved.jump != self.jump {
-            return Err(CHANGED);
-        }
-        if saved.incognito || !saved.isolation.is_none() {
-            return Err("This saved connection requires privacy or isolation unavailable to jobs.");
         }
         Ok(())
     }
@@ -280,13 +290,12 @@ impl SchedulerView {
     pub(crate) fn begin_ownership_review(
         &mut self,
         kind: Kind,
-        connection: &Connection,
+        connection: Option<&Connection>,
     ) -> Result<(), String> {
         let (reference, sudo) = self
             .ownership_target()
             .ok_or("Choose one saved SSH connection.")?;
         let route = Route::capture(reference.clone(), connection)?;
-        route.check_saved_logins(connection)?;
         self.ownership_review = Some(Review::new(route, kind, self.draft.source, sudo));
         Ok(())
     }
@@ -472,6 +481,7 @@ mod tests {
         let login = saved_login("target.example");
         let jump = Some(saved_login("jump.example"));
         let reference = ConnectionRef {
+            teamwork: None,
             id: 1,
             target: login.endpoint.clone(),
             jump: jump.as_ref().map(|login| login.endpoint.clone()),
@@ -482,8 +492,7 @@ mod tests {
             .collect();
         Route {
             reference,
-            login,
-            jump,
+            local_logins: Some((login, jump)),
             pins,
         }
     }

@@ -1,5 +1,7 @@
 //! Reusable language choices for snippet editors.
 
+pub(crate) mod mix;
+
 pub(crate) const MAX_CUSTOM: usize = 128;
 
 const BUILT_INS: &[&str] = &[
@@ -21,6 +23,7 @@ const BUILT_INS: &[&str] = &[
     "toml",
     "properties",
     "html",
+    "css",
     "markdown",
     "asciidoctor",
     "dockerfile",
@@ -32,7 +35,12 @@ pub(super) fn choices(custom: &[String]) -> Vec<String> {
     BUILT_INS
         .iter()
         .map(|language| (*language).to_owned())
-        .chain(custom.iter().cloned())
+        .chain(
+            custom
+                .iter()
+                .filter(|language| !built_in(language))
+                .cloned(),
+        )
         .collect()
 }
 
@@ -76,7 +84,8 @@ pub(crate) fn built_in(token: &str) -> bool {
 pub(crate) fn valid(custom: &[String]) -> bool {
     custom.len() <= MAX_CUSTOM
         && custom.iter().enumerate().all(|(index, token)| {
-            !built_in(token)
+            // Older profiles and backups could save CSS as a custom language.
+            (!built_in(token) || token == "css")
                 && normalize(token).as_ref() == Some(token)
                 && !custom[..index].contains(token)
         })

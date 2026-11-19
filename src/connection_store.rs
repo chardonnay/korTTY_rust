@@ -25,8 +25,9 @@ mod os_badge;
 mod terminal;
 mod window_geometry;
 pub(crate) use terminal::{
-    ANSI_NAMES, JAVA_ANSI_FIELDS, MAX_TERMINAL_COLUMNS, MAX_TERMINAL_ROWS, MIN_TERMINAL_COLUMNS,
-    MIN_TERMINAL_ROWS, TerminalOverrides, ThemeOverride,
+    ANSI_NAMES, AiAssignments, JAVA_ANSI_FIELDS, MAX_ASSIGNED_AI_SKILLS, MAX_TERMINAL_COLUMNS,
+    MAX_TERMINAL_ROWS, MIN_TERMINAL_COLUMNS, MIN_TERMINAL_ROWS, TerminalAppearance,
+    TerminalOverrides, ThemeOverride,
 };
 pub(crate) use terminal::{MAX_PASTE_LINE_DELAY_MS, validate_paste_line_delay};
 pub(crate) mod teamwork;
@@ -103,6 +104,12 @@ pub(crate) struct SerialProfile {
     pub(crate) strict_terminal_mode: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) highlight_set: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) terminal_effect: Option<crate::terminal_effects::Selection>,
+    #[serde(default, skip_serializing_if = "AiAssignments::is_empty")]
+    pub(crate) terminal_ai: AiAssignments,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) appearance: Option<Box<TerminalAppearance>>,
     #[serde(
         default,
         skip_serializing_if = "crate::session_journal::ConnectionConfig::is_default"
@@ -122,6 +129,9 @@ impl SerialProfile {
             paste_line_delay_ms: None,
             strict_terminal_mode: None,
             highlight_set: None,
+            terminal_effect: None,
+            terminal_ai: AiAssignments::default(),
+            appearance: None,
             journal: Default::default(),
         }
     }
@@ -168,6 +178,10 @@ impl SerialProfile {
 
     pub(crate) fn validate(&self) -> io::Result<()> {
         self.journal.validate()?;
+        self.terminal_ai.validate()?;
+        if let Some(appearance) = &self.appearance {
+            appearance.validate()?;
+        }
         validate_paste_line_delay(self.paste_line_delay_ms)?;
         if self
             .highlight_set

@@ -3237,6 +3237,7 @@ mod generation_tests {
         let legacy = scope(&job(action.clone())).unwrap();
         let mut grouped = action;
         grouped.target_groups = Some(crate::scheduler_window::TargetGroups {
+            group_order: Vec::new(),
             groups: vec!["Fleet".into()],
             explicit: Vec::new(),
         });

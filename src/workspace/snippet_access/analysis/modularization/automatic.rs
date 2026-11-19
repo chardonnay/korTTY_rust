@@ -8,6 +8,7 @@ pub(in crate::workspace::snippet_access::analysis) struct Prepared {
     pub(in crate::workspace::snippet_access::analysis) request: PlanRequest,
     source: SavedSource,
     local_profile_revision: Option<[u8; 32]>,
+    includes_additional_instructions: bool,
 }
 
 struct SavedSource {
@@ -25,6 +26,7 @@ pub(in crate::workspace::snippet_access::analysis) struct Approved {
     transport: local_ai::Profile,
     profile: ProfileRef,
     local_profile_revision: Option<[u8; 32]>,
+    includes_additional_instructions: bool,
 }
 
 pub(in crate::workspace::snippet_access::analysis) struct Deferred {
@@ -88,21 +90,23 @@ impl Prepared {
         snapshot: &Snapshot,
         source: &Source,
         rendered_hash: &str,
-        (skills, profile, local_profile_revision): (&str, &local_ai::Profile, Option<[u8; 32]>),
+        (instructions, skills, profile, local_profile_revision): (
+            &str,
+            &str,
+            &local_ai::Profile,
+            Option<[u8; 32]>,
+        ),
     ) -> Result<Option<Self>, String> {
         let Ok(originals) = capture_originals(window, page, snapshot) else {
             return Ok(None);
         };
-        let request = PlanRequest::new(
-            snapshot,
-            &source.report_language_code,
-            &page.instructions,
-            skills,
-        )?
-        .with_profile(profile);
+        let request =
+            PlanRequest::new(snapshot, &source.report_language_code, instructions, skills)?
+                .with_profile(profile);
         Ok(Some(Self {
             request,
             local_profile_revision,
+            includes_additional_instructions: !instructions.trim().is_empty(),
             source: SavedSource {
                 library: window.latest_library().clone(),
                 originals,
@@ -135,6 +139,7 @@ impl Prepared {
             transport,
             profile,
             local_profile_revision: self.local_profile_revision,
+            includes_additional_instructions: self.includes_additional_instructions,
         }
     }
 }
@@ -281,6 +286,7 @@ impl Workspace {
             && !self.scheduler_draining
             && !self.hosted_close_locks(id);
         let config = self.ai_configuration();
+        let instructions_enabled = self.window_settings.snippet_ai_additional_instructions();
         let token = self.allocate();
         let surface = self.snippets.get_mut(&id)?;
         let page = surface.analysis.page_mut(subject)?;
@@ -289,6 +295,13 @@ impl Workspace {
             return None;
         }
         let started = (|| {
+            if deferred.approved.includes_additional_instructions
+                && !page.allows_additional_instructions(instructions_enabled)
+            {
+                return Err(
+                    "Additional instructions are disabled. Review a new split request.".into(),
+                );
+            }
             deferred.revalidate(&surface.window, page, config.as_ref())?;
             let claim = apply::Claim::new(&surface.window, subject)?;
             let request = deferred

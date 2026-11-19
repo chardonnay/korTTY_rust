@@ -585,6 +585,7 @@ mod tests {
             };
             let plan = Plan::new(settings, run, Policy::default());
             let reference = ConnectionRef {
+                teamwork: None,
                 id: 9,
                 target: LoginTarget {
                     host: "fixture.example".into(),
@@ -602,6 +603,7 @@ mod tests {
             let blocked = TargetJournal::start(
                 &plan,
                 &ConnectionRef {
+                    teamwork: None,
                     id: 10,
                     ..reference
                 },

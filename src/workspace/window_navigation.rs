@@ -107,6 +107,12 @@ impl Workspace {
         }
         self.dismiss_terminal_context(id);
         self.dismiss_journal_context_for_window(id);
+        if self.windows.get(&id).is_some_and(|window| {
+            window.active_tab_id() != Some(tab_id)
+                && window.tabs.iter().any(|tab| tab.id() == tab_id)
+        }) {
+            self.cancel_unfocused_inline_completion(id);
+        }
         if let Some(window) = self.windows.get_mut(&id)
             && let Some(index) = window.tabs.iter().position(|tab| tab.id() == tab_id)
         {

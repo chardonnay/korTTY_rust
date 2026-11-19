@@ -4,7 +4,7 @@ use iced::{Task, window};
 use kortty_terminal::{TerminalProfile, TextEncoding};
 
 use crate::session::{Frame, PromptState, SessionId, Status as SessionStatus, agent_takeover};
-use crate::terminal_agent::design::{Approval, Arrangement, Status};
+use crate::terminal_agent::design::Approval;
 use crate::terminal_view::agent_cursor::{Binding, Key, Message, Review};
 
 use super::{Cancel, Desktop, PaneSession, Phase, Purpose, Run, RunTarget, Target, Workspace};
@@ -97,13 +97,8 @@ impl Workspace {
         }
         // Floating history, effects and graphics can cover the reviewed command.
         // In these combinations the Activity window keeps the approval visible.
-        let inline = !matches!(
-            run.design.arrangement,
-            Arrangement::PictureInPicture | Arrangement::Adaptive
-        ) && !matches!(
-            run.design.status,
-            Status::TopBar | Status::Hud | Status::Spotlight | Status::Toasts | Status::Orbit
-        ) && pane.effect.is_none()
+        let inline = run.design.cursor_overlay()
+            && pane.effect.is_none()
             && frame.screen.images.is_empty()
             && frame.typeahead.is_none()
             && frame.shell_activity().code_prompt.state != PromptState::Busy;

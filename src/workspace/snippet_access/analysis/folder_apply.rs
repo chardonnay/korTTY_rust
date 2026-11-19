@@ -264,6 +264,14 @@ pub(super) struct Review {
 }
 
 impl Review {
+    pub(super) fn summary_event(
+        &mut self,
+        run: SnippetId,
+        event: crate::snippet_window::diff_summary::Event,
+    ) -> Option<u16> {
+        self.change.summary_event(run, event)
+    }
+
     fn new(record: &Record, revision: Revision, proposals: Proposals) -> Self {
         let change = super::apply::Review::new(record, &proposals.files[0].run);
         Self {

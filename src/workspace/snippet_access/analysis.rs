@@ -112,6 +112,21 @@ pub(super) struct Tabs {
     export: Option<reports::Page>,
 }
 
+impl Tabs {
+    pub(super) fn blocks_automatic_completion(&self) -> bool {
+        self.pages.iter().any(|page| {
+            matches!(
+                page.state,
+                State::Requesting(_)
+                    | State::Drawing(_)
+                    | State::Applying(_)
+                    | State::FolderApplying(_)
+                    | State::Modularization(_)
+            )
+        })
+    }
+}
+
 struct Page {
     subject: Subject,
     name: String,
@@ -123,6 +138,7 @@ struct Page {
     record: Option<SnippetId>,
     selections: HashMap<SnippetId, Selection>,
     hardening: analysis::hardening::Draft,
+    apply_migration: Option<crate::snippet_window::ai_assist::migration::Plan>,
     instructions: String,
     skills: Vec<(u64, String)>,
     selected_skills: Vec<u64>,
@@ -262,8 +278,11 @@ impl Review {
         window: &SnippetWindow,
         page: &Page,
         config: Option<&Arc<Configuration>>,
+        instructions_enabled: bool,
     ) -> bool {
         config.is_some_and(|config| Arc::ptr_eq(config, &self.config))
+            && (self.instructions.is_empty()
+                || page.allows_additional_instructions(instructions_enabled))
             && self.previous == page.record().map(|record| record.id)
             && source_snapshot(window, page).is_ok_and(|snapshot| {
                 let same_revision = self.verification.is_none()
@@ -317,6 +336,7 @@ struct Run {
 
 #[derive(Clone)]
 pub(crate) enum Event {
+    Overview(Result<Arc<crate::snippet_analysis::store::overview::Overview>, String>),
     History(Subject, u64, Result<Arc<History>, String>, HistoryChange),
     Analyzed(Subject, u64, Result<Analysis, String>),
     Streaming(Subject, u64, live::Preview),
@@ -357,12 +377,15 @@ pub(crate) enum HistoryChange {
 }
 
 pub(super) struct Presentation {
+    pub(super) snippet_instructions_enabled: bool,
     pub(super) side_panel: analysis::panel::Preferences,
     pub(super) side_space: f32,
     pub(super) apply_progress_dock: bool,
     pub(super) auto_diagram: bool,
     pub(super) auto_plan: bool,
     pub(super) report_font: Option<u8>,
+    pub(super) ai_diff_font: u8,
+    pub(super) ai_diff_summary_divider: Option<u16>,
     pub(super) diagram_options_expanded: bool,
     pub(super) project_diagram_visible: bool,
     pub(super) snippet_diagram_horizontal: bool,
@@ -391,6 +414,20 @@ impl Tabs {
 
     pub(super) fn export_open(&self) -> bool {
         self.export.is_some()
+    }
+
+    pub(super) fn shows_ai_diff(&self) -> bool {
+        !self.export_open()
+            && self
+                .active
+                .and_then(|subject| self.page(subject))
+                .is_some_and(|page| {
+                    matches!(
+                        page.state,
+                        State::ReviewApply(_) | State::ReviewFolderApply(_)
+                    ) || matches!(&page.state, State::Modularization(pane)
+                        if matches!(pane.as_ref(), modularization::Pane::Review(_)))
+                })
     }
 
     fn page(&self, subject: Subject) -> Option<&Page> {
@@ -472,6 +509,18 @@ impl Tabs {
 }
 
 impl Page {
+    fn allows_additional_instructions(&self, enabled: bool) -> bool {
+        matches!(self.subject, Subject::Folder(_)) || enabled
+    }
+
+    fn additional_instructions(&self, enabled: bool) -> &str {
+        match self.subject {
+            Subject::Folder(_) => &self.instructions,
+            Subject::Snippet(_) if enabled => self.instructions.trim(),
+            Subject::Snippet(_) => "",
+        }
+    }
+
     fn loading(subject: Subject, token: u64) -> Self {
         Self {
             subject,
@@ -484,6 +533,7 @@ impl Page {
             record: None,
             selections: HashMap::new(),
             hardening: analysis::hardening::Draft::new(Default::default()),
+            apply_migration: None,
             instructions: String::new(),
             skills: Vec::new(),
             selected_skills: Vec::new(),
@@ -645,6 +695,8 @@ impl Page {
                 self.dock_saved_progress || content.follows_live(&self.session_apply_runs)
             });
         analysis::View {
+            ai_diff_font: presentation.ai_diff_font,
+            ai_diff_summary_divider: presentation.ai_diff_summary_divider,
             side_open: self.can_dock(window)
                 && presentation.side_panel.visible()
                 && presentation
@@ -685,7 +737,9 @@ impl Page {
             progress_dock_width: None,
             stale: self.stale(),
             status: self.status.as_deref(),
-            instructions: &self.instructions,
+            instructions: self
+                .allows_additional_instructions(presentation.snippet_instructions_enabled)
+                .then_some(self.instructions.as_str()),
             skills: &self.skills,
             selected_skills: &self.selected_skills,
             can_export: self.record().is_some(),
@@ -1053,6 +1107,7 @@ impl Workspace {
             return Task::none();
         }
         let cli_allowed = remote::cli_allowed(&self.clipboard.policy);
+        let instructions_enabled = self.window_settings.snippet_ai_additional_instructions();
         if self
             .snippets
             .get(&id)
@@ -1224,6 +1279,21 @@ impl Workspace {
                 }
                 return Task::none();
             }
+            Action::AiDiffFont(size) => {
+                use crate::snippet_window::ai_assist::FontView;
+                let reviewing = self
+                    .snippets
+                    .get(&id)
+                    .is_some_and(|surface| surface.analysis.shows_ai_diff());
+                if reviewing
+                    && FontView::Diff.bounds().contains(&size)
+                    && self.window_settings.snippet_ai_diff_font_size != Some(size)
+                {
+                    self.window_settings.snippet_ai_diff_font_size = Some(size);
+                    self.save_window_settings(Some(id));
+                }
+                return Task::none();
+            }
             Action::AutoDiagram(enabled) => {
                 if self.window_settings.snippet_analysis_auto_diagram != enabled {
                     self.window_settings.snippet_analysis_auto_diagram = enabled;
@@ -1313,6 +1383,7 @@ impl Workspace {
                     }
                     Action::Instructions(value)
                         if matches!(page.state, State::Ready)
+                            && page.allows_additional_instructions(instructions_enabled)
                             && value.len() <= MAX_INSTRUCTIONS_BYTES =>
                     {
                         page.instructions = value
@@ -1474,6 +1545,7 @@ impl Workspace {
         let auto_plan = self.window_settings.snippet_analysis_auto_modularization;
         let vault_revision = self.vault_change_revision();
         let cli_allowed = remote::cli_allowed(&self.clipboard.policy);
+        let instructions_enabled = self.window_settings.snippet_ai_additional_instructions();
         let Some(surface) = self.snippets.get_mut(&id) else {
             return Task::none();
         };
@@ -1488,6 +1560,7 @@ impl Workspace {
         page.suggest_skills(&surface.window, config.as_deref());
         let review = (|| {
             page.refresh(&surface.window)?;
+            let instructions = page.additional_instructions(instructions_enabled);
             let config = config.ok_or("AI features are disabled or unavailable.")?;
             let profile = page
                 .selected_profile(&config, cli_allowed)
@@ -1539,18 +1612,14 @@ impl Workspace {
                 })
                 .transpose()?;
             let (request, remote) = if let Some(cli) = &cli {
-                let (request, replacements) = cli.prepare(
-                    &snapshot,
-                    REPORT_LANGUAGE,
-                    &page.instructions,
-                    &guidance.text,
-                )?;
+                let (request, replacements) =
+                    cli.prepare(&snapshot, REPORT_LANGUAGE, instructions, &guidance.text)?;
                 (request, Some(replacements))
             } else if transport.is_remote() {
                 let (request, masking) = remote::prepare(
                     &snapshot,
                     REPORT_LANGUAGE,
-                    &page.instructions,
+                    instructions,
                     &guidance.text,
                     &transport,
                     self.vault.as_ref(),
@@ -1559,13 +1628,8 @@ impl Workspace {
                 (request, Some(masking.replacements))
             } else {
                 (
-                    Request::new(
-                        &snapshot,
-                        REPORT_LANGUAGE,
-                        &page.instructions,
-                        &guidance.text,
-                    )?
-                    .with_profile(&transport),
+                    Request::new(&snapshot, REPORT_LANGUAGE, instructions, &guidance.text)?
+                        .with_profile(&transport),
                     None,
                 )
             };
@@ -1580,7 +1644,7 @@ impl Workspace {
                             &config,
                             profile.id,
                             root,
-                            &page.instructions,
+                            instructions,
                             &rendered,
                             limit,
                         )
@@ -1616,6 +1680,7 @@ impl Workspace {
                     &source,
                     &rendered_hash,
                     (
+                        instructions,
                         &guidance.text,
                         &transport,
                         reviewed_local_profile_revision(&config, &profile_reference, &transport)?,
@@ -1652,7 +1717,7 @@ impl Workspace {
                 profile_reference,
                 previous: page.record().map(|record| record.id),
                 rendered_hash,
-                instructions: page.instructions.clone(),
+                instructions: instructions.to_owned(),
                 verification: None,
                 knowledge,
                 remote,
@@ -1682,6 +1747,7 @@ impl Workspace {
             .filter(|_| !self.exiting && !self.scheduler_draining);
         let auto_diagram = self.window_settings.snippet_analysis_auto_diagram;
         let auto_plan = self.window_settings.snippet_analysis_auto_modularization;
+        let instructions_enabled = self.window_settings.snippet_ai_additional_instructions();
         let vault_revision = self.vault_change_revision();
         let token = self.allocate();
         let policy = &self.clipboard.policy;
@@ -1704,11 +1770,12 @@ impl Workspace {
         {
             return Task::none();
         }
-        let current = review.matches_snapshot(&surface.window, page, config.as_ref())
-            && review
-                .plan
-                .as_ref()
-                .is_none_or(|plan| auto_plan && plan.matches_source(&surface.window, page));
+        let current =
+            review.matches_snapshot(&surface.window, page, config.as_ref(), instructions_enabled)
+                && review
+                    .plan
+                    .as_ref()
+                    .is_none_or(|plan| auto_plan && plan.matches_source(&surface.window, page));
         let State::Review(review) = std::mem::replace(&mut page.state, State::Ready) else {
             unreachable!("checked review state");
         };
@@ -1944,6 +2011,15 @@ impl Workspace {
         event: Event,
     ) -> Task<Message> {
         match event {
+            Event::Overview(result) => {
+                if let Some(surface) = self.snippets.get_mut(&id) {
+                    surface.overview_pending = false;
+                    if let Ok(overview) = result {
+                        surface.window.refresh_library_overview(overview);
+                    }
+                }
+                Task::none()
+            }
             Event::Knowledge(subject, token, result) => {
                 self.snippet_knowledge_event(id, subject, token, result)
             }
@@ -2816,6 +2892,7 @@ mod tests {
             export: None,
         };
         let presentation = |space, enabled| Presentation {
+            snippet_instructions_enabled: false,
             side_panel: analysis::panel::Preferences {
                 visible: Some(true),
                 width: Some(520),
@@ -2825,6 +2902,8 @@ mod tests {
             auto_diagram: false,
             auto_plan: false,
             report_font: None,
+            ai_diff_font: 14,
+            ai_diff_summary_divider: None,
             diagram_options_expanded: false,
             project_diagram_visible: true,
             snippet_diagram_horizontal: false,
@@ -2922,12 +3001,15 @@ mod tests {
             let page = Page::loading(subject, 1);
             let view = page.view(
                 Presentation {
+                    snippet_instructions_enabled: false,
                     side_panel: Default::default(),
                     side_space: 0.0,
                     apply_progress_dock: true,
                     auto_diagram: true,
                     auto_plan: false,
                     report_font: None,
+                    ai_diff_font: 14,
+                    ai_diff_summary_divider: None,
                     diagram_options_expanded: false,
                     project_diagram_visible: false,
                     snippet_diagram_horizontal: false,
@@ -3111,6 +3193,32 @@ mod tests {
         assert!(second.selected_skills.is_empty());
         first.configure(None);
         assert!(first.selected_skills.is_empty());
+    }
+
+    #[test]
+    fn snippet_analysis_instructions_follow_preference_and_folder_keeps_its_input() {
+        let id = SnippetId::new().unwrap();
+        let mut snippet = Page::loading(Subject::Snippet(id), 1);
+        snippet.instructions = "  Preserve the shell dialect.  ".into();
+        assert!(!snippet.allows_additional_instructions(false));
+        assert_eq!(snippet.additional_instructions(false), "");
+        assert_eq!(
+            snippet.additional_instructions(true),
+            "Preserve the shell dialect."
+        );
+        snippet.instructions = "   ".into();
+        assert_eq!(snippet.additional_instructions(true), "");
+
+        let folder_id =
+            crate::snippets::folders::Id::from_java_uuid("12345678-1234-1234-1234-123456789abc")
+                .unwrap();
+        let mut folder = Page::loading(Subject::Folder(folder_id), 1);
+        folder.instructions = "Review the dependency order.".into();
+        assert!(folder.allows_additional_instructions(false));
+        assert_eq!(
+            folder.additional_instructions(false),
+            "Review the dependency order."
+        );
     }
 
     #[test]

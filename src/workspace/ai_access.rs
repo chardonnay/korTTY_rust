@@ -260,7 +260,11 @@ impl Workspace {
         if self.uses_legacy_journal_profile() {
             return false;
         }
-        matches!(self.ai_manager.config.journal_profile(false), Some(Ok(_)))
+        self.ai_manager
+            .config
+            .journal_summary_server_default_id()
+            .is_some()
+            || matches!(self.ai_manager.config.journal_profile(false), Some(Ok(_)))
     }
 
     pub(super) fn uses_legacy_journal_profile(&self) -> bool {
@@ -795,6 +799,7 @@ mod tests {
                     working_directory: None,
                     shell_integration: false,
                     emulation: "xterm-256color".into(),
+                    terminal_effect: None,
                     terminal: Default::default(),
                 })
                 .unwrap()

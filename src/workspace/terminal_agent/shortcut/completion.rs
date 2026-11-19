@@ -1,4 +1,4 @@
-//! Local alias choices and asynchronous, read-only prompt history.
+//! Local alias choices and asynchronous prompt history.
 
 use std::fmt;
 use std::sync::{
@@ -7,15 +7,16 @@ use std::sync::{
 };
 
 use iced::keyboard::{Key, Modifiers, key::Named};
-use iced::widget::{self, Id, button, column, scrollable, text};
-use iced::{Element, Length, Task, window};
+use iced::widget::{self, Id, button, canvas, column, row, scrollable, text};
+use iced::{Element, Length, Size, Task, window};
 
+use crate::horizontal_divider::{self, Grow};
 use crate::session::{SessionId, ShortcutPrompt};
 use crate::terminal_agent::Mode;
 use crate::terminal_agent::history::{self as store, Entry, Snapshot};
 use crate::terminal_agent::shortcut::shortcut_character;
 
-use super::{Capture, Desktop, Workspace};
+use super::{Capture, Desktop, HISTORY_POPUP_HEIGHT, HISTORY_POPUP_WIDTH, Workspace};
 use crate::workspace::terminal_agent::history;
 
 static NEXT_COMPLETION: AtomicU64 = AtomicU64::new(1);
@@ -35,6 +36,14 @@ pub struct Ticket {
 pub enum Message {
     Choose(Ticket, usize),
     Loaded(Ticket, Arc<Result<Snapshot, String>>),
+    ResizeHistory(Ticket, HistoryResize),
+}
+
+#[derive(Clone, Copy)]
+pub enum HistoryResize {
+    Width(f32),
+    Height(f32),
+    Finish,
 }
 
 impl fmt::Debug for Message {
@@ -48,6 +57,45 @@ pub(super) struct Completion {
     options: Options,
     selected: usize,
     scroll: Id,
+    history_size: HistorySize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct HistorySize {
+    width: u16,
+    height: u16,
+}
+
+impl HistorySize {
+    fn new(width: Option<u16>, height: Option<u16>) -> Self {
+        Self {
+            width: width.unwrap_or(460),
+            height: height.unwrap_or(260),
+        }
+    }
+
+    fn pane_limit(bounds: Size) -> Size {
+        // Leave the draft and part of the terminal visible in narrow or short splits.
+        Size::new((bounds.width - 12.0).max(0.0), bounds.height * 0.75)
+    }
+
+    fn apply(&mut self, resize: HistoryResize) {
+        match resize {
+            HistoryResize::Width(width) if width.is_finite() => {
+                self.width = width.round().clamp(
+                    f32::from(*HISTORY_POPUP_WIDTH.start()),
+                    f32::from(*HISTORY_POPUP_WIDTH.end()),
+                ) as u16;
+            }
+            HistoryResize::Height(height) if height.is_finite() => {
+                self.height = height.round().clamp(
+                    f32::from(*HISTORY_POPUP_HEIGHT.start()),
+                    f32::from(*HISTORY_POPUP_HEIGHT.end()),
+                ) as u16;
+            }
+            _ => {}
+        }
+    }
 }
 
 enum Options {
@@ -68,7 +116,12 @@ impl Options {
 }
 
 impl Completion {
-    pub(super) fn view(&self, owner: window::Id, private: bool) -> Option<Element<'_, Desktop>> {
+    pub(super) fn view(
+        &self,
+        owner: window::Id,
+        private: bool,
+        bounds: Size,
+    ) -> Option<Element<'_, Desktop>> {
         if self.ticket.owner != owner || self.ticket.private != private {
             return None;
         }
@@ -84,7 +137,7 @@ impl Completion {
                 for (index, entry) in entries.iter().enumerate() {
                     list = list.push(self.button(index, history::label(entry)));
                 }
-                "Recent agent prompts"
+                return Some(self.history_view(list, bounds));
             }
             Options::Loading => return Some(text("Loading recent agent prompts…").size(13).into()),
             Options::Notice(notice) => return Some(text(*notice).size(13).into()),
@@ -100,6 +153,68 @@ impl Completion {
             .spacing(4)
             .into(),
         )
+    }
+
+    fn history_view<'a>(
+        &self,
+        list: widget::Column<'a, Desktop>,
+        bounds: Size,
+    ) -> Element<'a, Desktop> {
+        let limit = HistorySize::pane_limit(bounds);
+        let width = f32::from(self.history_size.width).min(limit.width);
+        let height = f32::from(self.history_size.height).min(limit.height);
+        let ticket = self.ticket;
+        let finish = Desktop::AgentShortcut(Message::ResizeHistory(ticket, HistoryResize::Finish));
+        let top = (height >= f32::from(*HISTORY_POPUP_HEIGHT.start())).then(|| {
+            canvas(
+                horizontal_divider::program(
+                    height,
+                    Grow::Up,
+                    move |height| {
+                        Desktop::AgentShortcut(Message::ResizeHistory(
+                            ticket,
+                            HistoryResize::Height(height.min(limit.height.floor())),
+                        ))
+                    },
+                    Some(finish.clone()),
+                )
+                .scoped(ticket.nonce),
+            )
+            .width(Length::Fill)
+            .height(horizontal_divider::WIDTH)
+        });
+        let right = (width >= f32::from(*HISTORY_POPUP_WIDTH.start())).then(|| {
+            canvas(
+                horizontal_divider::program(
+                    width,
+                    Grow::Right,
+                    move |width| {
+                        Desktop::AgentShortcut(Message::ResizeHistory(
+                            ticket,
+                            HistoryResize::Width(width.min(limit.width.floor())),
+                        ))
+                    },
+                    Some(finish),
+                )
+                .scoped(ticket.nonce),
+            )
+            .width(horizontal_divider::WIDTH)
+            .height(Length::Fill)
+        });
+        let body = column![
+            text("Recent agent prompts").size(13),
+            scrollable(list)
+                .id(self.scroll.clone())
+                .height(Length::Fill),
+            text("Use arrow keys to choose, Enter to insert, or Esc to dismiss.").size(12),
+        ]
+        .spacing(4)
+        .width(Length::Fill)
+        .height(Length::Fill);
+        column![top, row![body, right].height(Length::Fill)]
+            .width(width)
+            .height(height)
+            .into()
     }
 
     fn button(&self, index: usize, label: String) -> Element<'static, Desktop> {
@@ -275,6 +390,10 @@ impl Workspace {
             options,
             selected: 0,
             scroll: Id::unique(),
+            history_size: HistorySize::new(
+                self.window_settings.agent_history_popup_width,
+                self.window_settings.agent_history_popup_height,
+            ),
         });
         Some(task)
     }
@@ -284,7 +403,9 @@ impl Workspace {
         message: Message,
     ) -> Task<Desktop> {
         let ticket = match &message {
-            Message::Choose(ticket, _) | Message::Loaded(ticket, _) => *ticket,
+            Message::Choose(ticket, _)
+            | Message::Loaded(ticket, _)
+            | Message::ResizeHistory(ticket, _) => *ticket,
         };
         let live = self.agent_completion_live(ticket);
         let Some(capture) = self
@@ -331,6 +452,31 @@ impl Workspace {
                 }
             }
             Message::Loaded(..) => {}
+            Message::ResizeHistory(_, resize) => {
+                if let Some(completion) = capture.completion.as_mut()
+                    && !ticket.private
+                    && matches!(completion.options, Options::History(_))
+                {
+                    let size = &mut completion.history_size;
+                    if matches!(resize, HistoryResize::Finish) {
+                        let previous = HistorySize::new(
+                            self.window_settings.agent_history_popup_width,
+                            self.window_settings.agent_history_popup_height,
+                        );
+                        if size.width != previous.width {
+                            self.window_settings.agent_history_popup_width = Some(size.width);
+                        }
+                        if size.height != previous.height {
+                            self.window_settings.agent_history_popup_height = Some(size.height);
+                        }
+                        if *size != previous {
+                            self.save_window_settings(Some(ticket.owner));
+                        }
+                    } else {
+                        size.apply(resize);
+                    }
+                }
+            }
         }
         Task::none()
     }
@@ -356,5 +502,43 @@ impl Workspace {
                             .as_ref()
                             .is_some_and(|draft| draft.aliases == aliases)
                 })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workspace::tab_titles::WindowSettings;
+
+    #[test]
+    fn history_popup_uses_java_defaults_and_bounds_each_resize() {
+        let mut size = HistorySize::new(None, None);
+        assert_eq!((size.width, size.height), (460, 260));
+        size.apply(HistoryResize::Width(680.5));
+        assert_eq!((size.width, size.height), (681, 260));
+        size.apply(HistoryResize::Height(1200.0));
+        size.apply(HistoryResize::Width(f32::NAN));
+        assert_eq!((size.width, size.height), (681, 900));
+        size.apply(HistoryResize::Width(220.0));
+        assert_eq!((size.width, size.height), (280, 900));
+    }
+
+    #[test]
+    fn narrow_pane_limits_display_without_losing_saved_dimensions() {
+        let settings = WindowSettings::decode(
+            br#"{"agent_history_popup_width":820,"agent_history_popup_height":500}"#,
+        )
+        .unwrap();
+        let serialized = serde_json::to_vec(&settings).unwrap();
+        let reopened = WindowSettings::decode(&serialized).unwrap();
+        let preferred = HistorySize::new(
+            reopened.agent_history_popup_width,
+            reopened.agent_history_popup_height,
+        );
+        assert_eq!((preferred.width, preferred.height), (820, 500));
+        assert_eq!(
+            HistorySize::pane_limit(Size::new(240.0, 160.0)),
+            Size::new(228.0, 120.0)
+        );
     }
 }

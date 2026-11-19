@@ -229,6 +229,68 @@ fn java_toolbar_legacy_defaults_and_intentionally_empty_layouts_remain_distinct(
 }
 
 #[test]
+fn java_toolbar_can_bind_an_unchanged_catalogue_of_unique_existing_profiles() {
+    let source = Scratch::new();
+    let local = Scratch::new();
+    let directory = Directory::open(&local.0, false).unwrap();
+    let existing = br#"<connections>
+        <connection><name>Saved SSH</name><host>saved.example</host><username>user</username><group>Ops</group></connection>
+        <connection><name>Saved shell</name><protocol>LOCAL_SHELL</protocol><group>Ops</group></connection>
+        <connection><name>Saved serial</name><protocol>SERIAL</protocol><serial><portName>COM19</portName></serial><group>Ops</group></connection>
+        <connection><name>Compare route</name><host>direct.example</host><username>user</username></connection>
+        <connection><name>Ambiguous alias</name><host>alias.example</host><username>user</username></connection>
+    </connections>"#;
+    let mut current = ConnectionPreview::java_backup(existing)
+        .unwrap()
+        .portable_java_backup()
+        .unwrap()
+        .0;
+    current.extend_from_slice(b"\n\n");
+    directory.publish_copy(CONNECTIONS, &current).unwrap();
+    let store = Store::open(local.0.join(CONNECTIONS)).unwrap();
+    let ids = store.direct_group_ids("Ops").collect::<Vec<_>>();
+    assert_eq!(ids.len(), 3);
+    let archive = br#"<connections>
+        <connection id="ssh"><name>Saved SSH</name><host>saved.example</host><username>user</username><group>Ops</group></connection>
+        <connection id="local"><name>Saved shell</name><protocol>LOCAL_SHELL</protocol><group>Ops</group></connection>
+        <connection id="serial"><name>Saved serial</name><protocol>SERIAL</protocol><serial><portName>COM19</portName></serial><group>Ops</group></connection>
+        <connection id="different-route"><name>Compare route</name><host>direct.example</host><username>user</username><jumpServer><enabled>true</enabled><host>jump.example</host><username>user</username></jumpServer></connection>
+        <connection id="alias-a"><name>Ambiguous alias</name><host>alias.example</host><username>user</username></connection>
+        <connection id="alias-b"><name>Ambiguous alias</name><host>alias.example</host><username>user</username></connection>
+    </connections>"#;
+    let settings = br#"<globalSettings><iconToolbar>
+        <entry id="1" kind="CONNECTION" section="CONNECTIONS" target="ssh"/>
+        <entry id="2" kind="CONNECTION" section="CONNECTIONS" target="local"/>
+        <entry id="3" kind="CONNECTION" section="CONNECTIONS" target="serial"/>
+        <entry id="4" kind="GROUP" section="CONNECTIONS" target="Ops"/>
+        <entry id="5" kind="CONNECTION" section="CONNECTIONS" target="different-route"/>
+        <entry id="6" kind="CONNECTION" section="CONNECTIONS" target="alias-a"/>
+        <entry id="7" kind="CONNECTION" section="CONNECTIONS" target="alias-b"/>
+    </iconToolbar></globalSettings>"#;
+    let inspect = || inspect_source(&source.0, settings, Some(archive));
+    queue_at(&local.0, inspect());
+    let changed = [current.as_slice(), b" "].concat();
+    directory.replace_file(CONNECTIONS, &changed).unwrap();
+    assert!(
+        ProfileLease::acquire(&local.0, || false)
+            .is_err_and(|error| error.to_string().contains("connections changed"))
+    );
+    discard_pending_java(&pending_java_cancellation(&local.0).unwrap().unwrap()).unwrap();
+    directory.replace_file(CONNECTIONS, &current).unwrap();
+    queue_at(&local.0, inspect());
+    drop(ProfileLease::acquire(&local.0, || false).unwrap());
+    assert_eq!(fs::read(local.0.join(CONNECTIONS)).unwrap(), current);
+    assert_eq!(
+        read_layout(&local.0)["connections"]["items"],
+        json!([
+            {"connection": ids[0]}, {"connection": ids[1]}, {"connection": ids[2]},
+            {"folder": "Ops"}, {"unavailable": {"connection": "different-route"}},
+            {"unavailable": {"connection": "alias-a"}}, {"unavailable": {"connection": "alias-b"}},
+        ])
+    );
+}
+
+#[test]
 fn java_toolbar_requires_the_reviewed_layout_and_catalogue_on_restart() {
     let source = Scratch::new();
     let local = Scratch::new();

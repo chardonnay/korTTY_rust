@@ -11,7 +11,7 @@ use crate::connection_store::{Store, group_suffix};
 use crate::connection_window::FolderRename;
 use crate::profile;
 
-use super::toolbar_item_context::{Context, Event as ItemEvent};
+use super::toolbar_item_context::{Context, Event as ItemEvent, Target as ItemTarget};
 use super::{Action, Icon, WorkspaceMessage, settings_window, wrap};
 
 pub(crate) mod java;
@@ -430,6 +430,7 @@ pub enum Edit {
     Drop(Group, Option<usize>),
     CancelDrag,
     ItemContext(ItemEvent),
+    AssignJavaTarget(ItemTarget, Item),
     Remove,
     Step(bool),
     Move(Group),
@@ -515,6 +516,7 @@ impl Draft {
             }
             Edit::CancelDrag => self.drag = None,
             Edit::ItemContext(_) => unreachable!("toolbar routes stamped item events first"),
+            Edit::AssignJavaTarget(..) => unreachable!("toolbar checks saved targets first"),
             Edit::Remove => {
                 if let Some(location) = self.selected.take()
                     && self.layout.remove(location).is_some()
@@ -561,6 +563,33 @@ impl Draft {
         self.layout.item(location).map(|item| (location, item))
     }
 
+    fn assign_java_target(&mut self, target: ItemTarget, destination: Item) {
+        let location = target.location;
+        if self.selected != Some(location) || self.item_context.target(location) != target {
+            return;
+        }
+        let Some(current) = self
+            .layout
+            .section_mut(location.group)
+            .items
+            .get_mut(location.index)
+        else {
+            return;
+        };
+        if matches!(
+            (&*current, &destination),
+            (
+                Item::Unavailable(JavaTarget::Connection(_)),
+                Item::Connection(_)
+            ) | (Item::Unavailable(JavaTarget::Folder(_)), Item::Folder(_))
+        ) && destination.valid(location.group)
+        {
+            *current = destination;
+            self.drag = None;
+            self.item_context.invalidate();
+        }
+    }
+
     pub(super) fn can_drop(&self, group: Group) -> bool {
         let item = match self.drag.as_ref() {
             Some(Drag::Existing(location)) => self.layout.item(*location),
@@ -586,6 +615,7 @@ pub(super) struct ConnectionChoice {
     pub(super) id: u64,
     pub(super) name: String,
     pub(super) incognito: bool,
+    pub(super) assignment_label: String,
 }
 
 pub(super) struct FolderChoice {
@@ -623,6 +653,12 @@ impl Toolbar {
     }
 
     pub(super) fn refresh_connections(&mut self, store: &Store) {
+        let label = |id, name: &str, detail: &str| {
+            let path = store
+                .group_of(id)
+                .map_or_else(|| name.to_owned(), |group| format!("{group} / {name}"));
+            format!("{path} · {detail} · #{id}")
+        };
         self.connections = store
             .connections()
             .iter()
@@ -630,6 +666,13 @@ impl Toolbar {
                 id: connection.id,
                 name: connection.name.clone(),
                 incognito: connection.incognito,
+                assignment_label: {
+                    let endpoint = toolbar_endpoint_label(&connection.login.endpoint);
+                    let route = connection.jump.as_ref().map_or(endpoint.clone(), |jump| {
+                        format!("{endpoint} via {}", toolbar_endpoint_label(&jump.endpoint))
+                    });
+                    label(connection.id, &connection.name, &format!("SSH {route}"))
+                },
             })
             .chain(
                 store
@@ -639,6 +682,11 @@ impl Toolbar {
                         id: profile.id,
                         name: profile.name.clone(),
                         incognito: false,
+                        assignment_label: label(
+                            profile.id,
+                            &profile.name,
+                            &format!("Local shell ({})", profile.shell),
+                        ),
                     }),
             )
             .chain(
@@ -649,6 +697,11 @@ impl Toolbar {
                         id: profile.id,
                         name: profile.name.clone(),
                         incognito: false,
+                        assignment_label: label(
+                            profile.id,
+                            &profile.name,
+                            &format!("Serial {}", profile.connection.device.display()),
+                        ),
                     }),
             )
             .collect();
@@ -659,6 +712,10 @@ impl Toolbar {
                 populated: store.direct_group_ids(path).next().is_some(),
             })
             .collect();
+        if let Some(draft) = &mut self.draft {
+            draft.drag = None;
+            draft.item_context.invalidate();
+        }
     }
 
     pub(super) fn rename_folder(
@@ -781,6 +838,21 @@ impl Toolbar {
                     return draft.item_context_event(event);
                 }
             }
+            Message::Edit(owner, Edit::AssignJavaTarget(target, destination))
+                if self.can_edit(owner) =>
+            {
+                let exists = match &destination {
+                    Item::Connection(id) => self.connections.iter().any(|choice| choice.id == *id),
+                    Item::Folder(path) => self
+                        .folders
+                        .iter()
+                        .any(|choice| choice.path == *path && choice.populated),
+                    _ => false,
+                };
+                if exists && let Some(draft) = &mut self.draft {
+                    draft.assign_java_target(target, destination);
+                }
+            }
             Message::Edit(owner, edit) if self.can_edit(owner) => {
                 if let Some(draft) = self.draft.as_mut() {
                     let reset_scroll = matches!(edit, Edit::Search(_) | Edit::Catalog(_));
@@ -897,6 +969,20 @@ impl Toolbar {
             },
             |result| wrap(super::Message::Toolbar(Message::Saved(result))),
         )
+    }
+}
+
+fn toolbar_endpoint_label(endpoint: &crate::ssh_dialog::LoginTarget) -> String {
+    let host = if endpoint.host.contains(':') {
+        format!("[{}]", endpoint.host)
+    } else {
+        endpoint.host.clone()
+    };
+    let address = format!("{host}:{}", endpoint.port);
+    if endpoint.username.is_empty() {
+        address
+    } else {
+        format!("{}@{address}", endpoint.username)
     }
 }
 

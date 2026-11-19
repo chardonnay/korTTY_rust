@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use iced::{Task, window};
+use iced::{Subscription, Task, futures::StreamExt as _, window};
 use kortty_windowing::{SystemSleepRequest, supports_system_sleep_prevention};
 
 use crate::profile;
@@ -14,6 +14,7 @@ pub(super) struct State {
     pending: Option<Pending>,
     failed_for_current_work: bool,
     connected_terminal: Option<SessionId>,
+    ai_active: bool,
     #[cfg(target_os = "macos")]
     terminal_activity: Option<kortty_macos::TerminalActivity>,
     #[cfg(target_os = "macos")]
@@ -33,6 +34,12 @@ enum Reason {
 #[derive(Clone, Debug)]
 pub enum Event {
     Acquired(u64, Result<Arc<SystemSleepRequest>, String>),
+    AiActivityChanged,
+}
+
+fn watch_ai_activity() -> impl iced::futures::Stream<Item = WorkspaceMessage> {
+    crate::local_ai::request_activity::watch()
+        .map(|()| wrap(Message::Power(Event::AiActivityChanged)))
 }
 
 pub(super) const fn label() -> &'static str {
@@ -44,6 +51,19 @@ pub(super) const fn label() -> &'static str {
 }
 
 impl Workspace {
+    pub(in crate::workspace) fn sleep_prevention_subscription(
+        &self,
+    ) -> Subscription<WorkspaceMessage> {
+        if supports_system_sleep_prevention()
+            && self.window_settings.prevent_system_sleep
+            && !self.exiting
+        {
+            Subscription::run(watch_ai_activity)
+        } else {
+            Subscription::none()
+        }
+    }
+
     #[cfg(target_os = "macos")]
     pub(in crate::workspace) fn start_terminal_activity(&mut self) {
         match kortty_macos::TerminalActivity::start() {
@@ -102,13 +122,15 @@ impl Workspace {
                 self.chrome.power.failed_for_current_work = false;
                 return release(self.take_sleep_request());
             }
-        } else if self.sleep_work_active() {
-            if let Some(pending) = &mut self.chrome.power.pending {
-                pending.reason = Reason::Enable(owner);
-                return Task::none();
-            }
-            return self.acquire_sleep_request(Reason::Enable(owner));
         } else {
+            self.refresh_ai_sleep_activity();
+            if self.sleep_work_active() {
+                if let Some(pending) = &mut self.chrome.power.pending {
+                    pending.reason = Reason::Enable(owner);
+                    return Task::none();
+                }
+                return self.acquire_sleep_request(Reason::Enable(owner));
+            }
             self.persist_sleep_prevention(true, owner);
         }
         Task::none()
@@ -140,10 +162,11 @@ impl Workspace {
         self.chrome.power.request.take()
     }
 
-    pub(super) fn update_sleep_prevention(
-        &mut self,
-        Event::Acquired(ticket, result): Event,
-    ) -> Task<WorkspaceMessage> {
+    pub(super) fn update_sleep_prevention(&mut self, event: Event) -> Task<WorkspaceMessage> {
+        let Event::Acquired(ticket, result) = event else {
+            self.refresh_ai_sleep_activity();
+            return Task::none();
+        };
         let Some(Pending { reason, .. }) = self
             .chrome
             .power
@@ -167,7 +190,10 @@ impl Workspace {
         };
         let enabled = match reason {
             Reason::Restore => self.window_settings.prevent_system_sleep,
-            Reason::Enable(owner) => self.persist_sleep_prevention(true, owner),
+            Reason::Enable(owner) => {
+                self.refresh_ai_sleep_activity();
+                self.persist_sleep_prevention(true, owner)
+            }
         };
         if enabled && self.sleep_work_active() {
             self.chrome.power.request = Some(request);
@@ -213,6 +239,9 @@ impl Workspace {
     }
 
     fn sleep_work_active(&mut self) -> bool {
+        if self.chrome.power.ai_active {
+            return true;
+        }
         let cached = self.chrome.power.connected_terminal;
         if cached.is_some_and(|id| {
             self.sessions
@@ -238,6 +267,10 @@ impl Workspace {
             || self.journal_screenshot_analyses.ai_active()
             || self.journal_note_translations.ai_active()
             || self.journal_exports.ai_active()
+    }
+
+    fn refresh_ai_sleep_activity(&mut self) {
+        self.chrome.power.ai_active = crate::local_ai::request_activity::active();
     }
 }
 
@@ -348,6 +381,24 @@ mod tests {
         );
         assert_eq!(workspace.reconcile_sleep_prevention().units(), 0);
         assert!(workspace.chrome.power.pending.is_none());
+    }
+
+    #[test]
+    fn an_ai_request_counts_as_work_without_a_connected_terminal() {
+        let mut workspace = Workspace::default();
+        workspace.chrome.power.ai_active = true;
+        assert!(workspace.sleep_work_active());
+        assert_eq!(workspace.reconcile_sleep_prevention().units(), 0);
+        workspace.window_settings.prevent_system_sleep = true;
+        let requested = workspace.reconcile_sleep_prevention();
+        if supports_system_sleep_prevention() {
+            assert!(requested.units() > 0);
+            assert!(workspace.chrome.power.pending.is_some());
+        } else {
+            assert_eq!(requested.units(), 0);
+        }
+        workspace.chrome.power.ai_active = false;
+        assert!(!workspace.sleep_work_active());
     }
 
     #[test]

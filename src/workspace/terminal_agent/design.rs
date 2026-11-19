@@ -1,7 +1,10 @@
 //! Native activity windows and status for an exact terminal stream.
 
+use std::cell::Cell;
+use std::time::{Duration, Instant};
+
 use iced::widget::{button, canvas, column, container, row, text};
-use iced::{Alignment, Color, Element, Length, Size, window};
+use iced::{Alignment, Color, Element, Length, Size, Subscription, window};
 
 use crate::horizontal_divider::{self, Grow};
 use crate::session::SessionId;
@@ -10,30 +13,42 @@ use crate::terminal_agent::design::{Arrangement, History, Layout, Status};
 use super::palette::{self, Palette};
 use super::{Desktop, Message as AgentMessage, Phase, Run, State, Workspace, dialog_placement};
 
+mod activity;
 pub(in crate::workspace::terminal_agent) mod handoff;
 mod history;
 pub(in crate::workspace) mod pip;
 mod placement;
 mod presentation;
+mod sample;
 mod status;
 
+pub(crate) use activity::Change as ActivityChange;
+pub(in crate::workspace) use activity::Height;
+pub(super) use activity::controls as activity_controls;
+use activity::fitted_activity_height;
 pub(in crate::workspace) use placement::{
-    DockPlacement, DockPreferences, Slot, compose, status_slot,
+    DockExtents, DockPlacement, DockPreferences, Slot, compose, status_slot,
 };
 use presentation::Dock;
 pub(crate) use presentation::Message;
 pub(super) use presentation::Presentation;
+pub(in crate::workspace) use sample::{
+    Action as SampleAction, Grid as SampleGrid, Sample, View as SampleView,
+};
+
+pub(in crate::workspace) const AUTO_HIDE_SECONDS: std::ops::RangeInclusive<u8> = 0..=60;
+pub(in crate::workspace) const DEFAULT_AUTO_HIDE_SECONDS: u8 = 6;
 
 #[derive(Clone, Copy)]
 pub(crate) struct DockResize {
     expected: DockPreferences,
     side: Slot,
-    width: Option<f32>,
+    extent: Option<f32>,
 }
 
 impl DockResize {
-    fn message(self, id: window::Id, width: Option<f32>) -> Desktop {
-        Desktop::TerminalAgent(id, AgentMessage::DockResize(Self { width, ..self }))
+    fn message(self, id: window::Id, extent: Option<f32>) -> Desktop {
+        Desktop::TerminalAgent(id, AgentMessage::DockResize(Self { extent, ..self }))
     }
 }
 
@@ -69,13 +84,14 @@ pub(in crate::workspace) fn activity_entry<'a, M: 'a>(
     history: History,
     index: usize,
     value: &'a str,
+    size: f32,
 ) -> Element<'a, M> {
-    let entry = text(value).width(Length::Fill);
+    let entry = text(value).size(size).width(Length::Fill);
     if matches!(
         history,
         History::StepCards | History::CardStack | History::Conversation
     ) {
-        container(column![text(format!("Step {}", index + 1)).size(13), entry].spacing(4))
+        container(column![text(format!("Step {}", index + 1)).size(size), entry].spacing(4))
             .style(container::bordered_box)
             .padding(8)
             .width(Length::Fill)
@@ -85,14 +101,6 @@ pub(in crate::workspace) fn activity_entry<'a, M: 'a>(
     } else {
         entry.into()
     }
-}
-
-pub(in crate::workspace) fn status_indicator<'a, M: 'a>(
-    status: Status,
-    phase: &str,
-    stage: usize,
-) -> Option<Element<'a, M>> {
-    status_indicator_with_colors(status, phase, stage, None, None)
 }
 
 fn status_indicator_with_colors<'a, M: 'a>(
@@ -169,11 +177,7 @@ fn history_panel(run: &Run, palette: Option<Palette>) -> Element<'_, AgentMessag
     let (phase, _) = status::phase(run);
     let activity = history::view(run, palette);
     let controls = controls(run);
-    let body = if run.design.approval == crate::terminal_agent::design::Approval::AboveActivity {
-        column![controls, activity]
-    } else {
-        column![activity, controls]
-    };
+    let body = history_body(activity, controls, run.design.approval);
     let muted = palette.map(|palette| palette.muted.color());
     palette::panel(
         palette,
@@ -183,13 +187,59 @@ fn history_panel(run: &Run, palette: Option<Palette>) -> Element<'_, AgentMessag
                 text(&run.label)
                     .size(12)
                     .style(move |_| text::Style { color: muted }),
-                body.spacing(6).height(Length::Fill),
+                body,
             ]
             .spacing(5),
         )
         .padding(7)
         .width(Length::Fill)
         .height(Length::Fill),
+    )
+}
+
+fn history_body<'a>(
+    activity: Element<'a, AgentMessage>,
+    controls: Element<'a, AgentMessage>,
+    approval: crate::terminal_agent::design::Approval,
+) -> iced::widget::Column<'a, AgentMessage> {
+    if approval == crate::terminal_agent::design::Approval::AboveActivity {
+        column![controls, activity]
+    } else {
+        column![activity, controls]
+    }
+    .spacing(6)
+    .height(Length::Fill)
+}
+
+fn adaptive_status(dock: &Cell<Dock>, columns: usize, rows: usize) -> (Status, Slot) {
+    let chosen = dock.get().choose(columns, rows);
+    dock.set(chosen);
+    match chosen {
+        Dock::Side => (Status::Metro, Slot::Right),
+        Dock::Bar => (Status::Powerline, Slot::Bottom),
+        Dock::Pill => (Status::Spotlight, Slot::OverlayTop),
+    }
+}
+
+fn adaptive_timeline<'a>(
+    activity: history::Activity<'a>,
+    phase: &str,
+    controls: Element<'a, AgentMessage>,
+    palette: Option<Palette>,
+) -> Element<'a, AgentMessage> {
+    palette::panel(
+        palette,
+        container(
+            column![
+                text(format!("Agent · {phase}")).size(13),
+                history::view_as(activity, History::Timeline, palette),
+                controls,
+            ]
+            .spacing(5),
+        )
+        .padding(7)
+        .height(Length::Fill)
+        .width(Length::Fill),
     )
 }
 
@@ -270,9 +320,58 @@ fn pane_status(
 }
 
 impl Workspace {
+    pub(in crate::workspace) fn agent_status_subscription(&self) -> Subscription<Desktop> {
+        let seconds = self.window_settings.agent_status_auto_hide_seconds();
+        let now = Instant::now();
+        let waiting = !self.exiting
+            && self.terminal_agents.runs.values().any(|run| {
+                !run.swarm
+                    && !run.closing
+                    && (run.design.status != Status::Hidden
+                        || run.design.arrangement == Arrangement::Adaptive)
+                    && run
+                        .presentation
+                        .status_visibility
+                        .deadline(seconds)
+                        .is_some_and(|deadline| now < deadline)
+            });
+        if waiting {
+            crate::workspace::scheduler_access::desktop_clock(Duration::from_millis(100))
+                .map(|()| Desktop::AgentStatusClock)
+        } else {
+            Subscription::none()
+        }
+    }
+
+    fn agent_status_target(&self, owner: window::Id) -> Option<window::Id> {
+        let session = self.windows.get(&owner)?.tab()?.focused_session()?;
+        let stream = self.sessions.get(&session)?.stream_generation;
+        let (id, run) = self
+            .terminal_agents
+            .agent_activity_for_stream(session, stream)?;
+        (run.design.status != Status::Hidden || run.design.arrangement == Arrangement::Adaptive)
+            .then_some(id)
+    }
+
+    pub(in crate::workspace) fn agent_status_available(&self, owner: window::Id) -> bool {
+        self.agent_status_target(owner).is_some()
+    }
+
+    pub(in crate::workspace) fn toggle_agent_status(&mut self, owner: window::Id) {
+        if let Some(id) = self.agent_status_target(owner)
+            && let Some(run) = self.terminal_agents.runs.get_mut(&id)
+        {
+            run.presentation.status_visibility.toggle(
+                self.window_settings.agent_status_auto_hide_seconds(),
+                Instant::now(),
+            );
+        }
+    }
+
     pub(in crate::workspace) fn cancel_agent_dock_resizes(&mut self) {
         for run in self.terminal_agents.runs.values_mut() {
             run.presentation.dock_resize = None;
+            run.presentation.activity.preview = None;
         }
     }
 
@@ -290,7 +389,7 @@ impl Workspace {
                 || run.closing
                 || run.design.arrangement != Arrangement::Normal
                 || dock.history_slot(run.design) != Some(resize.side)
-                || !matches!(resize.side, Slot::Left | Slot::Right)
+                || !matches!(resize.side, Slot::Left | Slot::Right | Slot::Bottom)
             {
                 return None;
             }
@@ -307,6 +406,9 @@ impl Workspace {
             .then_some(owner)
         });
         let owner = current?;
+        if resize.side == Slot::Bottom {
+            return self.resize_activity_height(id, owner, resize.extent);
+        }
         let preview = &mut self
             .terminal_agents
             .runs
@@ -314,7 +416,7 @@ impl Workspace {
             .expect("checked run")
             .presentation
             .dock_resize;
-        if let Some(width) = resize.width {
+        if let Some(width) = resize.extent {
             if width.is_finite() {
                 let range = DockPreferences::WIDTH_RANGE;
                 let width = width
@@ -351,21 +453,26 @@ impl Workspace {
         let mut status_position = status_slot(status_kind);
         let mut adaptive_side = false;
         if run.design.arrangement == Arrangement::Adaptive {
-            let dock = run.presentation.dock.get().choose(
+            (status_kind, status_position) = adaptive_status(
+                &run.presentation.dock,
                 (bounds.width / cell.width.max(1.0)) as usize,
                 (bounds.height / cell.height.max(1.0)) as usize,
             );
-            run.presentation.dock.set(dock);
-            adaptive_side = dock == Dock::Side;
-            (status_kind, status_position) = match dock {
-                Dock::Side => (Status::Metro, Slot::Right),
-                Dock::Bar => (Status::Powerline, Slot::Bottom),
-                Dock::Pill => (Status::Spotlight, Slot::OverlayTop),
-            };
+            adaptive_side = status_position == Slot::Right;
         }
+        let status_visible = run.presentation.status_visibility.visible(
+            self.window_settings.agent_status_auto_hide_seconds(),
+            Instant::now(),
+        );
         let picture_in_picture = run.design.arrangement == Arrangement::PictureInPicture;
         let dock = self.window_settings.ai_agent_panel;
         let history_position = dock.history_slot(run.design);
+        let activity = &run.presentation.activity;
+        let bottom_height = fitted_activity_height(
+            bounds.height,
+            activity.preview.unwrap_or(activity.height),
+            activity.collapsed,
+        );
         let side_width = run
             .presentation
             .dock_resize
@@ -375,6 +482,40 @@ impl Workspace {
                 |(_, width)| f32::from(width),
             );
         let history = history_position.map(|side| {
+            if side == Slot::Bottom {
+                let header: Element<'_, AgentMessage> = activity::toggle(run).into();
+                let header = header.map(move |message| Desktop::TerminalAgent(id, message));
+                let mut panel = column![].spacing(3);
+                if !activity.collapsed
+                    && run.design.arrangement == Arrangement::Normal
+                    && bottom_height >= Height::MIN
+                {
+                    let resize = DockResize {
+                        expected: dock,
+                        side,
+                        extent: None,
+                    };
+                    let max_height = fitted_activity_height(bounds.height, f32::MAX, false);
+                    panel = panel.push(
+                        canvas(horizontal_divider::program(
+                            bottom_height,
+                            Grow::Up,
+                            move |height| resize.message(id, Some(height.min(max_height))),
+                            Some(resize.message(id, None)),
+                        ))
+                        .width(Length::Fill)
+                        .height(horizontal_divider::WIDTH),
+                    );
+                }
+                panel = panel.push(header);
+                if !activity.collapsed {
+                    panel = panel.push(
+                        history_panel(run, palette)
+                            .map(move |message| Desktop::TerminalAgent(id, message)),
+                    );
+                }
+                return panel.height(Length::Fill).into();
+            }
             let history =
                 history_panel(run, palette).map(move |message| Desktop::TerminalAgent(id, message));
             if run.design.arrangement != Arrangement::Normal
@@ -386,12 +527,12 @@ impl Workspace {
             let extent = placement::fitted_side_width(
                 bounds.width,
                 side_width,
-                left && status_position == Slot::Right,
+                left && status_visible && status_position == Slot::Right,
             );
             let resize = DockResize {
                 expected: dock,
                 side,
-                width: None,
+                extent: None,
             };
             let grip = canvas(horizontal_divider::program(
                 extent,
@@ -407,24 +548,12 @@ impl Workspace {
                 row![grip, history].height(Length::Fill).into()
             }
         });
-        let status = if adaptive_side && run.design.history == History::Timeline {
+        let status = if !status_visible || adaptive_side && run.design.history == History::Timeline
+        {
             // Both roles resolve to Java d02. Keep its single history presenter.
             None
         } else if adaptive_side {
-            let panel = palette::panel(
-                palette,
-                container(
-                    column![
-                        text(format!("Agent · {}", status::phase(run).0)).size(13),
-                        history::view_as(run, History::Timeline, palette),
-                        controls(run),
-                    ]
-                    .spacing(5),
-                )
-                .padding(7)
-                .height(Length::Fill)
-                .width(Length::Fill),
-            );
+            let panel = adaptive_timeline(run.into(), status::phase(run).0, controls(run), palette);
             Some(panel.map(move |message| Desktop::TerminalAgent(id, message)))
         } else {
             pane_status(id, run, status_kind, palette)
@@ -437,7 +566,11 @@ impl Workspace {
             history_position,
             status_position,
             bounds,
-            (side_width, if rail { 84.0 } else { side_width }),
+            DockExtents {
+                left: side_width,
+                right: if rail { 84.0 } else { side_width },
+                bottom: Some(bottom_height),
+            },
         );
         if picture_in_picture {
             pip::decorate(agents, id, run, terminal, reduced_motion, palette)
@@ -454,6 +587,60 @@ mod dock_tests {
     use crate::workspace::terminal_agent::flow::tests::Fixture;
 
     #[test]
+    fn activity_height_remembers_only_committed_changes_and_reopens_collapsed() {
+        let mut fixture = Fixture::with_endpoint(false, false, "127.0.0.1:12345");
+        let id = fixture.open(Mode::Ask);
+        let workspace = &mut fixture.workspace;
+        let dock = DockPreferences {
+            placement: Some(DockPlacement::Bottom),
+            width: None,
+        };
+        workspace.window_settings.ai_agent_panel = dock;
+        workspace.window_settings.agent_remember_activity_font = Some(true);
+        let resize = DockResize {
+            expected: dock,
+            side: Slot::Bottom,
+            extent: None,
+        };
+        assert!(
+            workspace
+                .resize_agent_dock(
+                    id,
+                    DockResize {
+                        extent: Some(307.5),
+                        ..resize
+                    }
+                )
+                .is_none()
+        );
+        assert_eq!(workspace.window_settings.agent_activity_height, None);
+        assert!(workspace.resize_agent_dock(id, resize).is_some());
+        assert_eq!(workspace.window_settings.agent_activity_height, Some(307.5));
+
+        workspace.change_agent_activity_panel(id, ActivityChange::KeepCollapsed(true));
+        workspace.change_agent_activity_panel(id, ActivityChange::ExpandAll(true));
+        let reopened = activity::Panel::load(&workspace.window_settings);
+        assert!(reopened.collapsed && reopened.expand_all);
+        assert_eq!(reopened.height, 307.5);
+        assert_eq!(fitted_activity_height(350.0, reopened.height, false), 250.0);
+        assert_eq!(fitted_activity_height(150.0, reopened.height, true), 50.0);
+        workspace.change_agent_activity_panel(id, ActivityChange::ToggleCollapsed);
+        assert!(
+            workspace
+                .resize_agent_dock(
+                    id,
+                    DockResize {
+                        extent: Some(350.0),
+                        ..resize
+                    }
+                )
+                .is_none()
+        );
+        assert!(workspace.resize_agent_dock(id, resize).is_none());
+        assert_eq!(workspace.window_settings.agent_activity_height, Some(307.5));
+    }
+
+    #[test]
     fn dock_drag_previews_then_commits_and_rejects_stale_layout_and_stream() {
         let mut fixture = Fixture::with_endpoint(false, false, "127.0.0.1:12345");
         let run = fixture.open(Mode::Ask);
@@ -466,10 +653,10 @@ mod dock_tests {
         let resize = DockResize {
             expected: panel,
             side: Slot::Left,
-            width: None,
+            extent: None,
         };
         let move_to = |width| DockResize {
-            width: Some(width),
+            extent: Some(width),
             ..resize
         };
 
@@ -505,7 +692,7 @@ mod dock_tests {
                 .resize_agent_dock(
                     run,
                     DockResize {
-                        width: Some(550.0),
+                        extent: Some(550.0),
                         ..updated
                     }
                 )

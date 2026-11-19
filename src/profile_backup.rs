@@ -24,6 +24,7 @@ mod rotation;
 pub(crate) mod schedule;
 mod writer;
 
+pub(crate) use java_scheduler::TargetReview as JavaSchedulerReview;
 pub(crate) use java_scheduler::read_swarm_journal;
 pub(crate) use openpgp::decrypt_openpgp_document;
 pub(crate) use restore::{JavaMemoryReview, JavaMemoryTarget};
@@ -65,6 +66,13 @@ pub(crate) struct Preview {
 }
 
 impl Preview {
+    pub(crate) fn has_java_teamwork_scheduler_sources(&self) -> bool {
+        self.java
+            .as_ref()
+            .and_then(|report| report.scheduler.as_ref())
+            .is_some_and(|scheduler| !scheduler.teamwork_origins.is_empty())
+    }
+
     pub(crate) fn count(&self) -> usize {
         self.snapshot.len()
             + usize::from(self.java_credentials.is_some())
@@ -118,7 +126,7 @@ impl Preview {
         self.java.as_ref()?.host_pins.clone()
     }
 
-    pub(crate) fn prepare_java_memory_review(mut self) -> Self {
+    fn prepare_java_memory_review(mut self) -> Self {
         if self
             .java
             .as_ref()
@@ -134,18 +142,95 @@ impl Preview {
         self
     }
 
-    fn prepare_java_memory_review_at(&mut self, root: &Path) -> io::Result<()> {
-        if let Some(source) = self
+    pub(crate) fn prepare_java_restore_review(self) -> io::Result<Self> {
+        let mut preview = self.prepare_java_memory_review();
+        if preview
             .java
+            .as_ref()
+            .is_some_and(|report| report.scheduler.is_some())
+            || preview.java.is_some()
+                && preview
+                    .snapshot
+                    .contains_key(crate::terminal_highlight::FILE)
+        {
+            let root = profile::root()?;
+            preview.prepare_java_highlight_review_at(&root)?;
+            preview.prepare_java_scheduler_review_at(&root)?;
+        }
+        Ok(preview)
+    }
+
+    fn prepare_java_scheduler_review_at(&mut self, root: &Path) -> io::Result<()> {
+        let Some(report) = &mut self.java else {
+            return Ok(());
+        };
+        let Some(source) = &mut report.scheduler else {
+            return Ok(());
+        };
+        if let Some(current) = restore::read_java_connections(root)? {
+            let highlights = restore::java_highlight_bindings(root, &self.snapshot)?;
+            source.target_review = JavaSchedulerReview::read(
+                source,
+                &current,
+                report
+                    .connection_library
+                    .clone()
+                    .with_highlight_sets(highlights.set_ids),
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn java_scheduler_review(&self) -> Option<&JavaSchedulerReview> {
+        self.java
+            .as_ref()?
+            .scheduler
+            .as_ref()?
+            .target_review
+            .as_ref()
+    }
+
+    pub(crate) fn java_scheduler_review_mut(&mut self) -> Option<&mut JavaSchedulerReview> {
+        self.java
+            .as_mut()?
+            .scheduler
+            .as_mut()?
+            .target_review
             .as_mut()
-            .and_then(|report| report.scoped_memory.as_mut())
+    }
+
+    fn prepare_java_highlight_review_at(&mut self, root: &Path) -> io::Result<()> {
+        use crate::terminal_highlight::{FILE, bind_java_backup_review};
+        let (Some(report), Some(incoming)) = (self.java.as_mut(), self.snapshot.get(FILE)) else {
+            return Ok(());
+        };
+        let highlights = restore::java_highlight_bindings(root, &self.snapshot)?;
+        let notes = highlights.conflicts.iter().map(|id| {
+            if let Some(destination) = highlights.set_ids.get(id) {
+                format!("Highlight set {id} already exists locally. Backup references will use the separate set {destination}.")
+            } else {
+                format!("Highlight set {id} already exists locally. The separate backup set and its references could not be imported.")
+            }
+        });
+        report.entries.splice(..0, notes);
+        let bound = bind_java_backup_review(incoming, &highlights.set_ids)?;
+        self.snapshot.insert(FILE.into(), Zeroizing::new(bound));
+        Ok(())
+    }
+
+    fn prepare_java_memory_review_at(&mut self, root: &Path) -> io::Result<()> {
+        if let Some(report) = &mut self.java
+            && let Some(source) = &mut report.scoped_memory
         {
             let current = restore::read_java_connections(root)?;
-            source.review = current
-                .as_deref()
-                .map(|bytes| JavaMemoryReview::read(source, bytes))
-                .transpose()?
-                .flatten();
+            if let Some(current) = current {
+                let highlights = restore::java_highlight_bindings(root, &self.snapshot)?;
+                let library = report
+                    .connection_library
+                    .clone()
+                    .with_highlight_sets(highlights.set_ids);
+                source.review = JavaMemoryReview::read(source, &current, library)?;
+            }
         }
         Ok(())
     }
@@ -267,12 +352,30 @@ pub(crate) struct QueuedRestore {
 }
 
 /// Queues the reviewed snapshot and reports any destination-specific job omissions.
-pub(crate) fn queue_restore(preview: Preview, mode: RestoreMode) -> io::Result<QueuedRestore> {
-    let root = profile::root()?;
-    queue_restore_at(&root, preview, mode)
+pub(crate) fn queue_restore(
+    preview: Preview,
+    mode: RestoreMode,
+    shared: crate::scheduler_window::SharedTargets,
+) -> io::Result<QueuedRestore> {
+    queue_restore_with_targets(&profile::root()?, preview, mode, &shared)
 }
 
+#[cfg(test)]
 fn queue_restore_at(root: &Path, preview: Preview, mode: RestoreMode) -> io::Result<QueuedRestore> {
+    queue_restore_with_targets(
+        root,
+        preview,
+        mode,
+        &crate::scheduler_window::SharedTargets::default(),
+    )
+}
+
+fn queue_restore_with_targets(
+    root: &Path,
+    preview: Preview,
+    mode: RestoreMode,
+    shared: &crate::scheduler_window::SharedTargets,
+) -> io::Result<QueuedRestore> {
     let is_java = preview.java.is_some();
     let (scheduler, scoped_memory, toolbar, connection_library) =
         preview.java.map_or_else(Default::default, |report| {
@@ -292,7 +395,7 @@ fn queue_restore_at(root: &Path, preview: Preview, mode: RestoreMode) -> io::Res
             root,
             preview.snapshot,
             preview.java_credentials.map(|prepared| *prepared),
-            scheduler,
+            scheduler.map(|source| (source, shared)),
             scoped_memory,
             toolbar,
             connection_library,
@@ -342,6 +445,13 @@ pub(crate) fn prepare_java_credentials(
                 .toolbar
                 .as_ref()
                 .is_some_and(|source| source.connections.is_some()),
+        crate::connection_store::import::JavaTargetReuse {
+            toolbar: report
+                .toolbar
+                .as_ref()
+                .is_some_and(|source| source.layout.uses_profiles()),
+            scheduler: report.scheduler.is_some(),
+        },
         &connection_library,
     )?;
     if let Some(prepared) = &mut review.prepared {

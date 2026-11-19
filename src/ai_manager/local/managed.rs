@@ -57,6 +57,8 @@ pub(crate) enum Message {
     ClearDefault,
     Import,
     Reference,
+    AskReattachment,
+    ConfirmReattachment,
     Start,
     Stop,
     Test,
@@ -88,6 +90,10 @@ impl Message {
 enum Action {
     Configure(Configuration),
     ConfirmRemoval,
+    Reattach {
+        weights: PathBuf,
+        projector: Option<PathBuf>,
+    },
 }
 
 struct Configuration {
@@ -280,6 +286,7 @@ pub(super) struct Models {
     default: Option<SavedDefault>,
     active_backend: Option<PackageBackend>,
     status: Option<ModelStatus>,
+    can_reattach: bool,
     action: Option<Action>,
 }
 
@@ -328,6 +335,7 @@ impl Models {
             .cloned();
         self.dismiss_action();
         self.update_status(profile);
+        self.update_reattachment(profile);
     }
 
     pub(super) fn default_change(&self, mark: bool, legacy: Option<&str>) -> Option<DefaultChange> {
@@ -372,6 +380,7 @@ impl Models {
             .find(|choice| choice.model.id == id)
             .cloned();
         self.update_status(profile);
+        self.update_reattachment(profile);
     }
 
     pub(super) fn has_selection(&self) -> bool {
@@ -398,6 +407,14 @@ impl Models {
             .selected
             .as_ref()
             .map(|choice| runtime_package::model_status(profile, &choice.model.id));
+    }
+
+    fn update_reattachment(&mut self, profile: &Path) {
+        self.can_reattach = self.selected.as_ref().is_some_and(|choice| {
+            Registry::new(profile.to_owned())
+                .check_reattachment(&choice.model)
+                .is_ok()
+        });
     }
 
     pub(super) fn view(
@@ -429,6 +446,33 @@ impl Models {
                 Some(Action::Configure(configuration)) => {
                     Some(configuration.view(ai_allowed, self.active_backend))
                 }
+                Some(Action::Reattach { weights, projector }) => Some(
+                    column![
+                        text(if projector.is_some() {
+                            format!("Reattach {} as a private vision pair?", model.name)
+                        } else {
+                            format!("Reattach {} as an external GGUF?", model.name)
+                        })
+                            .wrapping(text::Wrapping::WordOrGlyph),
+                        text(weights.display().to_string()).wrapping(text::Wrapping::WordOrGlyph),
+                        projector.as_ref().map(|path| text(format!("Projector · {}", path.display()))
+                            .wrapping(text::Wrapping::WordOrGlyph)),
+                        text("Choose files you trust. The backup records component sizes and shard layout. The application validates the selected GGUF files.")
+                            .size(13),
+                        row![
+                            button("Cancel").on_press_maybe(
+                                ai_allowed.then_some(Managed(Message::CancelAction))
+                            ),
+                            button("Reattach model").on_press_maybe(
+                                ai_allowed.then_some(Managed(Message::ConfirmReattachment))
+                            ),
+                        ]
+                        .spacing(8)
+                        .wrap(),
+                    ]
+                    .spacing(8)
+                    .into(),
+                ),
                 Some(Action::ConfirmRemoval) => Some(
                     column![
                         text(if model.external.is_some() {
@@ -533,15 +577,21 @@ impl Models {
                         .style(button::secondary)
                         .on_press_maybe(enabled.then_some(Managed(Message::RepairBackend)))),
                     row![
+                        self.can_reattach.then(|| button("Reattach local GGUF…")
+                            .on_press_maybe(
+                                (enabled && idle && !self.source.trim().is_empty()
+                                    && model.projector_bytes.is_some() != self.projector_path.trim().is_empty())
+                                    .then_some(Managed(Message::AskReattachment)),
+                            )),
                         button("Start model")
-                            .on_press_maybe((enabled && startable && model.backend.available(self.active_backend))
+                            .on_press_maybe((enabled && startable && !self.can_reattach && model.backend.available(self.active_backend))
                                 .then_some(Managed(Message::Start))),
                         button("Stop model").on_press_maybe(
                             (editable && !self.has_action() && idle && !matches!(status, ModelStatus::Stopped))
                                 .then_some(Managed(Message::Stop)),
                         ),
                         button("Test model")
-                            .on_press_maybe((enabled && idle && model.backend.available(self.active_backend))
+                            .on_press_maybe((enabled && idle && !self.can_reattach && model.backend.available(self.active_backend))
                                 .then_some(Managed(Message::Test))),
                         button("Configure model")
                             .on_press_maybe((enabled && idle).then_some(Managed(Message::Configure))),
@@ -573,6 +623,7 @@ impl Dialog {
                     self.managed.selected = Some(*choice);
                     self.managed.dismiss_action();
                     self.managed.update_status(&self.profile_dir);
+                    self.managed.update_reattachment(&self.profile_dir);
                 }
             }
             Message::Refresh if !self.managed.has_action() => {
@@ -610,6 +661,56 @@ impl Dialog {
                         })
                         .map_err(|error| format!("Could not import the managed model ({error})"))
                 });
+            }
+            Message::AskReattachment if self.managed.can_reattach && !self.managed.has_action() => {
+                let Some(Choice { model, .. }) = &self.managed.selected else {
+                    return Task::none();
+                };
+                let weights = PathBuf::from(self.managed.source.trim());
+                let projector_path = self.managed.projector_path.trim();
+                let projector = (!projector_path.is_empty()).then(|| PathBuf::from(projector_path));
+                if model.projector_bytes.is_some() == projector.is_some()
+                    && weights.is_absolute()
+                    && projector.as_ref().is_none_or(|path| path.is_absolute())
+                {
+                    self.managed.action = Some(Action::Reattach { weights, projector });
+                } else {
+                    self.status = Some(
+                        if model.projector_bytes.is_some() {
+                            "Enter absolute paths to the GGUF weights and vision projector."
+                        } else {
+                            "Enter an absolute GGUF path and clear the vision projector field."
+                        }
+                        .into(),
+                    );
+                }
+            }
+            Message::ConfirmReattachment => {
+                if let (Some(Action::Reattach { weights, projector }), Some(Choice { model, .. })) =
+                    (&self.managed.action, &self.managed.selected)
+                {
+                    let weights = weights.clone();
+                    let projector = projector.clone();
+                    let model = model.clone();
+                    return self.manage_models(
+                        "Reattaching the local GGUF…",
+                        true,
+                        move |_, registry, cancelled| {
+                            let result = if let Some(projector) = projector {
+                                registry.reattach_projector_pair(
+                                    &model, &weights, &projector, cancelled,
+                                )
+                            } else {
+                                registry.reattach(&model, &weights, cancelled)
+                            };
+                            result
+                                .map(|model| Some(format!("Reattached {}.", model.name)))
+                                .map_err(|error| {
+                                    format!("Could not reattach the managed model ({error})")
+                                })
+                        },
+                    );
+                }
             }
             Message::Start | Message::Stop => {
                 if let Some(Choice { model, .. }) = self.managed.selected.clone() {
@@ -980,7 +1081,7 @@ mod tests {
     }
 
     #[test]
-    fn manager_registers_and_removes_an_external_split_model_from_any_shard() {
+    fn manager_registers_reattaches_and_removes_a_split_model_from_any_shard() {
         let profile = crate::snippets::tests::Profile::new();
         let root = profile.0.canonicalize().unwrap();
         #[cfg(unix)]
@@ -1010,11 +1111,12 @@ mod tests {
             let task = manager.update(ManagerMessage::Local(Managed(action)));
             assert!(manager.local.busy(), "{:?}", manager.local.status);
             let mut outcomes = iced_runtime::task::into_stream(task).unwrap();
-            let Some(iced_runtime::Action::Output(event)) = block_on(outcomes.next()) else {
-                panic!("expected the model operation result");
-            };
-            let _ = manager.update(event);
-            assert!(!manager.local.busy());
+            while manager.local.busy() {
+                let Some(iced_runtime::Action::Output(event)) = block_on(outcomes.next()) else {
+                    panic!("expected the model operation result");
+                };
+                let _ = manager.update(event);
+            }
         };
         complete(&mut manager, Message::Reference);
         assert_eq!(manager.local.status.as_deref(), Some("Registered fixture."));
@@ -1024,9 +1126,45 @@ mod tests {
             choice.model.external.as_ref().unwrap().path(),
             root.join(first)
         );
+        let model_dir = directory
+            .private_child(managed_models::BACKUP_DIRECTORY, false)
+            .unwrap()
+            .private_child(&choice.model.id, false)
+            .unwrap();
+        let portable = managed_models::portable_registration(
+            &serde_json::to_vec(&choice.model).unwrap(),
+            &choice.model.id,
+        )
+        .unwrap();
+        model_dir
+            .replace_file(managed_models::BACKUP_MANIFEST, &portable)
+            .unwrap();
+        drop(model_dir);
+        complete(&mut manager, Message::Refresh);
+        let detached = manager.local.managed.choices[0].clone();
         let _ = manager.update(ManagerMessage::Local(Managed(Message::Select(Box::new(
-            choice,
+            detached,
         )))));
+        assert!(manager.local.managed.can_reattach);
+        assert!(
+            iced_runtime::task::into_stream(
+                manager.update(ManagerMessage::Local(Managed(Message::ConfirmReattachment))),
+            )
+            .is_none()
+        );
+        let _ = manager.update(ManagerMessage::Local(Managed(Message::AskReattachment)));
+        assert!(matches!(
+            &manager.local.managed.action,
+            Some(Action::Reattach { weights, projector: None }) if *weights == root.join(second)
+        ));
+        let _ = manager.update(ManagerMessage::Local(Managed(Message::CancelAction)));
+        let detached = &manager.local.managed.selected.as_ref().unwrap().model;
+        assert!(detached.external.is_none());
+        let _ = manager.update(ManagerMessage::Local(Managed(Message::AskReattachment)));
+        complete(&mut manager, Message::ConfirmReattachment);
+        assert_eq!(manager.local.status.as_deref(), Some("Reattached fixture."));
+        assert_eq!(manager.local.managed.selected.as_ref(), Some(&choice));
+        assert!(!manager.local.managed.can_reattach);
         let _ = manager.update(ManagerMessage::Local(Managed(Message::AskRemoval)));
         complete(&mut manager, Message::Remove);
         assert_eq!(

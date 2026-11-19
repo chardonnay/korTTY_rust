@@ -3,7 +3,7 @@
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-use iced::widget::{button, column, row, scrollable, text, text_input};
+use iced::widget::{Id, button, column, pick_list, row, scrollable, text, text_input};
 use iced::{Element, Length, Task};
 use zeroize::Zeroizing;
 
@@ -13,17 +13,18 @@ use crate::local_ai::{self, Cancel, Profile};
 use crate::terminal_logging::{Policy, Redactor, Secrets};
 use crate::vault_window::{JournalQuestionSecrets, VaultWindow};
 use crate::workspace::ai_quota;
+use crate::workspace::question_history::MAX_QUESTION_CHARS;
 use crate::workspace::terminal_ai::mask;
 
 use super::{Event as ManualEvent, Location, MANUAL, evidence};
 
-const MAX_QUESTION_CHARS: usize = 1_000;
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(90);
 const ANSWER_OUTPUT_TOKENS: u32 = 1_024;
 
 #[derive(Clone, Debug)]
 pub enum Event {
     Question(String),
+    Recall(String),
     Review,
     QuotaFinished(u64, String),
     Send(u64),
@@ -41,11 +42,13 @@ pub(super) struct State {
     answer: Option<String>,
     status: String,
     epoch: u64,
+    submitted_question: Option<String>,
 }
 
 struct Review {
     authority: Arc<Authority>,
     destination: String,
+    question: String,
     system: String,
     evidence: evidence::Evidence,
     cli: Option<local_ai::cli::Request>,
@@ -170,6 +173,11 @@ impl State {
         self.invalidate();
         self.question.clear();
         self.status.clear();
+        self.submitted_question = None;
+    }
+
+    pub(super) fn take_submitted_question(&mut self) -> Option<String> {
+        self.submitted_question.take()
     }
 
     pub(super) fn revalidate(
@@ -237,6 +245,7 @@ impl State {
                     let pending = review.start(scope.vault);
                     match pending {
                         Ok(pending) => {
+                            self.submitted_question = Some(review.question.clone());
                             self.pending = Some(pending.cancel);
                             self.status = "Requesting an answer…".into();
                             return Task::perform(
@@ -339,6 +348,7 @@ impl State {
         Ok(Review {
             authority: Arc::new(authority),
             destination,
+            question,
             system,
             evidence,
             cli,
@@ -354,27 +364,51 @@ impl State {
         location.valid(&MANUAL).then(|| location.clone())
     }
 
-    pub(super) fn view(&self, enabled: bool) -> Element<'_, ManualEvent> {
+    pub(super) fn view<'a>(
+        &'a self,
+        enabled: bool,
+        input_id: &Id,
+        history: &'a [String],
+        history_unavailable: bool,
+    ) -> Element<'a, ManualEvent> {
         let mut panel = column![
             text("Ask the manual").size(22),
             text("Only the reviewed question and excerpts from the bundled manual are sent."),
         ]
         .spacing(10);
         let busy = self.pending.is_some();
-        let mut input = text_input("Question about kortty", &self.question);
+        let mut input = text_input("Question about kortty", &self.question).id(input_id.clone());
+        let can_review = enabled && !busy && !self.question.trim().is_empty();
         if !busy {
             input = input.on_input(|value| ManualEvent::Ask(Event::Question(value)));
         }
+        if can_review {
+            input = input.on_submit(ManualEvent::Ask(Event::Review));
+        }
         let actions = row![
             input,
-            button("Review question").on_press_maybe(
-                (enabled && !busy && !self.question.trim().is_empty())
-                    .then_some(ManualEvent::Ask(Event::Review))
+            button("Clear").on_press_maybe(
+                (!busy && !self.question.is_empty())
+                    .then(|| ManualEvent::Ask(Event::Question(String::new()))),
             ),
+            button("Review question")
+                .on_press_maybe(can_review.then_some(ManualEvent::Ask(Event::Review))),
             button("Back to manual").on_press(ManualEvent::Ask(Event::Back)),
         ]
         .spacing(8);
         panel = panel.push(actions);
+        if !busy && !history.is_empty() {
+            panel = panel.push(
+                pick_list(history, None::<String>, |question| {
+                    ManualEvent::Ask(Event::Recall(question))
+                })
+                .placeholder("Question history")
+                .width(Length::Fill),
+            );
+        }
+        if history_unavailable {
+            panel = panel.push(text("Question history could not be saved or loaded.").size(13));
+        }
         if let Some(review) = &self.review {
             panel = panel.push(text(&review.destination));
             if let Some(answer) = &self.answer {
@@ -538,6 +572,7 @@ mod tests {
         assert!(preview.contains("password=***"));
         assert!(!preview.contains("manual-secret"));
         assert_eq!(server.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+        assert!(state.take_submitted_question().is_none());
 
         assert_eq!(
             state
@@ -546,6 +581,7 @@ mod tests {
             0
         );
         assert_eq!(server.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+        assert!(state.take_submitted_question().is_none());
         let _ = state.update(Event::Review, scope(Some(configuration.clone()), &policy));
         let approved = state.epoch;
         let review = state.review.as_ref().unwrap();
@@ -560,6 +596,10 @@ mod tests {
         let task = state.update(
             Event::Send(approved),
             scope(Some(configuration.clone()), &policy),
+        );
+        assert_eq!(
+            state.take_submitted_question().as_deref(),
+            Some("How does Scheduler work? password=***")
         );
         let mut stream = accept(&server);
         let body = request(&mut stream);

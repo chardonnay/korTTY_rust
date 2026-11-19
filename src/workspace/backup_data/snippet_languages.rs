@@ -60,7 +60,14 @@ pub(super) fn merge(fields: &mut RawFields, incoming: &[String]) -> io::Result<b
         return Err(io::Error::other("Invalid saved snippet language catalogue"));
     }
     let before = local.len();
-    for language in incoming {
+    let mut changed = false;
+    local.retain(|language| language != "css");
+    changed |= local.len() != before;
+    let before = local.len();
+    for language in incoming
+        .iter()
+        .filter(|language| !languages::built_in(language))
+    {
         if local.len() == languages::MAX_CUSTOM {
             break;
         }
@@ -68,7 +75,7 @@ pub(super) fn merge(fields: &mut RawFields, incoming: &[String]) -> io::Result<b
             local.push(language.clone());
         }
     }
-    if local.len() == before {
+    if !changed && local.len() == before {
         return Ok(false);
     }
     fields.insert(KEY.into(), serde_json::value::to_raw_value(&local)?);

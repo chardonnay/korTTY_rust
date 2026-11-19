@@ -30,6 +30,24 @@ impl Run {
         let mut page = column![text(title).size(22), text(&self.label)]
             .spacing(8)
             .padding(12);
+        let plan_view = self.mode == Mode::Plan;
+        let showing_plan = self.phase == Phase::PlanReady && self.plan.is_some();
+        let reviewing_model = self.phase == Phase::ModelReview;
+        let body_size = if plan_view {
+            self.fonts.plan
+        } else {
+            self.fonts.activity
+        };
+        if plan_view {
+            page = page.push(super::font::View::Plan.controls(body_size, None));
+        }
+        if !reviewing_model && !showing_plan {
+            page = page.push(super::font::View::Activity.controls(
+                self.fonts.activity,
+                (!self.binding.private()).then_some(self.fonts.remember_activity),
+            ));
+            page = page.push(super::design::activity_controls(self));
+        }
         if self.design.arrangement == crate::terminal_agent::design::Arrangement::PictureInPicture
             && !self.swarm
             && !self.closing
@@ -67,12 +85,11 @@ impl Run {
                 (!self.paused && directory_ready).then_some(Message::ConfirmDirectory(self.epoch)),
             ));
         }
-        let reviewing_model = self.phase == Phase::ModelReview;
         if self.phase == Phase::Setup {
             page = page.push(
                 column![
                     pick_list(self.profiles.as_slice(), self.profile().cloned(), Message::Profile),
-                    text_input("Describe your task", &self.goal).on_input(Message::Goal),
+                    text_input("Describe your task", &self.goal).on_input(Message::Goal).size(body_size),
                     (self.mode == Mode::Run).then(|| checkbox(self.auto_approve_root).label("Auto-approve commands, including sudo, for this run (root=true)").on_toggle(Message::AutoApproveRoot)),
                     (self.mode == Mode::Run).then(|| checkbox(self.confirm_every_command).label("Confirm every command in this run").on_toggle(Message::ConfirmEveryCommand)),
                     text(match self.mode {
@@ -90,7 +107,7 @@ impl Run {
                 ].spacing(8)
             );
         } else if !reviewing_model {
-            page = page.push(text(&self.goal));
+            page = page.push(text(&self.goal).size(body_size));
         }
         if self.phase == Phase::Setup && self.mode == Mode::Plan && !self.binding.private() {
             page = page.push(
@@ -105,7 +122,9 @@ impl Run {
             page = page.push(text(&self.history.notice).size(13));
         }
 
-        if !reviewing_model && self.design.approval == Approval::BelowActivity {
+        let show_activity =
+            !reviewing_model && !showing_plan && !self.presentation.activity.collapsed;
+        if show_activity && self.design.approval == Approval::BelowActivity {
             page = page.push(self.activity_view(palette));
         }
         if let Some(review) = self.model_review_view(Length::Fill) {
@@ -257,7 +276,7 @@ impl Run {
                 page = page.push(handoff);
             }
         }
-        if !reviewing_model && self.design.approval == Approval::AboveActivity {
+        if show_activity && self.design.approval == Approval::AboveActivity {
             page = page.push(self.activity_view(palette));
         }
         if let Some(export) = self.activity_export.view() {

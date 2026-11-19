@@ -10,6 +10,9 @@ pub(super) struct Preview {
     pub token: Token,
     pub playing: bool,
     pub owner: window::Id,
+    pub reduced_motion: bool,
+    pub cursor_review: bool,
+    pub deadline: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -40,7 +43,12 @@ impl canvas::Program<Desktop> for Preview {
         }
         clock.now = Some(*now);
         if !self.playing {
-            return None;
+            let deadline = self.deadline?;
+            return Some(if *now >= deadline {
+                Action::publish(message(self.owner, super::Action::StatusDeadline))
+            } else {
+                Action::request_redraw_at(deadline)
+            });
         }
         let started = *clock.started.get_or_insert(*now);
         let dwell = [1500, 1500, 2300, 2300, 1600]
@@ -53,7 +61,13 @@ impl canvas::Program<Desktop> for Preview {
                 super::Action::Tick(self.token),
             )));
         }
-        Some(Action::request_redraw_at(*now + Duration::from_millis(150)))
+        let next_step = started + Duration::from_millis(dwell);
+        let redraw = if self.reduced_motion || self.style.is_none() {
+            next_step
+        } else {
+            next_step.min(*now + Duration::from_millis(150))
+        };
+        Some(Action::request_redraw_at(redraw))
     }
 
     fn draw(
@@ -108,9 +122,15 @@ impl canvas::Program<Desktop> for Preview {
             let phase = clock.now.zip(clock.started).map_or(0, |(now, start)| {
                 now.duration_since(start).as_millis() / 150
             });
-            let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][phase as usize % 10];
+            let spinner = if self.reduced_motion {
+                "●"
+            } else {
+                ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][phase as usize % 10]
+            };
             let lines = inline::render(style, &self.model, columns, spinner);
-            let available = ((bounds.height - y - cell.height) / cell.height).max(0.0) as usize;
+            let footer = if self.cursor_review { 3.0 } else { 1.0 };
+            let available =
+                ((bounds.height - y - cell.height * footer) / cell.height).max(0.0) as usize;
             for line in lines.iter().take(available) {
                 paint(&mut frame, line, y, cell, palette.text, palette.primary);
                 y += cell.height;
@@ -152,6 +172,39 @@ impl canvas::Program<Desktop> for Preview {
             palette.text,
             palette.primary,
         );
+        if self.cursor_review {
+            frame.with_clip(Rectangle::with_size(bounds.size()), |frame| {
+                crate::terminal_view::agent_cursor::paint_ghost(
+                    frame,
+                    VACUUM,
+                    Point::new(8.0 + 15.0 * cell.width, y),
+                    palette.text,
+                    Font::MONOSPACE,
+                    12,
+                );
+                for (line, top) in [
+                    ("Enter run   Tab edit   Esc dismiss", y + cell.height),
+                    (
+                        "Agent waiting for approval · /var",
+                        bounds.height - cell.height,
+                    ),
+                ] {
+                    paint(
+                        frame,
+                        &Line {
+                            segments: vec![Segment {
+                                text: line.into(),
+                                role: Role::Muted,
+                            }],
+                        },
+                        top,
+                        cell,
+                        palette.text,
+                        palette.primary,
+                    );
+                }
+            });
+        }
         vec![frame.into_geometry()]
     }
 }

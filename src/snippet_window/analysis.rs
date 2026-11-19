@@ -72,6 +72,7 @@ pub enum Message {
     DiagramAppearance(crate::diagram_window::appearance::Edit),
     ProjectDiagramVisible(bool),
     ReportFont(u8),
+    AiDiffFont(u8),
     AutoDiagram(bool),
     AutoModularization(bool),
     Export,
@@ -199,6 +200,7 @@ pub(crate) enum Phase<'a> {
     RecoverApply {
         completed: usize,
         total: usize,
+        can_review: bool,
         discard: Option<SnippetId>,
     },
     ReviewApply(apply::Review<'a>),
@@ -216,7 +218,7 @@ pub(crate) struct View<'a> {
     pub(crate) profiles: &'a [ProfileChoice],
     pub(crate) cli_allowed: bool,
     pub(crate) profile: Option<ProfileId>,
-    pub(crate) instructions: &'a str,
+    pub(crate) instructions: Option<&'a str>,
     pub(crate) skills: &'a [(u64, String)],
     pub(crate) selected_skills: &'a [u64],
     pub(crate) files: &'a [FileChoice],
@@ -239,6 +241,8 @@ pub(crate) struct View<'a> {
     pub(crate) auto_diagram: bool,
     pub(crate) auto_plan: bool,
     pub(crate) report_font: u8,
+    pub(crate) ai_diff_font: u8,
+    pub(crate) ai_diff_summary_divider: Option<u16>,
     pub(crate) diagram_preview: Option<&'a svg::Handle>,
     pub(crate) can_generate_diagram: bool,
     pub(crate) diagram_options_expanded: bool,
@@ -348,8 +352,18 @@ fn report_view<'a>(state: &View<'a>) -> Element<'a, WindowMessage> {
     .spacing(3);
 
     let review = match state.phase {
-        Phase::ReviewApply(review) => Some(apply::review_body(review, state.status)),
-        Phase::ReviewFolderApply(review) => Some(apply::folder_review_body(review, state.status)),
+        Phase::ReviewApply(review) => Some(apply::review_body(
+            review,
+            state.status,
+            state.ai_diff_font,
+            state.ai_diff_summary_divider,
+        )),
+        Phase::ReviewFolderApply(review) => Some(apply::folder_review_body(
+            review,
+            state.status,
+            state.ai_diff_font,
+            state.ai_diff_summary_divider,
+        )),
         _ => None,
     };
     if let Some(review) = review {
@@ -414,7 +428,7 @@ fn report_view<'a>(state: &View<'a>) -> Element<'a, WindowMessage> {
             ],
             4,
         ),
-        Phase::RecoverApply { completed, total, discard } => (
+        Phase::RecoverApply { completed, total, can_review, discard } => (
             column![
                 text("Recover the apply proposal").size(17),
                 state.status.map(notice),
@@ -427,7 +441,7 @@ fn report_view<'a>(state: &View<'a>) -> Element<'a, WindowMessage> {
                     if completed == 0 { "Review retry…" } else { "Review remaining request…" },
                     apply::Action::Resume,
                 )),
-                (completed > 0).then(|| apply::control("Review completed changes…", apply::Action::ReviewPartial)),
+                can_review.then(|| apply::control("Review completed changes…", apply::Action::ReviewPartial)),
                 discard.map(|pre| apply::control("Discard checkpoint", apply::Action::DiscardRecovery(pre))),
             ],
             5,
@@ -436,7 +450,7 @@ fn report_view<'a>(state: &View<'a>) -> Element<'a, WindowMessage> {
             unreachable!("apply review has its own scrolling surface")
         }
         Phase::Modularization(phase) => {
-            let (body, actions) = modularization::view(phase, state.status);
+            let (body, actions) = modularization::view(phase, state.status, state.ai_diff_font);
             (body, actions, 6)
         }
         Phase::Ready | Phase::Running { .. } | Phase::SavingApply(_) => {
@@ -582,10 +596,10 @@ fn results<'a>(
     if matches!(state.phase, Phase::Ready) {
         body = body
             .push(profile_picker(state))
-            .push(
-                text_input("Additional instructions (optional)", state.instructions)
-                    .on_input(|instructions| wrap(Message::Instructions(instructions))),
-            )
+            .push(state.instructions.map(|instructions| {
+                text_input("Additional instructions (optional)", instructions)
+                    .on_input(|instructions| wrap(Message::Instructions(instructions)))
+            }))
             .push(
                 checkbox(state.auto_diagram)
                     .label("Generate a flowchart automatically for new analyses")
@@ -1442,6 +1456,10 @@ fn notice(message: &str) -> Element<'_, WindowMessage> {
 
 fn action(label: &'static str, message: Message) -> iced::widget::Button<'static, WindowMessage> {
     button(label).on_press(wrap(message))
+}
+
+fn diff_font_controls(size: u8) -> iced::widget::Row<'static, WindowMessage> {
+    super::ai_assist::FontView::Diff.controls(size, |size| wrap(Message::AiDiffFont(size)))
 }
 
 fn wrap(message: Message) -> WindowMessage {

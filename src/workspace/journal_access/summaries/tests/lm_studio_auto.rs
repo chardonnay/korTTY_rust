@@ -233,7 +233,7 @@ fn check_inherited_model_binding(mode: &str, chat_path: &str, localhost: bool) {
     assert_eq!(workspace.journal_summaries.live[0].receipt, bound);
     let reopened = Queue::load(&root).unwrap();
     assert_eq!(reopened.pending().front(), Some(&bound));
-    assert!(pins_lm_studio_auto(&bound));
+    assert!(pins_inherited_model(&bound));
     assert!(
         workspace
             .journal_summary_profile(bound.profile.as_ref(), false)

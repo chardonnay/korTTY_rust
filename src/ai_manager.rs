@@ -335,6 +335,8 @@ pub(crate) struct Configuration {
     local: local::State,
     skills: skills::Store,
     memory: memory::Settings,
+    #[serde(skip_serializing_if = "JavaGeneralPreferences::is_empty")]
+    java_general_preferences: JavaGeneralPreferences,
     #[serde(skip_serializing_if = "Option::is_none")]
     java_memory_tokens: Option<u16>,
     #[serde(skip_serializing_if = "memory::JavaPreferences::is_empty")]
@@ -453,6 +455,7 @@ impl Default for Configuration {
             local: local::State::default(),
             skills: skills::Store::default(),
             memory: memory::Settings::default(),
+            java_general_preferences: JavaGeneralPreferences::default(),
             java_memory_tokens: None,
             java_memory_preferences: memory::JavaPreferences::default(),
             java_skill_preferences: skills::JavaPreferences::default(),
@@ -484,6 +487,21 @@ struct General {
     agent_confirm_mutating: bool,
     #[serde(skip_serializing_if = "shortcut::Preferences::is_default")]
     agent_shortcut: shortcut::Preferences,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+struct JavaGeneralPreferences {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeout_minutes: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code_text_language: Option<CodeTextLanguage>,
+}
+
+impl JavaGeneralPreferences {
+    fn is_empty(&self) -> bool {
+        self.timeout_minutes.is_none() && self.code_text_language.is_none()
+    }
 }
 
 impl Default for General {
@@ -806,7 +824,11 @@ impl Configuration {
             shortcut.validate()?;
         }
         if self.version != VERSION
-            || !(1..=MAX_TIMEOUT_MINUTES).contains(&self.general.timeout_minutes)
+            || self.general.timeout_minutes > MAX_TIMEOUT_MINUTES
+            || self
+                .java_general_preferences
+                .timeout_minutes
+                .is_some_and(|minutes| minutes > MAX_TIMEOUT_MINUTES)
         {
             return Err(invalid("Invalid AI settings version or request timeout"));
         }
@@ -1212,6 +1234,61 @@ impl Configuration {
             .map(|profile| profile.id)
     }
 
+    pub(crate) fn journal_summary_server_default_id(&self) -> Option<ProfileId> {
+        let profile = self.bound_profile(self.local.profile(local::Role::Journal)?)?;
+        self.journal_summary_server_default_transport(profile.id)
+            .ok()?;
+        Some(profile.id)
+    }
+
+    pub(crate) fn journal_summary_server_default_profiles(
+        &self,
+    ) -> impl Iterator<Item = (ProfileId, &str, String)> {
+        self.profiles.entries().filter_map(|profile| {
+            self.journal_summary_server_default_transport(profile.id)
+                .ok()?;
+            Some((
+                profile.id,
+                profile.name.as_str(),
+                profile.destination().ok()?,
+            ))
+        })
+    }
+
+    pub(crate) fn journal_summary_server_default_transport(
+        &self,
+        id: ProfileId,
+    ) -> Result<local_ai::Profile, String> {
+        let profile = self
+            .profiles
+            .profile(id)
+            .filter(|profile| {
+                profile.journal_loopback_server_default()
+                    && profile.can_be_server_selected_chat_default()
+            })
+            .filter(|_| self.enabled() && self.saved_root().is_some())
+            .ok_or("The saved loopback summary profile is unavailable.")?;
+        let transport = self.transport_for(profile)?;
+        if transport.is_remote() {
+            return Err("Server-selected local summaries require a loopback profile.".into());
+        }
+        transport.require_current_policy_authority()?;
+        Ok(transport)
+    }
+
+    pub(crate) fn journal_summary_server_default_matches(
+        &self,
+        id: ProfileId,
+        destination: &str,
+    ) -> bool {
+        self.profiles.profile(id).is_some_and(|profile| {
+            profile.journal_loopback_server_default()
+                && profile
+                    .destination()
+                    .is_ok_and(|current| current == destination)
+        })
+    }
+
     pub(crate) fn journal_summary_transport(
         &self,
         id: ProfileId,
@@ -1517,13 +1594,14 @@ impl Configuration {
         self.available_ai_profiles(ProfileRoute::Local)
     }
 
-    pub(crate) fn foreground_agent_default_profiles(
+    pub(crate) fn foreground_default_profiles(
         &self,
+        planning: bool,
     ) -> impl Iterator<Item = (ProfileId, &str, String, bool)> {
         self.available_profile_transports(ProfileRoute::ForegroundAgentDefault)
-            .filter_map(|(profile, transport)| {
+            .filter_map(move |(profile, transport)| {
                 let remote = transport.is_remote();
-                if remote && !self.permits_foreground_agent_https(profile) {
+                if remote && !self.permits_foreground_default_https(profile, planning) {
                     return None;
                 }
                 Some((
@@ -1540,6 +1618,7 @@ impl Configuration {
         reference: &ProfileRef,
         destination: &str,
         remote: bool,
+        planning: bool,
     ) -> Result<(local_ai::Profile, usize), String> {
         let changed =
             || "The server-selected agent profile changed. Start a new review.".to_owned();
@@ -1547,15 +1626,24 @@ impl Configuration {
         if profile.reference() != *reference
             || profile.destination().as_deref() != Ok(destination)
             || profile.remote_protocol().is_some() != remote
-            || (remote && !self.permits_foreground_agent_https(profile))
+            || (remote && !self.permits_foreground_default_https(profile, planning))
         {
             return Err(changed());
         }
         self.selected_transport(profile.id, ProfileRoute::ForegroundAgentDefault)
     }
 
-    fn permits_foreground_agent_https(&self, profile: &profiles::Profile) -> bool {
-        self.saved_root().is_some() && profile.permits_reviewed_agent_https()
+    fn permits_foreground_default_https(
+        &self,
+        profile: &profiles::Profile,
+        planning: bool,
+    ) -> bool {
+        self.saved_root().is_some()
+            && if planning {
+                profile.permits_reviewed_planning_https()
+            } else {
+                profile.permits_reviewed_agent_https()
+            }
     }
 
     pub(crate) fn reviewed_agent_https_profiles(
@@ -3652,8 +3740,8 @@ impl Dialog {
                 .timeout
                 .parse::<u16>()
                 .ok()
-                .filter(|value| (1..=MAX_TIMEOUT_MINUTES).contains(value))
-                .ok_or("Enter a request timeout from 1 to 1440 minutes.")?;
+                .filter(|value| *value <= MAX_TIMEOUT_MINUTES)
+                .ok_or("Enter a request timeout from 0 to 1440 minutes.")?;
             if !self.memory.settings_valid() {
                 return Err("Correct the AI Memory token budget first.".to_owned());
             }
@@ -3682,6 +3770,7 @@ impl Dialog {
                 local: self.local_state.clone(),
                 skills: self.skill_store.clone(),
                 memory: self.memory.settings().clone(),
+                java_general_preferences: JavaGeneralPreferences::default(),
                 java_memory_tokens: self.saved.java_memory_tokens,
                 java_memory_preferences: self.saved.java_memory_preferences,
                 java_skill_preferences: self.saved.java_skill_preferences,
@@ -4013,7 +4102,7 @@ impl Dialog {
                         .timeout
                         .parse()
                         .ok()
-                        .filter(|value| (1..=MAX_TIMEOUT_MINUTES).contains(value))
+                        .filter(|value| *value <= MAX_TIMEOUT_MINUTES)
                         .ok_or("Enter a valid global request timeout before testing.")?;
                     let mut config = profile
                         .transport_in(
@@ -4387,7 +4476,7 @@ impl Dialog {
     fn general_view(&self) -> Element<'_, Message> {
         use search::Setting::{Features, GlobalTimeout};
         let mut features = checkbox(self.general.features_enabled).label(Features.title());
-        let mut timeout = text_input("1–1440", &self.timeout).width(80);
+        let mut timeout = text_input("0–1440", &self.timeout).width(80);
         if self.editable() {
             features = features.on_toggle(Message::Features);
             timeout = timeout.on_input(Message::Timeout);
@@ -4437,6 +4526,7 @@ impl Dialog {
                 row![text(GlobalTimeout.title()), self.revealed.input(GlobalTimeout, self.editable(), timeout)]
                     .spacing(12).align_y(Alignment::Center),
             ),
+            text("Use 0 to turn off the profile request timeout. Workflow, connection and CLI limits still apply.").size(13),
             text("AI chat").size(19),
             self.revealed.wrap(
                 terminal_actions_setting,

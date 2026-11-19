@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use super::hardening::{HardeningOption, InputOption, Requirement};
 use super::{Analysis, Provenance, content_hash, source_fits};
 use crate::ai_manager::CodeTextLanguage;
+use crate::snippet_window::ai_assist::migration;
 use crate::snippets::SnippetId;
 
 pub(crate) const MAX_APPLY_CONTENT_BYTES: usize = 256 * 1024;
@@ -161,6 +162,8 @@ pub(crate) struct Checkpoint {
     pub(in crate::snippet_analysis) code_sha256: String,
     pub(in crate::snippet_analysis) reasons: Vec<ChangeReason>,
     pub(in crate::snippet_analysis) completed: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(in crate::snippet_analysis) migration_notes: Vec<String>,
 }
 
 impl Checkpoint {
@@ -202,7 +205,8 @@ impl Checkpoint {
     }
 
     fn matches_reason_prefix(&self, live: &Self) -> bool {
-        self.reasons.len() <= live.reasons.len()
+        self.migration_notes == live.migration_notes
+            && self.reasons.len() <= live.reasons.len()
             && self
                 .reasons
                 .iter()
@@ -239,6 +243,8 @@ pub(crate) struct ApplyRequestSnapshot {
     pub(in crate::snippet_analysis) code_text_language: CodeTextLanguage,
     pub(in crate::snippet_analysis) stage_width: usize,
     pub(in crate::snippet_analysis) total_stages: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::snippet_analysis) migration: Option<migration::Plan>,
 }
 
 impl ApplyRequestSnapshot {
@@ -247,8 +253,11 @@ impl ApplyRequestSnapshot {
     }
 
     fn selected_through(&self, completed: usize) -> Selection {
-        self.selection
-            .through(completed.saturating_mul(self.stage_width))
+        self.selection.through(
+            completed
+                .saturating_sub(usize::from(self.migration.is_some()))
+                .saturating_mul(self.stage_width),
+        )
     }
 }
 
@@ -394,13 +403,18 @@ impl ApplyRecovery {
             || !short_text(&request.report_language_code, 64)
             || !request.selection.valid(analysis)
             || !matches!(request.stage_width, 3 | 6)
-            || request.total_stages != request.selection.len().div_ceil(request.stage_width)
+            || (request.migration.is_some() && request.stage_width != 3)
+            || request.total_stages
+                != request.selection.len().div_ceil(request.stage_width)
+                    + usize::from(request.migration.is_some())
         {
             return Err(invalid("The stored apply request has an invalid plan"));
         }
         if let Some(checkpoint) = self.checkpoint.as_deref() {
             if !(1..=request.total_stages).contains(&checkpoint.completed)
                 || !checkpoint.valid_source()?
+                || !migration::Response::notes_valid(&checkpoint.migration_notes)
+                || (request.migration.is_none() && !checkpoint.migration_notes.is_empty())
                 || (checkpoint.completed == request.total_stages
                     && checkpoint.code_sha256 == request.source_sha256)
             {
@@ -448,6 +462,8 @@ impl ApplyRecovery {
                 .selected_through(completed)
                 .matches_live(&run.selected)
             && run.partial == expected_partial
+            && run.migration == self.request.migration
+            && run.migration_notes == checkpoint.migration_notes
             && run.code_text_language == Some(self.request.code_text_language)
             && run.provenance.profile_name == self.profile_name
             && run.provenance.model == self.model
@@ -508,6 +524,10 @@ pub(crate) struct ApplyRun {
     pub(crate) partial: Option<PartialApply>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) code_text_language: Option<CodeTextLanguage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) migration: Option<migration::Plan>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) migration_notes: Vec<String>,
     #[serde(default)]
     pub(crate) provenance: Provenance,
 }
@@ -522,6 +542,7 @@ impl fmt::Debug for ApplyRun {
 }
 
 impl ApplyRun {
+    #[cfg(test)]
     pub(crate) fn new(
         before: String,
         after: String,
@@ -529,6 +550,20 @@ impl ApplyRun {
         reasons: Vec<ChangeReason>,
         started_at: u64,
     ) -> io::Result<Self> {
+        Self::new_for_stages(before, after, selected, reasons, started_at, None, None)
+    }
+
+    pub(in crate::snippet_analysis) fn new_for_stages(
+        before: String,
+        after: String,
+        selected: Selection,
+        reasons: Vec<ChangeReason>,
+        started_at: u64,
+        partial: Option<PartialApply>,
+        migration: Option<(migration::Plan, Vec<String>)>,
+    ) -> io::Result<Self> {
+        let (migration, migration_notes) =
+            migration.map_or_else(|| (None, Vec::new()), |(plan, notes)| (Some(plan), notes));
         let run = Self {
             id: SnippetId::new()?,
             status: ApplyStatus::Proposed,
@@ -542,8 +577,10 @@ impl ApplyRun {
             after_omitted: false,
             selected,
             reasons,
-            partial: None,
+            partial,
             code_text_language: None,
+            migration,
+            migration_notes,
             provenance: Provenance::default(),
         };
         run.validate_content()?;
@@ -556,7 +593,11 @@ impl ApplyRun {
     }
 
     pub(crate) fn has_review_source(&self) -> bool {
-        !self.before_omitted && !self.after_omitted && self.selected.has_required_source()
+        !self.before_omitted && self.has_retained_result() && self.selected.has_required_source()
+    }
+
+    pub(in crate::snippet_analysis) fn has_retained_result(&self) -> bool {
+        !self.after_omitted
     }
 
     pub(crate) fn matches_live(&self, live: &Self) -> bool {
@@ -598,7 +639,7 @@ impl ApplyRun {
 
     pub(crate) fn validate(&self, analysis: &Analysis) -> io::Result<()> {
         self.validate_content()?;
-        if !self.selected.valid(analysis) {
+        if !self.selected.valid(analysis) && !self.migration_only() {
             return Err(invalid(
                 "The apply selection no longer matches the analysis",
             ));
@@ -613,11 +654,19 @@ impl ApplyRun {
         Ok(())
     }
 
+    fn migration_only(&self) -> bool {
+        self.migration.is_some()
+            && self.selected.is_empty()
+            && self
+                .partial
+                .is_some_and(|partial| partial.completed_stages == 1)
+    }
+
     fn validate_content(&self) -> io::Result<()> {
         if !valid_body(&self.before, self.before_omitted)
             || !valid_body(&self.after, self.after_omitted)
             || self.before_sha256 == self.after_sha256
-            || self.selected.is_empty()
+            || (self.selected.is_empty() && !self.migration_only())
             || self.started_at == 0
             || (self.status == ApplyStatus::Proposed) != self.decided_at.is_none()
             || self.decided_at.is_some_and(|date| date < self.started_at)
@@ -627,6 +676,8 @@ impl ApplyRun {
             ));
         }
         if !valid_reasons(&self.reasons, &self.selected)
+            || !migration::Response::notes_valid(&self.migration_notes)
+            || (self.migration.is_none() && !self.migration_notes.is_empty())
             || (self.after_omitted && self.reasons.iter().any(|reason| reason.anchor.is_some()))
             || self.selected.requirements.iter().any(|requirement| {
                 !requirement.valid()
@@ -644,11 +695,15 @@ impl ApplyRun {
         if let Some(partial) = self.partial
             && (partial.completed_stages == 0
                 || partial.completed_stages >= partial.total_stages
-                || partial.total_stages > partial.total_items
+                || partial.total_stages
+                    > partial
+                        .total_items
+                        .saturating_add(usize::from(self.migration.is_some()))
                 || partial.total_items > MAX_SELECTION
                 || partial.total_items <= self.selected.len()
                 || self.reasons.len() != self.selected.len()
-                || partial.completed_stages > self.selected.len()
+                || partial.completed_stages
+                    > self.selected.len() + usize::from(self.migration.is_some())
                 || partial.total_stages - partial.completed_stages
                     > partial.total_items - self.selected.len())
         {

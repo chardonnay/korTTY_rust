@@ -97,6 +97,111 @@ fn managed_import_is_durable_and_removal_requires_idle_weights() {
 }
 
 #[test]
+fn restored_gguf_metadata_keeps_its_id_and_settings_on_reattachment() {
+    let original = Profile::new();
+    let restored = Profile::new();
+    let original_registry = original.registry();
+    let restored_registry = restored.registry();
+    let cancelled = AtomicBool::new(false);
+    let bytes = fixture(2048, 1);
+    let source = original.0.join("original.gguf");
+    fs::write(&source, &bytes).unwrap();
+    let mut model = original_registry
+        .reference(&source, Purpose::Chat, &cancelled)
+        .unwrap();
+    model.name = "My restored model".into();
+    model.cpu_threads = 3;
+    let model = original_registry.configure(model).unwrap();
+    let portable = portable_registration(&serde_json::to_vec(&model).unwrap(), &model.id).unwrap();
+    let directory = restored_registry
+        .root(true)
+        .unwrap()
+        .private_child(&model.id, true)
+        .unwrap();
+    directory.publish_copy(MANIFEST, &portable).unwrap();
+    let detached = read_model(&directory, &model.id).unwrap();
+    assert!(detached.external.is_none());
+    assert!(restored_registry.open(&model.id).is_err());
+    assert!(original_registry.check_reattachment(&model).is_err());
+    assert!(restored_registry.check_reattachment(&detached).is_ok());
+
+    let local = restored.0.join("other-machine.gguf");
+    fs::write(&local, [bytes.as_slice(), &[0]].concat()).unwrap();
+    assert!(
+        restored_registry
+            .reattach(&detached, &local, &cancelled)
+            .is_err()
+    );
+    assert_eq!(read_model(&directory, &model.id).unwrap(), detached);
+    fs::write(&local, &bytes).unwrap();
+    directory.publish_copy(WEIGHTS, &bytes[..8]).unwrap();
+    assert!(
+        restored_registry
+            .reattach(&detached, &local, &cancelled)
+            .is_err()
+    );
+    directory.remove_file(WEIGHTS).unwrap();
+
+    let mut stale = detached.clone();
+    stale.cpu_threads += 1;
+    assert!(
+        restored_registry
+            .reattach(&stale, &local, &cancelled)
+            .is_err()
+    );
+    let attached = restored_registry
+        .reattach(&detached, &local, &cancelled)
+        .unwrap();
+    let mut settings = attached.clone();
+    settings.external = None;
+    assert_eq!(settings, detached);
+    let reopened = restored.registry().open(&model.id).unwrap();
+    assert_eq!(reopened.model, attached);
+    assert_eq!(reopened.path, local);
+    reopened.revalidate().unwrap();
+    drop(reopened);
+    assert!(
+        restored_registry
+            .reattach(&detached, &local, &cancelled)
+            .is_err()
+    );
+    fs::write(&local, [bytes.as_slice(), &[0]].concat()).unwrap();
+    assert!(restored_registry.open(&model.id).is_err());
+}
+
+#[test]
+fn restored_split_registration_requires_all_shards_with_the_original_sizes() {
+    let profile = Profile::new();
+    let registry = profile.registry();
+    let cancelled = AtomicBool::new(false);
+    let first = profile.0.join("split-00001-of-00002.gguf");
+    let second = profile.0.join("split-00002-of-00002.gguf");
+    let first_bytes = split::tests::fixture(0, 2, 2, false);
+    let second_bytes = split::tests::fixture(1, 2, 2, false);
+    fs::write(&first, &first_bytes).unwrap();
+    fs::write(&second, &second_bytes).unwrap();
+    let model = registry
+        .reference(&second, Purpose::Chat, &cancelled)
+        .unwrap();
+    let root = registry.root(false).unwrap();
+    let directory = root.private_child(&model.id, false).unwrap();
+    let portable = portable_registration(&serde_json::to_vec(&model).unwrap(), &model.id).unwrap();
+    directory.replace_file(MANIFEST, &portable).unwrap();
+    let detached = read_model(&directory, &model.id).unwrap();
+
+    fs::remove_file(&second).unwrap();
+    assert!(registry.reattach(&detached, &first, &cancelled).is_err());
+    fs::write(&second, [second_bytes.as_slice(), &[0]].concat()).unwrap();
+    assert!(registry.reattach(&detached, &first, &cancelled).is_err());
+    fs::write(&second, second_bytes).unwrap();
+    let attached = registry.reattach(&detached, &second, &cancelled).unwrap();
+    assert_eq!(attached.shard_bytes, detached.shard_bytes);
+    let opened = registry.open(&model.id).unwrap();
+    assert_eq!(opened.path, first);
+    opened.revalidate().unwrap();
+}
+
+#[test]
 fn managed_configuration_defaults_legacy_fields_and_preserves_leased_weights() {
     let profile = Profile::new();
     let registry = profile.registry();

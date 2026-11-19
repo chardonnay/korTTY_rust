@@ -2,7 +2,7 @@
 
 use iced::keyboard::{Key, Location, Modifiers, key::Named};
 use iced::widget::{column, row, text};
-use iced::{Element, Task, window};
+use iced::{Element, Size, Task, window};
 use kortty_terminal::{TerminalProfile, TextEncoding};
 
 use crate::clipboard_policy::ClipboardPolicy;
@@ -16,6 +16,9 @@ use super::{Desktop, PaneSession, Workspace};
 mod completion;
 use completion::Completion;
 pub use completion::Message;
+
+pub(in crate::workspace) const HISTORY_POPUP_WIDTH: std::ops::RangeInclusive<u16> = 280..=1400;
+pub(in crate::workspace) const HISTORY_POPUP_HEIGHT: std::ops::RangeInclusive<u16> = 120..=900;
 
 pub(in crate::workspace) struct Capture {
     aliases: Aliases,
@@ -43,6 +46,7 @@ impl PaneSession {
         &self,
         owner: window::Id,
         private: bool,
+        bounds: Size,
     ) -> Option<Element<'_, Desktop>> {
         let capture = self.agent_shortcut.as_ref()?;
         if self.agent_shortcut_prompt()? != capture.prompt {
@@ -65,7 +69,7 @@ impl PaneSession {
                 capture
                     .completion
                     .as_ref()
-                    .and_then(|state| state.view(owner, private)),
+                    .and_then(|state| state.view(owner, private, bounds)),
                 row![text(label).size(12), text(preview).size(13)]
                     .spacing(8)
                     .wrap(),
@@ -1114,6 +1118,7 @@ while ($null -ne ($line = [Console]::ReadLine())) {
         fixture.type_text("agent-ask ");
         let result = loaded(fixture.press(Named::Tab));
         let _ = fixture.workspace.update(result);
+        assert_history_resize_messages(&fixture);
         fixture.enter();
         assert_eq!(fixture.draft().line.text(), "agent-ask Inspect *** safely");
         assert!(fixture.workspace.terminal_agents.runs.is_empty());
@@ -1137,5 +1142,51 @@ while ($null -ne ($line = [Console]::ReadLine())) {
         fixture.enter();
         assert_eq!(fixture.draft().line.text(), "agent ");
         assert!(fixture.workspace.terminal_agents.runs.is_empty());
+    }
+
+    fn assert_history_resize_messages(fixture: &Fixture) {
+        use iced::advanced::clipboard;
+        use iced::{Event, Font, Point, Renderer, mouse};
+        use iced_runtime::{UserInterface, user_interface::Cache};
+
+        let bounds = Size::new(900.0, 600.0);
+        let view = fixture.workspace.sessions[&fixture.pane]
+            .agent_shortcut_preview(fixture.owner, false, bounds)
+            .unwrap();
+        let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
+        let mut ui = UserInterface::build(view, bounds, Cache::default(), &mut renderer);
+        let start = Point::new(456.0, 125.0);
+        let end = Point::new(556.0, 125.0);
+        let mut messages = Vec::new();
+        for (event, position) in [
+            (mouse::Event::CursorMoved { position: start }, start),
+            (mouse::Event::ButtonPressed(mouse::Button::Left), start),
+            (mouse::Event::CursorMoved { position: end }, end),
+            (mouse::Event::ButtonReleased(mouse::Button::Left), end),
+        ] {
+            ui.update(
+                &[Event::Mouse(event)],
+                mouse::Cursor::Available(position),
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+        }
+        assert!(
+            matches!(
+                messages.as_slice(),
+                [
+                    Desktop::AgentShortcut(Message::ResizeHistory(
+                        _,
+                        completion::HistoryResize::Width(560.0)
+                    )),
+                    Desktop::AgentShortcut(Message::ResizeHistory(
+                        _,
+                        completion::HistoryResize::Finish
+                    ))
+                ]
+            ),
+            "native history divider did not emit the expected drag and release: {messages:?}"
+        );
     }
 }

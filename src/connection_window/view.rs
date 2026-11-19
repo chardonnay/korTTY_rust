@@ -397,6 +397,13 @@ impl ConnectionWindow {
                 ]
                 .spacing(8)
                 .align_y(iced::Alignment::Center),
+                choices.terminal_effects.map(|effects| column![
+                    text("Terminal Effect").size(16),
+                    draft
+                        .effect
+                        .view(effects, Message::SerialEffect, Message::SerialEffectSpeed),
+                ]
+                .spacing(6)),
             ]
             .spacing(10)
             .into()

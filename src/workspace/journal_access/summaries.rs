@@ -441,11 +441,11 @@ fn clock() -> BoxStream<'static, Desktop> {
         .boxed()
 }
 
-fn pins_lm_studio_auto(receipt: &Receipt) -> bool {
+fn pins_inherited_model(receipt: &Receipt) -> bool {
     receipt
         .profile
         .as_ref()
-        .is_some_and(ProfileChoice::pins_lm_studio_auto)
+        .is_some_and(ProfileChoice::pins_inherited_model)
 }
 
 impl Workspace {
@@ -567,7 +567,7 @@ impl Workspace {
                     .queue
                     .authorizes_reviewed(&active.receipt)
                     && https::vault_matches(active.vault_revision.as_ref(), self.vault.as_ref()))
-            && (!(active.receipt.reviewed() || pins_lm_studio_auto(&active.receipt))
+            && (!(active.receipt.reviewed() || pins_inherited_model(&active.receipt))
                 || self.journal_summary_profile(
                     active.receipt.profile.as_ref(),
                     active.receipt.screenshots,
@@ -689,7 +689,7 @@ impl Workspace {
         );
         let profile = profile
             .cloned()
-            .or_else(|| self.inherited_lm_studio_summary_profile());
+            .or_else(|| self.inherited_journal_summary_profile());
         let automatic_title = preferences.automatic_title && self.journal_rename_allowed();
         let receipt = Receipt {
             batch: generation.clone(),
@@ -887,7 +887,8 @@ impl Workspace {
                                 profile: Some(profile.clone()),
                                 label: format!(
                                     "Unavailable · {} · {}",
-                                    profile.model, profile.destination
+                                    profile.display_model(),
+                                    profile.destination
                                 ),
                             }),
                     )
@@ -926,7 +927,8 @@ impl Workspace {
                                 profile: Some(expected.clone()),
                                 label: format!(
                                     "Unavailable · {} · {}",
-                                    expected.model, expected.destination
+                                    expected.display_model(),
+                                    expected.destination
                                 ),
                             }))
                         }),
@@ -1399,11 +1401,29 @@ impl Workspace {
         })
     }
 
+    fn inherited_journal_summary_profile(&self) -> Option<ProfileChoice> {
+        let config = self.ai_configuration()?;
+        if let Some(id) = config.journal_summary_server_default_id() {
+            let (_, _, destination) = config
+                .journal_summary_server_default_profiles()
+                .find(|(profile, _, _)| *profile == id)?;
+            return Some(ProfileChoice {
+                id: config.profile_reference(id)?,
+                model: String::new(),
+                destination,
+                policy_model_fingerprint: None,
+                https: None,
+                cli: None,
+            });
+        }
+        self.inherited_lm_studio_summary_profile()
+    }
+
     fn bind_inherited_journal_model(&mut self, receipt: &mut Receipt) -> io::Result<()> {
         if receipt.automatic()
             && !receipt.raw_only
             && receipt.profile.is_none()
-            && let Some(profile) = self.inherited_lm_studio_summary_profile()
+            && let Some(profile) = self.inherited_journal_summary_profile()
         {
             let bound = self
                 .journal_summaries
@@ -1452,8 +1472,24 @@ impl Workspace {
                     label: format!("{} · {}", entry.name, entry.model),
                 })
             }));
+            choices.extend(config.journal_summary_server_default_profiles().filter_map(
+                |(id, name, destination)| {
+                    Some(Choice {
+                        profile: Some(ProfileChoice {
+                            id: config.profile_reference(id)?,
+                            model: String::new(),
+                            destination,
+                            policy_model_fingerprint: None,
+                            https: None,
+                            cli: None,
+                        }),
+                        label: format!("{name} · Server selects the model"),
+                    })
+                },
+            ));
             if let Some(default) = config
-                .journal_summary_default_id()
+                .journal_summary_server_default_id()
+                .or_else(|| config.journal_summary_default_id())
                 .and_then(|id| config.profile_reference(id))
                 && let Some(index) = choices.iter().position(|choice| {
                     choice
@@ -2245,7 +2281,7 @@ impl Workspace {
                         Err(error) => {
                             if !active.periodic
                                 || active.receipt.reviewed()
-                                || pins_lm_studio_auto(&active.receipt)
+                                || pins_inherited_model(&active.receipt)
                             {
                                 self.journal_summaries
                                     .paused
@@ -2386,7 +2422,7 @@ impl Workspace {
                 .paused
                 .insert(receipt.generation.clone());
             self.journal_summaries.status = Some(format!(
-                "Could not save the journal's selected LM Studio model ({error})."
+                "Could not save the journal's selected AI profile ({error})."
             ));
             self.journal_summaries.update_details(&receipt.batch);
             return Task::none();
@@ -2402,11 +2438,11 @@ impl Workspace {
         let profile = (!receipt.raw_only)
             .then(|| self.journal_summary_profile(receipt.profile.as_ref(), receipt.screenshots))
             .flatten();
-        if profile.is_none() && pins_lm_studio_auto(&receipt) {
+        if profile.is_none() && pins_inherited_model(&receipt) {
             self.journal_summaries
                 .paused
                 .insert(receipt.generation.clone());
-            self.journal_summaries.status = Some("The LM Studio model selected for this journal changed or is unavailable. Load the selected model and retry, or cancel the saved pass.".into());
+            self.journal_summaries.status = Some("The AI profile selected for this journal changed or is unavailable. Restore the selected profile and retry, or cancel the saved pass.".into());
             self.journal_summaries.update_details(&receipt.batch);
             return Task::none();
         }
@@ -2799,7 +2835,7 @@ impl Workspace {
                 let profile = if raw_only {
                     profile
                 } else {
-                    profile.or_else(|| self.inherited_lm_studio_summary_profile())
+                    profile.or_else(|| self.inherited_journal_summary_profile())
                 };
                 let title_approval = approval
                     .map(|approval| &approval.grant)
@@ -3034,7 +3070,7 @@ impl Workspace {
                     .placeholder("Select a job or interactive Swarm").width(Length::Fill),
                 automation_source.as_ref().map(|_| pick_list(outbound_choices, source_profile.as_deref(), |choice| Event::PickSourceProfile(Box::new(choice)))
                     .placeholder("Choose an HTTPS or CLI profile").width(Length::Fill)),
-                source_grant.map(|grant| text(format!("Approved for this source · {} · {}", grant.grant.profile.model, grant.grant.profile.destination))),
+                source_grant.map(|grant| text(format!("Approved for this source · {} · {}", grant.grant.profile.display_model(), grant.grant.profile.destination))),
                 source_grant.and_then(|grant| grant.grant.evidence_limits.as_ref()).map(|limits| text(evidence_scope_label(limits)).size(13)),
                 source_grant.filter(|grant| grant.grant.title_since.is_some())
                     .map(|_| text("Separate title requests approved for this source").size(13)),
@@ -3153,7 +3189,7 @@ fn check_summary_model<'a>(
     match checked {
         Ok(()) => Ok(Some(model)),
         Err(error)
-            if pins_lm_studio_auto(receipt) && error.kind() == io::ErrorKind::PermissionDenied =>
+            if pins_inherited_model(receipt) && error.kind() == io::ErrorKind::PermissionDenied =>
         {
             Err(error)
         }

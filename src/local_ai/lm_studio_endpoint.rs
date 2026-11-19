@@ -141,7 +141,7 @@ impl LmStudioEndpoint {
         format!("{}{}", self.origin, self.completion_path())
     }
 
-    pub(super) fn connection(&self, timeout: Duration) -> Connection {
+    pub(super) fn connection(&self, timeout: impl Into<Option<Duration>>) -> Connection {
         self.connect(connection_config(timeout), Arc::new(Activity::default()))
             .expect("new connection activity is active")
     }

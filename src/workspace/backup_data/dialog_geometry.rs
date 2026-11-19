@@ -20,9 +20,65 @@ const EXPLICIT: &[(&str, Kind)] = &[
     ("snippetManagerGeometry", Kind::SnippetManager),
     ("jobSchedulerDialogGeometry", Kind::JobScheduler),
     ("guideViewerGeometry", Kind::Manual),
+    ("workflowScriptDialogGeometry", Kind::AgentWorkflow),
 ];
 
 const NAMED: &[(&str, Kind)] = &[
+    ("de.kortty.ui.SettingsDialog", Kind::GlobalSettings),
+    ("de.kortty.ui.QuickConnectDialog", Kind::QuickConnect),
+    (
+        "de.kortty.ui.ConnectionManagerDialog",
+        Kind::ConnectionManager,
+    ),
+    ("de.kortty.ui.ConnectionEditDialog", Kind::ConnectionEditor),
+    (
+        "de.kortty.ui.ConnectionImportDialog",
+        Kind::ConnectionImport,
+    ),
+    (
+        "de.kortty.ui.ConnectionExportDialog",
+        Kind::ConnectionExport,
+    ),
+    (
+        "de.kortty.ui.CredentialManagementDialog",
+        Kind::CredentialVault,
+    ),
+    (
+        "de.kortty.ui.TeamworkSettingsDialog",
+        Kind::TeamworkSettings,
+    ),
+    ("de.kortty.ui.RestoreTeamworkDialog", Kind::TeamworkRestore),
+    ("de.kortty.ui.OsBadgeManagerDialog", Kind::OsBadgeManager),
+    ("de.kortty.ui.KnownHostsDialog", Kind::KnownHosts),
+    ("de.kortty.ui.SSHKeyManagementDialog", Kind::SshKeyManager),
+    ("de.kortty.ui.LogfileManagerDialog", Kind::LogfileManager),
+    ("de.kortty.ui.LogfileViewerDialog", Kind::LogfileViewer),
+    (
+        "de.kortty.ui.TerminalRecordingManagerDialog",
+        Kind::VideoManager,
+    ),
+    (
+        "de.kortty.ui.TerminalRecordingReplayDialog",
+        Kind::VideoReplay,
+    ),
+    (
+        "de.kortty.ui.SessionProcessesDialog",
+        Kind::SessionProcesses,
+    ),
+    (
+        "de.kortty.ui.ShellIntegrationSetupDialog",
+        Kind::ShellIntegration,
+    ),
+    (
+        "de.kortty.ui.EnvironmentManagementDialog",
+        Kind::Environments,
+    ),
+    (
+        "de.kortty.ui.TerminalEffectPluginManagerDialog",
+        Kind::TerminalEffects,
+    ),
+    ("de.kortty.ui.SnippetDiffDialog", Kind::SnippetComparison),
+    ("highlight.rules", Kind::HighlightRules),
     ("sessionJournal.markers", Kind::JournalMarkerManager),
     ("sessionJournal.exportOptions", Kind::JournalExport),
     ("terminal.journalNote", Kind::JournalNote),
@@ -153,7 +209,7 @@ mod tests {
             </windowGeometries></globalSettings>"
         );
         let incoming = portable_java_preferences(xml.as_bytes(), None).unwrap();
-        assert_eq!((incoming.count, incoming.omitted), (8, 2));
+        assert_eq!((incoming.count, incoming.omitted), (EXPLICIT.len() + 2, 2));
         let incoming = incoming.contents.unwrap();
         let native = br#"{"java_dialog_geometry":{"ai-manager":{"width":950,"height":700,"position":null}}}"#;
         let restored = merge_java_window_settings(Some(native), &incoming, &Default::default())
@@ -162,7 +218,7 @@ mod tests {
         let placements = WindowSettings::decode(&restored)
             .unwrap()
             .java_dialog_geometry;
-        assert_eq!(placements.len(), 8);
+        assert_eq!(placements.len(), EXPLICIT.len() + 2);
         for &(_, kind) in EXPLICIT {
             let placement = placements[kind.key()].placement(iced::Size::new(0.0, 0.0));
             assert_eq!(placement.height, 700.0);
@@ -185,6 +241,45 @@ mod tests {
         assert!(!placements.contains_key(Kind::JournalNote.key()));
         assert!(
             merge_java_window_settings(Some(&restored), &incoming, &Default::default())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn java_class_keys_restore_independent_dialogs_and_reject_aliases() {
+        let named = NAMED.iter().enumerate().map(|(index, (name, _))| {
+            let width = 900 + index;
+            format!(
+                "<window key=\"{name}\"><geometry><width>{width}</width><height>700</height></geometry></window>"
+            )
+        }).collect::<String>();
+        let xml = format!(
+            "<globalSettings><windowGeometries>{named}
+             <window key=\"QuickConnectDialog\"><geometry><width>1000</width><height>700</height></geometry></window>
+             <window key=\"de.kortty.ui.SshKeyManagementDialog\"><geometry><width>1000</width><height>700</height></geometry></window>
+             </windowGeometries></globalSettings>"
+        );
+        let incoming = portable_java_preferences(xml.as_bytes(), None).unwrap();
+        assert_eq!((incoming.count, incoming.omitted), (NAMED.len(), 2));
+        let payload = incoming.contents.unwrap();
+        let native = br#"{"java_dialog_geometry":{"connection-manager":{"width":1220,"height":770,"position":null}}}"#;
+        let merged = merge_java_window_settings(Some(native), &payload, &Default::default())
+            .unwrap()
+            .unwrap();
+        let settings = WindowSettings::decode(&merged).unwrap();
+        assert_eq!(settings.java_dialog_geometry.len(), NAMED.len());
+        for (index, (_, kind)) in NAMED.iter().enumerate() {
+            let bounds = settings.java_dialog_geometry[kind.key()].placement(iced::Size::ZERO);
+            let expected = if *kind == Kind::ConnectionManager {
+                1220
+            } else {
+                900 + index
+            };
+            assert_eq!(bounds.width, expected as f32, "{}", kind.key());
+        }
+        assert!(
+            merge_java_window_settings(Some(&merged), &payload, &Default::default())
                 .unwrap()
                 .is_none()
         );

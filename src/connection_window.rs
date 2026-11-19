@@ -21,6 +21,7 @@ mod os_badge;
 pub(crate) mod overview;
 mod selection;
 mod terminal_overrides;
+pub(crate) use terminal_overrides::{ai_profile_choices, theme_choices};
 #[cfg(test)]
 mod tests;
 mod tree_context;
@@ -85,6 +86,8 @@ pub enum Message {
     SerialPasteLineDelay(String),
     SerialStrictTerminalMode(Option<bool>),
     SerialHighlightSet(String),
+    SerialEffect(Option<crate::terminal_effects::Effect>),
+    SerialEffectSpeed(String),
     ToggleSerialPin,
     Serial(serial_dialog::Message),
     EditSelected,
@@ -1316,6 +1319,18 @@ impl ConnectionWindow {
             Message::SerialHighlightSet(value) => {
                 if let Some(draft) = &mut self.serial_draft {
                     draft.highlight_set = (!value.is_empty()).then_some(value);
+                    draft.changed = true;
+                }
+            }
+            Message::SerialEffect(effect) => {
+                if let Some(draft) = &mut self.serial_draft {
+                    draft.effect.effect = effect;
+                    draft.changed = true;
+                }
+            }
+            Message::SerialEffectSpeed(value) => {
+                if let Some(draft) = &mut self.serial_draft {
+                    draft.effect.set_speed(value);
                     draft.changed = true;
                 }
             }

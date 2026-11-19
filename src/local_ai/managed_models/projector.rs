@@ -88,6 +88,81 @@ mod tests {
     }
 
     #[test]
+    fn restores_a_split_vision_pair_atomically_under_the_original_model_id() {
+        use super::super::{MANIFEST, VISION_ASSETS, nonce, portable_registration, split};
+
+        let profile = crate::snippets::tests::Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        let first = root.join("fixture-00001-of-00002.gguf");
+        let second = root.join("fixture-00002-of-00002.gguf");
+        let projector_path = root.join("fixture-projector.gguf");
+        let first_bytes = split::tests::fixture(0, 2, 2, false);
+        let second_bytes = split::tests::fixture(1, 2, 2, false);
+        let vision = projector(true);
+        fs::write(&first, &first_bytes).unwrap();
+        fs::write(&second, &second_bytes).unwrap();
+        fs::write(&projector_path, &vision).unwrap();
+        let registry = Registry::new(root.clone());
+        let cancelled = AtomicBool::new(false);
+        let original = registry
+            .import_projector_pair(&second, &projector_path, &cancelled)
+            .unwrap();
+        let manifest =
+            portable_registration(&serde_json::to_vec(&original).unwrap(), &original.id).unwrap();
+        registry.remove(&original.id).unwrap();
+        let directory = registry
+            .root(false)
+            .unwrap()
+            .private_child(&original.id, true)
+            .unwrap();
+        directory.publish_copy(MANIFEST, &manifest).unwrap();
+        assert!(registry.open(&original.id).is_err());
+        assert!(registry.reattach(&original, &first, &cancelled).is_err());
+        fs::write(&projector_path, [&vision[..], &[0]].concat()).unwrap();
+        assert!(
+            registry
+                .reattach_projector_pair(&original, &second, &projector_path, &cancelled)
+                .is_err()
+        );
+        fs::write(&projector_path, &vision).unwrap();
+
+        let staging_id = nonce().unwrap();
+        assert!(
+            registry
+                .publish_restored_vision(&original, &staging_id, &cancelled, |stage| {
+                    stage.publish_copy(NAME, &vision)?;
+                    Err(invalid("interrupted test copy"))
+                })
+                .is_err()
+        );
+        assert!(!directory.has_entry(VISION_ASSETS).unwrap());
+        assert!(registry.check_reattachment(&original).is_ok());
+
+        let restored = registry
+            .reattach_projector_pair(&original, &second, &projector_path, &cancelled)
+            .unwrap();
+        assert_eq!(restored, original);
+        let reopened = Registry::new(root).open(&original.id).unwrap();
+        assert_eq!(reopened.model, original);
+        assert_eq!(fs::read(&reopened.path).unwrap(), first_bytes);
+        assert_eq!(
+            fs::read(reopened.path.with_file_name(split::private_name(1, 2))).unwrap(),
+            second_bytes
+        );
+        assert_eq!(
+            fs::read(reopened.path.with_file_name(NAME)).unwrap(),
+            vision
+        );
+        reopened.revalidate().unwrap();
+        assert!(registry.check_reattachment(&original).is_err());
+        drop(reopened);
+        drop(directory);
+        registry.remove(&original.id).unwrap();
+        assert!(registry.list().unwrap().is_empty());
+        assert_eq!(fs::read(projector_path).unwrap(), vision);
+    }
+
+    #[test]
     fn projector_pair_copies_and_leases_both_components_for_chat() {
         let profile = crate::snippets::tests::Profile::new();
         let root = profile.0.canonicalize().unwrap();

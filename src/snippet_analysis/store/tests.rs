@@ -47,6 +47,122 @@ fn record(text: &str) -> Record {
 }
 
 #[test]
+fn library_overview_refreshes_saved_source_older_reviews_and_removed_reports() {
+    use crate::snippet_analysis::model::Selection;
+    use overview::{Filter, Kind, Overview};
+
+    let (profile, store) = setup();
+    let mut library = Library::open(profile.path()).unwrap();
+    let input = |content: &str| crate::snippets::Input {
+        name: "Health check".into(),
+        language: "Bash".into(),
+        category: String::new(),
+        content: content.into(),
+    };
+    let before = "echo old\n";
+    let after = "echo fixed\n";
+    let snippet = library.save(None, input(before)).unwrap();
+    let subject = Subject::Snippet(snippet);
+    let status =
+        |library: &Library, overview: &Overview| overview.status(library.get(snippet).unwrap());
+    let mut overview = store
+        .library_overview(&library, &Overview::default())
+        .unwrap();
+    assert_eq!(status(&library, &overview).kind, Kind::None);
+
+    let first = record(before);
+    store.append(subject, first.clone()).unwrap();
+    overview = store.library_overview(&library, &overview).unwrap();
+    assert_eq!(status(&library, &overview).kind, Kind::Findings);
+    assert!(Filter::Open.matches(status(&library, &overview)));
+    let mut run = ApplyRun::new(
+        before.into(),
+        after.into(),
+        Selection {
+            findings: vec!["I1".into()],
+            ..Selection::default()
+        },
+        Vec::new(),
+        1,
+    )
+    .unwrap();
+    run.provenance = first.provenance.clone();
+    store
+        .append_apply_while(subject, first.id, &first.source.sha256, run.clone(), || {
+            true
+        })
+        .unwrap();
+    let newest = record(before);
+    store.append(subject, newest.clone()).unwrap();
+    overview = store.library_overview(&library, &overview).unwrap();
+    assert_eq!(status(&library, &overview).kind, Kind::Review);
+    assert!(Filter::Review.matches(status(&library, &overview)));
+
+    store
+        .decide_apply_while(
+            subject,
+            first.id,
+            run.id,
+            &run.after_sha256,
+            ApplyStatus::Accepted,
+            || true,
+        )
+        .unwrap();
+    store.remove(subject, newest.id).unwrap();
+    overview = store.library_overview(&library, &overview).unwrap();
+    let unsaved = status(&library, &overview);
+    assert_eq!(unsaved.kind, Kind::Findings);
+    assert!(unsaved.unsaved && Filter::Review.matches(unsaved));
+    let key = SavedApply {
+        report: first.id,
+        run: run.id,
+    };
+    assert!(
+        !library
+            .get(snippet)
+            .unwrap()
+            .saved_apply_results()
+            .contains(&key)
+    );
+    library.save(Some(snippet), input(after)).unwrap();
+    library = Library::open(profile.path()).unwrap();
+    assert!(
+        library
+            .get(snippet)
+            .unwrap()
+            .saved_apply_results()
+            .contains(&key)
+    );
+    assert_eq!(status(&library, &overview).kind, Kind::None);
+    overview = store.library_overview(&library, &overview).unwrap();
+    let applied = status(&library, &overview);
+    assert_eq!(applied.kind, Kind::Applied);
+    assert!(!applied.stale && !applied.unsaved);
+
+    library.save(Some(snippet), input("echo edited\n")).unwrap();
+    library = Library::open(profile.path()).unwrap();
+    assert!(library.get(snippet).unwrap().history().is_empty());
+    overview = store.library_overview(&library, &overview).unwrap();
+    let edited = status(&library, &overview);
+    assert_eq!(edited.kind, Kind::Applied);
+    assert!(Filter::Stale.matches(edited));
+    assert!(!Filter::Review.matches(edited));
+    store.remove(subject, first.id).unwrap();
+    overview = store.library_overview(&library, &overview).unwrap();
+    assert_eq!(status(&library, &overview).kind, Kind::None);
+    library
+        .save(Some(snippet), input("echo updated\n"))
+        .unwrap();
+    assert!(
+        library
+            .get(snippet)
+            .unwrap()
+            .saved_apply_results()
+            .is_empty()
+    );
+}
+
+#[test]
 fn snippet_history_preserves_numeric_wire_and_requires_exact_named_apply_provenance() {
     use crate::snippet_analysis::model::Selection;
 
@@ -538,6 +654,7 @@ fn zero_cap_preserves_live_review_and_acceptance_without_retaining_source() {
             })
             .collect(),
         completed: 1,
+        migration_notes: Vec::new(),
     });
     recovery.checkpoint = Some(Arc::clone(&checkpoint));
     let saved = save(Some(previous), recovery.clone()).unwrap();
@@ -692,6 +809,7 @@ fn staged_apply_recovery_reopens_and_atomically_converts_the_latest_checkpoint()
                 })
                 .collect(),
             completed,
+            migration_notes: Vec::new(),
         })
     };
     save(None, &recovery).unwrap();

@@ -13,9 +13,9 @@ use kortty_server_archive::rsync_tree::{
 use rustix::fs::{XattrFlags, fgetxattr, fsetxattr};
 
 use super::super::{draft_replace::mount_id, privileged_archive::require_source_node, *};
+use super::handoff::{Kind, Lease, PAYLOAD};
 use super::policy::{Rules, require_source_file};
 
-const PAYLOAD: &str = "payload";
 const ACL: &str = "system.posix_acl_access";
 const READ: u16 = 4;
 const SEARCH: u16 = 1;
@@ -88,22 +88,26 @@ pub(super) fn apply(
         return Err(invalid(STAGE_CHANGED));
     }
     let (uid, _) = rules.login();
-    let mut stage = Stage::create(parent, mount, uid)?;
+    let mut stage = Stage {
+        lease: Lease::create(rules, parent, mount, Kind::Download)?,
+        login: rules.login(),
+        active: true,
+    };
     let result = (|| {
         let current = source_proof(rules, &review.spec, limits, Some(stage.target()), None)?;
         if current != (expected, review.fingerprint) {
             return Err(invalid(SOURCE_CHANGED));
         }
         stage.verify(rules, &handoff, directory, expected)?;
-        let path = format!("{handoff}/{}/{PAYLOAD}", stage.name);
+        let path = format!("{handoff}/{}/{PAYLOAD}", stage.lease.name);
         if !review.contains_payload(&path) {
             return Err(invalid(STAGE_CHANGED));
         }
         rules.require_current()?;
         stage.require_owned()?;
         // Every child is sealed before the wrapper becomes traversable by the login.
-        seal(&stage.directory.fd, uid, SEARCH)?;
-        fsync(&stage.directory.fd)?;
+        seal(&stage.lease.directory.fd, uid, SEARCH)?;
+        fsync(&stage.lease.directory.fd)?;
         rules.require_current()?;
         write_reply(&mut *output, &Reply::Prepared { path })?;
         match read_decision(input) {
@@ -111,7 +115,7 @@ pub(super) fn apply(
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(Reply::Aborted),
             Ok(Decision::Verify) => {
                 stage.verify(rules, &handoff, directory, expected)?;
-                require_acl(&stage.directory.fd, uid, SEARCH)?;
+                require_acl(&stage.lease.directory.fd, uid, SEARCH)?;
                 if source_proof(rules, &review.spec, limits, None, None)? != current {
                     return Err(invalid(SOURCE_CHANGED));
                 }
@@ -413,49 +417,22 @@ impl Target<'_> {
 }
 
 struct Stage {
-    parent: Directory,
-    name: String,
-    directory: Directory,
-    mount: u64,
-    uid: u32,
+    lease: Lease,
+    login: (u32, u32),
     active: bool,
 }
 
 impl Stage {
-    fn create(parent: Directory, mount: u64, uid: u32) -> io::Result<Self> {
-        if uid == 0 || uid == u32::MAX {
-            return Err(invalid(STAGE_CHANGED));
-        }
-        let mut random = [0_u8; 16];
-        getrandom::fill(&mut random).map_err(io::Error::other)?;
-        let name = format!(".kortty-{}.kortty-part", hex::encode(random));
-        mkdirat(&parent.fd, name.as_str(), PRIVATE_DIRECTORY)?;
-        let directory = parent.child(&name)?;
-        let stage = Self {
-            parent,
-            name,
-            directory,
-            mount,
-            uid,
-            active: true,
-        };
-        stage.require_owned()?;
-        fchmod(&stage.directory.fd, PRIVATE_DIRECTORY)?;
-        Ok(stage)
-    }
-
     fn target(&self) -> Target<'_> {
         Target {
-            parent: &self.directory,
+            parent: &self.lease.directory,
             name: PAYLOAD,
-            uid: self.uid,
+            uid: self.login.0,
         }
     }
 
     fn require_owned(&self) -> io::Result<()> {
-        self.parent
-            .require_child(&self.name, &self.directory.stat)?;
-        require_owned(&self.directory.fd, self.mount, true)
+        self.lease.require_current()
     }
 
     fn verify(
@@ -467,20 +444,23 @@ impl Stage {
     ) -> io::Result<()> {
         rules.require_current()?;
         let (prefix, parent, mount) = rules.handoff()?;
-        if prefix != handoff || mount != self.mount || !same_node(&self.parent.stat, &parent.stat) {
+        if prefix != handoff
+            || mount != self.lease.mount
+            || !same_node(&self.lease.parent.stat, &parent.stat)
+        {
             return Err(invalid(STAGE_CHANGED));
         }
         self.require_owned()?;
-        if names(&self.directory, 1)? != [PAYLOAD] {
+        if names(&self.lease.directory, 2)? != [Kind::Download.marker(), PAYLOAD] {
             return Err(invalid(STAGE_CHANGED));
         }
         let mut walk = Walk::new(
-            self.mount,
-            Access::Handoff(self.uid),
+            self.lease.mount,
+            Access::Handoff(self.login.0),
             inventory_limits(expected),
             None,
         );
-        walk.entry(&self.directory, PAYLOAD, "", 0, Some(directory), None)?;
+        walk.entry(&self.lease.directory, PAYLOAD, "", 0, Some(directory), None)?;
         if walk.manifest.finish() != expected {
             return Err(invalid(STAGE_CHANGED));
         }
@@ -488,19 +468,9 @@ impl Stage {
     }
 
     fn cleanup(&mut self) -> io::Result<()> {
-        self.require_owned()?;
-        fchmod(&self.directory.fd, PRIVATE_DIRECTORY)?;
-        fsync(&self.directory.fd)?;
-        discard(
-            &self.directory,
-            self.mount,
-            0,
-            &mut (MAX_ENTRIES as usize + 1),
-        )?;
-        self.require_owned()?;
-        unlinkat(&self.parent.fd, self.name.as_str(), AtFlags::REMOVEDIR)?;
+        self.lease.remove(self.login)?;
         self.active = false;
-        fsync(&self.parent.fd)?;
+        fsync(&self.lease.parent.fd)?;
         Ok(())
     }
 }
@@ -541,29 +511,59 @@ fn discard(
     }
     require_owned(&directory.fd, mount, true)?;
     for name in names(directory, *remaining)? {
-        *remaining = remaining
-            .checked_sub(1)
-            .ok_or_else(|| invalid(STAGE_CHANGED))?;
         let named = statat(&directory.fd, &name, AtFlags::SYMLINK_NOFOLLOW)?;
-        let flags = match FileType::from_raw_mode(named.st_mode) {
-            FileType::Directory => {
-                let child = directory.child(&name)?;
-                if !same_node(&named, &child.stat) {
-                    return Err(invalid(STAGE_CHANGED));
-                }
-                discard(&child, mount, depth + 1, remaining)?;
-                AtFlags::REMOVEDIR
-            }
-            FileType::RegularFile => {
-                let file = open_regular(directory, &name, &named)?;
-                require_owned(&file, mount, false)?;
-                AtFlags::empty()
-            }
-            _ => return Err(invalid(STAGE_CHANGED)),
-        };
-        directory.require_child(&name, &named)?;
-        unlinkat(&directory.fd, &name, flags)?;
+        discard_entry(directory, &name, named, mount, depth, remaining)?;
     }
+    Ok(())
+}
+
+pub(super) fn discard_handoff(directory: &Directory, mount: u64) -> io::Result<()> {
+    require_owned(&directory.fd, mount, true)?;
+    fchmod(&directory.fd, PRIVATE_DIRECTORY)?;
+    fsync(&directory.fd)?;
+    match statat(&directory.fd, PAYLOAD, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(named) => discard_entry(
+            directory,
+            PAYLOAD,
+            named,
+            mount,
+            0,
+            &mut (MAX_ENTRIES as usize + 1),
+        ),
+        Err(Errno::NOENT) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn discard_entry(
+    directory: &Directory,
+    name: &str,
+    named: Stat,
+    mount: u64,
+    depth: usize,
+    remaining: &mut usize,
+) -> io::Result<()> {
+    *remaining = remaining
+        .checked_sub(1)
+        .ok_or_else(|| invalid(STAGE_CHANGED))?;
+    let flags = match FileType::from_raw_mode(named.st_mode) {
+        FileType::Directory => {
+            let child = directory.child(name)?;
+            if !same_node(&named, &child.stat) {
+                return Err(invalid(STAGE_CHANGED));
+            }
+            discard(&child, mount, depth + 1, remaining)?;
+            AtFlags::REMOVEDIR
+        }
+        FileType::RegularFile => {
+            let file = open_regular(directory, name, &named)?;
+            require_owned(&file, mount, false)?;
+            AtFlags::empty()
+        }
+        _ => return Err(invalid(STAGE_CHANGED)),
+    };
+    directory.require_child(name, &named)?;
+    unlinkat(&directory.fd, name, flags)?;
     Ok(())
 }
 

@@ -11,11 +11,11 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::clipboard_policy::{ClipboardPolicy, PolicyAiProfile};
 
 use super::{
-    ANTHROPIC_VERSION, Cancel, Client, Connection, DEFAULT_TIMEOUT, Error, LmStudioEndpoint,
-    MAX_RESPONSE_BYTES, Pending, PolicyProfileAuthority, Purpose, RemoteProtocol, Target,
-    WorkerPermit, authorization, bearer_header, credential_value, numeric_loopback_endpoint,
-    policy_profile, providers, remote_credential, remote_header, start_worker, transport_error,
-    valid_model, validate_credential,
+    ANTHROPIC_VERSION, Cancel, Client, Connection, Error, LmStudioEndpoint, MAX_RESPONSE_BYTES,
+    Pending, PolicyProfileAuthority, Purpose, RemoteProtocol, Target, WorkerPermit, authorization,
+    bearer_header, credential_value, numeric_loopback_endpoint, policy_profile, providers,
+    remote_credential, remote_header, start_worker, transport_error, valid_model,
+    validate_credential,
 };
 
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -678,10 +678,14 @@ impl Client {
             self.profile.target,
             Target::Managed(_, Purpose::Embedding, _)
         );
+        let _activity = super::request_activity::RequestActivity::begin();
         #[cfg(target_os = "macos")]
         let _power = kortty_macos::AppNapActivity::begin();
-        let deadline = managed
-            .then(|| Instant::now() + self.profile.options.timeout.unwrap_or(DEFAULT_TIMEOUT));
+        let deadline = if managed {
+            self.profile.options.request_deadline(None)
+        } else {
+            None
+        };
         let transport = self.transport(deadline)?;
         let connection = &transport.connection;
         let endpoint = connection.url(if managed {

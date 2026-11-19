@@ -4,10 +4,11 @@ use std::sync::Arc;
 
 use iced::widget::{button, checkbox, column, row, scrollable, text, text_input};
 use iced::{Element, Length, Task};
+use kortty_server_archive::draft_replace;
 
 use crate::clipboard_policy::{ClipboardPolicy, RemoteEditorPolicy};
 use crate::sftp_window::worker::{self, draft_file};
-use crate::sftp_window::{Directory, EntryName, Location, RemoteEditor, files};
+use crate::sftp_window::{Directory, EntryKind, EntryName, Location, RemoteEditor, files};
 
 use super::{Scope, Source};
 
@@ -20,9 +21,11 @@ pub enum Event {
     Navigate(Vec<u8>),
     Page(bool),
     ChooseFolder,
+    ChooseFile(Vec<u8>),
     Review,
     Backup(bool),
     ReviewReplacement,
+    ReviewSelectedReplacement,
     Reviewed(u64, Result<Arc<draft_file::Plan>, String>),
     Publish(u64),
     Published(u64, Result<Published, String>),
@@ -67,6 +70,12 @@ impl Folder {
 }
 
 const PAGE_SIZE: usize = 48;
+
+enum Destination {
+    New,
+    Compared,
+    Selected,
+}
 
 #[derive(Default)]
 enum Phase {
@@ -229,10 +238,27 @@ impl State {
                     self.phase = Phase::Idle;
                 }
             }
+            Event::ChooseFile(name) if self.replacement_channel => {
+                if let Phase::Browsing(directory, _) = &self.phase
+                    && let Some(path) = Folder::from_directory(directory)
+                    && let Some(name) = listed_file(directory, &name)
+                {
+                    self.directory = Folder::new(path.to_vec());
+                    self.name = name.to_owned();
+                    self.phase = Phase::Idle;
+                    *status = None;
+                }
+            }
             Event::Backup(backup) if matches!(self.phase, Phase::Idle) => self.backup = backup,
-            Event::Review | Event::ReviewReplacement if matches!(self.phase, Phase::Idle) => {
-                let replacement = matches!(event, Event::ReviewReplacement);
-                match self.prepare(source, scope, draft, authorize, next_ticket, replacement) {
+            Event::Review | Event::ReviewReplacement | Event::ReviewSelectedReplacement
+                if matches!(self.phase, Phase::Idle) =>
+            {
+                let destination = match event {
+                    Event::ReviewReplacement => Destination::Compared,
+                    Event::ReviewSelectedReplacement => Destination::Selected,
+                    _ => Destination::New,
+                };
+                match self.prepare(source, scope, draft, authorize, next_ticket, destination) {
                     Ok(task) => {
                         *status = None;
                         return Some(task);
@@ -304,12 +330,15 @@ impl State {
     }
 
     fn matches(&self, plan: &draft_file::Plan, source: &Source<'_>, draft: &Arc<str>) -> bool {
-        if plan.replacement().is_some() {
+        if plan.replaces_compared_file() {
             source
                 .right_remote
                 .is_some_and(|original| plan.matches_replacement(original, self.backup, draft))
         } else {
             plan.matches(&self.directory.path, &self.name, draft)
+                && plan
+                    .replacement()
+                    .is_none_or(|spec| spec.backup == self.backup)
         }
     }
 
@@ -320,23 +349,24 @@ impl State {
         draft: &Arc<str>,
         authorize: draft_file::Authorize,
         next_ticket: &mut u64,
-        replacement: bool,
+        destination: Destination,
     ) -> Result<Task<Event>, String> {
         let worker = self.worker(source, scope)?;
-        let request = if replacement {
-            let original = source
-                .right_remote
-                .ok_or("There is no eligible compared server file.")?;
-            draft_file::Request::replacing(
-                original,
-                self.backup,
-                Arc::clone(draft),
-                source.target,
-                worker,
-                authorize,
-            )
-        } else {
-            draft_file::Request::new(
+        let request = match destination {
+            Destination::Compared => {
+                let original = source
+                    .right_remote
+                    .ok_or("There is no eligible compared server file.")?;
+                draft_file::Request::replacing(
+                    original,
+                    self.backup,
+                    Arc::clone(draft),
+                    source.target,
+                    worker,
+                    authorize,
+                )
+            }
+            Destination::New | Destination::Selected => draft_file::Request::new(
                 &self.directory.path,
                 &self.name,
                 Arc::clone(draft),
@@ -344,6 +374,10 @@ impl State {
                 worker,
                 authorize,
             )
+            .and_then(|request| match destination {
+                Destination::Selected => request.for_replacement(None, self.backup, worker),
+                _ => Ok(request),
+            }),
         }
         .map_err(|error| error.to_string())?;
         let pending = Pending(worker::sync::Cancel::default());
@@ -395,7 +429,10 @@ impl State {
             return None;
         }
         let worker = self.worker(source, scope).ok()?;
-        let reply = match worker.submit(worker::Operation::BrowseDraftDestination(path.clone())) {
+        let reply = match worker.submit(worker::Operation::BrowseDraftDestination(
+            path.clone(),
+            self.replacement_channel,
+        )) {
             Ok(reply) => reply,
             Err(error) => {
                 *status = Some(error.to_string());
@@ -418,6 +455,8 @@ impl State {
     }
 
     pub(super) fn view(&self, right_remote: bool) -> Element<'_, Event> {
+        let named =
+            draft_file::valid_directory(&self.directory.path) && draft_file::valid_name(&self.name);
         match &self.phase {
             Phase::Idle => column![
                 row![
@@ -428,24 +467,24 @@ impl State {
                     ),
                 ]
                 .spacing(8),
-                (right_remote && self.replacement_channel).then(|| row![
+                self.replacement_channel.then(|| row![
                     checkbox(self.backup)
                         .label("Keep a .bak copy")
                         .on_toggle(Event::Backup),
-                    button("Review replacement of the right server file…")
-                        .on_press(Event::ReviewReplacement),
+                    right_remote.then(|| button("Review replacement of the right server file…")
+                        .on_press(Event::ReviewReplacement)),
                 ]
                 .spacing(8)
                 .wrap()),
                 row![
-                    text_input("New file name", &self.name).on_input(Event::Name),
-                    button("Review server save…").on_press_maybe(
-                        (draft_file::valid_directory(&self.directory.path)
-                            && draft_file::valid_name(&self.name))
-                        .then_some(Event::Review),
-                    ),
+                    text_input("Server file name", &self.name).on_input(Event::Name),
+                    button("Review new file…").on_press_maybe(named.then_some(Event::Review)),
+                    self.replacement_channel
+                        .then(|| button("Review replacement…")
+                            .on_press_maybe(named.then_some(Event::ReviewSelectedReplacement))),
                 ]
-                .spacing(8),
+                .spacing(8)
+                .wrap(),
             ]
             .spacing(8)
             .into(),
@@ -465,11 +504,18 @@ impl State {
             Phase::Review(id, plan) => column![
                 scrollable(
                     text(if let Some(spec) = plan.replacement() {
+                        let access =
+                            if draft_replace::windows_drive_path(spec.destination.as_bytes()) {
+                                "Preserve Windows access permissions".into()
+                            } else {
+                                format!("mode {:04o}", spec.original.mode)
+                            };
                         format!(
-                            "Replace server file · {} · {} bytes · mode {:04o} · {}",
+                            "Replace server file · {} · {} → {} bytes · {} · {}",
                             plan.destination(),
+                            spec.original.bytes,
                             plan.bytes(),
-                            spec.original.mode,
+                            access,
                             if spec.backup {
                                 "Keep a new .bak copy"
                             } else {
@@ -518,7 +564,11 @@ fn browse_view(directory: &Directory, offset: usize) -> Element<'_, Event> {
                 button(text(&entry.display))
                     .style(button::subtle)
                     .width(Length::Fill)
-                    .on_press(Event::Navigate(files::remote_join(path, name))),
+                    .on_press(if entry.kind == EntryKind::Directory {
+                        Event::Navigate(files::remote_join(path, name))
+                    } else {
+                        Event::ChooseFile(name.clone())
+                    }),
             );
         }
     }
@@ -538,6 +588,20 @@ fn browse_view(directory: &Directory, offset: usize) -> Element<'_, Event> {
     ]
     .spacing(5)
     .into()
+}
+
+fn listed_file<'a>(directory: &'a Directory, name: &[u8]) -> Option<&'a str> {
+    directory.entries.iter().find_map(|entry| {
+        let EntryName::Remote(listed) = &entry.name else {
+            return None;
+        };
+        if entry.kind != EntryKind::File || listed != name {
+            return None;
+        }
+        std::str::from_utf8(listed)
+            .ok()
+            .filter(|name| draft_file::valid_name(name))
+    })
 }
 
 fn parent(path: &[u8]) -> Option<&[u8]> {
@@ -613,7 +677,7 @@ async fn receive(
 
 #[cfg(test)]
 mod tests {
-    use crate::sftp_window::{Entry, EntryKind};
+    use crate::sftp_window::Entry;
 
     use super::*;
 
@@ -636,6 +700,8 @@ mod tests {
                 entry(b"other", EntryKind::Directory),
                 entry(b"raw-\xff", EntryKind::Directory),
                 entry(b"link", EntryKind::Link),
+                entry(b"target.conf", EntryKind::File),
+                entry(b"raw-file-\xff", EntryKind::File),
             ],
         );
         for path in [
@@ -645,8 +711,17 @@ mod tests {
         ] {
             assert!(browse_path_allowed(&listing, path));
         }
-        for path in [b"/".as_slice(), b"/home/current/link", b"/home/not-listed"] {
+        for path in [
+            b"/".as_slice(),
+            b"/home/current/link",
+            b"/home/not-listed",
+            b"/home/current/target.conf",
+        ] {
             assert!(!browse_path_allowed(&listing, path));
+        }
+        assert_eq!(listed_file(&listing, b"target.conf"), Some("target.conf"));
+        for name in [b"link".as_slice(), b"other", b"raw-file-\xff", b"unlisted"] {
+            assert_eq!(listed_file(&listing, name), None);
         }
         let folder = Folder::new(b"/home/current/raw-\xff".to_vec());
         assert_eq!(folder.path, b"/home/current/raw-\xff");

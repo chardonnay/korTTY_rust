@@ -1,12 +1,37 @@
 //! Native histories share the same bounded, redacted run activity.
 
+use std::collections::VecDeque;
+
 use iced::widget::{button, column, container, responsive, row, scrollable, text};
 use iced::{Element, Font, Length};
 
 use crate::terminal_agent::design::History;
 
 use super::super::Message as AgentMessage;
-use super::{Message, Palette, Run};
+use super::{Message, Palette, Presentation, Run};
+
+#[derive(Clone, Copy)]
+pub(super) struct Activity<'a> {
+    pub(super) activity: &'a VecDeque<String>,
+    pub(super) goal: &'a str,
+    pub(super) plan: Option<&'a str>,
+    pub(super) activity_font: f32,
+    pub(super) plan_font: f32,
+    pub(super) presentation: &'a Presentation,
+}
+
+impl<'a> From<&'a Run> for Activity<'a> {
+    fn from(run: &'a Run) -> Self {
+        Self {
+            activity: &run.activity,
+            goal: &run.goal,
+            plan: run.plan.as_deref(),
+            activity_font: run.fonts.activity,
+            plan_font: run.fonts.plan,
+            presentation: &run.presentation,
+        }
+    }
+}
 
 pub(super) fn summary(value: &str) -> String {
     let line = value
@@ -20,44 +45,63 @@ pub(super) fn summary(value: &str) -> String {
     result
 }
 
-fn select(run: &Run, index: usize) -> AgentMessage {
+fn select(run: Activity<'_>, index: usize) -> AgentMessage {
     AgentMessage::Design(Message::Select(run.presentation.identity(index)))
 }
 
-fn detail(run: &Run, selected: usize) -> Element<'_, AgentMessage> {
+fn detail(run: Activity<'_>, selected: usize) -> Element<'_, AgentMessage> {
+    if run.presentation.activity.expand_all && !run.activity.is_empty() {
+        return run
+            .activity
+            .iter()
+            .fold(column![].spacing(8), |entries, entry| {
+                entries.push(text(entry).size(run.activity_font).width(Length::Fill))
+            })
+            .into();
+    }
     text(
         run.activity
             .get(selected)
             .map_or("No activity yet.", String::as_str),
     )
+    .size(run.activity_font)
     .width(Length::Fill)
     .into()
 }
 
 pub(super) fn view(run: &Run, palette: Option<Palette>) -> Element<'_, AgentMessage> {
-    view_as(run, run.design.history, palette)
+    view_as(run.into(), run.design.history, palette)
 }
 
 pub(super) fn view_as(
-    run: &Run,
+    run: Activity<'_>,
     history: History,
     palette: Option<Palette>,
 ) -> Element<'_, AgentMessage> {
     if run.presentation.model_usage.label().is_none() {
         return entries(run, history);
     }
+    with_usage(run, history, palette)
+}
+
+fn with_usage(
+    run: Activity<'_>,
+    history: History,
+    palette: Option<Palette>,
+) -> Element<'_, AgentMessage> {
+    let font_size = run.activity_font;
     let muted = palette.map(|palette| palette.muted.color());
     responsive(move |size| {
         let mut usage = column![
             text(run.presentation.model_usage.label().unwrap_or_default())
-                .size(12)
+                .size(font_size - 1.0)
                 .style(move |_| text::Style { color: muted })
         ]
         .spacing(4);
         for row in run.presentation.model_usage.rows() {
             usage = usage.push(
                 text(row)
-                    .size(12)
+                    .size(font_size - 1.0)
                     .style(move |_| text::Style { color: muted }),
             );
         }
@@ -76,13 +120,14 @@ pub(super) fn view_as(
     .into()
 }
 
-fn entries(run: &Run, history: History) -> Element<'_, AgentMessage> {
+fn entries(run: Activity<'_>, history: History) -> Element<'_, AgentMessage> {
+    let size = run.activity_font;
     let selected = run.presentation.selection(run.activity.len());
     let mut entries = column![].spacing(7).width(Length::Fill);
     match history {
         History::Transcript | History::StepCards | History::InlineBlocks | History::Focus => {
             for (index, entry) in run.activity.iter().enumerate() {
-                entries = entries.push(super::activity_entry(history, index, entry));
+                entries = entries.push(super::activity_entry(history, index, entry, size));
             }
         }
         History::Timeline => {
@@ -91,10 +136,11 @@ fn entries(run: &Run, history: History) -> Element<'_, AgentMessage> {
                     row![
                         text(if index == selected { "●" } else { "│" }),
                         column![
-                            button(text(format!("{} · {}", index + 1, summary(entry))).size(13))
+                            button(text(format!("{} · {}", index + 1, summary(entry))).size(size))
                                 .on_press(select(run, index))
                                 .style(button::text),
-                            (index == selected).then(|| text(entry).size(13)),
+                            (index == selected || run.presentation.activity.expand_all)
+                                .then(|| text(entry).size(size)),
                         ]
                         .spacing(4)
                         .width(Length::Fill),
@@ -104,16 +150,16 @@ fn entries(run: &Run, history: History) -> Element<'_, AgentMessage> {
             }
         }
         History::PlanExecution => {
-            let mut steps = column![text("Goal").size(14), text(&run.goal).size(13)]
+            let mut steps = column![text("Goal").size(size + 1.0), text(run.goal).size(size)]
                 .spacing(5)
                 .width(Length::FillPortion(2));
-            if let Some(plan) = &run.plan {
-                steps = steps.push(text(plan).size(13));
+            if let Some(plan) = run.plan {
+                steps = steps.push(text(plan).size(run.plan_font));
             }
-            steps = steps.push(text("Activity").size(14));
+            steps = steps.push(text("Activity").size(size + 1.0));
             for (index, entry) in run.activity.iter().enumerate() {
                 steps = steps.push(
-                    button(text(format!("{}  {}", index + 1, summary(entry))).size(12))
+                    button(text(format!("{}  {}", index + 1, summary(entry))).size(size - 1.0))
                         .on_press(select(run, index))
                         .style(if index == selected {
                             button::primary
@@ -127,7 +173,11 @@ fn entries(run: &Run, history: History) -> Element<'_, AgentMessage> {
                     .height(Length::Fill)
                     .width(Length::FillPortion(2)),
                 scrollable(
-                    column![text("Selected activity").size(14), detail(run, selected)].spacing(7)
+                    column![
+                        text("Selected activity").size(size + 1.0),
+                        detail(run, selected)
+                    ]
+                    .spacing(7)
                 )
                 .height(Length::Fill)
                 .width(Length::FillPortion(3)),
@@ -135,14 +185,21 @@ fn entries(run: &Run, history: History) -> Element<'_, AgentMessage> {
             .spacing(10)
             .into();
         }
+        History::CardStack if run.presentation.activity.expand_all => {
+            for (index, entry) in run.activity.iter().enumerate() {
+                entries = entries.push(super::activity_entry(history, index, entry, size));
+            }
+        }
         History::CardStack => {
             for index in selected.saturating_sub(2)..selected {
                 if let Some(entry) = run.activity.get(index) {
                     entries = entries.push(
-                        button(text(format!("{} · {}", index + 1, summary(entry))).size(12))
-                            .width(Length::Fill)
-                            .on_press(select(run, index))
-                            .style(button::secondary),
+                        button(
+                            text(format!("{} · {}", index + 1, summary(entry))).size(size - 1.0),
+                        )
+                        .width(Length::Fill)
+                        .on_press(select(run, index))
+                        .style(button::secondary),
                     );
                 }
             }
@@ -161,7 +218,8 @@ fn entries(run: &Run, history: History) -> Element<'_, AgentMessage> {
                                     selected + 1
                                 },
                                 run.activity.len()
-                            )),
+                            ))
+                            .size(size),
                             button("Next").on_press_maybe(
                                 (selected + 1 < run.activity.len())
                                     .then_some(AgentMessage::Design(Message::Next))
@@ -184,8 +242,8 @@ fn entries(run: &Run, history: History) -> Element<'_, AgentMessage> {
                     column![
                         text(format!("── activity {} ──", index + 1))
                             .font(Font::MONOSPACE)
-                            .size(12),
-                        text(entry).font(Font::MONOSPACE).size(13),
+                            .size(size - 1.0),
+                        text(entry).font(Font::MONOSPACE).size(size),
                     ]
                     .spacing(4),
                 );
@@ -200,7 +258,7 @@ fn entries(run: &Run, history: History) -> Element<'_, AgentMessage> {
         History::Conversation => {
             entries = entries.push(
                 container(
-                    container(text(&run.goal).size(13))
+                    container(text(run.goal).size(size))
                         .padding(8)
                         .style(container::rounded_box)
                         .max_width(360),
@@ -212,10 +270,11 @@ fn entries(run: &Run, history: History) -> Element<'_, AgentMessage> {
                 entries = entries.push(
                     container(
                         column![
-                            button(text(format!("Agent · {}", summary(entry))).size(13))
+                            button(text(format!("Agent · {}", summary(entry))).size(size))
                                 .on_press(select(run, index))
                                 .style(button::text),
-                            (index == selected).then(|| text(entry).size(13)),
+                            (index == selected || run.presentation.activity.expand_all)
+                                .then(|| text(entry).size(size)),
                         ]
                         .spacing(4),
                     )
@@ -226,14 +285,19 @@ fn entries(run: &Run, history: History) -> Element<'_, AgentMessage> {
             }
         }
         History::LogTable => {
-            entries = entries
-                .push(row![text("#").width(36), text("Activity").width(Length::Fill)].spacing(6));
+            entries = entries.push(
+                row![
+                    text("#").size(size).width(36),
+                    text("Activity").size(size).width(Length::Fill)
+                ]
+                .spacing(6),
+            );
             for (index, entry) in run.activity.iter().enumerate() {
                 entries = entries.push(
                     button(
                         row![
-                            text((index + 1).to_string()).size(12).width(36),
-                            text(summary(entry)).size(12).width(Length::Fill),
+                            text((index + 1).to_string()).size(size - 1.0).width(36),
+                            text(summary(entry)).size(size - 1.0).width(Length::Fill),
                         ]
                         .spacing(6),
                     )

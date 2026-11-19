@@ -19,6 +19,58 @@ mod pip;
 mod shortcut;
 
 #[test]
+fn agent_text_zoom_keeps_independent_sizes_and_remembered_defaults() {
+    use crate::workspace::terminal_agent::font::View;
+    use iced::keyboard::{Key, Modifiers};
+
+    let mut fixture = Fixture::new(false, false);
+    fixture.workspace.window_settings.agent_activity_font_size = Some(19.5);
+    fixture.workspace.window_settings.agent_plan_font_size = Some(21.5);
+    let plan = fixture.open(Mode::Plan);
+    assert_eq!(fixture.run(plan).fonts.activity, 13.0);
+    assert_eq!(fixture.run(plan).fonts.plan, 21.5);
+    no_task(fixture.send(plan, Message::Zoom(View::Activity, true)));
+    assert_eq!(fixture.run(plan).fonts.activity, 14.0);
+    assert_eq!(
+        fixture.workspace.window_settings.agent_activity_font_size,
+        Some(19.5)
+    );
+
+    no_task(fixture.send(plan, Message::RememberActivityFont(true)));
+    no_task(fixture.send(plan, Message::Zoom(View::Activity, false)));
+    assert_eq!(
+        fixture.workspace.window_settings.agent_activity_font_size,
+        Some(13.0)
+    );
+    no_task(
+        fixture
+            .workspace
+            .agent_plan_zoom_shortcut(plan, &Key::Character("=".into()), Modifiers::COMMAND)
+            .unwrap(),
+    );
+    assert_eq!(fixture.run(plan).fonts.plan, 22.0);
+    assert_eq!(fixture.run(plan).fonts.activity, 13.0);
+    assert_eq!(
+        fixture.workspace.window_settings.agent_plan_font_size,
+        Some(22.0)
+    );
+
+    let mut private = Fixture::new(false, true);
+    let plan = private.open(Mode::Plan);
+    no_task(private.send(plan, Message::Zoom(View::Plan, true)));
+    no_task(private.send(plan, Message::RememberActivityFont(true)));
+    assert_eq!(private.run(plan).fonts.plan, 14.0);
+    assert_eq!(private.workspace.window_settings.agent_plan_font_size, None);
+    assert_eq!(
+        private
+            .workspace
+            .window_settings
+            .agent_remember_activity_font,
+        None
+    );
+}
+
+#[test]
 fn root_bypass_requires_probe_overrides_ask_and_revokes_with_saved_confirmation() {
     let mut fixture = Fixture::new(false, false);
     let id = fixture.open(Mode::Run);
@@ -736,6 +788,7 @@ impl Fixture {
                 working_directory: None,
                 shell_integration: false,
                 emulation: "xterm-256color".into(),
+                terminal_effect: None,
                 terminal: TerminalOverrides {
                     ai_agent_disabled: disabled,
                     ..Default::default()
@@ -970,7 +1023,7 @@ fn saved_connection_preselects_the_server_model_for_foreground_agent_only() {
     let run = fixture.open(Mode::Run);
     assert_eq!(fixture.run(run).profile().unwrap().id, 2);
     let plan = fixture.open(Mode::Plan);
-    assert_eq!(fixture.run(plan).profile().unwrap().id, 1);
+    assert_eq!(fixture.run(plan).profile().unwrap().id, 2);
 
     connection.terminal.ai_profile = Some(ProfileRef::Numeric(3));
     store.save_local(connection).unwrap();
@@ -1009,12 +1062,9 @@ fn standalone_agent_reviews_server_default_before_sending_without_a_model() {
     let run = fixture.open(Mode::Run);
     assert!(fixture.run(run).profile().is_none());
     assert!(fixture.run(run).profiles[0].server_default.is_some());
-    assert!(
-        fixture
-            .workspace
-            .build_agent(fixture.session, Mode::Plan, None, None, false)
-            .is_err()
-    );
+    let plan = fixture.open(Mode::Plan);
+    assert!(fixture.run(plan).profile().is_none());
+    assert!(fixture.run(plan).profiles[0].server_default.is_some());
 
     draft["profiles"]["profiles"]
         .as_array_mut()
@@ -1123,7 +1173,7 @@ fn check_standalone_https_agent_review(server_default: bool) {
         usize::from(!server_default)
     );
     assert_eq!(
-        saved.foreground_agent_default_profiles().count(),
+        saved.foreground_default_profiles(false).count(),
         usize::from(server_default)
     );
     fixture.workspace.set_test_ai_configuration(saved.clone());
@@ -1580,27 +1630,59 @@ fn inline_review_masks_the_destination_and_withholds_keyboard_approval() {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn terminal_agent_cursor_keys_bind_the_review_to_the_visible_stream_and_epoch() {
     use crate::terminal_agent::design::Approval;
     use crate::terminal_view::agent_cursor::{Key, Message as Cursor};
 
     let mut fixture = Fixture::new(false, false);
-    let session =
-        Session::start(GridSize::default(), kortty_terminal::TerminalProfile::Xterm).unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    session
-        .send(
-            concat!(
-                r"stty -echo; printf '\033]133;A\007cursor-fixture-ready\033]133;B\007'; ",
-                r"IFS= read -r unused",
-                "\r"
+    #[cfg(unix)]
+    let session = {
+        let session =
+            Session::start(GridSize::default(), kortty_terminal::TerminalProfile::Xterm).unwrap();
+        session
+            .send(
+                concat!(
+                    r"stty -echo; printf '\033]133;A\007cursor-fixture-ready\033]133;B\007'; ",
+                    r"IFS= read -r unused",
+                    "\r"
+                )
+                .as_bytes()
+                .to_vec(),
             )
-            .as_bytes()
-            .to_vec(),
+            .unwrap();
+        session
+    };
+    #[cfg(windows)]
+    let session = {
+        let powershell = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+        let script = r#"
+            $esc = [char]27
+            $bell = [char]7
+            [Console]::Write("${esc}]133;A${bell}cursor-fixture-ready${esc}]133;B${bell}")
+            [void][Console]::ReadLine()
+        "#;
+        Session::start_local(
+            GridSize::default(),
+            kortty_terminal::TerminalProfile::Xterm,
+            kortty_pty::LaunchOptions {
+                command: Some(vec![
+                    powershell.to_str().unwrap().into(),
+                    "-NoLogo".into(),
+                    "-NoProfile".into(),
+                    "-NonInteractive".into(),
+                    "-Command".into(),
+                    script.into(),
+                ]),
+                ..Default::default()
+            },
+            true,
+            None,
         )
-        .unwrap();
+        .unwrap()
+    };
     let frame = loop {
         let frame = session.frame();
         if session.agent_shortcut_prompt(&frame).is_some() {

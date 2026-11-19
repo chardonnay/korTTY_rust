@@ -199,6 +199,7 @@ pub(super) fn controls<'a>(job: Option<&'a Job>, controls: &Controls) -> Column<
 pub(super) fn view<'a>(
     phase: Phase<'a>,
     status: Option<&'a str>,
+    font_size: u8,
 ) -> (Column<'a, WindowMessage>, Row<'a, WindowMessage>) {
     match phase {
         Phase::Preview {
@@ -273,6 +274,7 @@ pub(super) fn view<'a>(
                 checkbox(included)
                     .label("Include this file in publication")
                     .on_toggle(move |enabled| msg(Action::Include(file, enabled))),
+                super::diff_font_controls(font_size),
                 pager(page, pages),
             ]
             .spacing(8);
@@ -284,7 +286,7 @@ pub(super) fn view<'a>(
                     column![
                         text("Original").size(14),
                         text(original.unwrap_or("New file"))
-                            .size(13)
+                            .size(u32::from(font_size))
                             .font(Font::MONOSPACE)
                             .wrapping(Wrapping::WordOrGlyph)
                     ]
@@ -293,7 +295,7 @@ pub(super) fn view<'a>(
                     column![
                         text("Proposed").size(14),
                         text(proposed)
-                            .size(13)
+                            .size(u32::from(font_size))
                             .font(Font::MONOSPACE)
                             .wrapping(Wrapping::WordOrGlyph)
                     ]

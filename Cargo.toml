@@ -40,6 +40,7 @@ kortty-windowing = { path = "crates/windowing" }
 kortty-vault = { path = "crates/vault" }
 latex-rust = "=3.0.3"
 lopdf = { version = "=0.47.0", default-features = false }
+num-bigint = { version = "0.4.8", default-features = false }
 percent-encoding = "2.3"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 pgp = { version = "0.21.0", default-features = false }
@@ -70,6 +71,8 @@ pdf-writer = { version = "=0.15.0", default-features = false }
 subsetter = { version = "=0.2.6", default-features = false }
 ttf-parser = { version = "=0.25.1", default-features = false }
 sevenz-rust2 = { version = "=0.25.0", path = "vendor/sevenz-rust2", default-features = false, features = ["compress", "aes256"] }
+jsonschema = { version = "0.61.2", default-features = false }
+referencing = { version = "0.61.2", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Use the system's libc interface for Linux desktop dependencies.

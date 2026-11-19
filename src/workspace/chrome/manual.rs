@@ -7,6 +7,7 @@ use iced::widget::{Id, button, column, container, row, scrollable, space, svg, t
 use iced::{Alignment, Element, Font, Length, Size, Task, window};
 
 use crate::workspace::dialog_placement::Kind as DialogKind;
+use crate::workspace::question_history::History;
 use crate::workspace::tab_titles::{DEFAULT_MANUAL_SCALE, MAX_MANUAL_SCALE, MIN_MANUAL_SCALE};
 
 use super::{Message, Workspace, WorkspaceMessage, wrap};
@@ -51,6 +52,10 @@ struct Reader {
     zoom_save_failed: bool,
     asking: bool,
     ask: ask::State,
+    ask_input: Id,
+    question_history: History,
+    history_loaded: bool,
+    history_unavailable: bool,
 }
 
 struct Chapter {
@@ -116,6 +121,7 @@ impl Workspace {
                 ..window::Settings::default()
             },
         );
+        let history = History::load();
         self.chrome.manual.window = Some(Reader {
             id,
             selected: 0,
@@ -127,6 +133,10 @@ impl Workspace {
             zoom_save_failed: false,
             asking: false,
             ask: ask::State::default(),
+            ask_input: Id::unique(),
+            history_loaded: history.is_ok(),
+            history_unavailable: history.is_err(),
+            question_history: history.unwrap_or_default(),
         });
         opened.discard()
     }
@@ -274,18 +284,37 @@ impl Workspace {
                 }
             }
             Event::Ask(event) if reader.asking => {
-                return reader
-                    .ask
-                    .update(
-                        event,
-                        ask::Scope {
-                            config: configuration,
-                            policy: &self.clipboard.policy,
-                            vault: self.vault.as_ref(),
-                            vault_revision,
-                        },
-                    )
-                    .map(move |event| wrap(Message::Manual(id, Event::Ask(event))));
+                let (event, focus) = match event {
+                    ask::Event::Recall(question) => {
+                        if !reader.question_history.entries().contains(&question) {
+                            return Task::none();
+                        }
+                        (
+                            ask::Event::Question(question),
+                            operation::focus(reader.ask_input.clone()),
+                        )
+                    }
+                    event => (event, Task::none()),
+                };
+                let update = reader.ask.update(
+                    event,
+                    ask::Scope {
+                        config: configuration,
+                        policy: &self.clipboard.policy,
+                        vault: self.vault.as_ref(),
+                        vault_revision,
+                    },
+                );
+                if let Some(question) = reader.ask.take_submitted_question() {
+                    let changed = reader.question_history.record(question);
+                    if reader.history_loaded && (changed || reader.history_unavailable) {
+                        reader.history_unavailable = reader.question_history.save().is_err();
+                    }
+                }
+                return Task::batch([
+                    focus,
+                    update.map(move |event| wrap(Message::Manual(id, Event::Ask(event)))),
+                ]);
             }
             Event::Ask(_) => {}
             Event::Close => return self.close_manual(id).unwrap_or_else(Task::none),
@@ -351,7 +380,17 @@ impl Workspace {
         let send = move |event| wrap(Message::Manual(id, event));
         let ai_enabled = self.ai_chat_enabled() && !self.exiting && !self.scheduler_draining;
         if reader.asking {
-            return Some(reader.ask.view(ai_enabled).map(send));
+            return Some(
+                reader
+                    .ask
+                    .view(
+                        ai_enabled,
+                        &reader.ask_input,
+                        reader.question_history.entries(),
+                        reader.history_unavailable,
+                    )
+                    .map(send),
+            );
         }
         let scale = self.window_settings.manual_scale;
         let needle = needle(&reader.query);

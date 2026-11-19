@@ -5,7 +5,6 @@ use kortty_terminal::TerminalProfile;
 use super::*;
 use crate::session::{GridSize, Session};
 
-#[cfg(unix)]
 fn save(library: &mut Library, name: &str, language: &str, content: &str) -> Snippet {
     let id = library
         .save(
@@ -21,6 +20,97 @@ fn save(library: &mut Library, name: &str, language: &str, content: &str) -> Sni
     library.get(id).unwrap().clone()
 }
 
+#[test]
+fn positional_arguments_keep_spaces_and_quoting_and_require_a_supported_interpreter() {
+    let profile = snippets::tests::Profile::new();
+    let mut library = Library::open(profile.path()).unwrap();
+    let bash = save(&mut library, "Arguments", "bash", "printf '%s\\n' \"$@\"");
+    let plain = save(&mut library, "Unsupported", "plain", "echo test");
+    let args: Vec<_> = argument_lines("  first  \r\n \n--flag\u{2028}O'Reilly; /tmp/a b")
+        .map(|value| Zeroizing::new(value.into()))
+        .collect();
+    let command = command_line(&bash, bash.content(), &args, false).unwrap();
+    let line = String::from_utf8(command).unwrap();
+    assert!(line.ends_with(" | bash -s -- '  first  ' '--flag' 'O'\\''Reilly; /tmp/a b'\r"));
+    assert!(!line.contains('\n'));
+    assert!(command_line(&plain, plain.content(), &args, false).is_err());
+    assert!(command_line(&bash, bash.content(), &args, true).is_err());
+    assert!(
+        command_line(
+            &bash,
+            bash.content(),
+            &[Zeroizing::new("a\tb".into())],
+            false
+        )
+        .is_err()
+    );
+    assert!(
+        command_line(
+            &bash,
+            bash.content(),
+            &[Zeroizing::new("'".repeat(4096))],
+            false
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn parameterized_library_run_prefills_defaults_and_pins_the_terminal_before_review() {
+    let profile = snippets::tests::Profile::new();
+    let mut library = Library::open(profile.path()).unwrap();
+    library
+        .save_variable(
+            None,
+            Variable {
+                name: "example".into(),
+                value: "stored".into(),
+            },
+        )
+        .unwrap();
+    let snippet = save(&mut library, "Parameterized", "bash", "echo ${example}");
+    let snapshot = Snapshot::load_at(profile.path(), snippet.id()).unwrap();
+    let mut workspace = Workspace::default();
+    let (owner, _) = workspace.open_window(false);
+    let grid = GridSize::default();
+    let session = workspace.store_session(
+        Session::start(grid, TerminalProfile::Xterm).unwrap(),
+        grid,
+        14,
+    );
+    workspace.add_tab(owner, session);
+    wait(|| workspace.sessions[&session].session.frame().status == Status::Running);
+    let manager = workspace
+        .install_snippet_surface(
+            owner,
+            super::super::SnippetWindow::open(profile.path()).unwrap(),
+            true,
+        )
+        .0;
+    let _ = workspace.run_library_snippet(manager, snippet.id(), true);
+    let token = workspace.windows[&owner]
+        .pending_snippet_run
+        .as_ref()
+        .unwrap()
+        .token;
+    let _ = workspace.update_snippet_run(owner, RunMessage::Loaded(token, Ok(snapshot)));
+    let run = workspace.windows[&owner]
+        .pending_snippet_run
+        .as_ref()
+        .unwrap();
+    assert_eq!(run.target.session, session);
+    let Stage::Review(review) = &run.stage else {
+        panic!("parameter review")
+    };
+    assert_eq!(review.requirements.missing[0].value.as_str(), "stored");
+    assert!(review.fields[0].remember);
+    assert!(review.arguments.is_some());
+    let _ = workspace.update_snippet_run(owner, RunMessage::Cancel(token));
+    assert!(workspace.windows[&owner].pending_snippet_run.is_none());
+    library.reload().unwrap();
+    assert_eq!(library.get(snippet.id()).unwrap().usage_count(), 0);
+}
+
 #[cfg(unix)]
 #[test]
 fn generated_shell_command_is_one_physical_line_and_preserves_script_bytes() {
@@ -33,7 +123,7 @@ fn generated_shell_command_is_one_physical_line_and_preserves_script_bytes() {
         "bash",
         "printf '%s\\n' 'Grüße'\r\nprintf '%s\\n' '\\c'",
     );
-    let mut command = command_line(&snippet, snippet.content(), false).unwrap();
+    let mut command = command_line(&snippet, snippet.content(), &[], false).unwrap();
     assert_eq!(command.pop(), Some(b'\r'));
     assert!(!command.contains(&b'\n'));
     let command = String::from_utf8(command).unwrap();
@@ -47,9 +137,9 @@ fn generated_shell_command_is_one_physical_line_and_preserves_script_bytes() {
         String::from_utf8(result.stderr).unwrap(),
         format!("Running snippet: {name}\n")
     );
-    assert!(command_line(&snippet, "echo x\x1b[201~", false).is_err());
-    assert!(command_line(&snippet, &"'".repeat(4096), false).is_err());
-    assert!(command_line(&snippet, "echo x", true).is_err());
+    assert!(command_line(&snippet, "echo x\x1b[201~", &[], false).is_err());
+    assert!(command_line(&snippet, &"'".repeat(4096), &[], false).is_err());
+    assert!(command_line(&snippet, "echo x", &[], true).is_err());
 }
 
 #[cfg(unix)]
@@ -95,6 +185,7 @@ fn confirmed_variable_runs_only_in_the_named_real_pty_despite_focus_and_broadcas
         "printf '%s%s\\n' 'KORTTY-RUN-' '${target}'\n",
     );
     let snapshot = Arc::new(Snapshot {
+        path: profile.path(),
         snippet,
         variables: library.variables().to_vec(),
     });
@@ -141,6 +232,7 @@ fn confirmed_variable_runs_only_in_the_named_real_pty_despite_focus_and_broadcas
         target,
         stage: Stage::Loading,
         trigger: None,
+        parameterized: false,
     });
     let _ =
         workspace.update_snippet_run(owner, RunMessage::Loaded(token, Ok(Arc::clone(&snapshot))));
@@ -153,7 +245,24 @@ fn confirmed_variable_runs_only_in_the_named_real_pty_despite_focus_and_broadcas
         RunMessage::Value(token, 0, Zeroizing::new("once".into())),
     );
     let _ = workspace.update_snippet_run(owner, RunMessage::Confirm(token));
+    let snippet = snapshot.snippet.id();
+    assert_eq!(
+        Library::open(profile.path())
+            .unwrap()
+            .get(snippet)
+            .unwrap()
+            .usage_count(),
+        0
+    );
     let _ = workspace.update_snippet_run(owner, RunMessage::Checked(token, Ok(snapshot)));
+    assert_eq!(
+        Library::open(profile.path())
+            .unwrap()
+            .get(snippet)
+            .unwrap()
+            .usage_count(),
+        1
+    );
 
     wait(|| output_line(&workspace.sessions[&first].session, "KORTTY-RUN-once"));
     let other_session = &workspace.sessions[&second].session;
@@ -187,6 +296,7 @@ fn resolved_multiline_clipboard_needs_its_own_confirmation_before_pty_input() {
         "printf '%s\\n' '${clipboard}'",
     );
     let snapshot = Arc::new(Snapshot {
+        path: profile.path(),
         snippet,
         variables: library.variables().to_vec(),
     });
@@ -213,6 +323,7 @@ fn resolved_multiline_clipboard_needs_its_own_confirmation_before_pty_input() {
         target,
         stage: Stage::Loading,
         trigger: None,
+        parameterized: false,
     });
     let _ =
         workspace.update_snippet_run(owner, RunMessage::Loaded(token, Ok(Arc::clone(&snapshot))));
@@ -318,6 +429,7 @@ fn triggered_plain_snippet_waits_for_explicit_review() {
         )
         .unwrap();
     let snapshot = Arc::new(Snapshot {
+        path: profile.path(),
         snippet: library.get(snippet).unwrap().clone(),
         variables: Vec::new(),
     });

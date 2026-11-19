@@ -1,6 +1,4 @@
 use std::os::fd::AsRawFd as _;
-use std::os::unix::process::CommandExt as _;
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use kortty_server_archive::rsync_tree::{Inventory, MAX_DEPTH, Manifest, valid_name};
@@ -9,16 +7,12 @@ use rustix::process::{Gid, Uid};
 
 use super::super::super::draft_replace::mount_id;
 use super::super::Rules;
+use super::super::handoff::{Kind, Lease, PAYLOAD};
 use super::*;
-
-const PAYLOAD: &str = "payload";
 
 pub(super) struct Handoff<'a> {
     rules: &'a Rules,
-    root: Directory,
-    mount: u64,
-    name: String,
-    directory: Directory,
+    lease: Lease,
     payload: Directory,
     path: String,
     owned: bool,
@@ -27,16 +21,10 @@ pub(super) struct Handoff<'a> {
 impl<'a> Handoff<'a> {
     pub(super) fn create(rules: &'a Rules) -> io::Result<Self> {
         let (root_path, root, mount) = rules.handoff()?;
-        let mut random = [0; 16];
-        getrandom::fill(&mut random).map_err(io::Error::other)?;
-        let name = format!(".kortty-{}.kortty-part", hex::encode(random));
-        mkdirat(&root.fd, name.as_str(), PRIVATE_DIRECTORY)?;
-        let directory = root.child(&name)?;
+        let mut lease = Lease::create(rules, root, mount, Kind::Upload)?;
+        let directory = &lease.directory;
         let setup = (|| {
-            root.require_child(&name, &directory.stat)?;
-            if directory.stat.st_uid != 0 || mount_id(&directory.fd)? != mount {
-                return Err(changed());
-            }
+            lease.require_current()?;
             mkdirat(&directory.fd, PAYLOAD, PRIVATE_DIRECTORY)?;
             let payload = directory.child(PAYLOAD)?;
             let (uid, gid) = rules.login();
@@ -52,21 +40,14 @@ impl<'a> Handoff<'a> {
         let payload = match setup {
             Ok(payload) => payload,
             Err(error) => {
-                if root.require_child(&name, &directory.stat).is_ok() {
-                    let _ = fchmod(&directory.fd, PRIVATE_DIRECTORY);
-                    let _ = unlinkat(&directory.fd, PAYLOAD, AtFlags::REMOVEDIR);
-                    let _ = unlinkat(&root.fd, name.as_str(), AtFlags::REMOVEDIR);
-                }
+                let _ = lease.remove(rules.login());
                 return Err(error);
             }
         };
-        let path = format!("{root_path}/{name}/{PAYLOAD}");
+        let path = format!("{root_path}/{}/{PAYLOAD}", lease.name);
         Ok(Self {
             rules,
-            root,
-            mount,
-            name,
-            directory,
+            lease,
             payload,
             path,
             owned: true,
@@ -79,12 +60,14 @@ impl<'a> Handoff<'a> {
 
     fn require_current(&self) -> io::Result<()> {
         let (_, root, mount) = self.rules.handoff()?;
-        if !same_node(&root.stat, &self.root.stat) || mount != self.mount {
+        if !same_node(&root.stat, &self.lease.parent.stat) || mount != self.lease.mount {
             return Err(changed());
         }
-        self.root.require_child(&self.name, &self.directory.stat)?;
-        self.directory.require_child(PAYLOAD, &self.payload.stat)?;
-        require_login(&self.payload.fd, true, self.mount, self.rules.login())
+        self.lease.require_current()?;
+        self.lease
+            .directory
+            .require_child(PAYLOAD, &self.payload.stat)?;
+        require_login(&self.payload.fd, true, self.lease.mount, self.rules.login())
     }
 
     pub(super) fn copy(
@@ -99,7 +82,7 @@ impl<'a> Handoff<'a> {
         let mut copy = CopyTree {
             rules: self.rules,
             permit,
-            mount: self.mount,
+            mount: self.lease.mount,
             manifest: Manifest::default(),
             limit: expected,
             files_left: expected.files,
@@ -132,30 +115,10 @@ impl<'a> Handoff<'a> {
             return Ok(());
         }
         self.owned = false;
-        self.root.require_child(&self.name, &self.directory.stat)?;
-        self.directory.require_child(PAYLOAD, &self.payload.stat)?;
-        let (uid, gid) = self.rules.login();
-        // Only the login may recursively remove its own mutable staging contents.
-        // The installed helper performs only checked empty-directory removals.
-        let _ = Command::new("/usr/bin/rm")
-            .env_clear()
-            .uid(uid)
-            .gid(gid)
-            .arg("-rf")
-            .arg("--one-file-system")
-            .arg("--")
-            .current_dir(format!("/proc/self/fd/{}", self.directory.fd.as_raw_fd()))
-            .arg(PAYLOAD)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        fchmod(&self.directory.fd, PRIVATE_DIRECTORY)?;
-        self.root.require_child(&self.name, &self.directory.stat)?;
-        self.directory.require_child(PAYLOAD, &self.payload.stat)?;
-        unlinkat(&self.directory.fd, PAYLOAD, AtFlags::REMOVEDIR)?;
-        unlinkat(&self.root.fd, self.name.as_str(), AtFlags::REMOVEDIR)?;
-        Ok(())
+        self.lease
+            .directory
+            .require_child(PAYLOAD, &self.payload.stat)?;
+        self.lease.remove(self.rules.login())
     }
 }
 

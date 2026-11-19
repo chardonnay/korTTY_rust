@@ -251,6 +251,33 @@ fn labels<M>(element: Element<'_, M>) -> String {
 }
 
 #[test]
+fn expand_all_shows_older_details_in_each_selectable_history() {
+    let mut run = run(DesignHistory::Timeline);
+    run.record("Old event\nOlder detail".into());
+    run.record("New event\nNewer detail".into());
+    for history in [
+        DesignHistory::Timeline,
+        DesignHistory::CardStack,
+        DesignHistory::Conversation,
+        DesignHistory::LogTable,
+        DesignHistory::PlanExecution,
+    ] {
+        run.design.history = history;
+        run.presentation.activity.expand_all = false;
+        assert!(
+            !labels(design::history_view(&run, None)).contains("Older detail"),
+            "{history}"
+        );
+        run.presentation.activity.expand_all = true;
+        let labels = labels(design::history_view(&run, None));
+        assert!(
+            labels.contains("Older detail") && labels.contains("Newer detail"),
+            "{history}"
+        );
+    }
+}
+
+#[test]
 fn every_native_history_and_visible_status_presents_real_attempt_metadata() {
     let mut run = run(DesignHistory::Transcript);
     run.record_model_attempts(run.epoch, &attempts());

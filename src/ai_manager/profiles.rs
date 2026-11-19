@@ -149,6 +149,7 @@ impl Catalog {
             profile.trusted_local_endpoint = false;
             profile.trusted_remote_endpoint = false;
             profile.reviewed_agent_https = false;
+            profile.reviewed_planning_https = false;
             profile.credential_env.clear();
             profile.clear_web_search();
             profile.restore_review = profile.restore_review
@@ -462,6 +463,8 @@ pub(super) struct Profile {
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub(super) reviewed_agent_https: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(super) reviewed_planning_https: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub(super) tavily_search: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) lm_web: Option<local_ai::web_search::McpSettings>,
@@ -539,6 +542,7 @@ impl Default for Profile {
             java_embedded_model: None,
             java_web_hint: None,
             reviewed_agent_https: false,
+            reviewed_planning_https: false,
             tavily_search: false,
             lm_web: None,
             model_mode: ModelMode::Manual,
@@ -803,6 +807,7 @@ impl Profile {
             || self.trusted_local_endpoint
             || self.trusted_remote_endpoint
             || self.reviewed_agent_https
+            || self.reviewed_planning_https
             || !self.credential_env.is_empty()
             || self.has_web_search()
         {
@@ -1024,6 +1029,18 @@ impl Profile {
                 || (self.reviewed_agent_https && self.trusted_remote_endpoint))
     }
 
+    pub(super) fn supports_reviewed_planning_https(&self) -> bool {
+        self.uses_server_default_model()
+            && self.remote_protocol().is_some()
+            && self.policy_definition().is_none()
+    }
+
+    pub(super) fn permits_reviewed_planning_https(&self) -> bool {
+        self.supports_reviewed_planning_https()
+            && self.trusted_remote_endpoint
+            && self.reviewed_planning_https
+    }
+
     fn cli_program(&self) -> Result<local_ai::cli::Program, String> {
         self.cli
             .as_ref()
@@ -1204,7 +1221,7 @@ impl Profile {
             );
         }
         let minutes = self.timeout_minutes.unwrap_or(u32::from(default_timeout));
-        let timeout = (minutes != 0).then(|| Duration::from_secs(u64::from(minutes) * 60));
+        let timeout = Some(Duration::from_secs(u64::from(minutes) * 60));
         let root_path = || {
             root.map(Path::to_path_buf).map_or_else(
                 || {
@@ -1607,6 +1624,7 @@ pub(crate) enum Message {
     TrustLocal(bool),
     TrustRemote(bool),
     ReviewedAgentHttps(bool),
+    ReviewedPlanningHttps(bool),
     Web(web::Action),
     ModelMode(ModelMode),
     Vision(Vision),
@@ -2288,6 +2306,14 @@ impl Editor {
                     profile.reviewed_agent_https = allow && profile.trusted_remote_endpoint;
                 }
             }
+            Message::ReviewedPlanningHttps(allow) if self.wizard.is_none() => {
+                if let Some(profile) = self
+                    .selected_mut()
+                    .filter(|profile| profile.supports_reviewed_planning_https())
+                {
+                    profile.reviewed_planning_https = allow && profile.trusted_remote_endpoint;
+                }
+            }
             Message::Tokenizer(tokenizer) if self.wizard.is_none() => {
                 if let Some(profile) = self.selected_mut() {
                     profile.tokenizer = tokenizer;
@@ -2357,6 +2383,7 @@ impl Editor {
                             profile.restore_review = true;
                         }
                         profile.reviewed_agent_https = false;
+                        profile.reviewed_planning_https = false;
                         if profile.java_web_hint.is_some() || profile.requires_endpoint_review() {
                             profile.clear_web_search();
                         } else {
@@ -2387,6 +2414,7 @@ impl Editor {
                 {
                     if profile.uses_server_default_model() || mode == ModelMode::ServerDefault {
                         profile.reviewed_agent_https = false;
+                        profile.reviewed_planning_https = false;
                     }
                     profile.model_mode = mode;
                     if mode == ModelMode::ServerDefault {
@@ -2495,6 +2523,7 @@ impl Editor {
         profile.trusted_local_endpoint = false;
         profile.trusted_remote_endpoint = false;
         profile.reviewed_agent_https = false;
+        profile.reviewed_planning_https = false;
         profile.credential_env.clear();
         profile.cli = (mode == ConnectionMode::Cli).then(cli_profile::Settings::default);
         profile.lm_web = None;
@@ -2713,6 +2742,7 @@ impl Editor {
                 profile.trusted_local_endpoint = false;
                 profile.trusted_remote_endpoint = false;
                 profile.reviewed_agent_https = false;
+                profile.reviewed_planning_https = false;
                 profile.credential_env.clear();
             }
             if matches!(field, Field::Endpoint | Field::Credential) {

@@ -452,7 +452,10 @@ impl LiveAuthority {
         let pins = workspace.review_skill_pins(pane).to_vec();
         let saved_pins = if let Some(root) = config.saved_root() {
             let saved = identity.saved_pins(root)?;
-            if saved.as_deref().unwrap_or_default() != pins {
+            let baseline = workspace
+                .terminal_overrides(pane)
+                .map_or(&[][..], |settings| settings.ai_skills.as_slice());
+            if saved.as_deref().unwrap_or_default() != baseline {
                 return Err(CHANGED_PINS.into());
             }
             saved
@@ -925,9 +928,8 @@ impl Workspace {
         Ok(task)
     }
 
-    fn review_skill_pins<'a>(&'a self, pane: &PaneSession) -> &'a [u64] {
-        self.terminal_overrides(pane)
-            .map_or(&[], |settings| &settings.ai_skills)
+    fn review_skill_pins<'a>(&'a self, pane: &'a PaneSession) -> &'a [u64] {
+        self.terminal_ai_assignments(pane).1
     }
 
     pub(super) fn require_model_review_authority(
@@ -1463,6 +1465,34 @@ fn event(id: window::Id, message: Message) -> Desktop {
 mod tests {
     use super::*;
     use crate::terminal_logging::Policy;
+
+    #[test]
+    fn quick_skill_selection_keeps_the_saved_connection_check() {
+        use crate::connection_store::AiAssignments;
+        use crate::workspace::terminal_agent::flow::tests::Fixture;
+
+        let mut fixture = Fixture::with_endpoint(false, false, "127.0.0.1:12345");
+        let id = fixture.open(crate::terminal_agent::Mode::Ask);
+        let workspace = &mut fixture.workspace;
+        let pane = workspace.sessions.get_mut(&fixture.session).unwrap();
+        pane.quick_ai = Some(AiAssignments {
+            profile: None,
+            skills: vec![11],
+        });
+        let profile_id = pane.saved_local.as_ref().unwrap().id;
+        let config = workspace.ai_configuration().unwrap();
+        let root = config.saved_root().unwrap();
+        let run = &workspace.terminal_agents.runs[&id];
+        let review = LiveAuthority::capture(workspace, run, &config, Kind::Ask).unwrap();
+        assert_eq!(review.pins, [11]);
+        assert_eq!(review.saved_pins.as_deref(), Some(&[][..]));
+
+        let mut store = Store::open(crate::profile::connections_path_at(root)).unwrap();
+        let mut edited = store.local(profile_id).unwrap().clone();
+        edited.terminal.ai_skills = vec![12];
+        store.save_local(edited).unwrap();
+        assert_eq!(review.check_worker(Some(root)).unwrap_err(), CHANGED_PINS);
+    }
 
     #[test]
     fn planning_classifier_masks_rules_that_span_the_goal_and_evidence() {

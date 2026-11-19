@@ -1,4 +1,4 @@
-//! Review a held Linux file and publish only into vacant, descriptor-relative names.
+//! Review a held server file and publish only into vacant, descriptor-relative names.
 
 use std::io::{Seek as _, Write as _};
 use std::time::Duration;
@@ -6,9 +6,9 @@ use std::time::Duration;
 use kortty_server_archive::draft_replace::{
     MAX_ORIGINAL_BYTES, Reply, Request, Review, Spec, read_request, write_reply,
 };
-use rustix::fs::{
-    StatxFlags, XattrFlags, fchown, fgetxattr, fgetxattr_query, flistxattr, fsetxattr, statx,
-};
+#[cfg(target_os = "linux")]
+use rustix::fs::{StatxFlags, statx};
+use rustix::fs::{XattrFlags, fchown, fgetxattr, fgetxattr_query, flistxattr, fsetxattr};
 use rustix::process::Gid;
 
 use super::*;
@@ -18,6 +18,10 @@ const DRAFT: &str = "draft";
 const BACKUP: &str = "backup";
 const DEADLINE: Duration = Duration::from_secs(90);
 const MAX_XATTR_BYTES: usize = 64 * 1024;
+#[cfg(target_os = "linux")]
+type MountId = u64;
+#[cfg(target_os = "macos")]
+type MountId = [u8; 32];
 
 pub(crate) fn serve() -> io::Result<()> {
     std::thread::Builder::new()
@@ -123,11 +127,13 @@ struct Target<'a> {
     name: &'a str,
     backup_name: Option<String>,
     parent: Directory,
-    mount: u64,
+    mount: MountId,
     file: File,
     stamp: Stamp,
     bytes: Vec<u8>,
     attributes: BTreeMap<String, Vec<u8>>,
+    #[cfg(target_os = "macos")]
+    acl: kortty_files::ExtendedAcl,
 }
 
 impl<'a> Target<'a> {
@@ -161,6 +167,8 @@ impl<'a> Target<'a> {
             ));
         }
         let attributes = read_xattrs(&file)?;
+        #[cfg(target_os = "macos")]
+        let acl = kortty_files::ExtendedAcl::capture(&file)?;
         let target = Self {
             spec,
             parent_path,
@@ -172,6 +180,8 @@ impl<'a> Target<'a> {
             stamp,
             bytes,
             attributes,
+            #[cfg(target_os = "macos")]
+            acl,
         };
         target.verify()?;
         Ok(target)
@@ -193,7 +203,11 @@ impl<'a> Target<'a> {
 
     fn verify(&self) -> io::Result<()> {
         self.verify_parent()?;
-        self.parent.require_child(self.name, &fstat(&self.file)?)?;
+        let current = fstat(&self.file)?;
+        require_original(&current, self.spec)?;
+        self.parent.require_child(self.name, &current)?;
+        #[cfg(target_os = "macos")]
+        self.acl.require_applied(&self.file)?;
         if Stamp::of(&self.file.metadata()?) != self.stamp {
             return Err(invalid("The reviewed server file changed"));
         }
@@ -207,6 +221,8 @@ impl<'a> Target<'a> {
         directory.require_child(ORIGINAL, displaced)?;
         let held = fstat(&self.file)?;
         require_original(&held, self.spec)?;
+        #[cfg(target_os = "macos")]
+        self.acl.require_applied(&self.file)?;
         let current = Stamp::of(&self.file.metadata()?);
         if !same_node(displaced, &held)
             || !same_after_rename(&self.stamp, &current)
@@ -230,7 +246,10 @@ impl<'a> Target<'a> {
         hash.update(self.parent.stat.st_mode.to_le_bytes());
         hash.update(self.parent.stat.st_uid.to_le_bytes());
         hash.update(self.parent.stat.st_gid.to_le_bytes());
+        #[cfg(target_os = "linux")]
         hash.update(self.mount.to_le_bytes());
+        #[cfg(target_os = "macos")]
+        hash.update(self.mount);
         self.stamp.hash_into(&mut hash);
         hash.update(serde_json::to_vec(self.spec).map_err(io::Error::other)?);
         Ok(format!("{nonce}{}", hex::encode(hash.finalize())))
@@ -242,16 +261,28 @@ impl<'a> Target<'a> {
             fchown(file, None, Some(Gid::from_raw(self.stamp.gid)))?;
         }
         for (name, bytes) in &self.attributes {
-            if name.starts_with("user.") {
-                fsetxattr(file, name.as_str(), bytes, XattrFlags::empty())?;
+            #[cfg(target_os = "linux")]
+            if name == "security.selinux" {
+                continue;
             }
+            fsetxattr(file, name.as_str(), bytes, XattrFlags::empty())?;
         }
-        fchmod(file, Mode::from_bits_truncate(self.spec.original.mode))?;
+        let mode = self.spec.original.mode;
+        #[cfg(target_os = "macos")]
+        let mode = u16::try_from(mode).map_err(io::Error::other)?;
+        fchmod(file, Mode::from_bits_truncate(mode))?;
+        #[cfg(target_os = "macos")]
+        self.acl.apply_to(file)?;
         file.sync_all()?;
         self.verify_stage_file(file, bytes.len() as u64, digest(bytes))
     }
 
     fn verify_stage_file(&self, file: &File, size: u64, expected: [u8; 32]) -> io::Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            require_plain_file_flags(&fstat(file)?)?;
+            self.acl.require_applied(file)?;
+        }
         let stamp = Stamp::of(&file.metadata()?);
         if stamp.uid != self.stamp.uid
             || stamp.gid != self.stamp.gid
@@ -529,12 +560,17 @@ impl Drop for Stage<'_> {
 }
 
 fn require_original(stat: &Stat, spec: &Spec) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    require_plain_file_flags(stat)?;
+    let mode = stat.st_mode & 0o7777;
+    #[cfg(target_os = "macos")]
+    let mode = u32::from(mode);
     if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
         || stat.st_uid != geteuid().as_raw()
         || stat.st_uid != spec.original.uid
         || stat.st_gid != spec.original.gid
         || stat.st_nlink != 1
-        || stat.st_mode & 0o7777 != spec.original.mode
+        || mode != spec.original.mode
         || u64::try_from(stat.st_size).ok() != Some(spec.original.bytes)
     {
         return Err(invalid(
@@ -544,6 +580,22 @@ fn require_original(stat: &Stat, spec: &Spec) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn require_plain_file_flags(stat: &Stat) -> io::Result<()> {
+    if stat.st_flags != 0 {
+        return Err(invalid(
+            "The server file has macOS flags that cannot be preserved",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn require_plain_directory(file: &File) -> io::Result<()> {
+    kortty_files::require_no_granting_extended_acl(file)
+}
+
+#[cfg(target_os = "linux")]
 fn require_plain_directory(file: &File) -> io::Result<()> {
     for attribute in ["system.posix_acl_access", "system.posix_acl_default"] {
         match fgetxattr_query(file, attribute) {
@@ -574,6 +626,7 @@ pub(super) fn read_xattrs(file: &File) -> io::Result<BTreeMap<String, Vec<u8>>> 
     {
         let name =
             std::str::from_utf8(name).map_err(|_| invalid("Unsupported server file attributes"))?;
+        #[cfg(target_os = "linux")]
         if name != "security.selinux" && !name.starts_with("user.") {
             return Err(invalid(
                 "The server file has security attributes that cannot be preserved",
@@ -594,12 +647,31 @@ pub(super) fn read_xattrs(file: &File) -> io::Result<BTreeMap<String, Vec<u8>>> 
     Ok(attributes)
 }
 
+#[cfg(target_os = "linux")]
 pub(super) fn mount_id(file: &File) -> io::Result<u64> {
     let info = statx(file, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)?;
     if info.stx_mask & StatxFlags::MNT_ID.bits() == 0 {
         return Err(invalid("The server cannot verify the mount boundary"));
     }
     Ok(info.stx_mnt_id)
+}
+
+#[cfg(target_os = "macos")]
+fn mount_id(file: &File) -> io::Result<MountId> {
+    let filesystem = rustix::fs::fstatfs(file)?;
+    let mounted_on: Vec<_> = filesystem
+        .f_mntonname
+        .iter()
+        .take_while(|&&byte| byte != 0)
+        .map(|&byte| byte as u8)
+        .collect();
+    if mounted_on.first() != Some(&b'/') {
+        return Err(invalid("The server cannot verify the mount boundary"));
+    }
+    // The mounted-on path is available to the ordinary login, even when f_fsid is hidden.
+    let mut hash = Sha256::new_with_prefix(file.metadata()?.dev().to_le_bytes());
+    hash.update(mounted_on);
+    Ok(hash.finalize().into())
 }
 
 fn digest(bytes: &[u8]) -> [u8; 32] {

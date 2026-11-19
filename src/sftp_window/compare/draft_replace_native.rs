@@ -1,6 +1,6 @@
 use std::fs;
 use std::net::SocketAddr;
-use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _, symlink};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -197,7 +197,70 @@ fn exercise(isolation: IsolationLevel) {
     );
     assert!(publish(plan).unwrap_err().message.contains("already used"));
     assert_eq!(fs::read_to_string(&invocations).unwrap().lines().count(), 6);
-    assert_eq!(fs::read_dir(directory).unwrap().count(), 3);
+    assert_eq!(fs::read_dir(&directory).unwrap().count(), 3);
+
+    let listing = submit(
+        &worker,
+        Operation::BrowseDraftDestination(directory.as_os_str().as_encoded_bytes().to_vec(), true),
+    )
+    .unwrap();
+    let Reply::Listed(listing) = listing.as_ref() else {
+        panic!("expected the destination listing");
+    };
+    assert!(listing.entries.iter().any(|entry| {
+        entry.kind == crate::sftp_window::EntryKind::File && entry.display == "reviewed.conf"
+    }));
+    let selected = directory.join("another.conf");
+    let link = directory.join("link.conf");
+    let review_selected = |name: &str, backup| {
+        let request = draft_file::Request::new(
+            directory.as_os_str().as_encoded_bytes(),
+            name,
+            Arc::clone(&draft),
+            &target,
+            &worker,
+            Arc::new(|| Ok(())),
+        )
+        .unwrap()
+        .for_replacement(None, backup, &worker)
+        .unwrap();
+        submit(
+            &worker,
+            Operation::ReviewDraftFile(Box::new(request), sync::Cancel::default()),
+        )
+    };
+    assert!(review_selected("missing.conf", true).is_err());
+    symlink(&remote, &link).unwrap();
+    assert!(review_selected("link.conf", true).is_err());
+    assert_eq!(fs::read_to_string(&invocations).unwrap().lines().count(), 6);
+    let different = b"mode=another-file\0\r\n";
+    write_original(&selected, different);
+
+    let reviewed = review_selected("another.conf", false).unwrap();
+    let Reply::DraftFileReviewed(plan) = reviewed.as_ref() else {
+        panic!("expected a review for the selected file");
+    };
+    assert!(plan.matches(
+        directory.as_os_str().as_encoded_bytes(),
+        "another.conf",
+        &draft
+    ));
+    assert_eq!(
+        plan.replacement().unwrap().original.digest,
+        draft_file::digest(different).unwrap()
+    );
+    assert!(!plan.replacement().unwrap().backup);
+    assert_eq!(fs::read(&selected).unwrap(), different);
+    let published = publish(Arc::clone(plan)).unwrap();
+    let Reply::DraftFilePublished(_, Some(saved)) = published.as_ref() else {
+        panic!("expected a publication receipt for the selected file");
+    };
+    assert_eq!(saved.path, selected.as_os_str().as_encoded_bytes());
+    assert_eq!(fs::read(&selected).unwrap(), DRAFT.as_bytes());
+    assert!(!directory.join("another.conf.bak").exists());
+    assert_eq!(fs::metadata(&selected).unwrap().mode() & 0o777, 0o640);
+    assert_eq!(fs::read(&remote).unwrap(), DRAFT.as_bytes());
+    assert_eq!(fs::read(&backup).unwrap(), ORIGINAL);
 
     assert!(worker.stop().recv_blocking().is_err());
     let log = daemon.join().unwrap();
