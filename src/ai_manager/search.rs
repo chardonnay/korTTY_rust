@@ -44,6 +44,7 @@ pub(crate) enum Setting {
     Role(Role),
     Embedding,
     Knowledge(KnowledgeSetting),
+    Hub(HubSetting),
     Control(Control),
 }
 
@@ -62,6 +63,7 @@ impl Setting {
             Self::Profile(_) | Self::WizardScan | Self::WizardTest => Page::Profiles,
             Self::Role(_) | Self::Embedding => Page::LocalPreferences,
             Self::Knowledge(_) => Page::Knowledge,
+            Self::Hub(_) => Page::LocalModels,
             Self::Control(control) => control.page(),
         }
     }
@@ -83,6 +85,7 @@ impl Setting {
             Self::Role(role) => role.label(),
             Self::Embedding => "Default embedding model",
             Self::Knowledge(setting) => setting.title(),
+            Self::Hub(setting) => setting.title(),
             Self::Control(control) => control.title(),
         }
     }
@@ -118,7 +121,98 @@ impl Setting {
                 "retrieval"
             }
             Self::Knowledge(_) => "",
+            Self::Hub(HubSetting::Query) => "Hugging Face HuggingFace Hub GGUF search query",
+            Self::Hub(_) => "Hugging Face HuggingFace Hub GGUF",
             Self::Control(_) => "",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HubSetting {
+    Access,
+    RecommendationRole,
+    RecommendedModel,
+    ReviewRecommendation,
+    Query,
+    Search,
+    LoadMore,
+    ShowAllModels,
+    Format,
+    Repository,
+    ReviewRepository,
+    ReviewMlx,
+    MlxFiles,
+    DownloadMlx,
+    FindPausedMlx,
+    ResumeMlx,
+    DiscardPausedMlx,
+    Artifact,
+    Purpose,
+    Download,
+    FindPaused,
+    DiscardPaused,
+    KeepPaused,
+    Resume,
+    Pause,
+}
+
+impl HubSetting {
+    const ALL: [Self; 25] = [
+        Self::Access,
+        Self::RecommendationRole,
+        Self::RecommendedModel,
+        Self::ReviewRecommendation,
+        Self::Query,
+        Self::Search,
+        Self::LoadMore,
+        Self::ShowAllModels,
+        Self::Format,
+        Self::Repository,
+        Self::ReviewRepository,
+        Self::ReviewMlx,
+        Self::MlxFiles,
+        Self::DownloadMlx,
+        Self::FindPausedMlx,
+        Self::ResumeMlx,
+        Self::DiscardPausedMlx,
+        Self::Artifact,
+        Self::Purpose,
+        Self::Download,
+        Self::FindPaused,
+        Self::DiscardPaused,
+        Self::KeepPaused,
+        Self::Resume,
+        Self::Pause,
+    ];
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Access => "Hub access",
+            Self::RecommendationRole => "Recommended model role",
+            Self::RecommendedModel => "Choose a recommended model",
+            Self::ReviewRecommendation => "Review recommended model",
+            Self::Query => "Search Hugging Face models",
+            Self::Search => "Search Hugging Face",
+            Self::LoadMore => "Load more search results",
+            Self::ShowAllModels => "Show all models or filter by RAM fit",
+            Self::Format => "Model format: GGUF or MLX",
+            Self::Repository => "Choose a GGUF repository",
+            Self::ReviewRepository => "Review repository",
+            Self::ReviewMlx => "Review MLX package",
+            Self::MlxFiles => "Reviewed MLX package files and checksums",
+            Self::DownloadMlx => "Download and register MLX model",
+            Self::FindPausedMlx => "Find paused MLX download",
+            Self::ResumeMlx => "Resume reviewed MLX download",
+            Self::DiscardPausedMlx => "Discard paused MLX download",
+            Self::Artifact => "Choose a reviewed GGUF file",
+            Self::Purpose => "Model purpose",
+            Self::Download => "Download and register reviewed model",
+            Self::FindPaused => "Find paused download",
+            Self::DiscardPaused => "Discard paused download",
+            Self::KeepPaused => "Keep download",
+            Self::Resume => "Resume reviewed download",
+            Self::Pause => "Pause download",
         }
     }
 }
@@ -749,6 +843,7 @@ pub(super) fn results<'a>(
     .chain(Role::ALL.into_iter().map(Setting::Role))
     .chain([Setting::Embedding])
     .chain(KnowledgeSetting::ALL.into_iter().map(Setting::Knowledge))
+    .chain(HubSetting::ALL.into_iter().map(Setting::Hub))
     .chain(Control::ALL.into_iter().map(Setting::Control))
     .map(Target::Setting)
     .chain(Page::ALL.into_iter().map(Target::Page));
@@ -1185,6 +1280,97 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn hub_search_reveals_the_query_without_a_request_and_respects_download_policy() {
+        use iced::keyboard::Key;
+        use iced_runtime::{UserInterface, user_interface::Cache};
+
+        use crate::ai_manager::local::{self, huggingface::Action};
+        use crate::settings_search::test_input;
+
+        let mut dialog = Dialog::new(
+            Arc::new(Configuration::default()),
+            PathBuf::new(),
+            Vec::new(),
+            true,
+            None,
+        );
+        let query = Target::Setting(Setting::Hub(HubSetting::Query));
+        let _ = dialog.update(Message::Search("huggingface search query".into()));
+        assert_eq!(dialog.search_results().collect::<Vec<_>>(), [query]);
+        let reveal = dialog.update(Message::SearchChoose);
+        assert_eq!(dialog.page, Page::LocalModels);
+        assert_eq!(
+            dialog.revealed.setting,
+            Some(Setting::Hub(HubSetting::Query))
+        );
+        assert!(!dialog.local.busy());
+
+        let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+        let bounds = Size::new(760.0, 360.0);
+        {
+            let mut ui = UserInterface::build(
+                dialog.view(Vec::new(), Vec::new()),
+                bounds,
+                Cache::default(),
+                &mut renderer,
+            );
+            test_input::apply(&mut ui, &renderer, reveal);
+            let messages = test_input::press(
+                &mut ui,
+                &mut renderer,
+                Key::Character("q".into()),
+                Some("q"),
+            );
+            assert!(
+                matches!(messages.as_slice(), [Message::Local(local::Message::HuggingFace(Action::Query(value)))] if value == "q")
+            );
+        }
+
+        let _ = dialog.update(Message::Search("huggingface review repository".into()));
+        let _ = dialog.update(Message::SearchChoose);
+        assert_eq!(
+            dialog.revealed.setting,
+            Some(Setting::Hub(HubSetting::ReviewRepository))
+        );
+        assert!(!dialog.local.busy());
+        let _ = dialog.update(Message::Search("huggingface reviewed gguf file".into()));
+        assert_eq!(dialog.search_results().count(), 0);
+
+        dialog.set_model_downloads_allowed(false);
+        let _ = dialog.update(Message::Search("huggingface search query".into()));
+        assert_eq!(dialog.search_results().count(), 0);
+        assert!(iced_runtime::task::into_stream(dialog.update(Message::Reveal(query))).is_none());
+        let discard = Target::Setting(Setting::Hub(HubSetting::DiscardPaused));
+        let _ = dialog.update(Message::Search(
+            "huggingface discard paused download".into(),
+        ));
+        let mut expected = vec![discard];
+        if crate::local_ai::mlx_runtime::supported() {
+            expected.insert(
+                0,
+                Target::Setting(Setting::Hub(HubSetting::DiscardPausedMlx)),
+            );
+        }
+        assert_eq!(dialog.search_results().collect::<Vec<_>>(), expected);
+        let _ = dialog.update(Message::Reveal(discard));
+        let _ = dialog.update(Message::Search("huggingface keep download".into()));
+        assert_eq!(dialog.search_results().count(), 0);
+        let _ = dialog.update(Message::SearchEscape);
+        let _ = dialog.update(Message::Local(local::Message::HuggingFace(
+            Action::DiscardPaused,
+        )));
+        let keep = Target::Setting(Setting::Hub(HubSetting::KeepPaused));
+        let _ = dialog.update(Message::Search("huggingface keep download".into()));
+        assert_eq!(dialog.search_results().collect::<Vec<_>>(), [keep]);
+        let _ = dialog.update(Message::SearchChoose);
+        assert_eq!(
+            dialog.revealed.setting,
+            Some(Setting::Hub(HubSetting::KeepPaused))
+        );
+        assert!(!dialog.local.busy());
     }
 
     #[test]

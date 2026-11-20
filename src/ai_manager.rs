@@ -3484,6 +3484,7 @@ impl Dialog {
                         local::Message::Finished(..)
                             | local::Message::ManagedBackendLoaded(..)
                             | local::Message::PolicyEmbeddingsLoaded(..)
+                            | local::Message::HubSizeResolved(..)
                     )
                     || (self.close_token.is_none()
                         && matches!(
@@ -3708,6 +3709,9 @@ impl Dialog {
                 self.local
                     .can_reveal_knowledge_setting(&self.local_state, setting)
             }
+            search::Target::Setting(search::Setting::Hub(setting)) => self
+                .local
+                .can_reveal_hub_setting(setting, self.editable() && self.general.features_enabled),
             search::Target::Setting(search::Setting::Control(control)) => match control.page() {
                 Page::Skills => self.editable() && self.skills.has_search_control(control),
                 Page::Memory => self.memory.has_search_controls(),
@@ -3756,6 +3760,11 @@ impl Dialog {
             self.revealed.setting = Some(setting);
             return self.revealed.apply();
         }
+        if matches!(target, search::Target::Setting(search::Setting::Hub(_)))
+            && !self.search_target_available(target)
+        {
+            return Task::none();
+        }
         self.page = target.page();
         self.search.clear();
         self.search_selection = 0;
@@ -3784,7 +3793,9 @@ impl Dialog {
         };
         if matches!(
             self.revealed.setting,
-            Some(search::Setting::Profile(search::ProfileSetting::Web(_)))
+            Some(
+                search::Setting::Profile(search::ProfileSetting::Web(_)) | search::Setting::Hub(_)
+            )
         ) {
             return scroll;
         }

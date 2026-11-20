@@ -58,6 +58,15 @@ pub(crate) struct Review {
 
 impl Review {
     pub(crate) fn prepare(path: &Path, cancelled: &AtomicBool) -> io::Result<Self> {
+        Self::prepare_directory(path, cancelled, MAX_FILES)
+    }
+
+    pub(super) fn prepare_hub_stage(path: &Path, cancelled: &AtomicBool) -> io::Result<Self> {
+        // The transfer's checkpoint receipt shares this private directory.
+        Self::prepare_directory(path, cancelled, MAX_FILES + 1)
+    }
+
+    fn prepare_directory(path: &Path, cancelled: &AtomicBool, entries: usize) -> io::Result<Self> {
         if !path.is_absolute() {
             return Err(invalid("Choose an absolute local MLX model directory"));
         }
@@ -70,7 +79,7 @@ impl Review {
         let directory = Directory::open(&source, false)?;
         let identity = directory.identity()?;
         let mut files = BTreeMap::new();
-        for name in directory.names(MAX_FILES)? {
+        for name in directory.names(entries)? {
             check_cancelled(cancelled)?;
             let Some(name) = name.to_str().filter(|name| is_asset(name)) else {
                 continue;
@@ -127,6 +136,20 @@ impl Review {
     pub(crate) fn asset_names(&self) -> impl Iterator<Item = &str> {
         self.model.assets.keys().map(String::as_str)
     }
+
+    pub(super) fn name_for_hub(&mut self, name: &str) -> io::Result<()> {
+        require_name(name)?;
+        self.model.name = name.into();
+        Ok(())
+    }
+
+    pub(super) fn asset_identity(&self, name: &str) -> Option<(u64, &[u8; 32])> {
+        self.model
+            .assets
+            .get(name)
+            .copied()
+            .zip(self.digests.get(name))
+    }
 }
 
 pub(crate) struct Registry<'a>(&'a Path);
@@ -171,7 +194,19 @@ impl<'a> Registry<'a> {
     }
 
     pub(crate) fn import(&self, review: &Review, cancelled: &AtomicBool) -> io::Result<Model> {
-        self.install(review, None, cancelled)
+        let (model, sync) = self.install(review, None, cancelled, &|| Ok(()))?;
+        sync?;
+        Ok(model)
+    }
+
+    pub(super) fn import_authorized(
+        &self,
+        review: &Review,
+        cancelled: &AtomicBool,
+        authorize: impl Fn() -> io::Result<()>,
+    ) -> io::Result<(Model, bool)> {
+        let (model, sync) = self.install(review, None, cancelled, &authorize)?;
+        Ok((model, sync.is_err()))
     }
 
     pub(crate) fn detached_model(&self, id: &str) -> io::Result<Model> {
@@ -201,7 +236,9 @@ impl<'a> Registry<'a> {
         review: &Review,
         cancelled: &AtomicBool,
     ) -> io::Result<Model> {
-        self.install(review, Some(expected), cancelled)
+        let (model, sync) = self.install(review, Some(expected), cancelled, &|| Ok(()))?;
+        sync?;
+        Ok(model)
     }
 
     fn install(
@@ -209,8 +246,10 @@ impl<'a> Registry<'a> {
         review: &Review,
         restored: Option<&Model>,
         cancelled: &AtomicBool,
-    ) -> io::Result<Model> {
+        authorize: &dyn Fn() -> io::Result<()>,
+    ) -> io::Result<(Model, io::Result<()>)> {
         check_cancelled(cancelled)?;
+        authorize()?;
         let source = Directory::open(&review.source, false)?;
         if source.identity()? != review.identity {
             return Err(invalid("The reviewed MLX model directory changed"));
@@ -236,34 +275,33 @@ impl<'a> Registry<'a> {
         let prepared = (|| {
             if let (Some(expected), Some((directory, _))) = (restored, &target) {
                 let assets = stage.create_private_subdirectory(OsStr::new(RESTORED_ASSETS))?;
-                copy_reviewed_assets(review, &source, &assets, cancelled)?;
+                copy_reviewed_assets(review, &source, &assets, cancelled, authorize)?;
                 drop(assets);
                 check_restore_target(directory, expected)?;
                 stage.move_subdirectory(RESTORED_ASSETS, directory)?;
                 return directory.sync();
             }
-            copy_reviewed_assets(review, &source, &stage, cancelled)?;
+            copy_reviewed_assets(review, &source, &stage, cancelled, authorize)?;
             stage.publish_copy(
                 MANIFEST,
                 &serde_json::to_vec(model).map_err(io::Error::other)?,
             )?;
             stage.sync()?;
-            check_cancelled(cancelled)
+            check_cancelled(cancelled)?;
+            authorize()
         })();
         drop(stage);
         if let Some(expected) = restored {
             let cleanup = discard_stage(&staging, &model.id);
             prepared?;
             cleanup?;
-            return Ok(expected.clone());
+            return Ok((expected.clone(), Ok(())));
         }
         if let Err(error) = prepared.and_then(|()| staging.move_subdirectory(&model.id, &root)) {
             discard_stage(&staging, &model.id)?;
             return Err(error);
         }
-        root.sync()?;
-        staging.sync()?;
-        Ok(model.clone())
+        Ok((model.clone(), root.sync().and_then(|()| staging.sync())))
     }
 
     pub(crate) fn open(&self, id: &str) -> io::Result<Opened> {
@@ -486,7 +524,7 @@ pub(super) fn open_policy_model(
     Ok(opened)
 }
 
-fn is_asset(name: &str) -> bool {
+pub(super) fn is_asset(name: &str) -> bool {
     if !name.is_ascii()
         || name.len() > 160
         || name.starts_with('.')
@@ -517,7 +555,7 @@ fn is_asset(name: &str) -> bool {
         )
 }
 
-fn validate_assets(model: &Model, files: &mut BTreeMap<String, File>) -> io::Result<()> {
+pub(super) fn require_asset_layout<T>(files: &BTreeMap<String, T>) -> io::Result<BTreeSet<String>> {
     let weights: BTreeSet<_> = files
         .keys()
         .filter(|name| name.ends_with(".safetensors"))
@@ -539,6 +577,11 @@ fn validate_assets(model: &Model, files: &mut BTreeMap<String, File>) -> io::Res
     if weights.len() > 1 && !files.contains_key(INDEX) {
         return Err(invalid("Split MLX weights require the safetensors index"));
     }
+    Ok(weights)
+}
+
+fn validate_assets(model: &Model, files: &mut BTreeMap<String, File>) -> io::Result<()> {
+    let weights = require_asset_layout(files)?;
     for (name, file) in files {
         if weights.contains(name) {
             let mut length = [0; 8];
@@ -620,7 +663,7 @@ fn read_json(mut file: impl Read) -> io::Result<Value> {
     serde_json::from_slice(&bytes).map_err(io::Error::other)
 }
 
-fn size_of_assets(assets: &BTreeMap<String, u64>) -> io::Result<u64> {
+pub(super) fn size_of_assets(assets: &BTreeMap<String, u64>) -> io::Result<u64> {
     let mut total = 0_u64;
     if assets.len() > MAX_FILES {
         return Err(invalid("Too many MLX model files"));
@@ -790,9 +833,11 @@ fn copy_reviewed_assets(
     source: &Directory,
     destination: &Directory,
     cancelled: &AtomicBool,
+    authorize: &dyn Fn() -> io::Result<()>,
 ) -> io::Result<()> {
     let mut buffer = vec![0; 128 * 1024];
     for (name, bytes) in &review.model.assets {
+        authorize()?;
         let mut file = source.open_file(name)?;
         require_single_link(&file)?;
         let stamp = &review.stamps[name];
@@ -841,9 +886,20 @@ fn prepare_staging(root: &Directory) -> io::Result<Directory> {
     Ok(staging)
 }
 
-fn discard_stage(staging: &Directory, id: &str) -> io::Result<()> {
+pub(super) fn discard_stage(staging: &Directory, id: &str) -> io::Result<()> {
+    discard_stage_checked(staging, id, None)
+}
+
+pub(super) fn discard_stage_checked(
+    staging: &Directory,
+    id: &str,
+    expected: Option<EntryIdentity>,
+) -> io::Result<()> {
     let directory = staging.private_child(id, false)?;
     let identity = directory.identity()?;
+    if expected.is_some_and(|expected| expected != identity) {
+        return Err(invalid("The MLX staging directory changed"));
+    }
     if directory.has_entry(RESTORED_ASSETS)? {
         let assets = directory.private_child(RESTORED_ASSETS, false)?;
         let identity = assets.identity()?;
@@ -917,6 +973,33 @@ mod tests {
         std::fs::write(source.join("model.safetensors"), &weights).unwrap();
         std::fs::write(source.join("model.py"), b"must never be imported").unwrap();
         source
+    }
+
+    #[test]
+    fn hub_mlx_registration_rechecks_policy_before_atomic_publication() {
+        use std::cell::Cell;
+        let fixture_root = crate::snippets::tests::Profile::new();
+        let root = fixture_root.0.canonicalize().unwrap();
+        let cancelled = AtomicBool::new(false);
+        let review = Review::prepare(&fixture(&root), &cancelled).unwrap();
+        let registry = Registry::new(&root);
+        let checks = Cell::new(0);
+        let final_check = review.asset_names().count() + 2;
+        let error = registry
+            .import_authorized(&review, &cancelled, || {
+                checks.set(checks.get() + 1);
+                if checks.get() == final_check {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "Fixture policy changed",
+                    ));
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(checks.get(), final_check);
+        assert!(registry.list().unwrap().is_empty());
     }
 
     #[test]
