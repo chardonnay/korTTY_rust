@@ -1643,6 +1643,19 @@ activity entry to read its details, or expand the status drawer for live run
 controls. Adaptive docking responds to the available pane size. Review opens
 the owned Agent Activity window with the original action and destination.
 
+When the **Log Table** is visible in the active terminal pane, **Ctrl+Shift+F6**
+focuses it. If that shortcut is assigned to another action, click a table row or
+column heading to focus the table. In detached history and the Settings preview,
+use **Tab**. While the table has focus, use **Up**, **Down**, **Home**, and **End**
+to select a row. **Enter** or **Space** opens its details, **Esc** closes them,
+and **Tab** leaves the table.
+
+The chronological Log Table follows new rows while you are at the bottom.
+Scrolling back, selecting a row, or sorting lets you review earlier activity.
+**Latest activity** clears the selection and sort and returns to the newest row.
+Column headings stay visible while scrolling vertically. Drag a divider to
+adjust the widths.
+
 Choose **At the terminal cursor** to show eligible command reviews beside the
 cursor in the active pane. Enter approves once and Esc dismisses the run. Tab
 ends the run and leaves the exact single-line command for editing when the shell

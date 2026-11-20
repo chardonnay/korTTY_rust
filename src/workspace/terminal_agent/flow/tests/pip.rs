@@ -129,13 +129,17 @@ impl Operation for LogTableLayout {
 }
 
 fn named_key(name: Named, repeat: bool) -> Event {
+    modified_key(name, Modifiers::empty(), repeat)
+}
+
+fn modified_key(name: Named, modifiers: Modifiers, repeat: bool) -> Event {
     let key = keyboard::Key::Named(name);
     Event::Keyboard(keyboard::Event::KeyPressed {
         key: key.clone(),
         modified_key: key,
         physical_key: key::Physical::Unidentified(key::NativeCode::Unidentified),
         location: Location::Standard,
-        modifiers: Modifiers::empty(),
+        modifiers,
         text: None,
         repeat,
     })
@@ -158,7 +162,12 @@ fn keyboard_log_view(fixture: &Fixture, size: Size) -> Element<'_, Desktop> {
             .width(iced::Length::Fill)
             .height(iced::Length::Fill)
             .into(),
-        |key, _| (*key == keyboard::Key::Named(Named::Enter)).then_some(Desktop::Noop),
+        |key, modifiers| {
+            (matches!(key, keyboard::Key::Named(Named::Tab | Named::Enter))
+                || *key == keyboard::Key::Named(Named::F6)
+                    && modifiers == Modifiers::CTRL | Modifiers::SHIFT)
+                .then_some(Desktop::Noop)
+        },
     );
     let stream = fixture.workspace.sessions[&fixture.session].stream_generation;
     let decorated = fixture.workspace.decorate_agent_terminal(
@@ -172,6 +181,214 @@ fn keyboard_log_view(fixture: &Fixture, size: Size) -> Element<'_, Desktop> {
     fixture
         .workspace
         .agent_log_keyboard(fixture.owner, decorated)
+}
+
+#[test]
+fn keyboard_entry_uses_only_the_focused_panes_visible_agent_log() {
+    use design::log_table::{Key as LogKey, Message as LogMessage};
+
+    let mut fixture = Fixture::new(false, false);
+    let id = fixture.open(Mode::Ask);
+    let run = fixture.run_mut(id);
+    run.design.arrangement = Arrangement::Normal;
+    run.design.history = History::LogTable;
+    run.design.status = Status::Hidden;
+    run.goal = "Review fixture activity".into();
+    run.next(Phase::Thinking, "Fixture activity");
+    run.inline_command("fixture keyboard route");
+    run.inline_result(engine::Status::Exited(0), "fixture keyboard output", "");
+    let epoch = run.epoch;
+    let size = Size::new(760.0, 540.0);
+    let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
+    let events = [
+        named_key(Named::Tab, false),
+        modified_key(Named::F6, Modifiers::CTRL | Modifiers::SHIFT, false),
+        named_key(Named::Enter, false),
+    ];
+    let send = |fixture: &Fixture, renderer: &mut Renderer| {
+        let mut ui = UserInterface::build(
+            keyboard_log_view(fixture, size),
+            size,
+            Cache::default(),
+            renderer,
+        );
+        let mut messages = Vec::new();
+        let _ = ui.update(
+            &events,
+            mouse::Cursor::Unavailable,
+            renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        messages
+    };
+    let messages = send(&fixture, &mut renderer);
+    assert!(matches!(messages.as_slice(), [
+        Desktop::Noop,
+        Desktop::TerminalAgent(focus, Message::Design(design::Message::LogTable(LogMessage::Navigate(LogKey::Focus)))),
+        Desktop::TerminalAgent(open, Message::Design(design::Message::LogTable(LogMessage::Navigate(LogKey::Open)))),
+    ] if *focus == id && *open == id));
+    for message in messages {
+        let _ = fixture.workspace.update(message);
+    }
+    assert_eq!(fixture.run(id).epoch, epoch);
+
+    fixture.run_mut(id).design.history = History::Timeline;
+    assert!(matches!(
+        send(&fixture, &mut renderer).as_slice(),
+        [Desktop::Noop, Desktop::Noop, Desktop::Noop]
+    ));
+    fixture.run_mut(id).design.history = History::LogTable;
+    let other = fixture.workspace.store_session(
+        Session::disconnected_ibm(IbmKind::Tn3270e),
+        GridSize::default(),
+        14,
+    );
+    fixture.workspace.add_tab(fixture.owner, other);
+    assert!(matches!(
+        send(&fixture, &mut renderer).as_slice(),
+        [Desktop::Noop, Desktop::Noop, Desktop::Noop]
+    ));
+}
+
+#[test]
+fn detached_log_accepts_tab_and_routes_keys_to_its_owned_run() {
+    use design::log_table::{Key as LogKey, Message as LogMessage};
+
+    let mut fixture = Fixture::new(false, false);
+    let id = fixture.open(Mode::Ask);
+    let run = fixture.run_mut(id);
+    run.design.arrangement = Arrangement::PictureInPicture;
+    run.design.history = History::LogTable;
+    run.goal = "Review detached fixture activity".into();
+    run.next(Phase::Thinking, "Fixture activity");
+    run.inline_command("fixture detached row");
+    let _ = fixture.send(id, Message::Pip(Pip::Detach));
+    let detached = fixture.run(id).presentation.pip.detached.unwrap();
+    let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
+    let mut ui = UserInterface::build(
+        fixture.workspace.view(detached),
+        Size::new(380.0, 310.0),
+        Cache::default(),
+        &mut renderer,
+    );
+    let mut messages = Vec::new();
+    let _ = ui.update(
+        &[
+            named_key(Named::Tab, false),
+            release_key(Named::Tab),
+            named_key(Named::Enter, false),
+            release_key(Named::Enter),
+            named_key(Named::Tab, false),
+            release_key(Named::Tab),
+            named_key(Named::Enter, false),
+        ],
+        mouse::Cursor::Unavailable,
+        &mut renderer,
+        &mut clipboard::Null,
+        &mut messages,
+    );
+    let [
+        Desktop::TerminalAgent(first, Message::PipOwned(selected, focus)),
+        Desktop::TerminalAgent(second, Message::PipOwned(opened, open)),
+    ] = messages.as_slice()
+    else {
+        panic!("expected focus and details messages only");
+    };
+    assert_eq!(
+        (*first, *selected, *second, *opened),
+        (detached, id, detached, id)
+    );
+    assert!(matches!(
+        focus.as_ref(),
+        Message::Design(design::Message::LogTable(LogMessage::Navigate(
+            LogKey::Focus
+        )))
+    ));
+    assert!(matches!(
+        open.as_ref(),
+        Message::Design(design::Message::LogTable(LogMessage::Navigate(
+            LogKey::Open
+        )))
+    ));
+}
+
+#[test]
+fn log_approval_row_is_masked_and_cannot_follow_a_replaced_review() {
+    use design::log_table::{Key as LogKey, Message as LogMessage, Row as LogRow};
+
+    let mut fixture = Fixture::new(false, false);
+    let id = fixture.open(Mode::Run);
+    let run = fixture.run_mut(id);
+    run.design.arrangement = Arrangement::Normal;
+    run.design.history = History::LogTable;
+    run.design.status = Status::Hidden;
+    run.goal = "Inspect fixture".into();
+    run.commands.push_back(ReviewedCommand {
+        proposal: Command {
+            command: "fixture token=synthetic-unmasked-value".into(),
+            purpose: "Inspect fixture".into(),
+            risk: engine::Risk::ReadOnly,
+            elevation: Elevation::None,
+        },
+        sudo: None,
+    });
+    let revision = run.next(Phase::Approval, "Review the fixture command");
+    let size = Size::new(760.0, 540.0);
+    let stream = fixture.workspace.sessions[&fixture.session].stream_generation;
+    let layout =
+        |fixture: &Fixture| inspect_design(fixture, stream, size, LogTableLayout::default());
+    let open = |revision| {
+        Message::Design(design::Message::LogTable(LogMessage::Open(
+            LogRow::Approval(revision),
+        )))
+    };
+    let navigate = |key| Message::Design(design::Message::LogTable(LogMessage::Navigate(key)));
+    assert!(
+        layout(&fixture)
+            .labels
+            .iter()
+            .any(|(_, label)| label == "Waiting")
+    );
+    let _ = fixture.send(id, navigate(LogKey::Last));
+    let _ = fixture.send(id, navigate(LogKey::Open));
+    let log = layout(&fixture);
+    for expected in ["Pending approval", "fixture token=***"] {
+        assert!(log.labels.iter().any(|(_, label)| label.contains(expected)));
+    }
+    assert!(
+        log.labels
+            .iter()
+            .all(|(_, label)| !label.contains("synthetic-unmasked-value"))
+    );
+    assert_eq!(fixture.run(id).epoch, revision);
+    assert!(fixture.run(id).phase == Phase::Approval);
+    assert_eq!(fixture.run(id).commands.len(), 1);
+
+    let run = fixture.run_mut(id);
+    run.commands.front_mut().unwrap().proposal.command = "fixture replacement".into();
+    let replacement = run.next(Phase::Approval, "Review the replacement command");
+    no_task(fixture.send(id, open(revision)));
+    assert!(
+        layout(&fixture)
+            .labels
+            .iter()
+            .all(|(_, label)| label != "Pending approval")
+    );
+    no_task(fixture.send(id, open(replacement)));
+    assert!(
+        layout(&fixture)
+            .labels
+            .iter()
+            .any(|(_, label)| label == "Pending approval")
+    );
+    let _ = fixture.send(id, Message::Cancel);
+    assert!(
+        layout(&fixture)
+            .labels
+            .iter()
+            .all(|(_, label)| label != "Pending approval" && label != "Waiting")
+    );
 }
 
 #[test]
@@ -307,17 +524,19 @@ fn narrow_detached_log_table_scrolls_to_the_exact_step_and_keeps_actions_in_view
         let mut layout = LogTableLayout::default();
         ui.operate(&renderer, &mut layout);
         let (grid, offset) = layout.grid.expect("both scroll axes are available");
-        assert_eq!(offset, Vector::ZERO);
+        assert_eq!(offset.x, 0.0);
+        let initial_y = offset.y;
+        assert!(
+            initial_y > 0.0,
+            "the live table starts at the latest activity"
+        );
         let at = grid.center();
         let mut messages = Vec::new();
         let _ = ui.update(
             &[
                 Event::Mouse(mouse::Event::CursorMoved { position: at }),
                 Event::Mouse(mouse::Event::WheelScrolled {
-                    delta: mouse::ScrollDelta::Pixels {
-                        x: -240.0,
-                        y: -142.0,
-                    },
+                    delta: mouse::ScrollDelta::Pixels { x: -240.0, y: 40.0 },
                 }),
             ],
             mouse::Cursor::Available(at),
@@ -329,7 +548,7 @@ fn narrow_detached_log_table_scrolls_to_the_exact_step_and_keeps_actions_in_view
         let mut layout = LogTableLayout::default();
         ui.operate(&renderer, &mut layout);
         let (grid, offset) = layout.grid.unwrap();
-        assert!(offset.x > 0.0 && offset.y > 0.0);
+        assert!(offset.x > 0.0 && offset.y > 0.0 && offset.y < initial_y);
         let (target_y, expected) = layout
             .labels
             .iter()

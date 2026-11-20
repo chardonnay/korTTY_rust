@@ -563,6 +563,7 @@ impl Run {
         self.presentation.review(phase);
         self.notice = notice.into();
         self.initialize_inline();
+        self.sync_log_approval();
         self.epoch
     }
 
@@ -608,6 +609,7 @@ impl Run {
             self.notice = notice.into();
             self.chat_handoff_notice = Some(notice.into());
         }
+        self.sync_log_approval();
     }
 
     fn block(&mut self, error: String) {

@@ -1,4 +1,4 @@
-//! Route keys to the visible table that took pointer focus before the terminal sees them.
+//! Route keys to the focused, visible table before the terminal sees them.
 
 use std::cell::Cell;
 
@@ -13,16 +13,161 @@ use iced::{
 use super::{AgentMessage, Key, Message, event, presentation};
 use crate::workspace::terminal_agent::{Desktop, State};
 
-pub(super) fn wrap<'a>(content: Element<'a, Desktop>, agents: &'a State) -> Element<'a, Desktop> {
-    Element::new(Scope { content, agents })
+pub(super) const PANE_FOCUS_KEY: Named = Named::F6;
+pub(super) const PANE_FOCUS_MODIFIERS: Modifiers = Modifiers::CTRL.union(Modifiers::SHIFT);
+
+pub(super) enum EntryKey {
+    Pane,
+    Detached,
 }
 
-struct Scope<'a> {
+pub(super) fn wrap<'a>(
     content: Element<'a, Desktop>,
     agents: &'a State,
+    window: window::Id,
+    entry: Option<(window::Id, EntryKey)>,
+) -> Element<'a, Desktop> {
+    Element::new(Scope {
+        content,
+        target: Live {
+            agents,
+            window,
+            entry,
+        },
+    })
 }
 
-#[derive(Clone, Copy)]
+pub(in crate::workspace) enum PreviewCommand {
+    Navigate(Key),
+    Tab(bool),
+}
+
+pub(in crate::workspace::terminal_agent::design) fn preview<'a>(
+    content: Element<'a, Desktop>,
+    table: &'a super::State,
+    sample: window::Id,
+    is_pointer_action: fn(&Desktop) -> bool,
+    message: impl Fn(PreviewCommand) -> Desktop + 'a,
+) -> Element<'a, Desktop> {
+    Element::new(Scope {
+        content,
+        target: Preview {
+            table,
+            sample,
+            is_pointer_action,
+            message,
+        },
+    })
+}
+
+struct Scope<'a, T> {
+    content: Element<'a, Desktop>,
+    target: T,
+}
+
+trait Target {
+    type Route: Copy + Eq + 'static;
+
+    fn pointer_route(&self, message: &Desktop) -> Option<Self::Route>;
+    fn table(&self, route: Self::Route) -> Option<&super::State>;
+    fn navigate(&self, route: Self::Route, key: Key) -> Desktop;
+
+    fn focus_node(&self) -> Option<(Self::Route, &super::State)> {
+        None
+    }
+
+    fn tab(&self, _: bool) -> Option<Desktop> {
+        None
+    }
+
+    fn focus_entry(&self, _: Named, _: Modifiers, _: Option<Self::Route>) -> Option<Self::Route> {
+        None
+    }
+}
+
+struct Preview<'a, Message> {
+    table: &'a super::State,
+    sample: window::Id,
+    is_pointer_action: fn(&Desktop) -> bool,
+    message: Message,
+}
+
+impl<Message: Fn(PreviewCommand) -> Desktop> Target for Preview<'_, Message> {
+    type Route = window::Id;
+
+    fn pointer_route(&self, message: &Desktop) -> Option<Self::Route> {
+        (self.is_pointer_action)(message).then_some(self.sample)
+    }
+
+    fn table(&self, route: Self::Route) -> Option<&super::State> {
+        (route == self.sample).then_some(self.table)
+    }
+
+    fn navigate(&self, _: Self::Route, key: Key) -> Desktop {
+        (self.message)(PreviewCommand::Navigate(key))
+    }
+
+    fn focus_node(&self) -> Option<(Self::Route, &super::State)> {
+        Some((self.sample, self.table))
+    }
+
+    fn tab(&self, backwards: bool) -> Option<Desktop> {
+        Some((self.message)(PreviewCommand::Tab(backwards)))
+    }
+}
+
+struct Live<'a> {
+    agents: &'a State,
+    window: window::Id,
+    entry: Option<(window::Id, EntryKey)>,
+}
+
+impl Target for Live<'_> {
+    type Route = Route;
+
+    fn pointer_route(&self, message: &Desktop) -> Option<Self::Route> {
+        Route::from_pointer(message)
+    }
+
+    fn table(&self, route: Self::Route) -> Option<&super::State> {
+        self.agents
+            .runs
+            .get(&route.run)
+            .filter(|run| !run.closing)
+            .map(|run| &run.presentation.log_table)
+    }
+
+    fn navigate(&self, route: Self::Route, key: Key) -> Desktop {
+        route.message(key)
+    }
+
+    fn focus_entry(
+        &self,
+        name: Named,
+        modifiers: Modifiers,
+        focused: Option<Route>,
+    ) -> Option<Route> {
+        let (run, key) = self.entry.as_ref()?;
+        match key {
+            EntryKey::Pane if name == PANE_FOCUS_KEY && modifiers == PANE_FOCUS_MODIFIERS => {
+                Some(Route {
+                    window: *run,
+                    run: *run,
+                })
+            }
+            EntryKey::Detached if matches!(navigation(name, modifiers), Some(Key::Leave)) => {
+                let route = Route {
+                    window: self.window,
+                    run: *run,
+                };
+                (focused != Some(route)).then_some(route)
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
 struct Route {
     window: window::Id,
     run: window::Id,
@@ -39,9 +184,7 @@ impl Route {
         };
         matches!(
             action,
-            AgentMessage::Design(presentation::Message::LogTable(
-                Message::Select(_) | Message::Open(_) | Message::Sort(_)
-            ))
+            AgentMessage::Design(presentation::Message::LogTable(message)) if message.takes_focus()
         )
         .then_some(Self {
             window: *window,
@@ -62,20 +205,61 @@ impl Route {
     }
 }
 
-#[derive(Default)]
-struct Focus {
-    route: Option<Route>,
+struct Focus<R> {
+    route: Option<R>,
     held: Vec<Named>,
+}
+
+impl<R> Default for Focus<R> {
+    fn default() -> Self {
+        Self {
+            route: None,
+            held: Vec::new(),
+        }
+    }
+}
+
+struct FocusNode<'a, R>(&'a mut Option<R>, R);
+
+impl<R: Copy + Eq> operation::Focusable for FocusNode<'_, R> {
+    fn is_focused(&self) -> bool {
+        *self.0 == Some(self.1)
+    }
+
+    fn focus(&mut self) {
+        *self.0 = Some(self.1);
+    }
+
+    fn unfocus(&mut self) {
+        *self.0 = None;
+    }
 }
 
 struct Visible<'a> {
     viewport: &'a Id,
-    found: bool,
+    bounds: Option<Rectangle>,
+}
+
+impl Visible<'_> {
+    fn find(
+        viewport: &Id,
+        child: &mut dyn Widget<Desktop, Theme, Renderer>,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+    ) -> Option<Rectangle> {
+        let mut visible = Visible {
+            viewport,
+            bounds: None,
+        };
+        child.operate(tree, layout, renderer, &mut visible);
+        visible.bounds
+    }
 }
 
 impl Operation for Visible<'_> {
     fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
-        if !self.found {
+        if self.bounds.is_none() {
             visit(self);
         }
     }
@@ -89,7 +273,7 @@ impl Operation for Visible<'_> {
         _: &mut dyn operation::Scrollable,
     ) {
         if id == Some(self.viewport) && bounds.width > 0.0 && bounds.height > 0.0 {
-            self.found = true;
+            self.bounds = Some(bounds);
         }
     }
 }
@@ -112,13 +296,13 @@ fn navigation(name: Named, modifiers: Modifiers) -> Option<Key> {
     }
 }
 
-impl Widget<Desktop, Theme, Renderer> for Scope<'_> {
+impl<T: Target> Widget<Desktop, Theme, Renderer> for Scope<'_, T> {
     fn tag(&self) -> tree::Tag {
-        tree::Tag::of::<Focus>()
+        tree::Tag::of::<Focus<T::Route>>()
     }
 
     fn state(&self) -> tree::State {
-        tree::State::new(Focus::default())
+        tree::State::new(Focus::<T::Route>::default())
     }
 
     fn children(&self) -> Vec<Tree> {
@@ -155,9 +339,20 @@ impl Widget<Desktop, Theme, Renderer> for Scope<'_> {
         renderer: &Renderer,
         operation: &mut dyn Operation,
     ) {
-        self.content
-            .as_widget_mut()
-            .operate(&mut tree.children[0], layout, renderer, operation);
+        let child = self.content.as_widget_mut();
+        let child_tree = &mut tree.children[0];
+        if let Some((route, table)) = self.target.focus_node()
+            && let Some(bounds) =
+                Visible::find(&table.viewport, child, child_tree, layout, renderer)
+        {
+            let focus = tree.state.downcast_mut::<Focus<T::Route>>();
+            operation.focusable(
+                Some(&table.viewport),
+                bounds,
+                &mut FocusNode(&mut focus.route, route),
+            );
+        }
+        child.operate(child_tree, layout, renderer, operation);
     }
 
     fn update(
@@ -171,7 +366,7 @@ impl Widget<Desktop, Theme, Renderer> for Scope<'_> {
         shell: &mut Shell<'_, Desktop>,
         viewport: &Rectangle,
     ) {
-        let focus = tree.state.downcast_mut::<Focus>();
+        let focus = tree.state.downcast_mut::<Focus<T::Route>>();
         let child = self.content.as_widget_mut();
         let child_tree = &mut tree.children[0];
         match input {
@@ -190,31 +385,51 @@ impl Widget<Desktop, Theme, Renderer> for Scope<'_> {
                 repeat,
                 ..
             }) if !shell.is_event_captured() => {
-                if let Some(key) = navigation(*name, *modifiers)
+                if let Some(route) = self.target.focus_entry(*name, *modifiers, focus.route)
+                    && let Some(table) = self.target.table(route)
+                    && Visible::find(&table.viewport, child, child_tree, layout, renderer).is_some()
+                {
+                    if !focus.held.contains(name) {
+                        focus.held.push(*name);
+                    }
+                    shell.capture_event();
+                    if !repeat {
+                        focus.route = Some(route);
+                        shell.publish(self.target.navigate(route, Key::Focus));
+                    }
+                    return;
+                }
+                let key = navigation(*name, *modifiers);
+                if matches!(key, Some(Key::Leave))
+                    && let Some(action) = self.target.tab(modifiers.shift())
+                {
+                    if !focus.held.contains(name) {
+                        focus.held.push(*name);
+                    }
+                    shell.capture_event();
+                    if !repeat {
+                        shell.publish(action);
+                    }
+                    return;
+                }
+                if let Some(key) = key
                     && let Some(route) = focus.route
                 {
                     if !focus.held.contains(name) {
                         focus.held.push(*name);
                     }
                     shell.capture_event();
-                    let Some(run) = self.agents.runs.get(&route.run).filter(|run| !run.closing)
-                    else {
+                    let Some(table) = self.target.table(route) else {
                         focus.route = None;
                         return;
                     };
-                    let table = &run.presentation.log_table;
-                    let mut visible = Visible {
-                        viewport: &table.viewport,
-                        found: false,
-                    };
-                    child.operate(child_tree, layout, renderer, &mut visible);
-                    if !visible.found
+                    if Visible::find(&table.viewport, child, child_tree, layout, renderer).is_none()
                         || matches!(key, Key::Leave)
                         || matches!(key, Key::Close) && table.detail.is_none()
                     {
                         focus.route = None;
                     } else if !repeat || matches!(key, Key::Previous | Key::Next) {
-                        shell.publish(route.message(key));
+                        shell.publish(self.target.navigate(route, key));
                     }
                     return;
                 }
@@ -254,7 +469,7 @@ impl Widget<Desktop, Theme, Renderer> for Scope<'_> {
             );
             let pointed = Cell::new(None);
             shell.merge(child_shell, |message| {
-                if let Some(route) = Route::from_pointer(&message) {
+                if let Some(route) = self.target.pointer_route(&message) {
                     pointed.set(Some(route));
                 }
                 message

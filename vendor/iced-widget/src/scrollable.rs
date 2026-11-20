@@ -78,7 +78,10 @@ pub struct Scrollable<
     height: Length,
     direction: Direction,
     auto_scroll: bool,
+    follow_bottom: Option<(bool, u64)>,
+    translate_cursor_moves: bool,
     content: Element<'a, Message, Theme, Renderer>,
+    header: Option<Element<'a, Message, Theme, Renderer>>,
     on_scroll: Option<Box<dyn Fn(Viewport) -> Message + 'a>>,
     class: Theme::Class<'a>,
     last_status: Option<Status>,
@@ -107,7 +110,10 @@ where
             height: Length::Shrink,
             direction: direction.into(),
             auto_scroll: false,
+            follow_bottom: None,
+            translate_cursor_moves: false,
             content: content.into(),
+            header: None,
             on_scroll: None,
             class: Theme::default(),
             last_status: None,
@@ -236,6 +242,43 @@ where
     pub fn auto_scroll(mut self, auto_scroll: bool) -> Self {
         self.auto_scroll = auto_scroll;
         self
+    }
+
+    /// Keeps a top-anchored vertical viewport at the bottom when its content
+    /// changes, until the user scrolls away. Changing the revision returns an
+    /// enabled viewport to the bottom even if the user has scrolled away.
+    pub fn follow_bottom(mut self, enabled: bool, revision: u64) -> Self {
+        self.follow_bottom = Some((enabled, revision));
+        self
+    }
+
+    /// Delivers cursor move events in the same content coordinates as the
+    /// cursor passed to child widgets.
+    pub fn translate_cursor_moves(mut self, enabled: bool) -> Self {
+        self.translate_cursor_moves = enabled;
+        self
+    }
+
+    /// Reserves a fixed heading above the vertical viewport. It scrolls
+    /// horizontally with the body and uses the body's horizontal extent.
+    pub fn fixed_header(
+        mut self,
+        header: impl Into<Element<'a, Message, Theme, Renderer>>,
+    ) -> Self {
+        self.header = Some(header.into());
+        self
+    }
+
+    fn viewport_layouts<'b>(
+        &self,
+        layout: Layout<'b>,
+    ) -> (Layout<'b>, Option<Layout<'b>>) {
+        if self.header.is_some() {
+            let mut children = layout.children();
+            (children.next().unwrap(), children.next())
+        } else {
+            (layout, None)
+        }
     }
 
     /// Sets the style of this [`Scrollable`].
@@ -441,11 +484,18 @@ where
     }
 
     fn children(&self) -> Vec<Tree> {
-        vec![Tree::new(&self.content)]
+        std::iter::once(&self.content)
+            .chain(self.header.iter())
+            .map(Tree::new)
+            .collect()
     }
 
     fn diff(&self, tree: &mut Tree) {
-        tree.diff_children(std::slice::from_ref(&self.content));
+        if let Some(header) = &self.header {
+            tree.diff_children(&[&self.content, header]);
+        } else {
+            tree.diff_children(std::slice::from_ref(&self.content));
+        }
     }
 
     fn size(&self) -> Size<Length> {
@@ -461,11 +511,40 @@ where
         renderer: &Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
+        let header = self.header.as_mut().map(|header| {
+            let bounded = limits.height(self.height).width(self.width);
+            let horizontal = self.direction.horizontal().is_some();
+            header.as_widget_mut().layout(
+                &mut tree.children[1],
+                renderer,
+                &layout::Limits::with_compression(
+                    Size::ZERO,
+                    Size::new(
+                        if horizontal {
+                            f32::INFINITY
+                        } else {
+                            bounded.max().width
+                        },
+                        bounded.max().height,
+                    ),
+                    Size::new(horizontal, false),
+                ),
+            )
+        });
+        let header_height =
+            header.as_ref().map_or(0.0, |node| node.size().height);
+        let limits = limits.shrink(Size::new(0.0, header_height));
+        let body_height = match self.height {
+            Length::Fixed(height) => {
+                Length::Fixed((height - header_height).max(0.0))
+            }
+            height => height,
+        };
         let mut layout = |right_padding, bottom_padding| {
             layout::padded(
-                limits,
+                &limits,
                 self.width,
-                self.height,
+                body_height,
                 Padding {
                     right: right_padding,
                     bottom: bottom_padding,
@@ -501,7 +580,7 @@ where
             )
         };
 
-        match self.direction {
+        let node = match self.direction {
             Direction::Vertical(Scrollbar {
                 width,
                 margin,
@@ -562,6 +641,33 @@ where
                 }
             }
             _ => layout(0.0, 0.0),
+        };
+
+        let state = tree.state.downcast_mut::<State>();
+        if let Some((enabled, revision)) = self.follow_bottom
+            && self
+                .direction
+                .vertical()
+                .is_some_and(|bar| bar.alignment == Anchor::Start)
+        {
+            let extent = (node.children()[0].size().height
+                - node.size().height)
+                .max(0.0);
+            state.track_bottom(self.id.as_ref(), extent, enabled, revision);
+        } else {
+            state.follow_bottom = None;
+        }
+        if let Some(header) = header {
+            let size = Size::new(
+                node.size().width,
+                node.size().height + header_height,
+            );
+            layout::Node::with_children(
+                size,
+                vec![node.move_to(Point::new(0.0, header_height)), header],
+            )
+        } else {
+            node
         }
     }
 
@@ -572,6 +678,7 @@ where
         renderer: &Renderer,
         operation: &mut dyn Operation,
     ) {
+        let (layout, header_layout) = self.viewport_layouts(layout);
         let state = tree.state.downcast_mut::<State>();
 
         let bounds = layout.bounds();
@@ -595,6 +702,16 @@ where
                 renderer,
                 operation,
             );
+            if let (Some(header), Some(header_layout)) =
+                (&mut self.header, header_layout)
+            {
+                header.as_widget_mut().operate(
+                    &mut tree.children[1],
+                    header_layout,
+                    renderer,
+                    operation,
+                );
+            }
         });
     }
 
@@ -607,14 +724,24 @@ where
         renderer: &Renderer,
         clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
-        _viewport: &Rectangle,
+        viewport: &Rectangle,
     ) {
         const AUTOSCROLL_DEADZONE: f32 = 20.0;
         const AUTOSCROLL_SMOOTHNESS: f32 = 1.5;
 
+        let outer = layout.bounds();
+        let (layout, header_layout) = self.viewport_layouts(layout);
         let state = tree.state.downcast_mut::<State>();
         let bounds = layout.bounds();
-        let cursor_over_scrollable = cursor.position_over(bounds);
+        let cursor_over_scrollable = if header_layout.is_some()
+            && matches!(event, Event::Mouse(mouse::Event::WheelScrolled { .. }))
+        {
+            outer
+                .intersection(viewport)
+                .and_then(|bounds| cursor.position_over(bounds))
+        } else {
+            cursor.position_over(bounds)
+        };
 
         let content = layout.children().next().unwrap();
         let content_bounds = content.bounds();
@@ -624,6 +751,33 @@ where
 
         let (mouse_over_y_scrollbar, mouse_over_x_scrollbar) =
             scrollbars.is_mouse_over(cursor);
+
+        if let (Some(header), Some(header_layout)) =
+            (&mut self.header, header_layout)
+            && let Some(visible) =
+                header_bounds(header_layout, bounds).intersection(viewport)
+            && !state.scrollers_grabbed()
+        {
+            let offset = Vector::new(
+                state.translation(self.direction, bounds, content_bounds).x,
+                0.0,
+            );
+            let local = cursor_in(cursor, visible, offset);
+            let moved = translated_cursor_move(event, offset);
+            header.as_widget_mut().update(
+                &mut tree.children[1],
+                moved.as_ref().unwrap_or(event),
+                header_layout,
+                local,
+                renderer,
+                clipboard,
+                shell,
+                &(visible + offset),
+            );
+            if shell.is_event_captured() {
+                return;
+            }
+        }
 
         let last_offsets = (state.offset_x, state.offset_y);
 
@@ -838,10 +992,15 @@ where
                 };
 
                 let had_input_method = shell.input_method().is_enabled();
+                let moved = if self.translate_cursor_moves {
+                    translated_cursor_move(event, translation)
+                } else {
+                    None
+                };
 
                 self.content.as_widget_mut().update(
                     &mut tree.children[0],
-                    event,
+                    moved.as_ref().unwrap_or(event),
                     content,
                     cursor,
                     renderer,
@@ -1178,15 +1337,17 @@ where
         cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
+        let outer = layout.bounds();
+        let (layout, header_layout) = self.viewport_layouts(layout);
         let state = tree.state.downcast_ref::<State>();
 
         let bounds = layout.bounds();
         let content_layout = layout.children().next().unwrap();
         let content_bounds = content_layout.bounds();
 
-        let Some(visible_bounds) = bounds.intersection(viewport) else {
+        if outer.intersection(viewport).is_none() {
             return;
-        };
+        }
 
         let scrollbars =
             Scrollbars::new(state, self.direction, bounds, content_bounds);
@@ -1198,7 +1359,7 @@ where
         let translation =
             state.translation(self.direction, bounds, content_bounds);
 
-        let cursor = match cursor_over_scrollable {
+        let content_cursor = match cursor_over_scrollable {
             Some(cursor_position)
                 if !(mouse_over_x_scrollbar || mouse_over_y_scrollbar) =>
             {
@@ -1215,7 +1376,35 @@ where
             }),
         );
 
-        container::draw_background(renderer, &style.container, layout.bounds());
+        container::draw_background(renderer, &style.container, outer);
+
+        if let (Some(header), Some(header_layout)) =
+            (&self.header, header_layout)
+            && let Some(visible) =
+                header_bounds(header_layout, bounds).intersection(viewport)
+        {
+            let offset = Vector::new(translation.x, 0.0);
+            renderer.with_layer(visible, |renderer| {
+                renderer.with_translation(
+                    Vector::new(-offset.x, 0.0),
+                    |renderer| {
+                        header.as_widget().draw(
+                            &tree.children[1],
+                            renderer,
+                            theme,
+                            defaults,
+                            header_layout,
+                            cursor_in(cursor, visible, offset),
+                            &(visible + offset),
+                        );
+                    },
+                );
+            });
+        }
+
+        let Some(visible_bounds) = bounds.intersection(viewport) else {
+            return;
+        };
 
         // Draw inner content
         if scrollbars.active() {
@@ -1229,7 +1418,7 @@ where
                             theme,
                             defaults,
                             content_layout,
-                            cursor,
+                            content_cursor,
                             &Rectangle {
                                 y: visible_bounds.y + translation.y,
                                 x: visible_bounds.x + translation.x,
@@ -1333,7 +1522,7 @@ where
                 theme,
                 defaults,
                 content_layout,
-                cursor,
+                content_cursor,
                 &Rectangle {
                     x: visible_bounds.x + translation.x,
                     y: visible_bounds.y + translation.y,
@@ -1348,9 +1537,10 @@ where
         tree: &Tree,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
-        _viewport: &Rectangle,
+        viewport: &Rectangle,
         renderer: &Renderer,
     ) -> mouse::Interaction {
+        let (layout, header_layout) = self.viewport_layouts(layout);
         let state = tree.state.downcast_ref::<State>();
         let bounds = layout.bounds();
         let cursor_over_scrollable = cursor.position_over(bounds);
@@ -1370,6 +1560,23 @@ where
 
         let translation =
             state.translation(self.direction, bounds, content_bounds);
+        if let (Some(header), Some(header_layout)) =
+            (&self.header, header_layout)
+            && let Some(visible) =
+                header_bounds(header_layout, bounds).intersection(viewport)
+        {
+            let offset = Vector::new(translation.x, 0.0);
+            let interaction = header.as_widget().mouse_interaction(
+                &tree.children[1],
+                header_layout,
+                cursor_in(cursor, visible, offset),
+                &(visible + offset),
+                renderer,
+            );
+            if interaction != mouse::Interaction::None {
+                return interaction;
+            }
+        }
 
         let cursor = match cursor_over_scrollable {
             Some(cursor_position)
@@ -1401,6 +1608,7 @@ where
         viewport: &Rectangle,
         translation: Vector,
     ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
+        let (layout, header_layout) = self.viewport_layouts(layout);
         let state = tree.state.downcast_ref::<State>();
         let bounds = layout.bounds();
         let content_layout = layout.children().next().unwrap();
@@ -1408,13 +1616,30 @@ where
         let visible_bounds = bounds.intersection(viewport).unwrap_or(*viewport);
         let offset = state.translation(self.direction, bounds, content_bounds);
 
+        let (body_tree, header_tree) = tree.children.split_at_mut(1);
         let overlay = self.content.as_widget_mut().overlay(
-            &mut tree.children[0],
-            layout.children().next().unwrap(),
+            &mut body_tree[0],
+            content_layout,
             renderer,
             &visible_bounds,
             translation - offset,
         );
+
+        let header_overlay = if let (Some(header), Some(header_layout)) =
+            (&mut self.header, header_layout)
+            && let Some(visible) =
+                header_bounds(header_layout, bounds).intersection(viewport)
+        {
+            header.as_widget_mut().overlay(
+                &mut header_tree[0],
+                header_layout,
+                renderer,
+                &visible,
+                translation - Vector::new(offset.x, 0.0),
+            )
+        } else {
+            None
+        };
 
         let icon = if let Interaction::AutoScrolling { origin, .. } =
             state.interaction
@@ -1432,15 +1657,45 @@ where
             None
         };
 
-        match (overlay, icon) {
-            (None, None) => None,
-            (None, Some(icon)) => Some(icon),
-            (Some(overlay), None) => Some(overlay),
-            (Some(overlay), Some(icon)) => Some(overlay::Element::new(
-                Box::new(overlay::Group::with_children(vec![overlay, icon])),
-            )),
+        let mut layers = [overlay, header_overlay, icon].into_iter().flatten();
+        let first = layers.next()?;
+        if let Some(second) = layers.next() {
+            Some(overlay::Element::new(Box::new(
+                overlay::Group::with_children(
+                    [first, second].into_iter().chain(layers).collect(),
+                ),
+            )))
+        } else {
+            Some(first)
         }
     }
+}
+
+fn header_bounds(header: Layout<'_>, body: Rectangle) -> Rectangle {
+    Rectangle {
+        width: body.width,
+        ..header.bounds()
+    }
+}
+
+fn cursor_in(
+    cursor: mouse::Cursor,
+    bounds: Rectangle,
+    offset: Vector,
+) -> mouse::Cursor {
+    cursor
+        .position_over(bounds)
+        .map_or(cursor.levitate(), mouse::Cursor::Available)
+        + offset
+}
+
+fn translated_cursor_move(event: &Event, offset: Vector) -> Option<Event> {
+    let Event::Mouse(mouse::Event::CursorMoved { position }) = event else {
+        return None;
+    };
+    Some(Event::Mouse(mouse::Event::CursorMoved {
+        position: *position + offset,
+    }))
 }
 
 struct AutoScrollIcon<'a, Class> {
@@ -1670,7 +1925,7 @@ fn notify_viewport<Message>(
     true
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct State {
     offset_y: Offset,
     offset_x: Offset,
@@ -1679,6 +1934,14 @@ struct State {
     last_notified: Option<Viewport>,
     last_scrolled: Option<Instant>,
     is_scrollbar_visible: bool,
+    follow_bottom: Option<BottomViewport>,
+}
+
+#[derive(Debug, Clone)]
+struct BottomViewport {
+    id: Option<widget::Id>,
+    extent: f32,
+    revision: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1704,6 +1967,7 @@ impl Default for State {
             last_notified: None,
             last_scrolled: None,
             is_scrollbar_visible: true,
+            follow_bottom: None,
         }
     }
 }
@@ -1820,6 +2084,32 @@ impl Viewport {
 impl State {
     fn new() -> Self {
         State::default()
+    }
+
+    fn track_bottom(
+        &mut self,
+        id: Option<&widget::Id>,
+        extent: f32,
+        enabled: bool,
+        revision: u64,
+    ) {
+        let previous = self
+            .follow_bottom
+            .as_ref()
+            .filter(|last| last.id.as_ref() == id);
+        let at_bottom = previous.is_none_or(|last| {
+            last.extent - self.offset_y.absolute(0.0, last.extent) <= 1.0
+        });
+        let jump =
+            previous.map_or(revision != 0, |last| last.revision != revision);
+        if enabled && (at_bottom || jump) {
+            self.offset_y = Offset::Absolute(extent);
+        }
+        self.follow_bottom = Some(BottomViewport {
+            id: id.cloned(),
+            extent,
+            revision,
+        });
     }
 
     fn scroll(

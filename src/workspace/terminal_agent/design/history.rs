@@ -138,7 +138,9 @@ fn entries(
 ) -> Element<'_, AgentMessage> {
     if history == History::LogTable
         && let Some(transcript) = run.transcript
-        && (!transcript.steps.is_empty() || !transcript.final_answer.is_empty())
+        && (!transcript.steps.is_empty()
+            || !transcript.final_answer.is_empty()
+            || super::log_table::has_approval(run))
     {
         return super::log_table::view(run, transcript, palette, reduced_motion);
     }

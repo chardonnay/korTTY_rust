@@ -4,13 +4,14 @@ use std::collections::VecDeque;
 use std::time::{Instant, SystemTime};
 
 use iced::widget::{button, column, container, row, text};
-use iced::{Element, Length, Size, window};
+use iced::{Element, Length, Size, Task, window};
 
 use crate::terminal_agent::design::{Arrangement, History, Layout, Status, inline};
 
 use super::{
-    AgentMessage, Desktop, DockExtents, DockPreferences, Message, Presentation, Slot,
-    adaptive_status, adaptive_timeline, compose, history, history_body, pip, status, status_slot,
+    AgentMessage, Desktop, DockExtents, DockPreferences, Message, Presentation, SampleLogCommand,
+    SampleLogKey, Slot, adaptive_status, adaptive_timeline, compose, history, history_body,
+    log_table, pip, status, status_slot,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -96,6 +97,28 @@ pub(in crate::workspace) struct View {
 }
 
 impl Sample {
+    pub(in crate::workspace) fn log_keyboard<'a>(
+        &'a self,
+        content: Element<'a, Desktop>,
+        is_pointer_action: fn(&Desktop) -> bool,
+        message: impl Fn(SampleLogCommand) -> Desktop + 'a,
+    ) -> Element<'a, Desktop> {
+        log_table::keyboard::preview(
+            content,
+            &self.presentation.log_table,
+            self.id,
+            is_pointer_action,
+            message,
+        )
+    }
+
+    pub(in crate::workspace) fn navigate_log(&mut self, key: SampleLogKey) -> Task<Desktop> {
+        let at = self.presentation.finish_time().unwrap_or_else(Instant::now);
+        self.presentation
+            .log_table
+            .navigate(&self.transcript, at, key, Some(0))
+    }
+
     pub(in crate::workspace) fn reset(&mut self) {
         *self = Self {
             grid: self.grid,
@@ -133,6 +156,9 @@ impl Sample {
             transcript.prompt.is_some(),
             now,
         );
+        self.presentation
+            .log_table
+            .set_approval(0, transcript.prompt.clone(), now);
         self.entries = transcript
             .steps
             .iter()
