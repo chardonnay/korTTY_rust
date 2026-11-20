@@ -542,6 +542,7 @@ pub(crate) enum Message {
     RuntimeUpdateBackend(runtime_policy::Backend),
     RuntimeDownloadProgress(u64, runtime_package::online::Progress),
     HuggingFace(huggingface::Action),
+    HubSizeResolved(u64, managed_models::huggingface::Repository, Option<u64>),
     ReviewRuntimeRemoval,
     ConfirmRuntimeRemoval,
     CancelRuntimeRemoval,
@@ -1068,6 +1069,7 @@ impl Dialog {
                     | Message::Finished(..)
                     | Message::ManagedBackendLoaded(..)
                     | Message::PolicyEmbeddingsLoaded(..)
+                    | Message::HubSizeResolved(..)
             )
         {
             return Task::none();
@@ -1827,6 +1829,9 @@ impl Dialog {
                 }
             }
             Message::Cancel => self.cancel(),
+            Message::HubSizeResolved(revision, repository, bytes) if ai_allowed => {
+                return self.resolve_hub_size(revision, repository, bytes, vault);
+            }
             Message::ManagedBackendLoaded(generation, backend) if generation == self.generation => {
                 self.managed.set_active_backend(backend);
             }
@@ -1861,6 +1866,12 @@ impl Dialog {
                         format!("{} installed models", self.models.len())
                     }
                     Ok(Output::ModelTest) => "The model replied to the connection test.".into(),
+                    Ok(Output::HuggingFace(output))
+                        if matches!(output, huggingface::Output::Search(..)) =>
+                    {
+                        self.status = Some(self.finish_huggingface(output));
+                        return self.fill_hub_sizes(vault);
+                    }
                     Ok(Output::HuggingFace(output)) => self.finish_huggingface(output),
                     Ok(Output::RuntimeCatalog(catalog)) => {
                         let count = catalog.choices().len();
@@ -2394,7 +2405,7 @@ impl Dialog {
         self.managed.dismiss_action();
         self.mlx.invalidate_review();
         self.online = online::State::default();
-        self.hf = huggingface::State::default();
+        self.hf.suspend();
     }
 
     fn select_store(&mut self, index: Option<usize>) {
@@ -2602,6 +2613,7 @@ impl Dialog {
                 can_request && self.runtime_removal.is_none(),
                 self.model_downloads_allowed,
                 hub_tokens,
+                reveal,
             ),
         ]
         .spacing(10)

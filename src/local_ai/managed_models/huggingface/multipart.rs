@@ -15,6 +15,10 @@ impl Selection {
     pub(super) fn files(&self) -> &[Artifact] {
         &self.0
     }
+
+    pub(crate) fn bytes(&self) -> u64 {
+        total(self.files()).expect("bounded GGUF selection")
+    }
 }
 
 impl fmt::Display for Selection {

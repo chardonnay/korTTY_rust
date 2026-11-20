@@ -20,7 +20,7 @@ use crate::private_files::{Directory, EntryIdentity, FileStamp, require_single_l
 
 use super::{Artifact, Hub, Plan, lowercase_hex, status_message};
 
-mod component;
+pub(super) mod component;
 #[cfg(test)]
 mod tests_multipart;
 use component::{Checkpoint, Component, Outcome, Verified};
@@ -28,10 +28,10 @@ use component::{Checkpoint, Component, Outcome, Verified};
 const FOLDER: &str = "huggingface-downloads";
 const TRANSFER: &str = "paused";
 const LOCK: &str = ".download.lock";
-const RECEIPT: &str = "receipt.json";
+pub(super) const RECEIPT: &str = "receipt.json";
 const MAX_RECEIPT: u64 = 256 * 1024;
-const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
-const RESERVE_BYTES: u64 = 8 * 1024 * 1024;
+pub(super) const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
+pub(super) const RESERVE_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 pub(crate) struct Progress {
@@ -46,6 +46,17 @@ pub(crate) struct Pause {
 }
 
 impl Pause {
+    pub(super) fn new(agent: Agent) -> (Self, Arc<AtomicBool>) {
+        let requested = Arc::new(AtomicBool::new(false));
+        (
+            Self {
+                requested: Arc::clone(&requested),
+                agent,
+            },
+            requested,
+        )
+    }
+
     pub(crate) fn request(&self) {
         self.requested.store(true, Ordering::Release);
         self.agent.clone().shutdown();
@@ -71,11 +82,7 @@ pub(crate) fn download(
 ) -> Result<Download, String> {
     plan.validate()?;
     let hub = Hub::new(token, DOWNLOAD_TIMEOUT)?;
-    let pause = Pause {
-        requested: Arc::new(AtomicBool::new(false)),
-        agent: hub.agent.clone(),
-    };
-    let paused = Arc::clone(&pause.requested);
+    let (pause, paused) = Pause::new(hub.agent.clone());
     let (updates, progress) = async_channel::bounded(2);
     let pending = work_with_agent(Some(hub.agent.clone()), move |cancelled| {
         run(&profile, &plan, &hub, &paused, cancelled, |update| {
@@ -182,14 +189,14 @@ fn run(
 }
 
 #[derive(Clone, Copy)]
-struct Stop<'a> {
-    paused: &'a AtomicBool,
-    cancelled: &'a AtomicBool,
-    deadline: Instant,
+pub(super) struct Stop<'a> {
+    pub(super) paused: &'a AtomicBool,
+    pub(super) cancelled: &'a AtomicBool,
+    pub(super) deadline: Instant,
 }
 
 impl Stop<'_> {
-    fn active(self) -> io::Result<()> {
+    pub(super) fn active(self) -> io::Result<()> {
         check_cancelled(self.cancelled)?;
         if Instant::now() >= self.deadline {
             return Err(io::Error::new(
@@ -200,7 +207,7 @@ impl Stop<'_> {
         Ok(())
     }
 
-    fn pausing(self) -> bool {
+    pub(super) fn pausing(self) -> bool {
         self.paused.load(Ordering::Acquire)
     }
 }
@@ -255,29 +262,34 @@ fn transfer(
         let component = Component {
             directory: stage.directory(),
             name: &name,
-            plan,
+            repository: &plan.repository,
+            revision: &plan.revision,
+            total: plan.total(),
             artifact,
             hub,
             stop,
-            ordinal: index,
             completed_bytes,
         };
         let prior_component = prior.as_ref().filter(|receipt| receipt.index == index);
         let verify_only = prior.as_ref().is_some_and(|receipt| index < receipt.index)
             || prior_component.is_some_and(|receipt| receipt.received == artifact.size());
-        let component = if verify_only {
-            component
-                .verify()
-                .map(Outcome::Complete)
-                .map_err(component::Failure::from)
+        let outcome = if verify_only {
+            Ok(Outcome::Complete)
         } else {
             component.fetch(
                 prior_component.map(Receipt::checkpoint).as_ref(),
                 &mut progress,
             )
         };
-        match component {
-            Ok(Outcome::Complete(component)) => {
+        match outcome {
+            Ok(Outcome::Complete) => {
+                let component = match component.verify_gguf(index, plan.count()) {
+                    Ok(component) => component,
+                    Err(error) => {
+                        stage.keep &= verify_only;
+                        return Err(error);
+                    }
+                };
                 if let Some(inspection) = &component.split
                     && let Err(error) = tensors.include(inspection)
                 {
@@ -347,7 +359,7 @@ fn transfer(
     Ok(Downloaded::Installed(model, sync_failed))
 }
 
-fn validate_response(
+pub(super) fn validate_response(
     response: &Response<impl Sized>,
     received: u64,
     total: u64,
@@ -403,7 +415,7 @@ fn validate_response(
     Ok(etag)
 }
 
-fn strong_etag(value: &str) -> bool {
+pub(super) fn strong_etag(value: &str) -> bool {
     let Some(opaque) = value
         .strip_prefix('"')
         .and_then(|value| value.strip_suffix('"'))
@@ -548,7 +560,9 @@ fn validate_components(
     Ok(())
 }
 
-fn read_receipt(directory: &Directory) -> io::Result<Option<Receipt>> {
+pub(super) fn read_saved<T: serde::de::DeserializeOwned>(
+    directory: &Directory,
+) -> io::Result<Option<T>> {
     let file = match directory.open_private_file(RECEIPT) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -564,8 +578,15 @@ fn read_receipt(directory: &Directory) -> io::Result<Option<Receipt>> {
             "The paused download receipt exceeds its size limit",
         ));
     }
-    let receipt: Receipt = serde_json::from_slice(&bytes)
-        .map_err(|_| io::Error::other("The paused download receipt is invalid"))?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|_| io::Error::other("The paused download receipt is invalid"))
+}
+
+fn read_receipt(directory: &Directory) -> io::Result<Option<Receipt>> {
+    let Some(receipt): Option<Receipt> = read_saved(directory)? else {
+        return Ok(None);
+    };
     receipt.plan.validate().map_err(io::Error::other)?;
     let file = receipt
         .plan
@@ -587,7 +608,7 @@ fn read_receipt(directory: &Directory) -> io::Result<Option<Receipt>> {
     Ok(Some(receipt))
 }
 
-fn save_receipt(directory: &Directory, receipt: Receipt) -> io::Result<()> {
+pub(super) fn save_receipt(directory: &Directory, receipt: impl Serialize) -> io::Result<()> {
     let bytes = serde_json::to_vec(&receipt).map_err(io::Error::other)?;
     if bytes.len() as u64 > MAX_RECEIPT {
         return Err(io::Error::other(
@@ -677,7 +698,7 @@ impl Drop for Stage<'_> {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(super) fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -687,13 +708,13 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 #[cfg(unix)]
-fn free_bytes(path: &Path) -> io::Result<u64> {
+pub(super) fn free_bytes(path: &Path) -> io::Result<u64> {
     let space = rustix::fs::statvfs(path)?;
     Ok(space.f_bavail.saturating_mul(space.f_frsize))
 }
 
 #[cfg(windows)]
-fn free_bytes(path: &Path) -> io::Result<u64> {
+pub(super) fn free_bytes(path: &Path) -> io::Result<u64> {
     kortty_files::available_space(path)
 }
 

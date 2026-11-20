@@ -190,6 +190,22 @@ impl State {
         });
     }
 
+    pub(super) fn add_hub_model(&mut self, model: mlx_models::Model, profile: &Path) {
+        let choice = Choice {
+            id: model.id,
+            name: model.name,
+            bytes: model.bytes,
+            idle_minutes: model.idle_minutes,
+        };
+        self.choices.retain(|other| other.id != choice.id);
+        self.choices.push(choice.clone());
+        self.choices
+            .sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+        self.select(Some(choice));
+        self.refresh_status(profile);
+        self.refresh_reattachment(profile);
+    }
+
     pub(super) fn invalidate_review(&mut self) {
         if !self.review.as_ref().is_some_and(Review::removal) {
             self.review = None;

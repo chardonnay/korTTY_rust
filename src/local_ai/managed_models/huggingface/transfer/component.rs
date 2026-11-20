@@ -8,44 +8,46 @@ use pgp::crypto::hash::HashAlgorithm;
 use crate::local_ai::managed_models::{check_cancelled, gguf};
 use crate::private_files::{Directory, FileStamp, require_single_link};
 
-use super::super::{Artifact, Hub, Plan, Range};
+use super::super::{Artifact, Hub, Range, Repository};
 use super::{Progress, Stop, hex, validate_response};
 
-pub(super) struct Component<'a> {
-    pub(super) directory: &'a Directory,
-    pub(super) name: &'a str,
-    pub(super) plan: &'a Plan,
-    pub(super) artifact: &'a Artifact,
-    pub(super) hub: &'a Hub,
-    pub(super) stop: Stop<'a>,
-    pub(super) ordinal: usize,
-    pub(super) completed_bytes: u64,
+pub(in crate::local_ai::managed_models::huggingface) struct Component<'a> {
+    pub(in crate::local_ai::managed_models::huggingface) directory: &'a Directory,
+    pub(in crate::local_ai::managed_models::huggingface) name: &'a str,
+    pub(in crate::local_ai::managed_models::huggingface) repository: &'a Repository,
+    pub(in crate::local_ai::managed_models::huggingface) revision: &'a str,
+    pub(in crate::local_ai::managed_models::huggingface) total: u64,
+    pub(in crate::local_ai::managed_models::huggingface) artifact: &'a Artifact,
+    pub(in crate::local_ai::managed_models::huggingface) hub: &'a Hub,
+    pub(in crate::local_ai::managed_models::huggingface) stop: Stop<'a>,
+    pub(in crate::local_ai::managed_models::huggingface) completed_bytes: u64,
 }
 
-#[derive(Clone, Debug)]
-pub(super) struct Checkpoint {
-    pub(super) received: u64,
-    pub(super) etag: Option<String>,
-    pub(super) prefix_digest: String,
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::local_ai::managed_models::huggingface) struct Checkpoint {
+    pub(in crate::local_ai::managed_models::huggingface) received: u64,
+    pub(in crate::local_ai::managed_models::huggingface) etag: Option<String>,
+    pub(in crate::local_ai::managed_models::huggingface) prefix_digest: String,
 }
 
-pub(super) struct Verified {
-    pub(super) stamp: FileStamp,
-    pub(super) context: u32,
-    pub(super) split: Option<gguf::Inspection>,
+pub(in crate::local_ai::managed_models::huggingface) struct Verified {
+    pub(in crate::local_ai::managed_models::huggingface) stamp: FileStamp,
+    pub(in crate::local_ai::managed_models::huggingface) context: u32,
+    pub(in crate::local_ai::managed_models::huggingface) split: Option<gguf::Inspection>,
 }
 
-pub(super) enum Outcome {
-    Complete(Verified),
+pub(in crate::local_ai::managed_models::huggingface) enum Outcome {
+    Complete,
     Paused {
         checkpoint: Option<Checkpoint>,
         interrupted: bool,
     },
 }
 
-pub(super) struct Failure {
-    pub(super) error: io::Error,
-    pub(super) discard: bool,
+pub(in crate::local_ai::managed_models::huggingface) struct Failure {
+    pub(in crate::local_ai::managed_models::huggingface) error: io::Error,
+    pub(in crate::local_ai::managed_models::huggingface) discard: bool,
 }
 
 impl Failure {
@@ -67,7 +69,9 @@ impl From<io::Error> for Failure {
 }
 
 impl Component<'_> {
-    pub(super) fn verify(&self) -> io::Result<Verified> {
+    pub(in crate::local_ai::managed_models::huggingface) fn verified_file(
+        &self,
+    ) -> io::Result<(File, FileStamp)> {
         let mut file = self.directory.open_private_file(self.name)?;
         require_single_link(&file)?;
         let stamp = FileStamp::read(&file)?;
@@ -80,17 +84,22 @@ impl Component<'_> {
                 "A staged model component does not match its reviewed SHA-256",
             ));
         }
+        Ok((file, stamp))
+    }
+
+    pub(in crate::local_ai::managed_models::huggingface) fn verify_gguf(
+        &self,
+        ordinal: usize,
+        count: usize,
+    ) -> io::Result<Verified> {
+        let (mut file, stamp) = self.verified_file()?;
+        let size = self.artifact.size();
         file.rewind()?;
-        let (context, split) = if self.plan.count() == 1 {
+        let (context, split) = if count == 1 {
             (gguf::context(&mut file, size, self.stop.cancelled)?, None)
         } else {
-            let inspection = gguf::inspect_split(
-                &mut file,
-                size,
-                self.ordinal,
-                self.plan.count(),
-                self.stop.cancelled,
-            )?;
+            let inspection =
+                gguf::inspect_split(&mut file, size, ordinal, count, self.stop.cancelled)?;
             (inspection.context, Some(inspection))
         };
         stamp.require_unchanged(&file)?;
@@ -101,7 +110,7 @@ impl Component<'_> {
         })
     }
 
-    pub(super) fn fetch(
+    pub(in crate::local_ai::managed_models::huggingface) fn fetch(
         &self,
         prior: Option<&Checkpoint>,
         mut progress: impl FnMut(Progress),
@@ -151,7 +160,8 @@ impl Component<'_> {
                 etag,
             });
         let mut response = match self.hub.artifact(
-            self.plan,
+            self.repository,
+            self.revision,
             self.artifact,
             range,
             self.stop.deadline,
@@ -187,7 +197,7 @@ impl Component<'_> {
         let mut policy_interrupted = false;
         let current = |received, resumable| Progress {
             received: self.completed_bytes + received,
-            total: self.plan.total(),
+            total: self.total,
             resumable,
         };
         progress(current(received, resumable));
@@ -282,7 +292,7 @@ impl Component<'_> {
         part.sync_all().map_err(fail)?;
         // Windows commits the last write time when the write handle closes.
         drop(part);
-        self.verify().map(Outcome::Complete).map_err(fail)
+        Ok(Outcome::Complete)
     }
 }
 

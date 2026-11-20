@@ -180,6 +180,25 @@ pub(super) fn work_with_agent<T: Send + 'static>(
     })
 }
 
+pub(super) fn read_metadata<T: Send + 'static>(
+    agent: ureq::Agent,
+    read: impl FnOnce(&AtomicBool) -> Result<T, String> + Send + 'static,
+) -> Result<Pending<T>, String> {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let token = Arc::clone(&cancelled);
+    let (send, reply) = async_channel::bounded(1);
+    std::thread::Builder::new()
+        .name("kortty-model-metadata".into())
+        .spawn(move || {
+            let _ = send.send_blocking(read(&token));
+        })
+        .map_err(|error| format!("Could not start the model metadata lookup ({error})"))?;
+    Ok(Pending {
+        reply,
+        cancel: Cancel(cancelled, Some(agent)),
+    })
+}
+
 fn import(profile: &Path, paths: &Import, cancelled: &AtomicBool) -> Result<String, String> {
     check_cancelled(cancelled).map_err(|error| error.to_string())?;
     let index_bytes = read_input(&paths.index, MAX_INDEX_BYTES as u64)

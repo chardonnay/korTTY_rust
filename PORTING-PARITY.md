@@ -16,6 +16,174 @@ open until a result is recorded for the tested revision and environment. Both
 Mosh modes are out of scope. The editor has a reduced native scope with structure
 navigation for classes, functions, variables, and placeholders.
 
+## November 20 Hub MLX pause, resume and discard
+
+The MLX transfer saves a private receipt with the reviewed manifest and
+its last verified checkpoint. The browser can find it after restart,
+display the package for review, and resume or discard it. Resume checks
+completed assets and the saved prefix. Byte-range requests require the
+original strong ETag and the exact remaining range. The complete package
+still passes native validation before registry publication. Cancelled
+transfers and explicit discard clean up the owned stage.
+
+On Apple Silicon, an anonymous live Hub test reviewed eight assets for
+`mlx-community/SmolLM2-135M-Instruct-8bit` at commit
+`0f0d9b8218915bc34d401e1a340b8c049d300d5e`. It paused after downloading
+5,318,229 bytes, read the saved receipt, and resumed with a fresh Hub client.
+The native registry published all 147,874,605 verified bytes and the transfer
+removed its checkpoint. Interactive Mac acceptance remains under B4.
+[Rust MLX Hub transfer](src/local_ai/managed_models/huggingface/mlx/download.rs)
+· [Apple Silicon live Hub test](target/verification/20261120-mlx-hub-resume-macos-live.log)
+
+## November 20 direct Hub MLX installation
+
+Apple Silicon offers Download and register MLX model after package review.
+The transfer uses the reviewed commit and checks the exact length and
+SHA-256 of each asset in a private stage. The native registry validates
+the assembled directory before atomic publication and checks download
+authorization again before publication. The installed model appears in
+the MLX model list and the transfer stage is cleaned on success or
+failure. Apple Silicon passed 27 Hugging Face tests, five MLX registry
+tests and seven AI Manager search tests. Windows ARM64 passed the 32 Hub
+and registry tests. Rustfmt and strict workspace Clippy passed. A local HTTP fixture exercised
+registration, checksum failure and stage cleanup. The registry test
+denied a change in policy just before publication. Pause, resume and
+interactive native acceptance remain under B4.
+[Rust MLX Hub installation](src/local_ai/managed_models/huggingface/mlx.rs)
+· [Apple Silicon tests](target/verification/20261120-mlx-hub-install-macos.log)
+· [Windows ARM64 tests](target/verification/20261120-mlx-hub-install-windows-final.log)
+
+## November 20 direct Hub MLX package review
+
+On supported Apple Silicon, a selected MLX result offers Review MLX
+package. The review shows the immutable commit, all supported native
+assets, individual sizes and SHA-256 digests. LFS assets use the Hub's
+published SHA-256. For ordinary Git metadata the review verifies the
+commit-pinned content against its Git object identity and computes its
+SHA-256. The download will use this manifest. A changed selection,
+search or vault revision invalidates an in-flight review.
+
+An anonymous live check verified the Git object identities of the
+configuration and tokenizer for the public Qwen2.5-0.5B-Instruct-4bit
+repository and confirmed the published weight digest. Apple Silicon
+passed 26 Hugging Face tests and seven AI Manager search tests. Windows
+ARM64 passed 26 Hugging Face tests before the platform-neutral fixture
+adjustment. Rustfmt and strict workspace Clippy passed with that adjustment.
+The loopback fixture rejected altered Git metadata and fetched metadata
+only during review. Transfer, pause, resume, registration and native
+desktop acceptance remain under B4.
+[Rust MLX Hub review](src/local_ai/managed_models/huggingface/mlx.rs)
+· [Apple Silicon tests](target/verification/20261120-mlx-hub-review-macos-final.log)
+· [Windows ARM64 tests](target/verification/20261120-mlx-hub-review-tests.log)
+
+## November 20 Hugging Face GGUF and MLX format filter
+
+On supported Apple Silicon, the Hub browser can search GGUF, MLX
+text-generation models, or both. The Format column identifies the
+results. Changing formats starts a new query and clears the previous
+selection and background lookups. Each format retains its own cursor.
+A successful page survives failure in the other format, and Load More
+can retry the failed continuation. MLX size lookups use the native asset
+layout and byte limits for the RAM estimate.
+
+Two anonymous MLX listing requests returned HTTP 200 for the first page
+and its continuation. The public Qwen2.5-0.5B-Instruct-4bit repository
+returned a commit and size metadata for configuration, tokenizer and
+weights. Windows ARM64 passed 24 Hugging Face tests, seven AI Manager
+search tests and four MLX registry tests. Rustfmt and strict workspace
+Clippy passed.
+
+The direct MLX Hub download and native desktop acceptance remain under B4.
+The model manager already supports local MLX directory import and signed
+catalog packages.
+[Hub model API](https://huggingface.co/.well-known/openapi.md)
+· [Rust model table](src/ai_manager/local/huggingface/browser.rs)
+· [Windows ARM64 tests](target/verification/20261120-hub-format-tests.log)
+
+## November 20 Hugging Face RAM filtering and background sizes
+
+The GGUF browser displays models with a known weight set that can fit in
+detected RAM. Show all models includes unknown and oversized results. An
+explicit search or Load More can start up to four concurrent metadata
+lookups to determine the smallest complete downloadable weight set. Rows
+update as replies arrive. The browser displays the visible and filtered
+counts while checking sizes. Search and access changes cancel the previous
+lookups, and saved-token lookups use the search's vault revision. Download
+actions require a separate immutable artifact review.
+
+The public SmolLM2 GGUF repository returned an immutable commit and exact
+size and digest metadata for 23 files in an anonymous check. Windows
+ARM64 passed 21 Hugging Face tests, seven AI Manager search tests,
+Rustfmt and strict workspace Clippy. The new tests covered fitting against
+the smallest weight set, complete shards, and stale background replies.
+Native desktop acceptance and the Apple Silicon format filter remain under B4.
+[Hugging Face model API](https://huggingface.co/.well-known/openapi.md)
+· [Rust model table](src/ai_manager/local/huggingface/browser.rs)
+· [Windows ARM64 tests](target/verification/20261120-hub-ram-filter-final-tests.log)
+
+## November 20 sortable Hugging Face model metadata
+
+The GGUF result table displays repository, architecture, quantizations,
+license, size, context length, age since repository creation and an
+estimated fit for the detected system RAM. Each header sorts locally.
+Missing metadata stays at the end in either sort direction. The listed
+size applies to a uniquely identifiable weight file. Selecting a reviewed
+file or shard set shows its exact size and updates the RAM estimate.
+Artifact downloads still use hashes from immutable review.
+
+An anonymous Hub check returned two expanded pages within the response
+limit. Windows ARM64 passed all 18 Hugging Face tests, including numeric
+sorting, missing metadata and RAM-fit thresholds, and seven AI Manager
+search tests. Rustfmt and strict workspace Clippy also passed. Native desktop
+acceptance and the Apple Silicon format filter remain under B4.
+[Hub API](https://huggingface.co/.well-known/openapi.md)
+· [Rust model table](src/ai_manager/local/huggingface/browser.rs)
+· [Windows ARM64 tests](target/verification/20261120-hub-metadata-final-tests.log)
+· [Strict workspace Clippy](target/verification/20261120-hub-metadata-clippy.log)
+
+## November 20 Hugging Face search pagination
+
+Local Models offers Load More when the Hub supplies an unambiguous
+continuation for the current GGUF query. The client rebuilds the next
+request for the same endpoint, search terms and filter from the cursor.
+Loading more merges new repositories into the existing results and
+preserves the reviewed selection. Query, access and policy changes clear
+the result pages. A repeated cursor stops further paging. Downloads still
+require immutable artifact review.
+
+An anonymous Hub API check returned HTTP 200 for both pages and four
+distinct model IDs across two results per page. Windows ARM64 passed all
+16 Hugging Face tests, including the two-page HTTP fixture and stale-result
+and cursor-cycle checks, and seven AI Manager search tests. Rustfmt and
+strict workspace Clippy also passed. The native desktop check and Apple
+Silicon format filter remain under B4.
+[Hub API](https://huggingface.co/docs/hub/en/api)
+· [Rust Hub client](src/local_ai/managed_models/huggingface.rs)
+· [Windows ARM64 tests](target/verification/20261120-hub-pagination-tests.log)
+
+## November 20 Hugging Face control search
+
+Local Models search reveals the Hugging Face access picker, recommended
+roles and models, query field, repository and file review, and available
+download controls. Revealing the query scrolls to the field and focuses
+it when editable. Revealing a result leaves repository review and download
+actions for explicit activation. Managed download restrictions hide the
+network controls while preserving access to local paused-download cleanup.
+
+The Windows ARM64 AI Manager suite passed 346 tests with ten ignored.
+The regression exercised query focus and verified that revealing the
+repository review starts no request. Rustfmt and strict workspace Clippy
+passed. Native desktop acceptance remains open.
+[AI Manager tests](target/verification/20261120-ai-manager-hub-search-tests.log)
+· [Strict workspace Clippy](target/verification/20261120-ai-manager-hub-search-clippy.log)
+
+The Java v2.26.0 model browser additionally offers Load More, an Apple
+Silicon GGUF/MLX filter and sortable repository metadata. At this checkpoint,
+Rust GGUF search returned one bounded page. The remaining browser work is
+tracked under B4.
+[Java model browser](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/LocalModelManagerPane.java#L803)
+· [Hugging Face controls](src/ai_manager/local/huggingface.rs)
+
 ## November 20 Knowledge Store field search
 
 AI Manager search reveals the selected store's vector backend, Qdrant

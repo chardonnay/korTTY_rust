@@ -1,20 +1,22 @@
 //! Explicit Hugging Face GGUF search and immutable artifact metadata.
 
+mod listing;
+mod mlx;
 mod multipart;
 mod recommendations;
 mod transfer;
 
 use std::fmt;
 use std::io::{self, Read as _};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Weak};
 use std::time::{Duration, Instant};
 
 use kortty_vault::Secret;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use ureq::{
     Agent, Body,
-    http::{HeaderValue, Response},
+    http::{HeaderMap, HeaderValue, Response, header::LINK},
 };
 use url::Url;
 
@@ -22,6 +24,12 @@ use super::{MAX_MODEL_BYTES, Purpose};
 use crate::clipboard_policy::ClipboardPolicy;
 use crate::local_ai::runtime_package::{Pending, work_with_agent};
 
+pub(crate) use listing::ModelListing;
+pub(crate) use mlx::{
+    Download as MlxDownload, Downloaded as MlxDownloaded, PackageReview as MlxPackageReview,
+    discard_paused as discard_paused_mlx, download as download_mlx, paused as paused_mlx,
+    review as review_mlx,
+};
 pub(crate) use multipart::Selection;
 pub(crate) use recommendations::{GIB, Recommendation, RecommendationRole, recommendations};
 pub(crate) use transfer::{Downloaded, Pause, Progress, discard_paused, download, paused};
@@ -32,10 +40,65 @@ const MAX_JSON_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_FILES: usize = 256;
 const MAX_REDIRECTS: usize = 5;
 const MAX_LICENSE_BYTES: usize = 80;
+const MAX_CONTINUATION_BYTES: usize = 16 * 1024;
+static NEXT_LINK: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)(?:^|,)\s*<([^<>]+)>\s*;\s*rel\s*=\s*([^;,\s]+)")
+        .expect("fixed Hub continuation Link syntax")
+});
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
 #[serde(transparent)]
 pub(crate) struct Repository(String);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) enum Format {
+    Gguf,
+    Mlx,
+}
+
+impl Format {
+    fn query_tag(self) -> &'static str {
+        match self {
+            Self::Gguf => "gguf",
+            Self::Mlx => "mlx",
+        }
+    }
+}
+
+impl fmt::Display for Format {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Gguf => "GGUF",
+            Self::Mlx => "MLX",
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct Continuation {
+    query: String,
+    cursor: String,
+    pub(crate) format: Format,
+}
+
+#[cfg(test)]
+impl Continuation {
+    pub(crate) fn for_test(cursor: &str) -> Self {
+        Self {
+            query: String::new(),
+            cursor: cursor.into(),
+            format: Format::Gguf,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SearchPage {
+    pub(crate) repositories: Vec<ModelListing>,
+    pub(crate) next: Option<Continuation>,
+}
+
+pub(crate) type SearchPages = Vec<(Format, Result<SearchPage, String>)>;
 
 impl Repository {
     fn parse(value: &str) -> Result<Self, String> {
@@ -176,8 +239,9 @@ impl Plan {
 
 pub(crate) fn search(
     query: String,
+    formats: &'static [Format],
     token: Option<Secret>,
-) -> Result<Pending<Vec<Repository>>, String> {
+) -> Result<Pending<SearchPages>, String> {
     let query = query.trim();
     if query.len() > 256 || query.chars().any(char::is_control) {
         return Err("Enter a model search of at most 256 bytes.".into());
@@ -185,7 +249,28 @@ pub(crate) fn search(
     let query = query.to_owned();
     let hub = Hub::new(token, Duration::from_secs(30))?;
     work_with_agent(Some(hub.agent.clone()), move |cancelled| {
-        hub.search(&query, cancelled)
+        Ok(formats
+            .iter()
+            .map(|&format| (format, hub.search_page(&query, format, None, cancelled)))
+            .collect())
+    })
+}
+
+pub(crate) fn load_more(
+    continuations: Vec<Continuation>,
+    token: Option<Secret>,
+) -> Result<Pending<SearchPages>, String> {
+    let hub = Hub::new(token, Duration::from_secs(30))?;
+    work_with_agent(Some(hub.agent.clone()), move |cancelled| {
+        Ok(continuations
+            .iter()
+            .map(|next| {
+                (
+                    next.format,
+                    hub.search_page(&next.query, next.format, Some(&next.cursor), cancelled),
+                )
+            })
+            .collect())
     })
 }
 
@@ -198,6 +283,24 @@ pub(crate) fn review(
     work_with_agent(Some(hub.agent.clone()), move |cancelled| {
         hub.review(repository, None, cancelled).map(Arc::new)
     })
+}
+
+pub(crate) fn inspect_size(
+    repository: Repository,
+    format: Format,
+    credentials: Option<(Secret, Weak<()>)>,
+) -> Result<Pending<Option<u64>>, String> {
+    Repository::parse(repository.id())?;
+    let (token, revision) = credentials.unzip();
+    let mut hub = Hub::new(token, Duration::from_secs(8))?;
+    hub.bind_credential_revision(revision);
+    crate::local_ai::runtime_package::read_metadata(
+        hub.agent.clone(),
+        move |cancelled| match format {
+            Format::Gguf => hub.smallest_size(repository, cancelled),
+            Format::Mlx => hub.mlx_size(repository, cancelled),
+        },
+    )
 }
 
 impl Recommendation {
@@ -221,11 +324,16 @@ struct Hub {
     agent: Agent,
     origin: Url,
     authorization: Option<HeaderValue>,
+    credential_revision: Option<Weak<()>>,
     authorize_downloads: Box<dyn Fn() -> io::Result<()> + Send + Sync>,
     timeout: Duration,
 }
 
 impl Hub {
+    fn bind_credential_revision(&mut self, revision: Option<Weak<()>>) {
+        self.credential_revision = revision;
+    }
+
     fn new(token: Option<Secret>, timeout: Duration) -> Result<Self, String> {
         let authorization = token
             .as_deref()
@@ -244,35 +352,74 @@ impl Hub {
             agent: Agent::new_with_config(super::super::connection_config(timeout)),
             origin: origin(),
             authorization,
+            credential_revision: None,
             authorize_downloads: Box::new(|| ClipboardPolicy::load().require_ai_model_downloads()),
             timeout,
         })
     }
 
     fn require_downloads(&self) -> io::Result<()> {
-        (self.authorize_downloads)()
+        (self.authorize_downloads)()?;
+        if self
+            .credential_revision
+            .as_ref()
+            .is_some_and(|revision| revision.strong_count() == 0)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "The Hugging Face credential changed or the vault was locked.",
+            ));
+        }
+        Ok(())
     }
 
-    fn search(&self, query: &str, cancelled: &AtomicBool) -> Result<Vec<Repository>, String> {
+    fn search_page(
+        &self,
+        query: &str,
+        format: Format,
+        cursor: Option<&str>,
+        cancelled: &AtomicBool,
+    ) -> Result<SearchPage, String> {
         let mut url = api_url(&self.origin, &[]);
         url.query_pairs_mut()
-            .append_pair("filter", "gguf")
+            .append_pair("filter", format.query_tag())
             .append_pair("limit", &SEARCH_LIMIT.to_string())
             .append_pair("sort", "downloads")
             .append_pair("direction", "-1");
+        if format == Format::Mlx {
+            url.query_pairs_mut()
+                .append_pair("pipeline_tag", "text-generation");
+        }
         if !query.is_empty() {
             url.query_pairs_mut().append_pair("search", query);
         }
-        let wire: Vec<RepositoryWire> = self.json(url, cancelled)?;
+        url.query_pairs_mut().extend_pairs(
+            listing::EXPANSIONS
+                .into_iter()
+                .filter(|field| format == Format::Gguf || *field != "gguf")
+                .map(|field| ("expand", field)),
+        );
+        let base = url.clone();
+        if let Some(cursor) = cursor {
+            url.query_pairs_mut().append_pair("cursor", cursor);
+        }
+        let mut response = self.get(url, None, false, None, cancelled)?;
+        let wire: Vec<listing::ListingWire> = self.decode_json(&mut response, cancelled)?;
         if wire.len() > SEARCH_LIMIT {
             return Err("The Hub returned too many search results.".into());
         }
         let mut seen = std::collections::BTreeSet::new();
-        Ok(wire
+        let repositories = wire
             .into_iter()
-            .filter_map(|item| item.id().and_then(|id| Repository::parse(id).ok()))
-            .filter(|repository| seen.insert(repository.id().to_ascii_lowercase()))
-            .collect())
+            .filter_map(|item| item.listing(format))
+            .filter(|model| seen.insert(model.repository.id().to_ascii_lowercase()))
+            .collect();
+        let next = next_cursor(&base, response.headers()).map(|cursor| Continuation {
+            query: query.into(),
+            cursor,
+            format,
+        });
+        Ok(SearchPage { repositories, next })
     }
 
     fn review(
@@ -298,8 +445,34 @@ impl Hub {
         Ok(review)
     }
 
+    fn smallest_size(
+        &self,
+        repository: Repository,
+        cancelled: &AtomicBool,
+    ) -> Result<Option<u64>, String> {
+        self.review(repository, None, cancelled)
+            .map(|review| review.files.iter().map(Selection::bytes).min())
+    }
+
+    fn mlx_size(
+        &self,
+        repository: Repository,
+        cancelled: &AtomicBool,
+    ) -> Result<Option<u64>, String> {
+        let wire = self.mlx_metadata(&repository, cancelled)?;
+        Ok(mlx_asset_bytes(&wire.siblings))
+    }
+
     fn json<T: DeserializeOwned>(&self, url: Url, cancelled: &AtomicBool) -> Result<T, String> {
         let mut response = self.get(url, None, false, None, cancelled)?;
+        self.decode_json(&mut response, cancelled)
+    }
+
+    fn decode_json<T: DeserializeOwned>(
+        &self,
+        response: &mut Response<Body>,
+        cancelled: &AtomicBool,
+    ) -> Result<T, String> {
         if response.status().as_u16() != 200 {
             return Err(status_message(response.status().as_u16()));
         }
@@ -324,14 +497,15 @@ impl Hub {
 
     fn artifact(
         &self,
-        plan: &Plan,
+        repository: &Repository,
+        revision: &str,
         file: &Artifact,
         range: Option<Range<'_>>,
         deadline: Instant,
         cancelled: &AtomicBool,
     ) -> Result<Response<Body>, String> {
         self.get(
-            artifact_url(&self.origin, plan, file),
+            resolve_url(&self.origin, repository, revision, file.path()),
             range,
             true,
             Some(deadline),
@@ -419,6 +593,41 @@ impl Hub {
     }
 }
 
+fn next_cursor(base: &Url, headers: &HeaderMap) -> Option<String> {
+    let mut links = headers
+        .get_all(LINK)
+        .iter()
+        .filter_map(|header| header.to_str().ok())
+        .filter(|header| header.len() <= MAX_CONTINUATION_BYTES)
+        .flat_map(|header| NEXT_LINK.captures_iter(header))
+        .filter(|link| {
+            link[2].eq_ignore_ascii_case("next") || link[2].eq_ignore_ascii_case("\"next\"")
+        });
+    let link = links.next()?;
+    if links.next().is_some() {
+        return None;
+    }
+    let next = base.join(link.get(1)?.as_str()).ok()?;
+    if !allowed_destination(base, &next, false) || next.path() != base.path() {
+        return None;
+    }
+    let mut expected: Vec<_> = base.query_pairs().collect();
+    let mut supplied = Vec::new();
+    let mut cursor = None;
+    for (key, value) in next.query_pairs() {
+        if key != "cursor" {
+            supplied.push((key, value));
+        } else if cursor.is_some() || value.is_empty() || value.chars().any(char::is_control) {
+            return None;
+        } else {
+            cursor = Some(value.into_owned());
+        }
+    }
+    expected.sort_unstable();
+    supplied.sort_unstable();
+    (expected == supplied).then_some(cursor).flatten()
+}
+
 #[derive(Clone, Copy)]
 struct Range<'a> {
     start: u64,
@@ -440,13 +649,17 @@ fn api_url(origin: &Url, segments: &[&str]) -> Url {
 }
 
 fn artifact_url(origin: &Url, plan: &Plan, file: &Artifact) -> Url {
+    resolve_url(origin, &plan.repository, &plan.revision, file.path())
+}
+
+fn resolve_url(origin: &Url, repository: &Repository, revision: &str, path: &str) -> Url {
     let mut url = origin.clone();
     url.path_segments_mut()
         .expect("Hub has path segments")
         .clear()
-        .extend(plan.repository.id().split('/'))
-        .extend(["resolve", &plan.revision])
-        .extend(file.path.split('/'));
+        .extend(repository.id().split('/'))
+        .extend(["resolve", revision])
+        .extend(path.split('/'));
     url
 }
 
@@ -507,6 +720,8 @@ struct Sibling {
     rfilename: String,
     size: Option<u64>,
     lfs: Option<Lfs>,
+    #[serde(rename = "blobId")]
+    blob_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -514,6 +729,38 @@ struct Lfs {
     size: Option<u64>,
     sha256: Option<String>,
     oid: Option<String>,
+}
+
+fn lfs_digest(lfs: Lfs) -> Option<String> {
+    let digest = lfs.sha256.or(lfs.oid)?;
+    let digest = digest
+        .strip_prefix("sha256:")
+        .unwrap_or(&digest)
+        .to_ascii_lowercase();
+    lowercase_hex(&digest, 64).then_some(digest)
+}
+
+fn mlx_asset_sizes(siblings: &[Sibling]) -> Option<std::collections::BTreeMap<String, u64>> {
+    use crate::local_ai::mlx_models;
+
+    let mut assets = std::collections::BTreeMap::new();
+    for file in siblings
+        .iter()
+        .filter(|file| mlx_models::is_asset(&file.rfilename))
+    {
+        let size = file.lfs.as_ref().and_then(|lfs| lfs.size).or(file.size)?;
+        if file.size.is_some_and(|other| other != size)
+            || assets.insert(file.rfilename.clone(), size).is_some()
+        {
+            return None;
+        }
+    }
+    mlx_models::require_asset_layout(&assets).ok()?;
+    Some(assets)
+}
+
+fn mlx_asset_bytes(siblings: &[Sibling]) -> Option<u64> {
+    crate::local_ai::mlx_models::size_of_assets(&mlx_asset_sizes(siblings)?).ok()
 }
 
 fn parse_review(repository: Repository, wire: ModelWire) -> Result<Review, String> {
@@ -531,17 +778,7 @@ fn parse_review(repository: Repository, wire: ModelWire) -> Result<Review, Strin
         .as_ref()
         .and_then(|card| card.get("license"))
         .and_then(serde_json::Value::as_str)
-        .filter(|value| {
-            value.len() <= MAX_LICENSE_BYTES
-                && value
-                    .as_bytes()
-                    .first()
-                    .is_some_and(u8::is_ascii_alphanumeric)
-                && value.bytes().all(|byte| {
-                    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'+')
-                })
-        })
-        .map(str::to_owned);
+        .and_then(license_label);
     let mut files = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     for sibling in wire.siblings {
@@ -554,13 +791,9 @@ fn parse_review(repository: Repository, wire: ModelWire) -> Result<Review, Strin
         if sibling.size.is_some_and(|other| other != size) {
             continue;
         }
-        let Some(digest) = lfs.sha256.or(lfs.oid) else {
+        let Some(digest) = lfs_digest(lfs) else {
             continue;
         };
-        let digest = digest
-            .strip_prefix("sha256:")
-            .unwrap_or(&digest)
-            .to_ascii_lowercase();
         let file = Artifact {
             path: sibling.rfilename,
             size,
@@ -579,6 +812,18 @@ fn parse_review(repository: Repository, wire: ModelWire) -> Result<Review, Strin
         files: multipart::selections(files),
         license,
     })
+}
+
+fn license_label(value: &str) -> Option<String> {
+    (value.len() <= MAX_LICENSE_BYTES
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'+')))
+    .then(|| value.to_owned())
 }
 
 fn repository_segment(segment: &str) -> bool {
@@ -659,6 +904,202 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn size_lookup_uses_the_smallest_complete_downloadable_weight_set() {
+        use crate::local_ai::test_support::{
+            accept, fixture_http_response, listener, wire_request,
+        };
+        use std::io::Write as _;
+
+        let (server, _) = listener();
+        let mut hub = Hub::new(None, Duration::from_secs(5)).unwrap();
+        hub.origin = Url::parse(&format!("http://{}/", server.local_addr().unwrap())).unwrap();
+        let worker = std::thread::spawn(move || {
+            let mut stream = accept(&server);
+            wire_request(
+                &mut stream,
+                "GET /api/models/example/fixture?blobs=true HTTP/1.1",
+            );
+            let digest = "a".repeat(64);
+            let metadata = json!({"id": "example/fixture", "sha": "b".repeat(40), "siblings": [
+                {"rfilename": "model-Q8_0.gguf", "lfs": {"size": 20, "sha256": digest}},
+                {"rfilename": "model-Q4_K_M-00001-of-00002.gguf", "lfs": {"size": 3, "sha256": digest}},
+                {"rfilename": "model-Q4_K_M-00002-of-00002.gguf", "lfs": {"size": 4, "sha256": digest}},
+                {"rfilename": "unverified.gguf", "size": 1}
+            ]});
+            stream
+                .get_mut()
+                .write_all(fixture_http_response("200 OK", "", &metadata.to_string()).as_bytes())
+                .unwrap();
+        });
+        let size = hub
+            .smallest_size(
+                Repository::parse("example/fixture").unwrap(),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(size, Some(7));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn mlx_search_uses_text_generation_filter_and_preserves_format_on_continuation() {
+        use crate::local_ai::test_support::{
+            accept, fixture_http_response, listener, wire_request,
+        };
+        use std::io::Write as _;
+
+        let (server, _) = listener();
+        let mut hub = Hub::new(None, Duration::from_secs(5)).unwrap();
+        hub.origin = Url::parse(&format!("http://{}/", server.local_addr().unwrap())).unwrap();
+        let worker = std::thread::spawn(move || {
+            let path = "/api/models?filter=mlx&limit=60&sort=downloads&direction=-1&pipeline_tag=text-generation&search=fixture&expand=siblings&expand=tags&expand=createdAt&expand=config";
+            let mut stream = accept(&server);
+            wire_request(&mut stream, &format!("GET {path} HTTP/1.1"));
+            let headers = format!("Link: <{path}&cursor=more>; rel=\"next\"\r\n");
+            stream
+                .get_mut()
+                .write_all(
+                    fixture_http_response(
+                        "200 OK",
+                        &headers,
+                        r#"[{"id":"example/fixture-4bit","config":{"model_type":"fixture"}}]"#,
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            let mut stream = accept(&server);
+            wire_request(&mut stream, &format!("GET {path}&cursor=more HTTP/1.1"));
+            stream
+                .get_mut()
+                .write_all(fixture_http_response("200 OK", "", "[]").as_bytes())
+                .unwrap();
+        });
+        let cancelled = AtomicBool::new(false);
+        let page = hub
+            .search_page("fixture", Format::Mlx, None, &cancelled)
+            .unwrap();
+        assert_eq!(page.repositories[0].format, Format::Mlx);
+        assert_eq!(page.repositories[0].quantizations, ["4-bit"]);
+        let next = page.next.unwrap();
+        assert_eq!(next.format, Format::Mlx);
+        let second = hub
+            .search_page(&next.query, next.format, Some(&next.cursor), &cancelled)
+            .unwrap();
+        assert!(second.next.is_none());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn mlx_metadata_size_requires_a_complete_bounded_asset_layout() {
+        let size = |wire| mlx_asset_bytes(&serde_json::from_value::<Vec<Sibling>>(wire).unwrap());
+        let mut files = json!([
+            {"rfilename":"config.json","size":2},
+            {"rfilename":"tokenizer.json","size":4},
+            {"rfilename":"model.safetensors","lfs":{"size":100}},
+            {"rfilename":"README.md"}
+        ]);
+        assert_eq!(size(files.clone()), Some(106));
+        files
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"rfilename":"model-00002-of-00002.safetensors","size":10}));
+        assert_eq!(size(files.clone()), None);
+        files
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"rfilename":"model.safetensors.index.json","size":3}));
+        assert_eq!(size(files.clone()), Some(119));
+        files[1]["size"] = json!(0);
+        assert_eq!(size(files), None);
+    }
+
+    const METADATA: &str =
+        "&expand=gguf&expand=siblings&expand=tags&expand=createdAt&expand=config";
+
+    #[test]
+    fn pagination_fetches_a_validated_cursor_only_when_requested() {
+        use std::io::Write as _;
+
+        use crate::local_ai::test_support::{
+            accept, fixture_http_response, listener, wire_request,
+        };
+
+        let (server, _) = listener();
+        let mut hub = Hub::new(None, Duration::from_secs(5)).unwrap();
+        hub.origin = Url::parse(&format!("http://{}/", server.local_addr().unwrap())).unwrap();
+        let worker = std::thread::spawn(move || {
+            let requests = [
+                (
+                    format!(
+                        "GET /api/models?filter=gguf&limit=60&sort=downloads&direction=-1&search=fixture{METADATA} HTTP/1.1"
+                    ),
+                    format!(
+                        "Link: </api/models?cursor=next%2Bpage&search=fixture&filter=gguf&limit=60&sort=downloads&direction=-1{METADATA}>; rel=\"next\"\r\n"
+                    ),
+                    r#"[{"id":"example/first"}]"#,
+                ),
+                (
+                    format!(
+                        "GET /api/models?filter=gguf&limit=60&sort=downloads&direction=-1&search=fixture{METADATA}&cursor=next%2Bpage HTTP/1.1"
+                    ),
+                    String::new(),
+                    r#"[{"id":"example/second"}]"#,
+                ),
+            ];
+            for (request, headers, models) in requests {
+                let mut stream = accept(&server);
+                wire_request(&mut stream, &request);
+                stream
+                    .get_mut()
+                    .write_all(fixture_http_response("200 OK", &headers, models).as_bytes())
+                    .unwrap();
+            }
+        });
+        let cancelled = AtomicBool::new(false);
+        let page = hub
+            .search_page("fixture", Format::Gguf, None, &cancelled)
+            .unwrap();
+        assert_eq!(page.repositories[0].repository.id(), "example/first");
+        let next = page.next.unwrap();
+        assert_eq!(next.cursor, "next+page");
+        let page = hub
+            .search_page(&next.query, next.format, Some(&next.cursor), &cancelled)
+            .unwrap();
+        assert_eq!(page.repositories[0].repository.id(), "example/second");
+        assert!(page.next.is_none());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn pagination_requires_the_same_endpoint_and_search_parameters() {
+        let base =
+            Url::parse("https://huggingface.co/api/models?filter=gguf&search=fixture").unwrap();
+        let cursor = |link: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(LINK, HeaderValue::from_str(link).unwrap());
+            next_cursor(&base, &headers)
+        };
+        let valid = r#"</api/models?search=fixture&filter=gguf&cursor=abc>; rel="next""#;
+        assert_eq!(cursor(valid).as_deref(), Some("abc"));
+        assert_eq!(
+            cursor(&format!("</previous>; rel=\"prev\", {valid}")).as_deref(),
+            Some("abc"),
+        );
+        assert_eq!(cursor(&format!("{valid}, {valid}")), None);
+        for target in [
+            "https://example.org/api/models?search=fixture&filter=gguf&cursor=abc",
+            "/api/models/id?search=fixture&filter=gguf&cursor=abc",
+            "/api/models?search=changed&filter=gguf&cursor=abc",
+            "/api/models?search=fixture&filter=mlx&cursor=abc",
+            "/api/models?search=fixture&filter=gguf&cursor=a&cursor=b",
+            "/api/models?search=fixture&filter=gguf&cursor=%0A",
+            "/api/models?search=fixture&filter=gguf&cursor=abc#fragment",
+        ] {
+            assert_eq!(cursor(&format!("<{target}>; rel=next")), None, "{target}");
+        }
+    }
+
+    #[test]
     fn ai_model_download_policy_rechecks_before_following_a_hub_redirect() {
         use std::io::Write as _;
 
@@ -685,7 +1126,9 @@ mod tests {
             let mut first = accept(&server);
             wire_request(
                 &mut first,
-                "GET /api/models?filter=gguf&limit=60&sort=downloads&direction=-1 HTTP/1.1",
+                &format!(
+                    "GET /api/models?filter=gguf&limit=60&sort=downloads&direction=-1{METADATA} HTTP/1.1"
+                ),
             );
             allowed.store(false, Ordering::Release);
             first
@@ -697,7 +1140,9 @@ mod tests {
                 .unwrap();
             server
         });
-        let error = hub.search("", &AtomicBool::new(false)).unwrap_err();
+        let error = hub
+            .search_page("", Format::Gguf, None, &AtomicBool::new(false))
+            .unwrap_err();
         assert_eq!(error, "Fixture policy denied downloads");
         let server = worker.join().unwrap();
         assert_eq!(
