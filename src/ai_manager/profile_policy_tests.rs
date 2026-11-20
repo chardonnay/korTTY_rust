@@ -20,6 +20,61 @@ fn saved_profiles() -> Configuration {
 }
 
 #[test]
+fn managed_agent_triage_blocks_a_stale_save_and_preserves_the_personal_choice() {
+    use crate::terminal_agent::planning::TriageMode;
+
+    let scratch = crate::snippets::tests::Profile::new();
+    let root = scratch.0.canonicalize().unwrap();
+    let original = Configuration::decode(br#"{"general":{"agent_triage":"never"}}"#).unwrap();
+    original
+        .save_with_policy(
+            &root,
+            &Configuration::default(),
+            None,
+            None,
+            ClipboardPolicy::default,
+        )
+        .unwrap();
+    let baseline = Configuration::load_from(&root).unwrap();
+    let managed = || {
+        crate::clipboard_policy::parse(
+            "[meta]\nschema-version=1\n[[rule]]\n[rule.ai-memory]\ntriage='always'\n",
+        )
+        .unwrap()
+    };
+    let mut draft = baseline.clone();
+    draft.general.agent_triage = TriageMode::Auto;
+    let checks = Cell::new(0);
+    let denied = draft
+        .save_with_policy(&root, &baseline, None, None, || {
+            let check = checks.get();
+            checks.set(check + 1);
+            if check == 0 {
+                ClipboardPolicy::default()
+            } else {
+                managed()
+            }
+        })
+        .unwrap_err();
+    assert_eq!(denied.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(checks.get(), 2);
+    assert!(Configuration::load_from(&root).unwrap() == baseline);
+
+    let mut unrelated = baseline.clone();
+    unrelated.general.timeout_minutes = 17;
+    unrelated
+        .save_with_policy(&root, &baseline, None, None, managed)
+        .unwrap();
+    let reopened = Configuration::load_from(&root).unwrap();
+    assert_eq!(reopened.general.timeout_minutes, 17);
+    assert_eq!(reopened.agent_triage(&managed()), TriageMode::Always);
+    assert_eq!(
+        reopened.agent_triage(&ClipboardPolicy::default()),
+        TriageMode::Never
+    );
+}
+
+#[test]
 fn ai_manager_profile_policy_distinguishes_create_edit_delete_and_default() {
     let saved = saved_profiles();
     let create_only = profile_policy(true, false);

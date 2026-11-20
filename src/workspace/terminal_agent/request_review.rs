@@ -12,7 +12,7 @@ use crate::ai_manager::{
 };
 use crate::clipboard_policy::{AiMemoryPolicy, ClipboardPolicy};
 use crate::connection_store::Store;
-use crate::terminal_agent::planning::{self as planning_model, Stage};
+use crate::terminal_agent::planning::{self as planning_model, Stage, TriageMode};
 use crate::vault_window::VaultWindow;
 use crate::workspace::terminal_ai::web;
 pub(super) use crate::workspace::terminal_ai::web::Message as WebMessage;
@@ -30,6 +30,7 @@ const CHANGED_PINS: &str = "The terminal's saved skill assignments changed. Star
 
 #[derive(Clone)]
 pub enum Message {
+    SkipTriage(u64),
     ReviewSkills(u64),
     Classify(u64),
     CancelClassification(u64),
@@ -44,7 +45,8 @@ pub enum Message {
 impl Message {
     fn epoch(&self) -> u64 {
         match *self {
-            Self::ReviewSkills(epoch)
+            Self::SkipTriage(epoch)
+            | Self::ReviewSkills(epoch)
             | Self::Classify(epoch)
             | Self::CancelClassification(epoch)
             | Self::Send(epoch)
@@ -116,6 +118,7 @@ struct Authority {
     source: Source,
     outbound: Option<OutboundAuthority>,
     memory: MemoryAuthority,
+    triage: Option<TriageMode>,
 }
 
 struct MemoryAuthority {
@@ -386,6 +389,11 @@ impl Authority {
         self.transport.0.require_current_policy_authority()?;
         let root = self.config.saved_root();
         let policy = ClipboardPolicy::load();
+        if self.triage.is_some_and(|mode| {
+            !policy.ai_planning_allowed() || self.config.agent_triage(&policy) != mode
+        }) {
+            return Err("The Agent complexity check policy changed. Start a new review.".into());
+        }
         if let Some(outbound) = &self.outbound {
             outbound.check(&self.transport.0)?;
             outbound.check_policy(&policy)?;
@@ -475,6 +483,11 @@ impl LiveAuthority {
         };
         let run_target = match kind {
             Kind::Run(kind) => Some(RunTargetReview::capture(workspace, run, kind)?),
+            Kind::Plan(Stage::Triage) => Some(RunTargetReview::capture(
+                workspace,
+                run,
+                engine::RunModel::FinalAdvice,
+            )?),
             _ => None,
         };
         Ok(Self {
@@ -566,6 +579,7 @@ impl Review {
             Kind::Ask => "Review Ask request",
             Kind::Run(engine::RunModel::Decision) => "Review agent decision request",
             Kind::Run(engine::RunModel::FinalAdvice) => "Review final response request",
+            Kind::Plan(Stage::Triage) => "Review complexity check",
             Kind::Plan(Stage::Questions) => "Review planning questions request",
             Kind::Plan(Stage::Options) => "Review planning options request",
             Kind::Plan(Stage::Report) => "Review planning report request",
@@ -583,6 +597,7 @@ impl Review {
         match self.kind {
             Kind::Ask => "Send question",
             Kind::Run(_) => "Send agent request",
+            Kind::Plan(Stage::Triage) => "Check complexity",
             Kind::Plan(_) => "Send planning request",
         }
     }
@@ -592,6 +607,10 @@ impl Review {
             Kind::Ask | Kind::Run(_) => None,
             Kind::Plan(stage) => Some(stage),
         }
+    }
+
+    pub(super) fn triage_mode(&self) -> Option<TriageMode> {
+        self.authority.triage
     }
 
     pub(super) fn transport(&self) -> &(local_ai::Profile, usize) {
@@ -821,6 +840,14 @@ impl Workspace {
         let config = self
             .ai_configuration()
             .ok_or("AI is unavailable under the current settings.")?;
+        let triage = if matches!(kind, Kind::Plan(Stage::Triage)) {
+            Some(
+                self.triage_mode(run)
+                    .ok_or("The complexity check is unavailable.")?,
+            )
+        } else {
+            None
+        };
         let source = if run.binding.saved().is_some() {
             Source::Saved(Box::new(SavedModelReview::capture(self, run)?))
         } else {
@@ -844,6 +871,7 @@ impl Workspace {
             source,
             outbound,
             memory,
+            triage,
         });
         let relevance = if run.swarm && matches!(kind, Kind::Ask) {
             mask::prompt(&run.redactor, &run.goal)?
@@ -947,6 +975,11 @@ impl Workspace {
         }
         self.agent_dispatch_policy(run)?.check()?;
         let authority = &review.authority;
+        if let Some(mode) = authority.triage
+            && self.triage_mode(run) != Some(mode)
+        {
+            return Err("The Agent complexity check policy changed. Start a new review.".into());
+        }
         if !self
             .ai_configuration()
             .is_some_and(|current| current.as_ref() == authority.config.as_ref())
@@ -976,7 +1009,7 @@ impl Workspace {
     }
 
     fn require_review_action(&self, run: &Run, review: &Review) -> Result<(), String> {
-        if review.plan_stage().is_some() {
+        if review.plan_stage().is_some() && review.triage_mode().is_none() {
             self.require_plan_review_route(run)?;
         }
         self.require_model_review_authority(run, review)
@@ -998,6 +1031,13 @@ impl Workspace {
         let Some(mut review) = run.model_review.take() else {
             return Ok(Task::none());
         };
+        if matches!(message, Message::SkipTriage(_))
+            && review.triage_mode().is_some()
+            && !run.paused
+        {
+            run.record("Complexity check skipped.".into());
+            return self.agent_turn(id, run);
+        }
         let task = match self.update_model_review(id, run, &mut review, message) {
             Err(error) if error == local_ai::WORKERS_BUSY => {
                 let epoch = run.next(
@@ -1444,7 +1484,11 @@ fn run_review_evidence(run: &Run) -> String {
         .then_some(run.context.as_str())
         .into_iter()
         .chain(run.plan.as_deref())
-        .chain(run.clarification_answers.iter().map(String::as_str))
+        .chain(
+            run.clarification_answers
+                .iter()
+                .flat_map(super::clarification::Answer::user_text),
+        )
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n")

@@ -1956,10 +1956,8 @@ impl Workspace {
                 }
                 return self.drop_ascii_art_image(id, path);
             }
-            Message::Window(_, _)
-            | Message::RepeatedKey(..)
-            | Message::AgentStatusClock
-            | Message::Noop => {}
+            Message::Window(_, _) | Message::RepeatedKey(..) | Message::Noop => {}
+            Message::AgentStatusClock => return self.expire_agent_inputs(),
             #[cfg(target_os = "macos")]
             Message::DockReopen(visible) => return self.dock_reopen(visible),
             #[cfg(target_os = "macos")]
@@ -4989,7 +4987,7 @@ impl Workspace {
         if let Some(id) = self.terminal_agents.running_window() {
             let cancelled = self.cancel_terminal_agent_activity(id);
             window_lifecycle::reply_to_native_quit(false);
-            return Task::batch([cancelled, window::gain_focus(id)]);
+            return Task::batch([cancelled, self.focus_agent_surface(id)]);
         }
         if let Some(task) = self.request_highlight_quit() {
             return task;

@@ -13,8 +13,41 @@ pub(crate) mod store;
 const MAX_RESPONSE_BYTES: usize = 24 * 1024;
 const MAX_ITEMS: usize = 12;
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TriageMode {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+impl TriageMode {
+    pub(crate) const ALL: [Self; 3] = [Self::Auto, Self::Always, Self::Never];
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "always" => Some(Self::Always),
+            "never" => Some(Self::Never),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for TriageMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Auto => "For complex requests",
+            Self::Always => "Always",
+            Self::Never => "Never",
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Stage {
+    Triage,
     Questions,
     Options,
     Report,
@@ -23,6 +56,14 @@ pub(crate) enum Stage {
 impl Stage {
     fn instruction(self) -> &'static str {
         match self {
+            Self::Triage => concat!(
+                "Assess whether the task needs a choice between materially different approaches. ",
+                "Give short reasons and one to three viable natural-language approaches. ",
+                "Use {\"status\":\"triage\",\"summary\":\"summary\",\"userMessage\":\"message\",",
+                "\"complex\":true,\"reasons\":[\"reason\"],\"recommended\":0,",
+                "\"options\":[{\"title\":\"title\",\"summary\":\"summary\",\"feasibility\":\"feasibility\",",
+                "\"risks\":[],\"prerequisites\":[],\"steps\":[\"step\"],\"alternatives\":[]}]}."
+            ),
             Self::Questions => concat!(
                 "Ask one to three concrete questions, each with two to four short suggestions. ",
                 "Use {\"status\":\"questions\",\"summary\":\"summary\",\"userMessage\":\"message\",",
@@ -65,6 +106,34 @@ pub(crate) struct Approach {
 }
 
 impl Approach {
+    fn valid(&self) -> bool {
+        text(&self.title, 256)
+            && text(&self.summary, 1024)
+            && text(&self.feasibility, 1024)
+            && list(&self.prerequisites, 0, MAX_ITEMS, 1024)
+            && list(&self.steps, 1, MAX_ITEMS, 1024)
+            && list(&self.risks, 0, MAX_ITEMS, 1024)
+            && list(&self.alternatives, 0, MAX_ITEMS, 1024)
+    }
+
+    fn redact(&mut self, mask: &impl Fn(&str) -> Result<String, String>) -> Result<(), String> {
+        mask_fields(
+            [&mut self.title, &mut self.summary, &mut self.feasibility],
+            mask,
+        )?;
+        for fields in [
+            &mut self.risks,
+            &mut self.prerequisites,
+            &mut self.steps,
+            &mut self.alternatives,
+        ] {
+            mask_fields(fields, mask)?;
+        }
+        self.valid()
+            .then_some(())
+            .ok_or_else(|| "The masked approach exceeds its field limits.".into())
+    }
+
     pub(crate) fn render(&self) -> String {
         let mut document = format!("{}\n\n{}", self.summary, self.feasibility);
         append_sections(
@@ -153,6 +222,12 @@ fn append_sections(document: &mut String, sections: [(&str, &[String]); 4]) {
 
 #[derive(Clone)]
 pub(crate) enum Reply {
+    Triage {
+        complex: bool,
+        reasons: Vec<String>,
+        recommended: usize,
+        options: Vec<Approach>,
+    },
     Questions {
         message: String,
         questions: Vec<Question>,
@@ -174,6 +249,17 @@ impl Reply {
         mask: &impl Fn(&str) -> Result<String, String>,
     ) -> Result<(), String> {
         match self {
+            Self::Triage {
+                reasons, options, ..
+            } => {
+                mask_fields(&mut *reasons, mask)?;
+                if !list(reasons, 1, 6, 512) {
+                    return Err("The masked complexity reasons exceed their field limits.".into());
+                }
+                for option in options {
+                    option.redact(mask)?;
+                }
+            }
             Self::Questions { message, questions } => {
                 mask_fields([message], mask)?;
                 for question in questions {
@@ -184,22 +270,7 @@ impl Reply {
             Self::Options { message, options } => {
                 mask_fields([message], mask)?;
                 for option in options {
-                    mask_fields(
-                        [
-                            &mut option.title,
-                            &mut option.summary,
-                            &mut option.feasibility,
-                        ],
-                        mask,
-                    )?;
-                    for fields in [
-                        &mut option.risks,
-                        &mut option.prerequisites,
-                        &mut option.steps,
-                        &mut option.alternatives,
-                    ] {
-                        mask_fields(fields, mask)?;
-                    }
+                    option.redact(mask)?;
                 }
             }
             Self::Report { message, report } => {
@@ -233,6 +304,14 @@ fn mask_fields<'a>(
     deny_unknown_fields
 )]
 enum Wire {
+    Triage {
+        summary: String,
+        user_message: String,
+        complex: bool,
+        reasons: Vec<String>,
+        recommended: usize,
+        options: Vec<Approach>,
+    },
     Questions {
         summary: String,
         user_message: String,
@@ -265,7 +344,12 @@ fn parse(stage: Stage, value: &str) -> Result<Reply, &'static str> {
     let wire: Wire =
         serde_json::from_str(value).map_err(|_| "Expected one structured planning reply.")?;
     let (summary, message) = match &wire {
-        Wire::Questions {
+        Wire::Triage {
+            summary,
+            user_message,
+            ..
+        }
+        | Wire::Questions {
             summary,
             user_message,
             ..
@@ -289,6 +373,27 @@ fn parse(stage: Stage, value: &str) -> Result<Reply, &'static str> {
         return Err("The planning reply requires a short summary and message.");
     }
     match (stage, wire) {
+        (
+            Stage::Triage,
+            Wire::Triage {
+                complex,
+                reasons,
+                recommended,
+                options,
+                ..
+            },
+        ) if list(&reasons, 1, 6, 512)
+            && (1..=3).contains(&options.len())
+            && recommended < options.len()
+            && options.iter().all(Approach::valid) =>
+        {
+            Ok(Reply::Triage {
+                complex,
+                reasons,
+                recommended,
+                options,
+            })
+        }
         (Stage::Options, Wire::Blocked { user_message, .. }) => Ok(Reply::Blocked(user_message)),
         (
             Stage::Questions,
@@ -329,17 +434,7 @@ fn parse(stage: Stage, value: &str) -> Result<Reply, &'static str> {
                 ..
             },
         ) => {
-            if !(1..=3).contains(&options.len())
-                || options.iter().any(|option| {
-                    !text(&option.title, 256)
-                        || !text(&option.summary, 1024)
-                        || !text(&option.feasibility, 1024)
-                        || !list(&option.prerequisites, 0, MAX_ITEMS, 1024)
-                        || !list(&option.steps, 1, MAX_ITEMS, 1024)
-                        || !list(&option.risks, 0, MAX_ITEMS, 1024)
-                        || !list(&option.alternatives, 0, MAX_ITEMS, 1024)
-                })
-            {
+            if !(1..=3).contains(&options.len()) || !options.iter().all(Approach::valid) {
                 return Err("Expected one to three bounded implementation approaches.");
             }
             Ok(Reply::Options {
@@ -424,7 +519,7 @@ pub(crate) fn request_reviewed(
         "Return a corrected reply for the current planning step.",
         move |response| parse(stage, response),
         usage::RequestMode::Planning {
-            repair: stage != Stage::Questions,
+            repair: matches!(stage, Stage::Options | Stage::Report),
             context_limit,
             progress,
         },

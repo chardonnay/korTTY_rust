@@ -318,7 +318,7 @@ impl Run {
 
 impl Workspace {
     pub(super) fn publish_agent_inline_history(&self, run: &Run) {
-        if run.reopened_history {
+        if run.reopened_history || run.runs_in_chat_tab() {
             return;
         }
         let Some(update) = run.inline_update(self.window_settings.agent_animations()) else {
@@ -354,6 +354,7 @@ impl Workspace {
             .iter_mut()
             .filter_map(|(&id, run)| {
                 if !run.active()
+                    || run.runs_in_chat_tab()
                     || run.cancel.requested()
                     || run.design.history.inline_style().is_none()
                 {

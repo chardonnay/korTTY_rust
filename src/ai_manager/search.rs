@@ -36,6 +36,8 @@ pub(crate) enum Setting {
     AgentShortcut,
     AgentShortcutName,
     AgentShortcutCase,
+    AgentTriage,
+    AgentRunPresentation,
     AgentExecution,
     AgentConfirmation,
     ShowAgentSetup,
@@ -66,6 +68,8 @@ impl Setting {
             | Self::AgentShortcut
             | Self::AgentShortcutName
             | Self::AgentShortcutCase
+            | Self::AgentTriage
+            | Self::AgentRunPresentation
             | Self::AgentExecution
             | Self::AgentConfirmation
             | Self::ShowAgentSetup
@@ -91,6 +95,8 @@ impl Setting {
             Self::AgentShortcut => "Enable terminal agent shortcuts",
             Self::AgentShortcutName => "Base command name",
             Self::AgentShortcutCase => "Ignore command name case",
+            Self::AgentTriage => "Agent complexity check",
+            Self::AgentRunPresentation => "Default Agent presentation",
             Self::AgentExecution => "Allow Agent command execution",
             Self::AgentConfirmation => "Require approval for mutating Agent command sets",
             Self::ShowAgentSetup => "Show terminal agent setup for submitted aliases",
@@ -127,6 +133,8 @@ impl Setting {
             }
             Self::ShowAgentSetup => "run dialog ask skip bypass startup prompt confirmation",
             Self::JournalSemanticSearch => "journal semantic search embedding lexical ranking BM25",
+            Self::AgentTriage => "triage solution options approaches planning",
+            Self::AgentRunPresentation => "agent run execution target chat tab terminal window",
             Self::ImportedGeneral(setting) => setting.keywords(),
             Self::WizardScan => "scan discover loopback LM Studio Ollama",
             Self::WizardTest => "run fixed CLI test verify provider",
@@ -1513,6 +1521,8 @@ pub(super) fn results<'a>(
         Setting::AgentShortcut,
         Setting::AgentShortcutName,
         Setting::AgentShortcutCase,
+        Setting::AgentTriage,
+        Setting::AgentRunPresentation,
         Setting::AgentExecution,
         Setting::AgentConfirmation,
         Setting::ShowAgentSetup,
@@ -1733,6 +1743,30 @@ mod tests {
         };
         apply(&mut position);
         position
+    }
+
+    #[test]
+    fn general_search_reveals_the_locked_agent_triage_setting() {
+        use crate::clipboard_policy::parse;
+        use crate::terminal_agent::planning::TriageMode;
+
+        let settings = Configuration::decode(br#"{"general":{"agent_triage":"never"}}"#).unwrap();
+        let policy =
+            parse("[meta]\nschema-version=1\n[[rule]]\n[rule.ai-memory]\ntriage='always'\n")
+                .unwrap();
+        let mut dialog = Dialog::new(Arc::new(settings), PathBuf::new(), Vec::new(), true, None)
+            .with_memory_policy(&policy.ai_memory, true);
+        let _ = dialog.update(Message::Search("agent complexity check".into()));
+        let reveal = dialog.update(Message::SearchChoose);
+        assert_eq!(dialog.page, Page::General);
+        assert_eq!(dialog.revealed.setting, Some(Setting::AgentTriage));
+        let position = applied_position(&dialog, reveal);
+        let visible_y = position.row_y.unwrap() - position.offset;
+        assert!(visible_y >= position.viewport.y - 1.0);
+        assert!(visible_y < position.viewport.y + position.viewport.height);
+        assert_eq!(dialog.managed_triage, Some(TriageMode::Always));
+        let _ = dialog.update(Message::AgentTriage(TriageMode::Auto));
+        assert_eq!(dialog.general.agent_triage, TriageMode::Never);
     }
 
     #[test]

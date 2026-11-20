@@ -210,6 +210,8 @@ pub(crate) struct JavaProfileReport {
     pub(crate) general_preferences: bool,
     pub(crate) request_timeout_omitted: bool,
     pub(crate) code_text_language_omitted: bool,
+    pub(crate) agent_triage_omitted: bool,
+    pub(crate) agent_run_presentation_omitted: bool,
     pub(crate) https_imported: usize,
     pub(crate) loopback_imported: usize,
     pub(crate) embedded_imported: usize,
@@ -279,6 +281,8 @@ pub(crate) fn portable_java_profiles(bytes: &[u8]) -> io::Result<(Vec<u8>, JavaP
             general_preferences: !settings.java_general_preferences.is_empty(),
             request_timeout_omitted: report.request_timeout_omitted,
             code_text_language_omitted: report.code_text_language_omitted,
+            agent_triage_omitted: report.agent_triage_omitted,
+            agent_run_presentation_omitted: report.agent_run_presentation_omitted,
             https_imported: report.https_imported,
             loopback_imported: report.loopback_imported,
             embedded_imported: report.embedded_imported,
@@ -488,6 +492,18 @@ fn merge_java_general(
         config.general.code_text_language = language;
         changed = true;
     }
+    if let Some(mode) = incoming.agent_triage
+        && unset("agent_triage")
+    {
+        config.general.agent_triage = mode;
+        changed = true;
+    }
+    if let Some(target) = incoming.agent_run_presentation
+        && unset("agent_run_presentation")
+    {
+        config.general.agent_run_presentation = target;
+        changed = true;
+    }
     Ok(changed)
 }
 
@@ -594,6 +610,72 @@ pub(crate) fn safe_memory(path: &str, bytes: &[u8]) -> bool {
 
 #[cfg(test)]
 mod java_profile_tests {
+    #[test]
+    fn java_agent_presentation_fills_only_an_unset_preference() {
+        use crate::terminal_agent::RunPresentation;
+
+        let policy = ClipboardPolicy::default();
+        let (incoming, report) = portable_java_profiles(
+            br#"<globalSettings><terminalAgentExecutionTarget>CHAT_WINDOW</terminalAgentExecutionTarget></globalSettings>"#,
+        )
+        .unwrap();
+        assert!(report.general_preferences && !report.agent_run_presentation_omitted);
+        let merged = merge_java_profiles(None, &incoming, &policy)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            Configuration::decode(&merged)
+                .unwrap()
+                .agent_run_presentation(),
+            RunPresentation::ChatTab
+        );
+        let explicit = br#"{"general":{"agent_run_presentation":"terminal_window"}}"#;
+        assert!(
+            merge_java_profiles(Some(explicit), &incoming, &policy)
+                .unwrap()
+                .is_none()
+        );
+
+        let (_, report) = portable_java_profiles(
+            br#"<globalSettings><terminalAgentExecutionTarget>UNKNOWN</terminalAgentExecutionTarget></globalSettings>"#,
+        )
+        .unwrap();
+        assert!(report.agent_run_presentation_omitted && !report.general_preferences);
+    }
+
+    #[test]
+    fn java_agent_triage_fills_only_an_unset_preference() {
+        use crate::terminal_agent::planning::TriageMode;
+
+        let policy = ClipboardPolicy::default();
+        let (incoming, report) = portable_java_profiles(
+            br#"<globalSettings><aiAgentTriageMode>ALWAYS</aiAgentTriageMode></globalSettings>"#,
+        )
+        .unwrap();
+        assert!(report.general_preferences && !report.agent_triage_omitted);
+        let merged = merge_java_profiles(None, &incoming, &policy)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            Configuration::decode(&merged)
+                .unwrap()
+                .agent_triage(&policy),
+            TriageMode::Always
+        );
+        let explicit = br#"{"general":{"agent_triage":"auto"}}"#;
+        assert!(
+            merge_java_profiles(Some(explicit), &incoming, &policy)
+                .unwrap()
+                .is_none()
+        );
+
+        let (_, report) = portable_java_profiles(
+            br#"<globalSettings><aiAgentTriageMode>OTHER</aiAgentTriageMode></globalSettings>"#,
+        )
+        .unwrap();
+        assert!(report.agent_triage_omitted && !report.general_preferences);
+    }
+
     #[test]
     fn java_general_ai_preferences_fill_only_unset_native_fields() {
         use crate::ai_manager::CodeTextLanguage;

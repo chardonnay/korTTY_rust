@@ -39,9 +39,31 @@ fn complete_review(fixture: &mut Fixture, id: window::Id, probe: bool, code: u32
     assert!(fixture.run(id).phase == if probe { Phase::Probe } else { Phase::Running });
     // Deliver a deterministic transport result to the reviewed, owned command epoch.
     drop(command_worker);
-    fixture.send(
+    let task = fixture.send(
         id,
         Message::Command(fixture.run(id).epoch, Arc::new(Ok(outcome(code)))),
+    );
+    if probe && code == 0 {
+        finish_agent_task(fixture, task);
+        return skip_triage(fixture, id);
+    }
+    task
+}
+
+fn skip_triage(fixture: &mut Fixture, id: window::Id) -> Task<Desktop> {
+    let epoch = fixture.run(id).epoch;
+    assert!(
+        fixture
+            .run(id)
+            .model_review
+            .as_ref()
+            .unwrap()
+            .triage_mode()
+            .is_some()
+    );
+    fixture.send(
+        id,
+        Message::ReviewModel(request_review::Message::SkipTriage(epoch)),
     )
 }
 
@@ -222,7 +244,10 @@ fn eight_turn_agent_reviews_every_command_and_settles_one_final_advice_with_repa
             let run = fixture.run(id);
             assert!(run.phase == Phase::Question);
             let epoch = run.epoch;
-            no_task(fixture.send(id, Message::Answer(epoch, "Second".into())));
+            no_task(fixture.send(
+                id,
+                Message::Clarification(clarification::Message::Suggested(epoch, 1)),
+            ));
             assert_eq!(fixture.run(id).turns, turn - 1);
             let answer = send_review(&mut fixture, id, &listener, &reviews);
             assert_eq!(fixture.run(id).turns, turn);
@@ -489,6 +514,8 @@ fn run_review_classifies_without_probe_output_and_refreshes_the_decision_quota()
     let epoch = run.epoch;
     let prepared = fixture.send(id, Message::Command(epoch, Arc::new(Ok(outcome(0)))));
     finish_agent_task(&mut fixture, prepared);
+    let skipped = skip_triage(&mut fixture, id);
+    finish_agent_task(&mut fixture, skipped);
 
     let run = fixture.run(id);
     assert!(run.phase == Phase::ModelReview && run.turns == 0);

@@ -488,6 +488,8 @@ struct General {
     journal_semantic_search: bool,
     agent_execution_enabled: bool,
     agent_confirm_mutating: bool,
+    agent_triage: crate::terminal_agent::planning::TriageMode,
+    agent_run_presentation: crate::terminal_agent::RunPresentation,
     #[serde(skip_serializing_if = "shortcut::Preferences::is_default")]
     agent_shortcut: shortcut::Preferences,
 }
@@ -499,11 +501,18 @@ struct JavaGeneralPreferences {
     timeout_minutes: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     code_text_language: Option<CodeTextLanguage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_triage: Option<crate::terminal_agent::planning::TriageMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_run_presentation: Option<crate::terminal_agent::RunPresentation>,
 }
 
 impl JavaGeneralPreferences {
     fn is_empty(&self) -> bool {
-        self.timeout_minutes.is_none() && self.code_text_language.is_none()
+        self.timeout_minutes.is_none()
+            && self.code_text_language.is_none()
+            && self.agent_triage.is_none()
+            && self.agent_run_presentation.is_none()
     }
 }
 
@@ -518,6 +527,8 @@ impl Default for General {
             journal_semantic_search: false,
             agent_execution_enabled: true,
             agent_confirm_mutating: false,
+            agent_triage: Default::default(),
+            agent_run_presentation: Default::default(),
             agent_shortcut: Default::default(),
         }
     }
@@ -943,6 +954,14 @@ impl Configuration {
             }
         }
         let require_profile_changes = || -> io::Result<()> {
+            if self.general.agent_triage != current.general.agent_triage
+                && load_policy().ai_memory.agent_triage.is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Managed policy sets the Agent complexity check.",
+                ));
+            }
             if self.profiles == current.profiles
                 && new_policy_references.is_empty()
                 && new_java_stores.is_empty()
@@ -1421,6 +1440,16 @@ impl Configuration {
         self.general.agent_confirm_mutating
     }
 
+    pub(crate) fn agent_triage(
+        &self,
+        policy: &ClipboardPolicy,
+    ) -> crate::terminal_agent::planning::TriageMode {
+        policy
+            .ai_memory
+            .agent_triage
+            .unwrap_or(self.general.agent_triage)
+    }
+
     pub(crate) fn current_agent_execution_enabled(&self) -> bool {
         if self.saved_root().is_some() {
             self.reload_saved()
@@ -1428,6 +1457,10 @@ impl Configuration {
         } else {
             self.agent_execution_enabled()
         }
+    }
+
+    pub(crate) fn agent_run_presentation(&self) -> crate::terminal_agent::RunPresentation {
+        self.general.agent_run_presentation
     }
 
     pub(crate) fn show_agent_setup(&self) -> bool {
@@ -2508,6 +2541,8 @@ pub(crate) enum Message {
     AgentExecutionEnabled(bool),
     AdoptJavaAgentExecution,
     AgentConfirmMutating(bool),
+    AgentTriage(crate::terminal_agent::planning::TriageMode),
+    AgentRunPresentation(crate::terminal_agent::RunPresentation),
     AdoptJavaAgentConfirmation,
     JournalSemanticSearch(bool),
     AdoptJavaJournalSemanticSearch,
@@ -2659,6 +2694,7 @@ pub(crate) struct Dialog {
     timeout: String,
     profiles: profiles::Editor,
     profile_policy: ProfilePolicy,
+    managed_triage: Option<crate::terminal_agent::planning::TriageMode>,
     skills: skills::Editor,
     skill_store: skills::Store,
     memory: memory::State,
@@ -2701,6 +2737,7 @@ impl Dialog {
                 profiles
             },
             profile_policy: ProfilePolicy::load(),
+            managed_triage: None,
             skills: skills::Editor::default()
                 .with_statistics_root(profile.clone())
                 .with_imported_preferences(saved.java_skill_preferences)
@@ -2743,6 +2780,7 @@ impl Dialog {
 
     pub(crate) fn with_memory_policy(mut self, policy: &AiMemoryPolicy, ai_allowed: bool) -> Self {
         self.memory.set_policy(policy, ai_allowed);
+        self.managed_triage = policy.agent_triage;
         self.skills
             .set_skill_creation_override(policy.skill_creation);
         self.skills.set_statistics_policy(policy.statistics);
@@ -3238,6 +3276,12 @@ impl Dialog {
                 if let Some(enabled) = self.saved.java_agent_execution_enabled {
                     self.general.agent_execution_enabled = enabled;
                 }
+            }
+            Message::AgentTriage(mode) if editable && self.managed_triage.is_none() => {
+                self.general.agent_triage = mode;
+            }
+            Message::AgentRunPresentation(target) if editable => {
+                self.general.agent_run_presentation = target;
             }
             Message::AgentConfirmMutating(enabled) if editable => {
                 self.general.agent_confirm_mutating = enabled;
@@ -4805,6 +4849,33 @@ impl Dialog {
         } else {
             text(self.general.chat_terminal_actions.to_string()).into()
         };
+        let triage_setting = search::Setting::AgentTriage;
+        let run_presentation_setting = search::Setting::AgentRunPresentation;
+        let run_presentation = self.general.agent_run_presentation;
+        let run_presentation_control: Element<'_, Message> = if self.editable() {
+            pick_list(
+                crate::terminal_agent::RunPresentation::ALL.as_slice(),
+                Some(run_presentation),
+                Message::AgentRunPresentation,
+            )
+            .dismiss_on_escape()
+        } else {
+            text(run_presentation.to_string()).into()
+        };
+        let triage = self.managed_triage.unwrap_or(self.general.agent_triage);
+        let triage_control: Element<'_, Message> =
+            if self.editable() && self.managed_triage.is_none() {
+                pick_list(
+                    crate::terminal_agent::planning::TriageMode::ALL.as_slice(),
+                    Some(triage),
+                    Message::AgentTriage,
+                )
+                .dismiss_on_escape()
+            } else if self.managed_triage.is_some() {
+                text(format!("{triage} (managed by policy)")).into()
+            } else {
+                text(triage.to_string()).into()
+            };
         let shortcut_setting = search::Setting::AgentShortcut;
         let shortcut_name = search::Setting::AgentShortcutName;
         let shortcut_case = search::Setting::AgentShortcutCase;
@@ -4852,6 +4923,16 @@ impl Dialog {
                 ].spacing(8).wrap(),
             )),
             text("Terminal AI Agent").size(19),
+            self.revealed.wrap(
+                run_presentation_setting,
+                row![text(run_presentation_setting.title()), run_presentation_control]
+                    .spacing(12).align_y(Alignment::Center).wrap(),
+            ),
+            self.revealed.wrap(
+                triage_setting,
+                row![text(triage_setting.title()), triage_control]
+                    .spacing(12).align_y(Alignment::Center).wrap(),
+            ),
             self.revealed.wrap(search::Setting::AgentConfirmation,
                 checkbox(self.general.agent_confirm_mutating).label("Require approval for mutating Agent command sets")
                     .on_toggle_maybe(self.editable().then_some(Message::AgentConfirmMutating))),

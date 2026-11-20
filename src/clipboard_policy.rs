@@ -2180,6 +2180,31 @@ external-files = " ALLOW "
     }
 
     #[test]
+    fn agent_triage_uses_the_highest_policy_scope_and_strictest_same_scope_mode() {
+        use crate::terminal_agent::planning::TriageMode;
+
+        let parse_as =
+            |source: &str, user: &str| parse_with_identity(source, None, || Ok(user), || Ok(&[]));
+        let source = format!(
+            "{POLICY_META}[[rule]]\n[rule.ai-memory]\ntriage='never'\n\
+             [[rule]]\nusers=['alice']\n[rule.ai-memory]\ntriage='auto'\n\
+             [[rule]]\nusers=['alice']\n[rule.ai-memory]\ntriage=' ALWAYS '\n"
+        );
+        assert_eq!(
+            parse_as(&source, "alice").unwrap().ai_memory.agent_triage,
+            Some(TriageMode::Always)
+        );
+        assert_eq!(
+            parse_as(&source, "guest").unwrap().ai_memory.agent_triage,
+            Some(TriageMode::Never)
+        );
+        let invalid = format!(
+            "{POLICY_META}[[rule]]\nusers=['alice']\n[rule.ai-memory]\ntriage='sometimes'\n"
+        );
+        assert!(parse_as(&invalid, "guest").is_err());
+    }
+
+    #[test]
     fn ai_memory_settings_resolve_their_tiers_independently() {
         let source = r#"
 [meta]

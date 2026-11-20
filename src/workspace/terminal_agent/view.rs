@@ -51,6 +51,7 @@ impl Run {
             page = page.push(super::design::activity_controls(self));
         }
         if self.design.arrangement == crate::terminal_agent::design::Arrangement::PictureInPicture
+            && !self.runs_in_chat_tab()
             && !self.swarm
             && !self.closing
             && self.binding.live().is_ok()
@@ -136,6 +137,11 @@ impl Run {
         }
         if let Some(review) = self.model_review_view(Length::Fill) {
             page = page.push(review.map(Message::ReviewModel));
+        }
+        if self.phase == Phase::TriageChoice
+            && let Some(choice) = &self.triage.choice
+        {
+            page = page.push(choice.view(self));
         }
         if !reviewing_model
             && let Some(controls) = self
@@ -266,14 +272,8 @@ impl Run {
         if let Some(prompt) = self.manual_password_view() {
             page = page.push(prompt);
         }
-        if let Some((question, answers)) = &self.question {
-            let mut choices = row![].spacing(6);
-            for answer in answers {
-                choices = choices.push(button(text(answer)).on_press_maybe(
-                    (!self.paused).then(|| Message::Answer(self.epoch, answer.clone())),
-                ));
-            }
-            page = page.push(column![text(question), choices.wrap()].spacing(6));
+        if let Some(question) = &self.question {
+            page = page.push(question.view(self).map(Message::Clarification));
         }
         if self.phase == Phase::PlanReady {
             page = page.push(button("Implement…").on_press_maybe(
@@ -411,6 +411,10 @@ impl Run {
                 })
                 .height(request_height),
                 row![
+                    review.triage_mode().map(|_| {
+                        button("Skip complexity check")
+                            .on_press_maybe(ready.then_some(Review::SkipTriage(self.epoch)))
+                    }),
                     review.web_available().then(|| {
                         let (label, message) = if review.web_included() {
                             ("Remove web excerpts", request_review::WebMessage::Close)

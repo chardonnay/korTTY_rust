@@ -458,7 +458,7 @@ impl Workspace {
         stream: u64,
         notice: AiRunNotice,
     ) -> Task<Message> {
-        if self.native_focused_window == Some(activity)
+        if self.agent_activity_is_focused(activity)
             || self
                 .sessions
                 .get(&session)
@@ -512,7 +512,7 @@ impl Workspace {
         session: SessionId,
         stream: u64,
     ) -> Task<Message> {
-        if self.native_focused_window == Some(activity)
+        if self.agent_activity_is_focused(activity)
             || !self.agent_password_notice_current(activity, epoch, session, stream)
         {
             return Task::none();
@@ -800,7 +800,26 @@ impl Workspace {
         tab.focused = pane;
         tab.remote_files.release_keyboard();
         self.session_restore.changed(false);
-        raise_window(activity.unwrap_or(owner), activation.token)
+        let mut destination = activity.unwrap_or(owner);
+        if let Some(tab_owner) = self.hosted_tool_owner(destination) {
+            if let Some((dialog, focus)) = self.owner_dialog(tab_owner) {
+                return Task::batch([raise_window(dialog, activation.token), Task::done(focus)]);
+            }
+            let Some(owner) = self.select_hosted_tool(destination) else {
+                return Task::none();
+            };
+            destination = owner;
+        }
+        raise_window(destination, activation.token)
+    }
+
+    fn agent_activity_is_focused(&self, activity: window::Id) -> bool {
+        self.native_focused_window.is_some_and(|focused| {
+            focused == activity
+                || self
+                    .active_hosted_tab(focused)
+                    .is_some_and(|tool| tool.instance == activity)
+        })
     }
 
     fn notification_pane(

@@ -16,6 +16,81 @@ open until a result is recorded for the tested revision and environment. Both
 Mosh modes are out of scope. The editor has a reduced native scope with structure
 navigation for classes, functions, variables, and placeholders.
 
+## November 20 Terminal Agent complexity assessment
+
+Interactive Run offers a reviewed assessment after a successful environment
+probe when there is no accepted plan and policy allows planning. Auto offers
+approaches for complex requests. Always also offers them for simple requests.
+Never goes to the normal decision review. The choice can supply a suggested
+approach, an original idea, or additional instructions for the next reviewed
+request. A failed assessment or an expired choice returns to the original
+request review.
+
+The AI Manager reveals the setting in General and shows the managed value when
+policy sets it. Java restore fills an unset preference, and the managed value
+uses the highest matching policy tier.
+
+Apple Silicon passed 371 selected tests with four ignored. The loopback
+fixture verified approval before the assessment and confirmed that the
+selected approach reaches a separate request review. The suite also checked
+policy denial, malformed responses, scoped policy, and Java preference
+restore. Strict workspace Clippy passed on Windows ARM64.
+[Apple Silicon tests](target/verification/20261120-triage-macos-final.log)
+· [Windows ARM64 Clippy](target/verification/20261120-triage-windows-clippy-corrected.log)
+
+The opt-in live regression passed on Apple Silicon and Fedora ARM64 with
+an isolated, pinned OpenSSH service and a local model fixture. It checked
+the exact approved probe sent to the remote shell, the assessment request
+preview, and the selected approach in a separate decision preview bound
+to the original directory. After the remote shell changed directories,
+the previous review was rejected before the next model request. The five
+focused migration, policy and triage tests also passed on both systems.
+Desktop interaction and checks with configured providers remain under A2.
+[Apple Silicon OpenSSH tests](target/verification/20261120-triage-live-ssh-macos-verified.log)
+· [Fedora OpenSSH tests](target/verification/20261120-triage-live-ssh-fedora-verified.log)
+
+The workspace clock regression expires the choice and brings back the
+original request review. An unsent instructions draft and later choice
+events stay out of that request. Cancellation clears the choice and rejects
+late choice and send events. The AI Manager search scrolls to the locked
+control, and the save path revalidates the managed setting at publication
+while preserving the stored personal choice.
+Apple Silicon passed 24 selected tests with the opt-in OpenSSH case skipped
+in this run. Strict workspace Clippy passed on Windows ARM64. The native
+Windows executable opened the main window with the isolated test profile.
+The visible managed setting and choice card still need desktop acceptance.
+[Apple Silicon dialog regressions](target/verification/20261120-triage-choice-tests-macos.log)
+· [Windows ARM64 Clippy](target/verification/20261120-triage-choice-tests-windows-clippy.log)
+· [Windows ARM64 startup](target/verification/20261120-triage-desktop-windows.log)
+
+## November 20 Terminal Agent clarifications
+
+The native Agent and Swarm member views offer suggested and custom
+answers, optional instructions and an explicit choice to let the
+agent decide. Expiry discards the draft. The question limit keeps
+the next request within the existing model-turn budget. Each settled
+question and its masked answer or instructions are included in
+subsequent decision and final-response previews.
+
+Apple Silicon passed 239 selected tests with four ignored. The
+regressions exercised a masked custom answer after older activity
+leaves the prompt, explicit deferral, expiry and stale events, and
+continued review at the question limit. The existing loopback
+decision and final-response workflow passed with a suggested answer.
+Windows ARM64 passed strict workspace Clippy. Verify the new input
+controls and continuation in the native desktop under A2.
+[Apple Silicon tests](target/verification/20261120-agent-clarification-macos-final.log)
+· [Windows ARM64 Clippy](target/verification/20261120-agent-clarification-windows-clippy-final.log)
+
+## November 20 Terminal Agent run presentation
+
+AI Manager saves the default presentation for newly opened interactive Run.
+The Chat tab hosts the existing reviewed Agent flow, preserves the original
+terminal stream and cancels its owned operation on close. Finished runs keep
+their presentation when reopened from history. Java restore fills an unset
+preference and reports unknown values. The native desktop review and the
+accepted-plan entry point are tracked under A2.
+
 ## November 20 Terminal Agent Log Table
 
 Design 16 renders the retained and masked typed steps as a sortable table.

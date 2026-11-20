@@ -654,7 +654,7 @@ impl Workspace {
             return window::minimize(id, false).chain(window::gain_focus(id));
         }
         let (id, opened) = self.open_modeless_placed_dialog(
-            run,
+            self.hosted_tool_owner(run).unwrap_or(run),
             dialog_placement::Kind::AgentWorkflow,
             window::Settings {
                 size: Size::new(940.0, 730.0),

@@ -477,6 +477,16 @@ pub(super) fn convert(
                 if imported.code_text_language_omitted {
                     report.omissions.push("Java's default AI code text language is invalid or unavailable in the native language list.".into());
                 }
+                if imported.agent_triage_omitted {
+                    report
+                        .omissions
+                        .push("Invalid Java Agent complexity check preference was omitted.".into());
+                }
+                if imported.agent_run_presentation_omitted {
+                    report
+                        .omissions
+                        .push("Invalid Java Agent presentation preference was omitted.".into());
+                }
                 if imported.journal_evidence_omitted {
                     report.omissions.push(
                         "Invalid or unsupported Java Session Journal evidence limits were omitted."
@@ -506,7 +516,7 @@ pub(super) fn convert(
                         snapshot.insert(ai::SETTINGS.into(), Zeroizing::new(bytes));
                         if imported.general_preferences {
                             report.entries.push(
-                                "Global AI timeout or code text language for unset fields".into(),
+                                "Global AI timeout, code text language, Agent complexity check or Agent presentation for unset fields".into(),
                             );
                         }
                         if imported.https_imported != 0 {
@@ -610,7 +620,9 @@ pub(super) fn convert(
                     } else {
                         report.note_count(count, "Java AI profiles omitted by managed policy");
                         if imported.general_preferences {
-                            report.omissions.push("The Java global AI timeout and code text language were omitted by managed policy.".into());
+                            report.omissions.push(
+                                "Java global AI preferences were omitted by managed policy.".into(),
+                            );
                         }
                         report.note_count(
                             imported.web_hints,

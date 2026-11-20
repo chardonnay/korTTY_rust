@@ -19,6 +19,7 @@ pub(super) enum Kind {
     RecordingManager,
     AiManager,
     AiChat,
+    TerminalAgent,
     JournalChatTranscript,
     SavedChats,
     LogfileManager,
@@ -151,6 +152,11 @@ impl Workspace {
             .collect()
     }
 
+    pub(super) fn active_hosted_tab(&self, owner: window::Id) -> Option<HostedTab> {
+        let tab = self.windows.get(&owner)?.active_tab_id()?;
+        self.hosted_tab_at(owner, tab)
+    }
+
     pub(super) fn hosted_tool_view(&self, tool: &HostedTab) -> Option<Element<'_, Message>> {
         match tool.kind {
             Kind::OpenPgp => self.openpgp_view(tool.instance),
@@ -160,6 +166,11 @@ impl Workspace {
             Kind::RecordingManager => self.recording_view(tool.instance),
             Kind::AiManager => self.ai_manager_view(tool.instance),
             Kind::AiChat => self.terminal_ai_view(tool.instance),
+            Kind::TerminalAgent => {
+                let id = tool.instance;
+                self.agent_window_view(id)
+                    .map(|view| view.map(move |message| Message::TerminalAgent(id, message)))
+            }
             Kind::JournalChatTranscript => self.journal_transcript_view(tool.instance),
             Kind::SavedChats => self.saved_chats_view(tool.instance),
             Kind::LogfileManager | Kind::LogfileViewer => self.logfile_view(tool.instance),
@@ -182,6 +193,7 @@ impl Workspace {
             Kind::RecordingManager => super::recording_access::MANAGER_TITLE,
             Kind::AiManager => crate::ai_manager::TITLE,
             Kind::AiChat => return self.terminal_chat_title(tool.instance),
+            Kind::TerminalAgent => "AI Agent",
             Kind::JournalChatTranscript => {
                 if self.journal_allowed()
                     && let Some(tab) = self.journal_chat_transcripts.get(&tool.instance)
@@ -224,7 +236,7 @@ impl Workspace {
             Kind::AiChat => self
                 .dismiss_terminal_rule(tool.instance)
                 .unwrap_or_else(|| self.request_hosted_tool_close(tool.instance)),
-            Kind::SavedChats | Kind::JournalChatTranscript => {
+            Kind::SavedChats | Kind::JournalChatTranscript | Kind::TerminalAgent => {
                 self.request_hosted_tool_close(tool.instance)
             }
             Kind::RecordingManager => self.dismiss_hosted_recording_manager(tool.instance),
@@ -272,6 +284,7 @@ impl Workspace {
             Kind::SessionJournalViewer => self.journal_entry_needs_close(tool.instance),
             Kind::AiChat => self.terminal_rule_write_pending(tool.instance),
             Kind::SavedChats
+            | Kind::TerminalAgent
             | Kind::JournalChatTranscript
             | Kind::SessionJournalManager
             | Kind::TerminalEffects => false,
@@ -292,6 +305,7 @@ impl Workspace {
             | Kind::SessionProcesses
             | Kind::RecordingManager
             | Kind::AiChat
+            | Kind::TerminalAgent
             | Kind::JournalChatTranscript
             | Kind::SavedChats
             | Kind::LogfileViewer
@@ -314,6 +328,7 @@ impl Workspace {
             | Kind::SessionProcesses
             | Kind::RecordingManager
             | Kind::AiChat
+            | Kind::TerminalAgent
             | Kind::JournalChatTranscript
             | Kind::SavedChats
             | Kind::LogfileViewer
@@ -332,6 +347,11 @@ impl Workspace {
             Kind::AiManager => self.remove_ai_manager(tool.instance),
             Kind::AiChat => {
                 self.terminal_chats.remove(&tool.instance);
+            }
+            Kind::TerminalAgent => {
+                return self
+                    .close_terminal_agent(tool.instance)
+                    .unwrap_or_else(Task::none);
             }
             Kind::JournalChatTranscript => {
                 self.journal_chat_transcripts.remove(&tool.instance);
@@ -356,9 +376,13 @@ impl Workspace {
     }
 
     pub(super) fn focus_hosted_tool(&mut self, instance: window::Id) -> Option<Task<Message>> {
+        self.select_hosted_tool(instance).map(window::gain_focus)
+    }
+
+    pub(super) fn select_hosted_tool(&mut self, instance: window::Id) -> Option<window::Id> {
         let (owner, tool) = self.locate_hosted_tool(instance)?;
         self.select_tab(owner, tool.id, false);
-        Some(window::gain_focus(owner))
+        Some(owner)
     }
 
     pub(super) fn hosted_close_locks(&self, instance: window::Id) -> bool {
