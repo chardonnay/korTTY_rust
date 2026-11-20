@@ -16,6 +16,68 @@ open until a result is recorded for the tested revision and environment. Both
 Mosh modes are out of scope. The editor has a reduced native scope with structure
 navigation for classes, functions, variables, and placeholders.
 
+## November 20 terminal Agent Spotlight and status
+
+The worktree on PR #11's merge (`646283d0`) adds **View → AI Agent Panel →
+Ask in Spotlight…**. The focused pane offers a profile picker and Up/Down
+recall of masked prompts. Tab switches between the input and profile choices.
+Browsing back to the draft restores the original input. Enter uses the
+ordinary Agent Run setup and review path, bound to the
+same stream. Private panes exclude saved prompt history. The terminal Tab
+chooser removes one exact entry with Delete or the row button and confirms
+clearing of all saved entries, including prompts hidden by single-line
+filtering. A concurrent change invalidates the confirmation and reloads the
+current entries without changing the user's terminal draft.
+[Java Spotlight](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignSpotlight.java)
+· [Native composer](src/workspace/terminal_agent/spotlight.rs)
+· [Native history chooser](src/workspace/terminal_agent/shortcut/completion.rs)
+
+Spotlight and Adaptive Dock's compact pill show the current step, settled
+step count and elapsed time from the masked trace. Orbit draws that progress
+in a ring. Toasts expire after four seconds and keep pending reviews
+available through the Activity window. Adaptive Dock counts down to the configured auto-hide deadline.
+Zero keeps the status visible without a countdown. Reduced motion leaves
+the timers in use and keeps the Orbit dots still. Settings shares the status
+presenters with the live pane.
+[Java designs](https://github.com/chardonnay/korTTY/blob/v2.26.0/app-docs/site/docs/en/features/ai-agent-designs.md)
+· [Native status](src/workspace/terminal_agent/design/status.rs)
+
+The full native Windows ARM64 workspace suite passed 4,545 tests, with 96
+ignored and no failures. The new checks cover the native input widget's
+history, Enter and Escape events, keyboard profile selection, pane/privacy
+binding, concurrent history edits, and the status timestamps and progress.
+The existing repair test still verifies that every visible status announces
+a model repair in progress.
+Workspace formatting and strict Clippy for all targets passed.
+[Windows workspace tests](target/verification/20261120-terminal-agent-interactions-windows-tests.log)
+· [Windows Clippy](target/verification/20261120-terminal-agent-interactions-windows-final-clippy.log)
+
+Status and history panels offer Run actions. The terminal context menu
+exposes the same actions under **AI → Agent Run** for the pane's displayed
+run. Export opens the ordinary review with one run or all finished runs
+preselected. Repeating a run opens a fresh setup with the current profile
+and masked goal. Selecting a typed step reveals separate actions for the
+command, output and entry, and an unsaved Snippet Editor draft where
+allowed. Each action rechecks the run, pane stream and epoch.
+[Native run and step actions](src/workspace/terminal_agent/design/actions.rs)
+
+After the menu changes, the Windows ARM64 workspace suite passed 4,546
+tests with 96 ignored. The step-copy test checks exact output and rejects
+stale epochs, missing steps and changed terminal streams. Workspace
+formatting and strict Clippy passed.
+[Windows menu tests](target/verification/20261120-agent-run-step-menus-tests.log)
+· [Windows menu Clippy](target/verification/20261120-agent-run-step-menus-clippy.log)
+
+The status and history panels and the terminal context menu can switch
+between retained runs bound to the same pane stream and privacy mode.
+Selecting a run restores a dismissed status or PiP panel. A new run or
+pending input takes precedence over that selection.
+[Native run selection](src/workspace/terminal_agent/design/runs.rs)
+
+Reopening archived runs after the Activity window closes still needs a
+Java comparison. Spotlight's animated transition, Toast entry/exit animation
+and interactive desktop checks remain open.
+
 ## November 19 Java release source comparison
 
 The published Java release is [v2.26.0](https://github.com/chardonnay/korTTY/releases/tag/v2.26.0),
@@ -62,8 +124,8 @@ on the top and right edges save changes in the profile when released.
 Small splits constrain the displayed size while preserving the profile
 preferences. Java backup restore imports each dimension into its unset
 native field. The composer offers entry removal and confirmed clearing.
-Those actions still need to be wired into the terminal Tab chooser.
-Verify interactive recall and resizing on native desktops.
+The November 20 changes also add these actions to the terminal Tab chooser.
+Verify interactive recall, deletion, clearing and resizing on native desktops.
 [Java history record](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/model/TerminalAgentInputHistoryEntry.java)
 · [Java completion popup](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/TerminalAgentCompletionPopup.java)
 · [Rust Agent history](src/terminal_agent/history.rs)

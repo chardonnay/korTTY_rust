@@ -25,6 +25,7 @@ const MAX_FIELD: usize = 16 * 1024;
 #[derive(Clone)]
 pub enum Message {
     Open,
+    OpenScope(Scope),
     Scope(Scope),
     Format(Format),
     Path(String),
@@ -206,6 +207,10 @@ impl Export {
         };
         Some(view.map(RunMessage::ActivityExport))
     }
+
+    pub(super) fn available(&self) -> bool {
+        self.snapshot.is_some() && !self.writing()
+    }
 }
 
 impl Workspace {
@@ -230,7 +235,9 @@ impl Workspace {
         message: Message,
     ) -> Task<Desktop> {
         match message {
-            Message::Open if !run.closing && !run.activity_export.writing() => {
+            Message::Open | Message::OpenScope(_)
+                if !run.closing && !run.activity_export.writing() =>
+            {
                 let result = self.agent_export_pane(run).and_then(|_| run.binding.live());
                 match result {
                     Ok(source) => {
@@ -242,7 +249,10 @@ impl Workspace {
                         }
                         run.activity_export.form = Some(Form {
                             all,
-                            scope: Scope::This,
+                            scope: match message {
+                                Message::OpenScope(scope) => scope,
+                                _ => Scope::This,
+                            },
                             format: Format::default(),
                             path: String::new(),
                         });

@@ -1,6 +1,7 @@
 //! Local alias choices and asynchronous prompt history.
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -13,7 +14,7 @@ use iced::{Element, Length, Size, Task, window};
 use crate::horizontal_divider::{self, Grow};
 use crate::session::{SessionId, ShortcutPrompt};
 use crate::terminal_agent::Mode;
-use crate::terminal_agent::history::{self as store, Entry, Snapshot};
+use crate::terminal_agent::history::{self as store, Snapshot};
 use crate::terminal_agent::shortcut::shortcut_character;
 
 use super::{Capture, Desktop, HISTORY_POPUP_HEIGHT, HISTORY_POPUP_WIDTH, Workspace};
@@ -35,8 +36,16 @@ pub struct Ticket {
 #[derive(Clone)]
 pub enum Message {
     Choose(Ticket, usize),
-    Loaded(Ticket, Arc<Result<Snapshot, String>>),
+    Loaded(Ticket, Arc<Result<ReadHistory, String>>),
+    Delete(Ticket, usize),
+    Clear(Ticket, bool),
+    ConfirmClear(Ticket),
     ResizeHistory(Ticket, HistoryResize),
+}
+
+pub struct ReadHistory {
+    snapshot: Snapshot,
+    write_error: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -101,21 +110,60 @@ impl HistorySize {
 enum Options {
     Commands(Vec<String>),
     Loading,
-    History(Vec<Entry>),
+    History(History),
     Notice(&'static str),
+}
+
+struct History {
+    snapshot: Snapshot,
+    single_line: Vec<usize>,
+    clearing: bool,
+    write_error: Option<String>,
+}
+
+impl History {
+    fn new(read: &ReadHistory, planning_allowed: bool) -> Self {
+        let single_line = read
+            .snapshot
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                (planning_allowed || entry.kind != store::Kind::Plan)
+                    && entry.goal.chars().all(shortcut_character)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        Self {
+            snapshot: read.snapshot.clone(),
+            single_line,
+            clearing: false,
+            write_error: read.write_error.clone(),
+        }
+    }
 }
 
 impl Options {
     fn len(&self) -> usize {
         match self {
             Self::Commands(variants) => variants.len(),
-            Self::History(entries) => entries.len(),
+            Self::History(history) => history.single_line.len(),
             Self::Loading | Self::Notice(_) => 0,
         }
     }
 }
 
 impl Completion {
+    fn edit_history(
+        &mut self,
+        root: PathBuf,
+        edit: impl FnOnce(&Path) -> std::io::Result<()> + Send + 'static,
+    ) -> Task<Desktop> {
+        self.ticket.nonce = NEXT_COMPLETION.fetch_add(1, Ordering::Relaxed);
+        self.options = Options::Loading;
+        load_history(self.ticket, root, edit)
+    }
+
     pub(super) fn view(
         &self,
         owner: window::Id,
@@ -133,12 +181,7 @@ impl Completion {
                 }
                 "Agent shortcut variants"
             }
-            Options::History(entries) => {
-                for (index, entry) in entries.iter().enumerate() {
-                    list = list.push(self.button(index, history::label(entry)));
-                }
-                return Some(self.history_view(list, bounds));
-            }
+            Options::History(history) => return Some(self.history_view(history, bounds)),
             Options::Loading => return Some(text("Loading recent agent prompts…").size(13).into()),
             Options::Notice(notice) => return Some(text(*notice).size(13).into()),
         };
@@ -155,11 +198,7 @@ impl Completion {
         )
     }
 
-    fn history_view<'a>(
-        &self,
-        list: widget::Column<'a, Desktop>,
-        bounds: Size,
-    ) -> Element<'a, Desktop> {
+    fn history_view<'a>(&self, history: &'a History, bounds: Size) -> Element<'a, Desktop> {
         let limit = HistorySize::pane_limit(bounds);
         let width = f32::from(self.history_size.width).min(limit.width);
         let height = f32::from(self.history_size.height).min(limit.height);
@@ -201,12 +240,62 @@ impl Completion {
             .width(horizontal_divider::WIDTH)
             .height(Length::Fill)
         });
+        let action = Desktop::AgentShortcut;
+        let controls: Element<'_, Desktop> = if history.clearing {
+            row![
+                button("Delete all saved prompts").on_press(action(Message::ConfirmClear(ticket))),
+                button("Keep prompts").on_press(action(Message::Clear(ticket, false))),
+            ]
+            .spacing(5)
+            .wrap()
+            .into()
+        } else {
+            row![
+                text("↑/↓ Choose · Enter Insert · Del Remove · Esc Close").size(12),
+                button("Clear all").on_press_maybe(
+                    (!history.snapshot.entries.is_empty())
+                        .then_some(action(Message::Clear(ticket, true)))
+                )
+            ]
+            .spacing(5)
+            .align_y(iced::Alignment::Center)
+            .wrap()
+            .into()
+        };
+        let mut list = column![].spacing(4);
+        for (index, &entry) in history.single_line.iter().enumerate() {
+            list = list.push(
+                row![
+                    self.choice(index, history::label(&history.snapshot.entries[entry]))
+                        .width(Length::Fill)
+                        .on_press_maybe(
+                            (!history.clearing).then_some(action(Message::Choose(ticket, index)))
+                        ),
+                    button("Delete").on_press_maybe(
+                        (!history.clearing).then_some(action(Message::Delete(ticket, index)))
+                    ),
+                ]
+                .spacing(5),
+            );
+        }
+        if history.single_line.is_empty() {
+            list = list.push(text("No single-line recent prompts.").size(12));
+        }
+        let notice = if history.clearing {
+            Some(format!(
+                "Delete all {} saved prompts, including any hidden here?",
+                history.snapshot.entries.len()
+            ))
+        } else {
+            history.write_error.clone()
+        };
         let body = column![
             text("Recent agent prompts").size(13),
+            notice.map(|notice| text(notice).size(12)),
             scrollable(list)
                 .id(self.scroll.clone())
                 .height(Length::Fill),
-            text("Use arrow keys to choose, Enter to insert, or Esc to dismiss.").size(12),
+            controls,
         ]
         .spacing(4)
         .width(Length::Fill)
@@ -218,17 +307,20 @@ impl Completion {
     }
 
     fn button(&self, index: usize, label: String) -> Element<'static, Desktop> {
-        let selected = self.selected == index;
-        button(text(label).size(13))
+        self.choice(index, label)
             .on_press(Desktop::AgentShortcut(Message::Choose(self.ticket, index)))
-            .style(move |theme, status| {
-                if selected {
-                    button::primary(theme, status)
-                } else {
-                    button::secondary(theme, status)
-                }
-            })
             .into()
+    }
+
+    fn choice(&self, index: usize, label: String) -> widget::Button<'static, Desktop> {
+        let selected = self.selected == index;
+        button(text(label).size(13)).style(move |theme, status| {
+            if selected {
+                button::primary(theme, status)
+            } else {
+                button::secondary(theme, status)
+            }
+        })
     }
 
     fn move_selection(&mut self, backwards: bool) -> Task<Desktop> {
@@ -286,6 +378,23 @@ impl Capture {
             || modifiers.is_empty() && *key == Key::Named(Named::ArrowUp);
         let forwards =
             modifiers.is_empty() && matches!(key, Key::Named(Named::Tab | Named::ArrowDown));
+        if let Options::History(history) = &mut completion.options {
+            if history.clearing {
+                if modifiers.is_empty() && *key == Key::Named(Named::Escape) {
+                    history.clearing = false;
+                    return Some(Task::none());
+                }
+                if backwards || forwards || matches!(key, Key::Named(Named::Enter | Named::Delete))
+                {
+                    return Some(Task::none());
+                }
+            } else if modifiers.is_empty() && *key == Key::Named(Named::Delete) {
+                return Some(Task::done(Desktop::AgentShortcut(Message::Delete(
+                    completion.ticket,
+                    completion.selected,
+                ))));
+            }
+        }
         if backwards || forwards {
             return Some(completion.move_selection(backwards));
         }
@@ -304,12 +413,12 @@ impl Capture {
         };
         let replacement = match &completion.options {
             Options::Commands(variants) => variants.get(index).map(|variant| format!("{variant} ")),
-            Options::History(entries) => self
+            Options::History(history) if !history.clearing => self
                 .aliases
                 .history_prefix(self.line.text())
-                .zip(entries.get(index))
-                .map(|(head, entry)| format!("{head} {}", entry.goal)),
-            Options::Loading | Options::Notice(_) => None,
+                .zip(history.single_line.get(index))
+                .map(|(head, &index)| format!("{head} {}", history.snapshot.entries[index].goal)),
+            Options::History(_) | Options::Loading | Options::Notice(_) => None,
         };
         if let Some(replacement) = replacement {
             self.line.replace_with_completion(&replacement);
@@ -367,15 +476,7 @@ impl Workspace {
                     Task::none(),
                 )
             } else if let Some(root) = self.agent_history_root() {
-                (
-                    Options::Loading,
-                    history::file_task(
-                        move || store::list(&root, false),
-                        move |result| {
-                            Desktop::AgentShortcut(Message::Loaded(ticket, Arc::new(result)))
-                        },
-                    ),
-                )
+                (Options::Loading, load_history(ticket, root, |_| Ok(())))
             } else {
                 (
                     Options::Notice("Recent prompt history is unavailable."),
@@ -405,9 +506,20 @@ impl Workspace {
         let ticket = match &message {
             Message::Choose(ticket, _)
             | Message::Loaded(ticket, _)
+            | Message::Delete(ticket, _)
+            | Message::Clear(ticket, _)
+            | Message::ConfirmClear(ticket)
             | Message::ResizeHistory(ticket, _) => *ticket,
         };
         let live = self.agent_completion_live(ticket);
+        let root = if live
+            && !ticket.private
+            && matches!(message, Message::Delete(..) | Message::ConfirmClear(_))
+        {
+            self.agent_history_root()
+        } else {
+            None
+        };
         let Some(capture) = self
             .sessions
             .get_mut(&ticket.session)
@@ -431,27 +543,52 @@ impl Workspace {
                 if let Some(completion) = capture.completion.as_mut()
                     && matches!(completion.options, Options::Loading)
                 {
-                    completion.options = if let Ok(snapshot) = result.as_ref() {
-                        let entries: Vec<_> = snapshot
-                            .entries
-                            .iter()
-                            .filter(|entry| {
-                                (ticket.planning_allowed || entry.kind != store::Kind::Plan)
-                                    && entry.goal.chars().all(shortcut_character)
-                            })
-                            .cloned()
-                            .collect();
-                        if entries.is_empty() {
+                    completion.options = if let Ok(read) = result.as_ref() {
+                        if read.snapshot.entries.is_empty() && read.write_error.is_none() {
                             Options::Notice("No single-line recent prompts.")
                         } else {
-                            Options::History(entries)
+                            Options::History(History::new(read, ticket.planning_allowed))
                         }
                     } else {
                         Options::Notice("Could not load recent prompts.")
                     };
+                    completion.selected = completion
+                        .selected
+                        .min(completion.options.len().saturating_sub(1));
                 }
             }
             Message::Loaded(..) => {}
+            Message::Delete(_, index) => {
+                if let (Some(root), Some(completion)) = (root, capture.completion.as_mut())
+                    && let Options::History(history) = &completion.options
+                    && !history.clearing
+                    && let Some(&entry) = history.single_line.get(index)
+                {
+                    let entry = history.snapshot.entries[entry].clone();
+                    completion.selected = index;
+                    return completion
+                        .edit_history(root, move |path| store::delete(path, &entry, false));
+                }
+            }
+            Message::Clear(_, clear) => {
+                if let Some(completion) = capture.completion.as_mut()
+                    && let Options::History(history) = &mut completion.options
+                    && !history.snapshot.entries.is_empty()
+                    && !ticket.private
+                {
+                    history.clearing = clear;
+                }
+            }
+            Message::ConfirmClear(_) => {
+                if let (Some(root), Some(completion)) = (root, capture.completion.as_mut())
+                    && let Options::History(history) = &completion.options
+                    && history.clearing
+                {
+                    let snapshot = history.snapshot.clone();
+                    return completion
+                        .edit_history(root, move |path| store::clear(path, &snapshot, false));
+                }
+            }
             Message::ResizeHistory(_, resize) => {
                 if let Some(completion) = capture.completion.as_mut()
                     && !ticket.private
@@ -503,6 +640,24 @@ impl Workspace {
                             .is_some_and(|draft| draft.aliases == aliases)
                 })
     }
+}
+
+fn load_history(
+    ticket: Ticket,
+    root: PathBuf,
+    edit: impl FnOnce(&Path) -> std::io::Result<()> + Send + 'static,
+) -> Task<Desktop> {
+    history::file_task(
+        move || {
+            let write_error = edit(&root).err().map(|error| error.to_string());
+            let snapshot = store::list(&root, false)?;
+            Ok(ReadHistory {
+                snapshot,
+                write_error,
+            })
+        },
+        move |result| Desktop::AgentShortcut(Message::Loaded(ticket, Arc::new(result))),
+    )
 }
 
 #[cfg(test)]

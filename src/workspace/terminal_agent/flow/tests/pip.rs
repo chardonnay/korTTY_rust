@@ -66,7 +66,7 @@ fn picture_in_picture_detaches_with_separate_identity_and_close_only_reattaches(
         !fixture
             .workspace
             .terminal_agents
-            .pip_selected
+            .presented_runs
             .contains_key(&fixture.session)
     );
     assert_ne!(detached, id);
@@ -176,7 +176,7 @@ fn picture_in_picture_can_be_restored_after_following_another_design_but_not_an_
         .stream_generation += 1;
     no_task(fixture.send(pip, Message::Pip(Pip::Show)));
     assert_eq!(
-        fixture.workspace.terminal_agents.pip_selected[&fixture.session],
+        fixture.workspace.terminal_agents.presented_runs[&fixture.session],
         (stream, other)
     );
     assert!(!fixture.run(pip).cancel.requested());
@@ -267,7 +267,7 @@ fn picture_in_picture_releases_a_pin_only_after_an_accepted_start_and_tracks_sta
         !fixture
             .workspace
             .terminal_agents
-            .pip_selected
+            .presented_runs
             .contains_key(&fixture.session)
     );
     let second_order = fixture.run(second).started_order;
@@ -358,7 +358,7 @@ fn picture_in_picture_new_input_moves_the_detached_window_and_rejects_old_owner_
         !fixture
             .workspace
             .terminal_agents
-            .pip_selected
+            .presented_runs
             .contains_key(&fixture.session)
     );
 }
@@ -383,7 +383,7 @@ fn picture_in_picture_detachment_follows_completion_without_creating_a_history_p
         !fixture
             .workspace
             .terminal_agents
-            .pip_selected
+            .presented_runs
             .contains_key(&fixture.session)
     );
     let decision = Decision {

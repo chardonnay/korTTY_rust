@@ -13,6 +13,7 @@ pub(super) struct Preview {
     pub reduced_motion: bool,
     pub cursor_review: bool,
     pub deadline: Option<Instant>,
+    pub status_frame: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -42,8 +43,14 @@ impl canvas::Program<Desktop> for Preview {
             clock.published = false;
         }
         clock.now = Some(*now);
+        if self.status_frame.is_some_and(|frame| *now >= frame) {
+            return Some(Action::publish(message(
+                self.owner,
+                super::Action::StatusDeadline,
+            )));
+        }
         if !self.playing {
-            let deadline = self.deadline?;
+            let deadline = self.deadline.into_iter().chain(self.status_frame).min()?;
             return Some(if *now >= deadline {
                 Action::publish(message(self.owner, super::Action::StatusDeadline))
             } else {
@@ -67,7 +74,9 @@ impl canvas::Program<Desktop> for Preview {
         } else {
             next_step.min(*now + Duration::from_millis(150))
         };
-        Some(Action::request_redraw_at(redraw))
+        Some(Action::request_redraw_at(
+            redraw.min(self.status_frame.unwrap_or(redraw)),
+        ))
     }
 
     fn draw(

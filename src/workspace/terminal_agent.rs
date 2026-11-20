@@ -44,6 +44,7 @@ mod planning;
 mod policy;
 mod request_review;
 pub(super) mod shortcut;
+pub(super) mod spotlight;
 pub(in crate::workspace) mod swarm;
 mod view;
 mod workflow;
@@ -125,6 +126,8 @@ pub enum Message {
     History(history::Message),
     ActivityExport(activity_export::Message),
     Design(design::Message),
+    DesignAction(design::Action),
+    SelectPresentedRun(u64, window::Id),
     DockResize(design::DockResize),
     Zoom(font::View, bool),
     RememberActivityFont(bool),
@@ -626,10 +629,11 @@ impl Drop for Run {
 #[derive(Default)]
 pub(super) struct State {
     runs: HashMap<window::Id, Run>,
+    spotlights: HashMap<window::Id, spotlight::Composer>,
     cursor_keys: u8,
     inline_details_held: bool,
     cursor_takeover: Option<cursor::Pending>,
-    pip_selected: HashMap<SessionId, (u64, window::Id)>,
+    presented_runs: HashMap<SessionId, (u64, window::Id)>,
     next_run_order: u64,
     swarms: HashMap<window::Id, swarm::Group>,
     workflows: HashMap<window::Id, workflow::Dialog>,
@@ -1043,19 +1047,9 @@ impl Workspace {
                 let config = self
                     .ai_configuration()
                     .ok_or("AI is unavailable under the current settings.")?;
-                let mut profiles = profile_choices(&config);
+                let profiles =
+                    self.live_agent_profile_choices(&config, &policy, mode, tab.incognito, swarm);
                 let (connection, _) = self.terminal_ai_assignments(pane);
-                if !tab.incognito && !swarm {
-                    profiles.extend(server_default_profile_choices(&config, mode));
-                }
-                if !tab.incognito && matches!(mode, Mode::Ask | Mode::Run) {
-                    profiles.extend(https_profile_choices(&config));
-                    if local_ai::cli::allowed(&policy, false)
-                        && local_ai::cli::allowed(&self.clipboard.policy, false)
-                    {
-                        profiles.extend(cli_profile_choices(&config));
-                    }
-                }
                 let role_https = config.preferred_agent_https_id();
                 let foreground_role = config.foreground_agent_default_role_id().filter(|id| {
                     profiles
@@ -1183,6 +1177,29 @@ impl Workspace {
         Ok(run)
     }
 
+    fn live_agent_profile_choices(
+        &self,
+        config: &crate::ai_manager::Configuration,
+        policy: &ClipboardPolicy,
+        mode: Mode,
+        private: bool,
+        swarm: bool,
+    ) -> Vec<ProfileChoice> {
+        let mut profiles = profile_choices(config);
+        if !private && !swarm {
+            profiles.extend(server_default_profile_choices(config, mode));
+        }
+        if !private && matches!(mode, Mode::Ask | Mode::Run) {
+            profiles.extend(https_profile_choices(config));
+            if local_ai::cli::allowed(policy, false)
+                && local_ai::cli::allowed(&self.clipboard.policy, false)
+            {
+                profiles.extend(cli_profile_choices(config));
+            }
+        }
+        profiles
+    }
+
     fn agent_source_redactor(&self, pane: &PaneSession) -> Result<Redactor, String> {
         let secrets = match pane.session.journal_redaction_secrets() {
             Some(secrets) => secrets,
@@ -1251,6 +1268,12 @@ impl Workspace {
         }
         if let Message::Pip(message) = message {
             return self.agent_pip_action(id, message);
+        }
+        if let Message::DesignAction(action) = message {
+            return self.agent_design_action(id, action);
+        }
+        if let Message::SelectPresentedRun(epoch, selected) = message {
+            return self.select_presented_agent_run(id, epoch, selected);
         }
         if let Message::Swarm(message) = message {
             return self.swarm_action(id, message);
@@ -1335,7 +1358,14 @@ impl Workspace {
                 .agent_pane(source.session)
                 .is_some_and(|(_, pane, _)| pane.stream_generation == source.stream)
         {
-            self.terminal_agents.pip_selected.remove(&source.session);
+            self.terminal_agents.presented_runs.remove(&source.session);
+        }
+        if let Some(history) = &run.inline {
+            run.presentation.sync_status(
+                history.status_transcript(),
+                run.phase.finished(),
+                std::time::Instant::now(),
+            );
         }
         self.publish_agent_inline_history(&run);
         if run.phase.finished() && !before.finished() && !run.closing {

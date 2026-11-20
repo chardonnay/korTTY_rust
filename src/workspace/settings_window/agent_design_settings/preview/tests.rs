@@ -118,6 +118,7 @@ fn canvas_clock_publishes_only_a_scoped_demo_tick_and_stops_while_paused() {
         reduced_motion: false,
         cursor_review: false,
         deadline: None,
+        status_frame: None,
     };
     let mut clock = canvas::Clock::default();
     let now = Instant::now();
@@ -186,6 +187,7 @@ fn reduced_motion_skips_intermediate_frames_and_keeps_demo_timing() {
         reduced_motion: true,
         cursor_review: false,
         deadline: None,
+        status_frame: None,
     };
     let bounds = Rectangle::with_size(Size::new(640.0, 320.0));
     let mut clock = canvas::Clock::default();

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use iced::widget::{Canvas, button, column, container, pick_list, responsive, row, text};
 use iced::{Element, Length, window};
 
-use crate::terminal_agent::design::{Approval, Arrangement, Layout, inline};
+use crate::terminal_agent::design::{Approval, Arrangement, Layout, Status, inline};
 use crate::workspace::terminal_agent::design::{Sample, SampleAction, SampleGrid, SampleView};
 use inline::{Kind, Prompt, State, Step, StepState, Transcript};
 
@@ -275,6 +275,13 @@ pub(super) fn view(
         .filter(|_| auto_hide_seconds > 0)
         .map(|finished| finished + Duration::from_secs(auto_hide_seconds.into()));
     let now = Instant::now();
+    let countdown = deadline
+        .filter(|&deadline| now < deadline && layout.arrangement == Arrangement::Adaptive)
+        .map(|deadline| (deadline, auto_hide_seconds));
+    let status_frame = (countdown.is_some()
+        || layout.status == Status::Orbit && demo.active() && demo.playing && !reduced_motion
+        || layout.status == Status::Toasts && demo.sample.has_live_toasts(now))
+    .then(|| now + Duration::from_millis(100));
     let preview = SampleView {
         layout,
         dock,
@@ -283,6 +290,7 @@ pub(super) fn view(
         approval: (approval && !cursor_review).then_some(VACUUM),
         status_visible: deadline.is_none_or(|deadline| now < deadline),
         reduced_motion,
+        countdown,
     };
     let map = move |action| message(id, Action::Interact(token, action));
     let scene = responsive(move |bounds| {
@@ -295,6 +303,7 @@ pub(super) fn view(
             reduced_motion,
             cursor_review,
             deadline: deadline.filter(|deadline| now < *deadline),
+            status_frame,
         })
         .width(Length::Fill)
         .height(Length::Fill)

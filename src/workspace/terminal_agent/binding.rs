@@ -8,7 +8,7 @@ use crate::terminal_agent::{Cancel, Outcome, PasswordlessSudo, Target};
 
 use super::swarm::headless::Source;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) struct Live {
     pub(super) session: SessionId,
     pub(super) stream: u64,

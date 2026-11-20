@@ -348,6 +348,7 @@ pub enum Action {
     AgentPanelLeft,
     AgentPanelRight,
     ToggleAgentStatus,
+    AgentSpotlight,
 }
 
 #[derive(Clone, Copy)]
@@ -459,6 +460,7 @@ impl Branch {
                 Item(AgentPanelRight),
                 Separator,
                 Item(AgentPanelDesign),
+                Item(AgentSpotlight),
                 Item(ToggleAgentStatus),
             ],
             Self::RemoteSidebar => &[
@@ -912,6 +914,7 @@ impl Action {
             AgentPanelBottom => "Dock Bottom",
             AgentPanelLeft => "Dock Left",
             AgentPanelRight => "Dock Right",
+            AgentSpotlight => "Ask in Spotlight…",
             ToggleAgentStatus => "Show or Hide Status Bar",
             TeamworkSettings => "Teamwork Settings…",
             LogfileManager => "Logfile Manager…",
@@ -1548,6 +1551,7 @@ impl Workspace {
                 self.toggle_agent_status(id);
                 return Task::none();
             }
+            AgentSpotlight => return self.open_agent_spotlight(id),
             QuickConnect => return self.show_quick_connect(id),
             QuickSelect => return self.start_quick_select(id),
             CodingAgentsLeft | CodingAgentsRight | ToggleCodingAgents => {
@@ -1665,6 +1669,7 @@ impl Workspace {
             | HideTerminalScrollbarsFullscreen => self.windows.contains_key(&id),
             ToggleSessionJournal => self.journal_toggle_enabled(id),
             ToggleAgentStatus => self.agent_status_available(id),
+            AgentSpotlight => self.agent_spotlight_available(id),
             SavedChats => self.windows.contains_key(&id) && self.ai_chat_enabled(),
             AgentSwarm => self.windows.contains_key(&id) && self.agent_swarm_available(),
             TerminalAgent | TerminalAgentAsk | TerminalAgentPlan => self
@@ -2730,6 +2735,7 @@ fn native_menu_requires_focused_owner(action: Action) -> bool {
             | AgentPanelBottom
             | AgentPanelLeft
             | AgentPanelRight
+            | AgentSpotlight
             | ToggleAgentStatus
             | ToggleCodingAgents
             | NextBlockedCodingAgent

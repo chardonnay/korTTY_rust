@@ -27,6 +27,7 @@ pub enum Section {
     Split,
     Effects,
     Ai,
+    AgentRun,
 }
 
 impl Section {
@@ -35,6 +36,7 @@ impl Section {
             Self::Root => None,
             Self::Extras | Self::Effects | Self::Ai => Some(Self::Root),
             Self::Font | Self::Split => Some(Self::Extras),
+            Self::AgentRun => Some(Self::Ai),
         }
     }
 
@@ -46,6 +48,7 @@ impl Section {
             Self::Split => "Split Terminal",
             Self::Effects => "Terminal Effect",
             Self::Ai => "AI",
+            Self::AgentRun => "Agent Run",
         }
     }
 
@@ -111,6 +114,8 @@ pub enum Action {
     Agent(chrome::Action),
     Ai(super::terminal_ai::Action),
     ContinueAgentChat,
+    AgentRunItem(window::Id, super::terminal_agent::design::Action),
+    ShowAgentRun(window::Id, u64, window::Id),
 }
 
 impl Action {
@@ -145,6 +150,8 @@ impl Action {
             Self::ShowMenuBar => "Show Menu Bar",
             Self::Agent(action) => action.title(),
             Self::Ai(action) => action.label(),
+            Self::AgentRunItem(_, action) => action.label(),
+            Self::ShowAgentRun(..) => "Show Agent run",
             Self::ContinueAgentChat => "Continue Last Agent Run in Chat…",
         }
     }
@@ -377,6 +384,12 @@ impl Workspace {
             }),
             Ai(action) => self.open_terminal_ai(owner, session, action),
             ContinueAgentChat => self.continue_latest_agent_chat(owner, session),
+            ShowAgentRun(current, epoch, selected) => self.update_terminal_agent(
+                current,
+                super::terminal_agent::Message::SelectPresentedRun(epoch, selected),
+            ),
+            AgentRunItem(run, action) => self
+                .update_terminal_agent(run, super::terminal_agent::Message::DesignAction(action)),
             Paste => self.update(Desktop::Paste(owner)),
             ClearBuffer => self.terminal_command(session, Command::ClearBuffer),
             Find => self.update(Desktop::OpenSearch(session)),
@@ -730,8 +743,23 @@ impl Workspace {
                     }
                     entries.push(Item(ContinueAgentChat));
                 }
+                if self.terminal_context_agent_runs_available(session, pane.stream_generation) {
+                    entries.push(Branch(Section::AgentRun));
+                }
                 entries
             }
+            Section::AgentRun => self
+                .terminal_agent_design_actions(session, pane.stream_generation)
+                .into_iter()
+                .map(|(run, action)| Item(AgentRunItem(run, action)))
+                .chain(
+                    self.alternate_agent_runs(session, pane.stream_generation)
+                        .into_iter()
+                        .map(|(current, epoch, selected)| {
+                            Item(ShowAgentRun(current, epoch, selected))
+                        }),
+                )
+                .collect(),
         }
     }
 
@@ -766,6 +794,15 @@ impl Workspace {
                 .is_some_and(|mode| self.terminal_agent_available(session, mode)),
             Item(Ai(action)) => self.terminal_ai_available(pane, Some(action)),
             Item(ContinueAgentChat) => self.agent_chat_handoff_available(session),
+            Branch(Section::AgentRun) => {
+                self.terminal_context_agent_runs_available(session, pane.stream_generation)
+            }
+            Item(AgentRunItem(run, action)) => self
+                .terminal_agent_design_actions(session, pane.stream_generation)
+                .contains(&(run, action)),
+            Item(ShowAgentRun(current, epoch, selected)) => self
+                .alternate_agent_runs(session, pane.stream_generation)
+                .contains(&(current, epoch, selected)),
             Item(ClearBuffer) => pane.frame.ibm.is_none() && !pane.frame.screen.alternate_screen,
             Item(Find) => pane.session.supports_search(),
             Item(Sftp) => self.remote_pane(session).is_some(),
@@ -788,6 +825,13 @@ impl Workspace {
             }
             _ => true,
         }
+    }
+
+    fn terminal_context_agent_runs_available(&self, session: SessionId, stream: u64) -> bool {
+        !self
+            .terminal_agent_design_actions(session, stream)
+            .is_empty()
+            || !self.alternate_agent_runs(session, stream).is_empty()
     }
 
     pub(super) fn terminal_context_view<'a>(
@@ -841,8 +885,9 @@ impl Workspace {
                 continue;
             }
             let (label, child) = match entry {
-                Item(action) => (action.label(), None),
-                Branch(child) => (child.label(), Some(child)),
+                Item(ShowAgentRun(_, _, selected)) => (self.agent_run_choice_label(selected), None),
+                Item(action) => (action.label().to_owned(), None),
+                Branch(child) => (child.label().to_owned(), Some(child)),
                 Separator => continue,
             };
             let expanded = child.is_some_and(|child| menu.section.includes(child));

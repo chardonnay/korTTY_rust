@@ -80,6 +80,8 @@ Custom designs can change activity history, terminal status, approval controls a
 
 Set how long the status stays after a run. The default is six seconds and zero keeps it visible. **View → AI Agent Panel → Show or Hide Status Bar** restores or hides the current pane's status. **Reduce Agent design animations** stops decorative motion in the preview and in terminal Agent designs. **Save** also applies these two preferences.
 
+**View → AI Agent Panel → Ask in Spotlight…** opens a prompt in the current terminal pane. Choose a profile or use the terminal default. Tab switches between the prompt and profile selection. Up and Down browse profiles or recall saved prompts in regular panes. Enter starts the usual Agent review for that pane. Escape closes Spotlight.
+
 ## Settings · Updates
 
 Enable **Check automatically for Rust updates** and choose an interval from 1 to 30 days. Automatic checks are off by default. A managed policy can disable update checks.

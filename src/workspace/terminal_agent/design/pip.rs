@@ -146,7 +146,7 @@ fn body<'a>(
         }
         // There is only one presenter for the selected history. Status stays outside PiP.
         content = content
-            .push(history::view(run, palette))
+            .push(super::history_with_steps(run, palette))
             .push(super::controls(run));
     }
     panel_view(content, palette)
@@ -256,10 +256,10 @@ impl Workspace {
             panel.hidden = false;
             let detached = panel.detached;
             self.terminal_agents
-                .pip_selected
+                .presented_runs
                 .retain(|_, (_, selected)| self.terminal_agents.runs.contains_key(selected));
             self.terminal_agents
-                .pip_selected
+                .presented_runs
                 .insert(session, (stream, id));
             let focus = detached.map_or_else(Task::none, |window| {
                 window::minimize(window, false).chain(window::gain_focus(window))
@@ -292,10 +292,10 @@ impl Workspace {
                 return Task::none();
             }
             self.terminal_agents
-                .pip_selected
+                .presented_runs
                 .retain(|_, (_, selected)| self.terminal_agents.runs.contains_key(selected));
             self.terminal_agents
-                .pip_selected
+                .presented_runs
                 .insert(session, (stream, selected));
             self.terminal_agents
                 .runs
@@ -366,7 +366,7 @@ impl Workspace {
     pub(in crate::workspace::terminal_agent) fn reconcile_agent_pip(&mut self) -> Task<Desktop> {
         let stale: Vec<_> = self
             .terminal_agents
-            .pip_selected
+            .presented_runs
             .iter()
             .filter_map(|(&session, &(stream, id))| {
                 let live = self
@@ -381,7 +381,7 @@ impl Workspace {
             })
             .collect();
         for session in stale {
-            self.terminal_agents.pip_selected.remove(&session);
+            self.terminal_agents.presented_runs.remove(&session);
         }
         let detached: Vec<_> = self
             .terminal_agents
@@ -479,12 +479,16 @@ pub(super) fn sample<'a>(
 }
 
 impl Panel {
+    pub(super) fn show(&mut self) {
+        self.hidden = false;
+    }
+
     pub(super) fn update_sample(&mut self, message: Message) {
         match message {
             Message::Corner(corner) => self.corner = corner,
             Message::Fold => self.folded = !self.folded,
             Message::Hide => self.hidden = true,
-            Message::Show => self.hidden = false,
+            Message::Show => self.show(),
             Message::Detach | Message::Select(_) => {}
         }
     }

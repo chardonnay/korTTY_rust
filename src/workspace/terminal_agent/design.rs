@@ -13,12 +13,15 @@ use crate::terminal_agent::design::{Arrangement, History, Layout, Status};
 use super::palette::{self, Palette};
 use super::{Desktop, Message as AgentMessage, Phase, Run, State, Workspace, dialog_placement};
 
+pub(in crate::workspace) mod actions;
 mod activity;
+pub(crate) use actions::Action;
 pub(in crate::workspace::terminal_agent) mod handoff;
 mod history;
 pub(in crate::workspace) mod pip;
 mod placement;
 mod presentation;
+mod runs;
 mod sample;
 mod status;
 
@@ -167,15 +170,30 @@ fn controls(run: &Run) -> Element<'_, AgentMessage> {
                 .on_press(AgentMessage::Pause)),
         active.then(|| button("Cancel").on_press(AgentMessage::Cancel)),
         handoff::compact(run),
+        actions::run_menu(run),
+        run.status_transcript()
+            .filter(|(trace, _)| !trace.steps.is_empty())
+            .map(|_| {
+                button(if run.presentation.step_list_open {
+                    "Run history"
+                } else {
+                    "Step details"
+                })
+                .on_press(AgentMessage::Design(Message::ToggleStepList))
+            }),
     ]
     .spacing(5)
     .wrap()
     .into()
 }
 
-fn history_panel(run: &Run, palette: Option<Palette>) -> Element<'_, AgentMessage> {
+fn history_panel<'a>(
+    run: &'a Run,
+    chooser: Option<Element<'static, AgentMessage>>,
+    palette: Option<Palette>,
+) -> Element<'a, AgentMessage> {
     let (phase, _) = status::phase(run);
-    let activity = history::view(run, palette);
+    let activity = history_with_steps(run, palette);
     let controls = controls(run);
     let body = history_body(activity, controls, run.design.approval);
     let muted = palette.map(|palette| palette.muted.color());
@@ -187,6 +205,7 @@ fn history_panel(run: &Run, palette: Option<Palette>) -> Element<'_, AgentMessag
                 text(&run.label)
                     .size(12)
                     .style(move |_| text::Style { color: muted }),
+                chooser,
                 body,
             ]
             .spacing(5),
@@ -195,6 +214,14 @@ fn history_panel(run: &Run, palette: Option<Palette>) -> Element<'_, AgentMessag
         .width(Length::Fill)
         .height(Length::Fill),
     )
+}
+
+fn history_with_steps(run: &Run, palette: Option<Palette>) -> Element<'_, AgentMessage> {
+    if run.presentation.step_list_open {
+        status::step_list(run)
+    } else {
+        history::view(run, palette)
+    }
 }
 
 fn history_body<'a>(
@@ -249,7 +276,7 @@ impl State {
         session: SessionId,
         stream: u64,
     ) -> Option<(window::Id, &Run)> {
-        if let Some(&(selected_stream, id)) = self.pip_selected.get(&session)
+        if let Some(&(selected_stream, id)) = self.presented_runs.get(&session)
             && selected_stream == stream
             && let Some(run) = self.runs.get(&id)
             && pip::matches(run, session, stream)
@@ -304,7 +331,7 @@ impl State {
         stream: u64,
     ) -> Option<Element<'_, Desktop>> {
         let (id, run) = self.agent_activity_for_stream(session, stream)?;
-        pane_status(id, run, run.design.status, None)
+        pane_status(id, run, run.design.status, None, Instant::now(), true)
     }
 }
 
@@ -313,9 +340,12 @@ fn pane_status(
     run: &Run,
     status: Status,
     palette: Option<Palette>,
+    now: Instant,
+    reduced_motion: bool,
 ) -> Option<Element<'_, Desktop>> {
     (status != Status::Hidden).then(|| {
-        status::view(run, status, palette).map(move |message| Desktop::TerminalAgent(id, message))
+        status::view(run, status, palette, now, reduced_motion)
+            .map(move |message| Desktop::TerminalAgent(id, message))
     })
 }
 
@@ -329,11 +359,18 @@ impl Workspace {
                     && !run.closing
                     && (run.design.status != Status::Hidden
                         || run.design.arrangement == Arrangement::Adaptive)
-                    && run
+                    && run.presentation.status_visibility.visible(seconds, now)
+                    && (run
                         .presentation
                         .status_visibility
                         .deadline(seconds)
-                        .is_some_and(|deadline| now < deadline)
+                        .is_some()
+                        || run.design.status == Status::Toasts
+                            && run.presentation.status_events.recent(now).next().is_some()
+                        || run.active()
+                            && (matches!(run.design.status, Status::Spotlight | Status::Orbit)
+                                || run.design.arrangement == Arrangement::Adaptive
+                                    && run.presentation.dock.get() == Dock::Pill))
             });
         if waiting {
             crate::workspace::scheduler_access::desktop_clock(Duration::from_millis(100))
@@ -460,10 +497,11 @@ impl Workspace {
             );
             adaptive_side = status_position == Slot::Right;
         }
-        let status_visible = run.presentation.status_visibility.visible(
-            self.window_settings.agent_status_auto_hide_seconds(),
-            Instant::now(),
-        );
+        let now = Instant::now();
+        let seconds = self.window_settings.agent_status_auto_hide_seconds();
+        let visibility = &run.presentation.status_visibility;
+        let status_visible = visibility.visible(seconds, now);
+        let chooser = || agents.run_picker(id, run);
         let picture_in_picture = run.design.arrangement == Arrangement::PictureInPicture;
         let dock = self.window_settings.ai_agent_panel;
         let history_position = dock.history_slot(run.design);
@@ -510,14 +548,14 @@ impl Workspace {
                 panel = panel.push(header);
                 if !activity.collapsed {
                     panel = panel.push(
-                        history_panel(run, palette)
+                        history_panel(run, chooser(), palette)
                             .map(move |message| Desktop::TerminalAgent(id, message)),
                     );
                 }
                 return panel.height(Length::Fill).into();
             }
-            let history =
-                history_panel(run, palette).map(move |message| Desktop::TerminalAgent(id, message));
+            let history = history_panel(run, chooser(), palette)
+                .map(move |message| Desktop::TerminalAgent(id, message));
             if run.design.arrangement != Arrangement::Normal
                 || !matches!(side, Slot::Left | Slot::Right)
             {
@@ -553,10 +591,40 @@ impl Workspace {
             // Both roles resolve to Java d02. Keep its single history presenter.
             None
         } else if adaptive_side {
-            let panel = adaptive_timeline(run.into(), status::phase(run).0, controls(run), palette);
+            let controls = column![chooser(), controls(run)].spacing(4).into();
+            let panel = adaptive_timeline(run.into(), status::phase(run).0, controls, palette);
             Some(panel.map(move |message| Desktop::TerminalAgent(id, message)))
         } else {
-            pane_status(id, run, status_kind, palette)
+            pane_status(id, run, status_kind, palette, now, reduced_motion).map(|status| {
+                let picker = if history_position.is_none() && !picture_in_picture {
+                    chooser().map(|picker| {
+                        picker.map(move |message| Desktop::TerminalAgent(id, message))
+                    })
+                } else {
+                    None
+                };
+                if let Some(picker) = picker {
+                    palette::panel(
+                        palette,
+                        container(column![status, picker].spacing(3)).padding(2),
+                    )
+                } else {
+                    status
+                }
+            })
+        };
+        let terminal = if run.design.arrangement == Arrangement::Adaptive {
+            status::adaptive_countdown(
+                terminal,
+                visibility
+                    .deadline(seconds)
+                    .map(|deadline| (deadline, seconds)),
+                now,
+                reduced_motion,
+                palette,
+            )
+        } else {
+            terminal
         };
         let rail = status_kind == Status::Minimap && history_position != Some(Slot::Right);
         let terminal = compose(

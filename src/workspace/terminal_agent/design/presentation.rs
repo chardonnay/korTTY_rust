@@ -3,11 +3,15 @@
 use std::cell::Cell;
 use std::time::{Duration, Instant};
 
+use crate::terminal_agent::design::inline::{Kind, StepState, Transcript};
+
 mod usage;
+
+pub(super) const TOAST_LIFETIME: Duration = Duration::from_secs(4);
 
 #[derive(Default)]
 pub(super) struct StatusVisibility {
-    finished_at: Option<Instant>,
+    pub(super) finished_at: Option<Instant>,
     manual: Option<bool>,
 }
 
@@ -33,11 +37,17 @@ impl StatusVisibility {
     pub(super) fn toggle(&mut self, seconds: u8, now: Instant) {
         self.manual = Some(!self.visible(seconds, now));
     }
+
+    pub(super) fn show(&mut self) {
+        self.manual = Some(true);
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Message {
     Select(usize),
+    SelectStep(u64),
+    ToggleStepList,
     Previous,
     Next,
     ToggleDrawer,
@@ -83,11 +93,23 @@ pub(in crate::workspace::terminal_agent) struct Presentation {
     pub(in crate::workspace::terminal_agent) drawer: bool,
     pub(super) dock: Cell<Dock>,
     pub(super) status_visibility: StatusVisibility,
+    pub(super) status_events: StatusEvents,
+    pub(super) selected_step: Option<u64>,
+    pub(super) step_list_open: bool,
 }
 
 impl Presentation {
     pub(in crate::workspace::terminal_agent) fn finished(&mut self, now: Instant) {
         self.status_visibility.finished(now);
+    }
+
+    pub(in crate::workspace::terminal_agent) fn sync_status(
+        &mut self,
+        transcript: &Transcript,
+        finished: bool,
+        now: Instant,
+    ) {
+        self.status_events.sync(transcript, finished, now);
     }
 
     pub(in crate::workspace::terminal_agent) fn load_activity(
@@ -143,6 +165,11 @@ impl Presentation {
                 self.selected = Some(identity);
                 self.drawer = true;
             }
+            Message::SelectStep(identity) => {
+                self.selected_step = Some(identity);
+                self.drawer = true;
+            }
+            Message::ToggleStepList => self.step_list_open = !self.step_list_open,
             Message::Previous if len > 0 => {
                 self.selected = Some(self.identity(self.selection(len).saturating_sub(1)));
             }
@@ -157,9 +184,95 @@ impl Presentation {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum Notice {
+    Step(u64),
+    Answer,
+}
+
+#[derive(Default)]
+pub(super) struct StatusEvents {
+    steps: Vec<(u64, Instant)>,
+    answer: Option<Instant>,
+}
+
+impl StatusEvents {
+    pub(super) fn sync(&mut self, transcript: &Transcript, finished: bool, now: Instant) {
+        self.steps
+            .retain(|(id, _)| transcript.steps.iter().any(|step| step.id == *id));
+        for step in &transcript.steps {
+            if step.state != StepState::Running
+                && step.kind != Kind::Question
+                && !self.steps.iter().any(|(id, _)| *id == step.id)
+            {
+                self.steps.push((step.id, now));
+            }
+        }
+        if finished && !transcript.final_answer.is_empty() {
+            self.answer.get_or_insert(now);
+        }
+    }
+
+    pub(super) fn recent(
+        &self,
+        now: Instant,
+    ) -> impl DoubleEndedIterator<Item = (Notice, Duration)> {
+        self.steps
+            .iter()
+            .map(|(id, at)| (Notice::Step(*id), *at))
+            .chain(self.answer.map(|at| (Notice::Answer, at)))
+            .filter_map(move |(event, at)| {
+                (at + TOAST_LIFETIME)
+                    .checked_duration_since(now)
+                    .filter(|remaining| !remaining.is_zero())
+                    .map(|remaining| (event, remaining))
+            })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal_agent::design::inline::Step;
+
+    #[test]
+    fn completed_steps_expire_without_reappearing_and_the_final_answer_has_its_own_deadline() {
+        let now = Instant::now();
+        let mut events = StatusEvents::default();
+        let mut trace = Transcript {
+            steps: vec![
+                Step {
+                    id: 1,
+                    kind: Kind::Action,
+                    state: StepState::Running,
+                    ..Step::default()
+                },
+                Step {
+                    id: 2,
+                    kind: Kind::Question,
+                    ..Step::default()
+                },
+            ],
+            ..Transcript::default()
+        };
+        events.sync(&trace, false, now);
+        assert!(events.recent(now).next().is_none());
+        trace.steps[0].state = StepState::Completed;
+        let completed = now + Duration::from_secs(1);
+        events.sync(&trace, false, completed);
+        assert!(matches!(
+            events.recent(completed).next(),
+            Some((Notice::Step(1), TOAST_LIFETIME))
+        ));
+        let expired = completed + TOAST_LIFETIME;
+        trace.final_answer = "Done".into();
+        events.sync(&trace, true, expired);
+        assert!(matches!(
+            events.recent(expired).collect::<Vec<_>>().as_slice(),
+            [(Notice::Answer, TOAST_LIFETIME)]
+        ));
+        assert!(events.recent(expired + TOAST_LIFETIME).next().is_none());
+    }
 
     #[test]
     fn status_hides_at_its_deadline_and_can_be_shown_until_the_next_run() {
