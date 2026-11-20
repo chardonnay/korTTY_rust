@@ -403,6 +403,11 @@ fn stage_import(
     let mut routes = BTreeMap::new();
     let mut memory_ids = BTreeMap::new();
     let mut profile_ids = existing_target_profiles(local, &imports, policy);
+    let existing_favorites: Vec<_> = profile_ids
+        .iter()
+        .filter(|(source, _)| imports.java_library.favorites.contains(*source))
+        .map(|(_, &id)| id)
+        .collect();
     let scheduler_sources = imports
         .entries
         .iter()
@@ -438,7 +443,7 @@ fn stage_import(
             ))
         })
         .collect();
-    let (candidate, outcome) = options::stage_with_java_library(
+    let (mut candidate, outcome) = options::stage_with_java_library(
         local,
         &imports.entries,
         &imports.local_entries,
@@ -483,9 +488,16 @@ fn stage_import(
             }
         },
     )?;
-    let contents = (outcome.imported > 0 || imports.java_groups.has_shared())
-        .then(|| options::encode(&candidate))
-        .transpose()?;
+    candidate
+        .library
+        .stage_java_favorites(BTreeSet::new(), existing_favorites);
+    let contents = (outcome.imported > 0
+        || imports.java_groups.has_shared()
+        || candidate
+            .library
+            .java_presentation_changed(&local.document.library))
+    .then(|| options::encode(&candidate))
+    .transpose()?;
     Ok(JavaConnectionImport {
         contents,
         routes,
@@ -587,7 +599,7 @@ fn existing_target_profiles(
     matches
 }
 
-fn unique_profile(mut ids: impl Iterator<Item = u64>) -> Option<u64> {
+pub(super) fn unique_profile(mut ids: impl Iterator<Item = u64>) -> Option<u64> {
     let first = ids.next()?;
     ids.next().is_none().then_some(first)
 }

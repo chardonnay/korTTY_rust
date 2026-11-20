@@ -8,6 +8,7 @@ use iced::widget::{checkbox, column, pick_list, text, text_input};
 use crate::knowledge_pdf as pdf;
 
 use crate::ai_manager::profiles::picker::DismissOnEscape as _;
+use crate::ai_manager::search::{KnowledgeSetting, Reveal, Setting};
 
 use super::knowledge::source::{
     FileSizeLimit, MAX_CONFIGURED_BYTES, NEW_SOURCE_DEFAULT, Options, SyncMode, validate_file_size,
@@ -78,7 +79,7 @@ impl Draft {
         Ok(options)
     }
 
-    pub(super) fn view(&self, enabled: bool) -> Element<'_, Edit> {
+    pub(super) fn view(&self, enabled: bool, reveal: &Reveal) -> Element<'_, Edit> {
         let legacy_size = !self.size_edited
             && self
                 .options
@@ -87,31 +88,32 @@ impl Draft {
         column![
             text("Folder scan options").size(16),
             enabled.then(|| {
-                pick_list(SyncMode::ALL, Some(self.options.sync), Edit::Sync).dismiss_on_escape()
+                reveal.wrap(Setting::Knowledge(KnowledgeSetting::FolderSync),
+                    pick_list(SyncMode::ALL, Some(self.options.sync), Edit::Sync).dismiss_on_escape())
             }),
             (self.options.sync == SyncMode::Automatic).then(|| text("Automatic sync checks new and changed files within these reviewed rules. Approve the embedding destination separately.").size(13)),
-            checkbox(self.options.recursive)
+            reveal.wrap(Setting::Knowledge(KnowledgeSetting::FolderRecursive), checkbox(self.options.recursive)
                 .label("Include subfolders")
-                .on_toggle_maybe(enabled.then_some(Edit::Recursive)),
-            checkbox(self.options.respect_gitignore)
+                .on_toggle_maybe(enabled.then_some(Edit::Recursive))),
+            reveal.wrap(Setting::Knowledge(KnowledgeSetting::FolderGitIgnore), checkbox(self.options.respect_gitignore)
                 .label("Respect the source root's .gitignore")
-                .on_toggle_maybe(enabled.then_some(Edit::GitIgnore)),
-            checkbox(self.options.include_pdf)
+                .on_toggle_maybe(enabled.then_some(Edit::GitIgnore))),
+            reveal.wrap(Setting::Knowledge(KnowledgeSetting::FolderPdf), checkbox(self.options.include_pdf)
                 .label("Include PDFs with a text layer")
-                .on_toggle_maybe(enabled.then_some(Edit::IncludePdf)),
+                .on_toggle_maybe(enabled.then_some(Edit::IncludePdf))),
             text(format!(
                 "Enter a per-file limit up to {} MiB. New sources default to {} MiB. A scan accepts up to {} MiB in total.",
                 MAX_CONFIGURED_BYTES / MIB as u64,
                 NEW_SOURCE_DEFAULT / MIB as u64,
                 pdf::MAX_FILE_BYTES / MIB,
             )).size(13),
-            text_input("Default for this source", &self.max_file_bytes)
-                .on_input_maybe(enabled.then_some(Edit::MaxFileBytes)),
+            reveal.knowledge_input(KnowledgeSetting::FolderFileLimit, enabled, text_input("Default for this source", &self.max_file_bytes)
+                .on_input_maybe(enabled.then_some(Edit::MaxFileBytes))),
             legacy_size.then(|| text("Re-enter a saved size to review it against the higher format limits.").size(13)),
-            text_input("Include globs separated by semicolons", &self.includes)
-                .on_input_maybe(enabled.then_some(Edit::Includes)),
-            text_input("Exclude globs separated by semicolons", &self.excludes)
-                .on_input_maybe(enabled.then_some(Edit::Excludes)),
+            reveal.knowledge_input(KnowledgeSetting::FolderIncludes, enabled, text_input("Include globs separated by semicolons", &self.includes)
+                .on_input_maybe(enabled.then_some(Edit::Includes))),
+            reveal.knowledge_input(KnowledgeSetting::FolderExcludes, enabled, text_input("Exclude globs separated by semicolons", &self.excludes)
+                .on_input_maybe(enabled.then_some(Edit::Excludes))),
             text("Use relative paths with /, * for one segment and ** for subfolders. Review the resulting file list before applying these options.").size(13),
         ]
         .spacing(6)

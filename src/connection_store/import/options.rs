@@ -332,6 +332,13 @@ pub(super) fn merge_java_backup(
             }
         })
         .collect();
+    let existing_favorites = existing_java_favorites(
+        &store,
+        &source.library.favorites,
+        &entries,
+        &local_entries,
+        &serial_entries,
+    );
     let ai_hints_changed = merge_java_ai_hints(&mut store.document, &entries, &mut local_entries);
     let mut favorites = BTreeSet::new();
     let (mut candidate, outcome) =
@@ -341,16 +348,86 @@ pub(super) fn merge_java_backup(
                 favorites.insert(allocated_id);
             }
         })?;
-    if outcome.imported == 0 && !ai_hints_changed {
-        return Ok(None);
-    }
-    candidate.library.favorites.extend(favorites);
+    candidate
+        .library
+        .stage_java_favorites(favorites, existing_favorites);
     install_java_colors(
         &store.document.library,
         &mut candidate.library,
         &source.library.group_colors,
+        source
+            .library
+            .java_group_colors
+            .iter()
+            .chain(&source.library.reviewed_java_group_colors),
     );
+    if outcome.imported == 0
+        && !ai_hints_changed
+        && !candidate
+            .library
+            .java_presentation_changed(&store.document.library)
+    {
+        return Ok(None);
+    }
     encode(&candidate).map(Some)
+}
+
+fn existing_java_favorites(
+    store: &Store,
+    source_favorites: &BTreeSet<u64>,
+    ssh: &[ImportedProfile],
+    shells: &[ImportedLocal],
+    serial: &[ImportedSerial],
+) -> BTreeSet<u64> {
+    use super::java_bindings::unique_profile;
+
+    let group = |id| store.group_of(id).unwrap_or_default();
+    let ssh = ssh.iter().filter_map(|entry| {
+        let proposed = &entry.connection;
+        if !source_favorites.contains(&proposed.id)
+            || !matches!(
+                proposed.login.auth,
+                Auth::Prompt | Auth::KeyboardInteractive
+            )
+            || proposed
+                .jump
+                .as_ref()
+                .is_some_and(|jump| !matches!(jump.auth, Auth::Prompt | Auth::KeyboardInteractive))
+        {
+            return None;
+        }
+        let mut comparison = proposed.clone();
+        unique_profile(store.connections().iter().filter_map(|saved| {
+            comparison.id = saved.id;
+            (group(saved.id) == entry.group
+                && *saved == comparison
+                && store.os_badge_id(saved.id) == entry.badge.as_deref()
+                && store.java_badge_hint(saved.id) == entry.java_badge.as_ref())
+            .then_some(saved.id)
+        }))
+    });
+    let shells = shells.iter().filter_map(|entry| {
+        if !source_favorites.contains(&entry.profile.id) {
+            return None;
+        }
+        let mut comparison = entry.profile.clone();
+        unique_profile(store.local_profiles().iter().filter_map(|saved| {
+            comparison.id = saved.id;
+            (group(saved.id) == entry.group && *saved == comparison).then_some(saved.id)
+        }))
+    });
+    let serial = serial.iter().filter_map(|entry| {
+        if !source_favorites.contains(&entry.profile.id) {
+            return None;
+        }
+        let mut comparison = entry.profile.clone();
+        unique_profile(store.serial_profiles().iter().filter_map(|saved| {
+            comparison.id = saved.id;
+            comparison.pinned = saved.pinned;
+            (group(saved.id) == entry.group && *saved == comparison).then_some(saved.id)
+        }))
+    });
+    ssh.chain(shells).chain(serial).collect()
 }
 
 fn merge_java_ai_hints(
@@ -489,23 +566,36 @@ pub(super) fn stage_with_java_library(
             }
             inserted(row);
         })?;
-    candidate.library.favorites.extend(favorites);
+    candidate.library.stage_java_favorites(favorites, []);
     install_java_colors(
         &store.document.library,
         &mut candidate.library,
         &settings.group_colors,
+        &settings.group_color_hints,
     );
     Ok((candidate, outcome))
 }
 
-fn install_java_colors(
+fn install_java_colors<'a>(
     original: &library::Library,
     candidate: &mut library::Library,
     colors: &std::collections::BTreeMap<String, super::super::TabColor>,
+    hints: impl IntoIterator<Item = &'a library::JavaGroupColor>,
 ) {
     for (path, color) in colors {
         if !original.groups.contains(path) && candidate.groups.contains(path) {
             candidate.group_colors.insert(path.clone(), *color);
+        }
+    }
+    for hint in hints {
+        if candidate.reviewed_java_group_colors.contains(hint) {
+            continue;
+        }
+        if candidate.group_colors.get(&hint.source) == Some(&hint.color) {
+            candidate.java_group_colors.remove(hint);
+            candidate.reviewed_java_group_colors.insert(hint.clone());
+        } else {
+            candidate.java_group_colors.insert(hint.clone());
         }
     }
 }

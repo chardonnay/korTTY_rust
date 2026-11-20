@@ -8,8 +8,8 @@ source and environment for earlier checks. Detailed logs under
 ## Current result and actionable backlog
 
 **Java v2.26.0 parity remains partial.** The comparison uses Java tag
-`v2.26.0` (`b235d91f2035`) and the Rust worktree based on merged PR #13
-(`ff850621`). Agent-to-Chat continuation, the Agent profile
+`v2.26.0` (`b235d91f2035`) and the Rust worktree based on merged PR #14
+(`89afebbc`). Agent-to-Chat continuation, the Agent profile
 role, Journal chat exports, command summaries, the snippet structure panel
 and Lua editor tools are implemented. AI Manager search reaches every page
 and a subset of individual controls. The [source comparison](PORTING-PARITY.md#november-19-java-release-source-comparison)
@@ -31,13 +31,13 @@ identifies the remaining interactions and the tested revisions.
 | Area | Remaining change | How to verify |
 | --- | --- | --- |
 | A2 · Terminal Agent | The current design and earlier-run selection paths are implemented. | Exercise the terminal context menu and the overlaid and detached run/step controls on native desktops. Switch runs, copy individual outputs, export one or all finished runs and open an unsaved step as a snippet. Check transitions with and without reduced motion. |
-| D4 · AI Manager search | Extend field-level navigation to the remaining controls in provider-specific forms and nested workflows. The search now reveals Knowledge Stores actions, signed runtime paths, memory controls, and skill library and editor controls. | Select a control by keyboard and mouse, verify its page, scroll position and highlight, and preserve editor-local Find in Skills and Memory. |
+| D4 · AI Manager search | The search reveals provider presets, CLI and MiniMax fields, reviewed HTTPS options, usage quota and cost, and the Web search controls exposed by the active provider and policy. The profile wizard searches its reachable steps using the same validation as Next. Runtime repair searches its signed-package fields and compatible release controls. Knowledge Store search follows the selected backend, source options and embedding mode. Memory and Skills also have field-level results. Extend coverage to other nested workflows. | Select a control by keyboard and mouse, verify its page, scroll position and highlight, and preserve editor-local Find in Skills and Memory. Exercise search from a partially completed wizard or repair and verify draft retention and cancellation. |
 | D2 · Connection folders | Drag writable SSH and serial rows to a local folder in the tree or sidebar. List and map share successive Undo. | Exercise native pointer gestures across the list, sidebar and map, reverse two saved moves and check read-only Teamwork entries. |
 | Q1 · Scheduler target picker | The job editor can filter saved SSH connections and groups by name, host or group path and apply a batch to one draft. | Exercise the picker on native desktops with an individual target, overlapping groups and a source-qualified Teamwork group. Verify search, reviewed order and cancellation. |
 | T2 · SFTP | The Local and Server panes review and clean up regular transfer parts in the displayed folder. Current-process stages are reserved during transfer and checked again before removal. | Exercise the confirmation and cancellation on native desktops. Verify protected deletion over a configured SSH route, including a replacement during review and a partial failure. |
 | D4 · Logfile Manager | Saved connections' existing log folders appear before their first logging session. Manual and logger-discovered origins are tracked independently. | Check deduplication when two connections share a folder, registration by the logger and forgetting a manually added folder. |
 | U1 · Update prompts | About offers a version-specific skip and a reminder on the next local day. Successful verified publication suppresses that version's automatic prompt. Startup and periodic prompts have separate repeat limits, and manual checks can still show the version. | Exercise the native About dialog and background notices across restart against a configured managed feed and an owner-published stable release. |
-| M1 · Portable data | Resolve ambiguous imported group references with explicit review. Java backup restore retains custom OS symbol metadata referenced by imported connections as a pending assignment. Extend adoption to definitions without a restored connection reference. | Verify the native symbol chooser with a missing PNG, a supplied image and a colliding local badge ID. Verify the reviewed assignment after restart. |
+| M1 · Portable data | Java folder colors with ambiguous or unmatched paths are available for explicit assignment in the folder color editor. Exact existing favorite profiles offer explicit review. Resolve remaining ambiguous group and profile references. Java backups retain custom OS symbol definitions for review in the symbol manager, including definitions without connection references. Imported connections retain pending assignments. | Exercise folder color and favorite review on native desktops. Exercise the symbol manager and connection picker with a missing PNG, a supplied image and a colliding local badge ID. Verify reviewed assignments after restart. |
 
 ### Implemented workflows awaiting acceptance and requested extensions
 
@@ -929,8 +929,9 @@ checkpoints.
    Verify native Skill Statistics interaction and cross-host restore of Java
    histories. Built-in usage and Java size measurements use separate history.
    Unmapped ledger entries retain their exact Java IDs in read-only reports.
-   Verify sparse window preferences, Java favorites for newly imported profiles
-   with unambiguous source IDs, and exact colors for newly imported groups.
+   Verify sparse window preferences, automatic Java favorites for newly
+   imported profiles with unambiguous source IDs, explicit favorite review for
+   exact existing profiles, and exact colors for newly imported groups.
    Review the remaining global settings and conflicts with existing profiles.
    Verify the implemented
    snippet/folder analysis history restore and review on native desktops.

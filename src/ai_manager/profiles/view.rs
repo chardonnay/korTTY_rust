@@ -252,7 +252,7 @@ impl Editor {
                 .policy_auto_problem()
                 .map(|problem| text(problem).size(13).wrapping(text::Wrapping::WordOrGlyph)),
             reveal.wrap(Setting::Profile(ProfileSetting::Default), is_default),
-            self.usage.recorded(profile, can_read_usage),
+            self.usage.recorded(profile, can_read_usage, reveal),
             form_lock.map(|notice| text(notice).size(13)),
             self.status.as_deref().map(|status| text(status).size(13)),
         ]
@@ -322,7 +322,7 @@ impl Editor {
             Section::Connection => column![
                 self.connection(profile, editable, reveal),
                 (!profile.is_cli() && !profile.restore_review)
-                    .then(|| self.web_search_view(profile, editable)),
+                    .then(|| self.web_search_view(profile, editable, reveal)),
             ]
             .spacing(10)
             .into(),
@@ -423,7 +423,7 @@ impl Editor {
         };
         let mode = field(reveal, ProfileSetting::Connection, mode);
         if profile.is_cli() {
-            return column![mode, self.cli_connection(profile, editable)]
+            return column![mode, self.cli_connection(profile, editable, reveal)]
                 .spacing(10)
                 .into();
         }
@@ -444,11 +444,12 @@ impl Editor {
             let credential_editable = editable && profile.trusted_remote_endpoint;
             let lm_studio = profile.connection_mode.uses_lm_studio_inventory();
             let loopback_messages = profile.connection_mode == ConnectionMode::LoopbackAnthropic;
-            let provider_picker = (editable
-                && !lm_studio
-                && !loopback_messages
-                && !profile.connection_mode.is_exact_https())
-            .then(|| cloud_provider_picker(profile));
+            let provider_picker = (editable && profile.has_cloud_provider_presets()).then(|| {
+                reveal.wrap(
+                    Setting::Profile(ProfileSetting::CloudProvider),
+                    cloud_provider_picker(profile),
+                )
+            });
             let placeholder = match profile.connection_mode {
                 ConnectionMode::LmStudio => "https://localhost:1234/api/v1/chat",
                 ConnectionMode::LmStudioCompatible => "https://localhost:1234/v1/chat/completions",
@@ -823,25 +824,25 @@ impl Editor {
                 choice(crate::local_ai::Tokenizer::ALL, profile.tokenizer, editable, Message::Tokenizer),
             )),
             (profile.remote_protocol().is_some() && profile.policy_definition().is_none()).then(||
-                checkbox(profile.permits_reviewed_agent_https())
+                reveal.wrap(Setting::Profile(ProfileSetting::ReviewedAgentHttps), checkbox(profile.permits_reviewed_agent_https())
                     .label(if profile.uses_server_default_model() {
                         "Allow reviewed Terminal Agent Ask and Run requests over HTTPS"
                     } else {
                         "Allow reviewed Agent, Swarm, and Scheduler requests over HTTPS"
                     })
-                    .on_toggle_maybe((editable && profile.trusted_remote_endpoint).then_some(Message::ReviewedAgentHttps))
+                    .on_toggle_maybe((editable && profile.trusted_remote_endpoint).then_some(Message::ReviewedAgentHttps)))
             ),
             profile.supports_reviewed_planning_https().then(||
-                checkbox(profile.permits_reviewed_planning_https())
+                reveal.wrap(Setting::Profile(ProfileSetting::ReviewedPlanningHttps), checkbox(profile.permits_reviewed_planning_https())
                     .label("Allow reviewed AI Planning requests over HTTPS")
-                    .on_toggle_maybe((editable && profile.trusted_remote_endpoint).then_some(Message::ReviewedPlanningHttps))
+                    .on_toggle_maybe((editable && profile.trusted_remote_endpoint).then_some(Message::ReviewedPlanningHttps)))
             ),
             text(if profile.is_cli() {
                 "CLI requests inherit the timeout set in General and have a 30-minute maximum. The fixed CLI test uses 30 seconds."
             } else {
                 "Profiles inherit the timeout set in General. An override of zero uses the transport’s default timeout."
             }).size(13),
-            (!profile.is_cli()).then(|| self.usage.view(profile, editable)),
+            (!profile.is_cli()).then(|| self.usage.view(profile, editable, reveal)),
         ]
         .spacing(10)
         .into()

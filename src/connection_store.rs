@@ -20,6 +20,7 @@ mod color;
 pub(crate) mod custom_os_badges;
 pub(crate) mod import;
 mod library;
+pub(crate) use library::JavaGroupColor;
 mod local;
 mod os_badge;
 mod terminal;
@@ -778,6 +779,10 @@ impl Store {
         self.document.library.group_colors.get(path).copied()
     }
 
+    pub(crate) fn java_group_colors(&self) -> &BTreeSet<JavaGroupColor> {
+        &self.document.library.java_group_colors
+    }
+
     pub(crate) fn inherited_group_color(&self, mut path: &str) -> Option<(&str, TabColor)> {
         loop {
             if let Some((source, color)) = self.document.library.group_colors.get_key_value(path) {
@@ -946,11 +951,16 @@ impl Store {
         let local = if local.is_empty() && !shared.is_empty() {
             BTreeSet::new()
         } else {
-            self.require_tagged_profiles(local)?
+            require_ids(local, |id| {
+                self.get(id).is_some() || self.serial(id).is_some() || self.local(id).is_some()
+            })?
         };
         let favorite = !local.is_subset(&self.document.library.favorites)
             || shared.iter().any(|id| !self.is_teamwork_favorite(id));
         let mut candidate = self.document.clone();
+        for id in &local {
+            candidate.library.review_java_favorite(*id);
+        }
         if favorite {
             candidate.library.favorites.extend(local);
         } else {
@@ -959,6 +969,23 @@ impl Store {
         candidate.library.teamwork_favorites.set(shared, favorite)?;
         self.commit(candidate)?;
         Ok(favorite)
+    }
+
+    pub(crate) fn has_java_favorite(&self, id: u64) -> bool {
+        self.document.library.java_favorites.contains(&id)
+    }
+
+    pub(crate) fn review_java_favorite(&mut self, id: u64, accept: bool) -> io::Result<()> {
+        let mut candidate = self.document.clone();
+        if !candidate.library.review_java_favorite(id) {
+            return Err(invalid(
+                "The imported Java favorite is no longer available.",
+            ));
+        }
+        if accept {
+            candidate.library.favorites.insert(id);
+        }
+        self.commit(candidate)
     }
 
     pub(crate) fn hide_teamwork(&mut self, entries: &[teamwork::HiddenEntry]) -> io::Result<()> {
@@ -1004,8 +1031,33 @@ impl Store {
         path: &str,
         color: Option<TabColor>,
     ) -> io::Result<()> {
+        self.save_group_color(path, color, None)
+    }
+
+    pub(crate) fn adopt_java_group_color(
+        &mut self,
+        path: &str,
+        hint: JavaGroupColor,
+    ) -> io::Result<()> {
+        self.save_group_color(path, Some(hint.color), Some(hint))
+    }
+
+    fn save_group_color(
+        &mut self,
+        path: &str,
+        color: Option<TabColor>,
+        hint: Option<JavaGroupColor>,
+    ) -> io::Result<()> {
         let mut candidate = self.document.clone();
         candidate.library.require_group(Some(path))?;
+        if let Some(hint) = hint {
+            if !candidate.library.java_group_colors.remove(&hint) {
+                return Err(invalid(
+                    "The imported Java folder color is no longer available.",
+                ));
+            }
+            candidate.library.reviewed_java_group_colors.insert(hint);
+        }
         if let Some(color) = color {
             candidate
                 .library

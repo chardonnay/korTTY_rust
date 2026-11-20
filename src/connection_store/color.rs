@@ -3,7 +3,7 @@ use std::fmt;
 use iced::Color;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(try_from = "String", into = "String")]
 pub(crate) struct TabColor(u8, u8, u8);
 

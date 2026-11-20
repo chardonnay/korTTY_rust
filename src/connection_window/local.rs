@@ -262,6 +262,7 @@ impl ConnectionWindow {
             .search_local(&self.query)
             .filter(|profile| match self.scope {
                 Scope::All => true,
+                Scope::Favorites => self.store.is_favorite(profile.id),
                 Scope::Open => self.open_count(profile.id) > 0,
                 _ => false,
             })

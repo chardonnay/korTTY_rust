@@ -652,7 +652,35 @@ pub(crate) enum Output {
 }
 
 impl Dialog {
-    pub(super) fn reveal_knowledge_index(&mut self, state: &State) {
+    pub(super) fn can_reveal_knowledge_setting(
+        &self,
+        state: &State,
+        setting: super::search::KnowledgeSetting,
+    ) -> bool {
+        use super::search::KnowledgeSetting::*;
+
+        let Some(store) = self
+            .selected
+            .and_then(|index| state.stores.get(index))
+            .or_else(|| state.stores.first())
+        else {
+            return false;
+        };
+        match setting {
+            QdrantEndpoint | QdrantCollection | QdrantDimensions | QdrantAuthentication => {
+                store.qdrant.is_some()
+            }
+            QdrantCredentialVariable => store
+                .qdrant
+                .as_ref()
+                .is_some_and(|settings| settings.vault_key.is_none()),
+            EmbeddingEndpoint | EmbeddingModel => state.embedding_fields(store).2.is_none(),
+            FolderSync => self.request.is_none(),
+            _ => true,
+        }
+    }
+
+    pub(super) fn reveal_knowledge_store(&mut self, state: &State) {
         if self
             .selected
             .is_none_or(|index| index >= state.stores.len())
@@ -706,6 +734,36 @@ impl Dialog {
 
     pub(super) fn backend_repair_open(&self) -> bool {
         self.backend_repair.is_some()
+    }
+
+    pub(super) fn can_reveal_runtime_control(
+        &self,
+        control: super::search::Control,
+        editable: bool,
+        ai_enabled: bool,
+    ) -> bool {
+        use super::search::Control::*;
+
+        let online_enabled = editable
+            && ai_enabled
+            && self.request.is_none()
+            && self.runtime_downloads_allowed
+            && self.runtime_removal.is_none();
+        let repair = self.backend_repair.as_ref();
+        match control {
+            CloseRuntimeRepair => repair.is_some(),
+            _ if repair.is_some_and(|repair| repair.installed) => false,
+            SignedIndex | IndexSignature | RuntimePackage | InstallRuntime => true,
+            CheckRuntimeOnline
+            | RuntimeOnlineChoice
+            | DownloadRuntimeOnline
+            | DiscardRuntimeDownload => self.online.has_search_control(
+                control,
+                online_enabled,
+                repair.map(|repair| repair.required),
+            ),
+            _ => repair.is_none(),
+        }
     }
 
     pub(super) fn runtime_removal_review_open(&self) -> bool {
@@ -2396,7 +2454,7 @@ impl Dialog {
             && let Some(repair) = &self.backend_repair
         {
             return column![
-                self.backend_repair_view(repair, can_edit, can_request),
+                self.backend_repair_view(repair, can_edit, can_request, reveal),
                 progress
             ]
             .spacing(10)
@@ -2497,12 +2555,13 @@ impl Dialog {
                 can_request && self.runtime_downloads_allowed && self.runtime_removal.is_none(),
                 can_edit,
                 None,
+                reveal,
             ),
             (!self.runtime_downloads_allowed)
                 .then(|| text(crate::clipboard_policy::AI_RUNTIME_DOWNLOADS_DISABLED).size(13)),
             text("Offline llama.cpp Runtime Package").size(17),
             text("Enter the absolute paths to the stable runtime index, its detached signature and the package ZIP.").size(13),
-            self.runtime_fields(can_edit, Some(reveal)),
+            self.runtime_fields(can_edit, reveal),
             row![
                 action(InstallRuntime, button("Install signed runtime").on_press_maybe(
                     (can_request && self.runtime_removal.is_none() && self.runtime_paths_ready())
@@ -2604,18 +2663,22 @@ impl Dialog {
         repair: &'a BackendRepair,
         can_edit: bool,
         can_request: bool,
+        reveal: &Reveal,
     ) -> Element<'a, Message> {
+        use super::search::{Control, Setting};
+
         let body: Element<'_, Message> = if repair.installed {
             text("The package was installed. Return to the model to Start or Test.").into()
         } else {
             column![
                 text("Choose the stable signed runtime index, its detached signature and the matching package ZIP using absolute paths.")
                     .wrapping(text::Wrapping::WordOrGlyph),
-                self.runtime_fields(can_request, None),
+                self.runtime_fields(can_request, reveal),
                 self.online.view(
                     can_request && self.runtime_downloads_allowed,
                     can_edit,
                     Some(repair.required),
+                    reveal,
                 ),
                 (!self.runtime_downloads_allowed)
                     .then(|| text(crate::clipboard_policy::AI_RUNTIME_DOWNLOADS_DISABLED).size(13)),
@@ -2623,6 +2686,25 @@ impl Dialog {
             .spacing(10)
             .into()
         };
+        let actions = row![
+            reveal.action(
+                Setting::Control(Control::CloseRuntimeRepair),
+                button(if repair.installed {
+                    "Return to model"
+                } else {
+                    "Cancel repair"
+                })
+                .style(button::secondary)
+                .on_press_maybe(can_edit.then_some(Message::CloseBackendRepair))
+            ),
+            (!repair.installed).then(|| reveal.action(
+                Setting::Control(Control::InstallRuntime),
+                button("Install matching signed runtime").on_press_maybe(
+                    (can_request && self.runtime_paths_ready()).then_some(Message::ImportRuntime),
+                )
+            )),
+        ]
+        .spacing(8);
         column![
             text("Install matching runtime").size(20),
             text(format!("Model: {}", repair.model_name)).wrapping(text::Wrapping::WordOrGlyph),
@@ -2630,29 +2712,17 @@ impl Dialog {
                 "Required signed package backend · {}",
                 repair.required
             )),
-            row![
-                button(if repair.installed {
-                    "Return to model"
-                } else {
-                    "Cancel repair"
-                })
-                .style(button::secondary)
-                .on_press_maybe(can_edit.then_some(Message::CloseBackendRepair)),
-                (!repair.installed).then(|| button("Install matching signed runtime")
-                    .on_press_maybe(
-                        (can_request && self.runtime_paths_ready())
-                            .then_some(Message::ImportRuntime),
-                    )),
-            ]
-            .spacing(8),
-            scrollable(body).height(Length::Fill),
+            actions,
+            scrollable(body)
+                .id(reveal.viewport.clone())
+                .height(Length::Fill),
         ]
         .spacing(10)
         .height(Length::Fill)
         .into()
     }
 
-    fn runtime_fields(&self, enabled: bool, reveal: Option<&Reveal>) -> Element<'_, Message> {
+    fn runtime_fields(&self, enabled: bool, reveal: &Reveal) -> Element<'_, Message> {
         use super::search::{Control, Setting};
         column(
             [
@@ -2682,11 +2752,7 @@ impl Dialog {
                     .on_input_maybe(
                         enabled.then_some(move |path| Message::RuntimePath(file, path)),
                     );
-                if let Some(reveal) = reveal {
-                    reveal.wrap(setting, field(label, reveal.input(setting, enabled, input)))
-                } else {
-                    field(label, input)
-                }
+                reveal.wrap(setting, field(label, reveal.input(setting, enabled, input)))
             }),
         )
         .spacing(8)
@@ -2703,7 +2769,7 @@ impl Dialog {
         reveal: &Reveal,
     ) -> Element<'a, Message> {
         use super::search::{KnowledgeSetting, Setting};
-        use KnowledgeSetting::{Create, Name, Rebuild, Update};
+        use KnowledgeSetting::*;
         let store_name = Setting::Knowledge(Name);
         let selected = self
             .selected
@@ -2933,24 +2999,24 @@ impl Dialog {
                 },
             );
             details = details.push(text(store.name.as_str()).size(19))
-                .push(self.knowledge_backend.view(store_index, store, can_review, vault_keys))
-                .push(text_input("Absolute path to a UTF-8 file, PDF, or folder", &self.source).on_input_maybe(can_review.then_some(Message::Source)))
+                .push(self.knowledge_backend.view(store_index, store, can_review, vault_keys, reveal))
+                .push(reveal.knowledge_input(SourcePath, can_review, text_input("Absolute path to a UTF-8 file, PDF, or folder", &self.source).on_input_maybe(can_review.then_some(Message::Source))))
                 .push(row![
-                    button("Add file").on_press_maybe(backend_valid.then_some(Message::AddSource)),
-                    button("Review folder…").on_press_maybe((can_review && backend_valid && !self.source.trim().is_empty()).then_some(Message::ReviewFolder)),
+                    reveal.action(Setting::Knowledge(AddFile), button("Add file").on_press_maybe(backend_valid.then_some(Message::AddSource))),
+                    reveal.action(Setting::Knowledge(ReviewFolder), button("Review folder…").on_press_maybe((can_review && backend_valid && !self.source.trim().is_empty()).then_some(Message::ReviewFolder))),
                 ].spacing(8).wrap())
-                .push(self.folder_options.view(can_review).map(Message::FolderOptions))
+                .push(self.folder_options.view(can_review, reveal).map(Message::FolderOptions))
                 .push(sources)
                 .push(folders)
                 .push(self.folder_review.as_deref().map(|review| folder_review_view(review, self.folder_review_page)))
-                .push(field("Embedding source", embedding_picker(
+                .push(reveal.wrap(Setting::Knowledge(EmbeddingSource), field("Embedding source", embedding_picker(
                     self.embedding_options(), managed, EmbeddingScope::Store, can_review,
-                )))
+                ))))
                 .push(managed.is_none().then(|| column![
-                    field("Local embedding endpoint", text_input("Numeric loopback address and port", endpoint)
-                        .on_input(|value| Message::ConfigureStore(EmbeddingField::Endpoint, value))),
-                    field("Embedding model", text_input("Installed embedding model", model)
-                        .on_input(|value| Message::ConfigureStore(EmbeddingField::Model, value))),
+                    field("Local embedding endpoint", reveal.knowledge_input(EmbeddingEndpoint, can_review, text_input("Numeric loopback address and port", endpoint)
+                        .on_input(|value| Message::ConfigureStore(EmbeddingField::Endpoint, value)))),
+                    field("Embedding model", reveal.knowledge_input(EmbeddingModel, can_review, text_input("Installed embedding model", model)
+                        .on_input(|value| Message::ConfigureStore(EmbeddingField::Model, value)))),
                 ].spacing(10)))
                 .push(store.embedding.is_none().then(|| text("This store inherits the default embedding settings until you select its own source.").size(13)))
                 .push(qdrant_destination.as_ref().map(|destination| {
@@ -3017,10 +3083,10 @@ impl Dialog {
                 ].spacing(8).wrap())
                 .push(text("Update reuses unchanged enabled files. Rebuild replaces enabled vectors and keeps disabled vectors that fit the embedding dimensions.").size(13))
                 .push(row![
-                    text_input("Test search", &self.query).on_input(Message::Query),
-                    button("Search").on_press_maybe(
+                    reveal.knowledge_input(TestQuery, can_review, text_input("Test search", &self.query).on_input(Message::Query)),
+                    reveal.action(Setting::Knowledge(TestSearch), button("Search").on_press_maybe(
                         (can_index && !self.query.trim().is_empty()).then_some(Message::Search),
-                    )
+                    ))
                 ].spacing(8));
             for hit in &self.hits {
                 details = details.push(text(hit.as_str()).wrapping(text::Wrapping::WordOrGlyph));

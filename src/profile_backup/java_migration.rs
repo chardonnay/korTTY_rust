@@ -12,6 +12,7 @@ use super::archive::java::{self, Member, MemberKind, Protection};
 use super::{Snapshot, archive, data, java_host_pins, java_scheduler};
 use crate::ai_manager::{backup as ai, java_knowledge, java_models};
 use crate::clipboard_policy::ClipboardPolicy;
+use crate::connection_store::custom_os_badges::java_catalog;
 use crate::connection_store::import::{JavaLibrarySettings, Preview as ConnectionPreview};
 use crate::recording_window::preferences as recording_preferences;
 use crate::session_journal::markers;
@@ -746,13 +747,30 @@ pub(super) fn convert(
         *settings = Zeroizing::new(bytes);
     }
 
-    if let Some(bytes) = connections {
-        if let Some(settings) = content("global-settings.xml") {
-            match JavaLibrarySettings::parse(settings) {
-                Ok(library) => report.connection_library = library,
-                Err(error) => report.omit("Java connection library settings", error),
+    if let Some(settings) = content("global-settings.xml") {
+        match JavaLibrarySettings::parse(settings) {
+            Ok(library) => {
+                let count = library.os_badges().len();
+                if count != 0 {
+                    let bytes = java_catalog::encode(library.os_badges().cloned())?;
+                    if archive::remaining_capacity(&snapshot)?(java_catalog::PATH, bytes.len()) {
+                        snapshot.insert(java_catalog::PATH.into(), Zeroizing::new(bytes));
+                        report.entries.push(format!(
+                            "Java OS symbol definitions awaiting a local image ({count})"
+                        ));
+                    } else {
+                        report.note_count(
+                            count,
+                            "Java OS symbol definitions exceeding the backup capacity omitted",
+                        );
+                    }
+                }
+                report.connection_library = library;
             }
+            Err(error) => report.omit("Java connection library settings", error),
         }
+    }
+    if let Some(bytes) = connections {
         match ConnectionPreview::java_backup(bytes).and_then(|preview| {
             let mut preview = preview.with_java_library(report.connection_library.clone());
             let sources = journal_profiles
@@ -790,15 +808,10 @@ pub(super) fn convert(
                 report
                     .entries
                     .push(format!("Connection profiles ({count})"));
-                let (favorites, colors) = report.connection_library.counts();
+                let (favorites, _) = report.connection_library.counts();
                 if favorites != 0 {
                     report.entries.push(format!(
-                        "Java favorites to match with newly added connections (up to {favorites})"
-                    ));
-                }
-                if colors != 0 {
-                    report.entries.push(format!(
-                        "Java group colors to match with newly added folders (up to {colors})"
+                        "Java favorites for new profiles or explicit review on exact saved matches (up to {favorites})"
                     ));
                 }
                 report.omissions.push("Connection profiles require local credentials or SSH keys where applicable. Review connection commands and paths before use.".into());
@@ -808,6 +821,18 @@ pub(super) fn convert(
                 .push("connections.xml: no supported profiles".into()),
             Err(error) => report.omit("connections.xml", error),
         }
+    }
+    let (_, colors) = report.connection_library.counts();
+    if colors != 0 {
+        if !snapshot.contains_key(CONNECTIONS) {
+            let (bytes, _) = ConnectionPreview::default()
+                .with_java_library(report.connection_library.clone())
+                .portable_java_backup()?;
+            snapshot.insert(CONNECTIONS.into(), Zeroizing::new(bytes));
+        }
+        report.entries.push(format!(
+            "Java folder colors for new folders or explicit review in Connection Manager ({colors})"
+        ));
     }
 
     let scheduler = content("job-scheduler.xml").and_then(|bytes| {
@@ -1235,6 +1260,7 @@ pub(super) fn merge_catalogue(
 ) -> io::Result<Option<Vec<u8>>> {
     match path {
         CONNECTIONS => ConnectionPreview::merge_java_backup(local, incoming, highlight_set_ids),
+        java_catalog::PATH => java_catalog::merge(local, incoming),
         snippets::FILE_NAME => snippets::merge_java_backup(local, incoming, allow_headers()),
         data::WINDOW_SETTINGS => {
             backup_data::merge_java_window_settings(local, incoming, highlight_set_ids)
@@ -1265,6 +1291,7 @@ pub(super) fn is_catalogue(path: &str) -> bool {
     matches!(
         path,
         CONNECTIONS
+            | java_catalog::PATH
             | snippets::FILE_NAME
             | data::WINDOW_SETTINGS
             | question_history::MANUAL_FILE

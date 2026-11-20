@@ -16,6 +16,153 @@ open until a result is recorded for the tested revision and environment. Both
 Mosh modes are out of scope. The editor has a reduced native scope with structure
 navigation for classes, functions, variables, and placeholders.
 
+## November 20 Knowledge Store field search
+
+AI Manager search reveals the selected store's vector backend, Qdrant
+fields, source path and folder scan options, embedding controls, and test
+query. Qdrant results require a Qdrant store. The credential variable is
+shown for the environment-variable authentication choice; a managed
+embedding source has no local endpoint or model inputs. A result keeps the
+selected store and its settings. Adding a source, reviewing a folder,
+building an index, and sending a test query require separate actions.
+Interactive desktop acceptance remains open.
+[Knowledge Store controls](src/ai_manager/local.rs)
+· [Backend fields](src/ai_manager/local/knowledge_backend.rs)
+
+Windows ARM64 passed 4,576 tests with 96 ignored. The fixture switched
+between a local store and a Qdrant store, focused the Qdrant endpoint,
+and verified that direct field reveals preserved settings and created no
+request. The existing index-action search test, Rustfmt, and strict
+Clippy also passed.
+[Workspace tests](target/verification/20261120-knowledge-setting-search-final-tests.log)
+· [Strict workspace Clippy](target/verification/20261120-knowledge-setting-search-final-clippy.log)
+
+## November 20 signed runtime repair search
+
+Local Models search can reveal signed runtime release checks, compatible
+package selection, downloads and download-discard review. In backend
+repair, the search is scoped to that repair. It reveals the offline
+index, signature and archive inputs and compatible release controls.
+It can also highlight the install or exit action. Selecting a result
+preserves the model, required backend and repair paths, and leaves the
+operation for the user to start. Escape or Close dismisses an active
+search before closing the repair. Interactive desktop acceptance remains
+open.
+[Runtime repair controls](src/ai_manager/local.rs)
+· [Runtime release controls](src/ai_manager/local/online.rs)
+
+Windows ARM64 passed 4,575 tests with 96 ignored. The runtime repair
+fixture verified scoped results, focus in the signature input, separate
+repair paths, a retained backend, and no request on reveal. Busy repair
+cancellation, Rustfmt, and strict Clippy also passed.
+[Workspace tests](target/verification/20261120-runtime-repair-search-tests.log)
+· [Strict workspace Clippy](target/verification/20261120-runtime-repair-search-clippy.log)
+
+## November 20 AI profile web settings search
+
+AI Manager search reveals the Web search provider, MCP plugin ID,
+Toolpack names, imported integration controls, and the SearXNG page
+reader settings. Results follow the selected profile, provider, reader
+enablement, and managed web-search policy. Editable fields receive
+keyboard focus. Revealing a result leaves the profile draft untouched
+and does not activate an imported integration or send a request.
+Interactive desktop acceptance remains open.
+[Web settings and controls](src/ai_manager/profiles/web.rs)
+· [AI Manager search](src/ai_manager/search.rs)
+
+Windows ARM64 passed 4,575 tests with 96 ignored. The new test checked
+SearXNG reader enablement, endpoint input focus, an unchanged draft, and
+blocked discovery and reveal after managed policy denies Web search.
+Rustfmt and strict workspace Clippy passed.
+[Workspace tests](target/verification/20261120-web-setting-search-tests.log)
+· [Strict workspace Clippy](target/verification/20261120-web-setting-search-clippy.log)
+
+## November 20 AI profile wizard search
+
+The profile wizard searches its own draft fields and actions. A result can
+reveal the current step, return to a preceding step, or advance through
+steps whose normal Next validation succeeds. The destination is rechecked
+when the result is activated. Selecting a result retains the draft and
+never starts the local scan or connection test. Escape or Close dismisses
+an active search first. The parent pages and Save stay blocked while the
+wizard is open. Interactive desktop acceptance remains open.
+[Wizard steps and validation](src/ai_manager/profiles/wizard.rs)
+· [AI Manager search routing](src/ai_manager.rs)
+
+Windows ARM64 passed 4,574 tests with 96 ignored. The new fixture
+verified forward validation, keyboard focus, draft retention and the
+absence of a connection request. The window and hosted-tab Escape check
+passed with the search field included in tab order. Rustfmt and strict
+workspace Clippy passed.
+[Workspace tests](target/verification/20261120-profile-wizard-search-final-tests.log)
+· [Strict workspace Clippy](target/verification/20261120-profile-wizard-search-final-clippy.log)
+
+## November 20 AI provider and profile field search
+
+AI Manager search can reveal and focus CLI executable, model and argument
+inputs, MiniMax module and configuration paths, and usage quota and cost
+inputs. It also reveals provider and command presets, executable review,
+MiniMax region, profile HTTPS permissions, and the usage refresh action.
+Results follow the profile's transport and available settings. Selecting a
+result navigates to its existing control. Actions such as reviewing an
+executable or refreshing recorded usage still require their own activation.
+Remaining nested workflows are tracked in the porting plan.
+[Java AI Manager search](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AiManagerDialog.java)
+· [Rust profile search](src/ai_manager/search.rs)
+
+Windows ARM64 passed 4,573 workspace tests with 96 ignored. A follow-up
+preserved connection-type matches for CLI queries and passed all five
+focused search tests, Rustfmt, and strict workspace Clippy. The keyboard
+fixture verified focus in CLI, MiniMax, and usage inputs.
+[Workspace tests](target/verification/20261120-ai-profile-field-search-tests.log)
+· [Focused search tests](target/verification/20261120-ai-profile-field-search-final-tests.log)
+· [Strict workspace Clippy](target/verification/20261120-ai-profile-field-search-final-clippy.log)
+
+## November 20 Java favorite review
+
+Java favorites with unambiguous source identities are added for newly
+imported profiles. For a unique exact saved match, the Connection Manager
+inspector offers **Add to Favorites** and **Dismiss**. The restore preserves
+the existing favorite state. An import replay preserves a dismissal or a
+later manual removal. A differing saved configuration remains outside the
+automatic match.
+
+Saved local shell favorites now appear in the **Favorites** scope and can
+be toggled in the inspector. Native desktop acceptance remains open.
+[Connection restore](src/connection_store/import/options.rs)
+· [Favorite review](src/connection_window/view.rs)
+
+Windows ARM64 passed 4,573 tests with 96 ignored. The encrypted restore
+fixture covered exact and differing saved profiles, confirmation, dismissal,
+manual removal, restore replay, and the local shell Favorites scope.
+Rustfmt and strict workspace Clippy passed.
+[Workspace tests](target/verification/20261120-java-favorites-tests.log)
+· [Strict workspace Clippy](target/verification/20261120-java-favorites-clippy.log)
+
+## November 20 Java folder color review
+
+Java folder colors transfer automatically to newly imported folders with a
+single resolved color. Existing folder colors are preserved at restore.
+Conflicting colors for one normalized path and colors without a matching
+folder remain available as suggestions, including from backups with
+global settings alone.
+
+Select a native folder in Connection Manager and open **Tab Color…**.
+Choose the imported path and color to preview the result for that folder,
+then confirm with **OK**. The review can assign a color to a renamed folder.
+Cancelling leaves the previous color and the suggestion available. Replaying
+the archive preserves a reviewed assignment and avoids reintroducing its
+suggestion. Native desktop acceptance remains open.
+[Java group settings](src/connection_store/import/java_library.rs)
+· [Native color dialog](src/connection_window/view.rs)
+
+Windows ARM64 passed 4,573 tests with 96 ignored. The restore fixtures
+covered settings-only archives, conflicting colors, cancelling a review,
+confirming a different destination, and settings preserved after replay.
+Rustfmt and strict workspace Clippy passed.
+[Workspace tests](target/verification/20261120-java-group-colors-tests.log)
+· [Strict workspace Clippy](target/verification/20261120-java-group-colors-clippy.log)
+
 ## November 20 Java OS symbol assignments
 
 Java backups contain custom symbol IDs, names and original image filenames.
@@ -42,8 +189,23 @@ workspace Clippy passed.
 [Workspace tests](target/verification/20261120-java-os-badges-tests.log)
 · [Strict workspace Clippy](target/verification/20261120-java-os-badges-clippy.log)
 
-Review of unused source definitions and interactive desktop acceptance
-remain open.
+The symbol manager also lists validated Java definitions from backups that
+contain global settings alone. **Choose image…** opens a blank local picker,
+then prefills the display name for confirmation. The new symbol receives a
+native ID and can be assigned in the connection picker. Replaying a backup
+preserves a completed adoption. Definitions from separate archives with the
+same Java ID and different metadata remain available for separate review.
+Native profile backups carry the definition metadata. On a different host,
+the image can be selected again. Interactive desktop acceptance remains open.
+[Symbol manager](src/workspace/os_badge_manager.rs)
+· [Java restore](src/profile_backup/java_migration.rs)
+
+The Windows ARM64 suite passed 4,572 tests with 96 ignored. The new tests
+covered settings-only encrypted archives, repeated restores, collisions,
+portable metadata and the explicit image picker. Strict workspace Clippy
+passed.
+[Workspace tests](target/verification/20261120-java-os-symbol-catalog-final-tests.log)
+· [Strict workspace Clippy](target/verification/20261120-java-os-symbol-catalog-final-clippy.log)
 
 ## November 20 SFTP transfer part cleanup
 

@@ -38,6 +38,8 @@ pub(crate) enum Setting {
     AgentConfirmation,
     ShowAgentSetup,
     JournalSemanticSearch,
+    WizardScan,
+    WizardTest,
     Profile(ProfileSetting),
     Role(Role),
     Embedding,
@@ -57,7 +59,7 @@ impl Setting {
             | Self::AgentConfirmation
             | Self::ShowAgentSetup
             | Self::JournalSemanticSearch => Page::General,
-            Self::Profile(_) => Page::Profiles,
+            Self::Profile(_) | Self::WizardScan | Self::WizardTest => Page::Profiles,
             Self::Role(_) | Self::Embedding => Page::LocalPreferences,
             Self::Knowledge(_) => Page::Knowledge,
             Self::Control(control) => control.page(),
@@ -75,6 +77,8 @@ impl Setting {
             Self::AgentConfirmation => "Require approval for mutating Agent command sets",
             Self::ShowAgentSetup => "Show terminal agent setup for submitted aliases",
             Self::JournalSemanticSearch => "Use local semantic ranking for journal questions",
+            Self::WizardScan => "Find local model servers",
+            Self::WizardTest => "Test profile connection",
             Self::Profile(setting) => setting.title(),
             Self::Role(role) => role.label(),
             Self::Embedding => "Default embedding model",
@@ -96,6 +100,8 @@ impl Setting {
             }
             Self::ShowAgentSetup => "run dialog ask skip bypass startup prompt confirmation",
             Self::JournalSemanticSearch => "journal semantic search embedding lexical ranking BM25",
+            Self::WizardScan => "scan discover loopback LM Studio Ollama",
+            Self::WizardTest => "run fixed CLI test verify provider",
             Self::Profile(setting) => setting.keywords(),
             Self::Role(Role::Text) => "translation profile roles",
             Self::Role(_) => "profile roles",
@@ -106,6 +112,12 @@ impl Setting {
             Self::Knowledge(KnowledgeSetting::Update | KnowledgeSetting::Rebuild) => {
                 "index refresh embedding vectors rag"
             }
+            Self::Knowledge(KnowledgeSetting::QdrantAuthentication) => "vault API key credential",
+            Self::Knowledge(KnowledgeSetting::QdrantCredentialVariable) => "environment credential",
+            Self::Knowledge(KnowledgeSetting::TestQuery | KnowledgeSetting::TestSearch) => {
+                "retrieval"
+            }
+            Self::Knowledge(_) => "",
             Self::Control(_) => "",
         }
     }
@@ -122,6 +134,11 @@ pub(crate) enum Control {
     IndexSignature,
     RuntimePackage,
     InstallRuntime,
+    CheckRuntimeOnline,
+    RuntimeOnlineChoice,
+    DownloadRuntimeOnline,
+    DiscardRuntimeDownload,
+    CloseRuntimeRepair,
     RemoveRuntime,
     MemoryEnabled,
     Learning,
@@ -156,7 +173,7 @@ pub(crate) enum Control {
 }
 
 impl Control {
-    const ALL: [Self; 40] = [
+    const ALL: [Self; 45] = [
         Self::LocalSetup,
         Self::LocalEndpoint,
         Self::RefreshModels,
@@ -166,6 +183,11 @@ impl Control {
         Self::IndexSignature,
         Self::RuntimePackage,
         Self::InstallRuntime,
+        Self::CheckRuntimeOnline,
+        Self::RuntimeOnlineChoice,
+        Self::DownloadRuntimeOnline,
+        Self::DiscardRuntimeDownload,
+        Self::CloseRuntimeRepair,
         Self::RemoveRuntime,
         Self::MemoryEnabled,
         Self::Learning,
@@ -210,6 +232,11 @@ impl Control {
             | Self::IndexSignature
             | Self::RuntimePackage
             | Self::InstallRuntime
+            | Self::CheckRuntimeOnline
+            | Self::RuntimeOnlineChoice
+            | Self::DownloadRuntimeOnline
+            | Self::DiscardRuntimeDownload
+            | Self::CloseRuntimeRepair
             | Self::RemoveRuntime => Page::LocalModels,
             Self::MemoryEnabled
             | Self::Learning
@@ -268,6 +295,11 @@ impl Control {
             Self::IndexSignature => "Index signature",
             Self::RuntimePackage => "Runtime package",
             Self::InstallRuntime => "Install signed runtime",
+            Self::CheckRuntimeOnline => "Check signed runtime updates",
+            Self::RuntimeOnlineChoice => "Choose a verified runtime package",
+            Self::DownloadRuntimeOnline => "Download or resume selected runtime",
+            Self::DiscardRuntimeDownload => "Discard saved runtime download",
+            Self::CloseRuntimeRepair => "Cancel repair or return to model",
             Self::RemoveRuntime => "Remove installed runtime",
             Self::MemoryEnabled => "Enable AI memory",
             Self::Learning => "Learning",
@@ -309,10 +341,57 @@ pub(crate) enum KnowledgeSetting {
     Create,
     Update,
     Rebuild,
+    VectorStorage,
+    QdrantEndpoint,
+    QdrantCollection,
+    QdrantDimensions,
+    QdrantAuthentication,
+    QdrantCredentialVariable,
+    SourcePath,
+    AddFile,
+    ReviewFolder,
+    FolderSync,
+    FolderRecursive,
+    FolderGitIgnore,
+    FolderPdf,
+    FolderFileLimit,
+    FolderIncludes,
+    FolderExcludes,
+    EmbeddingSource,
+    EmbeddingEndpoint,
+    EmbeddingModel,
+    TestQuery,
+    TestSearch,
 }
 
 impl KnowledgeSetting {
-    const ALL: [Self; 4] = [Self::Name, Self::Create, Self::Update, Self::Rebuild];
+    const ALL: [Self; 25] = [
+        Self::Name,
+        Self::Create,
+        Self::Update,
+        Self::Rebuild,
+        Self::VectorStorage,
+        Self::QdrantEndpoint,
+        Self::QdrantCollection,
+        Self::QdrantDimensions,
+        Self::QdrantAuthentication,
+        Self::QdrantCredentialVariable,
+        Self::SourcePath,
+        Self::AddFile,
+        Self::ReviewFolder,
+        Self::FolderSync,
+        Self::FolderRecursive,
+        Self::FolderGitIgnore,
+        Self::FolderPdf,
+        Self::FolderFileLimit,
+        Self::FolderIncludes,
+        Self::FolderExcludes,
+        Self::EmbeddingSource,
+        Self::EmbeddingEndpoint,
+        Self::EmbeddingModel,
+        Self::TestQuery,
+        Self::TestSearch,
+    ];
 
     fn title(self) -> &'static str {
         match self {
@@ -320,11 +399,32 @@ impl KnowledgeSetting {
             Self::Create => "Create store",
             Self::Update => "Update index",
             Self::Rebuild => "Rebuild index",
+            Self::VectorStorage => "Vector storage backend",
+            Self::QdrantEndpoint => "Qdrant endpoint",
+            Self::QdrantCollection => "Qdrant collection",
+            Self::QdrantDimensions => "Qdrant embedding dimensions",
+            Self::QdrantAuthentication => "Qdrant authentication",
+            Self::QdrantCredentialVariable => "Qdrant API key variable",
+            Self::SourcePath => "Source file or folder path",
+            Self::AddFile => "Add source file",
+            Self::ReviewFolder => "Review source folder",
+            Self::FolderSync => "Folder sync mode",
+            Self::FolderRecursive => "Include subfolders",
+            Self::FolderGitIgnore => "Respect .gitignore",
+            Self::FolderPdf => "Include PDFs with a text layer",
+            Self::FolderFileLimit => "Folder per-file size limit",
+            Self::FolderIncludes => "Folder include globs",
+            Self::FolderExcludes => "Folder exclude globs",
+            Self::EmbeddingSource => "Embedding source",
+            Self::EmbeddingEndpoint => "Local embedding endpoint",
+            Self::EmbeddingModel => "Embedding model",
+            Self::TestQuery => "Test search query",
+            Self::TestSearch => "Run knowledge search",
         }
     }
 
     pub(super) fn needs_store(self) -> bool {
-        matches!(self, Self::Update | Self::Rebuild)
+        !matches!(self, Self::Name | Self::Create)
     }
 }
 
@@ -333,6 +433,18 @@ pub(crate) enum ProfileSetting {
     Name,
     Default,
     Connection,
+    CloudProvider,
+    CliProvider,
+    CliExecutable,
+    CliModel,
+    CliPresets,
+    CliArguments,
+    CliAddArgument,
+    CliReasoning,
+    CliReview,
+    MiniMaxModule,
+    MiniMaxConfig,
+    MiniMaxRegion,
     Endpoint,
     Trust,
     Credential,
@@ -347,12 +459,68 @@ pub(crate) enum ProfileSetting {
     Timeout,
     OutputLimit,
     Tokenizer,
+    ReviewedAgentHttps,
+    ReviewedPlanningHttps,
+    Usage(profiles::UsageField),
+    RecordedUsage,
+    Web(WebSetting),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WebSetting {
+    Provider,
+    Plugin,
+    ToolpackNames,
+    ImportedToolpackNames,
+    UseImported,
+    SearxngPages,
+    SearxngEndpoint,
+    SearxngBearerEnv,
+}
+
+impl WebSetting {
+    pub(super) fn title(self) -> &'static str {
+        match self {
+            Self::Provider => "Web search provider",
+            Self::Plugin => "Installed MCP plugin ID",
+            Self::ToolpackNames => "Allowed Toolpack names",
+            Self::ImportedToolpackNames => "Imported Toolpack names",
+            Self::UseImported => "Use imported web integration",
+            Self::SearxngPages => "Read webpages through SearXNG MCP",
+            Self::SearxngEndpoint => "SearXNG MCP endpoint URL",
+            Self::SearxngBearerEnv => "SearXNG bearer token environment variable",
+        }
+    }
+
+    fn keywords(self) -> &'static str {
+        match self {
+            Self::Provider => "internet Tavily direct",
+            Self::Plugin => "LM Studio MCP server name",
+            Self::ToolpackNames | Self::ImportedToolpackNames => "allowed tools plugin",
+            Self::UseImported => "Java backup review Toolpack",
+            Self::SearxngPages => "page extraction webpage reader",
+            Self::SearxngEndpoint => "page URL web_url_read",
+            Self::SearxngBearerEnv => "optional credential variable",
+        }
+    }
 }
 
 impl ProfileSetting {
-    const ALL: [Self; 17] = [
+    pub(super) const ALL: &[Self] = &[
         Self::Name,
         Self::Default,
+        Self::CloudProvider,
+        Self::CliProvider,
+        Self::CliExecutable,
+        Self::CliModel,
+        Self::CliPresets,
+        Self::CliArguments,
+        Self::CliAddArgument,
+        Self::CliReasoning,
+        Self::CliReview,
+        Self::MiniMaxModule,
+        Self::MiniMaxConfig,
+        Self::MiniMaxRegion,
         Self::Connection,
         Self::Endpoint,
         Self::Trust,
@@ -368,6 +536,24 @@ impl ProfileSetting {
         Self::Timeout,
         Self::OutputLimit,
         Self::Tokenizer,
+        Self::ReviewedAgentHttps,
+        Self::ReviewedPlanningHttps,
+        Self::Usage(profiles::UsageField::Limit),
+        Self::Usage(profiles::UsageField::Days),
+        Self::Usage(profiles::UsageField::Yellow),
+        Self::Usage(profiles::UsageField::Red),
+        Self::Usage(profiles::UsageField::InputPrice),
+        Self::Usage(profiles::UsageField::OutputPrice),
+        Self::Usage(profiles::UsageField::Currency),
+        Self::RecordedUsage,
+        Self::Web(WebSetting::Provider),
+        Self::Web(WebSetting::Plugin),
+        Self::Web(WebSetting::ToolpackNames),
+        Self::Web(WebSetting::ImportedToolpackNames),
+        Self::Web(WebSetting::UseImported),
+        Self::Web(WebSetting::SearxngPages),
+        Self::Web(WebSetting::SearxngEndpoint),
+        Self::Web(WebSetting::SearxngBearerEnv),
     ];
 
     pub(super) fn section(self) -> profiles::Section {
@@ -377,7 +563,20 @@ impl ProfileSetting {
             | Self::Connection
             | Self::Endpoint
             | Self::Trust
-            | Self::Credential => profiles::Section::Connection,
+            | Self::Credential
+            | Self::CloudProvider
+            | Self::CliProvider
+            | Self::CliExecutable
+            | Self::CliModel
+            | Self::CliPresets
+            | Self::CliArguments
+            | Self::CliAddArgument
+            | Self::CliReasoning
+            | Self::CliReview
+            | Self::MiniMaxModule
+            | Self::MiniMaxConfig
+            | Self::MiniMaxRegion
+            | Self::Web(_) => profiles::Section::Connection,
             Self::ModelMode
             | Self::Model
             | Self::AvailableModels
@@ -385,9 +584,14 @@ impl ProfileSetting {
             | Self::Reasoning
             | Self::Vision
             | Self::PromptPreset => profiles::Section::Model,
-            Self::SelectionLimit | Self::Timeout | Self::OutputLimit | Self::Tokenizer => {
-                profiles::Section::Limits
-            }
+            Self::SelectionLimit
+            | Self::Timeout
+            | Self::OutputLimit
+            | Self::Tokenizer
+            | Self::ReviewedAgentHttps
+            | Self::ReviewedPlanningHttps
+            | Self::Usage(_)
+            | Self::RecordedUsage => profiles::Section::Limits,
         }
     }
 
@@ -396,6 +600,18 @@ impl ProfileSetting {
             Self::Name => "Profile name",
             Self::Default => "Use as default profile",
             Self::Connection => "Connection type",
+            Self::CloudProvider => "Cloud provider preset",
+            Self::CliProvider => "CLI provider",
+            Self::CliExecutable => "CLI executable path",
+            Self::CliModel => "CLI model identifier",
+            Self::CliPresets => "CLI command presets",
+            Self::CliArguments => "CLI arguments",
+            Self::CliAddArgument => "Add a CLI argument",
+            Self::CliReasoning => "CLI reasoning effort",
+            Self::CliReview => "Review CLI executable and arguments",
+            Self::MiniMaxModule => "MiniMax CLI module path",
+            Self::MiniMaxConfig => "MiniMax CLI config path",
+            Self::MiniMaxRegion => "MiniMax CLI region",
             Self::Endpoint => "API endpoint",
             Self::Trust => "Endpoint trust",
             Self::Credential => "API key variable",
@@ -410,14 +626,27 @@ impl ProfileSetting {
             Self::Timeout => "Profile timeout (min)",
             Self::OutputLimit => "Max. output tokens",
             Self::Tokenizer => "Forecast tokenizer",
+            Self::ReviewedAgentHttps => "Allow reviewed Agent requests over HTTPS",
+            Self::ReviewedPlanningHttps => "Allow reviewed AI Planning requests over HTTPS",
+            Self::Usage(field) => field.label(),
+            Self::RecordedUsage => "Refresh recorded usage",
+            Self::Web(setting) => setting.title(),
         }
     }
 
     fn keywords(self) -> &'static str {
         match self {
-            Self::Connection => "provider HTTP llama.cpp CLI executable arguments stdin",
+            Self::Connection => "provider HTTP llama.cpp CLI transport",
+            Self::CloudProvider => {
+                "OpenAI Anthropic Gemini Mistral DeepSeek Groq OpenRouter MiniMax"
+            }
+            Self::CliExecutable => "Node.js command binary program",
+            Self::CliPresets => "LM Studio Codex MiniMax stdin loaded model",
+            Self::MiniMaxModule => "dist/mmx.mjs package",
+            Self::MiniMaxConfig => "config.json OAuth login",
+            Self::CliReview => "approve command",
             Self::Endpoint => {
-                "URL connection cloud provider preset OpenAI Anthropic Gemini Mistral DeepSeek Groq OpenRouter MiniMax"
+                "URL connection OpenAI Anthropic Gemini Mistral DeepSeek Groq OpenRouter MiniMax"
             }
             Self::Trust => "trusted local endpoint",
             Self::Credential => "credential environment connection",
@@ -428,12 +657,16 @@ impl ProfileSetting {
                 "model family Llama Qwen Mistral Mixtral Gemma DeepSeek Phi GPT-OSS"
             }
             Self::SelectionLimit | Self::Timeout | Self::OutputLimit => "limits timeouts",
-            Self::Tokenizer => "token count quota estimate CL100K O200K P50K R50K",
+            Self::Tokenizer => "token count estimate CL100K O200K P50K R50K",
+            Self::ReviewedAgentHttps => "Terminal Agent Ask Run Swarm Scheduler permission",
+            Self::ReviewedPlanningHttps => "plan request permission",
+            Self::Usage(_) | Self::RecordedUsage => "token budget cost quota",
+            Self::Web(setting) => setting.keywords(),
             _ => "",
         }
     }
 
-    fn visible(self, profile: &profiles::Profile) -> bool {
+    pub(super) fn visible(self, profile: &profiles::Profile) -> bool {
         if profile.policy_definition().is_some() {
             return matches!(
                 self,
@@ -443,6 +676,7 @@ impl ProfileSetting {
                     | Self::Credential
                     | Self::Model
                     | Self::Default
+                    | Self::RecordedUsage
             ) || (self == Self::AvailableModels
                 && !profile.is_managed()
                 && profile.policy_auto_candidate().is_none()
@@ -456,7 +690,7 @@ impl ProfileSetting {
                     | Self::SelectionLimit
                     | Self::Timeout
                     | Self::PromptPreset
-            );
+            ) || profile.searchable_cli_setting(self);
         }
         match self {
             Self::Endpoint
@@ -469,6 +703,21 @@ impl ProfileSetting {
                 !profile.is_managed() && profile.model_mode == profiles::ModelMode::Manual
             }
             Self::ManagedModel => profile.is_managed(),
+            Self::CloudProvider => profile.has_cloud_provider_presets(),
+            Self::ReviewedAgentHttps => profile.remote_protocol().is_some(),
+            Self::ReviewedPlanningHttps => profile.supports_reviewed_planning_https(),
+            Self::Web(setting) => profile.searchable_web_setting(setting),
+            Self::CliProvider
+            | Self::CliExecutable
+            | Self::CliModel
+            | Self::CliPresets
+            | Self::CliArguments
+            | Self::CliAddArgument
+            | Self::CliReasoning
+            | Self::CliReview
+            | Self::MiniMaxModule
+            | Self::MiniMaxConfig
+            | Self::MiniMaxRegion => false,
             _ => true,
         }
     }
@@ -478,8 +727,7 @@ pub(super) fn results<'a>(
     query: &'a str,
     profile: Option<&'a profiles::Profile>,
 ) -> impl Iterator<Item = Target> + 'a {
-    let query = query.trim().to_lowercase();
-    [
+    let targets = [
         Setting::Features,
         Setting::JournalSemanticSearch,
         Setting::GlobalTimeout,
@@ -493,7 +741,8 @@ pub(super) fn results<'a>(
     .into_iter()
     .chain(
         ProfileSetting::ALL
-            .into_iter()
+            .iter()
+            .copied()
             .filter(move |setting| profile.is_some_and(|profile| setting.visible(profile)))
             .map(Setting::Profile),
     )
@@ -502,8 +751,16 @@ pub(super) fn results<'a>(
     .chain(KnowledgeSetting::ALL.into_iter().map(Setting::Knowledge))
     .chain(Control::ALL.into_iter().map(Setting::Control))
     .map(Target::Setting)
-    .chain(Page::ALL.into_iter().map(Target::Page))
-    .filter(move |target| {
+    .chain(Page::ALL.into_iter().map(Target::Page));
+    matching(query, targets)
+}
+
+pub(super) fn matching(
+    query: &str,
+    targets: impl Iterator<Item = Target>,
+) -> impl Iterator<Item = Target> {
+    let query = query.trim().to_lowercase();
+    targets.filter(move |target| {
         let terms = match target {
             Target::Page(page) => page.keywords(),
             Target::Setting(setting) => setting.keywords(),
@@ -532,6 +789,16 @@ impl Default for Reveal {
 }
 
 impl Reveal {
+    pub(super) fn knowledge_input<'a, Message: Clone + 'a>(
+        &self,
+        setting: KnowledgeSetting,
+        editable: bool,
+        input: iced::widget::TextInput<'a, Message>,
+    ) -> Element<'a, Message> {
+        let setting = Setting::Knowledge(setting);
+        self.wrap(setting, self.input(setting, editable, input))
+    }
+
     pub(super) fn wrap<'a, Message: 'a>(
         &self,
         setting: Setting,
@@ -634,13 +901,34 @@ mod tests {
         let endpoint = Target::Setting(Setting::Profile(ProfileSetting::Endpoint));
         let model = Target::Setting(Setting::Profile(ProfileSetting::ManagedModel));
         let preset = Target::Setting(Setting::Profile(ProfileSetting::PromptPreset));
+        let provider = Target::Setting(Setting::Profile(ProfileSetting::CloudProvider));
+        let executable = Target::Setting(Setting::Profile(ProfileSetting::CliExecutable));
+        let connection_type = Target::Setting(Setting::Profile(ProfileSetting::Connection));
+        let quota = Target::Setting(Setting::Profile(ProfileSetting::Usage(
+            profiles::UsageField::Limit,
+        )));
         assert!(results("API ENDPOINT", Some(&profile)).any(|target| target == endpoint));
+        assert_eq!(
+            results("CLI connection type", Some(&profile)).next(),
+            Some(connection_type)
+        );
+        assert_eq!(results("token quota", Some(&profile)).next(), Some(quota));
+        assert!(!results("cloud provider", Some(&profile)).any(|target| target == provider));
+        profile.connection_mode = profiles::ConnectionMode::RemoteOpenAi;
+        assert_eq!(
+            results("cloud provider", Some(&profile)).next(),
+            Some(provider)
+        );
+        profile.connection_mode = profiles::ConnectionMode::RemoteOpenAiExact;
+        assert!(!results("cloud provider", Some(&profile)).any(|target| target == provider));
         profile.connection_mode = profiles::ConnectionMode::Managed;
         assert!(!results("API ENDPOINT", Some(&profile)).any(|target| target == endpoint));
         assert!(results("GGUF model", Some(&profile)).any(|target| target == model));
         assert!(results("Qwen prompt", Some(&profile)).any(|target| target == preset));
         profile.connection_mode = profiles::ConnectionMode::Cli;
         assert!(results("Qwen prompt", Some(&profile)).any(|target| target == preset));
+        assert!(!results("token quota", Some(&profile)).any(|target| target == quota));
+        assert!(!results("cli executable path", Some(&profile)).any(|target| target == executable));
         assert!(
             results("Hugging Face", None).any(|target| target == Target::Page(Page::LocalModels))
         );
@@ -822,7 +1110,29 @@ mod tests {
                 "api key variable",
                 Setting::Profile(ProfileSetting::Credential),
             ),
+            (
+                "reset period in days",
+                Setting::Profile(ProfileSetting::Usage(profiles::UsageField::Days)),
+            ),
+            (
+                "cli executable path",
+                Setting::Profile(ProfileSetting::CliExecutable),
+            ),
+            (
+                "minimax cli config path",
+                Setting::Profile(ProfileSetting::MiniMaxConfig),
+            ),
         ] {
+            if setting == Setting::Profile(ProfileSetting::CliExecutable) {
+                let _ = dialog.update(Message::Profiles(profiles::Message::ConnectionMode(
+                    profiles::ConnectionMode::Cli,
+                )));
+            }
+            if setting == Setting::Profile(ProfileSetting::MiniMaxConfig) {
+                let _ = dialog.update(Message::Profiles(profiles::Message::Cli(
+                    profiles::CliAction::MiniMaxPreset,
+                )));
+            }
             let _ = dialog.update(Message::Search(query.into()));
             let mut interface = UserInterface::build(
                 dialog.view(Vec::new(), Vec::new()),
@@ -861,11 +1171,114 @@ mod tests {
                 Setting::Profile(ProfileSetting::SelectionLimit) => assert!(
                     matches!(messages.as_slice(), [Message::Profiles(profiles::Message::Number(profiles::Number::Selection, value))] if value.ends_with('2'))
                 ),
+                Setting::Profile(ProfileSetting::Usage(profiles::UsageField::Days)) => assert!(
+                    matches!(messages.as_slice(), [Message::Profiles(profiles::Message::EditUsage(profiles::UsageField::Days, value))] if value.ends_with('2'))
+                ),
+                Setting::Profile(ProfileSetting::CliExecutable) => assert!(
+                    matches!(messages.as_slice(), [Message::Profiles(profiles::Message::Cli(profiles::CliAction::Path(value)))] if value.ends_with('2'))
+                ),
+                Setting::Profile(ProfileSetting::MiniMaxConfig) => assert!(
+                    matches!(messages.as_slice(), [Message::Profiles(profiles::Message::Cli(profiles::CliAction::MiniMaxConfig(value)))] if value.ends_with('2'))
+                ),
                 _ => {
                     assert!(matches!(messages.as_slice(), [Message::Search(value)] if value == "2"))
                 }
             }
         }
+    }
+
+    #[test]
+    fn profile_setup_search_validates_steps_preserves_the_draft_and_focuses_the_name() {
+        use iced::advanced::widget::operation::focusable;
+        use iced::keyboard::{Key, key::Named};
+        use iced_runtime::{UserInterface, user_interface::Cache};
+
+        use crate::settings_search::test_input;
+
+        let mut dialog = Dialog::new(
+            Arc::new(Configuration::default()),
+            PathBuf::new(),
+            Vec::new(),
+            true,
+            None,
+        );
+        dialog.open_profile_wizard_for_test();
+        let candidate = dialog.profiles.selected().unwrap().id;
+        let edit =
+            |field, value: &str| Message::Profiles(profiles::Message::Edit(field, value.into()));
+        let name = Target::Setting(Setting::Profile(ProfileSetting::Name));
+        let _ = dialog.update(edit(profiles::Field::Endpoint, "invalid-endpoint"));
+        let _ = dialog.update(Message::Search("profile name".into()));
+        assert!(dialog.search_results().next().is_none());
+        assert!(iced_runtime::task::into_stream(dialog.update(Message::Reveal(name))).is_none());
+
+        let _ = dialog.update(Message::Search("find local model servers".into()));
+        assert_eq!(
+            dialog.search_results().next(),
+            Some(Target::Setting(Setting::WizardScan))
+        );
+        let _ = dialog.update(Message::SearchChoose);
+        assert_eq!(dialog.revealed.setting, Some(Setting::WizardScan));
+        assert!(dialog.request.is_none());
+
+        let _ = dialog.update(edit(profiles::Field::Endpoint, "127.0.0.1:11434"));
+        let _ = dialog.update(Message::Search("model identifier".into()));
+        let _ = dialog.update(Message::SearchChoose);
+        assert_eq!(
+            dialog.revealed.setting,
+            Some(Setting::Profile(ProfileSetting::Model))
+        );
+        let _ = dialog.update(edit(profiles::Field::Model, "wizard-test-model"));
+        let _ = dialog.update(Message::Search("profile name".into()));
+
+        let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+        let bounds = Size::new(760.0, 360.0);
+        let mut interface = UserInterface::build(
+            dialog.view(Vec::new(), Vec::new()),
+            bounds,
+            Cache::default(),
+            &mut renderer,
+        );
+        interface.operate(&renderer, &mut focusable::focus(dialog.search_id.clone()));
+        let messages = test_input::press(
+            &mut interface,
+            &mut renderer,
+            Key::Named(Named::Enter),
+            None,
+        );
+        assert!(matches!(messages.as_slice(), [Message::SearchChoose]));
+        let cache = interface.into_cache();
+        let reveal = dialog.update(messages.into_iter().next().unwrap());
+        assert_eq!(
+            dialog.revealed.setting,
+            Some(Setting::Profile(ProfileSetting::Name))
+        );
+        let mut interface = UserInterface::build(
+            dialog.view(Vec::new(), Vec::new()),
+            bounds,
+            cache,
+            &mut renderer,
+        );
+        test_input::apply(&mut interface, &renderer, reveal);
+        let messages = test_input::press(
+            &mut interface,
+            &mut renderer,
+            Key::Character("X".into()),
+            Some("X"),
+        );
+        assert!(
+            matches!(messages.as_slice(), [Message::Profiles(profiles::Message::Edit(profiles::Field::Name, value))] if value.ends_with('X'))
+        );
+        drop(interface);
+        let _ = dialog.update(messages.into_iter().next().unwrap());
+        let draft = dialog.profiles.selected().unwrap().clone();
+        let _ = dialog.update(Message::Search("test profile connection".into()));
+        let _ = dialog.update(Message::SearchChoose);
+        assert_eq!(dialog.revealed.setting, Some(Setting::WizardTest));
+        assert!(dialog.request.is_none());
+        assert!(dialog.profiles.selected() == Some(&draft));
+        assert!(dialog.profiles.catalog().profile(candidate).is_none());
+        assert!(dialog.profile_wizard_open());
     }
 
     #[test]

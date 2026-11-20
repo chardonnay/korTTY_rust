@@ -30,7 +30,7 @@ pub(super) fn is_reference(value: &str) -> bool {
 }
 
 /// An imported Java identifier and display metadata awaiting a local assignment.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct JavaBadgeHint {
     pub(crate) reference: String,
@@ -64,6 +64,61 @@ impl JavaBadgeHint {
     }
 }
 
+pub(crate) mod java_catalog {
+    use super::{Directory, JavaBadgeHint, Path, invalid, io, read_bounded};
+    use std::collections::BTreeSet;
+
+    pub(crate) const PATH: &str = "java-os-symbols.json";
+    pub(crate) const MAX_BYTES: usize = 4 * 1024 * 1024;
+    const MAX_HINTS: usize = 4096;
+
+    pub(crate) fn decode(bytes: &[u8]) -> io::Result<BTreeSet<JavaBadgeHint>> {
+        if bytes.len() > MAX_BYTES {
+            return Err(invalid("Java OS symbol metadata exceeds its size limit."));
+        }
+        let hints: Vec<JavaBadgeHint> = serde_json::from_slice(bytes).map_err(invalid)?;
+        if hints.len() > MAX_HINTS || hints.iter().any(|hint| !hint.valid()) {
+            return Err(invalid("Invalid or excessive Java OS symbol metadata."));
+        }
+        Ok(hints.into_iter().collect())
+    }
+
+    pub(crate) fn encode(hints: impl IntoIterator<Item = JavaBadgeHint>) -> io::Result<Vec<u8>> {
+        let hints: BTreeSet<_> = hints.into_iter().collect();
+        if hints.len() > MAX_HINTS || hints.iter().any(|hint| !hint.valid()) {
+            return Err(invalid("Invalid or excessive Java OS symbol metadata."));
+        }
+        let bytes = serde_json::to_vec(&hints).map_err(invalid)?;
+        if bytes.len() > MAX_BYTES {
+            return Err(invalid("Java OS symbol metadata exceeds its size limit."));
+        }
+        Ok(bytes)
+    }
+
+    fn read(directory: &Directory) -> io::Result<BTreeSet<JavaBadgeHint>> {
+        match directory.open_private_file(PATH) {
+            Ok(file) => decode(&read_bounded(file, MAX_BYTES as u64)?),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(BTreeSet::new()),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn load(root: &Path) -> io::Result<BTreeSet<JavaBadgeHint>> {
+        match Directory::open(root, false) {
+            Ok(directory) => read(&directory),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(BTreeSet::new()),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn merge(local: Option<&[u8]>, bytes: &[u8]) -> io::Result<Option<Vec<u8>>> {
+        let mut local = local.map(decode).transpose()?.unwrap_or_default();
+        let count = local.len();
+        local.extend(decode(bytes)?);
+        (local.len() != count).then(|| encode(local)).transpose()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Catalog {
     root: PathBuf,
@@ -83,6 +138,8 @@ struct Record {
     id: String,
     name: String,
     family: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    java_origin: Option<Arc<JavaBadgeHint>>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -134,9 +191,42 @@ impl Catalog {
     }
 
     pub(crate) fn add(&mut self, name: &str, family: &str, source: &Path) -> io::Result<String> {
-        let record = Record::new(new_id()?, name, family)?;
+        self.add_with_origin(name, family, source, None)
+    }
+
+    pub(crate) fn adopt_java(
+        &mut self,
+        name: &str,
+        family: &str,
+        source: &Path,
+        hint: JavaBadgeHint,
+    ) -> io::Result<String> {
+        if !java_catalog::load(&self.root)?.contains(&hint) {
+            return Err(invalid(
+                "The imported OS symbol definition no longer exists.",
+            ));
+        }
+        self.add_with_origin(name, family, source, Some(hint))
+    }
+
+    fn add_with_origin(
+        &mut self,
+        name: &str,
+        family: &str,
+        source: &Path,
+        java_origin: Option<JavaBadgeHint>,
+    ) -> io::Result<String> {
+        let mut record = Record::new(new_id()?, name, family)?;
+        record.java_origin = java_origin.map(Arc::new);
         let png = raster::load(source)?;
         let (directory, _lock, mut records) = self.edit(true)?;
+        if record.java_origin.as_ref().is_some_and(|origin| {
+            records
+                .iter()
+                .any(|existing| existing.java_origin.as_ref() == Some(origin))
+        }) {
+            return Err(invalid("This imported OS symbol has already been added."));
+        }
         if records.len() >= MAX_ENTRIES {
             return Err(invalid("The custom OS symbol catalog is full."));
         }
@@ -161,7 +251,9 @@ impl Catalog {
 
     pub(crate) fn rename(&mut self, reference: &str, name: &str, family: &str) -> io::Result<()> {
         let index = self.entry_index(reference)?;
-        let record = Record::new(self.entries[index].record.id.clone(), name, family)?;
+        let previous = &self.entries[index].record;
+        let mut record = Record::new(previous.id.clone(), name, family)?;
+        record.java_origin.clone_from(&previous.java_origin);
         let (directory, _lock, mut records) = self.edit(false)?;
         records[index] = record.clone();
         write_manifest(&directory, records)?;
@@ -238,6 +330,10 @@ impl CustomBadge {
         &self.record.family
     }
 
+    pub(crate) fn java_origin(&self) -> Option<&JavaBadgeHint> {
+        self.record.java_origin.as_deref()
+    }
+
     pub(crate) fn png(&self) -> &[u8] {
         match &self.image {
             Some(Handle::Bytes(_, bytes)) => bytes,
@@ -260,6 +356,7 @@ impl Record {
             id,
             name: name.trim().to_owned(),
             family: family.trim().to_owned(),
+            java_origin: None,
         };
         record.validate()?;
         Ok(record)
@@ -271,6 +368,7 @@ impl Record {
             || !valid_text(&self.family, MAX_LABEL_BYTES, false)
             || self.name.trim() != self.name
             || self.family.trim() != self.family
+            || self.java_origin.as_ref().is_some_and(|hint| !hint.valid())
         {
             return Err(invalid(
                 "Enter a valid OS symbol name and family (up to 80 bytes each).",

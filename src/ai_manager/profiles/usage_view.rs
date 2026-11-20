@@ -6,6 +6,7 @@ use std::sync::Arc;
 use iced::widget::{button, column, progress_bar, row, text, text_input};
 use iced::{Element, Length};
 
+use crate::ai_manager::search::{ProfileSetting, Reveal, Setting};
 use crate::local_ai::{UsageBudget, UsageSnapshot, UsageWarning};
 
 use super::{Message, Profile, ProfileId, ProfileRef};
@@ -19,6 +20,20 @@ pub(crate) enum Field {
     InputPrice,
     OutputPrice,
     Currency,
+}
+
+impl Field {
+    pub(in crate::ai_manager) fn label(self) -> &'static str {
+        match self {
+            Self::Limit => "Token quota (blank for unlimited)",
+            Self::Days => "Reset period in days",
+            Self::Yellow => "First warning (%)",
+            Self::Red => "Second warning (%)",
+            Self::InputPrice => "Input price per million tokens",
+            Self::OutputPrice => "Output price per million tokens",
+            Self::Currency => "Currency code",
+        }
+    }
 }
 
 pub(crate) struct Loaded {
@@ -92,38 +107,46 @@ impl Editor {
         }
     }
 
-    pub(super) fn view<'a>(&'a self, profile: &'a Profile, editable: bool) -> Element<'a, Message> {
+    pub(super) fn view<'a>(
+        &'a self,
+        profile: &'a Profile,
+        editable: bool,
+        reveal: &Reveal,
+    ) -> Element<'a, Message> {
         let budget = &profile.usage_budget;
-        let input = |field, label: &'static str, value: String| {
+        let input = |field: Field, value: String| {
             let value = self
                 .invalid
                 .get(&(profile.id, field))
                 .map_or(value.as_str(), String::as_str);
-            column![
-                text(label).size(13),
-                text_input("", value)
-                    .on_input_maybe(
-                        editable.then_some(move |value| Message::EditUsage(field, value))
-                    )
-                    .width(168)
-            ]
-            .spacing(4)
+            let setting = Setting::Profile(ProfileSetting::Usage(field));
+            let field_input = text_input("", value)
+                .on_input_maybe(editable.then_some(move |value| Message::EditUsage(field, value)))
+                .width(168);
+            reveal.action(
+                setting,
+                column![
+                    text(field.label()).size(13),
+                    reveal.input(setting, editable, field_input),
+                ]
+                .spacing(4),
+            )
         };
         column![
             text("Token quota and cost").size(16),
             row![
-                input(Field::Limit, "Token quota (blank for unlimited)", budget.token_limit.map_or_else(String::new, |value| value.to_string())),
-                input(Field::Days, "Reset period in days", budget.reset_days.to_string()),
-                input(Field::Yellow, "First warning (%)", budget.yellow_percent.to_string()),
-                input(Field::Red, "Second warning (%)", budget.red_percent.to_string()),
+                input(Field::Limit, budget.token_limit.map_or_else(String::new, |value| value.to_string())),
+                input(Field::Days, budget.reset_days.to_string()),
+                input(Field::Yellow, budget.yellow_percent.to_string()),
+                input(Field::Red, budget.red_percent.to_string()),
             ].spacing(8).wrap(),
             row![
-                input(Field::InputPrice, "Input price per million tokens", price_text(budget.input_micros_per_million)),
-                input(Field::OutputPrice, "Output price per million tokens", price_text(budget.output_micros_per_million)),
-                input(Field::Currency, "Currency code", budget.currency.clone()),
+                input(Field::InputPrice, price_text(budget.input_micros_per_million)),
+                input(Field::OutputPrice, price_text(budget.output_micros_per_million)),
+                input(Field::Currency, budget.currency.clone()),
             ].spacing(8).wrap(),
             text("Quota warnings use provider-reported tokens and pending output reservations. Providers can report incomplete usage. Prices calculate an estimate from reported tokens.").size(13),
-            self.recorded(profile, editable),
+            self.recorded(profile, editable, reveal),
         ].spacing(8).into()
     }
 
@@ -131,6 +154,7 @@ impl Editor {
         &'a self,
         profile: &'a Profile,
         can_load: bool,
+        reveal: &Reveal,
     ) -> Element<'a, Message> {
         let budget = &profile.usage_budget;
         let reference = profile.reference();
@@ -138,13 +162,16 @@ impl Editor {
             loaded.reference == reference && loaded.reset_days == budget.reset_days
         });
         column![
-            button(if self.loading {
-                "Reading recorded usage…"
-            } else {
-                "Refresh recorded usage"
-            })
-            .style(button::secondary)
-            .on_press_maybe((can_load && !self.loading).then_some(Message::LoadUsage)),
+            reveal.action(
+                Setting::Profile(ProfileSetting::RecordedUsage),
+                button(if self.loading {
+                    "Reading recorded usage…"
+                } else {
+                    "Refresh recorded usage"
+                })
+                .style(button::secondary)
+                .on_press_maybe((can_load && !self.loading).then_some(Message::LoadUsage))
+            ),
             snapshot.map(|loaded| match &loaded.result {
                 Ok(snapshot) => summary(budget, *snapshot),
                 Err(error) => column![text(error).size(13)].into(),

@@ -1220,6 +1220,8 @@ fn prepare_java_updates<'a>(
                     };
                     crate::private_files::require_single_link(&file)?;
                     Ok(Some(file))
+                } else if path == crate::connection_store::custom_os_badges::java_catalog::PATH {
+                    missing(parent.open_private_file(name))
                 } else {
                     missing(parent.open_file(name))
                 }

@@ -989,12 +989,15 @@ mod tests {
                     Cache::default(),
                     &mut renderer,
                 );
-                let mut focus = focusable::focus_next();
-                interface.operate(&renderer, &mut focus);
-                let operation::Outcome::Chain(mut focus) = focus.finish() else {
-                    panic!("expected the focus-next operation to select a field");
-                };
-                interface.operate(&renderer, focus.as_mut());
+                // The wizard search precedes the first form input in tab order.
+                for _ in 0..2 {
+                    let mut focus = focusable::focus_next();
+                    interface.operate(&renderer, &mut focus);
+                    let operation::Outcome::Chain(mut focus) = focus.finish() else {
+                        panic!("expected the focus-next operation to select an input");
+                    };
+                    interface.operate(&renderer, focus.as_mut());
+                }
                 let mut messages = Vec::new();
                 let (_, statuses) = interface.update(
                     &[

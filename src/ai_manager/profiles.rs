@@ -35,7 +35,6 @@ mod web;
 mod wizard;
 
 pub(super) use cli_profile::Action as CliAction;
-#[cfg(test)]
 pub(super) use usage_view::Field as UsageField;
 pub(super) use usage_view::Loaded as UsageLoaded;
 pub(super) use wizard::Action as WizardAction;
@@ -932,6 +931,19 @@ impl Profile {
 
     pub(super) fn is_cli(&self) -> bool {
         self.connection_mode == ConnectionMode::Cli
+    }
+
+    pub(super) fn searchable_cli_setting(&self, setting: super::search::ProfileSetting) -> bool {
+        self.cli
+            .as_ref()
+            .is_some_and(|settings| settings.searchable(setting))
+    }
+
+    pub(super) fn has_cloud_provider_presets(&self) -> bool {
+        self.remote_protocol().is_some()
+            && !self.connection_mode.uses_lm_studio_inventory()
+            && self.connection_mode != ConnectionMode::LoopbackAnthropic
+            && !self.connection_mode.is_exact_https()
     }
 
     pub(super) fn can_be_default(&self) -> bool {

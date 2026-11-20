@@ -2884,6 +2884,12 @@ impl Dialog {
     }
 
     pub(crate) fn child_close_message(&self) -> Option<Message> {
+        if (self.profile_wizard_open() || self.local.backend_repair_open())
+            && !self.search.is_empty()
+            && self.close_token.is_none()
+        {
+            return Some(Message::SearchEscape);
+        }
         if self.setup.is_some()
             || self.profile_wizard_open()
             || self.local.backend_repair_open()
@@ -3083,7 +3089,9 @@ impl Dialog {
                 | Message::LmStudioMetadataReady(..)
                 | Message::AutoTestResolved(..)
                 | Message::OrdinaryAutoTestResolved(..)
-        ) {
+        ) || self.profile_wizard_open()
+            && matches!(&message, Message::SearchChoose | Message::Reveal(_))
+        {
             self.profile_policy = load_policy();
         }
         let editable = self.editable();
@@ -3108,16 +3116,12 @@ impl Dialog {
             }
             _ => {}
         }
-        if (self.profile_wizard_open() || self.local.backend_repair_open())
+        let profile_wizard = self.profile_wizard_open();
+        let backend_repair = self.local.backend_repair_open();
+        if (profile_wizard || backend_repair)
             && matches!(
                 message,
                 Message::Page(_)
-                    | Message::Search(_)
-                    | Message::SearchStep(_)
-                    | Message::SearchChoose
-                    | Message::SearchEscape
-                    | Message::Reveal(_)
-                    | Message::Find
                     | Message::Save
                     | Message::Profiles(profiles::Message::Save | profiles::Message::Refresh)
             )
@@ -3138,7 +3142,11 @@ impl Dialog {
                     self.search_scroll.clone(),
                     iced::widget::operation::RelativeOffset::START,
                 );
-                return if was_searching && self.search.trim().is_empty() {
+                return if was_searching
+                    && self.search.trim().is_empty()
+                    && !profile_wizard
+                    && !backend_repair
+                {
                     Task::batch([
                         scroll,
                         self.load_profile_usage(),
@@ -3167,6 +3175,9 @@ impl Dialog {
             Message::SearchEscape => {
                 self.search.clear();
                 self.search_selection = 0;
+                if profile_wizard || backend_repair {
+                    return Task::none();
+                }
                 return Task::batch([self.load_profile_usage(), self.refresh_lm_studio_metadata()]);
             }
             Message::Reveal(target) => return self.open_page(target),
@@ -3351,6 +3362,9 @@ impl Dialog {
                         self.notice.clear();
                     }
                     self.profiles.update(event, editable);
+                    self.search.clear();
+                    self.search_selection = 0;
+                    self.revealed.setting = None;
                     return Task::batch([
                         self.load_profile_usage(),
                         self.refresh_lm_studio_metadata(),
@@ -3387,6 +3401,11 @@ impl Dialog {
                     _ => profile_editable,
                 };
                 self.profiles.update(event, event_editable);
+                if profile_wizard != self.profile_wizard_open() {
+                    self.search.clear();
+                    self.search_selection = 0;
+                    self.revealed.setting = None;
+                }
                 let usage = if self.profile_usage_key() != previous_usage {
                     self.load_profile_usage()
                 } else {
@@ -3499,7 +3518,7 @@ impl Dialog {
                         Message::ManagedDefaultSaved,
                     );
                 }
-                return self
+                let task = self
                     .local
                     .update_with_vault(
                         event,
@@ -3509,6 +3528,12 @@ impl Dialog {
                         vault,
                     )
                     .map(Message::Local);
+                if backend_repair != self.local.backend_repair_open() {
+                    self.search.clear();
+                    self.search_selection = 0;
+                    self.revealed.setting = None;
+                }
+                return task;
             }
             Message::CancelRequest => {
                 self.request = None;
@@ -3649,23 +3674,48 @@ impl Dialog {
     }
 
     fn search_results(&self) -> impl Iterator<Item = search::Target> + '_ {
+        let wizard = self.profile_wizard_open();
+        let editable = self.editable() && self.profile_form_lock().is_none();
         search::results(&self.search, self.profiles.searchable_profile())
+            .filter(move |_| !wizard)
+            .chain(search::matching(
+                &self.search,
+                self.profiles
+                    .wizard_search_settings(editable)
+                    .map(search::Target::Setting),
+            ))
             .filter(|&target| self.search_target_available(target))
     }
 
     fn search_target_available(&self, target: search::Target) -> bool {
+        if self.local.backend_repair_open() {
+            return matches!(
+                target, search::Target::Setting(search::Setting::Control(control))
+                    if control.page() == Page::LocalModels && self.local.can_reveal_runtime_control(
+                        control, self.editable(), self.general.features_enabled)
+            );
+        }
         match target {
+            search::Target::Setting(search::Setting::WizardScan | search::Setting::WizardTest) => {
+                self.profile_wizard_open()
+            }
+            search::Target::Setting(search::Setting::Profile(search::ProfileSetting::Web(
+                setting,
+            ))) => self.profiles.can_reveal_web_setting(setting),
             search::Target::Setting(search::Setting::Knowledge(setting))
                 if setting.needs_store() =>
             {
-                self.local_state.has_knowledge_stores()
+                self.local
+                    .can_reveal_knowledge_setting(&self.local_state, setting)
             }
             search::Target::Setting(search::Setting::Control(control)) => match control.page() {
                 Page::Skills => self.editable() && self.skills.has_search_control(control),
                 Page::Memory => self.memory.has_search_controls(),
-                Page::LocalModels => {
-                    control == search::Control::LocalSetup || !self.local.backend_repair_open()
-                }
+                Page::LocalModels => self.local.can_reveal_runtime_control(
+                    control,
+                    self.editable(),
+                    self.general.features_enabled,
+                ),
                 _ => true,
             },
             _ => true,
@@ -3673,6 +3723,39 @@ impl Dialog {
     }
 
     fn open_page(&mut self, target: search::Target) -> Task<Message> {
+        if self.local.backend_repair_open() {
+            let search::Target::Setting(setting) = target else {
+                return Task::none();
+            };
+            if !self.search_target_available(target) {
+                return Task::none();
+            }
+            self.search.clear();
+            self.search_selection = 0;
+            self.revealed.setting = Some(setting);
+            if matches!(
+                setting,
+                search::Setting::Control(
+                    search::Control::CloseRuntimeRepair | search::Control::InstallRuntime
+                )
+            ) {
+                return Task::none();
+            }
+            return self.revealed.apply();
+        }
+        if self.profile_wizard_open() {
+            let search::Target::Setting(setting) = target else {
+                return Task::none();
+            };
+            let editable = self.editable() && self.profile_form_lock().is_none();
+            if !self.profiles.reveal_wizard_setting(setting, editable) {
+                return Task::none();
+            }
+            self.search.clear();
+            self.search_selection = 0;
+            self.revealed.setting = Some(setting);
+            return self.revealed.apply();
+        }
         self.page = target.page();
         self.search.clear();
         self.search_selection = 0;
@@ -3689,7 +3772,7 @@ impl Dialog {
         if let Some(search::Setting::Knowledge(setting)) = self.revealed.setting
             && setting.needs_store()
         {
-            self.local.reveal_knowledge_index(&self.local_state);
+            self.local.reveal_knowledge_store(&self.local_state);
         }
         let scroll = if self.revealed.setting.is_some() {
             self.revealed.apply()
@@ -3699,6 +3782,12 @@ impl Dialog {
                 iced::widget::operation::RelativeOffset::START,
             )
         };
+        if matches!(
+            self.revealed.setting,
+            Some(search::Setting::Profile(search::ProfileSetting::Web(_)))
+        ) {
+            return scroll;
+        }
         let load = match self.page {
             Page::Memory
                 if self.revealed.setting
@@ -3707,6 +3796,22 @@ impl Dialog {
                 self.memory.load().map(Message::Memory)
             }
             Page::Profiles => self.refresh_managed_models(),
+            Page::Knowledge
+                if matches!(
+                    self.revealed.setting,
+                    Some(search::Setting::Knowledge(setting))
+                        if !matches!(setting,
+                            search::KnowledgeSetting::Name
+                                | search::KnowledgeSetting::Create
+                                | search::KnowledgeSetting::EmbeddingSource
+                                | search::KnowledgeSetting::Update
+                                | search::KnowledgeSetting::Rebuild
+                                | search::KnowledgeSetting::TestSearch)
+                ) =>
+            {
+                // Revealing these fields must leave the store editor ready for input.
+                Task::none()
+            }
             Page::LocalModels
                 if matches!(
                     self.revealed.setting,
@@ -3715,6 +3820,11 @@ impl Dialog {
                             | search::Control::SignedIndex
                             | search::Control::IndexSignature
                             | search::Control::RuntimePackage
+                            | search::Control::InstallRuntime
+                            | search::Control::CheckRuntimeOnline
+                            | search::Control::RuntimeOnlineChoice
+                            | search::Control::DownloadRuntimeOnline
+                            | search::Control::DiscardRuntimeDownload
                     ))
                 ) =>
             {
@@ -4307,17 +4417,27 @@ impl Dialog {
         .align_y(Alignment::Center);
         let header = row![
             crate::settings_search::input(
-                text_input("Search AI settings…", &self.search)
-                    .id(self.search_id.clone())
-                    .on_input(Message::Search)
-                    .on_submit(Message::SearchChoose),
+                text_input(
+                    if self.profile_wizard_open() {
+                        "Search profile setup…"
+                    } else if self.local.backend_repair_open() {
+                        "Search runtime repair…"
+                    } else {
+                        "Search AI settings…"
+                    },
+                    &self.search
+                )
+                .id(self.search_id.clone())
+                .on_input(Message::Search)
+                .on_submit(Message::SearchChoose),
                 Message::SearchStep(-1),
                 Message::SearchStep(1),
                 (!self.search.is_empty()).then_some(Message::SearchEscape),
                 None,
             ),
-            controls,
-            button("Manual").style(button::text).on_press(Message::Help),
+            (!child_form_open).then_some(controls),
+            (!child_form_open)
+                .then(|| button("Manual").style(button::text).on_press(Message::Help)),
         ]
         .spacing(10)
         .align_y(Alignment::Center);
@@ -4489,15 +4609,10 @@ impl Dialog {
         } else {
             container(content).height(Length::Fill).into()
         };
-        let body = column![
-            (!child_form_open).then_some(header),
-            (!child_form_open).then_some(tabs),
-            content,
-            footer
-        ]
-        .spacing(10)
-        .padding([10, 14])
-        .height(Length::Fill);
+        let body = column![header, (!child_form_open).then_some(tabs), content, footer]
+            .spacing(10)
+            .padding([10, 14])
+            .height(Length::Fill);
         if self.close_token.is_some() {
             iced::widget::stack![
                 body,
@@ -5941,6 +6056,12 @@ mod tests {
         let _ = dialog.update(Message::Profiles(profiles::Message::ConfirmDelete));
         let _ = dialog.update(Message::Save);
         assert_eq!(dialog.page, Page::Profiles);
+        assert!(dialog.search_results().next().is_none());
+        assert!(matches!(
+            dialog.child_close_message(),
+            Some(Message::SearchEscape)
+        ));
+        let _ = dialog.update(dialog.escape_message());
         assert!(dialog.search.is_empty());
         assert_eq!(dialog.profiles.selected().unwrap().id, candidate);
         assert!(dialog.profiles.catalog().profile(existing).is_some());

@@ -3,8 +3,9 @@
 use std::fmt;
 
 use iced::Element;
-use iced::widget::{button, checkbox, column, text, text_input};
+use iced::widget::{TextInput, button, checkbox, column, text, text_input};
 
+use crate::ai_manager::search::{ProfileSetting, Reveal, Setting, WebSetting};
 use crate::local_ai::web_search::{
     MAX_PAGE_URL_BYTES, McpMode, McpSettings, PageProvider, SearxngPageSettings, page_provider,
 };
@@ -80,9 +81,38 @@ impl Profile {
             !self.restore_review && !self.has_web_search() && self.supports_java_web_hint(hint)
         })
     }
+
+    pub(in crate::ai_manager) fn searchable_web_setting(&self, setting: WebSetting) -> bool {
+        if self.is_cli() || self.restore_review || self.policy_definition().is_some() {
+            return false;
+        }
+        let mcp = self.lm_web.as_ref();
+        let is_mode = |mode| mcp.is_some_and(|settings| settings.mode == mode);
+        match setting {
+            WebSetting::Provider => true,
+            WebSetting::Plugin => mcp.is_some_and(|settings| settings.mode.uses_plugin()),
+            WebSetting::ToolpackNames => is_mode(McpMode::Toolpack),
+            WebSetting::ImportedToolpackNames => {
+                matches!(self.imported_web_hint(), Some(JavaWebHint::Toolpack { .. }))
+            }
+            WebSetting::UseImported => self.imported_web_hint().is_some(),
+            WebSetting::SearxngPages => is_mode(McpMode::Searxng),
+            WebSetting::SearxngEndpoint | WebSetting::SearxngBearerEnv => {
+                is_mode(McpMode::Searxng)
+                    && mcp.is_some_and(|settings| settings.searxng_page.is_some())
+            }
+        }
+    }
 }
 
 impl Editor {
+    pub(in crate::ai_manager) fn can_reveal_web_setting(&self, setting: WebSetting) -> bool {
+        !self.web_search_denied
+            && self
+                .searchable_profile()
+                .is_some_and(|profile| profile.searchable_web_setting(setting))
+    }
+
     pub(super) fn update_web_search(&mut self, action: Action) {
         if let Action::ImportedToolpackNames(names) = action {
             if self.selected().is_some_and(|profile| {
@@ -212,6 +242,7 @@ impl Editor {
         &'a self,
         profile: &'a Profile,
         editable: bool,
+        reveal: &Reveal,
     ) -> Element<'a, Message> {
         if self.web_search_denied {
             return text("Managed policy blocks web search.").size(13).into();
@@ -223,7 +254,11 @@ impl Editor {
         } else {
             choice(Choice::STANDARD, mode, editable, select)
         };
-        let mut fields = column![text("Web search"), picker].spacing(6);
+        let mut fields = column![reveal.wrap(
+            target(WebSetting::Provider),
+            column![text("Web search"), picker].spacing(6)
+        )]
+        .spacing(6);
         if let Some(JavaWebHint::Toolpack { plugin }) = profile.imported_web_hint() {
             let has_token_name = profile.credential().ok().flatten().is_some();
             fields = fields
@@ -234,15 +269,15 @@ impl Editor {
                     "Set the LM Studio API token environment variable in this profile to review the imported plugin."
                 }).size(13))
                 .push(
-                    text_input("Allowed Toolpack names, separated by spaces", &self.imported_toolpack_names)
+                    input(reveal, WebSetting::ImportedToolpackNames, editable && has_token_name, text_input("Allowed Toolpack names, separated by spaces", &self.imported_toolpack_names)
                         .on_input_maybe((editable && has_token_name).then_some(|tools| {
                             Message::Web(Action::ImportedToolpackNames(tools))
-                        })),
+                        }))),
                 )
-                .push(button("Use imported Toolpack").on_press_maybe(
+                .push(reveal.action(target(WebSetting::UseImported), button("Use imported Toolpack").on_press_maybe(
                     (editable && has_token_name && !self.imported_toolpack_names.trim().is_empty())
                         .then_some(Message::Web(Action::UseImported)),
-                ));
+                )));
         } else if let Some(hint) = profile.imported_web_hint() {
             let label = hint.mcp_settings().map_or_else(
                 || "Tavily · direct search".into(),
@@ -250,8 +285,11 @@ impl Editor {
             );
             fields = fields.push(text(format!("Imported web integration · {label}")).size(13));
             fields = fields.push(
-                button("Use imported integration")
-                    .on_press_maybe(editable.then_some(Message::Web(Action::UseImported))),
+                reveal.action(
+                    target(WebSetting::UseImported),
+                    button("Use imported integration")
+                        .on_press_maybe(editable.then_some(Message::Web(Action::UseImported))),
+                ),
             );
         }
         match mode {
@@ -268,7 +306,7 @@ impl Editor {
                 let settings = profile.lm_web.as_ref().expect("selected MCP mode");
                 fields = fields.push(text(mode.setup()).size(13));
                 if mode == McpMode::Searxng {
-                    fields = fields.push(searxng_page_fields(settings, editable));
+                    fields = fields.push(searxng_page_fields(settings, editable, reveal));
                 } else if let Some(provider) = page_provider(Some(settings)) {
                     let detail = match provider {
                         PageProvider::Tavily => {
@@ -284,15 +322,21 @@ impl Editor {
                     fields = fields.push(text(detail).size(13));
                 }
                 if mode.uses_plugin() {
-                    fields = fields.push(
+                    fields = fields.push(input(
+                        reveal,
+                        WebSetting::Plugin,
+                        editable,
                         text_input("Installed plugin ID (mcp/server-name)", &settings.plugin)
                             .on_input_maybe(
                                 editable.then_some(|id| Message::Web(Action::Plugin(id))),
                             ),
-                    );
+                    ));
                 }
                 if mode == McpMode::Toolpack {
-                    fields = fields.push(
+                    fields = fields.push(input(
+                        reveal,
+                        WebSetting::ToolpackNames,
+                        editable,
                         text_input(
                             "Allowed Toolpack names, separated by spaces",
                             &settings.tool_names,
@@ -300,7 +344,7 @@ impl Editor {
                         .on_input_maybe(
                             editable.then_some(|tools| Message::Web(Action::Tools(tools))),
                         ),
-                    );
+                    ));
                 }
             }
         }
@@ -308,13 +352,34 @@ impl Editor {
     }
 }
 
-fn searxng_page_fields(settings: &McpSettings, editable: bool) -> Element<'_, Message> {
+fn target(setting: WebSetting) -> Setting {
+    Setting::Profile(ProfileSetting::Web(setting))
+}
+
+fn input<'a>(
+    reveal: &Reveal,
+    setting: WebSetting,
+    editable: bool,
+    input: TextInput<'a, Message>,
+) -> Element<'a, Message> {
+    let setting = target(setting);
+    reveal.wrap(setting, reveal.input(setting, editable, input))
+}
+
+fn searxng_page_fields<'a>(
+    settings: &'a McpSettings,
+    editable: bool,
+    reveal: &Reveal,
+) -> Element<'a, Message> {
     let mut fields = column![
-        checkbox(settings.searxng_page.is_some())
-            .label("Read webpages through a SearXNG MCP endpoint")
-            .on_toggle_maybe(
-                editable.then_some(|enabled| Message::Web(Action::SearxngPages(enabled)))
-            )
+        reveal.wrap(
+            target(WebSetting::SearxngPages),
+            checkbox(settings.searxng_page.is_some())
+                .label("Read webpages through a SearXNG MCP endpoint")
+                .on_toggle_maybe(
+                    editable.then_some(|enabled| Message::Web(Action::SearxngPages(enabled)))
+                )
+        )
     ]
     .spacing(6);
     if let Some(page) = &settings.searxng_page {
@@ -323,12 +388,18 @@ fn searxng_page_fields(settings: &McpSettings, editable: bool) -> Element<'_, Me
                 text("Page requests call web_url_read at the full MCP endpoint you enter.")
                     .size(13),
             )
-            .push(
+            .push(input(
+                reveal,
+                WebSetting::SearxngEndpoint,
+                editable,
                 text_input("SearXNG MCP endpoint URL", &page.endpoint).on_input_maybe(
                     editable.then_some(|url| Message::Web(Action::SearxngEndpoint(url))),
                 ),
-            )
-            .push(
+            ))
+            .push(input(
+                reveal,
+                WebSetting::SearxngBearerEnv,
+                editable,
                 text_input(
                     "Bearer token environment variable (optional)",
                     page.bearer_env.as_deref().unwrap_or_default(),
@@ -336,7 +407,7 @@ fn searxng_page_fields(settings: &McpSettings, editable: bool) -> Element<'_, Me
                 .on_input_maybe(
                     editable.then_some(|name| Message::Web(Action::SearxngBearerEnv(name))),
                 ),
-            );
+            ));
         if !page.endpoint.is_empty() {
             let destination = page.review_destination().map_or_else(
                 |error| error,
@@ -352,6 +423,89 @@ fn searxng_page_fields(settings: &McpSettings, editable: bool) -> Element<'_, Me
 mod tests {
     use super::*;
     use crate::ai_manager::profiles::{ConnectionMode, Field, java_backup};
+
+    #[test]
+    fn web_setting_search_requires_the_active_integration_and_respects_policy() {
+        use std::{path::PathBuf, sync::Arc};
+
+        use iced::{Font, Renderer, Size, keyboard::Key};
+        use iced_runtime::{UserInterface, user_interface::Cache};
+
+        use crate::ai_manager::{Configuration, Dialog, Message as ManagerMessage, search::Target};
+        use crate::settings_search::test_input;
+
+        let mut dialog = Dialog::new(
+            Arc::new(Configuration::default()),
+            PathBuf::new(),
+            Vec::new(),
+            true,
+            None,
+        )
+        .with_web_search_policy(true);
+        let send = |dialog: &mut Dialog, message| dialog.update(ManagerMessage::Profiles(message));
+        let _ = send(&mut dialog, Message::Add);
+        let _ = send(
+            &mut dialog,
+            Message::ConnectionMode(ConnectionMode::LmStudio),
+        );
+        let _ = send(&mut dialog, Message::TrustLocal(true));
+        let _ = send(
+            &mut dialog,
+            Message::Edit(Field::Credential, "KORTTY_LM_STUDIO_FIXTURE_TOKEN".into()),
+        );
+        let _ = send(
+            &mut dialog,
+            Message::Web(Action::Select(Choice::Mcp(McpMode::Searxng))),
+        );
+        let endpoint = target(WebSetting::SearxngEndpoint);
+        let _ = dialog.update(ManagerMessage::Search("searxng endpoint url".into()));
+        assert!(
+            !dialog
+                .search_results()
+                .any(|result| result == Target::Setting(endpoint))
+        );
+
+        let _ = send(&mut dialog, Message::Web(Action::SearxngPages(true)));
+        let draft = dialog.profiles.catalog().clone();
+        let reveal = dialog.update(ManagerMessage::SearchChoose);
+        assert_eq!(dialog.revealed.setting, Some(endpoint));
+        assert!(dialog.profiles.catalog() == &draft);
+        assert!(dialog.request.is_none());
+        let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+        let mut interface = UserInterface::build(
+            dialog.view(Vec::new(), Vec::new()),
+            Size::new(760.0, 360.0),
+            Cache::default(),
+            &mut renderer,
+        );
+        test_input::apply(&mut interface, &renderer, reveal);
+        let messages = test_input::press(
+            &mut interface,
+            &mut renderer,
+            Key::Character("x".into()),
+            Some("x"),
+        );
+        assert!(
+            matches!(messages.as_slice(), [ManagerMessage::Profiles(Message::Web(Action::SearxngEndpoint(value)))] if value == "x")
+        );
+        drop(interface);
+
+        let _ = send(
+            &mut dialog,
+            Message::Web(Action::Select(Choice::Mcp(McpMode::Toolpack))),
+        );
+        let _ = dialog.update(ManagerMessage::Search("toolpack names".into()));
+        let names = target(WebSetting::ToolpackNames);
+        assert_eq!(dialog.search_results().next(), Some(Target::Setting(names)));
+        dialog = dialog.with_web_search_policy(false);
+        assert!(
+            !dialog
+                .search_results()
+                .any(|result| result == Target::Setting(names))
+        );
+        let _ = dialog.update(ManagerMessage::Reveal(Target::Setting(names)));
+        assert!(dialog.revealed.setting.is_none());
+    }
 
     #[test]
     fn searxng_page_settings_are_explicit_and_scoped_to_the_selected_web_integration() {
