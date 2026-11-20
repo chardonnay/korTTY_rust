@@ -4,7 +4,7 @@ use iced::widget::{
 };
 use iced::{Alignment, Element, Length};
 
-use crate::ai_manager::search::{ProfileSetting, Reveal, Setting};
+use crate::ai_manager::search::{ProfileAction, ProfileSetting, Reveal, Setting};
 use crate::clipboard_policy::{AI_PROFILE_CREATION_DISABLED, PolicyAiProfile, PolicyAiProvider};
 
 use super::{
@@ -14,7 +14,91 @@ use super::{
 use super::{cloud, wizard};
 use crate::local_ai::{self, mlx_runtime};
 
+fn policy_connection_action(
+    definition: &PolicyAiProfile,
+    automatic: bool,
+) -> (ProfileAction, bool) {
+    if !automatic
+        && definition.model.is_none()
+        && matches!(
+            definition.provider,
+            PolicyAiProvider::Anthropic
+                | PolicyAiProvider::OpenAiCompatible
+                | PolicyAiProvider::LmStudio
+        )
+    {
+        (ProfileAction::DiscoverModels, true)
+    } else {
+        (
+            ProfileAction::TestConnection,
+            definition.model.is_some() || automatic,
+        )
+    }
+}
+
 impl Editor {
+    pub(in crate::ai_manager) fn can_reveal_profile_action(
+        &self,
+        action: ProfileAction,
+        editable: bool,
+    ) -> bool {
+        let Some(profile) = self.selected() else {
+            return false;
+        };
+        if let Some(definition) = profile.policy_definition() {
+            let automatic = local_ai::Profile::supports_policy_auto_model(definition);
+            let (shown, enabled) = policy_connection_action(definition, automatic);
+            return editable && enabled && action == shown;
+        }
+        let imported = profile.restore_review && profile.java_embedded_model.is_some();
+        match action {
+            ProfileAction::TestConnection | ProfileAction::TestCli => {
+                editable
+                    && !self.deleting
+                    && !imported
+                    && (action == ProfileAction::TestCli) == profile.is_cli()
+            }
+            ProfileAction::DiscoverModels => false,
+            ProfileAction::LoadModels => {
+                editable
+                    && !profile.is_cli()
+                    && !profile.is_managed()
+                    && profile.supports_model_discovery()
+            }
+            ProfileAction::ChooseImportedModel => imported,
+            ProfileAction::RefreshManagedModels | ProfileAction::ConfirmImportedModel => {
+                profile.is_managed()
+                    && self.can_select_managed_model(profile, editable)
+                    && (action == ProfileAction::RefreshManagedModels
+                        || imported
+                            && self.imported_model_review.is_none()
+                            && self
+                                .managed_catalog(profile)
+                                .choices
+                                .iter()
+                                .any(|choice| choice.id == profile.model))
+            }
+            ProfileAction::Delete => editable && !self.deleting,
+            ProfileAction::ConfirmDelete => editable && self.deleting,
+            ProfileAction::CancelDelete => self.deleting,
+        }
+    }
+
+    pub(in crate::ai_manager) fn reveal_profile_action(&mut self, action: ProfileAction) {
+        if let Some(section) = action.section() {
+            self.section = section;
+        }
+    }
+
+    fn can_select_managed_model(&self, profile: &Profile, editable: bool) -> bool {
+        editable
+            && !self.managed_catalog(profile).loading
+            && (!profile.restore_review
+                || profile.java_embedded_model.is_none()
+                || !profile.is_mlx()
+                || mlx_runtime::supported())
+    }
+
     pub(in crate::ai_manager) fn view<'a>(
         &'a self,
         editable: bool,
@@ -153,14 +237,8 @@ impl Editor {
             "None configured"
         };
         let automatic = local_ai::Profile::supports_policy_auto_model(definition);
-        let can_discover = !automatic
-            && definition.model.is_none()
-            && matches!(
-                definition.provider,
-                PolicyAiProvider::Anthropic
-                    | PolicyAiProvider::OpenAiCompatible
-                    | PolicyAiProvider::LmStudio
-            );
+        let (target, action_enabled) = policy_connection_action(definition, automatic);
+        let can_discover = target == ProfileAction::DiscoverModels;
         let discovered = (can_discover && !self.models.is_empty()).then(|| {
             let models = column(
                 self.models
@@ -257,19 +335,19 @@ impl Editor {
             self.status.as_deref().map(|status| text(status).size(13)),
         ]
         .spacing(8);
-        let action = if can_discover {
-            button("Discover models").on_press_maybe(actions_allowed.then_some(Message::Discover))
+        let (label, message) = if can_discover {
+            ("Discover models", Message::Discover)
         } else {
-            button("Test connection").on_press_maybe(
-                (actions_allowed && (definition.model.is_some() || automatic))
-                    .then_some(Message::Test),
-            )
+            ("Test connection", Message::Test)
         };
+        let action = button(label)
+            .style(button::secondary)
+            .on_press_maybe((actions_allowed && action_enabled).then_some(message));
         column![
             scrollable(details)
                 .id(reveal.viewport.clone())
                 .height(Length::Fill),
-            action.style(button::secondary),
+            reveal.action(Setting::ProfileAction(target), action),
         ]
         .spacing(10)
     }
@@ -332,30 +410,40 @@ impl Editor {
         let actions = if self.deleting {
             row![
                 text("Remove this profile from the draft?").width(Length::Fill),
-                button("Cancel")
-                    .style(button::secondary)
-                    .on_press(Message::CancelDelete),
-                button("Remove profile")
-                    .style(button::danger)
-                    .on_press_maybe(editable.then_some(Message::ConfirmDelete)),
+                reveal.action(
+                    Setting::ProfileAction(ProfileAction::CancelDelete),
+                    button("Cancel")
+                        .style(button::secondary)
+                        .on_press(Message::CancelDelete)
+                ),
+                reveal.action(
+                    Setting::ProfileAction(ProfileAction::ConfirmDelete),
+                    button("Remove profile")
+                        .style(button::danger)
+                        .on_press_maybe(editable.then_some(Message::ConfirmDelete))
+                ),
             ]
         } else {
+            let (target, label) = if profile.is_cli() {
+                (ProfileAction::TestCli, "Run fixed CLI test")
+            } else {
+                (ProfileAction::TestConnection, "Test connection")
+            };
             row![
-                button(if profile.is_cli() {
-                    "Run fixed CLI test"
-                } else {
-                    "Test connection"
-                })
-                .style(button::secondary)
-                .on_press_maybe(
-                    (editable
-                        && !(profile.restore_review && profile.java_embedded_model.is_some()))
-                    .then_some(Message::Test)
+                reveal.action(
+                    Setting::ProfileAction(target),
+                    button(label).style(button::secondary).on_press_maybe(
+                        self.can_reveal_profile_action(target, editable)
+                            .then_some(Message::Test)
+                    )
                 ),
                 space::horizontal(),
-                button("Delete")
-                    .style(button::danger)
-                    .on_press_maybe(editable.then_some(Message::Delete)),
+                reveal.action(
+                    Setting::ProfileAction(ProfileAction::Delete),
+                    button("Delete")
+                        .style(button::danger)
+                        .on_press_maybe(editable.then_some(Message::Delete))
+                ),
                 button("Save").on_press_maybe(editable.then_some(Message::Save)),
             ]
         }
@@ -399,9 +487,12 @@ impl Editor {
                     text(profile.connection_mode.to_string())
                 ),
                 self.imported_model_notice(profile, source.as_str()),
-                button("Choose local model…")
-                    .style(button::secondary)
-                    .on_press(Message::Section(Section::Model)),
+                reveal.action(
+                    Setting::ProfileAction(ProfileAction::ChooseImportedModel),
+                    button("Choose local model…")
+                        .style(button::secondary)
+                        .on_press(Message::Section(Section::Model))
+                ),
             ]
             .spacing(10)
             .into();
@@ -656,9 +747,12 @@ impl Editor {
                             && has_choices
                             && (profile.model_mode == ModelMode::Manual || automatic_lm_studio))
                             .then_some(discovered),
-                        button("Load models")
-                            .style(button::secondary)
-                            .on_press_maybe(editable.then_some(Message::Discover)),
+                        reveal.action(
+                            Setting::ProfileAction(ProfileAction::LoadModels),
+                            button("Load models")
+                                .style(button::secondary)
+                                .on_press_maybe(editable.then_some(Message::Discover))
+                        ),
                     ]
                     .spacing(6)
                     .wrap(),
@@ -696,7 +790,7 @@ impl Editor {
             .java_embedded_model
             .as_ref()
             .filter(|_| profile.restore_review);
-        let can_select = editable && !models.loading && (imported.is_none() || backend_supported);
+        let can_select = self.can_select_managed_model(profile, editable);
         let model: Element<'_, Message> = if can_select {
             super::picker::escape_dismissible(
                 pick_list(models.choices.as_slice(), selected, |choice| {
@@ -733,19 +827,27 @@ impl Editor {
                 ProfileSetting::ManagedModel,
                 row![
                     model,
-                    button("Refresh models")
-                        .style(button::secondary)
-                        .on_press_maybe(can_select.then_some(Message::RefreshManagedModels)),
+                    reveal.action(
+                        Setting::ProfileAction(ProfileAction::RefreshManagedModels),
+                        button("Refresh models")
+                            .style(button::secondary)
+                            .on_press_maybe(can_select.then_some(Message::RefreshManagedModels))
+                    ),
                 ]
                 .spacing(6)
                 .wrap(),
             ),
             text(status).size(13),
             imported.filter(|_| backend_supported).map(|_| {
-                button("Confirm model and review profile").on_press_maybe(
-                    selected
-                        .filter(|_| can_select && self.imported_model_review.is_none())
-                        .map(|choice| Message::ConfirmImportedModel(profile.id, choice.id.clone())),
+                reveal.action(
+                    Setting::ProfileAction(ProfileAction::ConfirmImportedModel),
+                    button("Confirm model and review profile").on_press_maybe(
+                        selected
+                            .filter(|_| can_select && self.imported_model_review.is_none())
+                            .map(|choice| {
+                                Message::ConfirmImportedModel(profile.id, choice.id.clone())
+                            }),
+                    ),
                 )
             }),
             selected.filter(|choice| choice.vision).map(|_| field(

@@ -224,6 +224,7 @@ pub(super) fn view(
     palette: Option<Palette>,
     now: Instant,
     reduced_motion: bool,
+    has_archive: bool,
 ) -> Element<'_, AgentMessage> {
     render(
         run.into(),
@@ -231,7 +232,8 @@ pub(super) fn view(
         Trace::live(run, now, reduced_motion),
         status,
         palette,
-        || super::controls(run),
+        has_archive,
+        || super::controls(run, has_archive),
     )
 }
 
@@ -241,6 +243,7 @@ pub(super) fn render<'a>(
     trace: Trace<'a>,
     status: Status,
     palette: Option<Palette>,
+    has_archive: bool,
     controls: impl Fn() -> Element<'a, AgentMessage>,
 ) -> Element<'a, AgentMessage> {
     let accent = palette.map(|palette| palette.accent.color());
@@ -529,7 +532,9 @@ pub(super) fn render<'a>(
     };
     let drawer = run.presentation.drawer;
     let simple = matches!(status, Status::Steps | Status::Pill);
-    let action_menu = trace.run.and_then(super::actions::run_menu);
+    let action_menu = trace
+        .run
+        .and_then(|run| super::actions::run_menu(run, has_archive));
     let mut panel = column![header, usage_label(run, palette), action_menu].spacing(5);
     if drawer && !simple {
         if matches!(status, Status::Spotlight | Status::Toasts | Status::Orbit) {

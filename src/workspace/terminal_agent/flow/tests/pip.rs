@@ -97,6 +97,7 @@ struct LogTableLayout {
     grid: Option<(Rectangle, Vector)>,
     labels: Vec<(Rectangle, String)>,
     step_actions: Option<Rectangle>,
+    detail_editor: Option<Rectangle>,
 }
 
 impl Operation for LogTableLayout {
@@ -124,6 +125,9 @@ impl Operation for LogTableLayout {
     fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
         if id == Some(&Id::new("agent-log-step-actions")) {
             self.step_actions = Some(bounds);
+        }
+        if id == Some(&Id::new("agent-log-detail-editor")) {
+            self.detail_editor = Some(bounds);
         }
     }
 }
@@ -163,7 +167,10 @@ fn keyboard_log_view(fixture: &Fixture, size: Size) -> Element<'_, Desktop> {
             .height(iced::Length::Fill)
             .into(),
         |key, modifiers| {
-            (matches!(key, keyboard::Key::Named(Named::Tab | Named::Enter))
+            (matches!(
+                key,
+                keyboard::Key::Named(Named::Tab | Named::Enter | Named::ContextMenu)
+            ) || *key == keyboard::Key::Named(Named::F10) && modifiers == Modifiers::SHIFT
                 || *key == keyboard::Key::Named(Named::F6)
                     && modifiers == Modifiers::CTRL | Modifiers::SHIFT)
                 .then_some(Desktop::Noop)
@@ -464,11 +471,10 @@ fn focused_agent_log_table_gets_keys_before_the_embedded_terminal() {
     );
     let mut layout = LogTableLayout::default();
     ui.operate(&renderer, &mut layout);
-    assert!(
-        layout
-            .labels
-            .iter()
-            .any(|(_, label)| label == "selected result")
+    assert!(layout.detail_editor.is_some());
+    assert_eq!(
+        fixture.run(id).log_detail_fixture().unwrap().0,
+        "selected result"
     );
     let mut messages = Vec::new();
     let _ = ui.update(
@@ -487,9 +493,370 @@ fn focused_agent_log_table_gets_keys_before_the_embedded_terminal() {
     assert_eq!(fixture.run(id).epoch, epoch);
 }
 
+fn click_log_label(
+    ui: &mut UserInterface<'_, Desktop, iced::Theme, Renderer>,
+    renderer: &mut Renderer,
+    label: &str,
+    button: mouse::Button,
+) -> Vec<Desktop> {
+    let mut layout = LogTableLayout::default();
+    ui.operate(renderer, &mut layout);
+    let position = layout
+        .labels
+        .iter()
+        .find(|(_, text)| text == label)
+        .unwrap_or_else(|| panic!("missing log table label {label}"))
+        .0
+        .center();
+    let mut messages = Vec::new();
+    let _ = ui.update(
+        &[
+            Event::Mouse(mouse::Event::CursorMoved { position }),
+            Event::Mouse(mouse::Event::ButtonPressed(button)),
+            Event::Mouse(mouse::Event::ButtonReleased(button)),
+        ],
+        mouse::Cursor::Available(position),
+        renderer,
+        &mut clipboard::Null,
+        &mut messages,
+    );
+    messages
+}
+
+#[test]
+fn docked_log_answer_context_menu_copies_the_selected_run_answer() {
+    use design::log_table::{Message as LogMessage, Row, Surface};
+
+    let mut fixture = Fixture::new(false, false);
+    fixture.workspace.clipboard.policy.internal = true;
+    let id = fixture.open(Mode::Ask);
+    let run = fixture.run_mut(id);
+    run.design.arrangement = Arrangement::Normal;
+    run.design.history = History::LogTable;
+    run.design.status = Status::Hidden;
+    run.goal = "Inspect the fixture".into();
+    run.next(Phase::Thinking, "Fixture activity");
+    let answer = "Reviewed fixture answer";
+    run.inline_decision(&engine::Action::Done, "Finished", answer);
+    run.next(Phase::Finished, "Finished");
+
+    let size = Size::new(760.0, 540.0);
+    let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
+    let mut ui = UserInterface::build(
+        keyboard_log_view(&fixture, size),
+        size,
+        Cache::default(),
+        &mut renderer,
+    );
+    let mut messages = click_log_label(&mut ui, &mut renderer, answer, mouse::Button::Right);
+    let cache = ui.into_cache();
+    assert!(matches!(
+        messages.as_slice(),
+        [Desktop::TerminalAgent(run, Message::Design(design::Message::LogTable(
+            LogMessage::OpenMenu(Surface::Pane, Some(Row::Answer), _)
+        )))] if *run == id
+    ));
+    no_task(fixture.workspace.update(messages.remove(0)));
+
+    let mut ui = UserInterface::build(
+        keyboard_log_view(&fixture, size),
+        size,
+        cache,
+        &mut renderer,
+    );
+    let mut messages = click_log_label(&mut ui, &mut renderer, "Copy answer", mouse::Button::Left);
+    drop(ui);
+    assert!(matches!(
+        messages.as_slice(),
+        [Desktop::TerminalAgent(run, Message::DesignAction(action))]
+        if *run == id && action.label() == "Copy answer"
+    ));
+    let _ = fixture.workspace.update(messages.remove(0));
+    assert_eq!(
+        fixture.workspace.clipboard.buffer.get().as_deref(),
+        Some(answer),
+    );
+}
+
+#[test]
+fn docked_log_run_menu_reopens_the_exact_archived_run() {
+    let mut fixture = Fixture::new(false, false);
+    let archived_id = fixture.open(Mode::Ask);
+    let archived = fixture.run_mut(archived_id);
+    archived.started_order = 1;
+    archived.goal = "Inspect previous result".into();
+    archived.next(Phase::Thinking, "");
+    archived.inline_decision(&engine::Action::Done, "Finished", "Earlier answer");
+    archived.next(Phase::Finished, "Finished");
+    let _ = fixture.send(archived_id, Message::Close);
+    let stream = fixture.workspace.sessions[&fixture.session].stream_generation;
+    assert_eq!(
+        fixture
+            .workspace
+            .finished_agent_run_choices(fixture.session, stream),
+        [archived_id],
+    );
+
+    let current_id = fixture.open(Mode::Ask);
+    let current = fixture.run_mut(current_id);
+    current.started_order = 2;
+    current.goal = "Inspect current result".into();
+    current.design.arrangement = Arrangement::Normal;
+    current.design.history = History::LogTable;
+    current.design.status = Status::Hidden;
+    current.next(Phase::Thinking, "");
+    current.inline_decision(&engine::Action::Done, "Finished", "Current answer");
+    let epoch = current.next(Phase::Finished, "Finished");
+
+    let size = Size::new(760.0, 540.0);
+    let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
+    let mut cache = Cache::default();
+    for (label, button) in [
+        ("Current answer", mouse::Button::Right),
+        ("Earlier runs ›", mouse::Button::Left),
+        ("Finished · Inspect previous result", mouse::Button::Left),
+    ] {
+        let mut ui = UserInterface::build(
+            keyboard_log_view(&fixture, size),
+            size,
+            cache,
+            &mut renderer,
+        );
+        let mut messages = click_log_label(&mut ui, &mut renderer, label, button);
+        cache = ui.into_cache();
+        assert_eq!(messages.len(), 1, "{label}");
+        if label.starts_with("Finished ·") {
+            assert!(matches!(
+                messages.as_slice(),
+                [Desktop::TerminalAgent(id, Message::SelectPresentedRun(source_epoch, selected))]
+                if (*id, *source_epoch, *selected) == (current_id, epoch, archived_id)
+            ));
+        }
+        let _ = fixture.workspace.update(messages.remove(0));
+    }
+    let (shown_id, shown) = fixture
+        .workspace
+        .terminal_agents
+        .agent_activity_for_stream(fixture.session, stream)
+        .expect("the terminal presents the reopened run");
+    assert_ne!(shown_id, archived_id);
+    assert_ne!(shown_id, current_id);
+    assert!(shown.reopened_history);
+    assert_eq!(
+        shown.status_transcript().unwrap().0.final_answer,
+        "Earlier answer"
+    );
+}
+
+#[test]
+fn keyboard_opens_the_focused_log_menu_without_leaking_action_key_releases() {
+    use design::log_table::{Key as LogKey, Message as LogMessage, Surface};
+    use iced::event::Status as EventStatus;
+
+    let mut fixture = Fixture::new(false, false);
+    fixture.workspace.clipboard.policy.internal = true;
+    let id = fixture.open(Mode::Ask);
+    let run = fixture.run_mut(id);
+    run.design.arrangement = Arrangement::Normal;
+    run.design.history = History::LogTable;
+    run.design.status = Status::Hidden;
+    run.goal = "Inspect the log".into();
+    let epoch = run.next(Phase::Thinking, "");
+    run.inline_command("first fixture command");
+    run.inline_result(engine::Status::Exited(0), "first fixture result", "");
+    run.inline_command("second fixture command");
+    run.inline_result(engine::Status::Exited(0), "second fixture result", "");
+
+    let size = Size::new(760.0, 540.0);
+    let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
+    let mut cache = Cache::default();
+    let mut key_event = |fixture: &Fixture, input| {
+        let mut ui = UserInterface::build(
+            keyboard_log_view(fixture, size),
+            size,
+            std::mem::take(&mut cache),
+            &mut renderer,
+        );
+        let mut messages = Vec::new();
+        let (_, status) = ui.update(
+            &[input],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        cache = ui.into_cache();
+        (messages, status)
+    };
+    let shift_f10 = || modified_key(Named::F10, Modifiers::SHIFT, false);
+    assert!(matches!(
+        key_event(&fixture, shift_f10()).0.as_slice(),
+        [Desktop::Noop]
+    ));
+    for (input, expected) in [
+        (
+            modified_key(Named::F6, Modifiers::CTRL | Modifiers::SHIFT, false),
+            LogKey::Focus,
+        ),
+        (named_key(Named::End, false), LogKey::Last),
+    ] {
+        let (mut messages, status) = key_event(&fixture, input);
+        assert_eq!(status, [EventStatus::Captured]);
+        assert!(matches!(
+            messages.as_slice(),
+            [Desktop::TerminalAgent(owner, Message::Design(design::Message::LogTable(
+                LogMessage::Navigate(key)
+            )))] if *owner == id && *key == expected
+        ));
+        let _ = fixture.workspace.update(messages.remove(0));
+    }
+    let (mut messages, status) = key_event(&fixture, shift_f10());
+    assert_eq!(status, [EventStatus::Captured]);
+    assert!(matches!(
+        messages.as_slice(),
+        [Desktop::TerminalAgent(owner, Message::Design(design::Message::LogTable(
+            LogMessage::KeyboardMenu(Surface::Pane, _)
+        )))] if *owner == id
+    ));
+    let _ = fixture.workspace.update(messages.remove(0));
+    assert_eq!(
+        key_event(&fixture, release_key(Named::F10)).1,
+        [EventStatus::Captured]
+    );
+
+    let (mut messages, status) = key_event(&fixture, named_key(Named::Enter, false));
+    assert_eq!(status, [EventStatus::Captured]);
+    assert!(matches!(
+        messages.as_slice(),
+        [Desktop::TerminalAgent(owner, Message::DesignAction(action))]
+        if *owner == id && action.label() == "Copy command"
+    ));
+    let _ = fixture.workspace.update(messages.remove(0));
+    let (messages, status) = key_event(&fixture, release_key(Named::Enter));
+    assert!(messages.is_empty());
+    assert_eq!(status, [EventStatus::Captured]);
+    assert_eq!(
+        fixture.workspace.clipboard.buffer.get().as_deref(),
+        Some("second fixture command")
+    );
+    assert_eq!(fixture.run(id).epoch, epoch);
+}
+
+#[test]
+fn log_detail_editor_copies_a_read_only_selection_and_rechecks_its_full_source() {
+    use crate::terminal_logging::{Redactor, Secrets};
+    use design::log_table::{Message as LogMessage, Row};
+    use iced::widget::text_editor::{Action, Edit, Motion};
+
+    let mut fixture = Fixture::new(false, false);
+    fixture.workspace.clipboard.policy.internal = true;
+    let id = fixture.open(Mode::Ask);
+    let run = fixture.run_mut(id);
+    run.design.history = History::LogTable;
+    run.goal = "Review retained output".into();
+    run.next(Phase::Thinking, "");
+    run.inline_command("fixture output");
+    let source = "αβ fixture-source";
+    run.inline_result(engine::Status::Exited(0), source, "");
+    let step = run.status_transcript().unwrap().0.steps[0].id;
+    no_task(fixture.send(
+        id,
+        Message::Design(design::Message::LogTable(LogMessage::Open(Row::Step(step)))),
+    ));
+    let (_, revision) = fixture.run(id).log_detail_fixture().unwrap();
+
+    let size = Size::new(760.0, 540.0);
+    let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
+    let (mut messages, cache) = {
+        let mut ui = UserInterface::build(
+            fixture.workspace.view(id),
+            size,
+            Cache::default(),
+            &mut renderer,
+        );
+        let mut layout = LogTableLayout::default();
+        ui.operate(&renderer, &mut layout);
+        let cursor = layout
+            .detail_editor
+            .expect("selected details are editable only for selection")
+            .center();
+        let mut messages = Vec::new();
+        let _ = ui.update(
+            &[
+                Event::Mouse(mouse::Event::CursorMoved { position: cursor }),
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            ],
+            mouse::Cursor::Available(cursor),
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        (messages, ui.into_cache())
+    };
+    assert!(matches!(
+        messages.as_slice(),
+        [Desktop::TerminalAgent(owner, Message::SelectLogDetail(key, Action::Click(_)))]
+        if (*owner, *key) == (id, revision)
+    ));
+    no_task(fixture.workspace.update(messages.remove(0)));
+    for action in [
+        Action::Move(Motion::DocumentStart),
+        Action::Edit(Edit::Insert('x')),
+        Action::Select(Motion::Right),
+    ] {
+        no_task(fixture.send(id, Message::SelectLogDetail(revision, action)));
+    }
+    let mut ui = UserInterface::build(fixture.workspace.view(id), size, cache, &mut renderer);
+    let key = keyboard::Key::Character("c".into());
+    let copy = Event::Keyboard(keyboard::Event::KeyPressed {
+        key: key.clone(),
+        modified_key: key,
+        physical_key: key::Physical::Unidentified(key::NativeCode::Unidentified),
+        location: Location::Standard,
+        modifiers: Modifiers::COMMAND,
+        text: None,
+        repeat: false,
+    });
+    let (_, status) = ui.update(
+        &[copy],
+        mouse::Cursor::Unavailable,
+        &mut renderer,
+        &mut clipboard::Null,
+        &mut messages,
+    );
+    assert_eq!(status, [iced::event::Status::Captured]);
+    drop(ui);
+    let [Desktop::TerminalAgent(owner, Message::DesignAction(copy))] = messages.as_slice() else {
+        panic!("the native editor must route Copy through the Agent action");
+    };
+    assert_eq!(*owner, id);
+    assert_eq!(copy.label(), "Copy selected");
+    let copy = *copy;
+    let _ = fixture.send(id, Message::DesignAction(copy));
+    assert_eq!(
+        fixture.workspace.clipboard.buffer.get().as_deref(),
+        Some("α")
+    );
+
+    let secrets = Secrets::default();
+    secrets.add(source);
+    fixture.run_mut(id).redactor =
+        Redactor::for_journal(secrets.seal().unwrap(), Default::default());
+    fixture.workspace.clipboard.buffer.set("unchanged".into());
+    no_task(fixture.send(id, Message::DesignAction(copy)));
+    assert_eq!(
+        fixture.workspace.clipboard.buffer.get().as_deref(),
+        Some("unchanged")
+    );
+}
+
 #[test]
 fn narrow_detached_log_table_scrolls_to_the_exact_step_and_keeps_actions_in_view() {
+    use design::log_table::{Message as LogMessage, Surface};
+
     let mut fixture = Fixture::new(false, false);
+    fixture.workspace.clipboard.policy.internal = true;
     let id = fixture.open(Mode::Ask);
     let run = fixture.run_mut(id);
     run.design.arrangement = Arrangement::Normal;
@@ -575,25 +942,104 @@ fn narrow_detached_log_table_scrolls_to_the_exact_step_and_keeps_actions_in_view
             ui.into_cache(),
         )
     };
-    let [Desktop::TerminalAgent(window, Message::PipOwned(owned, _))] = messages.as_slice() else {
+    let [Desktop::TerminalAgent(window, Message::PipOwned(owned, message))] = messages.as_slice()
+    else {
         panic!("the row click should be routed through the detached run");
     };
     assert_eq!(*window, detached);
     assert_eq!(*owned, id);
+    assert!(matches!(
+        message.as_ref(),
+        Message::Design(design::Message::LogTable(LogMessage::OpenMenu(
+            Surface::Detached,
+            Some(_),
+            _
+        )))
+    ));
     for message in messages {
         no_task(fixture.workspace.update(message));
     }
+    {
+        let mut activity = UserInterface::build(
+            fixture.workspace.view(id),
+            size,
+            Cache::default(),
+            &mut renderer,
+        );
+        let mut messages = Vec::new();
+        let _ = activity.update(
+            &[named_key(Named::Enter, false)],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        assert!(
+            !messages.iter().any(|message| matches!(
+                message,
+                Desktop::TerminalAgent(_, Message::DesignAction(_))
+            ))
+        );
+    }
+    let mut cache = cache;
+    for (key, expected_action) in [
+        (Named::ArrowDown, None),
+        (Named::Enter, Some("Copy output")),
+        (Named::ContextMenu, None),
+        (Named::Escape, None),
+        (Named::Enter, None),
+    ] {
+        let mut ui =
+            UserInterface::build(fixture.workspace.view(detached), size, cache, &mut renderer);
+        let mut messages = Vec::new();
+        let _ = ui.update(
+            &[named_key(key, false), release_key(key)],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        cache = ui.into_cache();
+        let [Desktop::TerminalAgent(window, Message::PipOwned(owned, message))] =
+            messages.as_slice()
+        else {
+            panic!("the menu key should go to its detached run");
+        };
+        assert_eq!((*window, *owned), (detached, id));
+        match expected_action {
+            Some(label) => {
+                let Message::DesignAction(action) = message.as_ref() else {
+                    panic!("the context menu should select the step action");
+                };
+                assert_eq!(action.label(), label);
+            }
+            None => assert!(matches!(
+                message.as_ref(),
+                Message::Design(design::Message::LogTable(
+                    LogMessage::SelectMenuItem(1)
+                        | LogMessage::Navigate(_)
+                        | LogMessage::KeyboardMenu(Surface::Detached, _)
+                        | LogMessage::CloseMenu
+                ))
+            )),
+        }
+        let _ = fixture.workspace.update(messages.remove(0));
+    }
+    assert_eq!(
+        fixture.workspace.clipboard.buffer.get().as_deref(),
+        Some(expected.as_str()),
+    );
     let mut ui = UserInterface::build(fixture.workspace.view(detached), size, cache, &mut renderer);
     let mut layout = LogTableLayout::default();
     ui.operate(&renderer, &mut layout);
-    for label in [expected.as_str(), "Close details"] {
-        assert!(
-            layout.labels.iter().any(|(bounds, text)| {
-                text == label && bounds.x >= 0.0 && bounds.x + bounds.width <= size.width
-            }),
-            "{label} must fit in the narrow details pane"
-        );
-    }
+    assert_eq!(fixture.run(id).log_detail_fixture().unwrap().0, expected);
+    let editor = layout
+        .detail_editor
+        .expect("the selected output has a read-only editor");
+    assert!(editor.x >= 0.0 && editor.x + editor.width <= size.width);
+    assert!(layout.labels.iter().any(|(bounds, text)| {
+        text == "Close details" && bounds.x >= 0.0 && bounds.x + bounds.width <= size.width
+    }));
     let actions = layout.step_actions.expect("the selected step has actions");
     assert!(actions.x >= 0.0 && actions.x + actions.width <= size.width);
     let mut messages = Vec::new();

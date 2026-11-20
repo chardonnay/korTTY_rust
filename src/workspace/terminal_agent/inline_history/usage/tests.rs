@@ -75,7 +75,7 @@ fn agent_log_table_keeps_the_decision_row_and_clears_unreported_requests() {
     assert!(first.tokens.is_none());
     let (id, time) = (first.id, first.recorded_at);
     assert!(time.is_some());
-    assert!(labels(design::history_view(&run, None, true)).contains("… Running"));
+    assert!(labels(design::history_view(&run, None, true, None)).contains("… Running"));
 
     let mut attempt = attempts()[0].clone();
     attempt.outcome = AttemptOutcome::Completed;
@@ -313,11 +313,11 @@ fn expand_all_shows_older_details_in_each_selectable_history() {
         run.design.history = history;
         run.presentation.activity.expand_all = false;
         assert!(
-            !labels(design::history_view(&run, None, true)).contains("Older detail"),
+            !labels(design::history_view(&run, None, true, None)).contains("Older detail"),
             "{history}"
         );
         run.presentation.activity.expand_all = true;
-        let labels = labels(design::history_view(&run, None, true));
+        let labels = labels(design::history_view(&run, None, true, None));
         assert!(
             labels.contains("Older detail") && labels.contains("Newer detail"),
             "{history}"
@@ -332,7 +332,7 @@ fn every_native_history_and_visible_status_presents_real_attempt_metadata() {
     run.phase = Phase::Finished;
     for history in DesignHistory::ALL {
         run.design.history = history;
-        let text = labels(design::history_view(&run, None, true));
+        let text = labels(design::history_view(&run, None, true, None));
         assert!(
             text.contains("Reported tokens · 30 input · 10 output · 40 total"),
             "{history}"
@@ -364,7 +364,7 @@ fn every_native_history_and_visible_status_presents_live_repair_before_completio
     assert!(run.model_repair_started(run.epoch, &attempts()[0]));
     for history in DesignHistory::ALL {
         run.design.history = history;
-        let text = labels(design::history_view(&run, None, true));
+        let text = labels(design::history_view(&run, None, true, None));
         assert!(text.contains("AI response repair · Running"), "{history}");
         assert!(
             text.contains("Repairing the AI response format."),
@@ -407,7 +407,7 @@ fn failed_and_cancelled_partial_usage_stays_visible_without_inventing_a_total() 
     let update = run.inline_update(false).unwrap();
     assert!(update.transcript.tokens.is_none());
     assert_eq!(update.transcript.steps[1].state, StepState::Cancelled);
-    let text = labels(design::history_view(&run, None, true));
+    let text = labels(design::history_view(&run, None, true, None));
     assert!(text.contains("0 input · output unavailable · total unavailable"));
     assert!(text.contains("28 total (reported subtotal; 1/2 attempts)"));
     assert!(text.contains("AI response repair · Cancelled"));
@@ -438,7 +438,7 @@ fn compact_native_history_keeps_most_space_for_transcript_below_usage() {
     for height in [48.0, 72.0, 120.0, 320.0, 600.0] {
         let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
         let mut ui = UserInterface::build(
-            design::history_view(&run, None, true),
+            design::history_view(&run, None, true, None),
             Size::new(300.0, height),
             Cache::default(),
             &mut renderer,

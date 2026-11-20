@@ -22,14 +22,22 @@ impl Workspace {
         message: Message,
     ) -> Task<Desktop> {
         if let Message::Design(message) = message {
-            if let design::Message::LogTable(design::log_table::Message::Navigate(key)) = message {
-                return run.navigate_agent_log(key);
+            use design::log_table::Message as LogMessage;
+            if let design::Message::LogTable(
+                navigation @ (LogMessage::Navigate(_) | LogMessage::KeyboardMenu(..)),
+            ) = message
+            {
+                return run.navigate_agent_log(navigation);
             }
             run.presentation.update(message, run.activity.len());
             return Task::none();
         }
         if matches!(message, Message::InlineDetails) {
             run.toggle_inline_details();
+            return Task::none();
+        }
+        if let Message::SelectLogDetail(revision, action) = message {
+            run.select_log_detail(revision, action);
             return Task::none();
         }
         if let Message::History(history) = message {

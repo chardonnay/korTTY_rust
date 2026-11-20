@@ -22,6 +22,7 @@ pub enum Item {
     CopyCommand,
     CopyOutput,
     CopyEntry,
+    CopyDetail(u64),
     Snippet,
 }
 
@@ -43,6 +44,7 @@ impl Item {
             Self::CopyCommand => "Copy command",
             Self::CopyOutput => "Copy output",
             Self::CopyEntry => "Copy entry",
+            Self::CopyDetail(_) => "Copy selected",
             Self::Snippet => "Open in Snippet Editor…",
         }
     }
@@ -72,18 +74,19 @@ fn answer(run: &Run) -> Option<&str> {
     (!answer.is_empty()).then_some(answer)
 }
 
-fn run_items(run: &Run) -> Vec<Item> {
+fn run_items(run: &Run, has_archive: bool) -> Vec<Item> {
     let mut choices = Vec::new();
     if run.can_generate_workflow() {
         choices.push(Item::Workflow);
     }
-    if run.phase.finished() {
-        if !run.binding.private() && run.activity_export.available() {
-            choices.extend([Item::ExportRun, Item::ExportAll]);
-        }
-        if run.profile().is_some() {
-            choices.push(Item::Repeat);
-        }
+    if run.can_export_activity(activity_export::Scope::This, has_archive) {
+        choices.push(Item::ExportRun);
+    }
+    if run.can_export_activity(activity_export::Scope::All, has_archive) {
+        choices.push(Item::ExportAll);
+    }
+    if run.phase.finished() && run.profile().is_some() {
+        choices.push(Item::Repeat);
     }
     if (run.phase.finished() || run.phase == Phase::PlanReady) && answer(run).is_some() {
         choices.push(Item::CopyAnswer);
@@ -94,24 +97,45 @@ fn run_items(run: &Run) -> Vec<Item> {
     choices
 }
 
-pub(super) fn run_menu(run: &Run) -> Option<Element<'static, Message>> {
-    let choices = run_items(run);
-    let epoch = run.epoch;
+pub(super) fn run_menu(run: &Run, has_archive: bool) -> Option<Element<'static, Message>> {
+    let choices = run_actions(run, has_archive);
     (!choices.is_empty()).then(|| {
-        pick_list(choices, None::<Item>, move |item| {
-            Message::DesignAction(Action {
-                epoch,
-                step: None,
-                item,
-            })
-        })
-        .placeholder("Run actions")
-        .text_size(12)
-        .into()
+        pick_list(choices, None::<Action>, Message::DesignAction)
+            .placeholder("Run actions")
+            .text_size(12)
+            .into()
     })
 }
 
 pub(super) fn step_menu(run: &Run, step: &Step) -> Element<'static, Message> {
+    pick_list(
+        step_actions(run, step),
+        None::<Action>,
+        Message::DesignAction,
+    )
+    .placeholder("Step actions")
+    .text_size(12)
+    .into()
+}
+
+impl fmt::Display for Action {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.item.fmt(f)
+    }
+}
+
+pub(super) fn run_actions(run: &Run, has_archive: bool) -> Vec<Action> {
+    run_items(run, has_archive)
+        .into_iter()
+        .map(|item| Action {
+            epoch: run.epoch,
+            step: None,
+            item,
+        })
+        .collect()
+}
+
+pub(super) fn step_actions(run: &Run, step: &Step) -> Vec<Action> {
     let mut choices = Vec::new();
     if step
         .command
@@ -127,14 +151,22 @@ pub(super) fn step_menu(run: &Run, step: &Step) -> Element<'static, Message> {
     if !run.binding.private() {
         choices.push(Item::Snippet);
     }
-    let epoch = run.epoch;
-    let step = Some(step.id);
-    pick_list(choices, None::<Item>, move |item| {
-        Message::DesignAction(Action { epoch, step, item })
+    choices
+        .into_iter()
+        .map(|item| Action {
+            epoch: run.epoch,
+            step: Some(step.id),
+            item,
+        })
+        .collect()
+}
+
+pub(super) fn copy_log_detail(run: &Run, revision: u64) -> Message {
+    Message::DesignAction(Action {
+        epoch: run.epoch,
+        step: None,
+        item: Item::CopyDetail(revision),
     })
-    .placeholder("Step actions")
-    .text_size(12)
-    .into()
 }
 
 impl Workspace {
@@ -152,18 +184,9 @@ impl Workspace {
         if self.current_run_pane(run).is_err() {
             return Vec::new();
         }
-        run_items(run)
+        run_actions(run, self.terminal_agents.has_archived_activity(run))
             .into_iter()
-            .map(|item| {
-                (
-                    id,
-                    Action {
-                        epoch: run.epoch,
-                        step: None,
-                        item,
-                    },
-                )
-            })
+            .map(|action| (id, action))
             .collect()
     }
 
@@ -247,7 +270,13 @@ impl Workspace {
                 let Some(answer) = answer(run) else {
                     return Task::none();
                 };
-                self.copy_agent_design_text(run, &policy, answer)
+                self.copy_agent_design_text(run, &policy, answer, None)
+            }
+            (None, Item::CopyDetail(revision)) => {
+                let Some((source, selected)) = run.log_detail_selection(revision) else {
+                    return Task::none();
+                };
+                self.copy_agent_design_text(run, &policy, &selected, Some(source))
             }
             (
                 Some(step),
@@ -272,7 +301,7 @@ impl Workspace {
                 if item == Item::Snippet {
                     Task::none()
                 } else {
-                    self.copy_agent_design_text(run, &policy, &text)
+                    self.copy_agent_design_text(run, &policy, &text, None)
                 }
             }
             _ => Task::none(),
@@ -284,6 +313,7 @@ impl Workspace {
         run: &Run,
         policy: &ClipboardPolicy,
         text: &str,
+        source: Option<&str>,
     ) -> Task<Desktop> {
         if text.trim().is_empty()
             || !policy.write_allowed
@@ -295,9 +325,18 @@ impl Workspace {
             .ok()
             .and_then(|(_, pane)| self.agent_source_redactor(pane).ok())
             .and_then(|current| {
-                mask::prompt(&run.redactor, text)
-                    .and_then(|text| mask::prompt(&current, &text))
-                    .ok()
+                let mask = |input| {
+                    mask::prompt(&run.redactor, input)
+                        .and_then(|text| mask::prompt(&current, &text))
+                        .ok()
+                };
+                // A selection can intersect only part of a newly masked value.
+                if let Some(source) = source
+                    && mask(source).as_deref() != Some(source)
+                {
+                    return None;
+                }
+                mask(text)
             })
             .map_or_else(Task::none, |text| self.write_clipboard(text))
     }

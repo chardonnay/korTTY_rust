@@ -1575,7 +1575,7 @@ Password sudo is available for a standalone agent on an attached SSH connection.
 
 The same flow works with an isolated SSH worker and in Incognito. The SSH server must allow pseudoterminals and the sudo policy must allow the ticket to be reused. If the ticket expires or sudo rejects an invocation, the run stops. A desktop notice can return to the current password request when Agent notices are enabled.
 
-Use **Export activity…** after a standalone Agent run on an eligible terminal. Choose **This run** or **All retained runs of this terminal** for up to five retained runs of the same terminal stream. Markdown, text, YAML, XML, JSON, PDF and Asciidoctor are available. Reports include the run's token counts and identify incomplete reporting. YAML, XML and JSON also carry structured counters for the retained model attempts. The export applies the current mask and publishes to a new file. Private sessions are ineligible.
+Use **Export activity…** after a standalone Agent run on an eligible terminal. Choose **This run** or **All retained runs of this terminal** for up to five retained runs of the same terminal stream. While another run is active, choose **Export all finished runs…** from **Run actions**. The export review keeps the selection it showed when it opened. Markdown, text, YAML, XML, JSON, PDF and Asciidoctor are available. Reports include the run's token counts and identify incomplete reporting. YAML, XML and JSON also carry structured counters for the retained model attempts. The export applies the current mask and publishes to a new file. Private sessions are ineligible.
 
 **AI → Ask Terminal Agent…** sends the question and any selected terminal text for an advisory answer. **AI → AI Planning…** guides you through clarifying questions, implementation approaches and a final report. The terminal context menu offers Agent, Ask and Planning for the clicked pane. **Save plan** adds the reviewed report to **Saved plans…** for the same destination. Private runs keep their activity in memory. **Implement…** checks the destination again and opens the separate environment-probe approval.
 
@@ -1655,6 +1655,17 @@ Scrolling back, selecting a row, or sorting lets you review earlier activity.
 **Latest activity** clears the selection and sort and returns to the newest row.
 Column headings stay visible while scrolling vertically. Drag a divider to
 adjust the widths.
+
+Right-click a step for actions on that step. Right-click the finished answer
+or open space in the table for run actions. With the live Log Table focused,
+use the **Context Menu** key or an unassigned **Shift+F10** to open actions for
+the selected row. Use the arrow keys to choose an action, **Enter** to select
+it, or **Esc** to close the menu.
+Choose **Earlier runs** in the run menu to switch to another run on this
+terminal or reopen a retained finished run.
+In the live details for a step or answer, select a passage and use
+**Copy selected** or the platform's Copy shortcut. The retained text is
+read-only.
 
 Choose **At the terminal cursor** to show eligible command reviews beside the
 cursor in the active pane. Enter approves once and Esc dismisses the run. Tab

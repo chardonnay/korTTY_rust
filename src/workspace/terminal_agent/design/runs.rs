@@ -10,9 +10,9 @@ use super::super::{Desktop, LiveBinding, Message, Phase, Run, State, Workspace};
 use super::history;
 
 #[derive(Clone, Eq, PartialEq)]
-struct Choice {
-    id: window::Id,
-    label: String,
+pub(super) struct Choice {
+    pub(super) id: window::Id,
+    pub(super) label: String,
 }
 
 impl fmt::Display for Choice {
@@ -84,6 +84,23 @@ impl State {
                 id,
                 label: label(run),
             })
+            .collect()
+    }
+
+    pub(super) fn history_choices(&self, id: window::Id, run: &Run) -> Vec<Choice> {
+        let Ok(source) = run.binding.live() else {
+            return Vec::new();
+        };
+        if self
+            .agent_activity_for_stream(source.session, source.stream)
+            .is_none_or(|(shown, _)| shown != id)
+        {
+            return Vec::new();
+        }
+        self.run_choices(source)
+            .into_iter()
+            .filter(|choice| choice.id != id)
+            .chain(self.finished_choices(source))
             .collect()
     }
 

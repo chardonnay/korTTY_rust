@@ -26,6 +26,15 @@ pub enum Role {
 }
 
 impl Role {
+    pub(super) const ALL: [Self; 6] = [
+        Self::Default,
+        Self::Text,
+        Self::Coding,
+        Self::Agent,
+        Self::Security,
+        Self::Journal,
+    ];
+
     pub(super) fn local(self) -> Option<local::Role> {
         match self {
             Self::Default => None,
@@ -218,18 +227,26 @@ impl Dialog {
         Task::none()
     }
 
+    fn imported_role_hints(&self) -> impl Iterator<Item = (Role, &JavaAiProfileHint)> {
+        self.saved.java_roles.iter().chain(
+            self.saved
+                .imported_journal_summary_profile(false)
+                .map(|hint| (Role::Journal, hint)),
+        )
+    }
+
+    pub(super) fn has_imported_role(&self, role: Role) -> bool {
+        self.imported_role_hints()
+            .any(|(hint_role, _)| hint_role == role)
+    }
+
     pub(super) fn java_roles_view(&self) -> Option<Element<'_, Message>> {
-        let journal = self.saved.imported_journal_summary_profile(false);
-        if self.saved.java_roles.is_empty() && journal.is_none() {
-            return None;
-        }
+        use super::search::{LocalPreference, Setting};
+
+        let mut hints = self.imported_role_hints().peekable();
+        hints.peek()?;
         let mut content = column![text("Imported Java profile roles").size(16)].spacing(6);
-        for (role, hint) in self
-            .saved
-            .java_roles
-            .iter()
-            .chain(journal.map(|hint| (Role::Journal, hint)))
-        {
+        for (role, hint) in hints {
             let profile = self.saved.java_role_profile(role);
             let description = match profile {
                 None => format!(
@@ -253,16 +270,19 @@ impl Dialog {
                 .java_role_target(role)
                 .filter(|profile| self.can_adopt_java_role(role, profile));
             content = content.push(
-                row![
-                    text(description)
-                        .size(13)
-                        .width(Length::Fill)
-                        .wrapping(text::Wrapping::WordOrGlyph),
-                    button("Use imported profile")
-                        .style(button::secondary)
-                        .on_press_maybe(adopt.map(|_| Message::AdoptJavaRole(role))),
-                ]
-                .spacing(8),
+                self.revealed.wrap(
+                    Setting::LocalPreference(LocalPreference::ImportedRole(role)),
+                    row![
+                        text(description)
+                            .size(13)
+                            .width(Length::Fill)
+                            .wrapping(text::Wrapping::WordOrGlyph),
+                        button("Use imported profile")
+                            .style(button::secondary)
+                            .on_press_maybe(adopt.map(|_| Message::AdoptJavaRole(role))),
+                    ]
+                    .spacing(8),
+                ),
             );
         }
         Some(content.into())

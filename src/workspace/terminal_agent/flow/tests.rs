@@ -463,12 +463,82 @@ fn terminal_agent_activity_export_keeps_completed_runs_scoped_and_masked() {
 }
 
 #[test]
+fn terminal_agent_can_export_frozen_archive_while_another_run_is_active() {
+    use std::path::Path;
+
+    use crate::terminal_agent::activity_report::Format;
+    use activity_export::{Message as Export, Scope};
+
+    let mut fixture = Fixture::new(false, false);
+    complete_export_run(&mut fixture, "First retained task");
+    complete_export_run(&mut fixture, "Second retained task");
+    let id = fixture.open(Mode::Ask);
+    let run = fixture.run_mut(id);
+    run.goal = "Currently active task".into();
+    run.activity_export.start();
+    let epoch = run.next(Phase::Thinking, "Waiting for a fixture decision");
+    let stream = fixture.workspace.sessions[&fixture.session].stream_generation;
+    let actions = fixture
+        .workspace
+        .terminal_agent_design_actions(fixture.session, stream);
+    let [(current, export)] = actions.as_slice() else {
+        panic!("an active run should offer only the archive export in this fixture");
+    };
+    assert_eq!(*current, id);
+    assert_eq!(export.label(), "Export all finished runs…");
+    let export = *export;
+
+    let root = fixture.profile.0.canonicalize().unwrap();
+    let review = |fixture: &mut Fixture, path: &Path| {
+        drop(fixture.send(id, Message::DesignAction(export)));
+        for action in [
+            Export::Scope(Scope::This),
+            Export::Format(Format::Json),
+            Export::Path(path.to_str().unwrap().into()),
+        ] {
+            no_task(fixture.send(id, Message::ActivityExport(action)));
+        }
+        assert!(!path.exists());
+    };
+    let publish = |fixture: &mut Fixture, path: &Path| {
+        let worker = fixture.send(id, Message::ActivityExport(Export::Confirm));
+        let write = fixture.send(id, activity_result(worker, id));
+        no_task(fixture.send(id, activity_result(write, id)));
+        let raw = std::fs::read_to_string(path).unwrap();
+        assert!(!raw.contains("fixture-plain-secret"));
+        let report: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let runs = report["runs"].as_array().unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0]["prompt"], "First retained task");
+        assert_eq!(runs[1]["prompt"], "Second retained task");
+    };
+
+    let path = root.join("archive-during-run.json");
+    review(&mut fixture, &path);
+    publish(&mut fixture, &path);
+    assert_eq!(fixture.run(id).epoch, epoch);
+    assert!(fixture.run(id).phase == Phase::Thinking);
+    assert!(!fixture.run(id).cancel.requested());
+
+    let path = root.join("archive-after-settlement.json");
+    review(&mut fixture, &path);
+    let decision = Decision {
+        summary: "Finished".into(),
+        message: "Recently completed answer".into(),
+        action: Action::Done,
+    };
+    drop(fixture.send(id, Message::Decision(epoch, Arc::new(Ok(decision).into()))));
+    assert!(fixture.run(id).phase == Phase::Finished);
+    publish(&mut fixture, &path);
+}
+
+#[test]
 fn terminal_agent_private_activity_never_offers_or_starts_export() {
     use activity_export::Message as Export;
 
     let mut fixture = Fixture::new(false, true);
     let id = complete_export_run(&mut fixture, "Private task");
-    assert!(fixture.run(id).activity_export.view().is_none());
+    assert!(fixture.run(id).activity_export.view(None).is_none());
     no_task(fixture.send(id, Message::ActivityExport(Export::Open)));
     no_task(fixture.send(id, Message::ActivityExport(Export::Confirm)));
     assert!(!fixture.run(id).activity_export.writing());

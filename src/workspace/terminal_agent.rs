@@ -128,6 +128,7 @@ pub enum Message {
     ActivityExport(activity_export::Message),
     Design(design::Message),
     DesignAction(design::Action),
+    SelectLogDetail(u64, iced::widget::text_editor::Action),
     SelectPresentedRun(u64, window::Id),
     DockResize(design::DockResize),
     Zoom(font::View, bool),
@@ -814,6 +815,7 @@ impl Workspace {
                 palette,
                 approvals.remaining,
                 reduced_motion,
+                (state, id),
             )
         };
         Some(if let Some(palette) = palette {
@@ -1277,6 +1279,16 @@ impl Workspace {
         if let Message::Pip(message) = message {
             return self.agent_pip_action(id, message);
         }
+        if matches!(
+            message,
+            Message::DesignAction(_) | Message::SelectPresentedRun(..)
+        ) && let Some(run) = self.terminal_agents.runs.get_mut(&id)
+        {
+            run.presentation.update(
+                design::Message::LogTable(design::log_table::Message::CloseMenu),
+                run.activity.len(),
+            );
+        }
         if let Message::DesignAction(action) = message {
             return self.agent_design_action(id, action);
         }
@@ -1343,6 +1355,7 @@ impl Workspace {
             Message::Start | Message::StartFromShortcut | Message::Implement(_)
         );
         let task = self.agent_action(id, &mut run, message);
+        run.sync_log_detail();
         let started = start_requested && run.epoch != before_epoch && run.active();
         let spotlight_submission = if start_requested {
             run.spotlight_submission.take()
