@@ -146,6 +146,86 @@ fn spotlight_rejects_stale_submit_and_late_history_after_a_privacy_change() {
 }
 
 #[test]
+fn spotlight_departure_releases_input_and_is_discarded_on_privacy_or_motion_change() {
+    let mut fixture = Fixture::with_endpoint(false, false, "127.0.0.1:12345");
+    let (owner, _) = open(&mut fixture);
+    let workspace = &mut fixture.workspace;
+    workspace.window_settings.ai_agent_design_reduced_animations = Some(false);
+    drop(send(
+        workspace,
+        owner,
+        Event::Edit("Review the service".into()),
+    ));
+    let composer = &workspace.terminal_agents.spotlights[&owner];
+    let submission = Submission {
+        owner,
+        tab: composer.tab,
+        source: composer.source,
+    };
+    let stale = composer.message(owner, Event::Submit);
+    drop(send(workspace, owner, Event::Submit));
+    let departure = &workspace.terminal_agents.spotlight_exits[&owner];
+    assert!(!departure.into_pill);
+    assert!(departure.frame(departure.started).is_some());
+    assert!(
+        workspace
+            .agent_spotlight_key(owner, &Key::Named(Named::Escape), Modifiers::empty())
+            .is_none()
+    );
+    drop(workspace.update(stale));
+    assert_eq!(workspace.terminal_agents.runs.len(), 1);
+    workspace.window_settings.ai_agent_design_reduced_animations = Some(true);
+    workspace.revalidate_agent_spotlights();
+    workspace.show_spotlight_departure(submission, true);
+    assert!(workspace.terminal_agents.spotlight_exits.is_empty());
+    workspace.window_settings.ai_agent_design_reduced_animations = Some(false);
+    workspace.show_spotlight_departure(submission, true);
+    assert!(workspace.terminal_agents.spotlight_exits[&owner].into_pill);
+    workspace.active_tab_mut(owner).unwrap().incognito = true;
+    workspace.revalidate_agent_spotlights();
+    assert!(workspace.terminal_agents.spotlight_exits.is_empty());
+}
+
+#[cfg(windows)]
+#[test]
+fn direct_spotlight_submission_morphs_when_the_owned_run_enters_review() {
+    use crate::terminal_agent::design::Status;
+    use serde_json::json;
+
+    let endpoint = "127.0.0.1:12345";
+    let mut fixture = Fixture::with_endpoint(false, false, endpoint);
+    fixture.workspace.set_test_ai_configuration(serde_json::from_value(json!({
+        "general": {"show_agent_setup": false},
+        "profiles": {
+            "profiles": [{"id": 1, "name": "Fixture", "endpoint": endpoint, "model": "fixture"}],
+            "default": 1,
+            "last_id": 1
+        }
+    })).unwrap());
+    let catalog = &mut fixture.workspace.window_settings.ai_agent_designs;
+    let choice = catalog.duplicate("standard").unwrap();
+    let mut layout = catalog.layout(&choice.id).unwrap();
+    layout.status = Status::Spotlight;
+    catalog.set_layout(&choice.id, layout);
+    assert!(catalog.set_custom_default(&choice.id));
+    let (owner, _) = open(&mut fixture);
+    let workspace = &mut fixture.workspace;
+    let profile = workspace.terminal_agents.spotlights[&owner].profiles[1].clone();
+    drop(send(workspace, owner, Event::Profile(profile)));
+    drop(send(
+        workspace,
+        owner,
+        Event::Edit("Inspect the service".into()),
+    ));
+    drop(send(workspace, owner, Event::Submit));
+    let run = workspace.terminal_agents.runs.values().next().unwrap();
+    assert!(run.started_order > 0 && run.active());
+    assert!(run.spotlight_submission.is_none());
+    assert!(run.commands.is_empty());
+    assert!(workspace.terminal_agents.spotlight_exits[&owner].into_pill);
+}
+
+#[test]
 fn spotlight_field_captures_history_enter_and_escape() {
     let mut fixture = Fixture::with_endpoint(false, false, "127.0.0.1:12345");
     let (owner, _) = open(&mut fixture);

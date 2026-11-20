@@ -16,6 +16,19 @@ open until a result is recorded for the tested revision and environment. Both
 Mosh modes are out of scope. The editor has a reduced native scope with structure
 navigation for classes, functions, variables, and placeholders.
 
+## November 20 Logfile Manager folder discovery
+
+The catalogue scans existing log folders from saved SSH connections before
+their first logging session, including connections with capture disabled.
+It merges configured, manually added and logger-discovered folders by
+canonical path. Only exclusively manual folders can be forgotten. Older
+Rust registries stored both origins in `folders`; those entries retain
+manual status until a saved connection or a later capture establishes
+another origin. Forgetting removes the registry entry and preserves the
+logs. Native desktop acceptance is open.
+[Java log catalogue](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/core/TerminalLogCatalog.java)
+· [Rust log catalogue](src/logfile_window/catalog.rs)
+
 ## November 20 terminal Agent Spotlight and status
 
 The worktree on PR #11's merge (`646283d0`) adds **View → AI Agent Panel →
@@ -74,9 +87,93 @@ Selecting a run restores a dismissed status or PiP panel. A new run or
 pending input takes precedence over that selection.
 [Native run selection](src/workspace/terminal_agent/design/runs.rs)
 
-Reopening archived runs after the Activity window closes still needs a
-Java comparison. Spotlight's animated transition, Toast entry/exit animation
-and interactive desktop checks remain open.
+### Spotlight entry and submission
+
+Spotlight fades in over 140 ms and scales from 96% over 160 ms. When a
+direct submission starts a run with a Spotlight pill, the card fades and
+shrinks toward the pill over 420 ms. Submission into the separate setup, or
+a run with another status, fades over 220 ms. The departing card has no
+prompt, history or input controls. Closing with Escape is immediate. Pane
+changes, loss of eligibility and reduced motion discard the departing card.
+The Settings replay uses the same motion with the sample prompt.
+[Java Spotlight](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignSpotlight.java)
+· [Native Spotlight transitions](src/workspace/terminal_agent/spotlight/motion.rs)
+
+Windows ARM64 passed 192 targeted Terminal Agent and Settings design tests
+with two ignored. The Spotlight cases cover timing and geometry, direct
+entry into review, focus release, stale submit rejection and cancellation of
+the departure on privacy and motion preference changes.
+[Windows design tests](target/verification/20261120-spotlight-motion-design-tests.log)
+
+### Toast transitions and finished-run retention
+
+The Toast status and Settings preview share a clipped slide-in and fade.
+Ordinary notices enter over 260 ms, count down for four seconds, fade over
+220 ms and collapse over 160 ms. Pending review slides into view and stays
+available through the existing review action. Reduced motion uses a static
+notice for four seconds and leaves pending review visible.
+[Java Toasts](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignToasts.java)
+· [Native transitions](src/workspace/terminal_agent/design/toast.rs)
+
+The serial Windows ARM64 workspace suite passed 4,550 tests with 96
+ignored. The Toast tests cover entry, expiry, fade and collapse boundaries,
+reduced motion and pointer clipping in the native widget tree.
+Formatting and strict workspace Clippy passed.
+[Windows tests](target/verification/20261120-agent-toast-workspace-tests.log)
+· [Windows Clippy](target/verification/20261120-agent-toast-final-clippy.log)
+
+Java keeps five finished runs per pane in its registry and trace map. Rust
+keeps up to five completed, closed Activity windows per non-private stream
+in memory. The terminal context menu can reopen them without an active
+run. Status and history choosers, including PiP, can reopen them alongside
+a current run. Reopening creates a new Activity window from the masked
+transcript, report and completed evidence, without its transport or
+approvals. Pane close, reconnect and a change of privacy discard the
+retained history. Interactive desktop checks remain open.
+[Java design host](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignHost.java)
+· [Rust finished runs](src/workspace/terminal_agent/finished_runs.rs)
+
+The native Windows ARM64 Terminal Agent and context-menu test selection
+passed 197 tests with two ignored. The retention tests cover restoration
+from a live chooser and an empty pane, eviction, renewed masking of
+late-learned secrets, stale stream rejection and privacy revocation.
+Workspace formatting and strict Clippy passed.
+[Windows tests](target/verification/20261120-finished-agent-runs-worktree-tests.log)
+
+The Windows ARM64 development build of the Spotlight, Toast and closed-run
+changes started successfully with an isolated profile and a local shell.
+The Settings window was not opened during the session, so the visual and
+interaction checks remain open.
+[Native startup record](target/verification/20261120-agent-native-desktop.log)
+
+### AI Manager Knowledge Stores search
+
+Search can reveal the new store name, Create store, Update index and Rebuild
+index controls on Knowledge Stores. It preserves an existing selection and
+selects the first available store for an index action when needed. The search
+only reveals the control. The index results are omitted when there is no
+store. Windows ARM64 passed 13 targeted tests, including a widget-tree check
+that Update index scrolls into view without changing the store.
+[Windows search tests](target/verification/20261120-knowledge-search-tests.log)
+
+### AI Manager search across Local Models, Memory and Skills
+
+The manager indexes 40 additional controls across the main Local Models,
+Memory and Skills surfaces. This covers local setup and model discovery,
+signed runtime paths and actions, memory settings and tools, and skill
+library actions and editor fields. A result reveals the existing control
+without invoking its action. Skill editor results require the current
+form. Memory controls follow the active policy and document review state.
+Opening an editable runtime path or memory budget from search defers the
+unrelated inventory or document reload that would disable the field.
+
+Windows ARM64 passed 353 AI Manager tests with ten ignored. The focus
+regression covers a signed runtime path, the memory token budget, and a
+skill name with document Find still open. Workspace formatting and strict
+Clippy passed. Provider-specific and nested controls and interactive
+desktop verification remain open.
+[Windows tests](target/verification/20261120-manager-control-search-verified-tests.log)
+· [Windows Clippy](target/verification/20261120-manager-control-search-verified-clippy.log)
 
 ## November 19 Java release source comparison
 

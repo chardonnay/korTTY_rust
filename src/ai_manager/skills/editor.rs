@@ -15,6 +15,7 @@ use crate::ai_manager::profiles::picker::DismissOnEscape as _;
 use crate::local_ai;
 
 use super::{MAX_SKILL_BYTES, Skill, Store, Target, markdown, shorten};
+use crate::ai_manager::search::{Control, Reveal, Setting};
 
 mod chooser;
 mod external;
@@ -228,6 +229,19 @@ impl Editor {
 
     pub(in crate::ai_manager) fn file_prompt_open(&self) -> bool {
         self.file.is_some() || self.external.is_some() || self.statistics.is_some()
+    }
+
+    pub(in crate::ai_manager) fn has_search_control(&self, control: Control) -> bool {
+        self.external.is_none()
+            && self.statistics.is_none()
+            && self.chooser.is_none()
+            && self.file != Some(FileAction::Export)
+            && (!control.skill_form()
+                || (self.form.is_some()
+                    && self.file.is_none()
+                    && self.shortening.is_none()
+                    && self.proposal.is_none()
+                    && self.confirmation.is_none()))
     }
 
     pub(in crate::ai_manager) fn find_open(&self) -> bool {
@@ -834,6 +848,7 @@ impl Editor {
         &'a self,
         store: &'a Store,
         shorten_available: bool,
+        reveal: &'a Reveal,
     ) -> Element<'a, Message> {
         if let Some(panel) = &self.statistics {
             return panel
@@ -877,36 +892,56 @@ impl Editor {
         if self.file == Some(FileAction::Export) {
             return self.export_view(store);
         }
+        let action = |control, button| reveal.action(Setting::Control(control), button);
+        let option = |control, checkbox| reveal.action(Setting::Control(control), checkbox);
         let header = row![
-            checkbox(store.enabled)
-                .label("Enable AI skills")
-                .on_toggle(Message::EnableLibrary),
-            checkbox(store.auto_detect)
-                .label("Automatically select relevant skills")
-                .on_toggle(Message::AutoDetect),
-            checkbox(
-                self.skill_creation_override
-                    .unwrap_or(store.learned_rules_enabled)
-            )
-            .label("Allow saving learned rules in skills")
-            .on_toggle_maybe(
-                self.skill_creation_override
-                    .is_none()
-                    .then_some(Message::LearnedRulesEnabled)
+            option(
+                Control::SkillsEnabled,
+                checkbox(store.enabled)
+                    .label("Enable AI skills")
+                    .on_toggle(Message::EnableLibrary)
             ),
-            checkbox(self.show_hidden)
-                .label("Show hidden")
-                .on_toggle(Message::ShowHidden),
-            checkbox(store.statistics_enabled(self.statistics_policy))
-                .label("Record local skill statistics")
+            option(
+                Control::SkillAutoSelect,
+                checkbox(store.auto_detect)
+                    .label("Automatically select relevant skills")
+                    .on_toggle(Message::AutoDetect)
+            ),
+            option(
+                Control::LearnInSkills,
+                checkbox(
+                    self.skill_creation_override
+                        .unwrap_or(store.learned_rules_enabled)
+                )
+                .label("Allow saving learned rules in skills")
                 .on_toggle_maybe(
-                    self.statistics_policy
+                    self.skill_creation_override
                         .is_none()
-                        .then_some(Message::UsageStatistics)
-                ),
-            button("Skill statistics…").on_press_maybe(
-                (self.statistics_root.is_some() && !self.pending_edit() && !self.busy())
-                    .then_some(Message::Statistics(statistics_view::Message::Open))
+                        .then_some(Message::LearnedRulesEnabled)
+                )
+            ),
+            option(
+                Control::ShowHiddenSkills,
+                checkbox(self.show_hidden)
+                    .label("Show hidden")
+                    .on_toggle(Message::ShowHidden)
+            ),
+            option(
+                Control::SkillUsage,
+                checkbox(store.statistics_enabled(self.statistics_policy))
+                    .label("Record local skill statistics")
+                    .on_toggle_maybe(
+                        self.statistics_policy
+                            .is_none()
+                            .then_some(Message::UsageStatistics)
+                    )
+            ),
+            action(
+                Control::SkillStatistics,
+                button("Skill statistics…").on_press_maybe(
+                    (self.statistics_root.is_some() && !self.pending_edit() && !self.busy())
+                        .then_some(Message::Statistics(statistics_view::Message::Open))
+                )
             ),
         ]
         .spacing(14)
@@ -998,7 +1033,7 @@ impl Editor {
             .align_y(Alignment::Center),
             scrollable(items).height(Length::Fill),
             row![
-                button("Add").on_press(Message::Add),
+                action(Control::AddSkill, button("Add").on_press(Message::Add)),
                 button("Delete…").on_press_maybe(
                     self.form
                         .as_ref()
@@ -1009,18 +1044,30 @@ impl Editor {
             .spacing(6)
             .wrap(),
             row![
-                button("Import Markdown…").on_press(Message::Import),
-                button("Export Markdown…")
-                    .on_press_maybe((!store.skills.is_empty()).then_some(Message::Export))
+                action(
+                    Control::ImportSkill,
+                    button("Import Markdown…").on_press(Message::Import)
+                ),
+                action(
+                    Control::ExportSkill,
+                    button("Export Markdown…")
+                        .on_press_maybe((!store.skills.is_empty()).then_some(Message::Export))
+                )
             ]
             .spacing(6)
             .wrap(),
             row![
-                button("Import external skills…")
-                    .on_press(Message::External(external::Message::OpenImport)),
-                button("Check external updates…").on_press_maybe(
-                    external::Panel::can_check(store)
-                        .then_some(Message::External(external::Message::OpenUpdates))
+                action(
+                    Control::ImportExternal,
+                    button("Import external skills…")
+                        .on_press(Message::External(external::Message::OpenImport))
+                ),
+                action(
+                    Control::ExternalUpdates,
+                    button("Check external updates…").on_press_maybe(
+                        external::Panel::can_check(store)
+                            .then_some(Message::External(external::Message::OpenUpdates))
+                    )
                 ),
             ]
             .spacing(6)
@@ -1042,7 +1089,7 @@ impl Editor {
         } else if self.importing() {
             self.import_paths_view()
         } else if let Some(form) = &self.form {
-            Self::form_view(form, shorten_available)
+            Self::form_view(form, shorten_available, reveal)
         } else {
             container(text("Select a skill to view or edit it."))
                 .padding(12)
@@ -1153,19 +1200,33 @@ impl Editor {
         .into()
     }
 
-    fn form_view(form: &Form, shorten_available: bool) -> Element<'_, Message> {
+    fn form_view<'a>(
+        form: &'a Form,
+        shorten_available: bool,
+        reveal: &'a Reveal,
+    ) -> Element<'a, Message> {
         let fields = responsive(move |size| {
             // Give the form a finite height inside the scrollable so its editor can fill
             // the remaining space. A minimum keeps the fields usable in compact tabs.
             let minimum = if form.find.is_open() { 560.0 } else { 480.0 };
-            Self::form_fields(form, size.height.max(minimum))
+            Self::form_fields(form, size.height.max(minimum), reveal)
         });
+        let action = |control, button| reveal.action(Setting::Control(control), button);
         let actions = row![
-            button("Apply skill edits").on_press_maybe(form.dirty.then_some(Message::Commit)),
-            button("Revert edits").on_press_maybe(form.dirty.then_some(Message::Revert)),
-            button("Shorten with local AI…").on_press_maybe(
-                (shorten_available && (form.dirty || shorten::available(&form.skill)))
-                    .then_some(Message::Shorten)
+            action(
+                Control::ApplySkill,
+                button("Apply skill edits").on_press_maybe(form.dirty.then_some(Message::Commit))
+            ),
+            action(
+                Control::RevertSkill,
+                button("Revert edits").on_press_maybe(form.dirty.then_some(Message::Revert))
+            ),
+            action(
+                Control::ShortenSkill,
+                button("Shorten with local AI…").on_press_maybe(
+                    (shorten_available && (form.dirty || shorten::available(&form.skill)))
+                        .then_some(Message::Shorten)
+                )
             )
         ]
         .spacing(6)
@@ -1177,7 +1238,11 @@ impl Editor {
             .into()
     }
 
-    fn form_fields(form: &Form, height: f32) -> Element<'_, Message> {
+    fn form_fields<'a>(form: &'a Form, height: f32, reveal: &Reveal) -> Element<'a, Message> {
+        let input = |control, label, input| {
+            let setting = Setting::Control(control);
+            reveal.wrap(setting, field(label, reveal.input(setting, true, input)))
+        };
         let skill = &form.skill;
         let builtin = skill.builtin.as_ref().map(|_| {
             row![
@@ -1193,15 +1258,18 @@ impl Editor {
         let fields = column![
             builtin,
             external::source_view(skill),
-            field(
+            input(
+                Control::SkillName,
                 "Name",
                 text_input("Skill name", &skill.name).on_input(Message::EditName)
             ),
-            field(
+            input(
+                Control::SkillDescription,
                 "Description",
                 text_input("Description", &skill.description).on_input(Message::EditDescription)
             ),
-            field(
+            input(
+                Control::SkillTags,
                 "Tags",
                 text_input("Comma-separated tags", &form.tags).on_input(Message::EditTags)
             ),
@@ -1216,7 +1284,10 @@ impl Editor {
             column![
                 row![
                     text("Skill Markdown").size(13).width(Length::Fill),
-                    button("Find…").on_press(Message::Find(document_find::Message::Open)),
+                    reveal.action(
+                        Setting::Control(Control::FindSkill),
+                        button("Find…").on_press(Message::Find(document_find::Message::Open))
+                    ),
                 ]
                 .align_y(Alignment::Center),
                 form.find.view(Message::Find),
@@ -1237,7 +1308,10 @@ impl Editor {
         .spacing(8)
         .width(Length::Fill)
         .height(height);
-        scrollable(fields).height(Length::Fill).into()
+        scrollable(fields)
+            .id(reveal.viewport.clone())
+            .height(Length::Fill)
+            .into()
     }
 }
 
@@ -1683,7 +1757,8 @@ mod tests {
                     .find
                     .update::<Message>(&mut form.markdown, document_find::Message::Open);
             }
-            let mut view = Editor::form_view(&form, false);
+            let reveal = Reveal::default();
+            let mut view = Editor::form_view(&form, false, &reveal);
             let mut tree = Tree::new(view.as_widget());
             let renderer = Renderer::new(Font::DEFAULT, Pixels(14.0));
 

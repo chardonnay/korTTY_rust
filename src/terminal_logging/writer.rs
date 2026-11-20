@@ -218,7 +218,7 @@ impl Folder {
         if !config.folder.is_empty() {
             let path = config.directory(profile).canonicalize()?;
             let folder = Self::existing(&path)?;
-            catalog::add_folder(profile, &path)?;
+            catalog::remember_logger_folder(profile, &path)?;
             return Ok(folder);
         }
         fs::create_dir_all(profile)?;

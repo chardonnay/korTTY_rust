@@ -6,8 +6,9 @@ use std::time::{Duration, Instant};
 use crate::terminal_agent::design::inline::{Kind, StepState, Transcript};
 
 mod usage;
+pub(in crate::workspace::terminal_agent) use usage::Usage;
 
-pub(super) const TOAST_LIFETIME: Duration = Duration::from_secs(4);
+use super::toast;
 
 #[derive(Default)]
 pub(super) struct StatusVisibility {
@@ -87,7 +88,7 @@ pub(in crate::workspace::terminal_agent) struct Presentation {
     pub(super) dock_resize: Option<(super::DockPreferences, u16)>,
     pub(in crate::workspace::terminal_agent) activity: super::activity::Panel,
     pub(in crate::workspace::terminal_agent) pip: super::pip::Panel,
-    pub(in crate::workspace::terminal_agent) model_usage: usage::Usage,
+    pub(in crate::workspace::terminal_agent) model_usage: Usage,
     first: usize,
     selected: Option<usize>,
     pub(in crate::workspace::terminal_agent) drawer: bool,
@@ -99,6 +100,15 @@ pub(in crate::workspace::terminal_agent) struct Presentation {
 }
 
 impl Presentation {
+    pub(in crate::workspace::terminal_agent) fn reveal_finished(&mut self, finished: Instant) {
+        self.status_visibility.finished(finished);
+        self.status_visibility.show();
+    }
+
+    pub(in crate::workspace::terminal_agent) fn finish_time(&self) -> Option<Instant> {
+        self.status_visibility.finished_at
+    }
+
     pub(in crate::workspace::terminal_agent) fn finished(&mut self, now: Instant) {
         self.status_visibility.finished(now);
     }
@@ -107,9 +117,11 @@ impl Presentation {
         &mut self,
         transcript: &Transcript,
         finished: bool,
+        waiting: bool,
         now: Instant,
     ) {
         self.status_events.sync(transcript, finished, now);
+        self.status_events.track_review(waiting, now);
     }
 
     pub(in crate::workspace::terminal_agent) fn load_activity(
@@ -194,6 +206,7 @@ pub(super) enum Notice {
 pub(super) struct StatusEvents {
     steps: Vec<(u64, Instant)>,
     answer: Option<Instant>,
+    review: Option<Instant>,
 }
 
 impl StatusEvents {
@@ -216,17 +229,30 @@ impl StatusEvents {
     pub(super) fn recent(
         &self,
         now: Instant,
-    ) -> impl DoubleEndedIterator<Item = (Notice, Duration)> {
+        reduced_motion: bool,
+    ) -> impl DoubleEndedIterator<Item = (Notice, toast::Frame)> {
         self.steps
             .iter()
             .map(|(id, at)| (Notice::Step(*id), *at))
             .chain(self.answer.map(|at| (Notice::Answer, at)))
             .filter_map(move |(event, at)| {
-                (at + TOAST_LIFETIME)
-                    .checked_duration_since(now)
-                    .filter(|remaining| !remaining.is_zero())
-                    .map(|remaining| (event, remaining))
+                toast::Frame::at(now.saturating_duration_since(at), reduced_motion)
+                    .map(|frame| (event, frame))
             })
+    }
+
+    fn track_review(&mut self, waiting: bool, now: Instant) {
+        self.review = waiting.then(|| self.review.unwrap_or(now));
+    }
+
+    pub(super) fn review_age(&self, now: Instant) -> Option<Duration> {
+        self.review
+            .map(|started| now.saturating_duration_since(started))
+    }
+
+    pub(super) fn ticking(&self, now: Instant, reduced_motion: bool) -> bool {
+        self.recent(now, reduced_motion).next().is_some()
+            || !reduced_motion && self.review_age(now).is_some_and(toast::review_animating)
     }
 }
 
@@ -256,22 +282,27 @@ mod tests {
             ..Transcript::default()
         };
         events.sync(&trace, false, now);
-        assert!(events.recent(now).next().is_none());
+        assert!(events.recent(now, true).next().is_none());
         trace.steps[0].state = StepState::Completed;
         let completed = now + Duration::from_secs(1);
         events.sync(&trace, false, completed);
         assert!(matches!(
-            events.recent(completed).next(),
-            Some((Notice::Step(1), TOAST_LIFETIME))
+            events.recent(completed, true).next(),
+            Some((Notice::Step(1), frame)) if frame.remaining == toast::LIFETIME
         ));
-        let expired = completed + TOAST_LIFETIME;
+        let expired = completed + toast::LIFETIME;
         trace.final_answer = "Done".into();
         events.sync(&trace, true, expired);
         assert!(matches!(
-            events.recent(expired).collect::<Vec<_>>().as_slice(),
-            [(Notice::Answer, TOAST_LIFETIME)]
+            events.recent(expired, true).collect::<Vec<_>>().as_slice(),
+            [(Notice::Answer, frame)] if frame.remaining == toast::LIFETIME
         ));
-        assert!(events.recent(expired + TOAST_LIFETIME).next().is_none());
+        assert!(
+            events
+                .recent(expired + toast::LIFETIME, true)
+                .next()
+                .is_none()
+        );
     }
 
     #[test]

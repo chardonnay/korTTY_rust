@@ -5,6 +5,7 @@ use std::fmt;
 use iced::widget::pick_list;
 use iced::{Element, Task, window};
 
+use super::super::finished_runs::FinishedRun;
 use super::super::{Desktop, LiveBinding, Message, Phase, Run, State, Workspace};
 use super::history;
 
@@ -43,7 +44,34 @@ fn label(run: &Run) -> String {
     format!("{state} · {}", history::summary(prompt))
 }
 
+fn finished_label(run: &FinishedRun) -> String {
+    format!("Finished · {}", history::summary(run.goal()))
+}
+
 impl State {
+    fn finished_choices(&self, source: LiveBinding) -> impl Iterator<Item = Choice> {
+        self.finished_runs
+            .iter()
+            .filter(move |entry| entry.source == source)
+            .map(|entry| Choice {
+                id: entry.id,
+                label: finished_label(entry),
+            })
+    }
+
+    pub(super) fn finished_run_picker(&self, run: &Run) -> Option<Element<'static, Message>> {
+        let choices: Vec<_> = self.finished_choices(run.binding.live().ok()?).collect();
+        let epoch = run.epoch;
+        (!choices.is_empty()).then(|| {
+            pick_list(choices, None::<Choice>, move |choice: Choice| {
+                Message::SelectPresentedRun(epoch, choice.id)
+            })
+            .placeholder("Earlier finished runs")
+            .text_size(12)
+            .into()
+        })
+    }
+
     fn run_choices(&self, source: LiveBinding) -> Vec<Choice> {
         let mut runs: Vec<_> = self
             .runs
@@ -64,7 +92,9 @@ impl State {
         id: window::Id,
         run: &Run,
     ) -> Option<Element<'static, Message>> {
-        let choices = self.run_choices(run.binding.live().ok()?);
+        let source = run.binding.live().ok()?;
+        let mut choices = self.run_choices(source);
+        choices.extend(self.finished_choices(source));
         let selected = choices.iter().find(|choice| choice.id == id)?.clone();
         let epoch = run.epoch;
         (choices.len() > 1).then(|| {
@@ -105,7 +135,31 @@ impl Workspace {
         self.terminal_agents
             .runs
             .get(&id)
-            .map_or_else(|| "Agent run".to_owned(), label)
+            .map(label)
+            .or_else(|| {
+                self.terminal_agents
+                    .finished_runs
+                    .get(id)
+                    .map(finished_label)
+            })
+            .unwrap_or_else(|| "Agent run".to_owned())
+    }
+
+    pub(in crate::workspace) fn finished_agent_run_choices(
+        &self,
+        session: crate::session::SessionId,
+        stream: u64,
+    ) -> Vec<window::Id> {
+        self.terminal_agents
+            .finished_runs
+            .iter()
+            .filter(|entry| {
+                entry.source.session == session
+                    && entry.source.stream == stream
+                    && self.current_agent_pane(entry.source, entry.mode).is_ok()
+            })
+            .map(|entry| entry.id)
+            .collect()
     }
 
     pub(in crate::workspace::terminal_agent) fn select_presented_agent_run(
@@ -120,15 +174,20 @@ impl Workspace {
         let Ok(source) = run.binding.live() else {
             return Task::none();
         };
+        let Ok((owner, _)) = self.current_run_pane(run) else {
+            return Task::none();
+        };
         if run.epoch != epoch
             || current == selected
-            || self.current_run_pane(run).is_err()
             || self
                 .terminal_agents
                 .agent_activity_for_stream(source.session, source.stream)
                 .is_none_or(|(shown, _)| shown != current)
         {
             return Task::none();
+        }
+        if self.terminal_agents.finished_runs.get(selected).is_some() {
+            return self.reopen_finished_agent_run(owner, source.session, source.stream, selected);
         }
         if self
             .terminal_agents

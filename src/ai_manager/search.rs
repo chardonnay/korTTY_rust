@@ -41,6 +41,8 @@ pub(crate) enum Setting {
     Profile(ProfileSetting),
     Role(Role),
     Embedding,
+    Knowledge(KnowledgeSetting),
+    Control(Control),
 }
 
 impl Setting {
@@ -57,6 +59,8 @@ impl Setting {
             | Self::JournalSemanticSearch => Page::General,
             Self::Profile(_) => Page::Profiles,
             Self::Role(_) | Self::Embedding => Page::LocalPreferences,
+            Self::Knowledge(_) => Page::Knowledge,
+            Self::Control(control) => control.page(),
         }
     }
 
@@ -74,6 +78,8 @@ impl Setting {
             Self::Profile(setting) => setting.title(),
             Self::Role(role) => role.label(),
             Self::Embedding => "Default embedding model",
+            Self::Knowledge(setting) => setting.title(),
+            Self::Control(control) => control.title(),
         }
     }
 
@@ -94,7 +100,231 @@ impl Setting {
             Self::Role(Role::Text) => "translation profile roles",
             Self::Role(_) => "profile roles",
             Self::Embedding => "rag knowledge vector",
+            Self::Knowledge(KnowledgeSetting::Name | KnowledgeSetting::Create) => {
+                "new add collection rag"
+            }
+            Self::Knowledge(KnowledgeSetting::Update | KnowledgeSetting::Rebuild) => {
+                "index refresh embedding vectors rag"
+            }
+            Self::Control(_) => "",
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Control {
+    LocalSetup,
+    LocalEndpoint,
+    RefreshModels,
+    InstalledModel,
+    TestModel,
+    SignedIndex,
+    IndexSignature,
+    RuntimePackage,
+    InstallRuntime,
+    RemoveRuntime,
+    MemoryEnabled,
+    Learning,
+    Budget,
+    Scope,
+    ReloadMemory,
+    Entries,
+    MemoryMarkdown,
+    Archive,
+    History,
+    CleanMemory,
+    ClearMemory,
+    ExternalMemory,
+    AddSkill,
+    ImportSkill,
+    ExportSkill,
+    ImportExternal,
+    ExternalUpdates,
+    SkillsEnabled,
+    SkillAutoSelect,
+    LearnInSkills,
+    ShowHiddenSkills,
+    SkillUsage,
+    SkillStatistics,
+    SkillName,
+    SkillDescription,
+    SkillTags,
+    FindSkill,
+    ApplySkill,
+    RevertSkill,
+    ShortenSkill,
+}
+
+impl Control {
+    const ALL: [Self; 40] = [
+        Self::LocalSetup,
+        Self::LocalEndpoint,
+        Self::RefreshModels,
+        Self::InstalledModel,
+        Self::TestModel,
+        Self::SignedIndex,
+        Self::IndexSignature,
+        Self::RuntimePackage,
+        Self::InstallRuntime,
+        Self::RemoveRuntime,
+        Self::MemoryEnabled,
+        Self::Learning,
+        Self::Budget,
+        Self::Scope,
+        Self::ReloadMemory,
+        Self::Entries,
+        Self::MemoryMarkdown,
+        Self::Archive,
+        Self::History,
+        Self::CleanMemory,
+        Self::ClearMemory,
+        Self::ExternalMemory,
+        Self::AddSkill,
+        Self::ImportSkill,
+        Self::ExportSkill,
+        Self::ImportExternal,
+        Self::ExternalUpdates,
+        Self::SkillName,
+        Self::SkillDescription,
+        Self::SkillTags,
+        Self::SkillsEnabled,
+        Self::SkillAutoSelect,
+        Self::LearnInSkills,
+        Self::ShowHiddenSkills,
+        Self::SkillUsage,
+        Self::SkillStatistics,
+        Self::FindSkill,
+        Self::ApplySkill,
+        Self::RevertSkill,
+        Self::ShortenSkill,
+    ];
+
+    pub(super) fn page(self) -> Page {
+        match self {
+            Self::LocalSetup
+            | Self::LocalEndpoint
+            | Self::RefreshModels
+            | Self::InstalledModel
+            | Self::TestModel
+            | Self::SignedIndex
+            | Self::IndexSignature
+            | Self::RuntimePackage
+            | Self::InstallRuntime
+            | Self::RemoveRuntime => Page::LocalModels,
+            Self::MemoryEnabled
+            | Self::Learning
+            | Self::Budget
+            | Self::Scope
+            | Self::ReloadMemory
+            | Self::Entries
+            | Self::MemoryMarkdown
+            | Self::Archive
+            | Self::History
+            | Self::CleanMemory
+            | Self::ClearMemory
+            | Self::ExternalMemory => Page::Memory,
+            Self::AddSkill
+            | Self::ImportSkill
+            | Self::ExportSkill
+            | Self::ImportExternal
+            | Self::ExternalUpdates
+            | Self::SkillsEnabled
+            | Self::SkillAutoSelect
+            | Self::LearnInSkills
+            | Self::ShowHiddenSkills
+            | Self::SkillUsage
+            | Self::SkillStatistics
+            | Self::SkillName
+            | Self::SkillDescription
+            | Self::SkillTags
+            | Self::FindSkill
+            | Self::ApplySkill
+            | Self::RevertSkill
+            | Self::ShortenSkill => Page::Skills,
+        }
+    }
+
+    pub(super) fn skill_form(self) -> bool {
+        matches!(
+            self,
+            Self::SkillName
+                | Self::SkillDescription
+                | Self::SkillTags
+                | Self::FindSkill
+                | Self::ApplySkill
+                | Self::RevertSkill
+                | Self::ShortenSkill
+        )
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::LocalSetup => "Set up local AI",
+            Self::LocalEndpoint => "Local endpoint",
+            Self::RefreshModels => "Refresh installed models",
+            Self::InstalledModel => "Select an installed model",
+            Self::TestModel => "Test model",
+            Self::SignedIndex => "Signed index",
+            Self::IndexSignature => "Index signature",
+            Self::RuntimePackage => "Runtime package",
+            Self::InstallRuntime => "Install signed runtime",
+            Self::RemoveRuntime => "Remove installed runtime",
+            Self::MemoryEnabled => "Enable AI memory",
+            Self::Learning => "Learning",
+            Self::Budget => "Token budget",
+            Self::Scope => "Scope",
+            Self::ReloadMemory => "Reload",
+            Self::Entries => "Entries",
+            Self::MemoryMarkdown => "Markdown",
+            Self::Archive => "Archive",
+            Self::History => "History",
+            Self::CleanMemory => "Clean up",
+            Self::ClearMemory => "Clear",
+            Self::ExternalMemory => "External memory files",
+            Self::AddSkill => "Add skill",
+            Self::ImportSkill => "Import Markdown",
+            Self::ExportSkill => "Export Markdown",
+            Self::ImportExternal => "Import external skills",
+            Self::ExternalUpdates => "Check external updates",
+            Self::SkillsEnabled => "Enable AI skills",
+            Self::SkillAutoSelect => "Automatically select relevant skills",
+            Self::LearnInSkills => "Allow saving learned rules in skills",
+            Self::ShowHiddenSkills => "Show hidden",
+            Self::SkillUsage => "Record local skill statistics",
+            Self::SkillStatistics => "Skill statistics",
+            Self::SkillName => "Skill name",
+            Self::SkillDescription => "Description",
+            Self::SkillTags => "Tags",
+            Self::FindSkill => "Find in skill",
+            Self::ApplySkill => "Apply skill edits",
+            Self::RevertSkill => "Revert edits",
+            Self::ShortenSkill => "Shorten with local AI",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum KnowledgeSetting {
+    Name,
+    Create,
+    Update,
+    Rebuild,
+}
+
+impl KnowledgeSetting {
+    const ALL: [Self; 4] = [Self::Name, Self::Create, Self::Update, Self::Rebuild];
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Name => "New store name",
+            Self::Create => "Create store",
+            Self::Update => "Update index",
+            Self::Rebuild => "Rebuild index",
+        }
+    }
+
+    pub(super) fn needs_store(self) -> bool {
+        matches!(self, Self::Update | Self::Rebuild)
     }
 }
 
@@ -269,6 +499,8 @@ pub(super) fn results<'a>(
     )
     .chain(Role::ALL.into_iter().map(Setting::Role))
     .chain([Setting::Embedding])
+    .chain(KnowledgeSetting::ALL.into_iter().map(Setting::Knowledge))
+    .chain(Control::ALL.into_iter().map(Setting::Control))
     .map(Target::Setting)
     .chain(Page::ALL.into_iter().map(Target::Page))
     .filter(move |target| {
@@ -305,9 +537,29 @@ impl Reveal {
         setting: Setting,
         content: impl Into<Element<'a, Message>>,
     ) -> Element<'a, Message> {
-        let row = container(content).width(Length::Fill);
+        self.wrap_width(setting, content, Length::Fill)
+    }
+
+    pub(super) fn action<'a, Message: 'a>(
+        &self,
+        setting: Setting,
+        content: impl Into<Element<'a, Message>>,
+    ) -> Element<'a, Message> {
+        self.wrap_width(setting, content, Length::Shrink)
+    }
+
+    fn wrap_width<'a, Message: 'a>(
+        &self,
+        setting: Setting,
+        content: impl Into<Element<'a, Message>>,
+        width: Length,
+    ) -> Element<'a, Message> {
+        let row = container(content).width(width);
         if self.setting == Some(setting) {
-            row.id(self.row.clone()).style(container::secondary).into()
+            row.id(self.row.clone())
+                .padding(if width == Length::Shrink { 3 } else { 0 })
+                .style(container::secondary)
+                .into()
         } else {
             row.into()
         }
@@ -342,6 +594,40 @@ mod tests {
     use super::*;
     use crate::ai_manager::{Configuration, Dialog, Message};
 
+    struct Position {
+        viewport_id: Id,
+        row_id: Id,
+        viewport: Rectangle,
+        row_y: Option<f32>,
+        offset: f32,
+    }
+
+    impl Operation for Position {
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+            operate(self);
+        }
+
+        fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
+            if id == Some(&self.row_id) {
+                self.row_y = Some(bounds.y);
+            }
+        }
+
+        fn scrollable(
+            &mut self,
+            id: Option<&Id>,
+            bounds: Rectangle,
+            _: Rectangle,
+            translation: Vector,
+            _: &mut dyn operation::Scrollable,
+        ) {
+            if id == Some(&self.viewport_id) {
+                self.viewport = bounds;
+                self.offset = translation.y;
+            }
+        }
+    }
+
     #[test]
     fn ai_manager_search_respects_connection_mode_and_matches_unopened_pages() {
         let mut profile = profiles::Profile::default();
@@ -362,6 +648,150 @@ mod tests {
             results("translation profile", None)
                 .any(|target| target == Target::Setting(Setting::Role(Role::Text)))
         );
+    }
+
+    #[test]
+    fn knowledge_search_reveals_actions_without_editing_or_indexing_the_store() {
+        use crate::ai_manager::local;
+
+        let mut dialog = Dialog::new(
+            Arc::new(Configuration::default()),
+            PathBuf::new(),
+            Vec::new(),
+            true,
+            None,
+        );
+        let update = Target::Setting(Setting::Knowledge(KnowledgeSetting::Update));
+        let create = Target::Setting(Setting::Knowledge(KnowledgeSetting::Create));
+        let _ = dialog.update(Message::Search("update index".into()));
+        assert!(!dialog.search_results().any(|target| target == update));
+        let _ = dialog.update(Message::Search("create store".into()));
+        assert!(dialog.search_results().any(|target| target == create));
+        let _ = dialog.update(Message::SearchChoose);
+        assert!(dialog.page == Page::Knowledge);
+        assert_eq!(
+            dialog.revealed.setting,
+            Some(Setting::Knowledge(KnowledgeSetting::Create))
+        );
+        assert!(!dialog.local_state.has_knowledge_stores());
+
+        let _ = dialog.update(Message::Local(local::Message::StoreName("Fixture".into())));
+        let _ = dialog.update(Message::Local(local::Message::CreateStore));
+        let _ = dialog.update(Message::Search("update index".into()));
+        assert!(dialog.search_results().any(|target| target == update));
+        let before = serde_json::to_value(&dialog.local_state).unwrap();
+        let task = dialog.update(Message::SearchChoose);
+        assert_eq!(
+            dialog.revealed.setting,
+            Some(Setting::Knowledge(KnowledgeSetting::Update))
+        );
+        let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+        let mut interface = iced_runtime::UserInterface::build(
+            dialog.view(Vec::new(), Vec::new()),
+            Size::new(760.0, 360.0),
+            iced_runtime::user_interface::Cache::default(),
+            &mut renderer,
+        );
+        let mut position = Position {
+            viewport_id: dialog.revealed.viewport.clone(),
+            row_id: dialog.revealed.row.clone(),
+            viewport: Rectangle::default(),
+            row_y: None,
+            offset: 0.0,
+        };
+        interface.operate(&renderer, &mut position);
+        let target = position
+            .row_y
+            .expect("target button has a native reveal row");
+        assert!(target >= position.viewport.y + position.viewport.height);
+        crate::settings_search::test_input::apply(&mut interface, &renderer, task);
+        interface.operate(&renderer, &mut position);
+        let y = target - position.offset;
+        assert!(y >= position.viewport.y && y < position.viewport.y + position.viewport.height);
+        assert_eq!(serde_json::to_value(&dialog.local_state).unwrap(), before);
+    }
+
+    #[test]
+    fn control_search_focuses_local_model_memory_and_skill_fields() {
+        use crate::ai_manager::{local, memory, skills};
+        use crate::settings_search::test_input;
+        use iced::keyboard::Key;
+        use iced_runtime::{UserInterface, user_interface::Cache};
+
+        struct Focus<'a> {
+            input: &'a Id,
+            focused: Option<bool>,
+        }
+        impl Operation for Focus<'_> {
+            fn traverse(&mut self, operation: &mut dyn FnMut(&mut dyn Operation)) {
+                operation(self);
+            }
+
+            fn focusable(
+                &mut self,
+                id: Option<&Id>,
+                _: Rectangle,
+                target: &mut dyn operation::Focusable,
+            ) {
+                if id == Some(self.input) {
+                    self.focused = Some(target.is_focused());
+                }
+            }
+        }
+
+        let scratch = crate::snippets::tests::Profile::new();
+        let mut dialog = Dialog::new(
+            Arc::new(Configuration::default()),
+            scratch.0.clone(),
+            Vec::new(),
+            true,
+            None,
+        );
+        let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+        for (query, control) in [
+            ("signed index", Control::SignedIndex),
+            ("token budget", Control::Budget),
+            ("skill name", Control::SkillName),
+        ] {
+            if control == Control::SkillName {
+                let _ = dialog.open_skill_find_for_test();
+                assert!(dialog.skills.find_open());
+            }
+            let _ = dialog.update(Message::Search(query.into()));
+            let task = dialog.update(Message::SearchChoose);
+            assert_eq!(dialog.page, control.page());
+            assert_eq!(dialog.revealed.setting, Some(Setting::Control(control)));
+            let mut interface = UserInterface::build(
+                dialog.view(Vec::new(), Vec::new()),
+                Size::new(900.0, 480.0),
+                Cache::default(),
+                &mut renderer,
+            );
+            test_input::apply(&mut interface, &renderer, task);
+            let mut focus = Focus {
+                input: &dialog.revealed.input,
+                focused: None,
+            };
+            interface.operate(&renderer, &mut focus);
+            assert_eq!(focus.focused, Some(true), "focus for {control:?}");
+            let typed = test_input::press(
+                &mut interface,
+                &mut renderer,
+                Key::Character("7".into()),
+                Some("7"),
+            );
+            match control {
+                Control::SignedIndex => assert!(matches!(typed.as_slice(),
+                    [Message::Local(local::Message::RuntimePath(_, text))] if text.ends_with('7'))),
+                Control::Budget => assert!(matches!(typed.as_slice(),
+                    [Message::Memory(memory::Message::Tokens(text))] if text.ends_with('7'))),
+                _ => {
+                    assert!(matches!(typed.as_slice(),
+                        [Message::Skills(skills::Message::EditName(text))] if text.ends_with('7')));
+                    assert!(dialog.skills.find_open());
+                }
+            }
+        }
     }
 
     #[test]
@@ -440,40 +870,6 @@ mod tests {
 
     #[test]
     fn ai_manager_search_reveals_profile_option_inside_the_scrolled_section() {
-        struct Position {
-            viewport_id: Id,
-            row_id: Id,
-            viewport: Rectangle,
-            row_y: Option<f32>,
-            offset: f32,
-        }
-
-        impl Operation for Position {
-            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
-                operate(self);
-            }
-
-            fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
-                if id == Some(&self.row_id) {
-                    self.row_y = Some(bounds.y);
-                }
-            }
-
-            fn scrollable(
-                &mut self,
-                id: Option<&Id>,
-                bounds: Rectangle,
-                _: Rectangle,
-                translation: Vector,
-                _: &mut dyn operation::Scrollable,
-            ) {
-                if id == Some(&self.viewport_id) {
-                    self.viewport = bounds;
-                    self.offset = translation.y;
-                }
-            }
-        }
-
         let mut dialog = Dialog::new(
             Arc::new(Configuration::default()),
             PathBuf::new(),

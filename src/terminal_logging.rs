@@ -89,6 +89,10 @@ impl Config {
         self.enabled
     }
 
+    pub(crate) fn custom_folder(&self) -> Option<&Path> {
+        (!self.folder.is_empty()).then(|| Path::new(&self.folder))
+    }
+
     pub(crate) fn validate(&self) -> io::Result<()> {
         if self.folder.len() > 4096
             || self.folder.chars().any(char::is_control)

@@ -53,6 +53,98 @@ fn age(path: &Path) {
 }
 
 #[test]
+fn saved_log_folders_are_discovered_once_and_protect_manual_entries() {
+    use crate::connection_store::{Auth, Connection, SavedLogin, Store};
+    use crate::ssh_dialog::LoginTarget;
+
+    let fixture = Fixture::new();
+    let configured = fixture.0.join("configured");
+    let missing = fixture.0.join("missing");
+    fs::create_dir(&configured).unwrap();
+    let path = configured.join("2026-11-06-13-00-00-server_1.log");
+    fs::write(&path, b"retained terminal output\n").unwrap();
+    let mut store = Store::open(crate::profile::connections_path_at(&fixture.0)).unwrap();
+    let save = |store: &mut Store, name: &str, folder: &Path| {
+        store
+            .save(Connection {
+                id: 0,
+                name: name.into(),
+                tag: String::new(),
+                login: SavedLogin {
+                    endpoint: LoginTarget {
+                        host: "example.test".into(),
+                        port: 22,
+                        username: "operator".into(),
+                    },
+                    auth: Auth::Prompt,
+                    keyboard_interactive: false,
+                },
+                jump: None,
+                emulation: "xterm-256color".into(),
+                tunnels: Vec::new(),
+                incognito: false,
+                isolation: Default::default(),
+                startup: Default::default(),
+                logging: serde_json::from_value(serde_json::json!({"folder": folder})).unwrap(),
+                terminal_effect: None,
+                command_timestamps: None,
+                tab_color: None,
+                paste_warning: None,
+                window_geometry: None,
+                terminal: Default::default(),
+            })
+            .unwrap()
+    };
+    let first = save(&mut store, "First", &configured);
+    let second = save(&mut store, "Second", &configured);
+    save(&mut store, "Missing", &missing);
+    let report = catalog::scan(&fixture.0, || false).unwrap();
+    assert_eq!(report.entries.len(), 1);
+    assert_eq!(report.entries[0].path, path);
+    assert!(report.entries[0].forgettable_folder().is_none());
+    assert!(!fixture.0.join("terminal-log-folders.json").exists());
+    catalog::add_folder(&fixture.0, &configured).unwrap();
+    assert!(fixture.entry(&path).forgettable_folder().is_none());
+    assert!(catalog::forget_folder(&fixture.0, &configured).is_err());
+    assert!(!missing.exists());
+
+    store.delete(first).unwrap();
+    assert!(fixture.entry(&path).forgettable_folder().is_none());
+    store.delete(second).unwrap();
+    assert_eq!(
+        fixture.entry(&path).forgettable_folder(),
+        Some(configured.as_path())
+    );
+    catalog::remember_logger_folder(&fixture.0, &configured).unwrap();
+    assert!(fixture.entry(&path).forgettable_folder().is_none());
+    assert!(catalog::forget_folder(&fixture.0, &configured).is_err());
+    assert_eq!(fs::read(path).unwrap(), b"retained terminal output\n");
+}
+
+#[test]
+fn legacy_manual_list_is_readable_when_the_connection_catalog_is_unavailable() {
+    let fixture = Fixture::new();
+    let folder = fixture.0.join("legacy");
+    fs::create_dir(&folder).unwrap();
+    let logfile = folder.join("2026-11-06-13-00-00-server_1.log");
+    fs::write(&logfile, b"existing logfile\n").unwrap();
+    let prefs = serde_json::to_vec(&serde_json::json!({"folders":[folder]})).unwrap();
+    let settings = fixture.0.join("terminal-log-folders.json");
+    fs::write(&settings, &prefs).unwrap();
+    assert_eq!(
+        fixture.entry(&logfile).forgettable_folder(),
+        Some(folder.as_path())
+    );
+    fs::write(crate::profile::connections_path_at(&fixture.0), b"invalid").unwrap();
+    let report = catalog::scan(&fixture.0, || false).unwrap();
+    assert_eq!(report.skipped, 1);
+    assert_eq!(report.entries[0].path, logfile);
+    assert!(report.entries[0].forgettable_folder().is_none());
+    assert!(catalog::forget_folder(&fixture.0, &folder).is_err());
+    assert_eq!(fs::read(settings).unwrap(), prefs);
+}
+
+#[test]
 fn latest_page_and_live_refresh_keep_an_unterminated_last_line() {
     let fixture = Fixture::new();
     let path = fixture.folder().join("2026-11-06-13-00-00-local_1.log");
