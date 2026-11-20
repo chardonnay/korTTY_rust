@@ -16,6 +16,142 @@ open until a result is recorded for the tested revision and environment. Both
 Mosh modes are out of scope. The editor has a reduced native scope with structure
 navigation for classes, functions, variables, and placeholders.
 
+## November 20 Java OS symbol assignments
+
+Java backups contain custom symbol IDs, names and original image filenames.
+For imported connections, Rust records that metadata as a pending
+assignment. A local custom symbol with the same ID requires the same
+explicit review as any other candidate. Missing or ambiguous metadata
+falls back to the imported ID. The source filename is display metadata.
+Built-in symbols transfer directly.
+
+In Connection Manager, select the restored connection and review its
+imported symbol. Use **Manage symbols…** to add an image when needed, then
+choose a local symbol in the connection's **OS symbol** picker. The picker
+rechecks the selected local image before committing the assignment.
+Selecting **No symbol** dismisses the suggestion. A replay of the same
+backup preserves the reviewed assignment.
+[Java symbol metadata](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/model/CustomOsBadge.java)
+· [Rust Java library import](src/connection_store/import/java_library.rs)
+
+The Windows ARM64 suite passed 4,570 tests with 96 ignored. The restore
+fixture exercised an encrypted Java backup, a conflicting native ID,
+unavailable image metadata, and explicit assignment of a supplied image.
+It also checked built-in symbols and replay after restart. Strict
+workspace Clippy passed.
+[Workspace tests](target/verification/20261120-java-os-badges-tests.log)
+· [Strict workspace Clippy](target/verification/20261120-java-os-badges-clippy.log)
+
+Review of unused source definitions and interactive desktop acceptance
+remain open.
+
+## November 20 SFTP transfer part cleanup
+
+**Remove transfer parts…** reviews regular `*.kortty-part` files in the
+folder shown on either side. Cleanup has a preview with the exact names
+and a separate confirmation. The Local pane can work without an SSH
+connection. The Server pane binds the review to its existing connection
+and uses a protected quarantine to check the exact object before removal.
+The app reserves active flat stages across its SFTP workers and checks the
+reservation again at removal. Other SFTP clients cannot share these
+reservations and must finish writing before cleanup is confirmed. Links,
+folders and backup files are excluded. Native durable checkpoints retain
+their separate queue and receipt workflow. A changed or newly active entry
+is kept, other reviewed parts can still be removed, and the pane refreshes
+after the batch.
+[Java part convention](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/core/sftp/transfer/PartFiles.java)
+· [Rust cleanup](src/sftp_window/worker/partial_cleanup.rs)
+
+The Fedora ARM64 test ran the Server pane against a native OpenSSH
+`sftp-server` subprocess. It removed the reviewed part and preserved an
+active part, a changed part, an unrelated backup and a checkpoint folder.
+The returned listing reflected the successful removal.
+[Native OpenSSH test](target/verification/20261120-sftp-parts-fedora.log)
+
+Windows ARM64 passed 4,569 workspace tests with 96 ignored. The local
+cleanup test exercises the real offline worker, cancel before
+confirmation, replacement after review, a reservation acquired during
+review, and refresh after partial failure. Strict workspace Clippy passed.
+Interactive desktop acceptance and a configured SSH route remain open.
+[Workspace tests](target/verification/20261120-sftp-parts-tests.log)
+· [Strict workspace Clippy](target/verification/20261120-sftp-parts-final-clippy.log)
+
+## November 20 Connection Manager folder moves
+
+Drag a saved SSH or serial row to a folder in the list or sidebar. The
+network map and the list share the **Undo move** history in the current
+manager window. Each successful store commit adds one move. Undo restores
+the last applicable move and keeps earlier ones available. A write
+conflict leaves the history intact. After reload, Undo skips entries when
+the profile or former folder is missing, or the current folder no longer
+matches the recorded destination. The current window retains up to 128
+moves. Teamwork rows and local shell profiles have no drag source.
+[Java Connection Manager](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ConnectionManagerTreeView.java)
+· [Rust move history](src/connection_window/folder_moves.rs)
+· [Rust pointer routing](src/internal_folder_drag.rs)
+
+The Windows ARM64 suite passed 4,568 tests with 96 ignored. The tests
+exercise the real Iced list and sidebar layouts with batched pointer
+events, refuse a Teamwork source, undo successive saved SSH and serial
+moves across both views, and retain valid history after a concurrent write
+conflict. Strict workspace Clippy passed. Interactive desktop acceptance
+remains open.
+[Workspace tests](target/verification/20261120-connection-folder-moves-tests.log)
+· [Strict workspace Clippy](target/verification/20261120-connection-folder-moves-clippy.log)
+
+## November 20 Scheduler target picker
+
+**Scheduler → Job → Choose multiple saved targets…** stages individual
+saved SSH connections and groups together. Search matches connection
+names, hosts and group paths without clearing earlier selections. Adding
+the selection reopens the saved store and refreshes the Teamwork catalog.
+The resolved draft retains the existing explicit target order, includes
+selected group descendants and deduplicates overlapping targets.
+Changed selected routes leave the prior draft intact. Applied changes
+invalidate reviews that depended on the previous targets and still require
+the Scheduler's normal save and execution checks. The live Teamwork
+catalog has source-qualified groups in the picker, and the existing action
+eligibility rules continue to apply.
+[Java target selection](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/JobSchedulerTargetSelectionDialog.java)
+· [Rust target picker](src/scheduler_window/target_picker.rs)
+
+The complete Windows ARM64 suite passed 4,565 tests with 96 ignored.
+The picker tests covered all three search fields, staging across filters,
+atomic refusal of a changed route, overlapping groups after restart and
+separate Teamwork sources with the same group name. Strict workspace
+Clippy passed. Interactive desktop acceptance remains open.
+[Workspace tests](target/verification/20261120-scheduler-target-picker-tests.log)
+· [Strict workspace Clippy](target/verification/20261120-scheduler-target-picker-clippy.log)
+
+## November 20 application update prompts
+
+The Rust About dialog offers **Remind me tomorrow** and **Skip this
+version** for the displayed release. The profile retains the choice on
+restart. A reminder can advance the next automatic check to the next local
+day and overrides the periodic repeat limit for that version. Choosing a
+reminder on a manual recheck can replace a previous skip. Startup notices
+for the same version are limited to one per local day, and periodic
+notices repeat after seven local days. A notice waits for a focused window
+and rechecks the saved decision before displaying. A verified download
+records suppression only after the archive is published. An explicit check
+in About can still display the release.
+[Java update service](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/update/UpdateCheckService.java)
+· [Rust cadence](src/workspace/application_updates.rs)
+· [Rust About dialog](src/workspace/chrome/about.rs)
+
+Windows ARM64 passed 19 focused tests, including local midnight across
+daylight saving time, restart persistence, a newer release, manual review,
+and cancellation or publication of a verified download. A queued notice
+rechecks a version recorded as downloaded before the window regains focus.
+The complete native workspace suite passed 4,564 tests with 96 ignored.
+[Focused tests](target/verification/20261120-application-update-prompts-verified-tests.log)
+· [Workspace tests](target/verification/20261120-application-update-prompts-workspace-tests.log)
+· [Strict workspace Clippy](target/verification/20261120-application-update-prompts-verified-clippy.log)
+
+Interactive native acceptance and a live default-channel download remain
+open. The November 20 GitHub release listing had no published stable Rust
+release. [Rust releases](https://github.com/chardonnay/korTTY_rust/releases)
+
 ## November 20 Logfile Manager folder discovery
 
 The catalogue scans existing log folders from saved SSH connections before

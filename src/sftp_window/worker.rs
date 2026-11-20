@@ -40,6 +40,7 @@ pub(super) mod folder_usage;
 pub(in crate::sftp_window) mod ordinary_access;
 pub(super) use folder_budget::FolderBudget;
 pub(super) mod ownership;
+pub(super) mod partial_cleanup;
 pub(crate) use ownership::resolve_scheduler_account;
 pub(super) mod recursive_delete;
 pub(in crate::sftp_window) mod resume;
@@ -281,6 +282,21 @@ struct Command {
 }
 
 impl Worker {
+    pub(super) fn review_remote_parts(
+        &self,
+        directory: Location,
+        entries: Vec<Entry>,
+    ) -> Operation {
+        Operation::ReviewPartialCleanup(
+            partial_cleanup::Request {
+                directory,
+                entries,
+                worker: Some(Arc::downgrade(&self.control)),
+            },
+            sync::Cancel::default(),
+        )
+    }
+
     pub(super) fn review_deletion(&self, root: Location, entries: Vec<Entry>) -> Operation {
         Operation::ReviewDeletion(
             recursive_delete::Request {
@@ -389,7 +405,9 @@ impl Worker {
                     let deletion = match &command.operation {
                         Operation::DeleteSelection { cancel, .. }
                         | Operation::ReviewDeletion(_, cancel)
-                        | Operation::ApplyDeletion(_, cancel) => Some(cancel.clone()),
+                        | Operation::ApplyDeletion(_, cancel)
+                        | Operation::ReviewPartialCleanup(_, cancel)
+                        | Operation::ApplyPartialCleanup(_, cancel) => Some(cancel.clone()),
                         _ => None,
                     };
                     let extracting = command.operation.is_server_extract();
@@ -574,36 +592,35 @@ fn submit(
     Ok(receiver)
 }
 
-pub(super) struct LocalArchiveJob {
+pub(super) struct LocalJob {
     cancel: sync::Cancel,
     done: Receiver<()>,
 }
 
-impl LocalArchiveJob {
+impl LocalJob {
     pub(super) fn stop(&self) -> Receiver<()> {
         self.cancel.stop_local();
         self.done.clone()
     }
 }
 
-impl Drop for LocalArchiveJob {
+impl Drop for LocalJob {
     fn drop(&mut self) {
         self.cancel.stop_local();
     }
 }
 
-pub(super) fn submit_local_archive(
+pub(super) fn submit_local(
     operation: Operation,
-) -> io::Result<(Receiver<Result<Arc<Reply>>>, LocalArchiveJob)> {
+) -> io::Result<(Receiver<Result<Arc<Reply>>>, LocalJob)> {
     let cancel = operation
-        .archive_cancel()
-        .filter(|_| operation.archive_side() == Some(super::Side::Local))
+        .local_cancel()
         .cloned()
-        .ok_or_else(|| io::Error::other("Expected a local archive operation"))?;
+        .ok_or_else(|| io::Error::other("Expected a local file operation"))?;
     let (response, receiver) = bounded(1);
     let (finished, done) = bounded(1);
     thread::Builder::new()
-        .name("kortty-local-archive".into())
+        .name("kortty-sftp-local-operation".into())
         .spawn(move || {
             let reply = match operation {
                 Operation::ReviewLocalArchive(request, cancel) => {
@@ -615,12 +632,19 @@ pub(super) fn submit_local_archive(
                     password.as_ref().map(crate::ssh_dialog::Password::as_str),
                     &cancel,
                 ),
-                _ => Err(io::Error::other("Expected a local archive operation").into()),
+                Operation::ReviewPartialCleanup(request, cancel) => {
+                    partial_cleanup::review_local(request, &|| cancel.stopped())
+                        .map(|plan| Reply::PartialCleanupReviewed(Arc::new(plan)))
+                }
+                Operation::ApplyPartialCleanup(plan, cancel) => {
+                    partial_cleanup::apply_local(&plan, &|| cancel.stopped())
+                }
+                _ => Err(io::Error::other("Expected a local file operation").into()),
             };
             let _ = response.try_send(reply.map(Arc::new));
             drop(finished);
         })?;
-    Ok((receiver, LocalArchiveJob { cancel, done }))
+    Ok((receiver, LocalJob { cancel, done }))
 }
 
 impl Drop for Worker {
@@ -786,6 +810,8 @@ pub(crate) enum Operation {
     },
     ReviewDeletion(recursive_delete::Request, sync::Cancel),
     ApplyDeletion(Arc<recursive_delete::Plan>, sync::Cancel),
+    ReviewPartialCleanup(partial_cleanup::Request, sync::Cancel),
+    ApplyPartialCleanup(Arc<partial_cleanup::Plan>, sync::Cancel),
     ChangeOwnership {
         directory: Vec<u8>,
         selected: Vec<Entry>,
@@ -860,6 +886,8 @@ impl Operation {
             | Self::DeleteSelection { .. }
             | Self::ReviewDeletion(..)
             | Self::ApplyDeletion(..)
+            | Self::ReviewPartialCleanup(..)
+            | Self::ApplyPartialCleanup(..)
             | Self::ChangeOwnership { .. }
             | Self::ReviewRemoteOwnership(..)
             | Self::ApplyRemoteOwnership(..) => false,
@@ -900,6 +928,24 @@ impl Operation {
             | Self::ApplyServerExtract(..) => Some(super::Side::Remote),
             Self::ReviewLocalArchive(..) | Self::ApplyLocalArchive(..) => Some(super::Side::Local),
             _ => None,
+        }
+    }
+
+    pub(super) fn local_cancel(&self) -> Option<&sync::Cancel> {
+        match self {
+            Self::ReviewPartialCleanup(request, cancel)
+                if matches!(request.directory(), Location::Local(_)) =>
+            {
+                Some(cancel)
+            }
+            Self::ApplyPartialCleanup(plan, cancel)
+                if matches!(plan.directory(), Location::Local(_)) =>
+            {
+                Some(cancel)
+            }
+            _ => self
+                .archive_cancel()
+                .filter(|_| self.archive_side() == Some(super::Side::Local)),
         }
     }
 
@@ -944,6 +990,7 @@ pub enum Reply {
     },
     Listed(Arc<Directory>),
     RecursiveDeletionReviewed(Arc<recursive_delete::Plan>),
+    PartialCleanupReviewed(Arc<partial_cleanup::Plan>),
     MeasuredFolders(browser::Sizes),
     Searched(Arc<search::Review>),
     SearchRevealed(Arc<Directory>, Option<EntryName>),
@@ -1527,6 +1574,17 @@ fn execute(
                 cancel.stopped() || control.is_closed()
             })
         }
+        Operation::ReviewPartialCleanup(request, cancel) => {
+            partial_cleanup::review_remote(client, request, control, &|| {
+                cancel.stopped() || control.is_closed()
+            })
+            .map(|plan| Reply::PartialCleanupReviewed(Arc::new(plan)))
+        }
+        Operation::ApplyPartialCleanup(plan, cancel) => {
+            partial_cleanup::apply_remote(client, &plan, control, &|| {
+                cancel.stopped() || control.is_closed()
+            })
+        }
         Operation::ChangeOwnership {
             directory,
             selected,
@@ -1906,7 +1964,8 @@ fn upload(
         .iter()
         .rposition(|&byte| byte == b'/')
         .ok_or_else(|| io::Error::other("remote target has no parent directory"))?;
-    let staging = files::remote_join(&target[..=slash], files::nonce()?.as_bytes());
+    let (name, _active) = super::partials::stage()?;
+    let staging = files::remote_join(&target[..=slash], name.as_bytes());
     let staging_label = files::display(&String::from_utf8_lossy(&staging));
     let result = (|| -> Result<u64> {
         let count = client.upload_new(&staging, Counted(progress, &file))?;

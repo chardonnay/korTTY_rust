@@ -8,9 +8,7 @@ use iced::widget::{
 };
 use iced::{Element, Length};
 use kortty::ssh_runtime::account_lookup::Kind as AccountKind;
-use kortty_jobs::{
-    Date, DependencyMode, Job, JobDefinition, JobGraph, JobId, JobSchedule, Time, Weekday,
-};
+use kortty_jobs::{Date, DependencyMode, Job, JobDefinition, JobId, JobSchedule, Time, Weekday};
 use kortty_server_archive::protocol::ArchiveMemberLayout;
 
 use crate::ai_manager::ProfileRef;
@@ -123,6 +121,7 @@ pub(super) struct Draft {
     additional_connections: Vec<ConnectionRef>,
     target_groups: Option<TargetGroups>,
     group_targets_unresolved: bool,
+    pub(super) target_picker: Option<super::target_picker::Picker>,
     working_directory: String,
     command: text_editor::Content,
     pub source: Source,
@@ -231,6 +230,7 @@ impl Default for Draft {
             additional_connections: Vec::new(),
             target_groups: None,
             group_targets_unresolved: false,
+            target_picker: None,
             working_directory: String::new(),
             command: text_editor::Content::new(),
             source: Source::Command,
@@ -515,6 +515,7 @@ impl Draft {
             additional_connections: action.additional_connections.clone(),
             target_groups: action.target_groups.clone(),
             group_targets_unresolved: false,
+            target_picker: None,
             working_directory: action.working_directory.clone().unwrap_or_default(),
             command: text_editor::Content::with_text(
                 script.map_or(&action.command, |script| &script.body),
@@ -2373,7 +2374,16 @@ impl Draft {
         store: &ConnectionStore,
         shared: &super::SharedTargets,
     ) -> Result<bool, &'static str> {
-        let mut source = self.target_groups.clone().unwrap_or_else(|| TargetGroups {
+        let mut source = self.target_selection();
+        if source.groups.contains(&group) {
+            return Ok(false);
+        }
+        source.groups.push(group);
+        self.apply_target_groups(source, store, shared)
+    }
+
+    fn target_selection(&self) -> TargetGroups {
+        self.target_groups.clone().unwrap_or_else(|| TargetGroups {
             group_order: Vec::new(),
             groups: Vec::new(),
             explicit: self
@@ -2382,12 +2392,64 @@ impl Draft {
                 .chain(&self.additional_connections)
                 .cloned()
                 .collect(),
-        });
-        if source.groups.contains(&group) {
-            return Ok(false);
+        })
+    }
+
+    pub(super) fn can_choose_saved_targets(&self) -> bool {
+        self.imported_route().is_none()
+            && !self.has_imported_privileged()
+            && !self.has_unresolved_imported_ai()
+    }
+
+    pub(super) fn add_selected_targets(
+        &mut self,
+        choices: &[super::target_picker::Choice],
+        store: &ConnectionStore,
+        shared: &super::SharedTargets,
+    ) -> Result<bool, &'static str> {
+        use super::target_picker::Choice;
+
+        let mut source = self.target_selection();
+        for choice in choices {
+            match choice {
+                Choice::Connection(choice) => {
+                    let reference = choice.reference().ok_or("Choose saved SSH targets.")?;
+                    reference.require_current_selection(store, shared)?;
+                    if let Some(current) = source
+                        .explicit
+                        .iter_mut()
+                        .find(|current| current.same_identity(reference))
+                    {
+                        current.clone_from(reference);
+                    } else {
+                        source.explicit.push(reference.clone());
+                    }
+                }
+                Choice::Group(group) => {
+                    if !source.groups.contains(group) {
+                        source.groups.push(group.clone());
+                    }
+                }
+            }
         }
-        source.groups.push(group);
-        self.apply_target_groups(source, store, shared)
+        let swarm = self.source == Source::SwarmDiagnostics;
+        if source.explicit.len() > super::connection::target_limit(swarm) {
+            return Err(super::connection::target_limit_notice(swarm));
+        }
+        if source.groups.is_empty() {
+            let mut ids = BTreeSet::new();
+            for reference in &source.explicit {
+                reference.validate()?;
+                if !ids.insert(reference.id) {
+                    return Err("Selected SSH connection IDs are ambiguous.");
+                }
+            }
+        }
+        let targets = self.resolve_group_selection(&source, store, shared)?;
+        if targets.len() > 1 && !self.allows_additional_agent_targets() {
+            return Err("Choose per-start proposals before adding more AI Agent targets");
+        }
+        Ok(self.set_group_selection(source, targets, false))
     }
 
     pub(super) fn remove_connection_group(
@@ -3160,12 +3222,14 @@ impl Draft {
 
     pub(super) fn job_view<'a>(
         &'a self,
-        graph: &'a JobGraph<SshCommand>,
-        connections: &'a [ConnectionChoice],
-        connection_groups: &'a [super::ConnectionGroup],
-        can_browse: bool,
+        runtime: &'a super::SchedulerWindow,
     ) -> Element<'a, Message> {
-        let mut dependencies = graph
+        let connections = &runtime.connection_choices;
+        let connection_groups = &runtime.connection_group_choices;
+        let can_browse = runtime.can_browse_directory();
+        let mut dependencies = runtime
+            .scheduler
+            .graph()
             .jobs()
             .iter()
             .filter(|job| self.id.as_ref() != Some(job.id()))
@@ -3200,6 +3264,19 @@ impl Draft {
                 .on_toggle_maybe((!self.requires_import_review()).then_some(Message::Enabled)),
             form_row("Name", input(Field::Name, "Job name", &self.name)),
             form_row("Connection", self.connection_view(connections)),
+            self.can_choose_saved_targets().then(|| {
+                use super::target_picker::Event;
+
+                let control: Element<'_, Message> = if let Some(picker) = &self.target_picker {
+                    picker.view(connections, connection_groups, &runtime.connection_group_paths, runtime.can_edit())
+                } else {
+                    button("Choose multiple saved targets…").on_press_maybe(
+                        (runtime.can_edit() && (connections.len() > 1 || !connection_groups.is_empty()))
+                            .then_some(Message::TargetPicker(Event::Open)),
+                    ).into()
+                };
+                form_row("Saved targets", control)
+            }),
             (self.imported_route().is_none() && !self.has_imported_privileged()
                 && (!self.has_unresolved_imported_ai() || self.has_connection_groups())).then(|| {
                 form_row("Connection groups", self.connection_groups_view(connection_groups))

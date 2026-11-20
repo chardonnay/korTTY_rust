@@ -42,6 +42,7 @@ mod listing_keys;
 mod local_accounts;
 mod ownership;
 pub(crate) mod parallel;
+mod partials;
 pub(crate) mod picture;
 mod privileged_edit;
 mod resume_settings;
@@ -422,6 +423,7 @@ pub enum Message {
     EditName(String),
     ConfirmChange,
     ReviewDeletion,
+    CleanPartialFiles(Side),
     ChangeOwnership,
     ChangeLocalOwnership,
     OwnerId(String),
@@ -471,6 +473,7 @@ enum Prompt {
         entries: Vec<Entry>,
     },
     RecursiveDelete(Arc<worker::recursive_delete::Plan>),
+    PartialCleanup(Arc<worker::partial_cleanup::Plan>),
     Ownership(ownership::Draft),
     Conflict {
         row: workbench::Id,
@@ -498,7 +501,7 @@ struct Busy {
     extracting: Option<extract::Phase>,
     extract_review: Option<extract::Selection>,
     replacement_setup: Option<Box<compare::CopySetup>>,
-    local_archive_job: Option<worker::LocalArchiveJob>,
+    local_job: Option<worker::LocalJob>,
     ownership: bool,
     ownership_review: Option<ownership::Draft>,
     sync_cancel: Option<worker::sync::Cancel>,
@@ -1178,8 +1181,8 @@ impl SftpWindow {
         stopped.extend(
             self.busy
                 .as_ref()
-                .and_then(|busy| busy.local_archive_job.as_ref())
-                .map(worker::LocalArchiveJob::stop),
+                .and_then(|busy| busy.local_job.as_ref())
+                .map(worker::LocalJob::stop),
         );
         stopped.extend(self.worker.take().map(worker::Worker::stop));
         stopped
@@ -1341,6 +1344,7 @@ impl SftpWindow {
             }
             Message::ConfirmChange => return self.confirm_change(),
             Message::ReviewDeletion => return self.review_deletion(),
+            Message::CleanPartialFiles(side) => return self.review_partial_cleanup(side),
             Message::OwnerId(value) => self.edit_ownership(true, value),
             Message::GroupId(value) => self.edit_ownership(false, value),
             Message::OwnershipMode(value) => self.edit_ownership_mode(value),
@@ -2083,7 +2087,12 @@ impl SftpWindow {
     fn confirm_change(&mut self) -> Task<Message> {
         if !matches!(
             self.prompt,
-            Some(Prompt::Change { .. } | Prompt::Delete { .. } | Prompt::RecursiveDelete(_))
+            Some(
+                Prompt::Change { .. }
+                    | Prompt::Delete { .. }
+                    | Prompt::RecursiveDelete(_)
+                    | Prompt::PartialCleanup(_)
+            )
         ) {
             return Task::none();
         }
@@ -2102,6 +2111,23 @@ impl SftpWindow {
                 "Deleting reviewed tree entries",
                 None,
             ),
+            Some(Prompt::PartialCleanup(plan)) => {
+                let side = match plan.directory() {
+                    Location::Local(_) => Side::Local,
+                    Location::Remote(_) => Side::Remote,
+                };
+                if !self.panel_available(side) || !self.directory_visible(plan.directory()) {
+                    self.status = Some(
+                        "The reviewed folder changed. Review the transfer parts again.".into(),
+                    );
+                    return Task::none();
+                }
+                self.dispatch(
+                    worker::Operation::ApplyPartialCleanup(plan, worker::sync::Cancel::default()),
+                    "Removing reviewed transfer parts",
+                    None,
+                )
+            }
             Some(Prompt::Change {
                 operation,
                 directory,
@@ -2131,6 +2157,40 @@ impl SftpWindow {
         let operation = worker.review_deletion(directory.clone(), entries.clone());
         self.prompt = None;
         self.dispatch(operation, "Reviewing folder contents", None)
+    }
+
+    fn review_partial_cleanup(&mut self, side: Side) -> Task<Message> {
+        if self.prompt.is_some() || !self.panel_available(side) {
+            return Task::none();
+        }
+        let Some(directory) = &self.panel(side).directory else {
+            return Task::none();
+        };
+        let entries: Vec<_> = directory
+            .entries
+            .iter()
+            .filter(|entry| partials::candidate(entry).is_some_and(|name| !partials::active(name)))
+            .take(worker::partial_cleanup::MAX_PARTS + 1)
+            .cloned()
+            .collect();
+        if entries.is_empty() {
+            self.status = Some("No inactive transfer parts in this folder.".into());
+            return Task::none();
+        }
+        let location = directory.path.clone();
+        let operation = match side {
+            Side::Local => worker::Operation::ReviewPartialCleanup(
+                worker::partial_cleanup::Request::local(location, entries),
+                worker::sync::Cancel::default(),
+            ),
+            Side::Remote => {
+                let Some(worker) = &self.worker else {
+                    return Task::none();
+                };
+                worker.review_remote_parts(location, entries)
+            }
+        };
+        self.dispatch(operation, "Reviewing transfer parts", None)
     }
 
     fn server_copy_source(&self) -> Option<(Vec<u8>, String)> {
@@ -2260,6 +2320,8 @@ impl SftpWindow {
             worker::Operation::DeleteSelection { directory, .. } => Some(directory),
             worker::Operation::ReviewDeletion(request, _) => Some(request.directory()),
             worker::Operation::ApplyDeletion(plan, _) => Some(plan.directory()),
+            worker::Operation::ReviewPartialCleanup(request, _) => Some(request.directory()),
+            worker::Operation::ApplyPartialCleanup(plan, _) => Some(plan.directory()),
             _ => None,
         }
         .map(|directory| match directory {
@@ -2281,6 +2343,8 @@ impl SftpWindow {
             | worker::Operation::ApplyServerCopy(_, _, cancel)
             | worker::Operation::ReviewDeletion(_, cancel)
             | worker::Operation::ApplyDeletion(_, cancel)
+            | worker::Operation::ReviewPartialCleanup(_, cancel)
+            | worker::Operation::ApplyPartialCleanup(_, cancel)
             | worker::Operation::DeleteSelection { cancel, .. } => Some(cancel),
             worker::Operation::MeasureFolders(request) => request
                 .allocated
@@ -2291,18 +2355,19 @@ impl SftpWindow {
                 .or_else(|| operation.archive_cancel()),
         }
         .cloned();
-        let submitted = if archive == Some(Side::Local) {
-            worker::submit_local_archive(operation).map(|(reply, job)| (reply, Some(job)))
+        let local = operation.local_cancel().is_some();
+        let submitted = if local {
+            worker::submit_local(operation).map(|(reply, job)| (reply, Some(job)))
         } else {
             let Some(worker) = self.worker.as_ref() else {
                 return Task::none();
             };
             worker.submit(operation).map(|reply| (reply, None))
         };
-        let (receiver, local_archive_job) = match submitted {
+        let (receiver, local_job) = match submitted {
             Ok(submitted) => submitted,
             Err(error) => {
-                if archive != Some(Side::Local) && error.kind() == io::ErrorKind::BrokenPipe {
+                if !local && error.kind() == io::ErrorKind::BrokenPipe {
                     self.worker.take();
                 }
                 self.status = Some(error.to_string());
@@ -2328,7 +2393,7 @@ impl SftpWindow {
             extracting,
             extract_review: None,
             replacement_setup: None,
-            local_archive_job,
+            local_job,
             ownership,
             ownership_review: None,
             sync_cancel,
@@ -2341,8 +2406,8 @@ impl SftpWindow {
             Message::Done(
                 id,
                 receiver.recv().await.unwrap_or_else(|_| {
-                    if archive == Some(Side::Local) {
-                        Err(io::Error::other("Local archive worker ended").into())
+                    if local {
+                        Err(io::Error::other("Local file operation ended").into())
                     } else {
                         Err(worker::Failure::disconnected("SFTP worker ended"))
                     }
@@ -2526,6 +2591,14 @@ impl SftpWindow {
                 worker::Reply::RecursiveDeletionReviewed(plan) => {
                     if !busy.cancelled && self.prompt.is_none() {
                         self.prompt = Some(Prompt::RecursiveDelete(Arc::clone(plan)));
+                    }
+                }
+                worker::Reply::PartialCleanupReviewed(plan) => {
+                    if !busy.cancelled
+                        && self.prompt.is_none()
+                        && self.directory_visible(plan.directory())
+                    {
+                        self.prompt = Some(Prompt::PartialCleanup(Arc::clone(plan)));
                     }
                 }
                 worker::Reply::Changed { directory, note } => {
@@ -3096,6 +3169,11 @@ impl SftpWindow {
                 button("Delete").on_press_maybe(
                     can_delete.then_some(Message::Change(side, Change::Delete))
                 ),
+                button("Remove transfer parts…").on_press_maybe(
+                    (available && panel.entries().any(|entry| {
+                        partials::candidate(entry).is_some_and(|name| !partials::active(name))
+                    })).then_some(Message::CleanPartialFiles(side))
+                ),
                 button("Rights").on_press_maybe(
                     (change_available
                         && selected.is_some_and(
@@ -3630,6 +3708,35 @@ impl SftpWindow {
             .padding(16)
             .spacing(12)
             .into(),
+            Prompt::PartialCleanup(plan) => column![
+                text(format!(
+                    "Remove {} reviewed transfer parts?",
+                    plan.paths().len()
+                ))
+                .size(20),
+                text(plan.directory().display()).wrapping(text::Wrapping::WordOrGlyph),
+                container(
+                    scrollable(
+                        plan.paths()
+                            .iter()
+                            .fold(column![].spacing(4), |rows, path| {
+                                rows.push(text(path).wrapping(text::Wrapping::WordOrGlyph))
+                            })
+                    )
+                    .height(Length::Shrink)
+                )
+                .max_height(300),
+                text("Confirm only for transfers that have stopped."),
+                row![
+                    button("Cancel").on_press(Message::Dismiss),
+                    button("Remove reviewed parts").on_press(Message::ConfirmChange),
+                ]
+                .spacing(8)
+                .wrap(),
+            ]
+            .padding(16)
+            .spacing(12)
+            .into(),
             Prompt::Change {
                 operation,
                 input,
@@ -3720,8 +3827,8 @@ mod tests {
                 Ok(result) => result,
                 Err(async_channel::TryRecvError::Empty) => return None,
                 Err(async_channel::TryRecvError::Closed) => {
-                    if busy.archive == Some(Side::Local) {
-                        Err(io::Error::other("Local archive worker ended").into())
+                    if busy.local_job.is_some() {
+                        Err(io::Error::other("Local file operation ended").into())
                     } else {
                         Err(worker::Failure::disconnected("SFTP worker ended"))
                     }
@@ -3729,6 +3836,82 @@ mod tests {
             };
             Some(Message::Done(busy.id, result))
         }
+    }
+
+    #[test]
+    fn local_transfer_part_cleanup_reviews_exact_files_and_refreshes_after_failures() {
+        use std::time::Instant;
+
+        let fixture = crate::snippets::tests::Profile::new();
+        let root = fixture.0.canonicalize().unwrap();
+        let active = root.join("active.kortty-part");
+        let removed = root.join("completed.kortty-part");
+        let changed = root.join("changed.kortty-part");
+        let late = root.join("late.kortty-part");
+        let ordinary = root.join("unrelated.txt");
+        let backup = root.join("original.kortty-old");
+        let directory = root.join(".kortty-checkpoint.kortty-part");
+        for path in [&active, &removed, &changed, &late, &ordinary, &backup] {
+            std::fs::write(path, b"original").unwrap();
+        }
+        std::fs::create_dir(&directory).unwrap();
+        let _active = partials::reserve(b"active.kortty-part").unwrap();
+        let target = serde_json::from_value(serde_json::json!({
+            "host": "localhost", "port": 22, "username": "fixture"
+        }))
+        .unwrap();
+        let mut window = SftpWindow::new(target, None, false, RemoteEditorPolicy::Deny);
+        window
+            .local
+            .load(Arc::new(files::list_local(&root).unwrap()));
+        let complete = |window: &mut SftpWindow| {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                if let Some(message) = window.poll_worker_reply_for_test() {
+                    assert!(matches!(&message, Message::Done(_, Ok(_))), "{message:?}");
+                    let _ = window.update(message);
+                    return;
+                }
+                assert!(Instant::now() < deadline, "cleanup worker did not reply");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let _ = window.update(Message::CleanPartialFiles(Side::Local));
+        complete(&mut window);
+        assert!(matches!(&window.prompt, Some(Prompt::PartialCleanup(plan))
+            if plan.paths() == ["changed.kortty-part", "completed.kortty-part", "late.kortty-part"]));
+        let _ = window.update(Message::Dismiss);
+        assert!(window.prompt.is_none() && removed.exists());
+
+        let _ = window.update(Message::CleanPartialFiles(Side::Local));
+        complete(&mut window);
+        let replacement = root.join("replacement");
+        std::fs::write(&replacement, b"new bytes").unwrap();
+        std::fs::remove_file(&changed).unwrap();
+        std::fs::rename(&replacement, &changed).unwrap();
+        let _late = partials::reserve(b"late.kortty-part").unwrap();
+        let _ = window.update(Message::ConfirmChange);
+        complete(&mut window);
+        assert!(
+            window
+                .status
+                .as_deref()
+                .unwrap()
+                .contains("Removed 1 of 3 reviewed transfer parts")
+        );
+        assert!(!removed.exists());
+        assert_eq!(std::fs::read(changed).unwrap(), b"new bytes");
+        assert!(
+            [active, late, ordinary, backup, directory]
+                .iter()
+                .all(|path| path.exists())
+        );
+        assert!(
+            !window
+                .local
+                .entries()
+                .any(|entry| entry.display == "completed.kortty-part")
+        );
     }
 
     #[test]

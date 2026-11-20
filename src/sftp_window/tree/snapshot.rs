@@ -275,7 +275,25 @@ pub(in crate::sftp_window) fn read_local(
     excluded: &dyn Fn(&[u8]) -> bool,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<Manifest> {
+    read_local_manifest(root, excluded, cancelled, false)
+}
+
+pub(in crate::sftp_window) fn read_local_selected(
+    root: &std::path::Path,
+    selected: &HashSet<Vec<u8>>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Manifest> {
+    read_local_manifest(root, &|path| !selected.contains(path), cancelled, true)
+}
+
+fn read_local_manifest(
+    root: &std::path::Path,
+    excluded: &dyn Fn(&[u8]) -> bool,
+    cancelled: &dyn Fn() -> bool,
+    review_leaves: bool,
+) -> Result<Manifest> {
     let mut walk = Walk::new(excluded, cancelled);
+    walk.review_leaves = review_leaves;
     let dir = local::Directory::open_path(root)?;
     let stamp = Identity::directory(&dir)?;
     let mut entries = BTreeMap::new();

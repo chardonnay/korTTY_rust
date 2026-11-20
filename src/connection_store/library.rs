@@ -25,6 +25,8 @@ pub(super) struct Library {
     pub membership: BTreeMap<u64, String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub os_badges: BTreeMap<u64, String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub java_os_badges: BTreeMap<u64, super::custom_os_badges::JavaBadgeHint>,
     #[serde(skip_serializing_if = "BTreeSet::is_empty")]
     pub favorites: BTreeSet<u64>,
     #[serde(skip_serializing_if = "Favorites::is_empty")]
@@ -43,6 +45,7 @@ impl Library {
             && self.group_colors.is_empty()
             && self.membership.is_empty()
             && self.os_badges.is_empty()
+            && self.java_os_badges.is_empty()
             && self.favorites.is_empty()
             && self.teamwork_favorites.is_empty()
             && self.teamwork_hidden.is_empty()
@@ -75,6 +78,9 @@ impl Library {
                             || byte.is_ascii_digit()
                             || matches!(byte, b'-' | b':')
                     })
+            })
+            || self.java_os_badges.iter().any(|(id, hint)| {
+                !connections.contains(id) || self.os_badges.contains_key(id) || !hint.valid()
             })
             || !self.favorites.is_subset(connections)
             || self.recent.len() > RECENT_LIMIT
@@ -161,6 +167,7 @@ impl Library {
     pub fn remove_connections(&mut self, ids: &BTreeSet<u64>) {
         self.membership.retain(|id, _| !ids.contains(id));
         self.os_badges.retain(|id, _| !ids.contains(id));
+        self.java_os_badges.retain(|id, _| !ids.contains(id));
         self.favorites.retain(|id| !ids.contains(id));
         self.recent.retain(|id| !ids.contains(id));
         self.used_at.retain(|id, _| !ids.contains(id));

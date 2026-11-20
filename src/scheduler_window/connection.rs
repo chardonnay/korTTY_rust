@@ -75,21 +75,8 @@ impl TargetGroups {
         let limit = target_limit(swarm);
         let mut targets = Vec::with_capacity(limit);
         for reference in &self.explicit {
-            let current = if let Some(binding) = &reference.teamwork {
-                shared
-                    .entries
-                    .get(binding.route.identity())
-                    .map(|target| target.reference.clone())
-            } else {
-                store.get(reference.id).map(ConnectionRef::from)
-            };
-            match current {
-                None => return Err("An explicitly selected SSH connection is unavailable."),
-                Some(current) if current != *reference => {
-                    return Err("An explicitly selected SSH connection changed. Select it again.");
-                }
-                Some(current) => targets.push(current),
-            }
+            reference.require_current_selection(store, shared)?;
+            targets.push(reference.clone());
         }
         for group in &self.groups {
             let mut members: Box<dyn Iterator<Item = ConnectionRef>> = match group {
@@ -227,6 +214,10 @@ struct SharedTarget {
 }
 
 impl SharedTargets {
+    pub(super) fn group_path(&self, reference: &ConnectionRef) -> Option<&str> {
+        Some(&self.entries.get(reference.shared_identity()?)?.group)
+    }
+
     pub(crate) fn new(
         catalog: &teamwork::Catalog,
         store: &Store,
@@ -519,6 +510,28 @@ impl From<&Connection> for ConnectionRef {
 }
 
 impl ConnectionRef {
+    pub(super) fn require_current_selection(
+        &self,
+        store: &Store,
+        shared: &SharedTargets,
+    ) -> Result<(), &'static str> {
+        let current = if let Some(identity) = self.shared_identity() {
+            shared
+                .entries
+                .get(identity)
+                .map(|target| target.reference.clone())
+        } else {
+            store.get(self.id).map(Self::from)
+        };
+        match current {
+            None => Err("An explicitly selected SSH connection is unavailable."),
+            Some(current) if current != *self => {
+                Err("An explicitly selected SSH connection changed. Select it again.")
+            }
+            Some(_) => Ok(()),
+        }
+    }
+
     fn shared(
         entry: &Entry,
         binding: Option<(LoginTarget, SharedAuth)>,

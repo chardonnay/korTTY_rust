@@ -2300,7 +2300,11 @@ folder before starting. kortty checks the archive size, SHA-256 and the desktop
 executable's format and architecture before placing the archive in that folder.
 On Linux and macOS, use an owner-controlled folder without shared write access.
 kortty then offers to open the folder. **Settings → Updates** provides an opt-in
-background check with a 1–30 day interval. Background checks report availability.
+background check with a 1–30 local-day interval. When an update is available,
+**Remind me tomorrow** schedules another automatic check for the next local
+day. **Skip this version** hides automatic prompts for that release. Saving a
+verified archive also silences its automatic prompt. To review any available
+release again, use **Check for updates**, including for a skipped release.
 Managed policy can disable the feature with `[rule.updates] enabled = false`.
 Set `feed-url` in that table to use a managed HTTP(S) release metadata
 endpoint. The feed uses the GitHub latest-release JSON format and lists a

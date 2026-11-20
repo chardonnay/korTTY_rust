@@ -147,7 +147,8 @@ fn upload_without_receipt(
         return Err(invalid("The upload destination folder changed").into());
     }
     require_absent(client, target)?;
-    let stage = files::remote_join(parent, files::nonce()?.as_bytes());
+    let (name, _active) = crate::sftp_window::partials::stage()?;
+    let stage = files::remote_join(parent, name.as_bytes());
     let mut owner = None;
     let writing = Cell::new(false);
     let result = (|| -> Result<u64> {

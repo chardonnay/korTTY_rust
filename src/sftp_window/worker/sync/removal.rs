@@ -29,18 +29,9 @@ pub(in crate::sftp_window::worker) fn remove_reviewed(
     };
     guard()?;
     match (&parent.0, &parent.1, target, expected) {
-        (
-            Location::Local(parent),
-            DirectoryStamp::Local(identity),
-            Location::Local(path),
-            expected,
-        ) => local::remove(
-            parent,
-            local_child(parent, path)?,
-            identity,
-            expected,
-            &guard,
-        ),
+        (Location::Local(_), _, Location::Local(_), expected) => {
+            remove_reviewed_local(parent, target, expected, stopped)
+        }
         (
             Location::Remote(parent_path),
             DirectoryStamp::Remote(_),
@@ -66,6 +57,31 @@ pub(in crate::sftp_window::worker) fn remove_reviewed(
         }
         _ => Err(invalid_plan().into()),
     }
+}
+
+pub(in crate::sftp_window::worker) fn remove_reviewed_local(
+    parent: &(Location, DirectoryStamp),
+    target: &Location,
+    expected: &SnapshotEntry,
+    stopped: &impl Fn() -> bool,
+) -> Result<Outcome> {
+    let (Location::Local(parent), DirectoryStamp::Local(identity), Location::Local(path)) =
+        (&parent.0, &parent.1, target)
+    else {
+        return Err(invalid_plan().into());
+    };
+    local::remove(
+        parent,
+        local_child(parent, path)?,
+        identity,
+        expected,
+        &|| {
+            if stopped() {
+                return Err(io::Error::other("Deletion stopped").into());
+            }
+            Ok(())
+        },
+    )
 }
 
 pub(super) struct Plan {
@@ -361,9 +377,13 @@ fn remove_remote(
         verify_remote_entry(client, path, expected)?;
         require_absent(client, &stage.payload)?;
         guard(client)?;
-        // POSIX rename moves one object to the empty private quarantine. The
-        // public path is never sent to REMOVE or RMDIR.
-        client.replace(path, &stage.payload)?;
+        // Move one object into the empty private quarantine. The public
+        // path is never sent to REMOVE or RMDIR.
+        if client.supports_atomic_replace() {
+            client.replace(path, &stage.payload)?;
+        } else {
+            client.rename(path, &stage.payload)?;
+        }
         Ok(())
     })();
     if let Err(error) = moved {

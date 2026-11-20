@@ -52,6 +52,7 @@ mod run_detail;
 pub(crate) mod script;
 mod standing_index;
 pub(crate) mod sync;
+pub(crate) mod target_picker;
 mod view;
 pub(crate) mod webhooks;
 mod working_directory;
@@ -923,6 +924,7 @@ pub enum Message {
     CommandSource(Source),
     ConnectionSelected(ConnectionChoice),
     ConnectionAdded(ConnectionChoice),
+    TargetPicker(target_picker::Event),
     ConnectionRemoved(u64),
     ConnectionGroupAdded(ConnectionGroup),
     ConnectionGroupRemoved(ConnectionGroup),
@@ -1087,6 +1089,7 @@ pub struct SchedulerWindow {
     snippet_choices: Vec<SnippetChoice>,
     connection_choices: Vec<ConnectionChoice>,
     connection_group_choices: Vec<ConnectionGroup>,
+    connection_group_paths: BTreeMap<u64, String>,
     shared_targets: SharedTargets,
     connection_store_path: Option<PathBuf>,
     archive_passwords: Vec<CredentialChoice>,
@@ -1459,6 +1462,7 @@ impl SchedulerWindow {
             snippet_choices: Vec::new(),
             connection_choices: vec![ConnectionChoice::Manual],
             connection_group_choices: Vec::new(),
+            connection_group_paths: BTreeMap::new(),
             shared_targets: SharedTargets::default(),
             connection_store_path: None,
             archive_passwords: Vec::new(),
@@ -1624,6 +1628,7 @@ impl SchedulerWindow {
     pub(crate) fn set_connections(&mut self, store: Option<&ConnectionStore>) {
         self.connection_choices.truncate(1);
         self.connection_group_choices.clear();
+        self.connection_group_paths.clear();
         self.connection_store_path = store.map(|store| store.path().to_owned());
         if let Some(store) = store {
             self.connection_group_choices
@@ -1642,6 +1647,16 @@ impl SchedulerWindow {
                 .extend(self.shared_targets.groups());
             self.connection_choices
                 .extend(self.shared_targets.choices());
+            self.connection_group_paths
+                .extend(self.connection_choices.iter().filter_map(|choice| {
+                    let reference = choice.reference()?;
+                    let path = if reference.shared_identity().is_some() {
+                        self.shared_targets.group_path(reference)
+                    } else {
+                        store.group_of(reference.id)
+                    }?;
+                    Some((reference.id, path.to_owned()))
+                }));
             self.connection_choices[1..]
                 .sort_by_cached_key(|choice| choice.to_string().to_lowercase());
         }
@@ -1714,6 +1729,61 @@ impl SchedulerWindow {
                 })
                 .into(),
         );
+    }
+
+    fn edit_target_picker(&mut self, view: &mut SchedulerView, event: target_picker::Event) {
+        use target_picker::{Choice, Event};
+
+        match event {
+            Event::Open => {
+                let store = match self.current_connection_store() {
+                    Ok(store) => store,
+                    Err(error) => {
+                        view.status = Some(error);
+                        return;
+                    }
+                };
+                self.set_connections(Some(&store));
+                view.draft
+                    .target_picker
+                    .get_or_insert_with(Default::default);
+            }
+            Event::Close => view.draft.target_picker = None,
+            event => {
+                let Some(picker) = &mut view.draft.target_picker else {
+                    return;
+                };
+                match event {
+                    Event::Search(query) => picker.search(query),
+                    Event::Select(choice, selected) => {
+                        let current = match &choice {
+                            Choice::Connection(choice) => {
+                                choice.reference().is_some()
+                                    && self.connection_choices.contains(choice)
+                            }
+                            Choice::Group(group) => self.connection_group_choices.contains(group),
+                        };
+                        if !selected || current {
+                            picker.select(choice, selected);
+                        }
+                    }
+                    Event::Clear => picker.clear(),
+                    Event::Apply if !picker.selected().is_empty() => {
+                        let choices = picker.selected().to_vec();
+                        let mut applied = false;
+                        self.change_connection_groups(view, |draft, store, shared| {
+                            let result = draft.add_selected_targets(&choices, store, shared);
+                            applied = result.is_ok();
+                            group_change(result)
+                        });
+                        if applied {
+                            view.draft.target_picker = None;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     pub(crate) fn set_archive_passwords(&mut self, mut passwords: Vec<CredentialChoice>) {
@@ -2597,6 +2667,20 @@ impl SchedulerWindow {
                         .suggest_agent_profile(self.agent_profiles.default.as_ref());
                 }
                 view.dirty = true;
+            }
+            Message::TargetPicker(event)
+                if view.page == Page::Job
+                    && self.draft_matches(view)
+                    && view.draft.can_choose_saved_targets()
+                    && (self.can_edit()
+                        || matches!(
+                            event,
+                            target_picker::Event::Close
+                                | target_picker::Event::Clear
+                                | target_picker::Event::Search(_)
+                        )) =>
+            {
+                self.edit_target_picker(view, event);
             }
             Message::ConnectionSelected(_)
             | Message::ConnectionAdded(_)

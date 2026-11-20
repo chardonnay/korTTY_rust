@@ -29,6 +29,41 @@ pub(super) fn is_reference(value: &str) -> bool {
     value.strip_prefix(PREFIX).is_some_and(valid_id)
 }
 
+/// An imported Java identifier and display metadata awaiting a local assignment.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct JavaBadgeHint {
+    pub(crate) reference: String,
+    pub(crate) name: Option<String>,
+    pub(crate) file: Option<String>,
+}
+
+impl JavaBadgeHint {
+    pub(super) fn valid(&self) -> bool {
+        is_reference(&self.reference)
+            && self
+                .name
+                .as_deref()
+                .is_none_or(|name| valid_text(name, MAX_LABEL_BYTES, false))
+            && self.file.as_deref().is_none_or(|file| {
+                file.len() <= 180
+                    && !file.starts_with('.')
+                    && file.ends_with(".png")
+                    && file.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'.' | b'_' | b'-')
+                    })
+            })
+    }
+
+    pub(super) fn unresolved(reference: String) -> Self {
+        Self {
+            reference,
+            name: None,
+            file: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Catalog {
     root: PathBuf,

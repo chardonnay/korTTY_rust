@@ -76,6 +76,19 @@ pub(crate) struct Offer {
 }
 
 impl Offer {
+    #[cfg(test)]
+    pub(crate) fn fixture(version: &str) -> Self {
+        Self {
+            version: version.into(),
+            name: "kortty-fixture.zip".into(),
+            size: 64,
+            digest: [0; 32],
+            url: Url::parse(RELEASE).unwrap(),
+            feed: None,
+            target: ExecutableTarget::parse("aarch64-pc-windows-msvc").unwrap(),
+        }
+    }
+
     pub(crate) fn version(&self) -> &str {
         &self.version
     }
@@ -110,8 +123,10 @@ impl fmt::Debug for Offer {
 
 #[derive(Clone, Debug)]
 pub(crate) struct Saved {
+    pub(crate) version: String,
     pub(crate) path: PathBuf,
     pub(crate) sync_failed: bool,
+    pub(crate) prompt_save_failed: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -219,7 +234,11 @@ pub(crate) fn check_authorized(
     })
 }
 
-pub(crate) fn download(offer: Offer, folder: PathBuf) -> Result<Download, String> {
+pub(crate) fn download(
+    offer: Offer,
+    folder: PathBuf,
+    record_downloaded: impl FnOnce(&str) -> io::Result<()> + Send + 'static,
+) -> Result<Download, String> {
     if !folder.is_absolute()
         || folder.components().any(|part| part == Component::ParentDir)
         || folder.as_os_str().as_encoded_bytes().len() > 4096
@@ -237,6 +256,7 @@ pub(crate) fn download(offer: Offer, folder: PathBuf) -> Result<Download, String
             |value| {
                 let _ = send.try_send(value);
             },
+            record_downloaded,
         )
     })?;
     Ok(Download { pending, progress })
@@ -583,6 +603,7 @@ fn publish_archive(
     authorize: impl Fn() -> Result<(), String>,
     open: impl FnOnce() -> Result<Response<Body>, String>,
     progress: impl FnMut(Progress),
+    record_downloaded: impl FnOnce(&str) -> io::Result<()>,
 ) -> Result<Saved, String> {
     let destination = Directory::open(folder, false)
         .map_err(|_| "Could not open the selected download directory.")?;
@@ -645,8 +666,10 @@ fn publish_archive(
             _ => format!("Could not save the verified update archive ({error})."),
         })?;
     Ok(Saved {
+        version: offer.version.clone(),
         path: folder.join(&offer.name),
         sync_failed: destination.sync().is_err(),
+        prompt_save_failed: record_downloaded(offer.version()).is_err(),
     })
 }
 
@@ -1058,6 +1081,7 @@ mod tests {
             || Ok(()),
             || panic!("a shared writable directory must be rejected before connecting"),
             |_| {},
+            |_| panic!("a failed download must not record the version"),
         );
         assert!(result.unwrap_err().contains("owner-controlled"));
         assert_eq!(std::fs::read_dir(folder).unwrap().count(), 0);
@@ -1126,12 +1150,27 @@ mod tests {
         );
         let open = || request(&agent, &url, false, &cancel);
         let authorized = || Ok(());
+        let recorded = std::cell::Cell::new(0);
+        let record = |version: &str| {
+            assert_eq!(version, "0.2.0");
+            assert_eq!(std::fs::read(&destination).unwrap(), data);
+            recorded.set(recorded.get() + 1);
+            Ok(())
+        };
         let checksum = offer.digest;
         offer.digest = [0; 32];
         assert!(
-            publish_archive(&offer, &directory, &cancel, authorized, open, |_| {})
-                .unwrap_err()
-                .contains("SHA-256")
+            publish_archive(
+                &offer,
+                &directory,
+                &cancel,
+                authorized,
+                open,
+                |_| {},
+                record
+            )
+            .unwrap_err()
+            .contains("SHA-256")
         );
         assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
         offer.digest = checksum;
@@ -1145,6 +1184,7 @@ mod tests {
                 open()
             },
             |_| {},
+            record,
         );
         assert!(collision.is_err());
         assert_eq!(std::fs::read(&destination).unwrap(), b"existing");
@@ -1153,9 +1193,17 @@ mod tests {
         offer.size = wrong_architecture.len() as u64;
         offer.digest = sha256(&wrong_architecture);
         assert!(
-            publish_archive(&offer, &directory, &cancel, authorized, open, |_| {})
-                .unwrap_err()
-                .contains("wrong native architecture")
+            publish_archive(
+                &offer,
+                &directory,
+                &cancel,
+                authorized,
+                open,
+                |_| {},
+                record
+            )
+            .unwrap_err()
+            .contains("wrong native architecture")
         );
         assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
         offer.size = data.len() as u64;
@@ -1168,7 +1216,8 @@ mod tests {
                 &cancel,
                 authorized,
                 || panic!("canceled update must not connect"),
-                |_| {}
+                |_| {},
+                record,
             )
             .is_err()
         );
@@ -1191,6 +1240,7 @@ mod tests {
                 open()
             },
             |_| {},
+            record,
         );
         assert!(denied.unwrap_err().contains("fixture policy revoked"));
         assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
@@ -1210,12 +1260,26 @@ mod tests {
                 open()
             },
             |_| {},
+            record,
         );
         assert!(canceled.unwrap_err().contains("canceled"));
         assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
         cancel.store(false, Ordering::Release);
-        let saved = publish_archive(&offer, &directory, &cancel, authorized, open, |_| {}).unwrap();
+        assert_eq!(recorded.get(), 0);
+        let saved = publish_archive(
+            &offer,
+            &directory,
+            &cancel,
+            authorized,
+            open,
+            |_| {},
+            record,
+        )
+        .unwrap();
         assert_eq!(saved.path, destination);
+        assert_eq!(saved.version, "0.2.0");
+        assert!(!saved.prompt_save_failed);
+        assert_eq!(recorded.get(), 1);
         assert_eq!(std::fs::read(saved.path).unwrap(), data);
         worker.join().unwrap();
     }

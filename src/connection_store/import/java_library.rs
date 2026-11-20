@@ -5,6 +5,7 @@ use roxmltree::{Document, ParsingOptions};
 
 use super::{MAX_PROFILES, invalid, kortty, library, valid_teamwork_id, xml};
 use crate::connection_store::TabColor;
+use crate::connection_store::custom_os_badges::JavaBadgeHint;
 
 const MAX_SETTINGS_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SETTINGS_NODES: u32 = 65_536;
@@ -15,6 +16,7 @@ pub(crate) struct JavaLibrarySettings {
     pub(super) favorites: BTreeSet<String>,
     pub(super) group_colors: BTreeMap<String, TabColor>,
     pub(super) highlight_sets: Option<BTreeMap<String, String>>,
+    pub(super) os_badges: BTreeMap<String, JavaBadgeHint>,
 }
 
 impl JavaLibrarySettings {
@@ -105,6 +107,40 @@ impl JavaLibrarySettings {
                 colors
                     .into_iter()
                     .filter_map(|(path, color)| Some((path, color?))),
+            );
+        }
+        if let Ok(Some(entries)) = xml::optional_child(root, "customOsBadges") {
+            let mut unique = BTreeMap::<String, Option<JavaBadgeHint>>::new();
+            for entry in entries
+                .children()
+                .filter(|node| xml::has_unqualified_tag(*node, "badge"))
+            {
+                let Some(id) = entry.attribute("id") else {
+                    continue;
+                };
+                let reference = format!("custom:{id}");
+                let hint = JavaBadgeHint {
+                    reference: reference.clone(),
+                    name: entry.attribute("name").map(str::to_owned),
+                    file: entry.attribute("file").map(str::to_owned),
+                };
+                if !hint.valid() || unique.len() == MAX_PROFILES && !unique.contains_key(&reference)
+                {
+                    continue;
+                }
+                unique
+                    .entry(reference)
+                    .and_modify(|stored| {
+                        if stored.as_ref() != Some(&hint) {
+                            *stored = None;
+                        }
+                    })
+                    .or_insert(Some(hint));
+            }
+            result.os_badges.extend(
+                unique
+                    .into_iter()
+                    .filter_map(|(reference, hint)| Some((reference, hint?))),
             );
         }
         Ok(result)
