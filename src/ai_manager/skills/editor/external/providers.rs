@@ -376,9 +376,11 @@ impl Panel {
             Vec::new()
         };
         let import_picker = (!imported.is_empty()).then(|| {
-            pick_list(imported, None, |choice| Message::JavaProvider(choice.id))
-                .placeholder("Review a Java provider suggestion…")
-                .dismiss_on_escape()
+            pick_list(imported, None::<ImportedChoice>, |choice| {
+                Message::JavaProvider(choice.id)
+            })
+            .placeholder("Review a Java provider suggestion…")
+            .dismiss_on_escape()
         });
         column![
             text("External skill providers").size(19),
