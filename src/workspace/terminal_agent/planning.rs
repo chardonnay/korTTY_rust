@@ -4,23 +4,31 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use iced::widget::{button, column, row, text, text_input};
-use iced::{Element, Task, window};
+use iced::widget::{button, column, row, scrollable, text, text_editor, text_input};
+use iced::{Element, Length, Task, window};
 
 use crate::terminal_agent::planning::store::{self, Destination, Record};
 use crate::terminal_agent::planning::{self as model, Approach, Question, Reply, Report, Stage};
+use crate::terminal_agent::planning_probe;
 use crate::terminal_agent::usage;
 
-use super::request_review::{Draft, Review};
-use super::{Desktop, Message as RunMessage, Mode, Phase, Run, Workspace, json, mask};
+use super::request_review::{Draft, Review, mask_json_strings};
+use super::{
+    Desktop, MAX_RUNS, Message as RunMessage, Mode, Outcome, Phase, Run, RunTarget, Workspace,
+    json, mask,
+};
 
 #[cfg(test)]
 mod tests;
+
+const MAX_REFINEMENT_BYTES: usize = 2048;
 
 #[derive(Clone)]
 pub enum Message {
     CustomAnswer(String),
     Answer(u64, String),
+    EditRefinement(u64, text_editor::Action),
+    Revise(u64),
     Choose(u64, usize),
     Progress(u64, usage::Progress),
     Reply(u64, Arc<usage::Report<Reply>>),
@@ -35,9 +43,11 @@ pub enum Message {
 
 pub(super) struct Flow {
     destination: Destination,
+    probe: Option<planning_probe::Snapshot>,
     questions: Vec<Question>,
     answers: Vec<String>,
     custom_answer: String,
+    refinement: text_editor::Content,
     options: Vec<Approach>,
     chosen: Option<usize>,
     report: Option<Report>,
@@ -51,9 +61,11 @@ impl Flow {
     fn new(destination: Destination) -> Self {
         Self {
             destination,
+            probe: None,
             questions: Vec::new(),
             answers: Vec::new(),
             custom_answer: String::new(),
+            refinement: text_editor::Content::new(),
             options: Vec::new(),
             chosen: None,
             report: None,
@@ -62,6 +74,10 @@ impl Flow {
             saved: false,
             storage_from: Phase::Setup,
         }
+    }
+
+    pub(super) fn probe_summary(&self) -> Option<String> {
+        self.probe.as_ref().map(planning_probe::Snapshot::summary)
     }
 
     pub(super) fn view<'a>(&'a self, run: &'a Run) -> Option<Element<'a, RunMessage>> {
@@ -109,45 +125,33 @@ impl Flow {
                 Some(controls.into())
             }
             Phase::PlanOptions => {
-                let mut options =
-                    column![text("Choose an implementation approach").size(size)].spacing(8);
-                for (index, option) in self.options.iter().enumerate() {
-                    options = options.push(
-                        column![
-                            text(&option.title).size(size + 3.0),
-                            text(option.render()).size(size),
-                            button("Draft plan for this approach").on_press_maybe(
-                                enabled.then_some(message(Message::Choose(run.epoch, index))),
-                            ),
-                        ]
-                        .spacing(4),
-                    );
-                }
-                Some(
-                    iced::widget::scrollable(options)
-                        .height(iced::Length::Fixed(270.0))
-                        .into(),
-                )
+                Some(scrollable(self.approaches(run)).height(Length::Fill).into())
             }
-            Phase::PlanReady => {
+            Phase::PlanReady | Phase::PlanHandedOff => {
                 let report = run.plan.as_deref()?;
                 Some(
-                    column![
-                        iced::widget::scrollable(text(report).size(size).width(iced::Length::Fill))
-                            .height(iced::Length::Fill),
-                        (self.report.is_some() && !run.binding.private()).then(|| {
-                            button(if self.saved {
-                                "Plan saved"
-                            } else {
-                                "Save plan"
-                            })
-                            .on_press_maybe(
-                                (enabled && !self.saved).then_some(message(Message::Save)),
-                            )
-                        })
-                    ]
-                    .spacing(6)
-                    .height(iced::Length::Fill)
+                    scrollable(
+                        column![
+                            text(report).size(size).width(Length::Fill),
+                            (run.phase == Phase::PlanReady
+                                && self.report.is_some()
+                                && !run.binding.private())
+                            .then(|| {
+                                button(if self.saved {
+                                    "Plan saved"
+                                } else {
+                                    "Save plan"
+                                })
+                                .on_press_maybe(
+                                    (enabled && !self.saved).then_some(message(Message::Save)),
+                                )
+                            }),
+                            (run.phase == Phase::PlanReady && !self.options.is_empty())
+                                .then(|| self.approaches(run)),
+                        ]
+                        .spacing(12),
+                    )
+                    .height(Length::Fill)
                     .into(),
                 )
             }
@@ -192,17 +196,208 @@ impl Flow {
             _ => None,
         }
     }
+
+    fn approaches<'a>(&'a self, run: &'a Run) -> Element<'a, RunMessage> {
+        let epoch = run.epoch;
+        let size = run.fonts.plan;
+        let enabled = !run.paused && !run.cancel.requested();
+        let editor = text_editor(&self.refinement)
+            .placeholder("Additional requirements for the next request")
+            .size(size)
+            .height(86);
+        let editor = if enabled {
+            editor.on_action(move |action| {
+                RunMessage::Planning(Message::EditRefinement(epoch, action))
+            })
+        } else {
+            editor
+        };
+        let mut options = column![
+            text("Choose an implementation approach").size(size),
+            editor,
+            button("Review revised approaches…")
+                .on_press_maybe(enabled.then_some(RunMessage::Planning(Message::Revise(epoch)))),
+        ]
+        .spacing(8);
+        for (index, option) in self.options.iter().enumerate() {
+            options = options.push(
+                column![
+                    text(&option.title).size(size + 3.0),
+                    text(option.render()).size(size),
+                    button("Draft plan for this approach").on_press_maybe(
+                        enabled.then_some(RunMessage::Planning(Message::Choose(epoch, index))),
+                    ),
+                ]
+                .spacing(4),
+            );
+        }
+        options.into()
+    }
+
+    fn can_refine(&self, run: &Run, epoch: u64) -> bool {
+        matches!(run.phase, Phase::PlanOptions | Phase::PlanReady)
+            && run.epoch == epoch
+            && !run.paused
+            && !self.options.is_empty()
+    }
 }
 
 impl Workspace {
+    pub(super) fn implement_agent_plan(
+        &mut self,
+        planner: window::Id,
+        epoch: u64,
+    ) -> Task<Desktop> {
+        let Some(plan) = self.terminal_agents.runs.get(&planner) else {
+            return Task::none();
+        };
+        if plan.mode != Mode::Plan
+            || plan.phase != Phase::PlanReady
+            || plan.epoch != epoch
+            || plan.swarm
+            || plan.paused
+            || plan.closing
+            || plan.cancel.requested()
+        {
+            return Task::none();
+        }
+        if self.terminal_agents.runs.len() >= MAX_RUNS {
+            self.terminal_agents
+                .runs
+                .get_mut(&planner)
+                .expect("reviewed plan")
+                .notice = "Close an agent activity before implementing the plan.".into();
+            return Task::none();
+        }
+        let mut plan = self
+            .terminal_agents
+            .runs
+            .remove(&planner)
+            .expect("reviewed plan");
+        let task = match self.prepare_accepted_plan(&plan) {
+            Ok((owner, run)) => {
+                let (id, opened) = self.open_agent_surface(owner, &run);
+                self.terminal_agents.runs.insert(id, run);
+                let started = self.update_terminal_agent(id, RunMessage::Start);
+                if self.terminal_agents.runs[&id].active() {
+                    plan.next(
+                        Phase::PlanHandedOff,
+                        "Implementation opened in a separate Agent view.",
+                    );
+                    self.terminal_agents.activity.capture(&mut plan);
+                }
+                opened.chain(started)
+            }
+            Err(error) => {
+                plan.block(error);
+                match (plan.binding.live(), plan.phase.notice(Phase::PlanReady)) {
+                    (Ok(source), Some(notice)) if !source.private => {
+                        self.notify_agent_run(planner, source.session, source.stream, notice)
+                    }
+                    _ => Task::none(),
+                }
+            }
+        };
+        self.terminal_agents.runs.insert(planner, plan);
+        task
+    }
+
+    fn prepare_accepted_plan(&self, plan: &Run) -> Result<(window::Id, Run), String> {
+        self.check_run_destination(plan)?;
+        let source = plan.binding.live()?;
+        let (owner, _) = self.current_agent_pane(source, Mode::Run)?;
+        self.validate_plan_destination(plan)?;
+        let profile = plan
+            .profile()
+            .ok_or("The planning profile is unavailable.")?;
+        let mut run = self.build_agent(source.session, Mode::Run, None, Some(profile.id), false)?;
+        if run.binding.live()? != source || run.profile() != Some(profile) {
+            return Err("The source pane or planning profile changed. Review a new plan.".into());
+        }
+        run.plan = Some(
+            plan.plan
+                .clone()
+                .ok_or("The reviewed plan is unavailable.")?,
+        );
+        run.goal.clone_from(&plan.goal);
+        run.manual_directory.clone_from(&plan.manual_directory);
+        run.surface = self.agent_run_presentation();
+        run.chat_handoff_enabled = self.ai_chat_enabled();
+        Ok((owner, run))
+    }
+
     pub(super) fn planning_start(
         &self,
         id: window::Id,
         run: &mut Run,
+        direct: bool,
+        with_probe: bool,
     ) -> Result<Task<Desktop>, String> {
-        let flow = Flow::new(self.planning_destination(run)?);
-        let task = self.prepare_plan_review(id, run, &flow, Stage::Questions)?;
+        run.planning = Some(Flow::new(self.planning_destination(run)?));
+        let (_, pane) = self.current_run_pane(run)?;
+        if with_probe
+            && self.agent_policy(pane, Mode::Run).is_ok()
+            && (pane.ssh.is_some() || pane.session.local_shell_running())
+        {
+            return match self.prepare_attached_probe(id, run, direct) {
+                Ok(task) => Ok(task),
+                Err(error) => self.plan_without_probe_after_failure(id, run, &error),
+            };
+        }
+        self.planning_questions(id, run)
+    }
+
+    pub(super) fn planning_questions(
+        &self,
+        id: window::Id,
+        run: &mut Run,
+    ) -> Result<Task<Desktop>, String> {
+        let flow = run
+            .planning
+            .take()
+            .ok_or("The planning destination is unavailable.")?;
+        let result = self.prepare_plan_review(id, run, &flow, Stage::Questions);
         run.planning = Some(flow);
+        result
+    }
+
+    pub(super) fn finish_planning_probe(
+        &self,
+        id: window::Id,
+        run: &mut Run,
+        result: &Result<Outcome, String>,
+    ) -> Result<Task<Desktop>, String> {
+        self.require_plan_review_route(run)?;
+        self.planning_probe_target(run)?;
+        let Some(RunTarget::Attached(target)) = &run.target else {
+            return Err("The reviewed probe destination is unavailable.".into());
+        };
+        let snapshot = result.as_ref().map_err(Clone::clone).and_then(|result| {
+            planning_probe::Snapshot::capture(target, result, &|text| {
+                mask::prompt(&run.redactor, text)
+            })
+        });
+        match snapshot {
+            Ok(snapshot) => {
+                let summary = snapshot.summary();
+                run.inline_result(super::engine::Status::Exited(0), &summary, "");
+                run.record(summary);
+                run.planning.as_mut().expect("reviewed planning flow").probe = Some(snapshot);
+                self.planning_questions(id, run)
+            }
+            Err(error) => self.plan_without_probe_after_failure(id, run, &error),
+        }
+    }
+
+    pub(super) fn plan_without_probe_after_failure(
+        &self,
+        id: window::Id,
+        run: &mut Run,
+        error: &str,
+    ) -> Result<Task<Desktop>, String> {
+        run.target = None;
+        let task = self.planning_questions(id, run)?;
+        run.notice = format!("Environment probe unavailable. {error}");
         Ok(task)
     }
 
@@ -308,11 +503,14 @@ impl Workspace {
                 }
                 run.next(Phase::PlanQuestions, "Answer the next planning question.");
             }
+            Message::EditRefinement(epoch, action) if flow.can_refine(run, epoch) => {
+                super::swarm::edit_bounded(&mut flow.refinement, action, MAX_REFINEMENT_BYTES);
+            }
+            Message::Revise(epoch) if flow.can_refine(run, epoch) => {
+                return self.prepare_plan_review(id, run, flow, Stage::Options);
+            }
             Message::Choose(epoch, choice)
-                if run.phase == Phase::PlanOptions
-                    && epoch == run.epoch
-                    && !run.paused
-                    && choice < flow.options.len() =>
+                if flow.can_refine(run, epoch) && choice < flow.options.len() =>
             {
                 flow.chosen = Some(choice);
                 return self.prepare_plan_review(id, run, flow, Stage::Report);
@@ -325,25 +523,48 @@ impl Workspace {
                 let skill_usage = run.model_review.take().and_then(Review::into_skill_usage);
                 run.record_model_response(epoch, &report);
                 run.finish_model_repair(epoch, false);
-                let mut reply = report.result.as_ref().map_err(Clone::clone)?.clone();
-                reply.redact(&|text| mask::prompt(&run.redactor, text))?;
+                let reply = report
+                    .result
+                    .as_ref()
+                    .map_err(Clone::clone)
+                    .cloned()
+                    .and_then(|mut reply| {
+                        reply.redact(&|text| mask::prompt(&run.redactor, text))?;
+                        Ok(reply)
+                    });
                 match (stage, reply) {
-                    (Stage::Questions, Reply::Questions { message, questions }) => {
+                    (Stage::Questions, Ok(Reply::Questions { message, questions })) => {
                         flow.questions = questions;
                         run.next(Phase::PlanQuestions, &message);
                     }
-                    (Stage::Options, Reply::Options { message, options }) => {
+                    (Stage::Options, Ok(Reply::Options { message, options })) => {
                         flow.options = options;
+                        flow.chosen = None;
+                        flow.report = None;
+                        flow.saved = false;
+                        run.plan = None;
                         run.next(Phase::PlanOptions, &message);
                     }
-                    (Stage::Report, Reply::Report { message, report }) => {
+                    (Stage::Report, Ok(Reply::Report { message, report })) => {
                         let text = report.render();
                         run.record(text.clone());
                         run.plan = Some(text);
                         flow.report = Some(report);
+                        flow.saved = false;
                         run.next(Phase::PlanReady, &message);
                     }
-                    (_, Reply::Blocked(error)) => return Err(error),
+                    (Stage::Options | Stage::Report, Err(error) | Ok(Reply::Blocked(error)))
+                        if !flow.options.is_empty() =>
+                    {
+                        let phase = if flow.report.is_some() {
+                            Phase::PlanReady
+                        } else {
+                            Phase::PlanOptions
+                        };
+                        run.next(phase, &error);
+                        return Ok(Task::none());
+                    }
+                    (_, Err(error) | Ok(Reply::Blocked(error))) => return Err(error),
                     _ => return Err("The reply did not match the reviewed planning stage.".into()),
                 }
                 if let Some(usage) = skill_usage {
@@ -531,12 +752,34 @@ impl Workspace {
         stage: Stage,
     ) -> Result<Task<Desktop>, String> {
         self.check_planning_route(run, flow)?;
-        let chosen = flow.chosen.and_then(|index| flow.options.get(index));
-        let input = json!({"goal":run.goal,"destination":flow.destination.label(),"questions":flow.questions,"answers":flow.answers,"selectedApproach":chosen}).to_string();
-        let input = mask::prompt(&run.redactor, &input)?;
+        let chosen = flow
+            .chosen
+            .filter(|_| stage == Stage::Report)
+            .and_then(|index| flow.options.get(index));
+        let notes = zeroize::Zeroizing::new(flow.refinement.text());
+        let notes = notes.trim();
+        let refinement = (!notes.is_empty() && stage != Stage::Questions)
+            .then(|| mask::prompt(&run.redactor, notes))
+            .transpose()?;
+        let mut input = json!({
+            "goal": run.goal,
+            "destination": flow.destination.label(),
+            "questions": flow.questions,
+            "answers": flow.answers,
+            "selectedApproach": chosen,
+        });
+        mask_json_strings(&mut input, &|text| mask::prompt(&run.redactor, text))?;
         let mut evidence = String::new();
+        if let Some(probe) = &flow.probe {
+            input["probe"] = probe.input().clone();
+            let _ = writeln!(evidence, "{}", probe.summary());
+        }
         for (question, answer) in flow.questions.iter().zip(&flow.answers) {
             let _ = writeln!(evidence, "{}\n{answer}\n", question.question);
+        }
+        if let Some(refinement) = &refinement {
+            input["refinement"] = json!(refinement);
+            let _ = writeln!(evidence, "Planning refinement\n{refinement}");
         }
         if let Some(approach) = chosen {
             let _ = writeln!(evidence, "{}\n{}", approach.title, approach.render());
@@ -547,7 +790,7 @@ impl Workspace {
             run,
             Draft::Plan {
                 stage,
-                input,
+                input: input.to_string(),
                 evidence,
             },
         )

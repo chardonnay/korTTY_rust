@@ -1160,10 +1160,45 @@ windows. [Java question handling](https://github.com/chardonnay/korTTY/blob/v2.2
 AI Manager General offers a default presentation for interactive Run. Its
 Chat tab keeps the source terminal binding, reviewed requests and command
 approvals. Closing the tab cancels its owned operation. Java backups fill the
-unset preference. Ask and Planning retain their own views. Verify tab-based
-review and cancellation on native desktops and compare how Java places a run
-started from an accepted plan.
+unset preference. Planning opens a dedicated tab. Implement rechecks the
+plan destination and selected profile, then opens a separate Run using the
+current presentation preference. The accepted plan remains readable and the
+new Run starts with an environment-probe review. Verify tab-based planning,
+handoff, request review and cancellation on native desktops.
 [Java Run tab](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/MainWindow.java#L12244)
+· [Java accepted-plan launch](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/MainWindow.java#L13209)
+
+The Planning tab accepts multiline refinement notes. Review revised
+approaches or draft the final report from a selected approach using the
+notes. Each request shows its masked content and rechecks the destination.
+A failed model revision preserves the last available approaches or report.
+Verify editing and repeated refinement on native desktops with a configured
+provider.
+[Java plan refinement](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AiAgentPlanTab.java#L329)
+
+Ask opens a temporary tab with its existing model review. A follow-up keeps
+that tab, the original masked selection, question, and answer and opens the
+Chat composer. Before that handoff, the original terminal still shows the
+selected Agent design. Each later request uses Chat review and requires the
+same live terminal stream and current policy. Save is explicit. When the
+selection is one filename, Ask loads a bounded UTF-8 snapshot from the
+original local shell directory or SSH connection. The masked preview offers
+removal and the send rechecks the source and file version. A missing or
+unavailable file leaves the selection in the preview. The approved snapshot
+can follow the conversation into Chat. Verify the native tab, attachment
+review and cancellation workflows.
+[Java Ask workflow](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/MainWindow.java#L12262)
+
+Planning can collect a reviewed environment snapshot from the source local
+shell or authenticated SSH session. The fixed probe covers system and account
+details, the working directory, free space, available management tools and
+sudo capabilities where the shell supports them. Windows Command Prompt
+reports system, account and directory details. The planning tab shows a
+masked summary and includes the same snapshot in the reviews for questions,
+approaches and the final report. Users can also plan without a probe. The
+implementation run still requires its own review. Verify the live SSH
+planning path and the native desktop approval and skip flows.
+[Java planning probe](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AiAgentPlanTab.java#L251)
 
 Interactive Agent and Swarm member reviews include masked memory for the exact
 saved target. Swarm workflow script generation and comparison review global

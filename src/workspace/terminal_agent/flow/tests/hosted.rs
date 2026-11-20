@@ -15,7 +15,11 @@ fn chat_tab_keeps_the_original_pane_and_cancels_its_owned_run_on_close() {
         .set_test_ai_configuration(Configuration::load_fixture_from(&root).unwrap());
 
     let plan = fixture.open(Mode::Plan);
-    assert!(fixture.workspace.hosted_tool_owner(plan).is_none());
+    assert_eq!(
+        fixture.workspace.hosted_tool_owner(plan),
+        Some(fixture.owner)
+    );
+    assert_eq!(fixture.workspace.hosted_agent_title(plan), "AI Planning");
     drop(fixture.workspace.close_terminal_agent(plan));
 
     let id = fixture.open(Mode::Run);

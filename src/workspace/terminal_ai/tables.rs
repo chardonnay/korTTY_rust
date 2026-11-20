@@ -71,7 +71,7 @@ impl Workspace {
         else {
             return Task::none();
         };
-        if !self.ai_chat_enabled() || self.private_agent_source_changed(chat) {
+        if !self.ai_chat_enabled() || self.bound_agent_source_changed(chat) {
             return Task::none();
         }
         selection

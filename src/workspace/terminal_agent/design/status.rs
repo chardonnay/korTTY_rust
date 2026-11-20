@@ -161,6 +161,7 @@ pub(super) fn phase(run: &Run) -> (&'static str, usize) {
         Phase::PlanQuestions | Phase::PlanOptions | Phase::PlanReady | Phase::PlanLibrary => {
             ("Planning review", 1)
         }
+        Phase::PlanHandedOff => ("Implementation opened", 3),
         Phase::FinalAdvice => ("Preparing final response", 2),
         Phase::Finished => ("Completed", 3),
         Phase::Failed => ("Failed", 3),

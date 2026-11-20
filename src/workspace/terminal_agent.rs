@@ -28,6 +28,7 @@ use super::{Message as Desktop, PaneSession, Tab, Workspace, dialog_placement};
 use self::binding::{ApprovedExecution, Binding, CommandToRun, Live as LiveBinding, RunTarget};
 
 mod activity_export;
+mod ask_attachment;
 mod binding;
 mod clarification;
 mod cursor;
@@ -125,6 +126,12 @@ pub enum Message {
     AutoApproveRoot(bool),
     Clarification(clarification::Message),
     Implement(u64),
+    StartPlanWithoutProbe,
+    SkipPlanProbe(u64),
+    AskAttachment(
+        u64,
+        Result<Arc<super::terminal_ai::attachment::Snapshot>, String>,
+    ),
     Planning(planning::Message),
     Triage(triage::Message),
     History(history::Message),
@@ -172,6 +179,7 @@ impl fmt::Debug for Message {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Setup,
+    AskAttachment,
     ModelReview,
     DirectoryConfirmation,
     Directory,
@@ -191,6 +199,7 @@ enum Phase {
     ScriptValidation,
     Paused,
     PlanReady,
+    PlanHandedOff,
     PlanQuestions,
     PlanOptions,
     TriageChoice,
@@ -206,7 +215,8 @@ impl Phase {
     fn working(self) -> bool {
         matches!(
             self,
-            Self::Directory
+            Self::AskAttachment
+                | Self::Directory
                 | Self::ReviewedDirectory { .. }
                 | Self::SavedPreflight
                 | Self::Probe
@@ -229,7 +239,7 @@ impl Phase {
     fn finished(self) -> bool {
         matches!(
             self,
-            Self::Finished | Self::Failed | Self::Blocked | Self::Cancelled
+            Self::PlanHandedOff | Self::Finished | Self::Failed | Self::Blocked | Self::Cancelled
         )
     }
 
@@ -261,6 +271,7 @@ struct Run {
     manual_directory: Option<String>,
     goal: String,
     context: String,
+    ask_file: ask_attachment::State,
     model_review: Option<request_review::Review>,
     plan: Option<String>,
     planning: Option<planning::Flow>,
@@ -440,6 +451,7 @@ impl Run {
             manual_directory: setup.manual_directory,
             goal: String::new(),
             context: setup.context,
+            ask_file: ask_attachment::State::default(),
             model_review: None,
             plan: None,
             planning: None,
@@ -565,6 +577,7 @@ impl Run {
         }
         self.phase = phase;
         if phase.finished() {
+            self.ask_file.cancel = None;
             self.probe_reviewed = false;
             self.auto_approve_root = false;
             self.revoke_command_approval();
@@ -605,6 +618,7 @@ impl Run {
         self.revoke_command_approval();
         self.cancel.request();
         self.ai_cancel = None;
+        self.ask_file.cancel = None;
         self.model_review = None;
         self.triage.choice = None;
         self.commands.clear();
@@ -640,6 +654,10 @@ impl Run {
 impl Run {
     fn runs_in_chat_tab(&self) -> bool {
         self.surface == RunPresentation::ChatTab
+    }
+
+    fn has_terminal_presentation(&self) -> bool {
+        self.mode == Mode::Ask || !self.runs_in_chat_tab()
     }
 
     fn ordinary_command_review(&self) -> bool {
@@ -1010,12 +1028,11 @@ impl Workspace {
         match result {
             Ok((mut run, direct)) => {
                 run.chat_handoff_enabled = self.ai_chat_enabled();
-                if run.mode == Mode::Run && !run.swarm {
-                    run.surface = self
-                        .ai_configuration()
-                        .map_or_else(RunPresentation::default, |config| {
-                            config.agent_run_presentation()
-                        });
+                if !run.swarm {
+                    run.surface = match run.mode {
+                        Mode::Run => self.agent_run_presentation(),
+                        Mode::Ask | Mode::Plan => RunPresentation::ChatTab,
+                    };
                 }
                 let (id, opened) = self.open_agent_surface(owner, &run);
                 self.terminal_agents.runs.insert(id, run);
@@ -1029,6 +1046,21 @@ impl Workspace {
                 self.notice(owner, error);
                 Task::none()
             }
+        }
+    }
+
+    fn agent_run_presentation(&self) -> RunPresentation {
+        self.ai_configuration()
+            .map_or_else(RunPresentation::default, |config| {
+                config.agent_run_presentation()
+            })
+    }
+
+    pub(super) fn hosted_agent_title(&self, id: window::Id) -> &'static str {
+        match self.terminal_agents.runs.get(&id).map(|run| run.mode) {
+            Some(Mode::Ask) => "Ask Agent",
+            Some(Mode::Plan) => "AI Planning",
+            _ => "AI Agent",
         }
     }
 
@@ -1193,7 +1225,7 @@ impl Workspace {
             .as_ref()
             .map_or_else(|| "Local shell".into(), |ssh| ssh.label());
         let label = mask::prompt(&redactor, &label)?;
-        let context = match pane
+        let (context, ask_filename) = match pane
             .selection
             .filter(|_| mode == Mode::Ask && include_selection)
         {
@@ -1203,9 +1235,13 @@ impl Workspace {
                 if text.len() > 24 * 1024 {
                     return Err("Select at most 24 KiB of terminal context.".into());
                 }
-                mask::prompt(&redactor, &text)?
+                let masked = mask::prompt(&redactor, &text)?;
+                let name = (text.as_str() == masked)
+                    .then(|| ask_attachment::filename(&text).map(str::to_owned))
+                    .flatten();
+                (masked, name)
             }
-            None => String::new(),
+            None => (String::new(), None),
         };
         let manual_directory = if cfg!(windows) {
             pane.local_security.as_ref().map(|settings| {
@@ -1240,6 +1276,7 @@ impl Workspace {
             redactor,
         });
         run.profile_pending = profile_pending;
+        run.ask_file.filename = ask_filename;
         run.fonts = font::Sizes::load(&self.window_settings);
         run.presentation.load_activity(&self.window_settings);
         Ok(run)
@@ -1369,6 +1406,9 @@ impl Workspace {
         if matches!(message, Message::Close) {
             return self.close_terminal_agent(id).unwrap_or_else(Task::none);
         }
+        if let Message::Implement(epoch) = message {
+            return self.implement_agent_plan(id, epoch);
+        }
         if matches!(message, Message::Focus) {
             let source = self
                 .terminal_agents
@@ -1410,7 +1450,7 @@ impl Workspace {
         let before_epoch = run.epoch;
         let start_requested = matches!(
             message,
-            Message::Start | Message::StartFromShortcut | Message::Implement(_)
+            Message::Start | Message::StartFromShortcut | Message::StartPlanWithoutProbe
         );
         let task = self.agent_action(id, &mut run, message);
         run.sync_log_detail();

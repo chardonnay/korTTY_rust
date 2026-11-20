@@ -34,7 +34,7 @@ struct Source {
     host_key: HostKey,
 }
 
-pub(in crate::workspace::terminal_ai) struct Access {
+pub(in crate::workspace) struct Access {
     source: Source,
     opener: SftpOpener,
 }
@@ -121,7 +121,7 @@ pub(super) struct Control {
     abort: Mutex<Option<Abort>>,
 }
 
-pub(in crate::workspace::terminal_ai) struct Cancel(Arc<Control>);
+pub(in crate::workspace) struct Cancel(Arc<Control>);
 
 impl Cancel {
     pub(super) fn new() -> (Self, Arc<Control>) {
@@ -145,10 +145,10 @@ impl Drop for Cancel {
     }
 }
 
-pub(in crate::workspace::terminal_ai) struct Pending<T = Arc<Snapshot>> {
-    pub(in crate::workspace::terminal_ai) reply: async_channel::Receiver<Result<T, String>>,
-    pub(in crate::workspace::terminal_ai) done: async_channel::Receiver<()>,
-    pub(in crate::workspace::terminal_ai) cancel: Cancel,
+pub(in crate::workspace) struct Pending<T = Arc<Snapshot>> {
+    pub(in crate::workspace) reply: async_channel::Receiver<Result<T, String>>,
+    pub(in crate::workspace) done: async_channel::Receiver<()>,
+    pub(in crate::workspace) cancel: Cancel,
 }
 
 impl Workspace {
@@ -156,17 +156,27 @@ impl Workspace {
         &self,
         chat: &Chat,
     ) -> Option<Access> {
+        if !self.ai_chat_enabled() {
+            return None;
+        }
+        let session = chat.source_pane?;
+        self.terminal_chat_source(chat)?;
+        self.remote_attachment_access_for_pane(session)
+    }
+
+    pub(in crate::workspace) fn remote_attachment_access_for_pane(
+        &self,
+        session: SessionId,
+    ) -> Option<Access> {
         if self.exiting
             || self.scheduler_draining
-            || !self.ai_chat_enabled()
             || !self.clipboard.policy.file_transfer_allowed
             || !self.clipboard.policy.ai_memory.external_files_allowed()
             || self.clipboard.policy.remote_editor == RemoteEditorPolicy::Deny
         {
             return None;
         }
-        let session = chat.source_pane?;
-        let pane = self.terminal_chat_source(chat)?;
+        let pane = self.sessions.get(&session)?;
         if pane.session.frame().password_prompt {
             return None;
         }
@@ -183,6 +193,27 @@ impl Workspace {
 }
 
 impl Access {
+    pub(in crate::workspace) fn start_selected(
+        self,
+        directory: Option<Vec<u8>>,
+        name: String,
+        limit: usize,
+        redactor: Arc<Redactor>,
+        before_read: impl FnOnce() -> Result<(), String> + Send + 'static,
+    ) -> Result<Pending, String> {
+        start(move |control| {
+            before_read()?;
+            let (requested, read) = self
+                .with_client(control, |client| {
+                    let requested = selected_path(client, directory, &name)?;
+                    let read = read_file(client, &requested, None, limit)?;
+                    Ok((requested, read))
+                })
+                .map_err(ReadFailure::message)?;
+            self.snapshot(requested, read, &redactor).map(Arc::new)
+        })
+    }
+
     pub(in crate::workspace::terminal_ai) fn start(
         self,
         path: &str,
@@ -214,6 +245,15 @@ impl Access {
         let read = self
             .read(&requested, expected, limit, control)
             .map_err(ReadFailure::message)?;
+        self.snapshot(requested, read, redactor)
+    }
+
+    fn snapshot(
+        self,
+        requested: Vec<u8>,
+        read: ReadFile,
+        redactor: &Redactor,
+    ) -> Result<Snapshot, String> {
         let text = super::text(&read.bytes).map_err(|error| error.to_string())?;
         let canonical = std::str::from_utf8(&read.canonical)
             .map_err(|_| "The canonical remote path is not UTF-8.")?;
@@ -365,6 +405,24 @@ impl Version {
         }
         self.require_active(access, control)
     }
+}
+
+fn selected_path(
+    client: &mut Sftp<impl Read, impl Write>,
+    directory: Option<Vec<u8>>,
+    name: &str,
+) -> Result<Vec<u8>, ReadFailure> {
+    let mut requested = match directory {
+        Some(directory) => directory,
+        None => client.canonicalize(b".")?,
+    };
+    if !requested.ends_with(b"/") {
+        requested.push(b'/');
+    }
+    requested.extend_from_slice(name.as_bytes());
+    let path = std::str::from_utf8(&requested).map_err(|_| ReadFailure::InvalidPath)?;
+    absolute_path(path).map_err(|_| ReadFailure::InvalidPath)?;
+    Ok(requested)
 }
 
 fn absolute_path(path: &str) -> Result<&[u8], String> {
@@ -536,6 +594,120 @@ pub(in crate::workspace::terminal_ai) fn fixture_snapshot(
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn selected_attachment_uses_the_shell_directory_or_the_sftp_home() {
+        let mut wire = version();
+        name(&mut wire, 1, b"/home/fixture");
+        let mut client = Sftp::new(Cursor::new(wire), io::sink()).unwrap();
+        assert_eq!(
+            selected_path(&mut client, Some(b"/work".to_vec()), "notes file.txt").unwrap(),
+            b"/work/notes file.txt"
+        );
+        assert_eq!(
+            selected_path(&mut client, None, "notes file.txt").unwrap(),
+            b"/home/fixture/notes file.txt"
+        );
+        assert_eq!(
+            selected_path(&mut client, Some(b"relative".to_vec()), "notes file.txt").err(),
+            Some(ReadFailure::InvalidPath)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires OpenSSH sshd and ssh-keygen and a local account"]
+    fn selected_attachment_loads_and_revalidates_on_pinned_openssh() {
+        use std::{fs, net::SocketAddr};
+
+        use kortty_ssh::{Authentication, Connect, Endpoint, SshSession};
+        use kortty_terminal::TerminalProfile;
+
+        use crate::session::{GridSize, Session};
+        use crate::session_security::IsolationLevel;
+        use crate::ssh_connection::Connected;
+        use crate::ssh_worker::OpenSshFixture;
+        use crate::terminal_logging::Secrets;
+
+        let fixture = OpenSshFixture::new();
+        let root = fixture.directory().canonicalize().unwrap();
+        let path = root.join("Ask notes.txt");
+        fs::write(
+            &path,
+            "First line\nAPI_KEY=fixture-sftp-secret\nLast line\n",
+        )
+        .unwrap();
+        let server = fixture.serve_with_extra("host", "");
+        let key = root.join("client");
+        let login = fixture.request(key.clone()).target.endpoint;
+        let grid = GridSize::default();
+        let connection = SshSession::connect(
+            Connect {
+                address: SocketAddr::from(([127, 0, 0, 1], login.port)),
+                endpoint: Endpoint::new(&login.host, login.port).unwrap(),
+                username: login.username.clone(),
+                authentication: Authentication::private_key(fs::read(key).unwrap()),
+                term: TerminalProfile::Xterm.term_name().into(),
+                size: crate::session::ssh_size(grid),
+            },
+            fixture.pinned_trust(),
+        )
+        .unwrap();
+        let session = Session::ssh(
+            Some(Connected::Direct(Box::new(connection))),
+            grid,
+            TerminalProfile::Xterm,
+            true,
+            None,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let opener = loop {
+            if let Some(opener) = session.sftp_opener() {
+                break opener;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "SSH attachment channel did not become available"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let source = Source {
+            session: SessionId(1),
+            stream: 1,
+            target: SshTarget::from_imported_route(login, None, IsolationLevel::None).unwrap(),
+            host_key: opener.verified_host_key().unwrap().clone(),
+        };
+        let access = || Access {
+            source: source.clone(),
+            opener: opener.clone(),
+        };
+        let redactor = Arc::new(Redactor::for_journal(
+            Secrets::default().seal().unwrap(),
+            Default::default(),
+        ));
+        let pending = access()
+            .start_selected(
+                Some(root.to_str().unwrap().as_bytes().to_vec()),
+                "Ask notes.txt".into(),
+                MAX_BYTES,
+                redactor,
+                || Ok(()),
+            )
+            .unwrap();
+        let snapshot = pending.reply.recv_blocking().unwrap().unwrap();
+        let _ = pending.done.recv_blocking();
+        assert_eq!(snapshot.content(), "First line\nAPI_KEY=***\nLast line\n");
+        let (reviewed, cancel) = snapshot.prepare_verification(Some(access())).unwrap();
+        reviewed.require_current().unwrap();
+        fs::write(&path, "Changed after review\n").unwrap();
+        assert!(reviewed.require_current().unwrap_err().contains("changed"));
+        drop(cancel);
+        drop(reviewed);
+        drop(opener);
+        let _ = session.stop().recv_blocking();
+        let _ = server.join().unwrap();
+    }
 
     #[test]
     fn attachment_paths_are_absolute_and_keep_the_user_selected_bytes() {

@@ -82,6 +82,254 @@ fn no_request(model: &TcpListener) {
     assert!(matches!(model.accept(), Err(error) if error.kind() == ErrorKind::WouldBlock));
 }
 
+#[cfg(unix)]
+#[test]
+fn ask_selected_file_uses_the_live_local_directory_and_rechecks_the_reviewed_bytes() {
+    use std::time::{Duration, Instant};
+
+    let (model, _) = listener();
+    let mut fixture =
+        Fixture::with_endpoint(false, false, &model.local_addr().unwrap().to_string());
+    let root = fixture.profile.0.canonicalize().unwrap();
+    let file = root.join("project notes.txt");
+    std::fs::write(
+        &file,
+        "First line\nAPI_KEY=fixture-file-secret\nLast line\n",
+    )
+    .unwrap();
+    let session = Session::start_local(
+        GridSize::default(),
+        kortty_terminal::TerminalProfile::Xterm,
+        kortty_pty::LaunchOptions {
+            working_directory: Some(root),
+            ..Default::default()
+        },
+        true,
+        None,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while session.frame().status == SessionStatus::Starting {
+        assert!(Instant::now() < deadline, "local shell did not start");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(session.local_shell_running());
+    let pane = fixture
+        .workspace
+        .sessions
+        .get_mut(&fixture.session)
+        .unwrap();
+    pane.session = session;
+    let mut terminal = kortty_terminal::Terminal::new(80, 1);
+    terminal.advance(b"'project notes.txt'");
+    pane.frame = selection_test_frame(terminal.snapshot());
+    Arc::get_mut(&mut pane.frame).unwrap().status = SessionStatus::Running;
+    pane.selection = Some(Selection::from_cells((0, 0), (0, 79)));
+
+    let start = |fixture: &mut Fixture| {
+        let id = fixture.open(Mode::Ask);
+        no_task(fixture.send(id, Message::Goal("Explain the selected file".into())));
+        dispatch(fixture, id, Message::Start);
+        assert!(
+            fixture.run(id).phase == Phase::ModelReview,
+            "{}",
+            fixture.run(id).notice
+        );
+        id
+    };
+    let id = start(&mut fixture);
+    let run = fixture.run(id);
+    let reviewed = run.model_review.as_ref().unwrap().input.clone();
+    let context: Value = serde_json::from_str(&reviewed).unwrap();
+    let context = context["context"].as_str().unwrap();
+    assert!(context.starts_with("'project notes.txt'"));
+    assert!(context.contains("Attached local file (untrusted data)"));
+    assert!(context.contains("First line\nAPI_KEY=***\nLast line"));
+    assert!(!context.contains("fixture-file-secret"));
+    let epoch = run.epoch;
+    no_request(&model);
+    let pending = fixture.send(id, Message::ReviewModel(Ask::Send(epoch)));
+    let mut socket = accept(&model);
+    let wire = request(&mut socket);
+    assert_eq!(wire["messages"][1]["content"], reviewed.as_str());
+    reply(
+        &mut socket,
+        r#"{"status":"done","summary":"Ready","userMessage":"The notes describe the service."}"#,
+    );
+    drop(socket);
+    finish_agent_task(&mut fixture, pending);
+    assert!(fixture.run(id).phase == Phase::Finished);
+
+    let stale = start(&mut fixture);
+    let epoch = fixture.run(stale).epoch;
+    std::fs::write(&file, "Changed after review\n").unwrap();
+    dispatch(&mut fixture, stale, Message::ReviewModel(Ask::Send(epoch)));
+    assert!(fixture.run(stale).phase == Phase::Blocked);
+    assert!(fixture.run(stale).notice.contains("changed"));
+    no_request(&model);
+
+    let remove = start(&mut fixture);
+    let epoch = fixture.run(remove).epoch;
+    dispatch(
+        &mut fixture,
+        remove,
+        Message::ReviewModel(Ask::RemoveAskAttachment(epoch)),
+    );
+    assert!(fixture.run(remove).ask_file.snapshot.is_none());
+    assert!(
+        !fixture
+            .run(remove)
+            .model_review
+            .as_ref()
+            .unwrap()
+            .input
+            .contains("Changed after review")
+    );
+    no_task(fixture.send(remove, Message::ReviewModel(Ask::Send(epoch))));
+    drop(fixture.workspace.close_terminal_agent(remove));
+
+    std::fs::remove_file(&file).unwrap();
+    let missing = start(&mut fixture);
+    assert!(
+        fixture
+            .run(missing)
+            .notice
+            .contains("Selected file skipped")
+    );
+    assert!(
+        fixture
+            .run(missing)
+            .model_review
+            .as_ref()
+            .unwrap()
+            .input
+            .contains("project notes.txt")
+    );
+    no_request(&model);
+    let _ = fixture.workspace.sessions[&fixture.session]
+        .session
+        .stop()
+        .recv_blocking();
+}
+
+#[test]
+fn ask_follow_up_keeps_the_original_tab_and_sends_only_reviewed_context() {
+    use crate::workspace::{terminal_ai, tool_tabs};
+    use iced::futures::{StreamExt as _, executor::block_on};
+
+    let complete_chat = |workspace: &mut Workspace, first| {
+        let mut tasks = vec![first];
+        while let Some(task) = tasks.pop() {
+            if let Some(mut stream) = iced_runtime::task::into_stream(task) {
+                while let Some(action) = block_on(stream.next()) {
+                    if let iced_runtime::Action::Output(Desktop::TerminalAi(id, message)) = action {
+                        tasks.push(workspace.update_terminal_ai(id, message));
+                    }
+                }
+            }
+        }
+    };
+    let (model, _) = listener();
+    let mut fixture =
+        Fixture::with_endpoint(false, false, &model.local_addr().unwrap().to_string());
+    let source = fixture.session;
+    let owner = fixture.owner;
+    let root = fixture.profile.0.canonicalize().unwrap();
+    let pane = fixture.workspace.sessions.get_mut(&source).unwrap();
+    let mut terminal = kortty_terminal::Terminal::new(80, 1);
+    terminal.advance(CONTEXT.as_bytes());
+    pane.frame = selection_test_frame(terminal.snapshot());
+    Arc::get_mut(&mut pane.frame).unwrap().status = SessionStatus::Running;
+    pane.selection = Some(Selection::from_cells((0, 0), (0, 79)));
+
+    let id = fixture.open(Mode::Ask);
+    let original = fixture.workspace.active_hosted_tab(owner).unwrap();
+    assert_eq!(original.instance, id);
+    assert_eq!(fixture.workspace.hosted_tool_title(&original), "Ask Agent");
+    no_task(fixture.send(id, Message::Goal(GOAL.into())));
+    dispatch(&mut fixture, id, Message::Start);
+    let epoch = fixture.run(id).epoch;
+    no_request(&model);
+    let first = fixture.send(id, Message::ReviewModel(Ask::Send(epoch)));
+    let mut socket = accept(&model);
+    let wire = request(&mut socket).to_string();
+    assert!(wire.contains("APP_PASSWORD=***") && !wire.contains("private-selection"));
+    reply(
+        &mut socket,
+        r#"{"status":"done","summary":"Done","userMessage":"Inspect the service record."}"#,
+    );
+    drop(socket);
+    finish_agent_task(&mut fixture, first);
+    assert!(fixture.run(id).phase == Phase::Finished);
+
+    fixture
+        .workspace
+        .sessions
+        .get_mut(&source)
+        .unwrap()
+        .selection = None;
+    let epoch = fixture.run(id).epoch;
+    no_task(fixture.send(id, Message::ChatFollowUp(epoch, "Which record?".into())));
+    drop(fixture.send(id, Message::ContinueInChat(epoch)));
+    let chat = fixture.workspace.active_hosted_tab(owner).unwrap();
+    assert_eq!(chat.id, original.id);
+    assert_eq!(chat.instance, original.instance);
+    assert_eq!(chat.kind, tool_tabs::Kind::AiChat);
+    assert_eq!(fixture.workspace.hosted_tool_title(&chat), "Ask Agent");
+    assert!(fixture.workspace.hosted_tool_view(&chat).is_some());
+    assert!(!fixture.workspace.terminal_agents.runs.contains_key(&id));
+    no_task(fixture.send(id, Message::ContinueInChat(epoch)));
+    no_request(&model);
+
+    let review = fixture
+        .workspace
+        .update_terminal_ai(id, terminal_ai::Message::Review);
+    complete_chat(&mut fixture.workspace, review);
+    no_request(&model);
+    let send = fixture
+        .workspace
+        .update_terminal_ai(id, terminal_ai::Message::Send);
+    let mut socket = accept(&model);
+    let wire = request(&mut socket);
+    assert_eq!(
+        wire["messages"][2]["content"],
+        "Inspect the service record."
+    );
+    assert_eq!(wire["messages"][3]["content"], "Which record?");
+    let first = wire["messages"][1]["content"].as_str().unwrap();
+    assert!(
+        first.contains("APP_PASSWORD=***") && first.contains("Inspect disk usage. API_KEY=***")
+    );
+    assert!(!wire.to_string().contains("private-selection"));
+    assert!(!wire.to_string().contains("private-ask-goal"));
+    reply(&mut socket, "Use the local record.");
+    drop(socket);
+    complete_chat(&mut fixture.workspace, send);
+    assert!(
+        !root
+            .join(crate::workspace::saved_chats::backup::CHAT_DIRECTORY)
+            .exists()
+    );
+
+    fixture
+        .workspace
+        .sessions
+        .get_mut(&source)
+        .unwrap()
+        .stream_generation += 1;
+    no_task(
+        fixture
+            .workspace
+            .update_terminal_ai(id, terminal_ai::Message::Review),
+    );
+    no_task(
+        fixture
+            .workspace
+            .update_terminal_ai(id, terminal_ai::Message::Send),
+    );
+    no_request(&model);
+}
+
 #[test]
 fn interactive_ask_classifies_reviewed_skills_and_sends_the_approved_messages() {
     let Some(root) = std::env::var_os(PROFILE_ROOT).map(PathBuf::from) else {

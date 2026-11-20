@@ -9,6 +9,7 @@ mod directory;
 pub(crate) mod history;
 mod local;
 pub(crate) mod planning;
+pub(crate) mod planning_probe;
 mod runner;
 pub(crate) mod shortcut;
 mod ssh;

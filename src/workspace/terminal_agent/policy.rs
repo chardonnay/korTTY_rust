@@ -357,6 +357,15 @@ impl Workspace {
                 .map(|transport| Box::new(transport.clone())),
         })
     }
+
+    pub(super) fn planning_probe_dispatch_policy(
+        &self,
+        run: &Run,
+    ) -> Result<Dispatch, &'static str> {
+        let mut dispatch = self.agent_dispatch_policy(run)?;
+        dispatch.mode = Some(Mode::Run);
+        Ok(dispatch)
+    }
 }
 
 #[cfg(test)]

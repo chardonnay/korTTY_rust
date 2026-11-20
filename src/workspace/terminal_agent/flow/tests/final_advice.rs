@@ -30,7 +30,12 @@ fn outcome(code: u32) -> Outcome {
     }
 }
 
-fn complete_review(fixture: &mut Fixture, id: window::Id, probe: bool, code: u32) -> Task<Desktop> {
+pub(super) fn complete_review(
+    fixture: &mut Fixture,
+    id: window::Id,
+    probe: bool,
+    code: u32,
+) -> Task<Desktop> {
     let epoch = fixture.run(id).epoch;
     let approved = fixture.send(id, Message::Approve(epoch));
     let directory = message(approved, id);
@@ -67,7 +72,7 @@ fn skip_triage(fixture: &mut Fixture, id: window::Id) -> Task<Desktop> {
     )
 }
 
-fn prepare_local_run(fixture: &mut Fixture, id: window::Id, goal: &str) {
+pub(super) fn prepare_local_run(fixture: &mut Fixture, id: window::Id, goal: &str) {
     fixture.run_mut(id).manual_directory = Some(
         fixture
             .profile

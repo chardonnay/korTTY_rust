@@ -157,6 +157,24 @@ impl Workspace {
         self.hosted_tab_at(owner, tab)
     }
 
+    pub(super) fn replace_hosted_agent_with_chat(&mut self, id: window::Id) -> bool {
+        let Some((owner, _)) = self.locate_hosted_tool(id) else {
+            return false;
+        };
+        let Some(tool) = self.windows.get_mut(&owner).and_then(|window| {
+            window.tabs.iter_mut().find_map(|tab| match tab {
+                TabEntry::Tool(tool) if tool.instance == id && tool.kind == Kind::TerminalAgent => {
+                    Some(tool)
+                }
+                _ => None,
+            })
+        }) else {
+            return false;
+        };
+        tool.kind = Kind::AiChat;
+        true
+    }
+
     pub(super) fn hosted_tool_view(&self, tool: &HostedTab) -> Option<Element<'_, Message>> {
         match tool.kind {
             Kind::OpenPgp => self.openpgp_view(tool.instance),
@@ -193,7 +211,7 @@ impl Workspace {
             Kind::RecordingManager => super::recording_access::MANAGER_TITLE,
             Kind::AiManager => crate::ai_manager::TITLE,
             Kind::AiChat => return self.terminal_chat_title(tool.instance),
-            Kind::TerminalAgent => "AI Agent",
+            Kind::TerminalAgent => self.hosted_agent_title(tool.instance),
             Kind::JournalChatTranscript => {
                 if self.journal_allowed()
                     && let Some(tab) = self.journal_chat_transcripts.get(&tool.instance)

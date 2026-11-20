@@ -89,7 +89,7 @@ fn no_model_request(listener: &TcpListener) {
 
 fn reviewed_messages(workspace: &Workspace, id: window::Id) -> (u64, [String; 2]) {
     let run = &workspace.terminal_agents.runs[&id];
-    assert!(run.phase == Phase::ModelReview && run.target.is_none());
+    assert!(run.phase == Phase::ModelReview);
     let review = run.model_review.as_ref().unwrap();
     let messages = [review.system.as_str(), review.input.as_str()];
     assert!(
@@ -104,6 +104,141 @@ fn reviewed_messages(workspace: &Workspace, id: window::Id) -> (u64, [String; 2]
         "about {estimate} input tokens and up to {OUTPUT_LIMIT} output tokens"
     )));
     (run.epoch, messages.map(str::to_owned))
+}
+
+#[cfg(unix)]
+#[test]
+fn planning_requires_fixed_probe_approval_and_reuses_the_masked_snapshot() {
+    use std::time::Instant;
+
+    let _exclusive = exclusive_run();
+    let (listener, _) = listener();
+    let profile = Profile::new();
+    let root = profile.0.canonicalize().unwrap();
+    let (mut workspace, owner, source) =
+        fixture(&root, listener.local_addr().unwrap(), CONTEXT_LIMIT);
+    let session = Session::start_local(
+        GridSize::default(),
+        kortty_terminal::TerminalProfile::Xterm,
+        kortty_pty::LaunchOptions {
+            working_directory: Some(root.clone()),
+            ..Default::default()
+        },
+        true,
+        None,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while session.frame().status == Status::Starting {
+        assert!(Instant::now() < deadline, "planning shell did not start");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(session.local_shell_running());
+    workspace.sessions.get_mut(&source).unwrap().session = session;
+
+    let id = open_plan(&mut workspace, owner, source);
+    no_task(workspace.update_terminal_agent(
+        id,
+        RunMessage::Goal("Inspect the current working directory".into()),
+    ));
+    let prepare = workspace.update_terminal_agent(id, RunMessage::Start);
+    finish_review(&mut workspace, prepare);
+    let run = &workspace.terminal_agents.runs[&id];
+    assert!(run.phase == Phase::ProbeApproval);
+    let command = run.reviewed_command().unwrap().1;
+    assert!(command.contains("availableDiskKb") && command.contains("sudo -n -l"));
+    let probe_epoch = run.epoch;
+    no_task(workspace.update_terminal_agent(id, RunMessage::Approve(probe_epoch - 1)));
+    no_task(workspace.update_terminal_agent(id, RunMessage::ApproveRemaining(probe_epoch)));
+    no_model_request(&listener);
+    let probe = workspace.update_terminal_agent(id, RunMessage::Approve(probe_epoch));
+    finish_review(&mut workspace, probe);
+
+    let (epoch, messages) = reviewed_messages(&workspace, id);
+    let root = root.to_str().unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&messages[1]).unwrap();
+    let snapshot = payload["probe"].clone();
+    assert_eq!(snapshot["currentDir"], root);
+    assert!(!snapshot["osRelease"].as_str().unwrap().is_empty());
+    assert!(snapshot["availableDiskKb"].is_u64());
+    assert!(
+        workspace.terminal_agents.runs[&id]
+            .planning
+            .as_ref()
+            .unwrap()
+            .probe_summary()
+            .unwrap()
+            .contains(root)
+    );
+    no_model_request(&listener);
+    let questions = send_review(&mut workspace, id, epoch);
+    let mut socket = accept(&listener);
+    let wire = request(&mut socket);
+    assert_eq!(wire["messages"][1]["content"], messages[1]);
+    let answer = json!({"status":"questions","summary":"Clarify","userMessage":"Choose detail","questions":[
+        {"id":"q1","question":"What level of detail?","options":["Brief","Detailed"],"allowCustomAnswer":false}
+    ]});
+    reply_with_plan_json(&mut socket, answer);
+    drop(socket);
+    finish_review(&mut workspace, questions);
+    let run = &workspace.terminal_agents.runs[&id];
+    assert!(run.phase == Phase::PlanQuestions);
+    let options = workspace.update_terminal_agent(
+        id,
+        RunMessage::Planning(Message::Answer(run.epoch, "Brief".into())),
+    );
+    finish_review(&mut workspace, options);
+    let (epoch, messages) = reviewed_messages(&workspace, id);
+    let payload: serde_json::Value = serde_json::from_str(&messages[1]).unwrap();
+    assert_eq!(payload["probe"], snapshot);
+    no_model_request(&listener);
+    let options = send_review(&mut workspace, id, epoch);
+    let mut socket = accept(&listener);
+    assert_eq!(request(&mut socket)["messages"][1]["content"], messages[1]);
+    reply_with_plan_json(
+        &mut socket,
+        json!({"status":"options","summary":"Choose","userMessage":"Available approach","options":[
+            {"title":"Inspect metadata","summary":"Use read-only facts","feasibility":"The probe located the directory","risks":[],"prerequisites":[],"steps":["Review the directory metadata"],"alternatives":[]}
+        ]}),
+    );
+    drop(socket);
+    finish_review(&mut workspace, options);
+    let run = &workspace.terminal_agents.runs[&id];
+    assert!(run.phase == Phase::PlanOptions);
+    let report =
+        workspace.update_terminal_agent(id, RunMessage::Planning(Message::Choose(run.epoch, 0)));
+    finish_review(&mut workspace, report);
+    let (_, messages) = reviewed_messages(&workspace, id);
+    let payload: serde_json::Value = serde_json::from_str(&messages[1]).unwrap();
+    assert_eq!(payload["probe"], snapshot);
+    no_model_request(&listener);
+    drop(workspace.close_terminal_agent(id));
+
+    let skipped = open_plan(&mut workspace, owner, source);
+    no_task(workspace.update_terminal_agent(
+        skipped,
+        RunMessage::Goal("Plan without reading the environment".into()),
+    ));
+    let bypass = workspace.update_terminal_agent(skipped, RunMessage::StartPlanWithoutProbe);
+    finish_review(&mut workspace, bypass);
+    let (_, messages) = reviewed_messages(&workspace, skipped);
+    let payload: serde_json::Value = serde_json::from_str(&messages[1]).unwrap();
+    assert!(payload.get("probe").is_none());
+    assert!(workspace.terminal_agents.runs[&skipped].target.is_none());
+    no_model_request(&listener);
+    let _ = workspace.sessions[&source].session.stop().recv_blocking();
+}
+
+#[cfg(unix)]
+fn reply_with_plan_json(
+    socket: &mut std::io::BufReader<std::net::TcpStream>,
+    answer: serde_json::Value,
+) {
+    let body = json!({"choices":[{"message":{"content":answer.to_string()}}], "usage":{"total_tokens":17}}).to_string();
+    socket
+        .get_mut()
+        .write_all(fixture_http_response("200 OK", "", &body).as_bytes())
+        .unwrap();
 }
 
 fn send_review(workspace: &mut Workspace, id: window::Id, epoch: u64) -> Task<Desktop> {
@@ -385,14 +520,16 @@ fn terminal_agent_planning_walks_review_steps_and_reopens_without_execution() {
             json!({"status":"questions","summary":"Clarify","userMessage":"Choose environment","questions":[{"id":"q1","question":"Which environment? API_KEY=private-plan-question","options":["Local","Test"],"allowCustomAnswer":false}]}),
             report.clone(), // Wrong status for Options, which can repair once.
             json!({"status":"options","summary":"Options","userMessage":"Choose approach","options":[{"title":"Review files","summary":"Inspect before changes","feasibility":"Files are available","risks":[],"prerequisites":[],"steps":["Inspect"],"alternatives":[]}]}),
+            json!({"status":"blocked","summary":"Unavailable","userMessage":"The revision is unavailable."}),
+            json!({"status":"options","summary":"Revised options","userMessage":"Choose a revised approach","options":[{"title":"Inspect unit metadata","summary":"Use read-only records","feasibility":"Metadata is available","risks":[],"prerequisites":[],"steps":["Inspect unit metadata"],"alternatives":[]}]}),
             json!({"status":"blocked","summary":"Unavailable","userMessage":"Only a final plan may settle this stage."}),
             report,
         ].into_iter().enumerate() {
-            if matches!(index, 0 | 1 | 3) {
+            if matches!(index, 0 | 1 | 3 | 4 | 5) {
                 reviewed = Some(received.recv_timeout(Duration::from_secs(5)).unwrap());
             }
             let [system, input] = reviewed.as_ref().unwrap();
-            let rejected = matches!(index, 0 | 4).then(|| reject_json_format(&listener));
+            let rejected = matches!(index, 0 | 6).then(|| reject_json_format(&listener));
             let mut socket = accept(&listener);
             let request = request(&mut socket);
             if let Some(rejected) = rejected {
@@ -403,7 +540,7 @@ fn terminal_agent_planning_walks_review_steps_and_reopens_without_execution() {
             assert_eq!(request["max_tokens"], OUTPUT_LIMIT);
             assert_eq!(request["messages"][0]["content"], *system);
             let sent = request["messages"][1]["content"].as_str().unwrap();
-            if matches!(index, 2 | 4) {
+            if matches!(index, 2 | 6) {
                 let repair: serde_json::Value = serde_json::from_str(sent).unwrap();
                 assert_eq!(repair["reviewedContext"], *input);
             } else {
@@ -411,13 +548,20 @@ fn terminal_agent_planning_walks_review_steps_and_reopens_without_execution() {
             }
             let request = request.to_string();
             assert!(request.contains("Execute nothing"));
-            assert_eq!(request.contains("reviewedContext"), matches!(index, 2 | 4));
+            assert_eq!(request.contains("reviewedContext"), matches!(index, 2 | 6));
             if index >= 1 {
                 assert!(request.contains("Local"));
             }
-            if index >= 3 {
-                assert!(request.contains("Review files"));
+            if matches!(index, 3 | 4) {
+                assert!(request.contains("Keep service read-only"));
+                assert!(request.contains("Use local metadata"));
             }
+            if index >= 5 {
+                assert!(request.contains("Inspect unit metadata"));
+                assert!(request.contains("Keep the unit name unchanged"));
+            }
+            assert!(!request.contains("private-approach-note"));
+            assert!(!request.contains("private-report-note"));
             let body = json!({"choices":[{"message":{"content":result.to_string()}}],
                 "usage":{"prompt_tokens":index+1,"completion_tokens":0}}).to_string();
             let response = fixture_http_response("200 OK", "", &body);
@@ -516,13 +660,96 @@ fn terminal_agent_planning_walks_review_steps_and_reopens_without_execution() {
     finish(&mut workspace, options, owner);
     let run = &workspace.terminal_agents.runs[&id];
     assert!(run.phase == Phase::PlanOptions && run.target.is_none());
+    let initial_options = run.epoch;
+    let edit = |epoch, action| RunMessage::Planning(Message::EditRefinement(epoch, action));
+    let paste =
+        |notes: &str| text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(notes.into())));
+    no_task(workspace.update_terminal_agent(
+        id,
+        edit(
+            initial_options,
+            paste(&"x".repeat(MAX_REFINEMENT_BYTES + 1)),
+        ),
+    ));
+    no_task(workspace.update_terminal_agent(
+        id,
+        edit(
+            initial_options,
+            paste("Keep service read-only.\nAPI_KEY=private-approach-note\nUse local metadata."),
+        ),
+    ));
+    let revise =
+        workspace.update_terminal_agent(id, RunMessage::Planning(Message::Revise(initial_options)));
+    finish_review(&mut workspace, revise);
+    let (approval, messages) = reviewed_messages(&workspace, id);
+    let revised: serde_json::Value = serde_json::from_str(&messages[1]).unwrap();
+    assert_eq!(
+        revised["refinement"],
+        "Keep service read-only.\nAPI_KEY=***\nUse local metadata."
+    );
+    assert_eq!(revised["answers"], json!(["Local"]));
+    assert!(revised["selectedApproach"].is_null());
+    no_task(workspace.update_terminal_agent(id, edit(initial_options, paste("Unreviewed notes"))));
+    assert_eq!(reviewed_messages(&workspace, id).1, messages);
+    no_task(send_review(&mut workspace, id, initial_options));
+    no_model_request(&listener);
+    reviews.send(messages).unwrap();
+    let revise = send_review(&mut workspace, id, approval);
+    finish(&mut workspace, revise, owner);
+
+    let run = &workspace.terminal_agents.runs[&id];
+    assert!(run.phase == Phase::PlanOptions);
+    assert_eq!(run.notice, "The revision is unavailable.");
+    assert_eq!(
+        run.planning.as_ref().unwrap().options[0].title,
+        "Review files"
+    );
+    let retry =
+        workspace.update_terminal_agent(id, RunMessage::Planning(Message::Revise(run.epoch)));
+    finish_review(&mut workspace, retry);
+    let (approval, messages) = reviewed_messages(&workspace, id);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&messages[1]).unwrap(),
+        revised
+    );
+    no_model_request(&listener);
+    reviews.send(messages).unwrap();
+    let retry = send_review(&mut workspace, id, approval);
+    finish(&mut workspace, retry, owner);
+
+    let run = &workspace.terminal_agents.runs[&id];
+    assert!(run.phase == Phase::PlanOptions && run.target.is_none());
     let epoch = run.epoch;
+    assert_eq!(
+        run.planning.as_ref().unwrap().options[0].title,
+        "Inspect unit metadata"
+    );
+    no_task(workspace.update_terminal_agent(
+        id,
+        RunMessage::Planning(Message::Choose(initial_options, 0)),
+    ));
+    no_task(workspace.update_terminal_agent(id, edit(epoch, text_editor::Action::SelectAll)));
+    no_task(workspace.update_terminal_agent(
+        id,
+        edit(
+            epoch,
+            paste("Keep the unit name unchanged.\nAPI_KEY=private-report-note"),
+        ),
+    ));
     let report =
         workspace.update_terminal_agent(id, RunMessage::Planning(Message::Choose(epoch, 0)));
     finish_review(&mut workspace, report);
     let (approval, messages) = reviewed_messages(&workspace, id);
     assert!(messages[0].contains(LOCAL_GUIDANCE));
-    assert!(messages[1].contains("Review files"));
+    let drafted: serde_json::Value = serde_json::from_str(&messages[1]).unwrap();
+    assert_eq!(
+        drafted["selectedApproach"]["title"],
+        "Inspect unit metadata"
+    );
+    assert_eq!(
+        drafted["refinement"],
+        "Keep the unit name unchanged.\nAPI_KEY=***"
+    );
     no_model_request(&listener);
     reviews.send(messages).unwrap();
     let report = send_review(&mut workspace, id, approval);
@@ -530,8 +757,8 @@ fn terminal_agent_planning_walks_review_steps_and_reopens_without_execution() {
     planner.join().unwrap();
     let run = &workspace.terminal_agents.runs[&id];
     assert!(run.phase == Phase::PlanReady && run.target.is_none());
-    assert_eq!(run.presentation.model_usage.attempts().count(), 5);
-    assert_eq!(run.presentation.model_usage.total(), Some(15));
+    assert_eq!(run.presentation.model_usage.attempts().count(), 7);
+    assert_eq!(run.presentation.model_usage.total(), Some(28));
     assert!(
         run.plan
             .as_deref()
@@ -564,10 +791,20 @@ fn terminal_agent_planning_walks_review_steps_and_reopens_without_execution() {
     ));
     let implement = workspace.update_terminal_agent(reopened, RunMessage::Implement(epoch));
     finish(&mut workspace, implement, owner);
-    let run = &workspace.terminal_agents.runs[&reopened];
+    let plan = &workspace.terminal_agents.runs[&reopened];
+    assert!(plan.phase == Phase::PlanHandedOff && plan.target.is_none());
+    let (&id, run) = workspace
+        .terminal_agents
+        .runs
+        .iter()
+        .find(|(_, run)| run.mode == Mode::Run)
+        .unwrap();
     assert!(run.phase == Phase::ProbeApproval);
+    assert!(workspace.hosted_tool_owner(id).is_none());
+    assert_eq!(run.plan, plan.plan);
     assert!(run.activity.iter().all(|line| !line.starts_with("$ ")));
     let _ = workspace.close_terminal_agent(reopened);
+    let _ = workspace.close_terminal_agent(id);
 
     let changed = open_plan(&mut workspace, owner, source);
     let browse = workspace.update_terminal_agent(changed, RunMessage::Planning(Message::Browse));
@@ -593,6 +830,66 @@ fn terminal_agent_planning_walks_review_steps_and_reopens_without_execution() {
     let run = &workspace.terminal_agents.runs[&changed];
     assert!(run.phase == Phase::Blocked && run.target.is_none());
     assert!(run.notice.contains("destination changed"));
+}
+
+#[test]
+fn accepted_plan_uses_the_current_chat_tab_preference_and_keeps_the_exact_source() {
+    let (listener, _) = listener();
+    let profile = Profile::new();
+    let root = profile.0.canonicalize().unwrap();
+    let (mut workspace, owner, source) =
+        fixture(&root, listener.local_addr().unwrap(), CONTEXT_LIMIT);
+    let planner = open_plan(&mut workspace, owner, source);
+    assert_eq!(workspace.hosted_tool_owner(planner), Some(owner));
+    let baseline = Configuration::load_fixture_from(&root).unwrap();
+    let mut config = serde_json::to_value(&baseline).unwrap();
+    config["general"]["agent_run_presentation"] = json!("chat_tab");
+    let config: Configuration = serde_json::from_value(config).unwrap();
+    config.save_fixture_at(&root, &baseline).unwrap();
+    workspace.set_test_ai_configuration(Configuration::load_fixture_from(&root).unwrap());
+
+    let destination = workspace
+        .planning_destination(&workspace.terminal_agents.runs[&planner])
+        .unwrap();
+    let report = Report {
+        title: "Inspect service".into(),
+        summary: "Review its configuration".into(),
+        steps: vec!["Read the configuration".into()],
+        success_criteria: vec!["Identify the reported port".into()],
+        prerequisites: Vec::new(),
+        risks: Vec::new(),
+    };
+    let mut flow = Flow::new(destination);
+    flow.report = Some(report.clone());
+    let plan = workspace.terminal_agents.runs.get_mut(&planner).unwrap();
+    plan.goal = "Inspect service".into();
+    plan.plan = Some(report.render());
+    plan.planning = Some(flow);
+    plan.manual_directory = Some(root.to_str().unwrap().into());
+    let epoch = plan.next(Phase::PlanReady, "Plan ready");
+    no_task(workspace.update_terminal_agent(planner, RunMessage::Implement(epoch - 1)));
+    assert_eq!(workspace.terminal_agents.runs.len(), 1);
+    let implement = workspace.update_terminal_agent(planner, RunMessage::Implement(epoch));
+    let tool = workspace.active_hosted_tab(owner).unwrap();
+    assert_ne!(tool.instance, planner);
+    let run = tool.instance;
+    assert_eq!(workspace.hosted_agent_title(run), "AI Agent");
+    finish(&mut workspace, implement, owner);
+    let state = &workspace.terminal_agents.runs[&run];
+    assert!(state.phase == Phase::ProbeApproval);
+    assert_eq!(state.binding.live().unwrap().session, source);
+    assert_eq!(state.plan.as_deref(), Some(report.render().as_str()));
+    assert_eq!(state.profile().unwrap().id, 1);
+    drop(workspace.update_terminal_agent(planner, RunMessage::Focus));
+    assert_eq!(
+        workspace.active_hosted_tab(owner).unwrap().instance,
+        planner
+    );
+    no_task(workspace.update_terminal_agent(planner, RunMessage::Implement(epoch)));
+    assert_eq!(workspace.terminal_agents.runs.len(), 2);
+    no_model_request(&listener);
+    drop(workspace.close_terminal_agent(planner));
+    assert!(workspace.terminal_agents.runs[&run].phase == Phase::ProbeApproval);
 }
 
 #[test]

@@ -715,7 +715,8 @@ impl super::Workspace {
                     let (id, run) = self
                         .terminal_agents
                         .agent_activity_for_stream(pane, stream)?;
-                    (!run.runs_in_chat_tab()).then_some((id, EntryKey::Pane))
+                    run.has_terminal_presentation()
+                        .then_some((id, EntryKey::Pane))
                 });
             let shift_f10_available = self
                 .window_settings

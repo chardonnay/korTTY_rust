@@ -70,13 +70,13 @@ impl Stage {
                 "\"questions\":[{\"id\":\"q1\",\"question\":\"question\",\"options\":[\"one\",\"two\"],\"allowCustomAnswer\":true}]}"
             ),
             Self::Options => concat!(
-                "Offer one to three approaches based on the accepted answers. ",
+                "Offer one to three approaches based on the accepted answers and any refinement. ",
                 "Use {\"status\":\"options\",\"summary\":\"summary\",\"userMessage\":\"message\",",
                 "\"options\":[{\"title\":\"title\",\"summary\":\"summary\",\"feasibility\":\"feasibility\",",
                 "\"risks\":[],\"prerequisites\":[],\"steps\":[\"step\"],\"alternatives\":[]}]}"
             ),
             Self::Report => concat!(
-                "Draft a report for the selected approach, including its risks and success criteria. ",
+                "Draft a report for the selected approach and any refinement, including risks and success criteria. ",
                 "Use {\"status\":\"final_plan\",\"title\":\"title\",\"summary\":\"summary\",\"userMessage\":\"message\",",
                 "\"prerequisites\":[],\"steps\":[\"step\"],\"risks\":[],\"successCriteria\":[\"criterion\"]}"
             ),

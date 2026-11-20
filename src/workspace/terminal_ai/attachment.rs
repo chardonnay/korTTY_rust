@@ -11,7 +11,7 @@ use crate::terminal_logging::Redactor;
 use crate::workspace::saved_chats::store::{Attachment, AttachmentKind, MAX_ATTACHMENT_BYTES};
 
 pub(super) mod flowchart;
-pub(super) mod remote;
+pub(in crate::workspace) mod remote;
 
 pub(super) const MAX_BYTES: usize = MAX_ATTACHMENT_BYTES;
 
@@ -32,13 +32,13 @@ enum Origin {
     Archived,
 }
 
-pub(super) struct Verification {
+pub(in crate::workspace) struct Verification {
     snapshot: std::sync::Arc<Snapshot>,
     remote: Option<(remote::Access, std::sync::Arc<remote::Control>)>,
 }
 
 impl Verification {
-    pub(super) fn require_current(&self) -> Result<(), String> {
+    pub(in crate::workspace) fn require_current(&self) -> Result<(), String> {
         match (&self.snapshot.origin, &self.remote) {
             (Origin::Remote { version, .. }, Some((access, control))) => {
                 version.require_current(access, control)
@@ -59,7 +59,15 @@ impl Verification {
 
 impl Snapshot {
     pub(super) fn read(path: &Path, redactor: &Redactor) -> Result<Self, String> {
-        let (text, stamp, digest) = read(path).map_err(|error| error.to_string())?;
+        Self::read_bounded(path, redactor, MAX_BYTES)
+    }
+
+    pub(in crate::workspace) fn read_bounded(
+        path: &Path,
+        redactor: &Redactor,
+        limit: usize,
+    ) -> Result<Self, String> {
+        let (text, stamp, digest) = read(path, limit).map_err(|error| error.to_string())?;
         let name = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -103,11 +111,11 @@ impl Snapshot {
         }
     }
 
-    pub(super) fn stored(&self) -> &Attachment {
+    pub(in crate::workspace) fn stored(&self) -> &Attachment {
         &self.attachment
     }
 
-    pub(super) fn is_remote(&self) -> bool {
+    pub(in crate::workspace) fn is_remote(&self) -> bool {
         matches!(self.origin, Origin::Remote { .. })
     }
 
@@ -117,14 +125,14 @@ impl Snapshot {
         }
     }
 
-    pub(super) fn matches_source(&self, access: Option<&remote::Access>) -> bool {
+    pub(in crate::workspace) fn matches_source(&self, access: Option<&remote::Access>) -> bool {
         match &self.origin {
             Origin::Local { .. } | Origin::Archived => true,
             Origin::Remote { version, .. } => access.is_some_and(|access| version.matches(access)),
         }
     }
 
-    pub(super) fn prepare_verification(
+    pub(in crate::workspace) fn prepare_verification(
         self: std::sync::Arc<Self>,
         access: Option<remote::Access>,
     ) -> Result<(Verification, Option<remote::Cancel>), String> {
@@ -160,7 +168,7 @@ impl Snapshot {
         format!("{title} · {detail} · {} bytes", self.content().len())
     }
 
-    pub(super) fn append_to(&self, context: &str) -> String {
+    pub(in crate::workspace) fn append_to(&self, context: &str) -> String {
         self.attachment.append_to(context)
     }
 
@@ -182,7 +190,7 @@ impl Snapshot {
                 "The SSH attachment requires verification on its original connection.".into(),
             );
         };
-        let (_, current_stamp, current_digest) = read(path).map_err(|_| {
+        let (_, current_stamp, current_digest) = read(path, MAX_BYTES).map_err(|_| {
             "The attached file is unavailable. Remove it and select a current snapshot.".to_owned()
         })?;
         if &current_stamp != stamp || &current_digest != digest {
@@ -195,7 +203,7 @@ impl Snapshot {
     }
 }
 
-fn read(path: &Path) -> io::Result<(Zeroizing<String>, FileStamp, Vec<u8>)> {
+fn read(path: &Path, limit: usize) -> io::Result<(Zeroizing<String>, FileStamp, Vec<u8>)> {
     if !path.is_absolute()
         || path.components().any(|part| part == Component::ParentDir)
         || path.as_os_str().as_encoded_bytes().len() > 4096
@@ -214,10 +222,11 @@ fn read(path: &Path) -> io::Result<(Zeroizing<String>, FileStamp, Vec<u8>)> {
     let file = directory.open_file(name)?;
     let stamp = FileStamp::read(&file)?;
     let mut bytes = Zeroizing::new(Vec::new());
-    (&file).take(MAX_BYTES as u64 + 1).read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_BYTES {
+    let limit = limit.min(MAX_BYTES);
+    (&file).take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
         return Err(io::Error::other(
-            "The attachment exceeds the 16 KiB text limit.",
+            "The file exceeds the available attachment size limit.",
         ));
     }
     stamp.require_unchanged(&file)?;

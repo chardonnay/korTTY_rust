@@ -376,7 +376,7 @@ impl Workspace {
         self.ai_chat_enabled()
             && !self.exiting
             && !self.hosted_close_locks(id)
-            && !self.private_agent_source_changed(chat)
+            && !self.bound_agent_source_changed(chat)
             && chat.code_actions_available()
             && chat.code_review.is_none()
     }

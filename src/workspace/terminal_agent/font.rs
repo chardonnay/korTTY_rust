@@ -156,6 +156,10 @@ impl Workspace {
         key: &keyboard::Key,
         modifiers: keyboard::Modifiers,
     ) -> Option<Task<Desktop>> {
+        let id = self
+            .active_hosted_tab(id)
+            .filter(|tool| tool.kind == crate::workspace::tool_tabs::Kind::TerminalAgent)
+            .map_or(id, |tool| tool.instance);
         if !modifiers.command()
             || modifiers.alt()
             || !self

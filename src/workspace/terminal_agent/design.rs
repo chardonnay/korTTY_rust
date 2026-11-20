@@ -391,7 +391,7 @@ fn pane_status(
 
 impl Workspace {
     pub(super) fn run_uses_spotlight_status(&self, run: &Run) -> bool {
-        if run.runs_in_chat_tab() {
+        if !run.has_terminal_presentation() {
             return false;
         }
         if run.design.arrangement != Arrangement::Adaptive {
@@ -425,7 +425,7 @@ impl Workspace {
             .filter(|run| {
                 !run.swarm
                     && !run.closing
-                    && !run.runs_in_chat_tab()
+                    && run.has_terminal_presentation()
                     && (run.design.status != Status::Hidden
                         || run.design.arrangement == Arrangement::Adaptive)
                     && run.presentation.status_visibility.visible(seconds, now)
@@ -488,12 +488,16 @@ impl Workspace {
             !run.paused && !run.cancel.requested(),
             reduced_motion,
         )?;
-        if run.runs_in_chat_tab() {
-            return self
+        if run.runs_in_chat_tab()
+            && self
                 .hosted_tool_owner(id)
                 .and_then(|owner| self.active_hosted_tab(owner))
                 .is_some_and(|tool| tool.instance == id)
-                .then_some(interval);
+        {
+            return Some(interval);
+        }
+        if !run.has_terminal_presentation() {
+            return None;
         }
         if self.placed_dialog_owner(id).is_some() {
             return Some(interval);
@@ -530,7 +534,7 @@ impl Workspace {
         let (id, run) = self
             .terminal_agents
             .agent_activity_for_stream(session, stream)?;
-        (!run.runs_in_chat_tab()
+        (run.has_terminal_presentation()
             && (run.design.status != Status::Hidden
                 || run.design.arrangement == Arrangement::Adaptive))
             .then_some(id)
@@ -630,7 +634,7 @@ impl Workspace {
         let agents = &self.terminal_agents;
         let Some((id, run)) = agents
             .agent_activity_for_stream(session, stream)
-            .filter(|(_, run)| !run.runs_in_chat_tab())
+            .filter(|(_, run)| run.has_terminal_presentation())
         else {
             return terminal;
         };

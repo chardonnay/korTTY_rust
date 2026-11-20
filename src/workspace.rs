@@ -1497,7 +1497,7 @@ impl Workspace {
         };
         self.revalidate_agent_chat_handoffs();
         self.revalidate_agent_journal_synchronizations();
-        self.revalidate_private_agent_chats();
+        self.revalidate_bound_agent_chats();
         self.reconcile_automatic_knowledge();
         self.reconcile_runtime_updates();
         self.reconcile_application_updates();

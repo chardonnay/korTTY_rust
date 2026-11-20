@@ -31,6 +31,7 @@ const CHANGED_PINS: &str = "The terminal's saved skill assignments changed. Star
 #[derive(Clone)]
 pub enum Message {
     SkipTriage(u64),
+    RemoveAskAttachment(u64),
     ReviewSkills(u64),
     Classify(u64),
     CancelClassification(u64),
@@ -46,6 +47,7 @@ impl Message {
     fn epoch(&self) -> u64 {
         match *self {
             Self::SkipTriage(epoch)
+            | Self::RemoveAskAttachment(epoch)
             | Self::ReviewSkills(epoch)
             | Self::Classify(epoch)
             | Self::CancelClassification(epoch)
@@ -488,6 +490,7 @@ impl LiveAuthority {
                 run,
                 engine::RunModel::FinalAdvice,
             )?),
+            Kind::Plan(_) if run.target.is_some() => Some(workspace.planning_probe_target(run)?),
             _ => None,
         };
         Ok(Self {
@@ -797,13 +800,27 @@ impl Review {
 }
 
 impl Workspace {
+    pub(super) fn planning_probe_target(&self, run: &Run) -> Result<RunTargetReview, String> {
+        RunTargetReview::capture(self, run, engine::RunModel::FinalAdvice)
+    }
+
     pub(in crate::workspace) fn revoke_model_review_source(&mut self, source: SessionId) {
         let runs: Vec<_> = self
             .terminal_agents
             .runs
             .iter()
             .filter_map(|(&id, run)| {
-                (run.model_review.is_some() && run.binding.session() == Some(source)).then_some(id)
+                ((run.model_review.is_some()
+                    || run.phase == Phase::AskAttachment
+                    || run.mode == Mode::Plan
+                        && matches!(
+                            run.phase,
+                            Phase::Directory
+                                | Phase::ReviewedDirectory { probe: true }
+                                | Phase::Probe
+                        ))
+                    && run.binding.session() == Some(source))
+                .then_some(id)
             })
             .collect();
         for id in runs {
@@ -1031,6 +1048,13 @@ impl Workspace {
         let Some(mut review) = run.model_review.take() else {
             return Ok(Task::none());
         };
+        if matches!(message, Message::RemoveAskAttachment(_))
+            && matches!(review.kind, Kind::Ask)
+            && !run.paused
+            && run.ask_file.snapshot.take().is_some()
+        {
+            return self.agent_turn(id, run);
+        }
         if matches!(message, Message::SkipTriage(_))
             && review.triage_mode().is_some()
             && !run.paused
@@ -1324,13 +1348,30 @@ impl Workspace {
                 return Ok(task);
             }
             Kind::Ask => {
+                let verification = self.verify_ask_attachment(run)?;
+                let remote = run
+                    .ask_file
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|file| file.is_remote());
                 let pending = engine::ask_with_progress_guarded(
                     transport.clone(),
                     review.system.clone(),
                     review.input.clone(),
                     *limit,
                     Some(progress),
-                    guard,
+                    move || {
+                        guard()?;
+                        if let Some(verification) = &verification {
+                            super::ask_attachment::require_allowed(
+                                &ClipboardPolicy::load(),
+                                remote,
+                            )?;
+                            verification.require_current()?;
+                            guard()?;
+                        }
+                        Ok(())
+                    },
                 )?;
                 run.turns += 1;
                 (
@@ -1458,7 +1499,7 @@ pub(super) fn mask_https_text(
     Ok(masked.to_string())
 }
 
-fn mask_json_strings(
+pub(super) fn mask_json_strings(
     value: &mut serde_json::Value,
     mask: &impl Fn(&str) -> Result<String, String>,
 ) -> Result<(), String> {

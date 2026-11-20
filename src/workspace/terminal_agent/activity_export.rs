@@ -68,7 +68,7 @@ impl Archive {
             return;
         }
         let status = match run.phase {
-            Phase::Finished => "Completed",
+            Phase::Finished | Phase::PlanHandedOff => "Completed",
             Phase::Failed => "Failed",
             Phase::Blocked => "Blocked",
             Phase::Cancelled => "Cancelled",
