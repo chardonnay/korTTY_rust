@@ -693,6 +693,7 @@ mod tests {
         workspace.window_settings.terminal_rows = Some(31);
         workspace.window_settings.scrollback_lines = 150;
         workspace.window_settings.scrollback_memory_mib = 3;
+        workspace.window_settings.confirm_busy_terminal_close = false;
         workspace.window_settings.colors.background = Some(Rgb::from_hex(0x102030));
         let session = workspace
             .store_saved_local_session(store.local(id).unwrap().clone(), None)

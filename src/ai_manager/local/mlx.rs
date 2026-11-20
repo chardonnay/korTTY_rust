@@ -1101,8 +1101,22 @@ mod tests {
             manager.update(ManagerMessage::Local(Message::Mlx(action)))
         };
         let save = |manager: &mut Manager, expected| {
-            let task = send(manager, Action::Configure);
-            let mut events = iced_runtime::task::into_stream(task).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut events = loop {
+                let task = send(manager, Action::Configure);
+                if let Some(events) = iced_runtime::task::into_stream(task) {
+                    break events;
+                }
+                assert_eq!(
+                    manager.local.status.as_deref(),
+                    Some("A managed local model operation is already running")
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "managed model worker did not become available"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            };
             let Some(iced_runtime::Action::Output(event)) = block_on(events.next()) else {
                 panic!("expected the MLX settings result");
             };
