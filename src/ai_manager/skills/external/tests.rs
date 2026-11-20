@@ -30,7 +30,7 @@ fn provider_fixture(
 fn vault_provider_credentials_stay_in_scope_and_expire_when_locked() {
     let scratch = crate::snippets::tests::Profile::new();
     let path = scratch.0.join("skill-vault.bin");
-    let mut vault = Vault::create(&path, b"test skill provider master").unwrap();
+    let mut vault = Vault::create(&path, &crate::vault_window::test_vault_password()[..]).unwrap();
     let secret = "fixture-provider-token";
     let credential_id = vault
         .save(

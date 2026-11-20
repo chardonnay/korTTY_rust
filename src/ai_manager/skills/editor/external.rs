@@ -1243,7 +1243,8 @@ mod tests {
 
         let scratch = crate::snippets::tests::Profile::new();
         let path = scratch.0.join("skills-vault.bin");
-        let mut vault = Vault::create(&path, b"test provider fixture password").unwrap();
+        let mut vault =
+            Vault::create(&path, &crate::vault_window::test_vault_password()[..]).unwrap();
         let save = |vault: &mut Vault, label: &str, kind| {
             vault
                 .save(
