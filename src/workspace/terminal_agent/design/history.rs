@@ -3,12 +3,13 @@
 use std::collections::VecDeque;
 
 use iced::widget::{button, column, container, responsive, row, scrollable, text};
-use iced::{Element, Font, Length};
+use iced::{Element, Font, Length, window};
 
 use crate::terminal_agent::design::History;
 
 use super::super::Message as AgentMessage;
-use super::{Message, Palette, Presentation, Run};
+use super::log_table::Surface;
+use super::{Message, Palette, Presentation, Run, State};
 
 #[derive(Clone, Copy)]
 pub(super) struct Activity<'a> {
@@ -20,6 +21,8 @@ pub(super) struct Activity<'a> {
     pub(super) presentation: &'a Presentation,
     pub(super) transcript: Option<&'a crate::terminal_agent::design::inline::Transcript>,
     pub(super) live_run: Option<&'a Run>,
+    pub(super) surface: Surface,
+    pub(super) owner: Option<(&'a State, window::Id)>,
 }
 
 impl<'a> From<&'a Run> for Activity<'a> {
@@ -33,6 +36,8 @@ impl<'a> From<&'a Run> for Activity<'a> {
             presentation: &run.presentation,
             transcript: run.status_transcript().map(|(trace, _)| trace),
             live_run: Some(run),
+            surface: Surface::Activity,
+            owner: None,
         }
     }
 }
@@ -73,12 +78,23 @@ fn detail(run: Activity<'_>, selected: usize) -> Element<'_, AgentMessage> {
     .into()
 }
 
-pub(super) fn view(
-    run: &Run,
+pub(super) fn view<'a>(
+    run: &'a Run,
     palette: Option<Palette>,
     reduced_motion: bool,
-) -> Element<'_, AgentMessage> {
-    view_as(run.into(), run.design.history, palette, reduced_motion)
+    surface: Surface,
+    owner: Option<(&'a State, window::Id)>,
+) -> Element<'a, AgentMessage> {
+    view_as(
+        Activity {
+            surface,
+            owner,
+            ..run.into()
+        },
+        run.design.history,
+        palette,
+        reduced_motion,
+    )
 }
 
 pub(super) fn view_as(

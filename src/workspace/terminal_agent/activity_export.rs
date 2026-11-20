@@ -15,7 +15,7 @@ use crate::terminal_logging::Redactor;
 
 use super::{
     Cancel, Desktop, LiveBinding, Message as RunMessage, Mode, PaneSession, Phase, Run, SessionId,
-    Task, Workspace, history, mask, window,
+    State, Task, Workspace, history, mask, window,
 };
 
 const MAX_ARCHIVE: usize = 32;
@@ -54,6 +54,10 @@ impl fmt::Display for Scope {
 pub(super) struct Archive(VecDeque<(LiveBinding, Arc<report::Run>)>);
 
 impl Archive {
+    fn contains(&self, source: LiveBinding) -> bool {
+        self.0.iter().any(|(old, _)| same_stream(*old, source))
+    }
+
     pub(super) fn capture(&mut self, run: &mut Run) {
         let (Some((began, started_at)), Ok(source)) =
             (run.activity_export.started.take(), run.binding.live())
@@ -140,10 +144,21 @@ fn same_stream(left: LiveBinding, right: LiveBinding) -> bool {
 }
 
 struct Form {
+    source: LiveBinding,
+    this: Option<Arc<report::Run>>,
     all: Vec<Arc<report::Run>>,
     scope: Scope,
     format: Format,
     path: String,
+}
+
+impl Form {
+    fn count(&self, scope: Scope) -> usize {
+        match scope {
+            Scope::This => usize::from(self.this.is_some()),
+            Scope::All => self.all.len(),
+        }
+    }
 }
 
 struct Pending {
@@ -189,17 +204,25 @@ impl Export {
         }
     }
 
-    pub(super) fn view(&self) -> Option<Element<'_, RunMessage>> {
-        self.snapshot.as_ref()?;
+    pub(super) fn view(&self, default_scope: Option<Scope>) -> Option<Element<'_, RunMessage>> {
         let view: Element<'_, Message> = if let Some(form) = &self.form {
             let editable = !self.writing();
+            let scope = if form.this.is_some() {
+                Element::from(pick_list(
+                    [Scope::This, Scope::All],
+                    Some(form.scope),
+                    Message::Scope,
+                ))
+            } else {
+                text(Scope::All.to_string()).into()
+            };
             column![
                 text("Export masked activity to a new local file. The export includes the task and retained transcript."),
                 row![
-                    pick_list([Scope::This, Scope::All], Some(form.scope), Message::Scope),
+                    scope,
                     pick_list(Format::ALL, Some(form.format), Message::Format),
                 ].spacing(8).wrap(),
-                text(format!("{} completed run(s) in this selection", if form.scope == Scope::All { form.all.len() } else { 1 })).size(13),
+                text(format!("{} completed run(s) in this selection", form.count(form.scope))).size(13),
                 text_input("Absolute path to a new export file", &form.path)
                     .on_input_maybe(editable.then_some(Message::Path)),
                 row![
@@ -213,7 +236,10 @@ impl Export {
             ].spacing(7).into()
         } else {
             column![
-                button("Export activity…").on_press(Message::Open),
+                button("Export activity…").on_press(match default_scope? {
+                    Scope::This => Message::Open,
+                    Scope::All => Message::OpenScope(Scope::All),
+                }),
                 text(&self.notice).size(13),
             ]
             .spacing(4)
@@ -221,9 +247,24 @@ impl Export {
         };
         Some(view.map(RunMessage::ActivityExport))
     }
+}
 
-    pub(super) fn available(&self) -> bool {
-        self.snapshot.is_some() && !self.writing()
+impl State {
+    pub(super) fn has_archived_activity(&self, run: &Run) -> bool {
+        run.binding
+            .live()
+            .is_ok_and(|source| self.activity.contains(source))
+    }
+}
+
+impl Run {
+    pub(super) fn can_export_activity(&self, scope: Scope, has_archive: bool) -> bool {
+        !self.swarm
+            && !self.binding.private()
+            && self.binding.live().is_ok()
+            && !self.activity_export.writing()
+            && (self.phase.finished() && self.activity_export.snapshot.is_some()
+                || scope == Scope::All && has_archive)
     }
 }
 
@@ -232,14 +273,41 @@ impl Workspace {
         &'a self,
         run: &Run,
     ) -> Result<&'a PaneSession, &'static str> {
-        if run.swarm
-            || run.binding.private()
-            || !run.phase.finished()
-            || run.activity_export.snapshot.is_none()
+        if run.swarm || run.binding.private() {
+            return Err("Only non-private terminal agent activity can be exported.");
+        }
+        if let Some(form) = &run.activity_export.form
+            && run.binding.live()? != form.source
         {
-            return Err("Only completed, non-private terminal agent activity can be exported.");
+            return Err("The source terminal changed. Open a new export review.");
         }
         self.current_run_pane(run).map(|(_, pane)| pane)
+    }
+
+    fn activity_export_form(&self, run: &Run, scope: Scope) -> Result<Form, &'static str> {
+        self.agent_export_pane(run)?;
+        let source = run.binding.live()?;
+        let this = run
+            .activity_export
+            .snapshot
+            .clone()
+            .filter(|_| run.phase.finished());
+        let mut all = self.terminal_agents.activity.matching(source);
+        if all.is_empty() {
+            all.extend(this.iter().cloned());
+        }
+        let form = Form {
+            source,
+            this,
+            all,
+            scope,
+            format: Format::default(),
+            path: String::new(),
+        };
+        if form.count(scope) == 0 {
+            return Err("No completed activity is available for this export.");
+        }
+        Ok(form)
     }
 
     pub(super) fn agent_activity_export(
@@ -252,24 +320,13 @@ impl Workspace {
             Message::Open | Message::OpenScope(_)
                 if !run.closing && !run.activity_export.writing() =>
             {
-                let result = self.agent_export_pane(run).and_then(|_| run.binding.live());
-                match result {
-                    Ok(source) => {
-                        let mut all = self.terminal_agents.activity.matching(source);
-                        if all.is_empty()
-                            && let Some(snapshot) = &run.activity_export.snapshot
-                        {
-                            all.push(Arc::clone(snapshot));
-                        }
-                        run.activity_export.form = Some(Form {
-                            all,
-                            scope: match message {
-                                Message::OpenScope(scope) => scope,
-                                _ => Scope::This,
-                            },
-                            format: Format::default(),
-                            path: String::new(),
-                        });
+                let scope = match message {
+                    Message::OpenScope(scope) => scope,
+                    _ => Scope::This,
+                };
+                match self.activity_export_form(run, scope) {
+                    Ok(form) => {
+                        run.activity_export.form = Some(form);
                         run.activity_export.notice.clear();
                     }
                     Err(error) => run.activity_export.notice = error.into(),
@@ -331,7 +388,7 @@ impl Workspace {
                 let export = &mut run.activity_export;
                 if let Some(form) = &mut export.form {
                     match message {
-                        Message::Scope(scope) => form.scope = scope,
+                        Message::Scope(scope) if form.count(scope) > 0 => form.scope = scope,
                         Message::Format(format) => form.format = format,
                         Message::Path(path) if path.len() <= MAX_PATH => form.path = path,
                         Message::Close => export.form = None,
@@ -363,8 +420,7 @@ impl Workspace {
         }
         let selected = match form.scope {
             Scope::This => vec![Arc::clone(
-                export
-                    .snapshot
+                form.this
                     .as_ref()
                     .ok_or("The selected run is unavailable.")?,
             )],

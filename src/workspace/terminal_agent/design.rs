@@ -149,17 +149,24 @@ fn status_indicator_with_colors<'a, M: 'a>(
     }
 }
 
-pub(super) fn history_view(
-    run: &Run,
+pub(super) fn history_view<'a>(
+    run: &'a Run,
     palette: Option<Palette>,
     reduced_motion: bool,
-) -> Element<'_, AgentMessage> {
-    history::view(run, palette, reduced_motion)
+    owner: Option<(&'a State, window::Id)>,
+) -> Element<'a, AgentMessage> {
+    history::view(
+        run,
+        palette,
+        reduced_motion,
+        log_table::Surface::Activity,
+        owner,
+    )
 }
 
 /// Review remains in the owned activity window, where the exact destination,
 /// command, password mode and epoch are reviewed together.
-fn controls(run: &Run) -> Element<'_, AgentMessage> {
+fn controls(run: &Run, has_archive: bool) -> Element<'_, AgentMessage> {
     let active = run.active() && !run.cancel.requested();
     row![
         button(match run.phase {
@@ -179,7 +186,7 @@ fn controls(run: &Run) -> Element<'_, AgentMessage> {
                 .on_press(AgentMessage::Pause)),
         active.then(|| button("Cancel").on_press(AgentMessage::Cancel)),
         handoff::compact(run),
-        actions::run_menu(run),
+        actions::run_menu(run, has_archive),
         run.status_transcript()
             .filter(|(trace, _)| !trace.steps.is_empty())
             .map(|_| {
@@ -201,10 +208,17 @@ fn history_panel<'a>(
     chooser: Option<Element<'static, AgentMessage>>,
     palette: Option<Palette>,
     reduced_motion: bool,
+    owner: (&'a State, window::Id),
 ) -> Element<'a, AgentMessage> {
     let (phase, _) = status::phase(run);
-    let activity = history_with_steps(run, palette, reduced_motion);
-    let controls = controls(run);
+    let activity = history_with_steps(
+        run,
+        palette,
+        reduced_motion,
+        log_table::Surface::Pane,
+        owner,
+    );
+    let controls = controls(run, owner.0.has_archived_activity(run));
     let body = history_body(activity, controls, run.design.approval);
     let muted = palette.map(|palette| palette.muted.color());
     palette::panel(
@@ -226,15 +240,17 @@ fn history_panel<'a>(
     )
 }
 
-fn history_with_steps(
-    run: &Run,
+fn history_with_steps<'a>(
+    run: &'a Run,
     palette: Option<Palette>,
     reduced_motion: bool,
-) -> Element<'_, AgentMessage> {
+    surface: log_table::Surface,
+    owner: (&'a State, window::Id),
+) -> Element<'a, AgentMessage> {
     if run.presentation.step_list_open {
         status::step_list(run)
     } else {
-        history::view(run, palette, reduced_motion)
+        history::view(run, palette, reduced_motion, surface, Some(owner))
     }
 }
 
@@ -345,7 +361,15 @@ impl State {
         stream: u64,
     ) -> Option<Element<'_, Desktop>> {
         let (id, run) = self.agent_activity_for_stream(session, stream)?;
-        pane_status(id, run, run.design.status, None, Instant::now(), true)
+        pane_status(
+            id,
+            run,
+            run.design.status,
+            None,
+            Instant::now(),
+            true,
+            self.has_archived_activity(run),
+        )
     }
 }
 
@@ -356,9 +380,10 @@ fn pane_status(
     palette: Option<Palette>,
     now: Instant,
     reduced_motion: bool,
+    has_archive: bool,
 ) -> Option<Element<'_, Desktop>> {
     (status != Status::Hidden).then(|| {
-        status::view(run, status, palette, now, reduced_motion)
+        status::view(run, status, palette, now, reduced_motion, has_archive)
             .map(move |message| Desktop::TerminalAgent(id, message))
     })
 }
@@ -602,6 +627,7 @@ impl Workspace {
         let visibility = &run.presentation.status_visibility;
         let status_visible = visibility.visible(seconds, now);
         let chooser = || agents.run_picker(id, run);
+        let has_archive = agents.has_archived_activity(run);
         let picture_in_picture = run.design.arrangement == Arrangement::PictureInPicture;
         let dock = self.window_settings.ai_agent_panel;
         let history_position = dock.history_slot(run.design);
@@ -648,13 +674,13 @@ impl Workspace {
                 panel = panel.push(header);
                 if !activity.collapsed {
                     panel = panel.push(
-                        history_panel(run, chooser(), palette, reduced_motion)
+                        history_panel(run, chooser(), palette, reduced_motion, (agents, id))
                             .map(move |message| Desktop::TerminalAgent(id, message)),
                     );
                 }
                 return panel.height(Length::Fill).into();
             }
-            let history = history_panel(run, chooser(), palette, reduced_motion)
+            let history = history_panel(run, chooser(), palette, reduced_motion, (agents, id))
                 .map(move |message| Desktop::TerminalAgent(id, message));
             if run.design.arrangement != Arrangement::Normal
                 || !matches!(side, Slot::Left | Slot::Right)
@@ -691,11 +717,22 @@ impl Workspace {
             // Both roles resolve to Java d02. Keep its single history presenter.
             None
         } else if adaptive_side {
-            let controls = column![chooser(), controls(run)].spacing(4).into();
+            let controls = column![chooser(), controls(run, has_archive)]
+                .spacing(4)
+                .into();
             let panel = adaptive_timeline(run.into(), status::phase(run).0, controls, palette);
             Some(panel.map(move |message| Desktop::TerminalAgent(id, message)))
         } else {
-            pane_status(id, run, status_kind, palette, now, reduced_motion).map(|status| {
+            pane_status(
+                id,
+                run,
+                status_kind,
+                palette,
+                now,
+                reduced_motion,
+                has_archive,
+            )
+            .map(|status| {
                 let picker = if history_position.is_none() && !picture_in_picture {
                     chooser().map(|picker| {
                         picker.map(move |message| Desktop::TerminalAgent(id, message))

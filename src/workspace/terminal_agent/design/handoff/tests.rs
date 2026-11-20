@@ -224,7 +224,7 @@ fn dismissed_offer_remains_reopenable_and_compact_dock_controls_fit_a_small_pane
     run.chat_handoff_pending = false;
     let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
     let mut ui = UserInterface::build(
-        super::super::controls(&run),
+        super::super::controls(&run, false),
         Size::new(300.0, 72.0),
         Cache::default(),
         &mut renderer,

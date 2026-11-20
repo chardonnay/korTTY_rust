@@ -34,15 +34,20 @@ pub(crate) enum Setting {
     CodeTextLanguage,
     ChatTerminalActions,
     AgentShortcut,
+    AgentShortcutName,
+    AgentShortcutCase,
     AgentExecution,
     AgentConfirmation,
     ShowAgentSetup,
     JournalSemanticSearch,
+    ImportedGeneral(ImportedGeneral),
     WizardScan,
     WizardTest,
     Profile(ProfileSetting),
+    ProfileAction(ProfileAction),
     Role(Role),
     Embedding,
+    LocalPreference(LocalPreference),
     Knowledge(KnowledgeSetting),
     Hub(HubSetting),
     Managed(ManagedSetting),
@@ -59,12 +64,17 @@ impl Setting {
             | Self::CodeTextLanguage
             | Self::ChatTerminalActions
             | Self::AgentShortcut
+            | Self::AgentShortcutName
+            | Self::AgentShortcutCase
             | Self::AgentExecution
             | Self::AgentConfirmation
             | Self::ShowAgentSetup
-            | Self::JournalSemanticSearch => Page::General,
-            Self::Profile(_) | Self::WizardScan | Self::WizardTest => Page::Profiles,
-            Self::Role(_) | Self::Embedding => Page::LocalPreferences,
+            | Self::JournalSemanticSearch
+            | Self::ImportedGeneral(_) => Page::General,
+            Self::Profile(_) | Self::ProfileAction(_) | Self::WizardScan | Self::WizardTest => {
+                Page::Profiles
+            }
+            Self::Role(_) | Self::Embedding | Self::LocalPreference(_) => Page::LocalPreferences,
             Self::Knowledge(_) => Page::Knowledge,
             Self::Hub(_) | Self::Managed(_) | Self::Mlx(_) => Page::LocalModels,
             Self::SkillProvider(_) => Page::Skills,
@@ -79,15 +89,20 @@ impl Setting {
             Self::CodeTextLanguage => "Default code text language",
             Self::ChatTerminalActions => "AI chat code blocks in the terminal",
             Self::AgentShortcut => "Enable terminal agent shortcuts",
+            Self::AgentShortcutName => "Base command name",
+            Self::AgentShortcutCase => "Ignore command name case",
             Self::AgentExecution => "Allow Agent command execution",
             Self::AgentConfirmation => "Require approval for mutating Agent command sets",
             Self::ShowAgentSetup => "Show terminal agent setup for submitted aliases",
             Self::JournalSemanticSearch => "Use local semantic ranking for journal questions",
+            Self::ImportedGeneral(setting) => setting.title(),
             Self::WizardScan => "Find local model servers",
             Self::WizardTest => "Test profile connection",
             Self::Profile(setting) => setting.title(),
+            Self::ProfileAction(action) => action.title(),
             Self::Role(role) => role.label(),
             Self::Embedding => "Default embedding model",
+            Self::LocalPreference(setting) => setting.title(),
             Self::Knowledge(setting) => setting.title(),
             Self::Hub(setting) => setting.title(),
             Self::Managed(setting) => setting.title(),
@@ -103,19 +118,24 @@ impl Setting {
             Self::GlobalTimeout => "limits timeouts",
             Self::CodeTextLanguage => "snippet script comments output messages translation",
             Self::ChatTerminalActions => "actions insert run copy save",
-            Self::AgentShortcut => "agent ask plan alias input command name case OSC 133",
+            Self::AgentShortcut => "agent ask plan alias input OSC 133",
+            Self::AgentShortcutName => "agent alias terminal prompt",
+            Self::AgentShortcutCase => "agent alias case insensitive uppercase lowercase",
             Self::AgentExecution => "agent execute run swarm scheduled diagnostics permission",
             Self::AgentConfirmation => {
                 "agent confirmation mutating command sets approve remaining always"
             }
             Self::ShowAgentSetup => "run dialog ask skip bypass startup prompt confirmation",
             Self::JournalSemanticSearch => "journal semantic search embedding lexical ranking BM25",
+            Self::ImportedGeneral(setting) => setting.keywords(),
             Self::WizardScan => "scan discover loopback LM Studio Ollama",
             Self::WizardTest => "run fixed CLI test verify provider",
             Self::Profile(setting) => setting.keywords(),
+            Self::ProfileAction(action) => action.keywords(),
             Self::Role(Role::Text) => "translation profile roles",
             Self::Role(_) => "profile roles",
             Self::Embedding => "rag knowledge vector",
+            Self::LocalPreference(setting) => setting.keywords(),
             Self::Knowledge(KnowledgeSetting::Name | KnowledgeSetting::Create) => {
                 "new add collection rag"
             }
@@ -128,6 +148,9 @@ impl Setting {
                 "retrieval"
             }
             Self::Knowledge(_) => "",
+            Self::Hub(HubSetting::Access) => {
+                "Hugging Face HuggingFace token vault credential anonymous"
+            }
             Self::Hub(HubSetting::Query) => "Hugging Face HuggingFace Hub GGUF search query",
             Self::Hub(_) => "Hugging Face HuggingFace Hub GGUF",
             Self::Managed(ManagedSetting::IdleMinutes | ManagedSetting::NeverUnload) => {
@@ -138,6 +161,158 @@ impl Setting {
             Self::Mlx(MlxSetting::NeverUnload) => "keep running",
             Self::Mlx(_) => "Apple Silicon",
             Self::SkillProvider(_) | Self::Control(_) => "",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ImportedGeneral {
+    JournalSearch,
+    AgentConfirmation,
+    AgentExecution,
+    AgentShortcut,
+}
+
+impl ImportedGeneral {
+    const ALL: [Self; 4] = [
+        Self::JournalSearch,
+        Self::AgentConfirmation,
+        Self::AgentExecution,
+        Self::AgentShortcut,
+    ];
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::JournalSearch => "Use imported journal search preference",
+            Self::AgentConfirmation => "Use imported confirmation preference",
+            Self::AgentExecution => "Use imported execution preference",
+            Self::AgentShortcut => "Use imported command preferences",
+        }
+    }
+
+    fn keywords(self) -> &'static str {
+        match self {
+            Self::JournalSearch => "Java restore semantic ranking journal",
+            Self::AgentConfirmation => "Java restore agent mutating command approval",
+            Self::AgentExecution => "Java restore agent terminal execution",
+            Self::AgentShortcut => "Java restore agent alias name case",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LocalPreference {
+    RuntimeUpdatePolicy,
+    RuntimeBackend,
+    EmbeddingSource,
+    EmbeddingSetup,
+    RefreshEmbeddingModels,
+    ImportedRole(super::java_roles::Role),
+}
+
+impl LocalPreference {
+    const CONTROLS: [Self; 5] = [
+        Self::RuntimeUpdatePolicy,
+        Self::RuntimeBackend,
+        Self::EmbeddingSource,
+        Self::EmbeddingSetup,
+        Self::RefreshEmbeddingModels,
+    ];
+
+    pub(super) fn title(self) -> &'static str {
+        use super::java_roles::Role as JavaRole;
+        match self {
+            Self::RuntimeUpdatePolicy => "Managed runtime update policy",
+            Self::RuntimeBackend => "Preferred runtime backend",
+            Self::EmbeddingSource => "Default embedding source",
+            Self::EmbeddingSetup => "Set up an embedding model",
+            Self::RefreshEmbeddingModels => "Refresh embedding models",
+            Self::ImportedRole(role) => match role {
+                JavaRole::Default => "Imported Java default profile",
+                JavaRole::Text => "Imported Java text profile",
+                JavaRole::Coding => "Imported Java coding profile",
+                JavaRole::Agent => "Imported Java agent profile",
+                JavaRole::Security => "Imported Java security profile",
+                JavaRole::Journal => "Imported Java journal profile",
+            },
+        }
+    }
+
+    fn keywords(self) -> &'static str {
+        match self {
+            Self::RuntimeUpdatePolicy => "llama.cpp updates notify automatic stable signed runtime",
+            Self::RuntimeBackend => "llama.cpp runtime CPU GPU Metal Vulkan",
+            Self::EmbeddingSource => "default embedding model vector managed local endpoint",
+            Self::EmbeddingSetup => "guided embedding model vector",
+            Self::RefreshEmbeddingModels => "reload managed policy embedding inventory",
+            Self::ImportedRole(_) => "adopt use imported profile role backup restore",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProfileAction {
+    TestConnection,
+    TestCli,
+    DiscoverModels,
+    LoadModels,
+    ChooseImportedModel,
+    RefreshManagedModels,
+    ConfirmImportedModel,
+    Delete,
+    CancelDelete,
+    ConfirmDelete,
+}
+
+impl ProfileAction {
+    const ALL: [Self; 10] = [
+        Self::TestConnection,
+        Self::TestCli,
+        Self::DiscoverModels,
+        Self::LoadModels,
+        Self::ChooseImportedModel,
+        Self::RefreshManagedModels,
+        Self::ConfirmImportedModel,
+        Self::Delete,
+        Self::CancelDelete,
+        Self::ConfirmDelete,
+    ];
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::TestConnection => "Test connection",
+            Self::TestCli => "Run fixed CLI test",
+            Self::DiscoverModels => "Discover models",
+            Self::LoadModels => "Load models",
+            Self::ChooseImportedModel => "Choose local model",
+            Self::RefreshManagedModels => "Refresh managed models",
+            Self::ConfirmImportedModel => "Confirm model and review profile",
+            Self::Delete => "Delete profile",
+            Self::CancelDelete => "Cancel profile removal",
+            Self::ConfirmDelete => "Remove profile",
+        }
+    }
+
+    fn keywords(self) -> &'static str {
+        match self {
+            Self::TestConnection => "check provider endpoint",
+            Self::TestCli => "check executable command",
+            Self::DiscoverModels | Self::LoadModels => "provider model discovery",
+            Self::ChooseImportedModel | Self::ConfirmImportedModel => {
+                "Java restore mapping GGUF MLX"
+            }
+            Self::RefreshManagedModels => "local models refresh GGUF MLX",
+            Self::Delete | Self::CancelDelete | Self::ConfirmDelete => "profile deletion",
+        }
+    }
+
+    pub(super) fn section(self) -> Option<profiles::Section> {
+        match self {
+            Self::ChooseImportedModel => Some(profiles::Section::Connection),
+            Self::LoadModels | Self::RefreshManagedModels | Self::ConfirmImportedModel => {
+                Some(profiles::Section::Model)
+            }
+            _ => None,
         }
     }
 }
@@ -1252,7 +1427,7 @@ impl ProfileSetting {
             }
             Self::Trust => "trusted local endpoint",
             Self::Credential => "credential environment connection",
-            Self::AvailableModels => "discovery load suggested examples",
+            Self::AvailableModels => "discovery list suggested examples",
             Self::ManagedModel => "GGUF llama.cpp",
             Self::Vision => "image input",
             Self::PromptPreset => {
@@ -1336,11 +1511,18 @@ pub(super) fn results<'a>(
         Setting::CodeTextLanguage,
         Setting::ChatTerminalActions,
         Setting::AgentShortcut,
+        Setting::AgentShortcutName,
+        Setting::AgentShortcutCase,
         Setting::AgentExecution,
         Setting::AgentConfirmation,
         Setting::ShowAgentSetup,
     ]
     .into_iter()
+    .chain(
+        ImportedGeneral::ALL
+            .into_iter()
+            .map(Setting::ImportedGeneral),
+    )
     .chain(
         ProfileSetting::ALL
             .iter()
@@ -1348,8 +1530,19 @@ pub(super) fn results<'a>(
             .filter(move |setting| profile.is_some_and(|profile| setting.visible(profile)))
             .map(Setting::Profile),
     )
+    .chain(ProfileAction::ALL.into_iter().map(Setting::ProfileAction))
     .chain(Role::ALL.into_iter().map(Setting::Role))
     .chain([Setting::Embedding])
+    .chain(
+        LocalPreference::CONTROLS
+            .into_iter()
+            .chain(
+                super::java_roles::Role::ALL
+                    .into_iter()
+                    .map(LocalPreference::ImportedRole),
+            )
+            .map(Setting::LocalPreference),
+    )
     .chain(KnowledgeSetting::ALL.into_iter().map(Setting::Knowledge))
     .chain(HubSetting::ALL.into_iter().map(Setting::Hub))
     .chain(ManagedSetting::ALL.into_iter().map(Setting::Managed))
@@ -1503,6 +1696,187 @@ mod tests {
                 self.offset = translation.y;
             }
         }
+    }
+
+    fn applied_position(dialog: &Dialog, reveal: Task<Message>) -> Position {
+        let renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+        let mut view = dialog.view(Vec::new(), Vec::new());
+        let mut tree = Tree::new(view.as_widget());
+        let node = view.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(760.0, 300.0)),
+        );
+        let mut apply = |operation: &mut dyn Operation| {
+            view.as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, operation);
+        };
+        let mut actions = iced_runtime::task::into_stream(reveal).unwrap();
+        while let Some(action) = block_on(actions.next()) {
+            let iced_runtime::Action::Widget(mut operation) = action else {
+                panic!("revealing a control should produce only widget actions");
+            };
+            loop {
+                apply(operation.as_mut());
+                let operation::Outcome::Chain(next) = operation.finish() else {
+                    break;
+                };
+                operation = next;
+            }
+        }
+        let mut position = Position {
+            viewport_id: dialog.revealed.viewport.clone(),
+            row_id: dialog.revealed.row.clone(),
+            viewport: Rectangle::default(),
+            row_y: None,
+            offset: 0.0,
+        };
+        apply(&mut position);
+        position
+    }
+
+    #[test]
+    fn general_search_reveals_imported_preferences_without_adopting_them() {
+        let mut dialog = Dialog::new(
+            Arc::new(Configuration {
+                java_journal_semantic_search: Some(true),
+                java_agent_confirm_mutating: Some(false),
+                java_agent_execution_enabled: Some(false),
+                java_agent_shortcut: Some(super::super::JavaAgentShortcut {
+                    name: Some("fixture".into()),
+                    case_insensitive: Some(false),
+                }),
+                ..Configuration::default()
+            }),
+            PathBuf::new(),
+            Vec::new(),
+            true,
+            None,
+        );
+        let draft = dialog.general.clone();
+
+        for imported in ImportedGeneral::ALL {
+            let setting = Setting::ImportedGeneral(imported);
+            let _ = dialog.update(Message::Search(setting.title().into()));
+            let reveal = dialog.update(Message::SearchChoose);
+            assert_eq!(dialog.page, Page::General);
+            assert_eq!(dialog.revealed.setting, Some(setting));
+            let position = applied_position(&dialog, reveal);
+            let visible_y =
+                position.row_y.expect("imported preference is highlighted") - position.offset;
+            assert!(visible_y >= position.viewport.y - 1.0);
+            assert!(visible_y < position.viewport.y + position.viewport.height);
+            assert!(dialog.general == draft);
+            assert!(dialog.request.is_none());
+        }
+    }
+
+    #[test]
+    fn local_preferences_search_scrolls_runtime_and_imported_roles_in_one_viewport() {
+        use crate::ai_manager::{backup, java_roles};
+        use crate::clipboard_policy::ClipboardPolicy;
+
+        let (portable, _) = backup::portable_java_profiles(
+            br#"<globalSettings>
+            <defaultAiProfileId>java-review</defaultAiProfileId>
+            <textAiProfileId>missing-text</textAiProfileId>
+            <terminalAgentAiProfileId>java-review</terminalAgentAiProfileId>
+            <securityCheckAiProfileId>java-review</securityCheckAiProfileId>
+            <aiProfiles><profile><id>java-review</id><name>Imported review</name>
+                <apiUrl>https://review.example.test/v1</apiUrl><model>fixture</model>
+            </profile></aiProfiles>
+        </globalSettings>"#,
+        )
+        .unwrap();
+        let merged = backup::merge_java_profiles(None, &portable, &ClipboardPolicy::default())
+            .unwrap()
+            .unwrap();
+        let mut dialog = Dialog::new(
+            Arc::new(Configuration::decode(&merged).unwrap()),
+            PathBuf::new(),
+            Vec::new(),
+            true,
+            None,
+        );
+        dialog.local.set_runtime_downloads_allowed(false);
+        let local = dialog.local_state.clone();
+        let profiles = dialog.profiles.catalog().clone();
+        assert!(
+            !dialog.search_target_available(Target::Setting(Setting::LocalPreference(
+                LocalPreference::ImportedRole(java_roles::Role::Coding),
+            )))
+        );
+        for (query, setting) in [
+            ("preferred runtime backend", LocalPreference::RuntimeBackend),
+            (
+                "imported Java agent profile",
+                LocalPreference::ImportedRole(java_roles::Role::Agent),
+            ),
+            (
+                "managed runtime update policy",
+                LocalPreference::RuntimeUpdatePolicy,
+            ),
+            (
+                "imported Java text profile",
+                LocalPreference::ImportedRole(java_roles::Role::Text),
+            ),
+        ] {
+            let _ = dialog.update(Message::Search(query.into()));
+            let reveal = dialog.update(Message::SearchChoose);
+            assert_eq!(dialog.page, Page::LocalPreferences);
+            assert_eq!(
+                dialog.revealed.setting,
+                Some(Setting::LocalPreference(setting))
+            );
+            let position = applied_position(&dialog, reveal);
+            let visible_y =
+                position.row_y.expect("the chosen setting is highlighted") - position.offset;
+            assert!(
+                visible_y >= position.viewport.y - 1.0
+                    && visible_y < position.viewport.y + position.viewport.height
+            );
+            if matches!(
+                setting,
+                LocalPreference::RuntimeBackend | LocalPreference::RuntimeUpdatePolicy
+            ) {
+                assert!(position.offset > 0.0);
+            }
+            assert_eq!(dialog.local_state, local);
+            assert_eq!(dialog.profiles.catalog(), &profiles);
+        }
+    }
+
+    #[test]
+    fn local_preferences_search_distinguishes_embedding_source_and_manual_identifier() {
+        let mut dialog = Dialog::new(
+            Arc::new(Configuration::default()),
+            PathBuf::new(),
+            Vec::new(),
+            true,
+            None,
+        );
+        let source = Setting::LocalPreference(LocalPreference::EmbeddingSource);
+        let guide = Setting::LocalPreference(LocalPreference::EmbeddingSetup);
+        let _ = dialog.update(Message::Search("default embedding model".into()));
+        assert_eq!(
+            dialog.search_results().next(),
+            Some(Target::Setting(Setting::Embedding))
+        );
+        assert!(dialog.search_target_available(Target::Setting(guide)));
+
+        dialog
+            .local_state
+            .set_guided_embedding("fixture-managed-embedding".into());
+        assert!(!dialog.search_target_available(Target::Setting(guide)));
+        assert!(!dialog.search_target_available(Target::Setting(Setting::Embedding)));
+        assert_eq!(
+            dialog.search_results().next(),
+            Some(Target::Setting(source))
+        );
+        assert!(
+            results("Hugging Face token", None)
+                .any(|target| target == Target::Setting(Setting::Hub(HubSetting::Access)))
+        );
     }
 
     #[test]
@@ -1712,6 +2086,8 @@ mod tests {
         let bounds = Size::new(760.0, 360.0);
         for (query, setting) in [
             ("global request timeout", Setting::GlobalTimeout),
+            ("base command name", Setting::AgentShortcutName),
+            ("ignore command name case", Setting::AgentShortcutCase),
             (
                 "max selection characters",
                 Setting::Profile(ProfileSetting::SelectionLimit),
@@ -1777,6 +2153,9 @@ mod tests {
             match setting {
                 Setting::GlobalTimeout => assert!(
                     matches!(messages.as_slice(), [Message::Timeout(value)] if value.ends_with('2'))
+                ),
+                Setting::AgentShortcutName => assert!(
+                    matches!(messages.as_slice(), [Message::AgentShortcutName(value)] if value.ends_with('2'))
                 ),
                 Setting::Profile(ProfileSetting::SelectionLimit) => assert!(
                     matches!(messages.as_slice(), [Message::Profiles(profiles::Message::Number(profiles::Number::Selection, value))] if value.ends_with('2'))
@@ -1980,6 +2359,93 @@ mod tests {
         assert!(dialog.profiles.selected() == Some(&draft));
         assert!(dialog.profiles.catalog().profile(candidate).is_none());
         assert!(dialog.profile_wizard_open());
+    }
+
+    #[test]
+    fn profile_action_search_reveals_discovery_and_removal_without_triggering_either() {
+        let mut dialog = Dialog::new(
+            Arc::new(Configuration::default()),
+            PathBuf::new(),
+            Vec::new(),
+            true,
+            None,
+        );
+        let action = |action| Target::Setting(Setting::ProfileAction(action));
+        assert!(!dialog.search_target_available(action(ProfileAction::TestConnection)));
+        let _ = dialog.update(Message::Profiles(profiles::Message::Add));
+        let draft = dialog.profiles.catalog().clone();
+        assert!(dialog.search_target_available(action(ProfileAction::TestConnection)));
+        assert!(!dialog.search_target_available(action(ProfileAction::TestCli)));
+        assert!(!dialog.search_target_available(action(ProfileAction::ConfirmDelete)));
+
+        let _ = dialog.update(Message::Search("load models".into()));
+        let reveal = dialog.update(Message::SearchChoose);
+        assert_eq!(dialog.page, Page::Profiles);
+        assert_eq!(
+            dialog.revealed.setting,
+            Some(Setting::ProfileAction(ProfileAction::LoadModels))
+        );
+        assert!(dialog.request.is_none());
+        assert_eq!(dialog.profiles.catalog(), &draft);
+        let position = applied_position(&dialog, reveal);
+        let row = position.row_y.expect("the discovery button is highlighted");
+        assert!(row - position.offset >= position.viewport.y - 1.0);
+        assert!(row - position.offset < position.viewport.y + position.viewport.height);
+
+        let _ = dialog.update(Message::Profiles(profiles::Message::Delete));
+        let _ = dialog.update(Message::Search("remove profile".into()));
+        let _ = dialog.update(Message::SearchChoose);
+        assert_eq!(
+            dialog.revealed.setting,
+            Some(Setting::ProfileAction(ProfileAction::ConfirmDelete))
+        );
+        assert!(dialog.search_target_available(action(ProfileAction::CancelDelete)));
+        assert!(!dialog.search_target_available(action(ProfileAction::TestConnection)));
+        assert_eq!(dialog.profiles.catalog(), &draft);
+        let _ = dialog.update(Message::Profiles(profiles::Message::CancelDelete));
+        assert!(!dialog.search_target_available(action(ProfileAction::ConfirmDelete)));
+        assert_eq!(dialog.profiles.catalog(), &draft);
+    }
+
+    #[test]
+    fn profile_action_search_distinguishes_imported_model_mapping_from_connection_test() {
+        use crate::ai_manager::backup;
+        use crate::clipboard_policy::ClipboardPolicy;
+
+        let (portable, _) = backup::portable_java_profiles(
+            br#"<globalSettings>
+            <aiProfiles><profile><id>java-local</id><name>Imported work</name>
+                <connectionMode>EMBEDDED_LLAMA_CPP</connectionMode>
+                <embeddedModelId>java-model</embeddedModelId>
+            </profile></aiProfiles>
+        </globalSettings>"#,
+        )
+        .unwrap();
+        let merged = backup::merge_java_profiles(None, &portable, &ClipboardPolicy::default())
+            .unwrap()
+            .unwrap();
+        let mut dialog = Dialog::new(
+            Arc::new(Configuration::decode(&merged).unwrap()),
+            PathBuf::new(),
+            Vec::new(),
+            true,
+            None,
+        );
+        let action = |action| Target::Setting(Setting::ProfileAction(action));
+        let draft = dialog.profiles.catalog().clone();
+        assert!(dialog.search_target_available(action(ProfileAction::ChooseImportedModel)));
+        assert!(!dialog.search_target_available(action(ProfileAction::TestConnection)));
+        assert!(!dialog.search_target_available(action(ProfileAction::ConfirmImportedModel)));
+        let _ = dialog.update(Message::Search("refresh managed models".into()));
+        let _ = dialog.update(Message::SearchChoose);
+        assert_eq!(dialog.page, Page::Profiles);
+        assert_eq!(
+            dialog.revealed.setting,
+            Some(Setting::ProfileAction(ProfileAction::RefreshManagedModels))
+        );
+        assert!(dialog.search_target_available(action(ProfileAction::RefreshManagedModels)));
+        assert_eq!(dialog.profiles.catalog(), &draft);
+        assert!(dialog.request.is_none());
     }
 
     #[test]

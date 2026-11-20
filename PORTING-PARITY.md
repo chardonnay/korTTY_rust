@@ -165,6 +165,103 @@ strict workspace Clippy. Native desktop acceptance remains open under A2.
 [Apple Silicon fixed-header tests](target/verification/20261120-agent-log-header-macos.log)
 · [Windows ARM64 Clippy](target/verification/20261120-agent-log-header-windows-clippy.log)
 
+Right-clicking a retained Log Table step opens its step actions. The answer
+row and table background open the run actions when available. The menu
+belongs to the pane, detached history or Activity window that opened it.
+The action dispatch still checks the run, stream, epoch and effective
+policy. Apple Silicon passed 125 selected tests. They cover selecting
+Copy answer with the pointer, selecting Copy output with the keyboard
+after scrolling both axes in detached history, and keeping that menu out
+of the Activity window. The loopback provider admission, repair and
+usage tests also passed. Windows ARM64 passed strict workspace Clippy.
+Native desktop interaction and configured model acceptance remain open.
+[Apple Silicon context-menu tests](target/verification/20261120-agent-log-context-macos-final.log)
+· [Windows ARM64 Clippy](target/verification/20261120-agent-log-context-windows-clippy-final.log)
+· [Java row context menu](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignLogTable.java)
+
+The Log Table run menu includes Earlier runs when the same terminal stream
+has other presentable runs or retained finished runs. It uses the existing
+run-selection and archive-reopening path. Apple Silicon passed 129 selected
+tests. The docked widget test opens the run menu, selects an archived run
+and verifies that the terminal presents its original answer with a fresh
+window identity. The native tests also cover stale selection, changed
+streams and private runs. Windows ARM64 passed strict workspace Clippy.
+[Java run menu](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignHost.java#L933)
+· [Apple Silicon tests](target/verification/20261120-agent-log-earlier-macos.log)
+· [Windows ARM64 Clippy](target/verification/20261120-agent-log-earlier-windows-clippy.log)
+
+The run actions offer Export all finished runs while another run is active.
+The export review fixes the completed runs from the same terminal stream
+when it opens. Each file uses the current mask and still requires a new
+path and explicit confirmation. Apple Silicon passed 185 selected tests.
+The export regression writes the two retained runs while a third run stays
+in progress. When that third run finishes during a second review, the new
+report still includes the two runs originally selected. The existing tests
+also verify private-session exclusion and rejection after the stream changes.
+Windows ARM64 passed strict workspace Clippy.
+[Java run menu export](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignHost.java#L943)
+· [Apple Silicon tests](target/verification/20261120-agent-log-export-macos-final.log)
+· [Windows ARM64 Clippy](target/verification/20261120-agent-log-export-windows-clippy-final.log)
+
+The focused live Log Table opens its row actions with the Context Menu key
+or an unassigned Shift+F10. The shortcut reveals the selected row and keeps
+the popup anchored to it in the scrolled table. The approval row opens its
+read-only details. The menu retains keyboard events through key release
+even if activation closes the popup. Apple Silicon passed 186 selected
+tests. The docked case verifies Shift+F10, the exact command copied and
+Enter release isolation. The detached case opens and dismisses the menu
+after scrolling both axes. Native desktop acceptance remains under A2.
+[Apple Silicon tests](target/verification/20261120-agent-log-menu-keys-macos.log)
+· [Windows ARM64 Clippy](target/verification/20261120-agent-log-menu-keys-windows-clippy.log)
+
+Live Log Table step and answer details have selectable, read-only text.
+Copy selected and the platform Copy shortcut use the Agent clipboard
+action. It checks the original detail and the current mask before copying
+a selection. Apple Silicon passed 187 selected tests, including copying
+one Unicode character, rejecting edits, and rejecting a partial copy after
+the full source becomes masked. The detached viewport test exercises the
+new editor in the narrow details pane. Windows ARM64 passed strict
+workspace Clippy. Manual desktop acceptance remains under A2.
+[Apple Silicon tests](target/verification/20261120-agent-log-detail-selection-macos.log)
+· [Windows ARM64 Clippy](target/verification/20261120-agent-log-detail-selection-windows-clippy.log)
+
+## AI Manager profile actions in search
+
+The Profiles search reveals the connection test, fixed CLI test and model
+discovery controls available for the selected profile. For an imported
+embedded profile, it reaches the local model choice, inventory refresh
+and the mapping confirmation once a compatible model is selected. Profile
+deletion has separate search targets for opening, confirming and cancelling
+the review. Selecting a result shows its control and preserves the draft.
+Apple Silicon passed 98 selected tests with three ignored. The native
+widget test checks the highlight and scroll position for Load models.
+It also verifies that the profile list remains intact through search and
+cancel, and that revealing an imported model control leaves its review
+pending. Windows ARM64 passed strict workspace Clippy.
+[Java Profiles connection test](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AiManagerDialog.java#L689)
+· [Apple Silicon tests](target/verification/20261120-profile-action-search-macos-final.log)
+· [Windows ARM64 Clippy](target/verification/20261120-profile-action-search-windows-clippy-final.log)
+
+General search reveals the shortcut toggle, editable base command, and
+case preference individually. It also reveals the retained Java journal
+search, confirmation, execution, and shortcut preferences when present.
+Revealing these rows preserves the current draft and leaves adoption
+to the corresponding button.
+
+Local Preferences search reveals the runtime update policy, preferred
+backend, embedding source, guided embedding setup and available inventory
+refresh. The manual embedding identifier is searchable while its field is
+present. Imported Java role rows share the settings viewport and can be
+revealed individually, including unresolved hints. The existing Hub access
+control also matches searches for a Hugging Face token or vault credential.
+Apple Silicon passed 99 selected tests with three ignored. The widget
+tests reveal imported roles and policy-locked runtime settings in a
+300-point-high window and verify that the draft stays intact. Windows
+ARM64 passed strict workspace Clippy.
+[Java Local Preferences](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AiLocalPreferencesPane.java)
+· [Apple Silicon tests](target/verification/20261120-local-preferences-search-macos.log)
+· [Windows ARM64 Clippy](target/verification/20261120-local-preferences-search-windows-clippy.log)
+
 ## November 20 Java external skill provider suggestions
 
 Java v2.26.0 settings imports retain valid GitHub, SkillsMP and HTTP

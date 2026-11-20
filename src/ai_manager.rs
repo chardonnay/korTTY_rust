@@ -3694,6 +3694,8 @@ impl Dialog {
     }
 
     fn search_target_available(&self, target: search::Target) -> bool {
+        use search::LocalPreference;
+
         if self.local.backend_repair_open() {
             return matches!(
                 target, search::Target::Setting(search::Setting::Control(control))
@@ -3702,12 +3704,48 @@ impl Dialog {
             );
         }
         match target {
+            search::Target::Setting(search::Setting::ImportedGeneral(setting)) => {
+                use search::ImportedGeneral;
+                match setting {
+                    ImportedGeneral::JournalSearch => {
+                        self.saved.java_journal_semantic_search.is_some()
+                    }
+                    ImportedGeneral::AgentConfirmation => {
+                        self.saved.java_agent_confirm_mutating.is_some()
+                    }
+                    ImportedGeneral::AgentExecution => {
+                        self.saved.java_agent_execution_enabled.is_some()
+                    }
+                    ImportedGeneral::AgentShortcut => self.saved.java_agent_shortcut.is_some(),
+                }
+            }
+            search::Target::Setting(search::Setting::Embedding) => {
+                self.local_state.uses_manual_embedding()
+            }
+            search::Target::Setting(search::Setting::LocalPreference(preference)) => {
+                match preference {
+                    LocalPreference::ImportedRole(role) => self.has_imported_role(role),
+                    LocalPreference::EmbeddingSetup => self.local_state.needs_guided_embedding(),
+                    LocalPreference::RefreshEmbeddingModels => {
+                        self.local.can_refresh_embedding_inventory(self.editable())
+                    }
+                    LocalPreference::RuntimeUpdatePolicy
+                    | LocalPreference::RuntimeBackend
+                    | LocalPreference::EmbeddingSource => true,
+                }
+            }
             search::Target::Setting(search::Setting::WizardScan | search::Setting::WizardTest) => {
                 self.profile_wizard_open()
             }
             search::Target::Setting(search::Setting::Profile(search::ProfileSetting::Web(
                 setting,
             ))) => self.profiles.can_reveal_web_setting(setting),
+            search::Target::Setting(search::Setting::ProfileAction(action)) => {
+                self.profiles.can_reveal_profile_action(
+                    action,
+                    self.editable() && self.profile_form_lock().is_none(),
+                )
+            }
             search::Target::Setting(search::Setting::Knowledge(setting))
                 if setting.needs_store() =>
             {
@@ -3789,7 +3827,11 @@ impl Dialog {
                 search::Setting::Hub(_)
                 | search::Setting::Managed(_)
                 | search::Setting::Mlx(_)
-                | search::Setting::SkillProvider(_),
+                | search::Setting::SkillProvider(_)
+                | search::Setting::ProfileAction(_)
+                | search::Setting::ImportedGeneral(_)
+                | search::Setting::Embedding
+                | search::Setting::LocalPreference(_),
             ) => true,
             search::Target::Setting(search::Setting::Knowledge(setting)) => {
                 setting.needs_active_review()
@@ -3814,6 +3856,9 @@ impl Dialog {
         if let Some(search::Setting::Profile(setting)) = self.revealed.setting {
             self.profiles
                 .update(profiles::Message::Section(setting.section()), false);
+        }
+        if let Some(search::Setting::ProfileAction(action)) = self.revealed.setting {
+            self.profiles.reveal_profile_action(action);
         }
         if let Some(search::Setting::Knowledge(setting)) = self.revealed.setting
             && setting.needs_store()
@@ -3841,7 +3886,17 @@ impl Dialog {
         if matches!(
             self.revealed.setting,
             Some(
-                search::Setting::Profile(search::ProfileSetting::Web(_)) | search::Setting::Hub(_)
+                search::Setting::Profile(search::ProfileSetting::Web(_))
+                    | search::Setting::ProfileAction(_)
+                    | search::Setting::ImportedGeneral(_)
+                    | search::Setting::LocalPreference(
+                        search::LocalPreference::RuntimeUpdatePolicy
+                            | search::LocalPreference::RuntimeBackend
+                            | search::LocalPreference::ImportedRole(_)
+                            | search::LocalPreference::EmbeddingSetup
+                            | search::LocalPreference::RefreshEmbeddingModels
+                    )
+                    | search::Setting::Hub(_)
             )
         ) {
             return scroll;
@@ -4617,14 +4672,14 @@ impl Dialog {
                             self.can_open_guided_setup(role)
                                 .then_some(Message::Setup(setup::Message::Open(role))),
                         );
-                        let setup = if role.is_none() {
-                            self.revealed.action(
-                                search::Setting::Control(search::Control::LocalSetup),
-                                setup,
-                            )
+                        let setting = if role.is_none() {
+                            search::Setting::Control(search::Control::LocalSetup)
                         } else {
-                            setup.into()
+                            search::Setting::LocalPreference(
+                                search::LocalPreference::EmbeddingSetup,
+                            )
                         };
+                        let setup = self.revealed.action(setting, setup);
                         column![setup, catalog.map(|label| text(label).size(13)), content]
                             .spacing(8)
                             .height(Length::Fill)
@@ -4677,7 +4732,7 @@ impl Dialog {
                 .id(self.search_scroll.clone())
                 .height(Length::Fill)
                 .into()
-        } else if self.page == Page::General
+        } else if matches!(self.page, Page::General | Page::LocalPreferences)
             || self.page == Page::Memory && !self.memory.reviewing_document()
         {
             scrollable(content)
@@ -4720,6 +4775,7 @@ impl Dialog {
     }
 
     fn general_view(&self) -> Element<'_, Message> {
+        use search::ImportedGeneral;
         use search::Setting::{Features, GlobalTimeout};
         let mut features = checkbox(self.general.features_enabled).label(Features.title());
         let mut timeout = text_input("0–1440", &self.timeout).width(80);
@@ -4750,11 +4806,13 @@ impl Dialog {
             text(self.general.chat_terminal_actions.to_string()).into()
         };
         let shortcut_setting = search::Setting::AgentShortcut;
+        let shortcut_name = search::Setting::AgentShortcutName;
+        let shortcut_case = search::Setting::AgentShortcutCase;
         let setup_setting = search::Setting::ShowAgentSetup;
         let shortcut = &self.general.agent_shortcut;
         let mut enabled = checkbox(shortcut.enabled).label(shortcut_setting.title());
         let mut name = text_input(shortcut::DEFAULT_ALIAS, &shortcut.name).width(200);
-        let mut case = checkbox(shortcut.case_insensitive).label("Ignore command name case");
+        let mut case = checkbox(shortcut.case_insensitive).label(shortcut_case.title());
         let mut show_setup = checkbox(self.general.show_agent_setup).label(setup_setting.title());
         if self.editable() {
             enabled = enabled.on_toggle(Message::AgentShortcutEnabled);
@@ -4786,45 +4844,57 @@ impl Dialog {
                 .label("Use local semantic ranking when preparing cross-journal questions")
                 .on_toggle_maybe(self.editable().then_some(Message::JournalSemanticSearch))),
             text("Preparing a cross-journal question sends its masked text and new or changed search cards to the configured local embedding model. Lexical ranking is used if no model is available. Answer requests still require review.").size(13),
-            self.saved.java_journal_semantic_search.map(|enabled| row![
-                text(format!("Imported from Java: semantic search {}", if enabled { "on" } else { "off" })).size(13),
-                button("Use imported search preference").on_press_maybe(self.editable().then_some(Message::AdoptJavaJournalSemanticSearch)),
-            ].spacing(8).wrap()),
+            self.saved.java_journal_semantic_search.map(|enabled| self.revealed.wrap(
+                search::Setting::ImportedGeneral(ImportedGeneral::JournalSearch),
+                row![
+                    text(format!("Imported from Java: semantic search {}", if enabled { "on" } else { "off" })).size(13),
+                    button("Use imported search preference").on_press_maybe(self.editable().then_some(Message::AdoptJavaJournalSemanticSearch)),
+                ].spacing(8).wrap(),
+            )),
             text("Terminal AI Agent").size(19),
             self.revealed.wrap(search::Setting::AgentConfirmation,
                 checkbox(self.general.agent_confirm_mutating).label("Require approval for mutating Agent command sets")
                     .on_toggle_maybe(self.editable().then_some(Message::AgentConfirmMutating))),
             text("When unchecked, a command review can explicitly approve future ordinary commands for that run and target. Managed confirmation policy overrides this choice. Elevation and password requests keep their separate approvals.").size(13),
-            self.saved.java_agent_confirm_mutating.map(|enabled| row![
-                text(format!("Imported from Java: command confirmation {}", if enabled { "on" } else { "off" })).size(13),
-                button("Use imported confirmation preference").on_press_maybe(self.editable().then_some(Message::AdoptJavaAgentConfirmation)),
-            ].spacing(8).wrap()),
+            self.saved.java_agent_confirm_mutating.map(|enabled| self.revealed.wrap(
+                search::Setting::ImportedGeneral(ImportedGeneral::AgentConfirmation),
+                row![
+                    text(format!("Imported from Java: command confirmation {}", if enabled { "on" } else { "off" })).size(13),
+                    button("Use imported confirmation preference").on_press_maybe(self.editable().then_some(Message::AdoptJavaAgentConfirmation)),
+                ].spacing(8).wrap(),
+            )),
             self.revealed.wrap(search::Setting::AgentExecution,
                 checkbox(self.general.agent_execution_enabled).label("Allow Agent command execution")
                     .on_toggle_maybe(self.editable().then_some(Message::AgentExecutionEnabled))),
             text("Disabling execution blocks Agent Run, executing AI Swarm and scheduled Agent diagnostics. Ask, planning and ordinary snippets remain available, subject to policy. Existing Agent operations stop when their permissions are rechecked.").size(13),
-            self.saved.java_agent_execution_enabled.map(|enabled| row![
-                text(format!("Imported from Java: Agent execution {}", if enabled { "on" } else { "off" })).size(13),
-                button("Use imported execution preference").on_press_maybe(self.editable().then_some(Message::AdoptJavaAgentExecution)),
-            ].spacing(8).wrap()),
-            self.revealed.wrap(
-                shortcut_setting,
-                column![
-                    enabled,
-                    row![text("Base command name"), self.revealed.input(shortcut_setting, self.editable(), name)]
+            self.saved.java_agent_execution_enabled.map(|enabled| self.revealed.wrap(
+                search::Setting::ImportedGeneral(ImportedGeneral::AgentExecution),
+                row![
+                    text(format!("Imported from Java: Agent execution {}", if enabled { "on" } else { "off" })).size(13),
+                    button("Use imported execution preference").on_press_maybe(self.editable().then_some(Message::AdoptJavaAgentExecution)),
+                ].spacing(8).wrap(),
+            )),
+            column![
+                self.revealed.wrap(shortcut_setting, enabled),
+                self.revealed.wrap(
+                    shortcut_name,
+                    row![text(shortcut_name.title()), self.revealed.input(shortcut_name, self.editable(), name)]
                         .spacing(8).align_y(Alignment::Center).wrap(),
-                    case,
-                    self.saved.java_agent_shortcut.as_ref().map(|imported| column![
+                ),
+                self.revealed.wrap(shortcut_case, case),
+                self.saved.java_agent_shortcut.as_ref().map(|imported| self.revealed.wrap(
+                    search::Setting::ImportedGeneral(ImportedGeneral::AgentShortcut),
+                    column![
                         text(format!("Imported from Java · command: {} · ignore case: {}",
                             imported.name.as_deref().unwrap_or("not specified"),
                             imported.case_insensitive.map_or("not specified", |value| if value { "on" } else { "off" }))).size(13),
                         button("Use imported command preferences").on_press_maybe(self.editable().then_some(Message::AdoptJavaAgentShortcut)),
                         text("Adoption preserves whether terminal agent shortcuts are enabled. Save to apply the name to local and SSH shell prompts.").size(13),
-                    ].spacing(4)),
-                    text("Type the base command, or add -ask or -plan, at a shell prompt with OSC 133 integration. Tab offers variants or recent prompts. Enter submits the alias.").size(13),
-                    text("For local terminals, enable automatic shell integration in Quick Connect or the saved shell profile. For SSH, install the matching snippet on the remote host and reconnect. Right-click the terminal → Set Up Shell Integration… shows shortcut readiness.").size(13),
-                ].spacing(6),
-            ),
+                    ].spacing(4),
+                )),
+                text("Type the base command, or add -ask or -plan, at a shell prompt with OSC 133 integration. Tab offers variants or recent prompts. Enter submits the alias.").size(13),
+                text("For local terminals, enable automatic shell integration in Quick Connect or the saved shell profile. For SSH, install the matching snippet on the remote host and reconnect. Right-click the terminal → Set Up Shell Integration… shows shortcut readiness.").size(13),
+            ].spacing(6),
             self.revealed.wrap(
                 setup_setting,
                 column![

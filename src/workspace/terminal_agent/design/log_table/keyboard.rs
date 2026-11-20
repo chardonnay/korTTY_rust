@@ -10,11 +10,13 @@ use iced::{
     Element, Event, Length, Rectangle, Renderer, Size, Theme, Vector, mouse, touch, window,
 };
 
-use super::{AgentMessage, Key, Message, event, presentation};
+use super::{AgentMessage, Key, Message, Surface, event, presentation};
 use crate::workspace::terminal_agent::{Desktop, State};
 
 pub(super) const PANE_FOCUS_KEY: Named = Named::F6;
 pub(super) const PANE_FOCUS_MODIFIERS: Modifiers = Modifiers::CTRL.union(Modifiers::SHIFT);
+pub(super) const MENU_KEY: Named = Named::F10;
+pub(super) const MENU_MODIFIERS: Modifiers = Modifiers::SHIFT;
 
 pub(super) enum EntryKey {
     Pane,
@@ -26,6 +28,7 @@ pub(super) fn wrap<'a>(
     agents: &'a State,
     window: window::Id,
     entry: Option<(window::Id, EntryKey)>,
+    shift_f10_available: bool,
 ) -> Element<'a, Desktop> {
     Element::new(Scope {
         content,
@@ -33,6 +36,7 @@ pub(super) fn wrap<'a>(
             agents,
             window,
             entry,
+            shift_f10_available,
         },
     })
 }
@@ -71,6 +75,18 @@ trait Target {
     fn pointer_route(&self, message: &Desktop) -> Option<Self::Route>;
     fn table(&self, route: Self::Route) -> Option<&super::State>;
     fn navigate(&self, route: Self::Route, key: Key) -> Desktop;
+
+    fn menu_shortcut(&self, _: Named, _: Modifiers) -> bool {
+        false
+    }
+
+    fn open_menu(&self, _: Self::Route, _: Vector) -> Option<Desktop> {
+        None
+    }
+
+    fn menu_open(&self, _: Self::Route) -> bool {
+        false
+    }
 
     fn focus_node(&self) -> Option<(Self::Route, &super::State)> {
         None
@@ -120,6 +136,7 @@ struct Live<'a> {
     agents: &'a State,
     window: window::Id,
     entry: Option<(window::Id, EntryKey)>,
+    shift_f10_available: bool,
 }
 
 impl Target for Live<'_> {
@@ -138,7 +155,22 @@ impl Target for Live<'_> {
     }
 
     fn navigate(&self, route: Self::Route, key: Key) -> Desktop {
-        route.message(key)
+        route.message(Message::Navigate(key))
+    }
+
+    fn menu_shortcut(&self, name: Named, modifiers: Modifiers) -> bool {
+        (name == Named::ContextMenu && modifiers.is_empty())
+            || (self.shift_f10_available && name == MENU_KEY && modifiers == MENU_MODIFIERS)
+    }
+
+    fn open_menu(&self, route: Route, offset: Vector) -> Option<Desktop> {
+        Some(route.message(Message::KeyboardMenu(route.surface(self.window), offset.x)))
+    }
+
+    fn menu_open(&self, route: Route) -> bool {
+        self.table(route)
+            .and_then(|table| table.menu)
+            .is_some_and(|menu| menu.surface == route.surface(self.window))
     }
 
     fn focus_entry(
@@ -192,8 +224,18 @@ impl Route {
         })
     }
 
-    fn message(self, key: Key) -> Desktop {
-        let action = event(Message::Navigate(key));
+    fn surface(self, window: window::Id) -> Surface {
+        if self.window != self.run {
+            Surface::Detached
+        } else if window == self.run {
+            Surface::Activity
+        } else {
+            Surface::Pane
+        }
+    }
+
+    fn message(self, message: Message) -> Desktop {
+        let action = event(message);
         Desktop::TerminalAgent(
             self.window,
             if self.window == self.run {
@@ -219,6 +261,14 @@ impl<R> Default for Focus<R> {
     }
 }
 
+impl<R> Focus<R> {
+    fn hold(&mut self, name: Named) {
+        if !self.held.contains(&name) {
+            self.held.push(name);
+        }
+    }
+}
+
 struct FocusNode<'a, R>(&'a mut Option<R>, R);
 
 impl<R: Copy + Eq> operation::Focusable for FocusNode<'_, R> {
@@ -237,7 +287,7 @@ impl<R: Copy + Eq> operation::Focusable for FocusNode<'_, R> {
 
 struct Visible<'a> {
     viewport: &'a Id,
-    bounds: Option<Rectangle>,
+    bounds: Option<(Rectangle, Vector)>,
 }
 
 impl Visible<'_> {
@@ -247,7 +297,7 @@ impl Visible<'_> {
         tree: &mut Tree,
         layout: Layout<'_>,
         renderer: &Renderer,
-    ) -> Option<Rectangle> {
+    ) -> Option<(Rectangle, Vector)> {
         let mut visible = Visible {
             viewport,
             bounds: None,
@@ -269,11 +319,11 @@ impl Operation for Visible<'_> {
         id: Option<&Id>,
         bounds: Rectangle,
         _: Rectangle,
-        _: Vector,
+        offset: Vector,
         _: &mut dyn operation::Scrollable,
     ) {
         if id == Some(self.viewport) && bounds.width > 0.0 && bounds.height > 0.0 {
-            self.bounds = Some(bounds);
+            self.bounds = Some((bounds, offset));
         }
     }
 }
@@ -342,7 +392,7 @@ impl<T: Target> Widget<Desktop, Theme, Renderer> for Scope<'_, T> {
         let child = self.content.as_widget_mut();
         let child_tree = &mut tree.children[0];
         if let Some((route, table)) = self.target.focus_node()
-            && let Some(bounds) =
+            && let Some((bounds, _)) =
                 Visible::find(&table.viewport, child, child_tree, layout, renderer)
         {
             let focus = tree.state.downcast_mut::<Focus<T::Route>>();
@@ -389,9 +439,7 @@ impl<T: Target> Widget<Desktop, Theme, Renderer> for Scope<'_, T> {
                     && let Some(table) = self.target.table(route)
                     && Visible::find(&table.viewport, child, child_tree, layout, renderer).is_some()
                 {
-                    if !focus.held.contains(name) {
-                        focus.held.push(*name);
-                    }
+                    focus.hold(*name);
                     shell.capture_event();
                     if !repeat {
                         focus.route = Some(route);
@@ -399,13 +447,27 @@ impl<T: Target> Widget<Desktop, Theme, Renderer> for Scope<'_, T> {
                     }
                     return;
                 }
+                if self.target.menu_shortcut(*name, *modifiers)
+                    && let Some(route) = focus.route
+                {
+                    let visible = self.target.table(route).and_then(|table| {
+                        Visible::find(&table.viewport, child, child_tree, layout, renderer)
+                    });
+                    if let Some((_, offset)) = visible {
+                        focus.hold(*name);
+                        shell.capture_event();
+                        if !repeat && let Some(message) = self.target.open_menu(route, offset) {
+                            shell.publish(message);
+                        }
+                        return;
+                    }
+                    focus.route = None;
+                }
                 let key = navigation(*name, *modifiers);
                 if matches!(key, Some(Key::Leave))
                     && let Some(action) = self.target.tab(modifiers.shift())
                 {
-                    if !focus.held.contains(name) {
-                        focus.held.push(*name);
-                    }
+                    focus.hold(*name);
                     shell.capture_event();
                     if !repeat {
                         shell.publish(action);
@@ -415,9 +477,7 @@ impl<T: Target> Widget<Desktop, Theme, Renderer> for Scope<'_, T> {
                 if let Some(key) = key
                     && let Some(route) = focus.route
                 {
-                    if !focus.held.contains(name) {
-                        focus.held.push(*name);
-                    }
+                    focus.hold(*name);
                     shell.capture_event();
                     let Some(table) = self.target.table(route) else {
                         focus.route = None;
@@ -530,12 +590,99 @@ impl<T: Target> Widget<Desktop, Theme, Renderer> for Scope<'_, T> {
         viewport: &Rectangle,
         translation: Vector,
     ) -> Option<overlay::Element<'b, Desktop, Theme, Renderer>> {
-        self.content.as_widget_mut().overlay(
+        let focus = tree.state.downcast_mut::<Focus<T::Route>>();
+        let menu_open = focus
+            .route
+            .is_some_and(|route| self.target.menu_open(route));
+        let content = self.content.as_widget_mut().overlay(
             &mut tree.children[0],
             layout,
             renderer,
             viewport,
             translation,
-        )
+        )?;
+        if menu_open {
+            Some(overlay::Element::new(Box::new(MenuOverlay {
+                content,
+                focus,
+            })))
+        } else {
+            Some(content)
+        }
+    }
+}
+
+/// Keep key releases paired with presses consumed by the context menu, even
+/// after an action dismisses the overlay and the terminal becomes reachable.
+struct MenuOverlay<'a, R> {
+    content: overlay::Element<'a, Desktop, Theme, Renderer>,
+    focus: &'a mut Focus<R>,
+}
+
+impl<R> overlay::Overlay<Desktop, Theme, Renderer> for MenuOverlay<'_, R> {
+    fn index(&self) -> f32 {
+        self.content.as_overlay().index()
+    }
+
+    fn layout(&mut self, renderer: &Renderer, bounds: Size) -> layout::Node {
+        self.content.as_overlay_mut().layout(renderer, bounds)
+    }
+
+    fn draw(
+        &self,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+    ) {
+        self.content
+            .as_overlay()
+            .draw(renderer, theme, style, layout, cursor);
+    }
+
+    fn operate(&mut self, layout: Layout<'_>, renderer: &Renderer, operation: &mut dyn Operation) {
+        self.content
+            .as_overlay_mut()
+            .operate(layout, renderer, operation);
+    }
+
+    fn update(
+        &mut self,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Desktop>,
+    ) {
+        self.content
+            .as_overlay_mut()
+            .update(event, layout, cursor, renderer, clipboard, shell);
+        match event {
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(name),
+                ..
+            }) if shell.is_event_captured() => self.focus.hold(*name),
+            Event::Keyboard(keyboard::Event::KeyReleased {
+                key: keyboard::Key::Named(name),
+                ..
+            }) if self.focus.held.contains(name) => {
+                self.focus.held.retain(|held| held != name);
+                shell.capture_event();
+            }
+            _ => {}
+        }
+    }
+
+    fn mouse_interaction(
+        &self,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+    ) -> mouse::Interaction {
+        self.content
+            .as_overlay()
+            .mouse_interaction(layout, cursor, renderer)
     }
 }

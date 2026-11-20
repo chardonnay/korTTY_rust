@@ -254,6 +254,8 @@ impl Sample {
             presentation: &self.presentation,
             transcript: Some(&self.transcript),
             live_run: None,
+            surface: super::log_table::Surface::Activity,
+            owner: None,
         };
         let controls = || -> Element<'a, AgentMessage> {
             if let Some(command) = view.approval {
@@ -308,6 +310,7 @@ impl Sample {
                     status::Trace::sample(&self.transcript, self.started, now, view.reduced_motion),
                     status_kind,
                     None,
+                    false,
                     controls,
                 )
                 .map(forward),

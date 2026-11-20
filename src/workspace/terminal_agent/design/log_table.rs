@@ -5,9 +5,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use iced::widget::{
     Id, button, canvas, column, container, mouse_area, responsive, row, scrollable, space, stack,
-    text,
+    text, text_editor,
 };
-use iced::{Alignment, Color, Element, Font, Length, Padding, Task, mouse};
+use iced::{Alignment, Color, Element, Font, Length, Padding, Point, Task, mouse};
 use jiff::{Timestamp, tz::TimeZone};
 
 use crate::horizontal_divider::{self, Grow};
@@ -16,8 +16,10 @@ use crate::terminal_agent::design::inline::{
 };
 
 use super::super::Message as AgentMessage;
-use super::{Palette, history::Activity, presentation};
+use super::{Palette, actions, history::Activity, presentation};
 
+mod context;
+mod detail_editor;
 pub(super) mod keyboard;
 
 const FLASH_DURATION: Duration = Duration::from_millis(900);
@@ -32,6 +34,13 @@ pub(crate) enum Row {
     Step(u64),
     Approval(u64),
     Answer,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Surface {
+    Activity,
+    Pane,
+    Detached,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -204,12 +213,20 @@ pub(crate) enum Message {
     Latest,
     Sort(Column),
     ResizeColumns(Widths),
+    OpenMenu(Surface, Option<Row>, Point),
+    KeyboardMenu(Surface, f32),
+    SelectMenuItem(usize),
+    MenuPage(context::Page),
+    CloseMenu,
     Navigate(Key),
 }
 
 impl Message {
     pub(in crate::workspace) fn takes_focus(self) -> bool {
-        matches!(self, Self::Select(_) | Self::Open(_) | Self::Sort(_))
+        matches!(
+            self,
+            Self::Select(_) | Self::Open(_) | Self::Sort(_) | Self::OpenMenu(..)
+        )
     }
 }
 
@@ -229,11 +246,14 @@ pub(super) struct State {
     viewport: Id,
     selected: Option<Row>,
     detail: Option<Row>,
+    detail_editor: Option<detail_editor::Editor>,
+    detail_revision: u64,
     sort: Option<(Column, bool)>,
     first_seen: Vec<(Row, Instant)>,
     approval: Option<Approval>,
     follow_revision: u64,
     manual_widths: Option<Widths>,
+    menu: Option<context::Menu>,
 }
 
 struct Approval {
@@ -269,16 +289,46 @@ impl Default for State {
             viewport: Id::unique(),
             selected: None,
             detail: None,
+            detail_editor: None,
+            detail_revision: 0,
             sort: None,
             first_seen: Vec::new(),
             approval: None,
             follow_revision: 0,
             manual_widths: None,
+            menu: None,
         }
     }
 }
 
 impl State {
+    fn sync_detail_editor(&mut self, transcript: &Transcript) {
+        let Some(detail @ (Detail::Step(_) | Detail::Answer(_))) = self.detail(transcript, None)
+        else {
+            self.detail_editor = None;
+            return;
+        };
+        let source = detail.body();
+        if source.is_empty() {
+            self.detail_editor = None;
+            return;
+        }
+        let row = self.detail.expect("a resolved detail has a selected row");
+        if self
+            .detail_editor
+            .as_ref()
+            .is_some_and(|editor| editor.row == row && editor.source == source)
+        {
+            return;
+        }
+        self.detail_revision = self.detail_revision.saturating_add(1);
+        self.detail_editor = Some(detail_editor::Editor::new(
+            row,
+            self.detail_revision,
+            source,
+        ));
+    }
+
     pub(super) fn set_approval(&mut self, revision: u64, prompt: Option<Prompt>, now: Instant) {
         if prompt.is_some()
             && self
@@ -383,6 +433,23 @@ impl State {
 
     pub(super) fn update(&mut self, message: Message) {
         match message {
+            Message::OpenMenu(surface, row, point) => {
+                self.selected = row;
+                self.detail = None;
+                self.menu = Some(context::Menu::new(surface, row, point));
+            }
+            Message::SelectMenuItem(index) => {
+                if let Some(menu) = &mut self.menu {
+                    menu.selected = index;
+                }
+            }
+            Message::MenuPage(page) => {
+                if let Some(menu) = &mut self.menu {
+                    menu.page = page;
+                    menu.selected = 0;
+                }
+            }
+            Message::CloseMenu => self.menu = None,
             Message::Select(Row::Approval(revision)) | Message::Open(Row::Approval(revision))
                 if self.approval(Some(revision)).is_none() => {}
             Message::Select(row) => {
@@ -410,7 +477,7 @@ impl State {
                 self.manual_widths = Some(widths);
             }
             Message::ResizeColumns(_) => {}
-            Message::Navigate(_) => {}
+            Message::Navigate(_) | Message::KeyboardMenu(..) => {}
         }
     }
 
@@ -422,12 +489,14 @@ impl State {
         approval_revision: Option<u64>,
     ) -> Task<super::Desktop> {
         let row = self.navigate_row(transcript, at, key, approval_revision);
-        row.map_or_else(Task::none, |row| {
-            crate::workspace::coding_agents::roster_scroll::reveal_row(
-                self.viewport.clone(),
-                self.row_id(row),
-            )
-        })
+        row.map_or_else(Task::none, |row| self.reveal(row))
+    }
+
+    fn reveal(&self, row: Row) -> Task<super::Desktop> {
+        crate::workspace::coding_agents::roster_scroll::reveal_row(
+            self.viewport.clone(),
+            self.row_id(row),
+        )
     }
 
     fn navigate_row(
@@ -522,6 +591,45 @@ impl State {
 }
 
 impl super::Run {
+    pub(in crate::workspace::terminal_agent) fn sync_log_detail(&mut self) {
+        if self.design.history == crate::terminal_agent::design::History::LogTable
+            && let Some(history) = &self.inline
+        {
+            self.presentation
+                .log_table
+                .sync_detail_editor(history.status_transcript());
+        }
+    }
+
+    pub(in crate::workspace::terminal_agent) fn select_log_detail(
+        &mut self,
+        revision: u64,
+        action: text_editor::Action,
+    ) {
+        let table = &mut self.presentation.log_table;
+        if let Some(editor) = &mut table.detail_editor
+            && table.detail == Some(editor.row)
+            && editor.revision == revision
+        {
+            editor.update(action);
+        }
+    }
+
+    pub(super) fn log_detail_selection(&self, revision: u64) -> Option<(&str, String)> {
+        let table = &self.presentation.log_table;
+        let editor = table.detail_editor.as_ref()?;
+        if table.detail != Some(editor.row) || editor.revision != revision {
+            return None;
+        }
+        Some((&editor.source, editor.selection()?))
+    }
+
+    #[cfg(test)]
+    pub(in crate::workspace::terminal_agent) fn log_detail_fixture(&self) -> Option<(&str, u64)> {
+        let editor = self.presentation.log_table.detail_editor.as_ref()?;
+        Some((&editor.source, editor.revision))
+    }
+
     fn log_approval_revision(&self) -> Option<u64> {
         (!self.cancel.requested()
             && !self.closing
@@ -545,7 +653,7 @@ impl super::Run {
 
     pub(in crate::workspace::terminal_agent) fn navigate_agent_log(
         &mut self,
-        key: Key,
+        message: Message,
     ) -> Task<super::Desktop> {
         if self.design.history != crate::terminal_agent::design::History::LogTable {
             return Task::none();
@@ -555,9 +663,24 @@ impl super::Run {
         };
         let at = self.presentation.finish_time().unwrap_or_else(Instant::now);
         let revision = self.log_approval_revision();
-        self.presentation
-            .log_table
-            .navigate(history.status_transcript(), at, key, revision)
+        let transcript = history.status_transcript();
+        let table = &mut self.presentation.log_table;
+        match message {
+            Message::Navigate(key) => table.navigate(transcript, at, key, revision),
+            Message::KeyboardMenu(surface, offset) => {
+                let Some(row) = table.navigate_row(transcript, at, Key::Focus, revision) else {
+                    return Task::none();
+                };
+                if matches!(row, Row::Approval(_)) {
+                    table.update(Message::Open(row));
+                } else {
+                    let point = Point::new(offset.max(0.0) + 8.0, 7.0);
+                    table.update(Message::OpenMenu(surface, Some(row), point));
+                }
+                table.reveal(row)
+            }
+            _ => Task::none(),
+        }
     }
 }
 
@@ -568,7 +691,7 @@ impl super::Workspace {
         content: Element<'a, super::Desktop>,
     ) -> Element<'a, super::Desktop> {
         use iced::keyboard::Key;
-        use keyboard::{EntryKey, PANE_FOCUS_KEY, PANE_FOCUS_MODIFIERS};
+        use keyboard::{EntryKey, MENU_KEY, MENU_MODIFIERS, PANE_FOCUS_KEY, PANE_FOCUS_MODIFIERS};
 
         if self.windows.contains_key(&window) || self.terminal_agents.window_run(window).is_some() {
             let entry = self
@@ -591,7 +714,18 @@ impl super::Workspace {
                         .agent_activity_for_stream(pane, stream)?;
                     Some((run, EntryKey::Pane))
                 });
-            keyboard::wrap(content, &self.terminal_agents, window, entry)
+            let shift_f10_available = self
+                .window_settings
+                .key_bindings
+                .action_for(&Key::Named(MENU_KEY), MENU_MODIFIERS)
+                .is_none();
+            keyboard::wrap(
+                content,
+                &self.terminal_agents,
+                window,
+                entry,
+                shift_f10_available,
+            )
         } else {
             content
         }
@@ -602,6 +736,21 @@ enum Detail<'a> {
     Step(&'a Step),
     Approval(&'a Approval),
     Answer(&'a str),
+}
+
+impl Detail<'_> {
+    fn body(&self) -> String {
+        match self {
+            Self::Step(step) if step.output.is_empty() => step.detail.clone(),
+            Self::Step(step) => step.output.join("\n"),
+            Self::Approval(approval) => std::iter::once(approval.message())
+                .chain(approval.commands().iter().map(String::as_str))
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Self::Answer(answer) => (*answer).into(),
+        }
+    }
 }
 
 fn event(message: Message) -> AgentMessage {
@@ -692,9 +841,10 @@ fn entry(
     style: GridStyle,
     flash: f32,
     command: bool,
+    details_on_right: bool,
 ) -> Element<'static, AgentMessage> {
     let selected = state.selected == Some(row);
-    mouse_area(
+    let trigger = mouse_area(
         container(cells(values, style, command))
             .id(state.row_id(row))
             .padding(ROW_PADDING)
@@ -718,49 +868,63 @@ fn entry(
     )
     .interaction(mouse::Interaction::Pointer)
     .on_press(event(Message::Select(row)))
-    .on_double_click(event(Message::Open(row)))
-    .on_right_press(event(Message::Open(row)))
-    .into()
+    .on_double_click(event(Message::Open(row)));
+    if details_on_right {
+        trigger.on_right_press(event(Message::Open(row))).into()
+    } else {
+        trigger.into()
+    }
 }
 
 fn details<'a>(run: Activity<'a>, detail: Detail<'a>) -> Element<'a, AgentMessage> {
-    let (title, body, actions) = match detail {
+    let (title, actions) = match &detail {
         Detail::Step(step) => (
             super::history::summary(title(step)),
-            if step.output.is_empty() {
-                step.detail.clone()
-            } else {
-                step.output.join("\n")
-            },
             run.live_run.map(|run| super::actions::step_menu(run, step)),
         ),
-        Detail::Approval(approval) => (
-            "Pending approval".into(),
-            std::iter::once(approval.message())
-                .chain(approval.commands().iter().map(String::as_str))
-                .filter(|text| !text.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n"),
-            None,
-        ),
-        Detail::Answer(answer) => ("Answer".into(), answer.into(), None),
+        Detail::Approval(_) => ("Pending approval".into(), None),
+        Detail::Answer(_) => ("Answer".into(), None),
+    };
+    let table = &run.presentation.log_table;
+    let editor = table
+        .detail_editor
+        .as_ref()
+        .filter(|editor| table.detail == Some(editor.row))
+        .zip(run.live_run);
+    let copy = editor.map(|(editor, live)| {
+        button("Copy selected").on_press_maybe(
+            editor
+                .selection()
+                .is_some()
+                .then(|| actions::copy_log_detail(live, editor.revision)),
+        )
+    });
+    let body: Element<'_, AgentMessage> = if let Some((editor, live)) = editor {
+        container(editor.view(live, run.activity_font))
+            .id("agent-log-detail-editor")
+            .into()
+    } else {
+        let body = detail.body();
+        text(if body.is_empty() {
+            "No output recorded.".into()
+        } else {
+            body
+        })
+        .size(run.activity_font)
+        .into()
     };
     container(
         column![
             text(title).width(Length::Fill),
             row![
                 actions.map(|actions| container(actions).id("agent-log-step-actions")),
+                copy,
                 button("Close details").on_press(event(Message::Close)),
                 latest(),
             ]
             .spacing(5)
             .wrap(),
-            text(if body.is_empty() {
-                "No output recorded.".into()
-            } else {
-                body
-            })
-            .size(run.activity_font),
+            body,
         ]
         .spacing(4),
     )
@@ -808,6 +972,8 @@ fn table_view<'a>(
     style: GridStyle,
 ) -> Element<'a, AgentMessage> {
     let state = &run.presentation.log_table;
+    let surface = run.surface;
+    let menu = state.menu.filter(|menu| menu.surface == surface);
     let approval_revision = approval_revision(run);
     let approval = state.approval(approval_revision);
     let now = Instant::now();
@@ -875,7 +1041,7 @@ fn table_view<'a>(
     let mut rows = column![].spacing(1);
     for step in state.rows(transcript, duration_at) {
         let row = Row::Step(step.id);
-        rows = rows.push(entry(
+        let trigger = entry(
             row,
             state,
             timestamped_values(
@@ -891,7 +1057,19 @@ fn table_view<'a>(
             style,
             flash(row),
             step.command.is_some(),
-        ));
+            run.live_run.is_none(),
+        );
+        let entry = if let Some(run) = run.live_run {
+            context::anchor(trigger, menu, surface, Some(row), |_| {
+                super::actions::step_actions(run, step)
+                    .into_iter()
+                    .map(context::Entry::from)
+                    .collect()
+            })
+        } else {
+            trigger
+        };
+        rows = rows.push(entry);
     }
     if let Some(approval) = approval {
         let row = approval.row();
@@ -914,10 +1092,35 @@ fn table_view<'a>(
             style,
             flash(row),
             !approval.commands().is_empty(),
+            true,
         ));
     }
+    let run_actions = run
+        .live_run
+        .map(|live| {
+            super::actions::run_actions(
+                live,
+                run.owner
+                    .is_some_and(|(state, _)| state.has_archived_activity(live)),
+            )
+        })
+        .unwrap_or_default();
+    let earlier_runs = run
+        .live_run
+        .zip(run.owner)
+        .map(|(run, (state, id))| state.history_choices(id, run))
+        .unwrap_or_default();
+    let has_run_menu = !run_actions.is_empty() || !earlier_runs.is_empty();
+    let run_entries = |page| {
+        context::run_entries(
+            &run_actions,
+            &earlier_runs,
+            run.live_run.map_or(0, |run| run.epoch),
+            page,
+        )
+    };
     if !transcript.final_answer.is_empty() {
-        rows = rows.push(entry(
+        let trigger = entry(
             Row::Answer,
             state,
             [
@@ -931,7 +1134,14 @@ fn table_view<'a>(
             style,
             flash(Row::Answer),
             false,
-        ));
+            !has_run_menu,
+        );
+        let trigger = if has_run_menu {
+            context::anchor(trigger, menu, surface, Some(Row::Answer), run_entries)
+        } else {
+            trigger
+        };
+        rows = rows.push(trigger);
     }
     let follow = state.selected.is_none()
         && state.sort.is_none()
@@ -951,6 +1161,11 @@ fn table_view<'a>(
     .translate_cursor_moves(true)
     .width(Length::Fill)
     .height(Length::FillPortion(2));
+    let table = if has_run_menu {
+        context::anchor(table.into(), menu, surface, None, run_entries)
+    } else {
+        table.into()
+    };
     let detail = state
         .detail(transcript, approval_revision)
         .map(|detail| scrollable(details(run, detail)).height(Length::FillPortion(1)));
@@ -1053,6 +1268,7 @@ mod tests {
                 GridStyle::fit(800.0, 12.0, None),
                 0.0,
                 true,
+                true,
             ),
             Size::new(800.0, 140.0),
             Cache::default(),
@@ -1149,6 +1365,8 @@ mod tests {
             presentation: &presentation,
             transcript: Some(&transcript),
             live_run: None,
+            surface: Surface::Activity,
+            owner: None,
         };
         let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
         let mut cache = Cache::default();
@@ -1250,6 +1468,8 @@ mod tests {
                 presentation,
                 transcript: Some(transcript),
                 live_run: None,
+                surface: Surface::Activity,
+                owner: None,
             };
             scrollable(iced::widget::column![
                 space().height(90.0),
@@ -1438,6 +1658,8 @@ mod tests {
                 presentation,
                 transcript: Some(transcript),
                 live_run: None,
+                surface: Surface::Activity,
+                owner: None,
             };
             UserInterface::build(
                 view(info, transcript, None, true),

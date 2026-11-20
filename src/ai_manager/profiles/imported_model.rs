@@ -465,7 +465,11 @@ mod tests {
         );
         editor.update(Message::ManagedModel(embedding), true);
         assert!(editor.selected().unwrap().model.is_empty());
+        use crate::ai_manager::search::ProfileAction;
+        assert!(!editor.can_reveal_profile_action(ProfileAction::ConfirmImportedModel, true));
         editor.update(Message::ManagedModel(chat.clone()), true);
+        assert!(editor.can_reveal_profile_action(ProfileAction::ConfirmImportedModel, true));
+        assert!(!editor.can_reveal_profile_action(ProfileAction::ConfirmImportedModel, false));
         let candidate = editor.validated_catalog().unwrap();
         assert!(candidate.profile(1).unwrap().model.is_empty());
         assert!(candidate.choices().is_empty());

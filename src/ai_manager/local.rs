@@ -144,7 +144,11 @@ impl State {
     }
 
     pub(super) fn needs_guided_embedding(&self) -> bool {
-        self.managed_embedding.is_none() && self.embedding.trim().is_empty()
+        self.uses_manual_embedding() && self.embedding.trim().is_empty()
+    }
+
+    pub(super) fn uses_manual_embedding(&self) -> bool {
+        self.managed_embedding.is_none()
     }
 
     pub(super) fn prepare_backup(&mut self) {
@@ -1133,6 +1137,16 @@ impl Dialog {
 
     pub(super) fn set_runtime_downloads_allowed(&mut self, allowed: bool) {
         self.runtime_downloads_allowed = allowed;
+    }
+
+    pub(super) fn can_refresh_embedding_inventory(&self, editable: bool) -> bool {
+        editable
+            && self.request.is_none()
+            && self.policy_embedding_load.is_none()
+            && self
+                .policy_embeddings
+                .as_ref()
+                .is_some_and(|models| models.unavailable)
     }
 
     pub(super) fn merge_automatic_knowledge(&mut self, state: &State) {
@@ -2554,6 +2568,8 @@ impl Dialog {
         ai_enabled: bool,
         reveal: &Reveal,
     ) -> Element<'a, Message> {
+        use super::search::LocalPreference;
+
         let can_edit = editable && self.request.is_none();
         let can_request = can_edit && ai_enabled;
         let progress = row![
@@ -2592,6 +2608,7 @@ impl Dialog {
             .spacing(10)
             .into();
         }
+        let preferences_page = matches!(page, Page::Preferences);
         let inventory_status: Option<Element<'_, Message>> = if matches!(page, Page::Models(..)) {
             None
         } else if self.policy_embedding_load.is_some() {
@@ -2601,14 +2618,24 @@ impl Dialog {
             .as_ref()
             .is_some_and(|models| models.unavailable)
         {
+            let refresh = button("Refresh embedding models")
+                .style(button::secondary)
+                .on_press_maybe(
+                    self.can_refresh_embedding_inventory(editable)
+                        .then_some(Message::Managed(managed::Message::Refresh)),
+                );
+            let refresh = if preferences_page {
+                reveal.action(
+                    Setting::LocalPreference(LocalPreference::RefreshEmbeddingModels),
+                    refresh,
+                )
+            } else {
+                refresh.into()
+            };
             Some(
                 row![
                     text("One or more policy-managed embedding models are unavailable.").size(13),
-                    button("Refresh embedding models")
-                        .style(button::secondary)
-                        .on_press_maybe(
-                            can_edit.then_some(Message::Managed(managed::Message::Refresh))
-                        ),
+                    refresh,
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center)
@@ -2640,16 +2667,16 @@ impl Dialog {
                 self.runtime_update_status.as_deref(),
             ),
         };
-        column![
+        let page = if preferences_page {
+            page
+        } else {
             scrollable(page)
                 .id(reveal.viewport.clone())
                 .spacing(6)
-                .height(Length::Fill),
-            inventory_status,
-            progress,
-        ]
-        .spacing(10)
-        .into()
+                .height(Length::Fill)
+                .into()
+        };
+        column![page, inventory_status, progress].spacing(10).into()
     }
 
     fn models_view<'a>(
@@ -3706,6 +3733,8 @@ fn preferences(
     runtime_downloads_allowed: bool,
     runtime_status: Option<&str>,
 ) -> Element<'static, Message> {
+    use super::search::LocalPreference;
+
     let options: Vec<_> = std::iter::once(Choice(None, "Use default".into()))
         .chain(
             profiles
@@ -3758,37 +3787,40 @@ fn preferences(
             ),
         );
     }
-    content = content.push(
-        reveal.wrap(
-            Setting::Embedding,
-            field(
-                Setting::Embedding.title(),
-                column![
-                    embedding_picker(
-                        models,
-                        state.managed_embedding.as_deref(),
-                        EmbeddingScope::Default,
-                        editable
-                    ),
-                    state.managed_embedding.is_none().then(|| {
-                        reveal.input(
-                            Setting::Embedding,
-                            editable,
-                            text_input("Installed embedding model", &state.embedding)
-                                .on_input_maybe(editable.then_some(Message::Embedding)),
-                        )
-                    }),
-                ]
-                .spacing(8),
+    content = content.push(field(
+        Setting::Embedding.title(),
+        column![
+            reveal.wrap(
+                Setting::LocalPreference(LocalPreference::EmbeddingSource),
+                embedding_picker(
+                    models,
+                    state.managed_embedding.as_deref(),
+                    EmbeddingScope::Default,
+                    editable
+                ),
             ),
-        ),
-    );
+            state.uses_manual_embedding().then(|| {
+                let setting = Setting::Embedding;
+                reveal.wrap(
+                    setting,
+                    reveal.input(
+                        setting,
+                        editable,
+                        text_input("Installed embedding model", &state.embedding)
+                            .on_input_maybe(editable.then_some(Message::Embedding)),
+                    ),
+                )
+            }),
+        ]
+        .spacing(8),
+    ));
     content
         .push(runtime_preferences(
             state.runtime_update,
             editable,
             runtime_downloads_allowed,
             runtime_status,
+            reveal,
         ))
         .into()
 }
@@ -3798,7 +3830,10 @@ fn runtime_preferences(
     editable: bool,
     runtime_downloads_allowed: bool,
     status: Option<&str>,
+    reveal: &Reveal,
 ) -> Element<'static, Message> {
+    use super::search::LocalPreference;
+
     let can_edit = editable && runtime_downloads_allowed;
     let mode: Element<_> = if !runtime_downloads_allowed {
         text(runtime_policy::Mode::Off.to_string()).into()
@@ -3826,8 +3861,14 @@ fn runtime_preferences(
     };
     column![
         text("Managed runtime updates").size(17),
-        field("Update policy", mode),
-        field("Preferred backend", backend),
+        reveal.wrap(
+            Setting::LocalPreference(LocalPreference::RuntimeUpdatePolicy),
+            field("Update policy", mode),
+        ),
+        reveal.wrap(
+            Setting::LocalPreference(LocalPreference::RuntimeBackend),
+            field("Preferred backend", backend),
+        ),
         text(if runtime_downloads_allowed {
             "Save to apply. Notify and Automatic Stable check the signed chardonnay/kortty-llama-runtimes channel on GitHub at startup and daily while AI is enabled. Automatic Stable downloads and installs a compatible verified release when managed requests are idle."
         } else {

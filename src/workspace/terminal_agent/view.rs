@@ -1,17 +1,18 @@
 use iced::widget::{button, checkbox, column, pick_list, row, scrollable, text, text_input};
-use iced::{Element, Length};
+use iced::{Element, Length, window};
 
 use crate::terminal_agent::design::Approval;
 
-use super::{Message, Mode, Phase, Purpose, Run, engine, palette, request_review};
+use super::{Message, Mode, Phase, Purpose, Run, State, engine, palette, request_review};
 
 impl Run {
-    pub(super) fn view(
-        &self,
+    pub(super) fn view<'a>(
+        &'a self,
         palette: Option<palette::Palette>,
         remaining_allowed: bool,
         reduced_motion: bool,
-    ) -> Element<'_, Message> {
+        owner: (&'a State, window::Id),
+    ) -> Element<'a, Message> {
         let title = match self.mode {
             Mode::Run => "AI Agent",
             Mode::Ask => "Ask Agent",
@@ -126,7 +127,12 @@ impl Run {
         let show_activity =
             !reviewing_model && !showing_plan && !self.presentation.activity.collapsed;
         if show_activity && self.design.approval == Approval::BelowActivity {
-            page = page.push(super::design::history_view(self, palette, reduced_motion));
+            page = page.push(super::design::history_view(
+                self,
+                palette,
+                reduced_motion,
+                Some(owner),
+            ));
         }
         if let Some(review) = self.model_review_view(Length::Fill) {
             page = page.push(review.map(Message::ReviewModel));
@@ -278,9 +284,19 @@ impl Run {
             }
         }
         if show_activity && self.design.approval == Approval::AboveActivity {
-            page = page.push(super::design::history_view(self, palette, reduced_motion));
+            page = page.push(super::design::history_view(
+                self,
+                palette,
+                reduced_motion,
+                Some(owner),
+            ));
         }
-        if let Some(export) = self.activity_export.view() {
+        use super::activity_export::Scope;
+        let has_archive = owner.0.has_archived_activity(self);
+        let export_scope = [Scope::This, Scope::All]
+            .into_iter()
+            .find(|&scope| self.can_export_activity(scope, has_archive));
+        if let Some(export) = self.activity_export.view(export_scope) {
             page = page.push(export);
         }
         if self.can_generate_workflow() {

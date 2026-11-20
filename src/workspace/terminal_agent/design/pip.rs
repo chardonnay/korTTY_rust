@@ -156,8 +156,18 @@ fn body<'a>(
         }
         // There is only one presenter for the selected history. Status stays outside PiP.
         content = content
-            .push(super::history_with_steps(run, palette, reduced_motion))
-            .push(super::controls(run));
+            .push(super::history_with_steps(
+                run,
+                palette,
+                reduced_motion,
+                if panel.detached.is_some() {
+                    super::log_table::Surface::Detached
+                } else {
+                    super::log_table::Surface::Pane
+                },
+                (state, id),
+            ))
+            .push(super::controls(run, state.has_archived_activity(run)));
     }
     panel_view(content, palette)
 }
