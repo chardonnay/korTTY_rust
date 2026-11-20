@@ -64,6 +64,54 @@ fn attempts() -> [Attempt; 2] {
 }
 
 #[test]
+fn agent_log_table_keeps_the_decision_row_and_clears_unreported_requests() {
+    let mut run = run(DesignHistory::LogTable);
+    run.begin_model_decision();
+    let (trace, _) = run.status_transcript().unwrap();
+    let [first] = trace.steps.as_slice() else {
+        panic!("the in-flight request should have one activity row");
+    };
+    assert_eq!(first.state, StepState::Running);
+    assert!(first.tokens.is_none());
+    let (id, time) = (first.id, first.recorded_at);
+    assert!(time.is_some());
+    assert!(labels(design::history_view(&run, None, true)).contains("… Running"));
+
+    let mut attempt = attempts()[0].clone();
+    attempt.outcome = AttemptOutcome::Completed;
+    run.record_model_response(
+        run.epoch,
+        &Report {
+            result: Ok(()),
+            attempts: vec![attempt],
+        },
+    );
+    let (trace, _) = run.status_transcript().unwrap();
+    let [completed] = trace.steps.as_slice() else {
+        panic!("the result should update the in-flight row");
+    };
+    assert_eq!((completed.id, completed.recorded_at), (id, time));
+    assert_eq!(
+        (completed.state, completed.elapsed_ms, completed.tokens),
+        (StepState::Completed, Some(12), Some(12))
+    );
+
+    let prior_epoch = run.epoch;
+    run.next(Phase::FinalAdvice, "Waiting for the final response");
+    run.begin_model_decision();
+    run.record_model_response(prior_epoch, &Report::from(Ok(())));
+    let (trace, _) = run.status_transcript().unwrap();
+    assert_eq!(trace.steps[1].state, StepState::Running);
+    assert_eq!(trace.steps[1].title, "Final AI response");
+    run.next(Phase::Cancelled, "Cancelled");
+    let (trace, _) = run.status_transcript().unwrap();
+    assert_eq!(
+        (trace.steps[1].state, trace.steps[1].tokens),
+        (StepState::Cancelled, None)
+    );
+}
+
+#[test]
 fn accepted_attempts_project_typed_thinking_without_changing_model_evidence_or_authority() {
     for history in [DesignHistory::InlineBlocks, DesignHistory::Focus] {
         let mut run = run(history);
@@ -83,7 +131,7 @@ fn accepted_attempts_project_typed_thinking_without_changing_model_evidence_or_a
         let initial = &update.transcript.steps[0];
         assert_eq!(initial.kind, Kind::Thinking);
         assert_eq!(initial.state, StepState::Failed);
-        assert_eq!(initial.elapsed_ms, 12);
+        assert_eq!(initial.elapsed_ms, Some(12));
         assert_eq!(initial.tokens, Some(12));
         assert!(initial.detail.contains("Invalid reply · 0.012 s"));
         assert!(initial.command.is_none() && initial.output.is_empty());
@@ -143,7 +191,7 @@ fn live_repair_replaces_one_stable_step_and_counts_only_reported_attempts() {
             assert_eq!(after.state, StepState::Completed);
         }
         assert_eq!(completed.transcript.steps[1].tokens, Some(28));
-        assert_eq!(completed.transcript.steps[1].elapsed_ms, 50);
+        assert_eq!(completed.transcript.steps[1].elapsed_ms, Some(50));
         assert_eq!(completed.transcript.tokens, Some(40));
     }
 }
@@ -178,7 +226,7 @@ fn abandoned_repair_keeps_its_step_without_inventing_metadata_and_can_accept_a_r
             }
         );
         assert!(repair.tokens.is_none());
-        assert_eq!(repair.elapsed_ms, 0);
+        assert!(repair.elapsed_ms.is_some());
         assert!(
             repair
                 .detail
@@ -191,7 +239,7 @@ fn abandoned_repair_keeps_its_step_without_inventing_metadata_and_can_accept_a_r
         let reconciled = run.inline_update(false).unwrap();
         assert_eq!(reconciled.transcript.steps.len(), 2);
         assert_eq!(reconciled.transcript.steps[1].id, repair.id);
-        assert_eq!(reconciled.transcript.steps[1].elapsed_ms, 50);
+        assert_eq!(reconciled.transcript.steps[1].elapsed_ms, Some(50));
         assert!(run.presentation.model_usage.total().is_none());
         assert_eq!(run.presentation.model_usage.attempts().count(), 2);
     }
@@ -265,11 +313,11 @@ fn expand_all_shows_older_details_in_each_selectable_history() {
         run.design.history = history;
         run.presentation.activity.expand_all = false;
         assert!(
-            !labels(design::history_view(&run, None)).contains("Older detail"),
+            !labels(design::history_view(&run, None, true)).contains("Older detail"),
             "{history}"
         );
         run.presentation.activity.expand_all = true;
-        let labels = labels(design::history_view(&run, None));
+        let labels = labels(design::history_view(&run, None, true));
         assert!(
             labels.contains("Older detail") && labels.contains("Newer detail"),
             "{history}"
@@ -284,7 +332,7 @@ fn every_native_history_and_visible_status_presents_real_attempt_metadata() {
     run.phase = Phase::Finished;
     for history in DesignHistory::ALL {
         run.design.history = history;
-        let text = labels(design::history_view(&run, None));
+        let text = labels(design::history_view(&run, None, true));
         assert!(
             text.contains("Reported tokens · 30 input · 10 output · 40 total"),
             "{history}"
@@ -316,7 +364,7 @@ fn every_native_history_and_visible_status_presents_live_repair_before_completio
     assert!(run.model_repair_started(run.epoch, &attempts()[0]));
     for history in DesignHistory::ALL {
         run.design.history = history;
-        let text = labels(design::history_view(&run, None));
+        let text = labels(design::history_view(&run, None, true));
         assert!(text.contains("AI response repair · Running"), "{history}");
         assert!(
             text.contains("Repairing the AI response format."),
@@ -359,7 +407,7 @@ fn failed_and_cancelled_partial_usage_stays_visible_without_inventing_a_total() 
     let update = run.inline_update(false).unwrap();
     assert!(update.transcript.tokens.is_none());
     assert_eq!(update.transcript.steps[1].state, StepState::Cancelled);
-    let text = labels(design::history_view(&run, None));
+    let text = labels(design::history_view(&run, None, true));
     assert!(text.contains("0 input · output unavailable · total unavailable"));
     assert!(text.contains("28 total (reported subtotal; 1/2 attempts)"));
     assert!(text.contains("AI response repair · Cancelled"));
@@ -390,7 +438,7 @@ fn compact_native_history_keeps_most_space_for_transcript_below_usage() {
     for height in [48.0, 72.0, 120.0, 320.0, 600.0] {
         let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
         let mut ui = UserInterface::build(
-            design::history_view(&run, None),
+            design::history_view(&run, None, true),
             Size::new(300.0, height),
             Cache::default(),
             &mut renderer,

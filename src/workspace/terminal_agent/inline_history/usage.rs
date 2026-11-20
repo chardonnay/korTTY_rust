@@ -1,10 +1,66 @@
 //! Projection of already accepted model-attempt metadata; never adds model input or authority.
 
-use crate::terminal_agent::usage::{Attempt, AttemptKind, AttemptOutcome};
+use crate::terminal_agent::usage::{Attempt, AttemptKind, AttemptOutcome, Report};
 
 use super::*;
 
 impl Run {
+    pub(in crate::workspace::terminal_agent) fn begin_model_decision(&mut self) {
+        let title = self.initial_model_title();
+        if let Some(history) = &mut self.inline {
+            history.model_step(
+                self.epoch,
+                AttemptKind::Initial,
+                Step {
+                    kind: Kind::Thinking,
+                    title: title.into(),
+                    state: StepState::Running,
+                    ..Step::default()
+                },
+            );
+        }
+    }
+
+    pub(in crate::workspace::terminal_agent) fn finish_model_decision_without_report(
+        &mut self,
+        state: StepState,
+    ) {
+        if let Some(step) = self
+            .inline
+            .as_mut()
+            .and_then(|history| history.model_step_mut(self.epoch, AttemptKind::Initial))
+            .filter(|step| step.state == StepState::Running)
+        {
+            step.elapsed_ms = step.elapsed_at(Instant::now());
+            step.state = state;
+            step.detail = "No model attempt metadata is available.".into();
+        }
+    }
+
+    pub(in crate::workspace::terminal_agent) fn record_model_response<T>(
+        &mut self,
+        epoch: u64,
+        report: &Report<T>,
+    ) {
+        if epoch != self.epoch {
+            return;
+        }
+        self.record_model_attempts(epoch, &report.attempts);
+        self.finish_model_decision_without_report(if report.result.is_ok() {
+            StepState::Completed
+        } else {
+            StepState::Failed
+        });
+    }
+
+    fn initial_model_title(&self) -> &'static str {
+        if self.phase == Phase::FinalAdvice {
+            "Final AI response"
+        } else {
+            "AI decision"
+        }
+    }
+
     /// The caller has validated the current run, source, policy and request epoch.
     pub(in crate::workspace::terminal_agent) fn model_repair_started(
         &mut self,
@@ -28,14 +84,10 @@ impl Run {
             return false;
         }
         // The initial call finished; its schema failure starts a separate repair attempt.
-        if let Some(history) = &mut self.inline
-            && let Some((current, [Some(initial_id), _])) = history.model_steps
-            && current == epoch
-            && let Some(step) = history
-                .transcript
-                .steps
-                .iter_mut()
-                .find(|step| step.id == initial_id)
+        if let Some(step) = self
+            .inline
+            .as_mut()
+            .and_then(|history| history.model_step_mut(epoch, AttemptKind::Initial))
         {
             if format_failure {
                 step.state = StepState::Completed;
@@ -94,6 +146,7 @@ impl Run {
         epoch: u64,
         attempts: &[Attempt],
     ) {
+        let initial_title = self.initial_model_title();
         for attempt in attempts {
             if !self.presentation.model_usage.accept(epoch, attempt) {
                 continue;
@@ -110,15 +163,14 @@ impl Run {
                     Step {
                         kind: Kind::Thinking,
                         title: match attempt.kind {
-                            AttemptKind::Initial if self.phase == Phase::FinalAdvice => {
-                                "Final AI response"
-                            }
-                            AttemptKind::Initial => "AI decision",
+                            AttemptKind::Initial => initial_title,
                             AttemptKind::Repair => "AI response repair",
                         }
                         .into(),
                         detail,
-                        elapsed_ms: attempt.elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
+                        elapsed_ms: Some(
+                            attempt.elapsed.as_millis().min(u128::from(u64::MAX)) as u64
+                        ),
                         tokens: attempt.total_tokens,
                         state: match attempt.outcome {
                             AttemptOutcome::Completed => StepState::Completed,
@@ -137,6 +189,12 @@ impl Run {
 }
 
 impl History {
+    fn model_step_mut(&mut self, epoch: u64, kind: AttemptKind) -> Option<&mut Step> {
+        let (current, ids) = self.model_steps?;
+        let id = ids[attempt_index(kind)].filter(|_| current == epoch)?;
+        self.transcript.steps.iter_mut().find(|step| step.id == id)
+    }
+
     fn model_step(&mut self, epoch: u64, kind: AttemptKind, mut step: Step) {
         if self
             .model_steps
@@ -152,10 +210,7 @@ impl History {
         {
             self.model_steps = Some((epoch, [None; 2]));
         }
-        let index = match kind {
-            AttemptKind::Initial => 0,
-            AttemptKind::Repair => 1,
-        };
+        let index = attempt_index(kind);
         let (_, ids) = self
             .model_steps
             .as_mut()
@@ -171,10 +226,22 @@ impl History {
             .iter_mut()
             .find(|existing| existing.id == step.id)
         {
+            step.recorded_at = existing.recorded_at;
+            step.started_at = existing.started_at;
+            if step.state != StepState::Running && step.elapsed_ms.is_none() {
+                step.elapsed_ms = existing.elapsed_at(Instant::now());
+            }
             *existing = step;
         } else {
             self.step(step);
         }
+    }
+}
+
+fn attempt_index(kind: AttemptKind) -> usize {
+    match kind {
+        AttemptKind::Initial => 0,
+        AttemptKind::Repair => 1,
     }
 }
 

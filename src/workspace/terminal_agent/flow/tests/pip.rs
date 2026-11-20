@@ -1,6 +1,15 @@
 //! PiP lifecycle and actual native layout, independent of agent execution.
 
-use iced::Size;
+use iced::advanced::{
+    clipboard,
+    widget::{Id, Operation, operation},
+};
+use iced::keyboard::{
+    self, Location, Modifiers,
+    key::{self, Named},
+};
+use iced::{Element, Event, Font, Point, Rectangle, Renderer, Size, Vector, mouse};
+use iced_runtime::{UserInterface, user_interface::Cache};
 
 use crate::terminal_agent::design::{Arrangement, History, Status};
 
@@ -70,13 +79,7 @@ fn picture_in_picture_detaches_with_separate_identity_and_close_only_reattaches(
             .contains_key(&fixture.session)
     );
     assert_ne!(detached, id);
-    assert!(
-        fixture
-            .workspace
-            .terminal_agents
-            .view(detached, None, false, false, false, Vec::new)
-            .is_some()
-    );
+    assert!(fixture.workspace.agent_window_view(detached).is_some());
     assert_eq!(
         fixture.workspace.terminal_agents.title(detached),
         Some("kortty · Agent history")
@@ -86,13 +89,335 @@ fn picture_in_picture_detaches_with_separate_identity_and_close_only_reattaches(
     assert!(fixture.run(id).presentation.pip.detached.is_none());
     assert!(!fixture.run(id).cancel.requested());
     assert_eq!(fixture.run(id).epoch, epoch);
-    assert!(
-        fixture
-            .workspace
-            .terminal_agents
-            .view(detached, None, false, false, false, Vec::new)
-            .is_none()
+    assert!(fixture.workspace.agent_window_view(detached).is_none());
+}
+
+#[derive(Default)]
+struct LogTableLayout {
+    grid: Option<(Rectangle, Vector)>,
+    labels: Vec<(Rectangle, String)>,
+    step_actions: Option<Rectangle>,
+}
+
+impl Operation for LogTableLayout {
+    fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+        visit(self);
+    }
+
+    fn scrollable(
+        &mut self,
+        _: Option<&Id>,
+        bounds: Rectangle,
+        content: Rectangle,
+        translation: Vector,
+        _: &mut dyn operation::Scrollable,
+    ) {
+        if content.width > bounds.width && content.height > bounds.height {
+            self.grid = Some((bounds, translation));
+        }
+    }
+
+    fn text(&mut self, _: Option<&Id>, bounds: Rectangle, value: &str) {
+        self.labels.push((bounds, value.to_owned()));
+    }
+
+    fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
+        if id == Some(&Id::new("agent-log-step-actions")) {
+            self.step_actions = Some(bounds);
+        }
+    }
+}
+
+fn named_key(name: Named, repeat: bool) -> Event {
+    let key = keyboard::Key::Named(name);
+    Event::Keyboard(keyboard::Event::KeyPressed {
+        key: key.clone(),
+        modified_key: key,
+        physical_key: key::Physical::Unidentified(key::NativeCode::Unidentified),
+        location: Location::Standard,
+        modifiers: Modifiers::empty(),
+        text: None,
+        repeat,
+    })
+}
+
+fn release_key(name: Named) -> Event {
+    let key = keyboard::Key::Named(name);
+    Event::Keyboard(keyboard::Event::KeyReleased {
+        key: key.clone(),
+        modified_key: key,
+        physical_key: key::Physical::Unidentified(key::NativeCode::Unidentified),
+        location: Location::Standard,
+        modifiers: Modifiers::empty(),
+    })
+}
+
+fn keyboard_log_view(fixture: &Fixture, size: Size) -> Element<'_, Desktop> {
+    let terminal = crate::workspace::dialog_placement::escape::on_key_press(
+        iced::widget::container(iced::widget::text("Terminal"))
+            .width(iced::Length::Fill)
+            .height(iced::Length::Fill)
+            .into(),
+        |key, _| (*key == keyboard::Key::Named(Named::Enter)).then_some(Desktop::Noop),
     );
+    let stream = fixture.workspace.sessions[&fixture.session].stream_generation;
+    let decorated = fixture.workspace.decorate_agent_terminal(
+        fixture.session,
+        stream,
+        terminal,
+        size,
+        Size::new(8.0, 16.0),
+        true,
+    );
+    fixture
+        .workspace
+        .agent_log_keyboard(fixture.owner, decorated)
+}
+
+#[test]
+fn focused_agent_log_table_gets_keys_before_the_embedded_terminal() {
+    use design::log_table::{Key as LogKey, Message as LogMessage};
+
+    let mut fixture = Fixture::new(false, false);
+    let id = fixture.open(Mode::Ask);
+    let run = fixture.run_mut(id);
+    run.design.arrangement = Arrangement::Normal;
+    run.design.history = History::LogTable;
+    run.design.status = Status::Hidden;
+    run.goal = "Review fixture".into();
+    run.next(Phase::Thinking, "Fixture activity");
+    run.inline_command("fixture keyboard row");
+    run.inline_result(engine::Status::Exited(0), "selected result", "");
+    let epoch = run.epoch;
+    let size = Size::new(760.0, 540.0);
+    let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
+    let (messages, cache) = {
+        let mut ui = UserInterface::build(
+            keyboard_log_view(&fixture, size),
+            size,
+            Cache::default(),
+            &mut renderer,
+        );
+        let mut messages = Vec::new();
+        let _ = ui.update(
+            &[named_key(Named::Enter, false)],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        assert!(matches!(messages.as_slice(), [Desktop::Noop]));
+        messages.clear();
+        let mut layout = LogTableLayout::default();
+        ui.operate(&renderer, &mut layout);
+        let cursor = layout
+            .labels
+            .iter()
+            .find(|(_, label)| label == "fixture keyboard row")
+            .unwrap()
+            .0
+            .center();
+        let _ = ui.update(
+            &[
+                Event::Mouse(mouse::Event::CursorMoved { position: cursor }),
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                named_key(Named::Enter, false),
+                named_key(Named::Enter, true),
+            ],
+            mouse::Cursor::Available(cursor),
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        (messages, ui.into_cache())
+    };
+    assert!(matches!(messages.as_slice(), [
+        Desktop::TerminalAgent(first, Message::Design(design::Message::LogTable(LogMessage::Select(_)))),
+        Desktop::TerminalAgent(second, Message::Design(design::Message::LogTable(LogMessage::Navigate(LogKey::Open))))
+    ] if *first == id && *second == id));
+    for message in messages {
+        let _ = fixture.workspace.update(message);
+    }
+
+    let mut ui = UserInterface::build(
+        keyboard_log_view(&fixture, size),
+        size,
+        cache,
+        &mut renderer,
+    );
+    let mut layout = LogTableLayout::default();
+    ui.operate(&renderer, &mut layout);
+    assert!(
+        layout
+            .labels
+            .iter()
+            .any(|(_, label)| label == "selected result")
+    );
+    let mut messages = Vec::new();
+    let _ = ui.update(
+        &[
+            named_key(Named::Tab, false),
+            named_key(Named::Enter, true),
+            release_key(Named::Enter),
+            named_key(Named::Enter, false),
+        ],
+        mouse::Cursor::Unavailable,
+        &mut renderer,
+        &mut clipboard::Null,
+        &mut messages,
+    );
+    assert!(matches!(messages.as_slice(), [Desktop::Noop]));
+    assert_eq!(fixture.run(id).epoch, epoch);
+}
+
+#[test]
+fn narrow_detached_log_table_scrolls_to_the_exact_step_and_keeps_actions_in_view() {
+    let mut fixture = Fixture::new(false, false);
+    let id = fixture.open(Mode::Ask);
+    let run = fixture.run_mut(id);
+    run.design.arrangement = Arrangement::Normal;
+    run.design.history = History::LogTable;
+    run.goal = "Review fixture activity".into();
+    run.next(Phase::Thinking, "Fixture activity");
+    for number in 1..=20 {
+        run.inline_command(&format!("fixture step {number:02}"));
+        run.inline_result(
+            engine::Status::Exited(0),
+            &format!("fixture output {number:02}"),
+            "",
+        );
+    }
+    let epoch = run.epoch;
+    let stream = fixture.workspace.sessions[&fixture.session].stream_generation;
+    let size = Size::new(340.0, 330.0);
+    let (docked, _) = inspect_design(&fixture, stream, size, LogTableLayout::default())
+        .grid
+        .expect("the narrow docked panel has both scroll axes");
+    assert!(docked.width > 0.0 && docked.width <= size.width);
+    assert!(docked.height > 0.0);
+
+    fixture.run_mut(id).design.arrangement = Arrangement::PictureInPicture;
+    let _ = fixture.send(id, Message::Pip(Pip::Detach));
+    let detached = fixture.run(id).presentation.pip.detached.unwrap();
+    let terminal_before = terminal_bounds(&fixture, stream, size);
+    let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
+    let (messages, expected, cache) = {
+        let view = fixture.workspace.view(detached);
+        let mut ui = UserInterface::build(view, size, Cache::default(), &mut renderer);
+        let mut layout = LogTableLayout::default();
+        ui.operate(&renderer, &mut layout);
+        let (grid, offset) = layout.grid.expect("both scroll axes are available");
+        assert_eq!(offset, Vector::ZERO);
+        let at = grid.center();
+        let mut messages = Vec::new();
+        let _ = ui.update(
+            &[
+                Event::Mouse(mouse::Event::CursorMoved { position: at }),
+                Event::Mouse(mouse::Event::WheelScrolled {
+                    delta: mouse::ScrollDelta::Pixels {
+                        x: -240.0,
+                        y: -142.0,
+                    },
+                }),
+            ],
+            mouse::Cursor::Available(at),
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        assert!(messages.is_empty());
+        let mut layout = LogTableLayout::default();
+        ui.operate(&renderer, &mut layout);
+        let (grid, offset) = layout.grid.unwrap();
+        assert!(offset.x > 0.0 && offset.y > 0.0);
+        let (target_y, expected) = layout
+            .labels
+            .iter()
+            .filter_map(|(bounds, label)| {
+                let y = bounds.center().y - offset.y;
+                label.strip_prefix("fixture step ").map(|step| (y, step))
+            })
+            .find(|(y, _)| *y > grid.y + 6.0 && *y < grid.y + grid.height - 15.0)
+            .expect("a scrolled step is visible");
+        let at = Point::new(grid.center().x, target_y);
+        let _ = ui.update(
+            &[
+                Event::Mouse(mouse::Event::CursorMoved { position: at }),
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)),
+            ],
+            mouse::Cursor::Available(at),
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        (
+            messages,
+            format!("fixture output {expected}"),
+            ui.into_cache(),
+        )
+    };
+    let [Desktop::TerminalAgent(window, Message::PipOwned(owned, _))] = messages.as_slice() else {
+        panic!("the row click should be routed through the detached run");
+    };
+    assert_eq!(*window, detached);
+    assert_eq!(*owned, id);
+    for message in messages {
+        no_task(fixture.workspace.update(message));
+    }
+    let mut ui = UserInterface::build(fixture.workspace.view(detached), size, cache, &mut renderer);
+    let mut layout = LogTableLayout::default();
+    ui.operate(&renderer, &mut layout);
+    for label in [expected.as_str(), "Close details"] {
+        assert!(
+            layout.labels.iter().any(|(bounds, text)| {
+                text == label && bounds.x >= 0.0 && bounds.x + bounds.width <= size.width
+            }),
+            "{label} must fit in the narrow details pane"
+        );
+    }
+    let actions = layout.step_actions.expect("the selected step has actions");
+    assert!(actions.x >= 0.0 && actions.x + actions.width <= size.width);
+    let mut messages = Vec::new();
+    let _ = ui.update(
+        &[named_key(Named::End, false)],
+        mouse::Cursor::Unavailable,
+        &mut renderer,
+        &mut clipboard::Null,
+        &mut messages,
+    );
+    assert!(
+        matches!(messages.as_slice(), [Desktop::TerminalAgent(window, Message::PipOwned(owned, _))]
+        if *window == detached && *owned == id)
+    );
+    let cache = ui.into_cache();
+    let task = fixture.workspace.update(messages.remove(0));
+    use iced::futures::{StreamExt, executor::block_on};
+    let mut task_stream =
+        iced_runtime::task::into_stream(task).expect("End reveals the selected row");
+    let Some(iced_runtime::Action::Widget(mut operation)) = block_on(task_stream.next()) else {
+        panic!("expected the selected row to scroll into view");
+    };
+    let mut ui = UserInterface::build(fixture.workspace.view(detached), size, cache, &mut renderer);
+    ui.operate(&renderer, operation.as_mut());
+    let operation::Outcome::Chain(mut scroll) = operation.finish() else {
+        panic!("the last row needs vertical scrolling");
+    };
+    ui.operate(&renderer, scroll.as_mut());
+    let mut layout = LogTableLayout::default();
+    ui.operate(&renderer, &mut layout);
+    let (grid, offset) = layout.grid.unwrap();
+    let last = layout
+        .labels
+        .iter()
+        .find(|(_, label)| label == "fixture step 20")
+        .unwrap()
+        .0
+        .center()
+        .y;
+    assert!(last - offset.y >= grid.y && last - offset.y <= grid.y + grid.height);
+    assert!(offset.x > 0.0);
+    assert_eq!(fixture.run(id).epoch, epoch);
+    assert_eq!(terminal_bounds(&fixture, stream, size), terminal_before);
 }
 
 #[test]

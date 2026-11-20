@@ -1,7 +1,7 @@
 //! Typed, masked activity for inline history and reviewed Chat follow-up.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use iced::{Task, keyboard, window};
 
@@ -82,7 +82,14 @@ impl History {
         }
     }
 
-    fn step(&mut self, step: Step) {
+    fn step(&mut self, mut step: Step) {
+        if step.state == StepState::Running && step.started_at.is_none() {
+            step.started_at = Some(Instant::now());
+        }
+        if step.recorded_at.is_none() {
+            step.recorded_at = SystemTime::now()
+                .checked_sub(Duration::from_millis(step.elapsed_ms.unwrap_or_default()));
+        }
         if self.transcript.steps.len() == MAX_STEPS {
             self.transcript.steps.remove(0);
         }
@@ -95,13 +102,15 @@ impl History {
         self.next_step += 1;
         self.step(Step {
             id,
+            recorded_at: None,
+            started_at: None,
             kind,
             title,
             detail,
             command,
             output: Vec::new(),
             exit_code: None,
-            elapsed_ms: 0,
+            elapsed_ms: None,
             tokens: None,
             state: if active {
                 StepState::Running
@@ -123,11 +132,11 @@ impl History {
             .steps
             .iter_mut()
             .rev()
-            .find(|step| step.state == StepState::Running)
+            .find(|step| step.kind == Kind::Action && step.state == StepState::Running)
         else {
             return;
         };
-        step.elapsed_ms = started.elapsed().as_millis() as u64;
+        step.elapsed_ms = Some(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
         step.state = match status {
             engine::Status::Exited(0) => StepState::Completed,
             engine::Status::Cancelled => StepState::Cancelled,
@@ -202,6 +211,7 @@ impl Run {
             match decision {
                 engine::Action::Done | engine::Action::Blocked => {
                     history.transcript.final_answer = detail.into();
+                    history.transcript.final_answer_at = Some(SystemTime::now());
                 }
                 engine::Action::Input { .. } => {
                     history.event(Kind::Question, summary.into(), detail.into(), None);
@@ -262,24 +272,6 @@ impl Run {
                 detail: "Open the Activity window to review the masked request.".into(),
                 state: StepState::Running,
                 ..Step::default()
-            });
-        } else if self.phase.deciding() && !self.presentation.model_usage.repairing(self.epoch) {
-            transcript.steps.push(Step {
-                id: history.next_step,
-                kind: Kind::Thinking,
-                title: if self.phase == Phase::FinalAdvice {
-                    "Preparing the final AI response"
-                } else {
-                    "Waiting for the AI decision"
-                }
-                .into(),
-                detail: String::new(),
-                command: None,
-                output: Vec::new(),
-                exit_code: None,
-                elapsed_ms: 0,
-                tokens: None,
-                state: StepState::Running,
             });
         }
         transcript.prompt = match self.phase {

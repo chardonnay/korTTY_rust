@@ -18,6 +18,8 @@ pub(super) struct Activity<'a> {
     pub(super) activity_font: f32,
     pub(super) plan_font: f32,
     pub(super) presentation: &'a Presentation,
+    pub(super) transcript: Option<&'a crate::terminal_agent::design::inline::Transcript>,
+    pub(super) live_run: Option<&'a Run>,
 }
 
 impl<'a> From<&'a Run> for Activity<'a> {
@@ -29,6 +31,8 @@ impl<'a> From<&'a Run> for Activity<'a> {
             activity_font: run.fonts.activity,
             plan_font: run.fonts.plan,
             presentation: &run.presentation,
+            transcript: run.status_transcript().map(|(trace, _)| trace),
+            live_run: Some(run),
         }
     }
 }
@@ -69,25 +73,31 @@ fn detail(run: Activity<'_>, selected: usize) -> Element<'_, AgentMessage> {
     .into()
 }
 
-pub(super) fn view(run: &Run, palette: Option<Palette>) -> Element<'_, AgentMessage> {
-    view_as(run.into(), run.design.history, palette)
+pub(super) fn view(
+    run: &Run,
+    palette: Option<Palette>,
+    reduced_motion: bool,
+) -> Element<'_, AgentMessage> {
+    view_as(run.into(), run.design.history, palette, reduced_motion)
 }
 
 pub(super) fn view_as(
     run: Activity<'_>,
     history: History,
     palette: Option<Palette>,
+    reduced_motion: bool,
 ) -> Element<'_, AgentMessage> {
     if run.presentation.model_usage.label().is_none() {
-        return entries(run, history);
+        return entries(run, history, palette, reduced_motion);
     }
-    with_usage(run, history, palette)
+    with_usage(run, history, palette, reduced_motion)
 }
 
 fn with_usage(
     run: Activity<'_>,
     history: History,
     palette: Option<Palette>,
+    reduced_motion: bool,
 ) -> Element<'_, AgentMessage> {
     let font_size = run.activity_font;
     let muted = palette.map(|palette| palette.muted.color());
@@ -111,7 +121,7 @@ fn with_usage(
                 .width(Length::Fill)
                 .height(Length::Fixed((size.height * 0.28).min(104.0)))
                 .spacing(6),
-            entries(run, history),
+            entries(run, history, palette, reduced_motion),
         ]
         .spacing((size.height * 0.03).min(6.0))
         .height(Length::Fill)
@@ -120,7 +130,18 @@ fn with_usage(
     .into()
 }
 
-fn entries(run: Activity<'_>, history: History) -> Element<'_, AgentMessage> {
+fn entries(
+    run: Activity<'_>,
+    history: History,
+    palette: Option<Palette>,
+    reduced_motion: bool,
+) -> Element<'_, AgentMessage> {
+    if history == History::LogTable
+        && let Some(transcript) = run.transcript
+        && (!transcript.steps.is_empty() || !transcript.final_answer.is_empty())
+    {
+        return super::log_table::view(run, transcript, palette, reduced_motion);
+    }
     let size = run.activity_font;
     let selected = run.presentation.selection(run.activity.len());
     let mut entries = column![].spacing(7).width(Length::Fill);

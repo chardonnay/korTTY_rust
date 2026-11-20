@@ -208,6 +208,16 @@ fn terminal_agent_live_repair_projects_pending_and_accounts_each_attempt_once() 
     let _exclusive = exclusive_run();
     let (release, held) = mpsc::sync_channel(1);
     let (mut fixture, id, task, repair_seen, server) = start(Settlement::Respond(held));
+    let (initial_row, initial_time) = {
+        let (trace, _) = fixture.run(id).status_transcript().unwrap();
+        let [row] = trace.steps.as_slice() else {
+            panic!("the initial provider call should have one activity row");
+        };
+        assert_eq!(row.state, inline::StepState::Running);
+        assert!(row.tokens.is_none());
+        assert!(row.recorded_at.is_some());
+        (row.id, row.recorded_at)
+    };
     let mut stream = iced_runtime::task::into_stream(task).unwrap();
     let started = next_update(&mut stream, id);
     let Message::Progress(epoch, Progress::Repairing(initial, _)) = &started else {
@@ -257,6 +267,11 @@ fn terminal_agent_live_repair_projects_pending_and_accounts_each_attempt_once() 
         .recv_timeout(WAIT)
         .expect("authorized repair reached the held loopback response");
     let rows = held_repair(&fixture, id);
+    assert_eq!(rows[0], initial_row);
+    assert_eq!(
+        fixture.run(id).status_transcript().unwrap().0.steps[0].recorded_at,
+        initial_time
+    );
     let _ = fixture.send(id, started);
     assert_eq!(held_repair(&fixture, id), rows);
 

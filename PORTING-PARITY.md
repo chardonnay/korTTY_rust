@@ -16,6 +16,85 @@ open until a result is recorded for the tested revision and environment. Both
 Mosh modes are out of scope. The editor has a reduced native scope with structure
 navigation for classes, functions, variables, and placeholders.
 
+## November 20 Terminal Agent Log Table
+
+Design 16 renders the retained and masked typed steps as a sortable table.
+It shows local time, activity kind, step, result or exit code, elapsed
+time, and reported tokens. Unknown values display a dash. The answer
+stays at the bottom when the step rows are sorted. Double-clicking a
+row opens that step's retained output or the final answer. Right-clicking
+a step reveals the existing step actions in its details. Both the
+live panel and the Settings preview use the same table.
+
+The Apple Silicon run passed all 61 selected Agent designs, Settings
+preview and history tests. The new regressions exercise native Iced
+double-click delivery and verify that sorting and eviction preserve
+the identity of the selected output. Strict workspace Clippy passed
+on Windows ARM64.
+[Apple Silicon tests](target/verification/20261120-agent-log-table-macos-final.log)
+· [Windows ARM64 Clippy](target/verification/20261120-agent-log-table-windows-clippy-final.log)
+
+The table uses the theme accent for a 900 ms flash when a step or answer
+first appears. The running marker advances every 120 ms. Sorting and
+updates to an existing row preserve its first appearance time. Pausing
+the run keeps the marker still. Reduced animations also suppresses the
+flash. Native desktop acceptance remains under A2.
+[Apple Silicon motion and PiP tests](target/verification/20261120-agent-log-motion-macos-verified.log)
+· [Windows ARM64 Clippy](target/verification/20261120-agent-log-motion-windows-clippy-verified.log)
+[Java Log Table](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignLogTable.java)
+· [Native table](src/workspace/terminal_agent/design/log_table.rs)
+
+After the reviewed Ask, Run or Planning request starts, its running
+decision appears in the typed history used by the Log Table and inline
+history. The initial report updates the same row and preserves its time
+and identity. Repair has a separate row. Failed and cancelled requests
+can settle without provider-reported metadata.
+[Java thinking activity](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/core/TerminalAgentService.java#L3427)
+· [Native model activity](src/workspace/terminal_agent/inline_history/usage.rs)
+
+Apple Silicon passed 286 selected Terminal Agent and Settings tests with
+four ignored. A loopback request verified that admission creates the
+initial row and that the repair update preserves its identity and time.
+A log table fixture verified reported usage, cancellation without
+metadata, and rejection of replies from an older request. Strict
+workspace Clippy passed on Windows ARM64.
+[Apple Silicon tests](target/verification/20261120-agent-decision-rows-macos.log)
+· [Windows ARM64 Clippy](target/verification/20261120-agent-decision-rows-windows-clippy.log)
+
+The Duration column uses the step's monotonic start while it runs and
+the accepted attempt or command result when it finishes. If a model
+request ends without an attempt report, the table retains the locally
+observed duration. Unknown timing still displays a dash, and a reported
+zero displays as zero. Duration sorting uses the same numeric value as
+the cell. Reduced animations refreshes the live duration once per second
+and keeps the running marker still.
+
+Apple Silicon passed 294 selected tests with four ignored. The duration
+test covers live numeric ordering, the switch to a measured zero and the
+display for unknown timing. The window test checks the separate refresh
+cadence with reduced animations. Windows ARM64 passed strict workspace
+Clippy.
+[Apple Silicon tests](target/verification/20261120-agent-log-time-macos.log)
+· [Windows ARM64 Clippy](target/verification/20261120-agent-log-time-windows-clippy.log)
+
+The narrow details pane places the step title above its actions. A
+340-point Iced fixture exercised the docked viewport, both scroll axes
+in detached PiP, and a right-click on a scrolled row. It checked the
+selected output, action placement, the run epoch and the terminal
+geometry. Apple Silicon passed 295 selected tests with four ignored.
+Windows ARM64 passed strict workspace Clippy.
+[Apple Silicon viewport tests](target/verification/20261120-agent-log-viewport-macos-final.log)
+· [Windows ARM64 Clippy](target/verification/20261120-agent-log-viewport-windows-clippy-final.log)
+
+Clicking a row or sorting the table gives it keyboard focus in the live
+terminal and detached history. The arrow keys, Home and End move the
+selection and scroll it into view. Enter and Space open the selected
+details. Escape closes details and releases table focus when no details
+are open. Tab releases table focus. Held navigation keys stay out of the
+terminal until released. The tests exercise Iced event routing and scroll
+position. Native desktop acceptance and keyboard navigation in the
+Settings preview remain open under A2.
+
 ## November 20 Java external skill provider suggestions
 
 Java v2.26.0 settings imports retain valid GitHub, SkillsMP and HTTP

@@ -18,6 +18,7 @@ mod activity;
 pub(crate) use actions::Action;
 pub(in crate::workspace::terminal_agent) mod handoff;
 mod history;
+pub(super) mod log_table;
 pub(in crate::workspace) mod pip;
 mod placement;
 mod presentation;
@@ -145,8 +146,12 @@ fn status_indicator_with_colors<'a, M: 'a>(
     }
 }
 
-pub(super) fn history_view(run: &Run, palette: Option<Palette>) -> Element<'_, AgentMessage> {
-    history::view(run, palette)
+pub(super) fn history_view(
+    run: &Run,
+    palette: Option<Palette>,
+    reduced_motion: bool,
+) -> Element<'_, AgentMessage> {
+    history::view(run, palette, reduced_motion)
 }
 
 /// Review remains in the owned activity window, where the exact destination,
@@ -192,9 +197,10 @@ fn history_panel<'a>(
     run: &'a Run,
     chooser: Option<Element<'static, AgentMessage>>,
     palette: Option<Palette>,
+    reduced_motion: bool,
 ) -> Element<'a, AgentMessage> {
     let (phase, _) = status::phase(run);
-    let activity = history_with_steps(run, palette);
+    let activity = history_with_steps(run, palette, reduced_motion);
     let controls = controls(run);
     let body = history_body(activity, controls, run.design.approval);
     let muted = palette.map(|palette| palette.muted.color());
@@ -217,11 +223,15 @@ fn history_panel<'a>(
     )
 }
 
-fn history_with_steps(run: &Run, palette: Option<Palette>) -> Element<'_, AgentMessage> {
+fn history_with_steps(
+    run: &Run,
+    palette: Option<Palette>,
+    reduced_motion: bool,
+) -> Element<'_, AgentMessage> {
     if run.presentation.step_list_open {
         status::step_list(run)
     } else {
-        history::view(run, palette)
+        history::view(run, palette, reduced_motion)
     }
 }
 
@@ -260,7 +270,7 @@ fn adaptive_timeline<'a>(
         container(
             column![
                 text(format!("Agent · {phase}")).size(13),
-                history::view_as(activity, History::Timeline, palette),
+                history::view_as(activity, History::Timeline, palette, true),
                 controls,
             ]
             .spacing(5),
@@ -405,12 +415,66 @@ impl Workspace {
                                 && run.presentation.dock.get() == Dock::Pill))
                     .then_some(100)
             })
+            .chain(self.terminal_agents.runs.iter().filter_map(|(&id, run)| {
+                self.agent_log_table_interval(id, run, now, reduced_motion)
+            }))
             .chain(self.spotlight_animating(now).then_some(16))
             .min();
         interval.map_or_else(Subscription::none, |millis| {
             crate::workspace::scheduler_access::desktop_clock(Duration::from_millis(millis))
                 .map(|()| Desktop::AgentStatusClock)
         })
+    }
+
+    fn agent_log_table_interval(
+        &self,
+        id: window::Id,
+        run: &Run,
+        now: Instant,
+        reduced_motion: bool,
+    ) -> Option<u64> {
+        if run.design.history != History::LogTable
+            || run.swarm
+            || run.closing
+            || run.reopened_history
+        {
+            return None;
+        }
+        let (transcript, _) = run.status_transcript()?;
+        let interval = run.presentation.log_table.refresh_interval(
+            transcript,
+            now,
+            run.active(),
+            !run.paused && !run.cancel.requested(),
+            reduced_motion,
+        )?;
+        if self.placed_dialog_owner(id).is_some() {
+            return Some(interval);
+        }
+        if run.presentation.step_list_open {
+            return None;
+        }
+        let source = run.binding.live().ok()?;
+        let (owner, _) = self.current_run_pane(run).ok()?;
+        let pip = &run.presentation.pip;
+        if run.design.arrangement == Arrangement::PictureInPicture {
+            if !pip.shows_history() {
+                return None;
+            }
+            if pip.detached.is_some() {
+                return Some(interval);
+            }
+        } else if self.window_settings.ai_agent_panel.history_slot(run.design) == Some(Slot::Bottom)
+            && run.presentation.activity.collapsed
+        {
+            return None;
+        }
+        (self.window_contains_visible_pane(owner, source.session)
+            && self
+                .terminal_agents
+                .agent_activity_for_stream(source.session, source.stream)
+                .is_some_and(|(shown, _)| shown == id))
+        .then_some(interval)
     }
 
     fn agent_status_target(&self, owner: window::Id) -> Option<window::Id> {
@@ -581,13 +645,13 @@ impl Workspace {
                 panel = panel.push(header);
                 if !activity.collapsed {
                     panel = panel.push(
-                        history_panel(run, chooser(), palette)
+                        history_panel(run, chooser(), palette, reduced_motion)
                             .map(move |message| Desktop::TerminalAgent(id, message)),
                     );
                 }
                 return panel.height(Length::Fill).into();
             }
-            let history = history_panel(run, chooser(), palette)
+            let history = history_panel(run, chooser(), palette, reduced_motion)
                 .map(move |message| Desktop::TerminalAgent(id, message));
             if run.design.arrangement != Arrangement::Normal
                 || !matches!(side, Slot::Left | Slot::Right)
@@ -686,6 +750,41 @@ mod dock_tests {
     use super::*;
     use crate::terminal_agent::Mode;
     use crate::workspace::terminal_agent::flow::tests::Fixture;
+
+    #[test]
+    fn agent_log_table_motion_clock_is_independent_of_the_status_module() {
+        let mut fixture = Fixture::with_endpoint(false, false, "127.0.0.1:12345");
+        let id = fixture.open(Mode::Ask);
+        let run = fixture.run_mut(id);
+        run.design.history = History::LogTable;
+        run.design.status = Status::Hidden;
+        run.goal = "Verify the activity display".into();
+        run.next(Phase::Running, "Showing the fixture");
+        run.initialize_inline();
+        run.inline_command("fixture command");
+        let now = Instant::now();
+        run.presentation.sync_status(
+            run.inline.as_ref().unwrap().status_transcript(),
+            false,
+            false,
+            now,
+        );
+        let interval = |fixture: &Fixture, time, reduced_motion| {
+            let workspace = &fixture.workspace;
+            workspace.agent_log_table_interval(
+                id,
+                &workspace.terminal_agents.runs[&id],
+                time,
+                reduced_motion,
+            )
+        };
+        assert_eq!(interval(&fixture, now, false), Some(16));
+        assert_eq!(interval(&fixture, now, true), Some(1_000));
+        let after_flash = now + Duration::from_secs(1);
+        assert_eq!(interval(&fixture, after_flash, false), Some(120));
+        fixture.run_mut(id).paused = true;
+        assert_eq!(interval(&fixture, after_flash, false), Some(1_000));
+    }
 
     #[test]
     fn activity_height_remembers_only_committed_changes_and_reopens_collapsed() {

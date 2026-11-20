@@ -1,7 +1,7 @@
 //! Renders example activity through the same presenters as a terminal run.
 
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use iced::widget::{button, column, container, row, text};
 use iced::{Element, Length, Size, window};
@@ -104,12 +104,34 @@ impl Sample {
     }
 
     pub(in crate::workspace) fn sync(&mut self, transcript: &inline::Transcript) {
-        self.transcript.clone_from(transcript);
+        let now = Instant::now();
+        let clock = SystemTime::now();
+        let mut next = transcript.clone();
+        for step in &mut next.steps {
+            let previous = self
+                .transcript
+                .steps
+                .iter()
+                .find(|previous| previous.id == step.id);
+            step.recorded_at = previous
+                .and_then(|previous| previous.recorded_at)
+                .or(Some(clock));
+            step.started_at = previous
+                .and_then(|previous| previous.started_at)
+                .or_else(|| (step.state == inline::StepState::Running).then_some(now));
+            if step.state != inline::StepState::Running && step.elapsed_ms.is_none() {
+                step.elapsed_ms = previous.and_then(|previous| previous.elapsed_at(now));
+            }
+        }
+        if !next.final_answer.is_empty() {
+            next.final_answer_at = self.transcript.final_answer_at.or(Some(clock));
+        }
+        self.transcript = next;
         self.presentation.sync_status(
             transcript,
             transcript.state.finished(),
             transcript.prompt.is_some(),
-            Instant::now(),
+            now,
         );
         self.entries = transcript
             .steps
@@ -138,6 +160,27 @@ impl Sample {
 
     pub(in crate::workspace) fn has_live_toasts(&self, now: Instant, reduced_motion: bool) -> bool {
         self.presentation.status_events.ticking(now, reduced_motion)
+    }
+
+    pub(in crate::workspace) fn log_table_refresh_interval(
+        &self,
+        layout: Layout,
+        now: Instant,
+        reduced_motion: bool,
+    ) -> Option<u64> {
+        if layout.history != History::LogTable
+            || (layout.arrangement == Arrangement::PictureInPicture
+                && !self.presentation.pip.shows_history())
+        {
+            return None;
+        }
+        self.presentation.log_table.refresh_interval(
+            &self.transcript,
+            now,
+            !self.transcript.state.finished(),
+            self.transcript.state == inline::State::Running,
+            reduced_motion,
+        )
     }
 
     pub(in crate::workspace) fn has_spotlight_preview(&self, now: Instant, layout: Layout) -> bool {
@@ -183,6 +226,8 @@ impl Sample {
             activity_font: fonts.activity,
             plan_font: fonts.plan,
             presentation: &self.presentation,
+            transcript: Some(&self.transcript),
+            live_run: None,
         };
         let controls = || -> Element<'a, AgentMessage> {
             if let Some(command) = view.approval {
@@ -206,7 +251,7 @@ impl Sample {
                 column![
                     text(format!("{} · {}", layout.history, view.phase.0)).size(13),
                     history_body(
-                        history::view_as(activity, layout.history, None),
+                        history::view_as(activity, layout.history, None, view.reduced_motion),
                         controls(),
                         layout.approval,
                     ),

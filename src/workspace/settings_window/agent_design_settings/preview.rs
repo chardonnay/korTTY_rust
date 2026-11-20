@@ -155,7 +155,7 @@ impl Demo {
             kind: Kind::Action,
             title: "Inspect SSH session".into(),
             detail: "Ubuntu 24.04 · bash".into(),
-            elapsed_ms: 1000,
+            elapsed_ms: (self.stage != 0).then_some(1000),
             state: if self.stage == 0 {
                 StepState::Running
             } else {
@@ -193,7 +193,7 @@ impl Demo {
                     "23G /var".into(),
                 ],
                 exit_code: Some(0),
-                elapsed_ms: 1000,
+                elapsed_ms: Some(1000),
                 ..Step::default()
             });
             model.upsert(Step {
@@ -227,7 +227,7 @@ impl Demo {
                 command: Some(VACUUM.into()),
                 output: vec!["Vacuuming done, freed 20.9G of archived journals.".into()],
                 exit_code: (self.stage == 5).then_some(0),
-                elapsed_ms: 1100,
+                elapsed_ms: (self.stage == 5).then_some(1100),
                 state: if self.stage == 4 {
                     StepState::Running
                 } else {
@@ -282,17 +282,23 @@ pub(super) fn view(
         layout.status == Status::Toasts && demo.sample.has_live_toasts(now, reduced_motion);
     let spotlight =
         !reduced_motion && demo.active() && demo.sample.has_spotlight_preview(now, layout);
-    let status_frame = (countdown.is_some()
+    let status_interval = (countdown.is_some()
         || layout.status == Status::Orbit && demo.active() && demo.playing && !reduced_motion
         || toasts
         || spotlight)
-        .then(|| {
-            now + Duration::from_millis(if spotlight || toasts && !reduced_motion {
-                16
-            } else {
-                100
-            })
+        .then_some(if spotlight || toasts && !reduced_motion {
+            16
+        } else {
+            100
         });
+    let log_table_interval = demo
+        .sample
+        .log_table_refresh_interval(layout, now, reduced_motion);
+    let status_frame = status_interval
+        .into_iter()
+        .chain(log_table_interval)
+        .min()
+        .map(|ms| now + Duration::from_millis(ms));
     let preview = SampleView {
         layout,
         dock,

@@ -329,7 +329,10 @@ fn inline(model: &Transcript, width: usize, spinner: &str) -> Vec<Line> {
             ));
             lines.push(justify(
                 left,
-                vec![segment(meta(step.elapsed_ms, step.tokens), Role::Muted)],
+                vec![segment(
+                    meta(step.elapsed_ms.unwrap_or_default(), step.tokens),
+                    Role::Muted,
+                )],
                 width,
             ));
             if model.expanded
@@ -423,7 +426,10 @@ fn focus(model: &Transcript, width: usize, spinner: &str) -> Vec<Line> {
             ];
             if step.state == StepState::Running {
                 parts.push(segment(
-                    format!("  {spinner} {}", meta(step.elapsed_ms, step.tokens)),
+                    format!(
+                        "  {spinner} {}",
+                        meta(step.elapsed_ms.unwrap_or_default(), step.tokens)
+                    ),
                     Role::Muted,
                 ));
             }

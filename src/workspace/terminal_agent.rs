@@ -539,6 +539,14 @@ impl Run {
     }
 
     fn next(&mut self, phase: Phase, notice: &str) -> u64 {
+        if self.phase.deciding() {
+            let state = if phase == Phase::Cancelled {
+                crate::terminal_agent::design::inline::StepState::Cancelled
+            } else {
+                crate::terminal_agent::design::inline::StepState::Failed
+            };
+            self.finish_model_decision_without_report(state);
+        }
         self.epoch += 1;
         if phase.finished() && !self.phase.finished() {
             self.presentation.finished(std::time::Instant::now());
@@ -761,37 +769,50 @@ impl State {
             .unwrap_or(id);
         self.runs.get(&run).or_else(|| self.swarm_focused_run(id))
     }
+}
 
-    fn view(
-        &self,
-        id: window::Id,
-        palette: Option<palette::Palette>,
-        swarm_animation: bool,
-        approvals: impl Into<policy::Approvals>,
-        web_available: bool,
-        summary_profiles: impl FnOnce() -> Vec<crate::scheduler_window::AutomationSummaryProvider>,
-    ) -> Option<Element<'_, Message>> {
+impl Workspace {
+    pub(super) fn agent_window_view(&self, id: window::Id) -> Option<Element<'_, Message>> {
         use iced::widget::container;
-        let approvals = approvals.into();
+        let state = &self.terminal_agents;
+        let palette = self.agent_window_palette(id);
+        let reduced_motion = !self.window_settings.agent_animations();
+        let allow_execution = self.clipboard.policy.ai_agent_execution
+            == crate::clipboard_policy::AiAgentExecution::Allow;
+        let approvals = policy::Approvals {
+            batch: allow_execution,
+            remaining: allow_execution
+                && self.ai_configuration().is_some_and(|config| {
+                    config.saved_root().is_some()
+                        && config.agent_execution_enabled()
+                        && !config.agent_requires_command_confirmation()
+                }),
+        };
 
-        let view = if let Some(dialog) = self.workflows.get(&id) {
+        let view = if let Some(dialog) = state.workflows.get(&id) {
             dialog.view().map(Message::Workflow)
-        } else if let Some(run_id) = self.pip_run_for_window(id) {
-            return Some(design::pip::detached_view(self, run_id, palette));
-        } else if let Some(view) = self.swarm_view(
+        } else if let Some(run_id) = state.pip_run_for_window(id) {
+            return Some(design::pip::detached_view(
+                state,
+                run_id,
+                palette,
+                reduced_motion,
+            ));
+        } else if let Some(view) = state.swarm_view(
             id,
-            swarm_animation,
+            self.swarm_status_animated(id),
             palette,
             approvals,
-            web_available,
-            summary_profiles,
+            self.swarm_web_available(id),
+            || self.automation_summary_providers(),
         ) {
             view.map(Message::Swarm)
         } else {
-            self.runs
-                .get(&id)
-                .filter(|run| !run.swarm)?
-                .view(palette, approvals.remaining)
+            state.runs.get(&id).filter(|run| !run.swarm)?.view(
+                palette,
+                approvals.remaining,
+                reduced_motion,
+            )
         };
         Some(if let Some(palette) = palette {
             palette::panel(
@@ -804,30 +825,6 @@ impl State {
             view
         })
     }
-}
-
-impl Workspace {
-    pub(super) fn agent_window_view(&self, id: window::Id) -> Option<Element<'_, Message>> {
-        self.terminal_agents.view(
-            id,
-            self.agent_window_palette(id),
-            self.swarm_status_animated(id),
-            policy::Approvals {
-                batch: self.clipboard.policy.ai_agent_execution
-                    == crate::clipboard_policy::AiAgentExecution::Allow,
-                remaining: self.clipboard.policy.ai_agent_execution
-                    == crate::clipboard_policy::AiAgentExecution::Allow
-                    && self.ai_configuration().is_some_and(|config| {
-                        config.saved_root().is_some()
-                            && config.agent_execution_enabled()
-                            && !config.agent_requires_command_confirmation()
-                    }),
-            },
-            self.swarm_web_available(id),
-            || self.automation_summary_providers(),
-        )
-    }
-
     fn agent_window_palette(&self, id: window::Id) -> Option<palette::Palette> {
         let theme = self
             .terminal_agents
