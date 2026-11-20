@@ -1,12 +1,14 @@
 //! Native editor for custom OS symbols assigned to saved connections.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use iced::{Element, Size, Task, window};
 
-use crate::connection_store::custom_os_badges::{Catalog, CustomBadge};
+use crate::connection_store::custom_os_badges::{
+    Catalog, CustomBadge, JavaBadgeHint, java_catalog,
+};
 use crate::profile;
 use crate::sftp_window::{Directory, EntryKind, Location, list_local};
 use crate::ssh_dialog::unsafe_text;
@@ -28,8 +30,11 @@ pub enum Event {
     Close,
     Dismiss,
     Loaded(Result<Arc<Catalog>, String>),
+    JavaHintsLoaded(Result<BTreeSet<JavaBadgeHint>, String>),
     Select(String),
     Add,
+    AdoptJava(JavaBadgeHint),
+    JavaPage(bool),
     Rename,
     Delete,
     BrowsePath(String),
@@ -61,6 +66,9 @@ struct Dialog {
     focus_scope: iced::widget::Id,
     catalog: Arc<Catalog>,
     catalog_state: CatalogState,
+    java_hints: BTreeSet<JavaBadgeHint>,
+    java_page: usize,
+    java_problem: Option<String>,
     selected: Option<String>,
     mode: Mode,
     generation: u64,
@@ -84,8 +92,14 @@ enum Mode {
 
 #[derive(Clone)]
 enum Target {
-    Add(PathBuf),
-    Rename { reference: String, family: String },
+    Add {
+        source: PathBuf,
+        java_origin: Option<JavaBadgeHint>,
+    },
+    Rename {
+        reference: String,
+        family: String,
+    },
 }
 
 enum Change {
@@ -99,6 +113,7 @@ struct Browser {
     page: usize,
     path: String,
     loading: bool,
+    java_origin: Option<JavaBadgeHint>,
 }
 
 impl Dialog {
@@ -109,6 +124,9 @@ impl Dialog {
             focus_scope: iced::widget::Id::unique(),
             catalog,
             catalog_state: CatalogState::Loading,
+            java_hints: BTreeSet::new(),
+            java_page: 0,
+            java_problem: None,
             selected: None,
             mode: Mode::List,
             generation: 0,
@@ -131,7 +149,34 @@ impl Dialog {
         self.generation
     }
 
-    fn browse(&mut self, folder: PathBuf, path: String) -> Task<Message> {
+    fn pending_java(&self) -> impl Iterator<Item = &JavaBadgeHint> {
+        self.java_hints.iter().filter(|hint| {
+            !self
+                .catalog
+                .entries()
+                .iter()
+                .any(|badge| badge.java_origin() == Some(hint))
+        })
+    }
+
+    fn java_max_page(&self) -> usize {
+        self.pending_java().count().saturating_sub(1) / PAGE_SIZE
+    }
+
+    fn start_browse(&mut self, java_origin: Option<JavaBadgeHint>) -> Task<Message> {
+        if let Some(folder) = std::env::home_dir().or_else(|| std::env::current_dir().ok()) {
+            return self.browse(folder, String::new(), java_origin);
+        }
+        self.problem = Some("Could not find a starting folder.".into());
+        Task::none()
+    }
+
+    fn browse(
+        &mut self,
+        folder: PathBuf,
+        path: String,
+        java_origin: Option<JavaBadgeHint>,
+    ) -> Task<Message> {
         let generation = self.advance();
         self.mode = Mode::Browse(Browser {
             folder: folder.clone(),
@@ -139,6 +184,7 @@ impl Dialog {
             page: 0,
             path,
             loading: true,
+            java_origin,
         });
         let id = self.id;
         Task::perform(
@@ -151,7 +197,7 @@ impl Dialog {
         let Mode::Browse(browser) = &self.mode else {
             return Task::none();
         };
-        self.browse(path, browser.path.clone())
+        self.browse(path, browser.path.clone(), browser.java_origin.clone())
     }
 
     fn choose_image(&mut self, path: PathBuf) -> Task<Message> {
@@ -159,15 +205,26 @@ impl Dialog {
             self.problem = Some("Choose a PNG, JPG, GIF or SVG image.".into());
             return Task::none();
         }
-        let value = path
+        let Mode::Browse(browser) = &self.mode else {
+            return Task::none();
+        };
+        let java_origin = browser.java_origin.clone();
+        let fallback = path
             .file_stem()
             .and_then(|stem| stem.to_str())
             .filter(|name| name.len() <= MAX_NAME_BYTES && !unsafe_text(name))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let value = java_origin
+            .as_ref()
+            .and_then(|hint| hint.name.as_deref())
+            .unwrap_or(fallback)
             .to_owned();
         self.advance();
         self.mode = Mode::Name {
-            target: Target::Add(path),
+            target: Target::Add {
+                source: path,
+                java_origin,
+            },
             value,
         };
         focus_dialog_field(self.focus_scope.clone(), NAME_INPUT)
@@ -182,9 +239,19 @@ impl Dialog {
             async move {
                 let edit = Arc::make_mut(&mut catalog);
                 let selected = match change {
-                    Change::Name(Target::Add(source), name) => {
-                        Some(edit.add(&name, FAMILY, &source).map_err(problem)?)
-                    }
+                    Change::Name(
+                        Target::Add {
+                            source,
+                            java_origin,
+                        },
+                        name,
+                    ) => Some(
+                        match java_origin {
+                            Some(hint) => edit.adopt_java(&name, FAMILY, &source, hint),
+                            None => edit.add(&name, FAMILY, &source),
+                        }
+                        .map_err(problem)?,
+                    ),
                     Change::Name(Target::Rename { reference, family }, name) => {
                         edit.rename(&reference, &name, &family).map_err(problem)?;
                         Some(reference)
@@ -254,11 +321,21 @@ impl Dialog {
                 }
             }
             Event::Add if matches!(self.mode, Mode::List) => {
-                let folder = std::env::home_dir().or_else(|| std::env::current_dir().ok());
-                if let Some(folder) = folder {
-                    return self.browse(folder, String::new());
+                return self.start_browse(None);
+            }
+            Event::AdoptJava(hint) if matches!(self.mode, Mode::List) => {
+                let pending = self.pending_java().any(|entry| entry == &hint);
+                if pending {
+                    return self.start_browse(Some(hint));
                 }
-                self.problem = Some("Could not find a starting folder.".into());
+            }
+            Event::JavaPage(forward) if matches!(self.mode, Mode::List) => {
+                let current = self.java_page.min(self.java_max_page());
+                self.java_page = if forward {
+                    (current + 1).min(self.java_max_page())
+                } else {
+                    current.saturating_sub(1)
+                };
             }
             Event::Rename if matches!(self.mode, Mode::List) => {
                 if let Some(badge) = self.selected() {
@@ -425,8 +502,14 @@ fn read_catalog(cached: Arc<Catalog>) -> Result<Arc<Catalog>, String> {
     Ok(if same { cached } else { Arc::new(loaded) })
 }
 
-fn badge_data(badge: &CustomBadge) -> (&str, &str, &str, &[u8]) {
-    (badge.reference(), badge.name(), badge.family(), badge.png())
+fn badge_data(badge: &CustomBadge) -> (&str, &str, &str, &[u8], Option<&JavaBadgeHint>) {
+    (
+        badge.reference(),
+        badge.name(),
+        badge.family(),
+        badge.png(),
+        badge.java_origin(),
+    )
 }
 
 pub(super) fn message(id: window::Id, event: Event) -> Message {
@@ -462,6 +545,14 @@ impl Workspace {
             Task::perform(async move { read_catalog(catalog) }, move |result| {
                 message(id, Event::Loaded(result))
             }),
+            Task::perform(
+                async {
+                    profile::root()
+                        .and_then(|root| java_catalog::load(&root))
+                        .map_err(|error| error.to_string())
+                },
+                move |result| message(id, Event::JavaHintsLoaded(result)),
+            ),
         ])
     }
 
@@ -535,6 +626,13 @@ impl Workspace {
                     dialog.finish_load(result);
                 }
             }
+            Event::JavaHintsLoaded(result) => match result {
+                Ok(hints) => dialog.java_hints = hints,
+                Err(error) => {
+                    dialog.java_problem =
+                        Some(format!("Could not load imported OS symbols ({error})."));
+                }
+            },
             Event::Saved(generation, result)
                 if dialog.writing && generation == dialog.generation =>
             {
@@ -619,17 +717,58 @@ mod tests {
         let mut dialog = Dialog::new(id, window::Id::unique(), catalog);
         dialog.catalog_state = CatalogState::Ready;
         // Test double: the task is never run and its completion is injected below.
-        let _ = dialog.browse(PathBuf::new(), String::new());
+        let _ = dialog.browse(PathBuf::new(), String::new(), None);
         let old_generation = dialog.generation;
         let _ = dialog.handle(Event::Dismiss);
         assert!(matches!(dialog.mode, Mode::List));
 
-        let _ = dialog.browse(PathBuf::new(), String::new());
+        let _ = dialog.browse(PathBuf::new(), String::new(), None);
         let _ = dialog.handle(Event::Listed(old_generation, Err("old response".into())));
         assert!(dialog.problem.is_none());
         assert!(matches!(
             dialog.mode,
             Mode::Browse(Browser { loading: true, .. })
         ));
+    }
+
+    #[test]
+    fn imported_symbol_opens_a_blank_picker_and_prefills_its_name_after_selection() {
+        let id = window::Id::unique();
+        let catalog = Arc::new(Catalog::empty(Path::new("unused-in-memory-catalog")));
+        let mut dialog = Dialog::new(id, window::Id::unique(), catalog);
+        dialog.catalog_state = CatalogState::Ready;
+        let hint = JavaBadgeHint {
+            reference: "custom:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
+            name: Some("Imported router".into()),
+            file: Some("previous-machine.png".into()),
+        };
+        let _ = dialog.handle(Event::AdoptJava(hint.clone()));
+        assert!(matches!(dialog.mode, Mode::List));
+        dialog.java_hints.insert(hint.clone());
+        let _ = dialog.handle(Event::AdoptJava(hint.clone()));
+        let Mode::Browse(browser) = &dialog.mode else {
+            panic!("expected an image picker for the pending definition");
+        };
+        assert!(browser.path.is_empty());
+        assert_eq!(browser.java_origin.as_ref(), Some(&hint));
+        let _ = dialog.browse_path(PathBuf::from("next-folder"));
+        let chosen = PathBuf::from("user-selected.png");
+        let _ = dialog.choose_image(chosen.clone());
+        let Mode::Name {
+            target: Target::Add {
+                source,
+                java_origin,
+            },
+            value,
+        } = &dialog.mode
+        else {
+            panic!("expected to confirm the local image and name");
+        };
+        assert_eq!(source, &chosen);
+        assert_eq!(java_origin.as_ref(), Some(&hint));
+        assert_eq!(value, "Imported router");
+        let _ = dialog.handle(Event::Dismiss);
+        assert!(matches!(dialog.mode, Mode::List));
+        assert_eq!(dialog.pending_java().next(), Some(&hint));
     }
 }

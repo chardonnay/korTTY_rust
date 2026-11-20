@@ -13,6 +13,20 @@ pub(crate) const RECENT_LIMIT: usize = 15;
 const MAX_GROUPS: usize = 512;
 const MAX_GROUP_DEPTH: usize = 8;
 pub(crate) const MAX_GROUP_PATH_BYTES: usize = 512;
+const MAX_JAVA_GROUP_COLORS: usize = 1024;
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct JavaGroupColor {
+    pub(crate) source: String,
+    pub(crate) color: TabColor,
+}
+
+impl std::fmt::Display for JavaGroupColor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} · {}", self.source, self.color)
+    }
+}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -21,6 +35,10 @@ pub(super) struct Library {
     pub groups: BTreeSet<String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub group_colors: BTreeMap<String, TabColor>,
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    pub java_group_colors: BTreeSet<JavaGroupColor>,
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    pub reviewed_java_group_colors: BTreeSet<JavaGroupColor>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub membership: BTreeMap<u64, String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -29,6 +47,10 @@ pub(super) struct Library {
     pub java_os_badges: BTreeMap<u64, super::custom_os_badges::JavaBadgeHint>,
     #[serde(skip_serializing_if = "BTreeSet::is_empty")]
     pub favorites: BTreeSet<u64>,
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    pub java_favorites: BTreeSet<u64>,
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    pub reviewed_java_favorites: BTreeSet<u64>,
     #[serde(skip_serializing_if = "Favorites::is_empty")]
     pub teamwork_favorites: Favorites,
     #[serde(skip_serializing_if = "HiddenEntries::is_empty")]
@@ -40,13 +62,48 @@ pub(super) struct Library {
 }
 
 impl Library {
+    pub fn stage_java_favorites(
+        &mut self,
+        added: BTreeSet<u64>,
+        existing: impl IntoIterator<Item = u64>,
+    ) {
+        self.reviewed_java_favorites.extend(&added);
+        self.favorites.extend(added);
+        for id in existing {
+            if self.favorites.contains(&id) {
+                self.reviewed_java_favorites.insert(id);
+            } else if !self.reviewed_java_favorites.contains(&id) {
+                self.java_favorites.insert(id);
+            }
+        }
+    }
+
+    pub fn review_java_favorite(&mut self, id: u64) -> bool {
+        if !self.java_favorites.remove(&id) {
+            return false;
+        }
+        self.reviewed_java_favorites.insert(id);
+        true
+    }
+
+    pub fn java_presentation_changed(&self, original: &Self) -> bool {
+        self.java_group_colors != original.java_group_colors
+            || self.reviewed_java_group_colors != original.reviewed_java_group_colors
+            || self.java_favorites != original.java_favorites
+            || self.reviewed_java_favorites != original.reviewed_java_favorites
+    }
+
     pub fn is_empty(&self) -> bool {
         self.groups.is_empty()
             && self.group_colors.is_empty()
+            && self.java_group_colors.is_empty()
+            && self.reviewed_java_group_colors.is_empty()
             && self.membership.is_empty()
             && self.os_badges.is_empty()
             && self.java_os_badges.is_empty()
             && self.favorites.is_empty()
+            && self.java_favorites.is_empty()
+            && self.reviewed_java_favorites.is_empty()
             && self.teamwork_favorites.is_empty()
             && self.teamwork_hidden.is_empty()
             && self.recent.is_empty()
@@ -65,6 +122,16 @@ impl Library {
                 .group_colors
                 .keys()
                 .any(|path| !self.groups.contains(path))
+            || self.java_group_colors.len() + self.reviewed_java_group_colors.len()
+                > MAX_JAVA_GROUP_COLORS
+            || !self
+                .java_group_colors
+                .is_disjoint(&self.reviewed_java_group_colors)
+            || self
+                .java_group_colors
+                .iter()
+                .chain(&self.reviewed_java_group_colors)
+                .any(|hint| !valid_path(&hint.source))
             || self
                 .membership
                 .iter()
@@ -83,6 +150,12 @@ impl Library {
                 !connections.contains(id) || self.os_badges.contains_key(id) || !hint.valid()
             })
             || !self.favorites.is_subset(connections)
+            || !self.java_favorites.is_subset(connections)
+            || !self.reviewed_java_favorites.is_subset(connections)
+            || !self.java_favorites.is_disjoint(&self.favorites)
+            || !self
+                .java_favorites
+                .is_disjoint(&self.reviewed_java_favorites)
             || self.recent.len() > RECENT_LIMIT
             || !self.recent.iter().all(|id| connections.contains(id))
             || self.recent.iter().collect::<BTreeSet<_>>().len() != self.recent.len()
@@ -169,6 +242,8 @@ impl Library {
         self.os_badges.retain(|id, _| !ids.contains(id));
         self.java_os_badges.retain(|id, _| !ids.contains(id));
         self.favorites.retain(|id| !ids.contains(id));
+        self.java_favorites.retain(|id| !ids.contains(id));
+        self.reviewed_java_favorites.retain(|id| !ids.contains(id));
         self.recent.retain(|id| !ids.contains(id));
         self.used_at.retain(|id, _| !ids.contains(id));
     }

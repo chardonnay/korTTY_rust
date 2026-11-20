@@ -12,6 +12,7 @@ use super::data::WINDOW_SETTINGS;
 use super::{
     Directory, JOBS, PINS, RECORDINGS, Snapshot, missing, path_error, read_bounded, with_target,
 };
+use crate::connection_store::custom_os_badges::java_catalog;
 use crate::connection_store::{self, Auth, Connection};
 use crate::scheduler_window::{ConnectionRef, RemoteAction, SshCommand};
 use crate::snippets::{self, FILE_NAME as SNIPPETS, SnippetId};
@@ -35,6 +36,7 @@ pub(super) fn apply(
 ) -> io::Result<()> {
     let independent = snapshot.iter().filter(|(path, _)| {
         !LINKED.contains(&path.as_str())
+            && path.as_str() != java_catalog::PATH
             && !path.starts_with(KEY_DIR)
             && super::data::analysis::filename(path).is_none()
     });
@@ -123,6 +125,14 @@ pub(super) fn apply(
         sync_parent(directory, path)?;
     }
     super::data::analysis::install(directory, snapshot, super::data::analysis::managed_limit)?;
+    if let Some(incoming) = snapshot.get(java_catalog::PATH) {
+        let local = missing(directory.open_private_file(java_catalog::PATH))?
+            .map(|file| read_bounded(file, java_catalog::MAX_BYTES))
+            .transpose()?;
+        if let Some(merged) = java_catalog::merge(local.as_deref().map(Vec::as_slice), incoming)? {
+            directory.replace_file(java_catalog::PATH, &merged)?;
+        }
+    }
     directory.sync()
 }
 

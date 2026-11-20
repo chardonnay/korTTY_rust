@@ -8,7 +8,9 @@ use iced::{Point, Task};
 
 use crate::connection_store::custom_os_badges::Catalog;
 use crate::connection_store::teamwork;
-use crate::connection_store::{Connection, LocalProfile, Search, SerialProfile, Store, TabColor};
+use crate::connection_store::{
+    Connection, JavaGroupColor, LocalProfile, Search, SerialProfile, Store, TabColor,
+};
 use crate::serial_dialog;
 use crate::terminal_effects::Effect;
 
@@ -64,11 +66,13 @@ pub enum Message {
     EditGroupColor,
     GroupColorEnabled(bool),
     GroupColorInput(String),
+    PickJavaGroupColor(JavaGroupColor),
     GroupName(String),
     CommitGroup,
     CancelGroup,
     DraftGroup(Option<String>),
     ToggleFavorite,
+    ReviewJavaFavorite(u64, bool),
     ToggleOsBadgePicker(u64),
     SetOsBadge(u64, Option<String>),
     ManageOsBadges,
@@ -217,6 +221,7 @@ enum FolderDialog {
         path: String,
         original: Option<TabColor>,
         draft: ColorDraft,
+        imported: Option<JavaGroupColor>,
     },
 }
 
@@ -549,6 +554,12 @@ impl ConnectionWindow {
                 .filter(|entry| self.store.is_favorite(entry.id))
                 .count()
             + self
+                .store
+                .local_profiles()
+                .iter()
+                .filter(|entry| self.store.is_favorite(entry.id))
+                .count()
+            + self
                 .shared_entries()
                 .filter(|entry| self.store.is_teamwork_favorite(entry.identity()))
                 .count()
@@ -823,8 +834,11 @@ impl ConnectionWindow {
                 FolderDialog::Rename { path, name } => path.rsplit('/').next() != Some(name),
                 FolderDialog::Delete { .. } => false,
                 FolderDialog::Color {
-                    original, draft, ..
-                } => draft.value() != Ok(*original),
+                    original,
+                    draft,
+                    imported,
+                    ..
+                } => imported.is_some() || draft.value() != Ok(*original),
             });
         !self.confirming_close
     }
@@ -1053,6 +1067,7 @@ impl ConnectionWindow {
                     Message::GroupName(_)
                         | Message::GroupColorEnabled(_)
                         | Message::GroupColorInput(_)
+                        | Message::PickJavaGroupColor(_)
                         | Message::CommitGroup
                         | Message::CancelGroup
                         | Message::Completed(_)
@@ -1398,7 +1413,9 @@ impl ConnectionWindow {
                 self.reconcile_selection();
             }
             Message::ToggleFavorite if self.can_browse() => {
-                let local = self.selected_profile_ids();
+                let local = self
+                    .single_local()
+                    .map_or_else(|| self.selected_profile_ids(), |profile| vec![profile.id]);
                 let shared = self
                     .selected_shared_entries()
                     .map(|entry| entry.identity().clone())
@@ -1416,6 +1433,25 @@ impl ConnectionWindow {
                         ))
                     });
                 }
+            }
+            Message::ReviewJavaFavorite(id, accept)
+                if self.can_browse()
+                    && self.store.has_java_favorite(id)
+                    && (self.selection.single_connection() == Some(id)
+                        || self.selection.single_local() == Some(id)
+                        || self.selection.single_serial() == Some(id)) =>
+            {
+                return self.persist(move |mut store| {
+                    store.review_java_favorite(id, accept)?;
+                    Ok(Persisted::preserving_selection(
+                        store,
+                        if accept {
+                            "Added to Favorites."
+                        } else {
+                            "Imported favorite dismissed."
+                        },
+                    ))
+                });
             }
             Message::NewGroup if self.can_browse() && self.scope != Scope::Teamwork => {
                 self.folder = Some(FolderDialog::Create {
@@ -1453,20 +1489,39 @@ impl ConnectionWindow {
                         path: path.into(),
                         original,
                         draft: ColorDraft::new(original, inherited),
+                        imported: None,
                     });
                     self.notice = None;
                 }
             }
             Message::GroupColorEnabled(enabled) => {
-                if let Some(FolderDialog::Color { draft, .. }) = &mut self.folder {
+                if let Some(FolderDialog::Color {
+                    draft, imported, ..
+                }) = &mut self.folder
+                {
                     draft.set_enabled(enabled);
+                    *imported = None;
                     self.notice = None;
                 }
             }
             Message::GroupColorInput(input) => {
-                if let Some(FolderDialog::Color { draft, .. }) = &mut self.folder
+                if let Some(FolderDialog::Color {
+                    draft, imported, ..
+                }) = &mut self.folder
                     && draft.set_input(input)
                 {
+                    *imported = None;
+                    self.notice = None;
+                }
+            }
+            Message::PickJavaGroupColor(hint) => {
+                if let Some(FolderDialog::Color {
+                    draft, imported, ..
+                }) = &mut self.folder
+                    && self.store.java_group_colors().contains(&hint)
+                {
+                    *draft = ColorDraft::new(Some(hint.color), None);
+                    *imported = Some(hint);
                     self.notice = None;
                 }
             }
@@ -1618,11 +1673,14 @@ impl ConnectionWindow {
             return Task::none();
         };
         if let FolderDialog::Color {
-            original, draft, ..
+            original,
+            draft,
+            imported,
+            ..
         } = &action
         {
             match draft.value() {
-                Ok(value) if value == *original => {
+                Ok(value) if value == *original && imported.is_none() => {
                     self.folder = None;
                     self.notice = None;
                     return Task::none();
@@ -1653,8 +1711,20 @@ impl ConnectionWindow {
                     store.delete_group(&path)?;
                     (Scope::All, "Folder deleted.", None)
                 }
-                FolderDialog::Color { path, draft, .. } => {
-                    store.set_group_color(&path, draft.value().map_err(std::io::Error::other)?)?;
+                FolderDialog::Color {
+                    path,
+                    draft,
+                    imported,
+                    ..
+                } => {
+                    if let Some(hint) = imported {
+                        store.adopt_java_group_color(&path, hint)?;
+                    } else {
+                        store.set_group_color(
+                            &path,
+                            draft.value().map_err(std::io::Error::other)?,
+                        )?;
+                    }
                     (Scope::Group(path), "Folder tab color saved.", None)
                 }
             };

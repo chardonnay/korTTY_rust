@@ -1252,6 +1252,12 @@ mod tests {
 
     #[test]
     fn guided_backend_repair_keeps_model_and_separates_install_paths() {
+        use iced::{Font, Renderer, Size, keyboard::Key};
+        use iced_runtime::{UserInterface, user_interface::Cache};
+
+        use crate::ai_manager::search::{Control, Setting, Target};
+        use crate::settings_search::test_input;
+
         let profile = crate::snippets::tests::Profile::new();
         let root = profile.0.canonicalize().unwrap();
         let mut gpu = model(
@@ -1299,6 +1305,50 @@ mod tests {
             manager.local.runtime_import().expected_backend,
             Some(required)
         );
+        let _ = manager.update(ManagerMessage::Search("memory".into()));
+        assert!(manager.search_results().next().is_none());
+        assert!(matches!(
+            manager.child_close_message(),
+            Some(ManagerMessage::SearchEscape)
+        ));
+        let _ = manager.update(ManagerMessage::Search("index signature".into()));
+        let signature = Setting::Control(Control::IndexSignature);
+        assert_eq!(
+            manager.search_results().next(),
+            Some(Target::Setting(signature))
+        );
+        let reveal = manager.update(ManagerMessage::SearchChoose);
+        assert_eq!(manager.revealed.setting, Some(signature));
+        assert!(manager.local.request.is_none());
+        let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+        let mut interface = UserInterface::build(
+            manager.view(Vec::new(), Vec::new()),
+            Size::new(760.0, 360.0),
+            Cache::default(),
+            &mut renderer,
+        );
+        test_input::apply(&mut interface, &renderer, reveal);
+        let messages = test_input::press(
+            &mut interface,
+            &mut renderer,
+            Key::Character("x".into()),
+            Some("x"),
+        );
+        assert!(
+            matches!(messages.as_slice(), [ManagerMessage::Local(LocalMessage::RuntimePath(super::super::RuntimeFile::Signature, value))] if value == "x")
+        );
+        drop(interface);
+
+        let _ = manager.update(ManagerMessage::Search(
+            "check signed runtime updates".into(),
+        ));
+        let _ = manager.update(ManagerMessage::SearchChoose);
+        assert_eq!(
+            manager.revealed.setting,
+            Some(Setting::Control(Control::CheckRuntimeOnline))
+        );
+        assert!(manager.local.request.is_none());
+        assert_eq!(manager.local.runtime_import().archive, PathBuf::new());
         let second = manager.local.managed.choices[1].clone();
         let _ = manager.update(ManagerMessage::Local(Managed(Message::Select(Box::new(
             second,

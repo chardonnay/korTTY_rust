@@ -79,6 +79,51 @@ impl Dialog {
         if self.catalog.entries().is_empty() {
             items = items.push(container(text("No symbols of your own yet.")).padding(8));
         }
+        let max_page = self.java_max_page();
+        let page = self.java_page.min(max_page);
+        let mut pending = self
+            .pending_java()
+            .skip(page * PAGE_SIZE)
+            .take(PAGE_SIZE)
+            .peekable();
+        if pending.peek().is_some() {
+            items = items.push(
+                container(text("Imported Java symbols awaiting an image").size(15)).padding([8, 4]),
+            );
+            for hint in pending {
+                let title = hint.name.as_deref().unwrap_or("Unnamed symbol");
+                let details = match &hint.file {
+                    Some(file) => format!("{file} · {}", hint.reference),
+                    None => hint.reference.clone(),
+                };
+                items = items.push(
+                    row![
+                        column![text(title), text(details).size(12)].width(Length::Fill),
+                        button("Choose image…")
+                            .on_press_maybe(ready.then(|| Event::AdoptJava(hint.clone()))),
+                    ]
+                    .padding([2, 4])
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                );
+            }
+            if max_page != 0 {
+                items = items.push(
+                    row![
+                        button("Previous")
+                            .on_press_maybe((page != 0).then_some(Event::JavaPage(false))),
+                        text(format!("{} / {}", page + 1, max_page + 1)).size(13),
+                        button("Next")
+                            .on_press_maybe((page < max_page).then_some(Event::JavaPage(true))),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                );
+            }
+        }
+        if let Some(problem) = &self.java_problem {
+            items = items.push(container(text(problem).size(13)).padding(4));
+        }
         let selected = ready && self.selected().is_some();
         column![
             container(scrollable(items).height(Length::Fill))
@@ -167,7 +212,7 @@ impl Dialog {
 
     fn name_view(&self, target: &Target, value: &str) -> Element<'_, Event> {
         let (title, accept) = match target {
-            Target::Add(_) => ("Add OS symbol", "Add"),
+            Target::Add { .. } => ("Add OS symbol", "Add"),
             Target::Rename { .. } => ("Rename OS symbol", "Rename"),
         };
         let save = (!self.writing && !value.trim().is_empty()).then_some(Event::SaveName);

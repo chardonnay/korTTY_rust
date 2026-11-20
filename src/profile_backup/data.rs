@@ -10,6 +10,7 @@ use kortty_ssh::TrustStore;
 use kortty_vault::Vault;
 use zeroize::Zeroizing;
 
+use crate::connection_store::custom_os_badges::java_catalog;
 use crate::private_files::Directory;
 use crate::recording_window::preferences as recording_preferences;
 use crate::session_journal::markers;
@@ -33,6 +34,7 @@ pub(super) const STATIC_PATHS: &[&str] = &[
     "connections.json",
     "environments.json",
     "jobs.json",
+    java_catalog::PATH,
     question_history::MANUAL_FILE,
     question_history::TERMINAL_FILE,
     question_history::WORKFLOW_FILE,
@@ -298,6 +300,9 @@ fn validate_entries(snapshot: &Snapshot, java: bool) -> io::Result<()> {
         }
         match path.as_str() {
             "connections.json" => connection_store::validate_backup(bytes)?,
+            java_catalog::PATH => {
+                java_catalog::decode(bytes)?;
+            }
             "jobs.json" => {
                 let graph = SchedulerStore::decode_backup::<SshCommand>(bytes).map_err(invalid)?;
                 for job in graph.jobs() {
@@ -399,6 +404,7 @@ pub(super) fn allowed_path(path: &str) -> bool {
 
 pub(super) fn file_limit(path: &str) -> usize {
     match path {
+        java_catalog::PATH => java_catalog::MAX_BYTES,
         crate::workspace::environment_access::java_backup::PATH => {
             crate::workspace::environment_access::java_backup::MAX_BACKUP_BYTES
         }
@@ -424,6 +430,7 @@ pub(super) fn file_limit(path: &str) -> usize {
 
 fn open_path(directory: &Directory, path: &str) -> io::Result<File> {
     match path.split_once('/') {
+        None if path == java_catalog::PATH => directory.open_private_file(path),
         Some((parent, name)) if path == agent_history::BACKUP_PATH => {
             let file = directory
                 .private_child(parent, false)?

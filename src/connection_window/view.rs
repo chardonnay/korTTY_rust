@@ -10,7 +10,9 @@ use iced::{Alignment, Color, Element, Length, Theme};
 use crate::ai_manager::ProfileRef;
 use crate::clipboard_policy::PasteWarningMode;
 use crate::connection_store::teamwork;
-use crate::connection_store::{Auth, Connection, LocalProfile, SerialProfile, Store};
+use crate::connection_store::{
+    Auth, Connection, JavaGroupColor, LocalProfile, SerialProfile, Store,
+};
 use crate::ssh_dialog::KeyChoice;
 use crate::terminal_agent::design::Choice as AgentDesignChoice;
 use crate::terminal_effects::Effect;
@@ -1234,6 +1236,8 @@ impl ConnectionWindow {
                     "Emulation",
                     profile.profile().unwrap_or_default().to_string()
                 ),
+                favorite_tool(self.store.is_favorite(profile.id), self.can_browse()),
+                self.java_favorite_review(profile.id),
             ]
             .spacing(10)
             .into()
@@ -1266,6 +1270,7 @@ impl ConnectionWindow {
                         .on_press_maybe(self.can_browse().then_some(Message::ToggleSerialPin)),
                 ]
                 .spacing(6),
+                self.java_favorite_review(profile.id),
             ]
             .spacing(10)
             .into()
@@ -1405,6 +1410,9 @@ impl ConnectionWindow {
                 text("Local shell").size(13).style(text::secondary),
             ]
             .spacing(1),
+            self.store
+                .is_favorite(profile.id)
+                .then(|| Icon::Star.widget(16, true)),
             (open > 0).then(|| text(format!("{open} open")).size(12)),
         ]
         .spacing(9)
@@ -1568,6 +1576,7 @@ impl ConnectionWindow {
                 fact("Terminal", entry.emulation.as_str()),
             ]
             .spacing(4),
+            self.java_favorite_review(id),
             self.store.java_badge_hint(id).map(|hint| {
                 column![
                     text("Review imported Java OS symbol").size(14),
@@ -1649,6 +1658,24 @@ impl ConnectionWindow {
         }
         body.into()
     }
+
+    fn java_favorite_review(&self, id: u64) -> Option<Element<'_, Message>> {
+        self.store.has_java_favorite(id).then(|| {
+            let enabled = self.can_browse();
+            column![
+                text("This profile was a favorite in the Java backup.").size(13),
+                row![
+                    button("Add to Favorites")
+                        .on_press_maybe(enabled.then_some(Message::ReviewJavaFavorite(id, true))),
+                    button("Dismiss")
+                        .on_press_maybe(enabled.then_some(Message::ReviewJavaFavorite(id, false))),
+                ]
+                .spacing(6),
+            ]
+            .spacing(4)
+            .into()
+        })
+    }
 }
 
 fn group_counts(store: &Store, ids: impl Iterator<Item = u64>) -> BTreeMap<&str, usize> {
@@ -1694,7 +1721,14 @@ fn folder_dialog<'a>(dialog: &'a FolderDialog, store: &'a Store) -> Element<'a, 
             None,
             "Delete folder",
         ),
-        FolderDialog::Color { path, draft, .. } => return folder_color_dialog(path, draft, store),
+        FolderDialog::Color {
+            path,
+            draft,
+            imported,
+            ..
+        } => {
+            return folder_color_dialog(path, draft, imported.as_ref(), store);
+        }
     };
     let mut contents = column![text(title).size(22)].spacing(10);
     if let Some(hint) = hint {
@@ -1732,12 +1766,23 @@ fn folder_dialog<'a>(dialog: &'a FolderDialog, store: &'a Store) -> Element<'a, 
 fn folder_color_dialog<'a>(
     path: &str,
     draft: &'a ColorDraft,
+    imported: Option<&JavaGroupColor>,
     store: &Store,
 ) -> Element<'a, Message> {
     let inherited = store.ancestor_group_color(path);
+    let suggestions = store.java_group_colors();
     column![
         text("Folder Tab Color").size(22),
         text(format!("Tab color of the folder \"{path}\"")),
+        (!suggestions.is_empty()).then(|| {
+            pick_list(
+                suggestions.iter().cloned().collect::<Vec<_>>(),
+                imported.cloned(),
+                Message::PickJavaGroupColor,
+            )
+            .placeholder("Choose an imported Java folder color…")
+            .width(Length::Fill)
+        }),
         draft.view(
             "Mark the tabs of this folder's connections with a color",
             Message::GroupColorEnabled,

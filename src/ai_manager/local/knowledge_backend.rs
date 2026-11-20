@@ -8,6 +8,7 @@ use iced::widget::{column, pick_list, text, text_input};
 use crate::connection_window::CredentialChoice;
 
 use crate::ai_manager::profiles::picker::DismissOnEscape as _;
+use crate::ai_manager::search::{KnowledgeSetting, Reveal, Setting};
 
 use super::knowledge::Store;
 use super::knowledge::qdrant::Settings;
@@ -87,6 +88,7 @@ impl Editor {
         store: &'a Store,
         idle: bool,
         vault_keys: Vec<CredentialChoice>,
+        reveal: &Reveal,
     ) -> Element<'a, Message> {
         let editable = editable(store);
         let can_edit = editable && idle;
@@ -144,32 +146,51 @@ impl Editor {
             column![
                 field(
                     "Qdrant endpoint",
-                    text_input("HTTPS URL or loopback HTTP URL", &settings.endpoint)
-                        .on_input_maybe(
-                            can_edit.then_some(move |value| message(Edit::Endpoint(value)))
-                        ),
+                    reveal.knowledge_input(
+                        KnowledgeSetting::QdrantEndpoint,
+                        can_edit,
+                        text_input("HTTPS URL or loopback HTTP URL", &settings.endpoint)
+                            .on_input_maybe(
+                                can_edit.then_some(move |value| message(Edit::Endpoint(value)))
+                            )
+                    ),
                 ),
                 field(
                     "Qdrant collection",
-                    text_input("Collection name", &settings.collection).on_input_maybe(
-                        can_edit.then_some(move |value| message(Edit::Collection(value)))
+                    reveal.knowledge_input(
+                        KnowledgeSetting::QdrantCollection,
+                        can_edit,
+                        text_input("Collection name", &settings.collection).on_input_maybe(
+                            can_edit.then_some(move |value| message(Edit::Collection(value)))
+                        )
                     ),
                 ),
                 field(
                     "Embedding dimensions",
-                    text_input("Match the embedding model", &dimensions).on_input_maybe(
-                        can_edit.then_some(move |value| message(Edit::Dimensions(value)))
+                    reveal.knowledge_input(
+                        KnowledgeSetting::QdrantDimensions,
+                        can_edit,
+                        text_input("Match the embedding model", &dimensions).on_input_maybe(
+                            can_edit.then_some(move |value| message(Edit::Dimensions(value)))
+                        )
                     ),
                 ),
-                field("Qdrant authentication", key_picker),
+                reveal.wrap(
+                    Setting::Knowledge(KnowledgeSetting::QdrantAuthentication),
+                    field("Qdrant authentication", key_picker)
+                ),
                 settings.vault_key.is_none().then(|| field(
                     "API key variable",
-                    text_input(
-                        "Optional environment variable name",
-                        &settings.credential_env
-                    )
-                    .on_input_maybe(
-                        idle.then_some(move |value| message(Edit::CredentialVariable(value)))
+                    reveal.knowledge_input(
+                        KnowledgeSetting::QdrantCredentialVariable,
+                        idle,
+                        text_input(
+                            "Optional environment variable name",
+                            &settings.credential_env
+                        )
+                        .on_input_maybe(
+                            idle.then_some(move |value| message(Edit::CredentialVariable(value)))
+                        )
                     ),
                 )),
                 settings.vault_key.is_none().then(|| text(
@@ -180,7 +201,7 @@ impl Editor {
             .spacing(6)
         });
         column![
-            field("Vector storage", picker),
+            reveal.wrap(Setting::Knowledge(KnowledgeSetting::VectorStorage), field("Vector storage", picker)),
             settings,
             (!editable).then(|| text(
                 "Remove the store's sources before changing the backend, endpoint, collection, or embedding dimensions."
@@ -205,6 +226,85 @@ pub(super) fn validate(store: &Store) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn knowledge_setting_search_uses_the_selected_store_and_focuses_its_qdrant_endpoint() {
+        use std::{path::PathBuf, sync::Arc};
+
+        use iced::{Font, Renderer, Size, keyboard::Key};
+        use iced_runtime::{UserInterface, user_interface::Cache};
+
+        use crate::ai_manager::{Configuration, Dialog, Message as ManagerMessage, search::Target};
+        use crate::settings_search::test_input;
+
+        let mut dialog = Dialog::new(
+            Arc::new(Configuration::default()),
+            PathBuf::new(),
+            Vec::new(),
+            true,
+            None,
+        );
+        let send = |dialog: &mut Dialog, message| dialog.update(ManagerMessage::Local(message));
+        for name in ["Local fixture", "Qdrant fixture"] {
+            let _ = send(&mut dialog, Message::StoreName(name.into()));
+            let _ = send(&mut dialog, Message::CreateStore);
+        }
+        let _ = send(&mut dialog, Message::SelectStore(1));
+        let _ = send(
+            &mut dialog,
+            Message::KnowledgeBackend {
+                store: 1,
+                edit: Edit::Backend(Backend::Qdrant),
+            },
+        );
+        let endpoint = Setting::Knowledge(KnowledgeSetting::QdrantEndpoint);
+        let _ = send(&mut dialog, Message::SelectStore(0));
+        let _ = dialog.update(ManagerMessage::Search("qdrant endpoint".into()));
+        assert!(
+            !dialog
+                .search_results()
+                .any(|result| result == Target::Setting(endpoint))
+        );
+        let _ = dialog.update(ManagerMessage::SearchEscape);
+
+        let _ = send(&mut dialog, Message::SelectStore(1));
+        let _ = dialog.update(ManagerMessage::Search("qdrant endpoint".into()));
+        assert_eq!(
+            dialog.search_results().next(),
+            Some(Target::Setting(endpoint))
+        );
+        let before = serde_json::to_value(&dialog.local_state).unwrap();
+        let reveal = dialog.update(ManagerMessage::SearchChoose);
+        assert_eq!(dialog.revealed.setting, Some(endpoint));
+        assert_eq!(serde_json::to_value(&dialog.local_state).unwrap(), before);
+        assert!(dialog.local.request.is_none());
+        let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+        let mut interface = UserInterface::build(
+            dialog.view(Vec::new(), Vec::new()),
+            Size::new(760.0, 360.0),
+            Cache::default(),
+            &mut renderer,
+        );
+        test_input::apply(&mut interface, &renderer, reveal);
+        let messages = test_input::press(
+            &mut interface,
+            &mut renderer,
+            Key::Character("x".into()),
+            Some("x"),
+        );
+        assert!(
+            matches!(messages.as_slice(), [ManagerMessage::Local(Message::KnowledgeBackend { store: 1, edit: Edit::Endpoint(value) })] if value.ends_with('x'))
+        );
+        drop(interface);
+
+        let _ = dialog.update(ManagerMessage::Search("folder include globs".into()));
+        let _ = dialog.update(ManagerMessage::SearchChoose);
+        assert_eq!(
+            dialog.revealed.setting,
+            Some(Setting::Knowledge(KnowledgeSetting::FolderIncludes))
+        );
+        assert!(dialog.local.request.is_none());
+        assert_eq!(serde_json::to_value(&dialog.local_state).unwrap(), before);
+    }
     use super::super::{Dialog, State, SyncMode};
     use super::*;
     use std::io::{self, Write as _};

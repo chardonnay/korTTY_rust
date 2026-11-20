@@ -2697,6 +2697,107 @@ fn java_marker_restore_matches_entries_preserves_local_rules_and_replays() {
 }
 
 #[test]
+fn java_os_symbol_definitions_survive_without_connections_and_require_an_image() {
+    use crate::connection_store::custom_os_badges::{Catalog, java_catalog};
+    use zip::{AesMode, ZipWriter, write::SimpleFileOptions};
+
+    let source = Scratch::new();
+    let local = Scratch::new();
+    let image = source.0.join("chosen.png");
+    image::RgbaImage::from_pixel(24, 24, image::Rgba([20_u8, 120, 190, 255]))
+        .save(&image)
+        .unwrap();
+    let mut catalog = Catalog::load(&local.0).unwrap();
+    let existing = catalog.add("Native symbol", "Custom", &image).unwrap();
+    let id = existing.strip_prefix("custom:").unwrap();
+    let restore = |name: &str, filename: &str| {
+        let path = source.0.join("definitions.zip");
+        let mut zip = ZipWriter::new(File::create(&path).unwrap());
+        zip.start_file(
+            "global-settings.xml",
+            SimpleFileOptions::default()
+                .with_aes_encryption_bytes(AesMode::Aes256, b"fixture password"),
+        )
+        .unwrap();
+        write!(
+            zip,
+            r#"<globalSettings><customOsBadges>
+            <badge id="{id}" name="{name}" file="{filename}"/>
+            <badge id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" name="Unsafe" file="../chosen.png"/>
+            <badge id="bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee" name="First" file="a.png"/>
+            <badge id="bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee" name="Second" file="b.png"/>
+            </customOsBadges></globalSettings>"#
+        )
+        .unwrap();
+        zip.finish().unwrap();
+        let preview =
+            super::super::inspect_java_password(&path, &Secret::new("fixture password".into()))
+                .unwrap();
+        assert!(
+            preview
+                .java_review()
+                .unwrap()
+                .1
+                .iter()
+                .any(|entry| entry == "Java OS symbol definitions awaiting a local image (1)")
+        );
+        assert!(!preview.snapshot.contains_key(CONNECTIONS));
+        super::super::queue_restore_at(&local.0, preview, RestoreMode::JavaAdditive).unwrap();
+        drop(ProfileLease::acquire(&local.0, || false).unwrap());
+    };
+    restore("Unused Java symbol", "source.png");
+    assert!(!local.0.join(CONNECTIONS).exists());
+    let hints = java_catalog::load(&local.0).unwrap();
+    assert_eq!(hints.len(), 1);
+    let hint = hints.into_iter().next().unwrap();
+    assert_eq!(hint.reference, existing);
+    assert_eq!(hint.file.as_deref(), Some("source.png"));
+    assert_eq!(catalog.entries().len(), 1);
+    assert!(
+        catalog
+            .adopt_java(
+                "Imported symbol",
+                "Custom",
+                &source.0.join("missing.png"),
+                hint.clone()
+            )
+            .is_err()
+    );
+    let adopted = catalog
+        .adopt_java("Imported symbol", "Custom", &image, hint.clone())
+        .unwrap();
+    assert_ne!(adopted, existing);
+    catalog
+        .rename(&adopted, "Renamed symbol", "Custom")
+        .unwrap();
+    restore("Unused Java symbol", "source.png");
+    restore("Other Java symbol", "other.png");
+
+    let hints = java_catalog::load(&local.0).unwrap();
+    assert_eq!(hints.len(), 2);
+    assert!(hints.iter().all(|entry| entry.reference == existing));
+    let mut reloaded = Catalog::load(&local.0).unwrap();
+    assert_eq!(reloaded.find(&adopted).unwrap().java_origin(), Some(&hint));
+    assert_eq!(reloaded.find(&adopted).unwrap().name(), "Renamed symbol");
+    assert!(
+        reloaded
+            .adopt_java("Duplicate", "Custom", &image, hint)
+            .is_err()
+    );
+    assert_eq!(reloaded.find(&existing).unwrap().java_origin(), None);
+    let snapshot = data::collect(&local.0).unwrap();
+    assert_eq!(
+        java_catalog::decode(&snapshot[java_catalog::PATH]).unwrap(),
+        hints
+    );
+    let other = Scratch::new();
+    let directory = Directory::open(&other.0, false).unwrap();
+    merge::apply(&directory, &snapshot, &|| false, &|| false).unwrap();
+    assert_eq!(java_catalog::load(&other.0).unwrap(), hints);
+    assert!(Catalog::load(&other.0).unwrap().entries().is_empty());
+}
+
+#[test]
 fn java_os_badge_restore_requires_a_local_image_choice_even_when_the_id_exists() {
     use crate::connection_store::{Store, custom_os_badges::Catalog};
     use crate::connection_window::{ConnectionWindow, Message};
@@ -2829,15 +2930,22 @@ fn java_os_badge_restore_requires_a_local_image_choice_even_when_the_id_exists()
 #[test]
 fn java_connection_library_restore_remaps_only_unambiguous_insertions() {
     use crate::connection_store::{Store, TabColor, import::Preview as ConnectionPreview};
+    use crate::connection_window::{ConnectionWindow, Message, Scope};
+    use iced::futures::{StreamExt, executor::block_on};
+    use iced_runtime::{Action, task};
     use zip::{AesMode, ZipWriter, write::SimpleFileOptions};
 
     const INITIAL: &[u8] = br#"<connections>
         <connection><name>Local favorite</name><host>local.example</host><username>fixture</username><group>Work</group></connection>
         <connection><name>Existing match</name><host>existing.example</host><username>fixture</username><group>Work</group></connection>
+        <connection><name>Different settings</name><host>different.example</host><username>fixture</username><group>Work</group><terminalEmulationType>VT100</terminalEmulationType></connection>
+        <connection><name>Existing shell</name><protocol>LOCAL_SHELL</protocol></connection>
     </connections>"#;
     const CONNECTIONS_XML: &[u8] = br#"<connections>
         <connection id="new-ssh"><name>Java SSH</name><host>new.example</host><username>fixture</username><group> Work / Imported </group></connection>
         <connection id="already-here"><name>Existing match</name><host>existing.example</host><username>fixture</username><group>Work</group></connection>
+        <connection id="different"><name>Different settings</name><host>different.example</host><username>fixture</username><group>Work</group><terminalEmulationType>VT220</terminalEmulationType></connection>
+        <connection id="existing-shell"><name>Existing shell</name><protocol>LOCAL_SHELL</protocol></connection>
         <connection id="teamwork"><name>Teamwork entry</name><host>team.example</host><username>fixture</username><connectionSource>TEAMWORK</connectionSource></connection>
         <connection id="duplicate-id"><name>First duplicate ID</name><host>first.example</host><username>fixture</username></connection>
         <connection id="duplicate-id"><name>Second duplicate ID</name><host>second.example</host><username>fixture</username><group>Work/Conflict</group></connection>
@@ -2851,6 +2959,7 @@ fn java_connection_library_restore_remaps_only_unambiguous_insertions() {
             <connection>new-ssh</connection><connection>already-here</connection><connection>teamwork</connection>
             <connection>duplicate-id</connection><connection>shadow-a</connection><connection>new-serial</connection><connection>new-shell</connection>
             <connection>new</connection><connection>stale</connection>
+            <connection>different</connection><connection>existing-shell</connection>
         </favoriteConnections>
         <connectionGroupColors>
             <group path="Work" color="#bbb"/>
@@ -2910,6 +3019,20 @@ fn java_connection_library_restore_remaps_only_unambiguous_insertions() {
         .map(|entry| entry.name.as_str())
         .collect();
     assert_eq!(favorites, ["Local favorite", "Java SSH"]);
+    let existing = store
+        .connections()
+        .iter()
+        .find(|entry| entry.name == "Existing match")
+        .unwrap()
+        .id;
+    let differing = store
+        .connections()
+        .iter()
+        .find(|entry| entry.name == "Different settings")
+        .unwrap()
+        .id;
+    assert!(store.has_java_favorite(existing));
+    assert!(!store.has_java_favorite(differing));
     assert!(
         !store
             .connections()
@@ -2928,10 +3051,34 @@ fn java_connection_library_restore_remaps_only_unambiguous_insertions() {
         .find(|profile| profile.name == "Java shell")
         .unwrap();
     assert!(store.is_favorite(shell.id));
+    assert!(!store.has_java_favorite(shell.id));
+    let imported_shell = shell.id;
+    let existing_shell = store
+        .local_profiles()
+        .iter()
+        .find(|entry| entry.name == "Existing shell")
+        .unwrap()
+        .id;
+    assert!(store.has_java_favorite(existing_shell));
+    store.review_java_favorite(existing_shell, false).unwrap();
     assert_eq!(store.group_color("Work"), TabColor::parse("#900"));
     assert_eq!(store.group_color("Work/Imported"), TabColor::parse("#3af"));
     assert_eq!(store.group_color("Work/Conflict"), None);
     assert!(!store.has_group("Orphan"));
+    let hints = store.java_group_colors();
+    assert_eq!(hints.len(), 4);
+    assert_eq!(
+        hints
+            .iter()
+            .filter(|hint| hint.source == "Work/Conflict")
+            .count(),
+        2
+    );
+    let orphan = hints
+        .iter()
+        .find(|hint| hint.source == "Orphan")
+        .unwrap()
+        .clone();
 
     let imported = store
         .connections()
@@ -2944,11 +3091,97 @@ fn java_connection_library_restore_remaps_only_unambiguous_insertions() {
         .set_group_color("Work/Imported", TabColor::parse("#098"))
         .unwrap();
     drop(store);
+
+    let mut editor = ConnectionWindow::open(connection_path.clone()).unwrap();
+    let _ = editor.update(Message::SelectGroup("Work".into()));
+    let _ = editor.update(Message::EditGroupColor);
+    let _ = editor.update(Message::PickJavaGroupColor(orphan.clone()));
+    let _ = editor.update(Message::CancelGroup);
+    assert_eq!(
+        Store::open(connection_path.clone())
+            .unwrap()
+            .group_color("Work"),
+        TabColor::parse("#900")
+    );
+    let _ = editor.update(Message::EditGroupColor);
+    let _ = editor.update(Message::PickJavaGroupColor(orphan.clone()));
+    let mut operation = task::into_stream(editor.update(Message::CommitGroup)).unwrap();
+    let Some(Action::Output(completed @ Message::Completed(Ok(_)))) = block_on(operation.next())
+    else {
+        panic!("expected a reviewed group color assignment");
+    };
+    let _ = editor.update(completed);
+    let _ = editor.update(Message::Select(existing));
+    let mut favorite =
+        task::into_stream(editor.update(Message::ReviewJavaFavorite(existing, true))).unwrap();
+    let Some(Action::Output(completed @ Message::Completed(Ok(_)))) = block_on(favorite.next())
+    else {
+        panic!("expected an explicitly accepted Java favorite");
+    };
+    let _ = editor.update(completed);
+    let _ = editor.update(Message::Scope(Scope::Favorites));
+    let _ = editor.update(Message::SelectLocal(imported_shell));
+    assert_eq!(
+        editor.selected_local().map(|profile| profile.id),
+        Some(imported_shell)
+    );
+    let mut store = Store::open(connection_path.clone()).unwrap();
+    assert!(store.is_favorite(existing));
+    assert!(!store.has_java_favorite(existing));
+    assert!(!store.toggle_connection_favorites(&[existing], &[]).unwrap());
+    drop(store);
+    drop(editor);
+
     super::super::queue_restore_at(&local.0, inspect(), RestoreMode::JavaAdditive).unwrap();
     drop(ProfileLease::acquire(&local.0, || false).unwrap());
     let store = Store::open(connection_path).unwrap();
     assert!(!store.is_favorite(imported));
+    assert!(!store.has_java_favorite(imported));
+    assert!(!store.is_favorite(existing));
+    assert!(!store.has_java_favorite(existing));
+    assert!(!store.is_favorite(existing_shell));
+    assert!(!store.has_java_favorite(existing_shell));
     assert_eq!(store.group_color("Work/Imported"), TabColor::parse("#098"));
+    assert_eq!(store.group_color("Work"), Some(orphan.color));
+    assert!(!store.java_group_colors().contains(&orphan));
+}
+
+#[test]
+fn java_group_colors_restore_from_settings_alone_without_creating_folders() {
+    use crate::connection_store::Store;
+    use zip::{AesMode, ZipWriter, write::SimpleFileOptions};
+
+    let source = Scratch::new();
+    let local = Scratch::new();
+    let path = source.0.join("java-colors.zip");
+    let mut archive = ZipWriter::new(File::create(&path).unwrap());
+    archive
+        .start_file(
+            "global-settings.xml",
+            SimpleFileOptions::default()
+                .with_aes_encryption_bytes(AesMode::Aes256, b"archive-password"),
+        )
+        .unwrap();
+    archive
+        .write_all(
+            br##"<globalSettings>
+        <connectionGroupColors><group path="Old/Empty" color="#abc"/></connectionGroupColors>
+    </globalSettings>"##,
+        )
+        .unwrap();
+    archive.finish().unwrap();
+    let preview =
+        super::super::inspect_java_password(&path, &Secret::new("archive-password".into()))
+            .unwrap();
+    super::super::queue_restore_at(&local.0, preview, RestoreMode::JavaAdditive).unwrap();
+    drop(ProfileLease::acquire(&local.0, || false).unwrap());
+    let store = Store::open(local.0.join(CONNECTIONS)).unwrap();
+    assert!(store.connections().is_empty());
+    assert!(!store.has_group("Old/Empty"));
+    assert_eq!(
+        store.java_group_colors().iter().next().unwrap().source,
+        "Old/Empty"
+    );
 }
 
 #[test]

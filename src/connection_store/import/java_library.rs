@@ -4,8 +4,8 @@ use std::io;
 use roxmltree::{Document, ParsingOptions};
 
 use super::{MAX_PROFILES, invalid, kortty, library, valid_teamwork_id, xml};
-use crate::connection_store::TabColor;
 use crate::connection_store::custom_os_badges::JavaBadgeHint;
+use crate::connection_store::{JavaGroupColor, TabColor};
 
 const MAX_SETTINGS_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SETTINGS_NODES: u32 = 65_536;
@@ -15,6 +15,7 @@ const MAX_SETTINGS_NODES: u32 = 65_536;
 pub(crate) struct JavaLibrarySettings {
     pub(super) favorites: BTreeSet<String>,
     pub(super) group_colors: BTreeMap<String, TabColor>,
+    pub(super) group_color_hints: BTreeSet<JavaGroupColor>,
     pub(super) highlight_sets: Option<BTreeMap<String, String>>,
     pub(super) os_badges: BTreeMap<String, JavaBadgeHint>,
 }
@@ -94,6 +95,14 @@ impl JavaLibrarySettings {
                 } else {
                     None
                 };
+                if let Some(color) = color
+                    && result.group_color_hints.len() < MAX_PROFILES
+                {
+                    result.group_color_hints.insert(JavaGroupColor {
+                        source: path.clone(),
+                        color,
+                    });
+                }
                 colors
                     .entry(path)
                     .and_modify(|stored| {
@@ -147,6 +156,10 @@ impl JavaLibrarySettings {
     }
 
     pub(crate) fn counts(&self) -> (usize, usize) {
-        (self.favorites.len(), self.group_colors.len())
+        (self.favorites.len(), self.group_color_hints.len())
+    }
+
+    pub(crate) fn os_badges(&self) -> impl ExactSizeIterator<Item = &JavaBadgeHint> {
+        self.os_badges.values()
     }
 }

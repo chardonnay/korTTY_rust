@@ -4,7 +4,7 @@ use std::sync::Arc;
 use iced::widget::{button, column, container, row, scrollable, space, text, text_input};
 use iced::{Element, Length, Task};
 
-use crate::ai_manager::search::Reveal;
+use crate::ai_manager::search::{ProfileSetting, Reveal, Setting};
 use crate::local_ai::{self, LocalModelServer};
 
 use super::{ConnectionMode, Editor, Field, Message, ModelMode, Profile};
@@ -21,7 +21,7 @@ pub(crate) enum Action {
     UseServer(SocketAddr),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 enum Step {
     Connection,
     Model,
@@ -50,6 +50,59 @@ impl Wizard {
     pub(super) fn model_step_open(&self) -> bool {
         matches!(self.step, Step::Model)
     }
+
+    fn next_step(&self, step: Step) -> Result<Step, String> {
+        match step {
+            Step::Connection => self.profile.validate_connection().map(|()| Step::Model),
+            Step::Model if self.profile.is_managed() || self.profile.is_cli() => {
+                self.profile.validate_model().map(|()| Step::Name)
+            }
+            Step::Model
+                if self.profile.model_mode == ModelMode::Manual
+                    && self.profile.model.trim().is_empty() =>
+            {
+                Err("Enter a model identifier or choose automatic model selection".into())
+            }
+            Step::Model => Ok(Step::Name),
+            Step::Name => self.profile.validate().map(|()| Step::Test),
+            Step::Test => Ok(Step::Test),
+        }
+    }
+
+    fn reachable_step(&self, editable: bool) -> Step {
+        let mut step = self.step;
+        while editable && step != Step::Test {
+            let Ok(next) = self.next_step(step) else {
+                break;
+            };
+            step = next;
+        }
+        step
+    }
+
+    fn setting_step(&self, setting: Setting) -> Option<Step> {
+        match setting {
+            Setting::WizardScan => Some(Step::Connection),
+            Setting::WizardTest => Some(Step::Test),
+            Setting::Profile(ProfileSetting::Web(_)) => None,
+            Setting::Profile(ProfileSetting::Name) => Some(Step::Name),
+            Setting::Profile(ProfileSetting::CloudProvider)
+                if self.profile.remote_protocol().is_none() =>
+            {
+                Some(Step::Connection)
+            }
+            Setting::Profile(setting)
+                if setting != ProfileSetting::Default && setting.visible(&self.profile) =>
+            {
+                match setting.section() {
+                    super::Section::Connection => Some(Step::Connection),
+                    super::Section::Model => Some(Step::Model),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
 }
 
 enum Scan {
@@ -67,6 +120,62 @@ pub(crate) struct ScanResult {
 }
 
 impl Editor {
+    pub(in crate::ai_manager) fn wizard_search_settings(
+        &self,
+        editable: bool,
+    ) -> impl Iterator<Item = Setting> + '_ {
+        self.wizard.iter().flat_map(move |wizard| {
+            let reachable = wizard.reachable_step(editable);
+            ProfileSetting::ALL
+                .iter()
+                .copied()
+                .map(Setting::Profile)
+                .chain([Setting::WizardScan, Setting::WizardTest])
+                .filter(move |&setting| {
+                    (editable || setting != Setting::Profile(ProfileSetting::CloudProvider))
+                        && wizard.setting_step(setting).is_some_and(|step| {
+                            step == wizard.step || editable && step <= reachable
+                        })
+                })
+        })
+    }
+
+    pub(in crate::ai_manager) fn reveal_wizard_setting(
+        &mut self,
+        setting: Setting,
+        editable: bool,
+    ) -> bool {
+        let Some(wizard) = &self.wizard else {
+            return false;
+        };
+        let Some(step) = wizard.setting_step(setting) else {
+            return false;
+        };
+        if !editable
+            && (step != wizard.step || setting == Setting::Profile(ProfileSetting::CloudProvider))
+            || step > wizard.reachable_step(editable)
+        {
+            return false;
+        }
+        if step != wizard.step {
+            self.set_wizard_step(step);
+        }
+        true
+    }
+
+    fn set_wizard_step(&mut self, step: Step) {
+        let Some(wizard) = &mut self.wizard else {
+            return;
+        };
+        if matches!(wizard.scan, Some(Scan::Pending { .. })) {
+            wizard.scan = None;
+        }
+        wizard.step = step;
+        self.cancel_cli_catalog();
+        self.cli_discovery = None;
+        self.status = None;
+    }
+
     pub(super) fn update_wizard(&mut self, action: Action) {
         if matches!(action, Action::Open) {
             if let Some(profile) = self.new_profile() {
@@ -94,22 +203,7 @@ impl Editor {
             (Action::Back, Step::Model) => Ok(Step::Connection),
             (Action::Back, Step::Name) => Ok(Step::Model),
             (Action::Back, Step::Test) => Ok(Step::Name),
-            (Action::Next, Step::Connection) => {
-                wizard.profile.validate_connection().map(|()| Step::Model)
-            }
-            (Action::Next, Step::Model)
-                if wizard.profile.is_managed() || wizard.profile.is_cli() =>
-            {
-                wizard.profile.validate_model().map(|()| Step::Name)
-            }
-            (Action::Next, Step::Model)
-                if wizard.profile.model_mode == ModelMode::Manual
-                    && wizard.profile.model.trim().is_empty() =>
-            {
-                Err("Enter a model identifier or choose automatic model selection".into())
-            }
-            (Action::Next, Step::Model) => Ok(Step::Name),
-            (Action::Next, Step::Name) => wizard.profile.validate().map(|()| Step::Test),
+            (Action::Next, step) if step != Step::Test => wizard.next_step(step),
             (Action::Finish, Step::Test) => {
                 if let Some(wizard) = self.wizard.take() {
                     self.insert_profile(wizard.profile);
@@ -125,15 +219,7 @@ impl Editor {
             _ => return,
         };
         match outcome {
-            Ok(step) => {
-                if matches!(wizard.scan, Some(Scan::Pending { .. })) {
-                    wizard.scan = None;
-                }
-                wizard.step = step;
-                self.cancel_cli_catalog();
-                self.cli_discovery = None;
-                self.status = None;
-            }
+            Ok(step) => self.set_wizard_step(step),
             Err(error) => self.set_status(error),
         }
     }
@@ -244,14 +330,20 @@ impl Editor {
         let profile = &wizard.profile;
         let body = match wizard.step {
             Step::Connection => column![
-                (editable && profile.remote_protocol().is_none()).then(|| super::view::cloud_provider_picker(profile)),
+                (editable && profile.remote_protocol().is_none()).then(|| reveal.wrap(
+                    Setting::Profile(ProfileSetting::CloudProvider),
+                    super::view::cloud_provider_picker(profile),
+                )),
                 self.connection(profile, editable, reveal),
-                self.local_scan_view(wizard, editable),
+                reveal.wrap(Setting::WizardScan, self.local_scan_view(wizard, editable)),
             ].spacing(10).into(),
             Step::Model => self.model(profile, editable, reveal),
-            Step::Name => text_input("Profile name", &profile.name)
-                .on_input_maybe(editable.then_some(|value| Message::Edit(Field::Name, value)))
-                .into(),
+            Step::Name => {
+                let setting = Setting::Profile(ProfileSetting::Name);
+                let name = text_input("Profile name", &profile.name)
+                    .on_input_maybe(editable.then_some(|value| Message::Edit(Field::Name, value)));
+                reveal.wrap(setting, reveal.input(setting, editable, name))
+            }
             Step::Test => column![
                 text(&profile.name),
                 text(
@@ -274,9 +366,9 @@ impl Editor {
                     "Test the connection now or finish setup and test the profile later."
                 })
                     .size(13),
-                button(if profile.is_cli() { "Run fixed CLI test" } else { "Test connection" })
+                reveal.action(Setting::WizardTest, button(if profile.is_cli() { "Run fixed CLI test" } else { "Test connection" })
                     .style(button::secondary)
-                    .on_press_maybe(editable.then_some(Message::Test)),
+                    .on_press_maybe(editable.then_some(Message::Test))),
             ]
             .spacing(8)
             .into(),
@@ -302,7 +394,9 @@ impl Editor {
             text(wizard.step.title()).size(16),
             form_lock.map(|notice| text(notice).size(13)),
             self.status.as_deref().map(|status| text(status).size(13)),
-            scrollable(container(body).padding(4)).height(Length::Fill),
+            scrollable(container(body).padding(4))
+                .id(reveal.viewport.clone())
+                .height(Length::Fill),
             actions,
         ]
         .spacing(10)

@@ -6,6 +6,7 @@ use iced::widget::{button, column, row, text, text_input};
 use iced::{Element, Task};
 use serde::{Deserialize, Serialize};
 
+use crate::ai_manager::search::{ProfileSetting, Reveal, Setting};
 use crate::local_ai::{self, cli};
 use crate::ssh_dialog::unsafe_text;
 
@@ -26,6 +27,25 @@ pub(crate) struct Settings {
     pub(super) fingerprint: Option<[u8; 32]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     minimax: Option<MiniMaxSettings>,
+}
+
+impl Settings {
+    pub(super) fn searchable(&self, setting: ProfileSetting) -> bool {
+        match setting {
+            ProfileSetting::CliProvider
+            | ProfileSetting::CliExecutable
+            | ProfileSetting::CliModel
+            | ProfileSetting::CliPresets
+            | ProfileSetting::CliReview => true,
+            ProfileSetting::CliArguments => self.minimax.is_none() && !self.arguments.is_empty(),
+            ProfileSetting::CliAddArgument => self.minimax.is_none(),
+            ProfileSetting::CliReasoning => self.minimax.is_none() && self.uses_reasoning(),
+            ProfileSetting::MiniMaxModule
+            | ProfileSetting::MiniMaxConfig
+            | ProfileSetting::MiniMaxRegion => self.minimax.is_some(),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -504,18 +524,34 @@ impl Editor {
         &'a self,
         profile: &'a Profile,
         editable: bool,
+        reveal: &Reveal,
     ) -> Element<'a, Message> {
         let Some(settings) = &profile.cli else {
             return text("The CLI profile has no executable settings.").into();
         };
         let enabled = editable && !self.cli_review.checking;
+        let wrap = |setting, content: Element<'a, Message>| {
+            reveal.wrap(Setting::Profile(setting), content)
+        };
+        let input = |setting, input| {
+            wrap(
+                setting,
+                reveal
+                    .input(Setting::Profile(setting), enabled, input)
+                    .into(),
+            )
+        };
         let mut arguments = column![].spacing(6);
         for (index, argument) in settings.arguments.iter().enumerate() {
+            let argument = text_input("CLI argument", argument).on_input_maybe(
+                enabled.then_some(move |value| Message::Cli(Action::Argument(index, value))),
+            );
             arguments = arguments.push(
                 row![
-                    text_input("CLI argument", argument).on_input_maybe(
-                        enabled
-                            .then_some(move |value| Message::Cli(Action::Argument(index, value)))
+                    reveal.input(
+                        Setting::Profile(ProfileSetting::CliArguments),
+                        enabled && index == 0,
+                        argument
                     ),
                     button("Remove").style(button::secondary).on_press_maybe(
                         enabled.then_some(Message::Cli(Action::RemoveArgument(index)))
@@ -531,54 +567,66 @@ impl Editor {
             .flatten()
             .and_then(|candidate| candidate.program(&profile.model, profile.reasoning).ok());
         let mut content = column![
-            self.cli_catalog_view(profile, enabled && review.is_none()),
-            text_input(
-                if settings.minimax.is_some() {
-                    "Absolute Node.js executable path"
-                } else {
-                    "Absolute native executable path"
-                },
-                &settings.path
-            )
-            .on_input_maybe(enabled.then_some(|path| Message::Cli(Action::Path(path)))),
-            text_input("Optional model identifier", &profile.model)
-                .on_input_maybe(enabled.then_some(|value| Message::Edit(Field::Model, value))),
-            row![
-                button("LM Studio with model ID")
-                    .style(button::secondary)
-                    .on_press_maybe(enabled.then_some(Message::Cli(Action::LmStudioPreset {
-                        loaded_model: false
-                    }))),
-                button("LM Studio with loaded model")
-                    .style(button::secondary)
-                    .on_press_maybe(
-                        enabled
-                            .then_some(Message::Cli(Action::LmStudioPreset { loaded_model: true }))
-                    ),
-                button("Codex read-only stdin")
-                    .style(button::secondary)
-                    .on_press_maybe(enabled.then_some(Message::Cli(Action::CodexPreset))),
-                button("MiniMax CLI")
-                    .style(button::secondary)
-                    .on_press_maybe(enabled.then_some(Message::Cli(Action::MiniMaxPreset))),
-            ]
-            .spacing(8)
-            .wrap(),
+            wrap(
+                ProfileSetting::CliProvider,
+                self.cli_catalog_view(profile, enabled && review.is_none())
+            ),
+            input(
+                ProfileSetting::CliExecutable,
+                text_input(
+                    if settings.minimax.is_some() {
+                        "Absolute Node.js executable path"
+                    } else {
+                        "Absolute native executable path"
+                    },
+                    &settings.path
+                )
+                .on_input_maybe(enabled.then_some(|path| Message::Cli(Action::Path(path))))
+            ),
+            input(
+                ProfileSetting::CliModel,
+                text_input("Optional model identifier", &profile.model)
+                    .on_input_maybe(enabled.then_some(|value| Message::Edit(Field::Model, value)))
+            ),
+            wrap(
+                ProfileSetting::CliPresets,
+                row![
+                    button("LM Studio with model ID")
+                        .style(button::secondary)
+                        .on_press_maybe(enabled.then_some(Message::Cli(Action::LmStudioPreset {
+                            loaded_model: false
+                        }))),
+                    button("LM Studio with loaded model")
+                        .style(button::secondary)
+                        .on_press_maybe(enabled.then_some(Message::Cli(Action::LmStudioPreset {
+                            loaded_model: true
+                        }))),
+                    button("Codex read-only stdin")
+                        .style(button::secondary)
+                        .on_press_maybe(enabled.then_some(Message::Cli(Action::CodexPreset))),
+                    button("MiniMax CLI")
+                        .style(button::secondary)
+                        .on_press_maybe(enabled.then_some(Message::Cli(Action::MiniMaxPreset))),
+                ]
+                .spacing(8)
+                .wrap()
+                .into()
+            ),
         ]
         .spacing(8);
         if let Some(minimax) = &settings.minimax {
             content = content.push(column![
                 text("Choose Node.js 22.15 or later and the unmodified dist/mmx.mjs from mmx-cli 1.0.15 or 1.0.29. Sign in with mmx auth login. Refresh expired OAuth sessions with mmx auth refresh.").size(13),
-                text_input("Absolute path to dist/mmx.mjs", &minimax.module)
-                    .on_input_maybe(enabled.then_some(|path| Message::Cli(Action::MiniMaxModule(path)))),
-                text_input("Absolute path to the MiniMax config.json", &minimax.config)
-                    .on_input_maybe(enabled.then_some(|path| Message::Cli(Action::MiniMaxConfig(path)))),
-                row(cli::MiniMaxRegion::ALL.map(|region| {
+                input(ProfileSetting::MiniMaxModule, text_input("Absolute path to dist/mmx.mjs", &minimax.module)
+                    .on_input_maybe(enabled.then_some(|path| Message::Cli(Action::MiniMaxModule(path))))),
+                input(ProfileSetting::MiniMaxConfig, text_input("Absolute path to the MiniMax config.json", &minimax.config)
+                    .on_input_maybe(enabled.then_some(|path| Message::Cli(Action::MiniMaxConfig(path))))),
+                wrap(ProfileSetting::MiniMaxRegion, row(cli::MiniMaxRegion::ALL.map(|region| {
                     button(text(region.to_string())).style(if !minimax.require_region_selection && minimax.region == region { button::primary } else { button::secondary })
                     .on_press_maybe((enabled && (minimax.require_region_selection || minimax.region != region)).then_some(Message::Cli(Action::MiniMaxRegion(region))))
                         .into()
                 })).push(button("Use literal arguments").style(button::secondary)
-                    .on_press_maybe(enabled.then_some(Message::Cli(Action::LiteralArguments)))).spacing(8).wrap(),
+                    .on_press_maybe(enabled.then_some(Message::Cli(Action::LiteralArguments)))).spacing(8).wrap().into()),
                 minimax.require_region_selection.then(|| text("Select the region used by your MiniMax login.").size(13)),
                 text("The reviewed text command sends JSON over stdin to the selected MiniMax HTTPS endpoint. Proxy settings, redirects, and automatic OAuth refresh are disabled.").size(13),
             ].spacing(8));
@@ -587,14 +635,14 @@ impl Editor {
                 text("Both LM Studio presets replace the arguments and require an approved native lms executable. The loaded-model preset clears the model identifier. Load a model in LM Studio before testing. LM Studio selects a loaded model each time the CLI runs.").size(13),
                 text("The Codex preset replaces the arguments and clears the model identifier. It requires an approved native Codex executable and an existing Codex sign-in. Review the OpenAI destination before sending each request.").size(13),
                 self.cli_discovery_view(profile, enabled && review.is_none()),
-                arguments,
-                button("Add argument").style(button::secondary).on_press_maybe(
+                wrap(ProfileSetting::CliArguments, arguments.into()),
+                reveal.action(Setting::Profile(ProfileSetting::CliAddArgument), button("Add argument").style(button::secondary).on_press_maybe(
                     (enabled && settings.arguments.len() < cli::MAX_ARGS).then_some(Message::Cli(Action::AddArgument))
-                ),
-                settings.uses_reasoning().then(|| row![
+                )),
+                settings.uses_reasoning().then(|| wrap(ProfileSetting::CliReasoning, row![
                     text("Reasoning effort"),
                     super::view::choice(Reasoning::ALL, profile.reasoning, enabled, Message::Reasoning),
-                ].spacing(8)),
+                ].spacing(8).into())),
                 text("Use {model} and {reasoning} alone or inside an argument. Model default substitutes empty text for {reasoning}. Keep secrets out of arguments.").size(13),
                 text("Input uses UTF-8 stdin by default. Use {promptFile} for a combined private file, or include both {systemPromptFile} and {userPromptFile} for separate roles. File placeholders can appear inside an argument.").size(13),
             ].spacing(8));
@@ -603,29 +651,36 @@ impl Editor {
             .push(text("The CLI executable runs with your operating system permissions.").size(13))
             .push(text("Terminal Chat, Agent, Swarm, Scheduler and journal summaries require their own review before using this program.").size(13));
         if let Some(program) = review {
-            content = content.push(text(program.command_review()).size(13)).push(
-                row![
-                    button("Back")
-                        .style(button::secondary)
-                        .on_press(Message::Cli(Action::Back)),
-                    button("Approve CLI executable and arguments")
-                        .on_press_maybe(enabled.then_some(Message::Cli(Action::Approve))),
-                ]
-                .spacing(6),
-            );
+            content = content
+                .push(text(program.command_review()).size(13))
+                .push(wrap(
+                    ProfileSetting::CliReview,
+                    row![
+                        button("Back")
+                            .style(button::secondary)
+                            .on_press(Message::Cli(Action::Back)),
+                        button("Approve CLI executable and arguments")
+                            .on_press_maybe(enabled.then_some(Message::Cli(Action::Approve))),
+                    ]
+                    .spacing(6)
+                    .into(),
+                ));
         } else {
             if let Ok(program) = settings.program(&profile.model, profile.reasoning) {
                 content = content.push(text(program.command_review()).size(13));
             }
             content = content.push(
-                button(if self.cli_review.checking {
-                    "Checking executable…"
-                } else {
-                    "Review CLI executable…"
-                })
-                .on_press_maybe(
-                    (enabled && !self.cli_discovery_busy())
-                        .then_some(Message::Cli(Action::Inspect)),
+                reveal.action(
+                    Setting::Profile(ProfileSetting::CliReview),
+                    button(if self.cli_review.checking {
+                        "Checking executable…"
+                    } else {
+                        "Review CLI executable…"
+                    })
+                    .on_press_maybe(
+                        (enabled && !self.cli_discovery_busy())
+                            .then_some(Message::Cli(Action::Inspect)),
+                    ),
                 ),
             );
         }
