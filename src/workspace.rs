@@ -6238,7 +6238,7 @@ impl Workspace {
     }
 
     pub fn view(&self, id: window::Id) -> Element<'_, Message> {
-        let element = self.view_window(id);
+        let element = self.agent_log_keyboard(id, self.view_window(id));
         #[cfg(target_os = "macos")]
         let element = if let Some(window) = self
             .windows

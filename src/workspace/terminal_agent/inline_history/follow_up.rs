@@ -160,7 +160,7 @@ fn command_step(step: &Step, redactor: &Redactor) -> Result<ChatStep, String> {
         output,
         exit_code: step.exit_code.map(i64::from),
         status: Some(status),
-        elapsed_seconds: Some(step.elapsed_ms / 1000),
+        elapsed_seconds: step.elapsed_ms.map(|ms| ms / 1000),
         truncated: truncated.then_some(true),
     })
 }

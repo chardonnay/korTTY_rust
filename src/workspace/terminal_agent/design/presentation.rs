@@ -48,6 +48,7 @@ impl StatusVisibility {
 pub(crate) enum Message {
     Select(usize),
     SelectStep(u64),
+    LogTable(super::log_table::Message),
     ToggleStepList,
     Previous,
     Next,
@@ -97,6 +98,7 @@ pub(in crate::workspace::terminal_agent) struct Presentation {
     pub(super) status_events: StatusEvents,
     pub(super) selected_step: Option<u64>,
     pub(super) step_list_open: bool,
+    pub(super) log_table: super::log_table::State,
 }
 
 impl Presentation {
@@ -122,6 +124,7 @@ impl Presentation {
     ) {
         self.status_events.sync(transcript, finished, now);
         self.status_events.track_review(waiting, now);
+        self.log_table.sync(transcript, now);
     }
 
     pub(in crate::workspace::terminal_agent) fn load_activity(
@@ -181,6 +184,7 @@ impl Presentation {
                 self.selected_step = Some(identity);
                 self.drawer = true;
             }
+            Message::LogTable(message) => self.log_table.update(message),
             Message::ToggleStepList => self.step_list_open = !self.step_list_open,
             Message::Previous if len > 0 => {
                 self.selected = Some(self.identity(self.selection(len).saturating_sub(1)));

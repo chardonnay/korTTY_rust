@@ -10,6 +10,7 @@ impl Run {
         &self,
         palette: Option<palette::Palette>,
         remaining_allowed: bool,
+        reduced_motion: bool,
     ) -> Element<'_, Message> {
         let title = match self.mode {
             Mode::Run => "AI Agent",
@@ -125,7 +126,7 @@ impl Run {
         let show_activity =
             !reviewing_model && !showing_plan && !self.presentation.activity.collapsed;
         if show_activity && self.design.approval == Approval::BelowActivity {
-            page = page.push(self.activity_view(palette));
+            page = page.push(super::design::history_view(self, palette, reduced_motion));
         }
         if let Some(review) = self.model_review_view(Length::Fill) {
             page = page.push(review.map(Message::ReviewModel));
@@ -277,7 +278,7 @@ impl Run {
             }
         }
         if show_activity && self.design.approval == Approval::AboveActivity {
-            page = page.push(self.activity_view(palette));
+            page = page.push(super::design::history_view(self, palette, reduced_motion));
         }
         if let Some(export) = self.activity_export.view() {
             page = page.push(export);
@@ -328,10 +329,6 @@ impl Run {
             .wrap(),
         )
         .into()
-    }
-
-    fn activity_view(&self, palette: Option<palette::Palette>) -> Element<'_, Message> {
-        super::design::history_view(self, palette)
     }
 
     pub(super) fn model_review_view(

@@ -22,6 +22,9 @@ impl Workspace {
         message: Message,
     ) -> Task<Desktop> {
         if let Message::Design(message) = message {
+            if let design::Message::LogTable(design::log_table::Message::Navigate(key)) = message {
+                return run.navigate_agent_log(key);
+            }
             run.presentation.update(message, run.activity.len());
             return Task::none();
         }
@@ -284,7 +287,7 @@ impl Workspace {
                 }
                 run.ai_cancel = None;
                 let skill_usage = run.model_review.take().and_then(Review::into_skill_usage);
-                run.record_model_attempts(epoch, &report.attempts);
+                run.record_model_response(epoch, &report);
                 run.finish_model_repair(epoch, false);
                 if run.phase == Phase::FinalAdvice {
                     run.accept_final_advice(self, &report.result)?;
@@ -807,6 +810,7 @@ impl Run {
     ) -> Task<Desktop> {
         self.ai_cancel = Some(pending.cancel);
         let epoch = self.next(phase, notice);
+        self.begin_model_decision();
         let completion = Task::perform(
             async move {
                 Arc::new(match pending.reply.recv().await {

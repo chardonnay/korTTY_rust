@@ -93,15 +93,29 @@ pub(crate) enum StepState {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Step {
     pub id: u64,
+    pub recorded_at: Option<std::time::SystemTime>,
+    pub started_at: Option<std::time::Instant>,
     pub kind: Kind,
     pub title: String,
     pub detail: String,
     pub command: Option<String>,
     pub output: Vec<String>,
     pub exit_code: Option<u32>,
-    pub elapsed_ms: u64,
+    pub elapsed_ms: Option<u64>,
     pub tokens: Option<u64>,
     pub state: StepState,
+}
+
+impl Step {
+    pub(crate) fn elapsed_at(&self, now: std::time::Instant) -> Option<u64> {
+        self.elapsed_ms.or_else(|| {
+            let started = self
+                .started_at
+                .filter(|_| self.state == StepState::Running)?;
+            let elapsed = now.saturating_duration_since(started).as_millis();
+            Some(elapsed.min(u128::from(u64::MAX)) as u64)
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -127,6 +141,7 @@ pub(crate) struct Transcript {
     pub expanded: bool,
     pub prompt: Option<Prompt>,
     pub final_answer: String,
+    pub final_answer_at: Option<std::time::SystemTime>,
 }
 
 impl Transcript {

@@ -34,6 +34,12 @@ pub(in crate::workspace::terminal_agent) struct Panel {
     hidden: bool,
 }
 
+impl Panel {
+    pub(super) fn shows_history(&self) -> bool {
+        !self.folded && !self.hidden
+    }
+}
+
 pub(super) fn matches(run: &Run, session: SessionId, stream: u64) -> bool {
     !run.swarm
         && !run.closing
@@ -106,6 +112,7 @@ fn body<'a>(
     id: window::Id,
     run: &'a Run,
     palette: Option<Palette>,
+    reduced_motion: bool,
 ) -> Element<'a, AgentMessage> {
     let panel = &run.presentation.pip;
     let mut content = column![title(panel, true)].spacing(4);
@@ -149,7 +156,7 @@ fn body<'a>(
         }
         // There is only one presenter for the selected history. Status stays outside PiP.
         content = content
-            .push(super::history_with_steps(run, palette))
+            .push(super::history_with_steps(run, palette, reduced_motion))
             .push(super::controls(run));
     }
     panel_view(content, palette)
@@ -175,7 +182,7 @@ pub(super) fn decorate<'a>(
                 .into(),
         )
     } else {
-        body(state, id, run, palette)
+        body(state, id, run, palette, reduced_motion)
     };
     surface::view(
         terminal,
@@ -199,9 +206,10 @@ pub(in crate::workspace::terminal_agent) fn detached_view(
     state: &State,
     run_id: window::Id,
     palette: Option<Palette>,
+    reduced_motion: bool,
 ) -> Element<'_, AgentMessage> {
     let run = &state.runs[&run_id];
-    body(state, run_id, run, palette)
+    body(state, run_id, run, palette, reduced_motion)
         .map(move |message| AgentMessage::PipOwned(run_id, Box::new(message)))
 }
 

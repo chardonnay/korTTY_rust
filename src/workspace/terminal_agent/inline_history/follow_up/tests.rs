@@ -132,7 +132,7 @@ fn newly_learned_password_is_remasked_before_clipping_the_stored_trace() {
         ),
         "",
     );
-    run.inline.as_mut().unwrap().transcript.steps[1].elapsed_ms = 2_345;
+    run.inline.as_mut().unwrap().transcript.steps[1].elapsed_ms = Some(2_345);
     let learned = RedactionSecrets::with_secret(None, LEARNED).unwrap();
     run.redactor = run.redactor.with_overlay(&learned).unwrap();
     run.learned_sudo = Some(learned);

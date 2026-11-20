@@ -323,7 +323,7 @@ impl Workspace {
                 })?;
                 run.ai_cancel = None;
                 let skill_usage = run.model_review.take().and_then(Review::into_skill_usage);
-                run.record_model_attempts(epoch, &report.attempts);
+                run.record_model_response(epoch, &report);
                 run.finish_model_repair(epoch, false);
                 let mut reply = report.result.as_ref().map_err(Clone::clone)?.clone();
                 reply.redact(&|text| mask::prompt(&run.redactor, text))?;
@@ -575,6 +575,7 @@ impl Workspace {
         run.transport = Some((transport.clone(), *limit));
         run.ai_cancel = Some(pending.cancel);
         let epoch = run.next(Phase::Thinking, "Waiting for the planning response…");
+        run.begin_model_decision();
         let completion = Task::perform(
             async move {
                 Arc::new(match pending.reply.recv().await {
