@@ -343,6 +343,8 @@ pub(crate) struct Configuration {
     java_memory_preferences: memory::JavaPreferences,
     #[serde(skip_serializing_if = "skills::JavaPreferences::is_empty")]
     java_skill_preferences: skills::JavaPreferences,
+    #[serde(skip_serializing_if = "skills::java_providers::Hints::is_empty")]
+    java_skill_providers: skills::java_providers::Hints,
     #[serde(skip_serializing_if = "Option::is_none")]
     java_agent_shortcut: Option<JavaAgentShortcut>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -459,6 +461,7 @@ impl Default for Configuration {
             java_memory_tokens: None,
             java_memory_preferences: memory::JavaPreferences::default(),
             java_skill_preferences: skills::JavaPreferences::default(),
+            java_skill_providers: skills::java_providers::Hints::default(),
             java_agent_shortcut: None,
             java_agent_execution_enabled: None,
             java_agent_confirm_mutating: None,
@@ -839,6 +842,7 @@ impl Configuration {
         self.java_roles.validate()?;
         self.java_model_hints.validate()?;
         self.java_knowledge_hints.validate()?;
+        self.java_skill_providers.validate()?;
         self.skills.validate().map_err(invalid)
     }
 
@@ -2699,7 +2703,8 @@ impl Dialog {
             profile_policy: ProfilePolicy::load(),
             skills: skills::Editor::default()
                 .with_statistics_root(profile.clone())
-                .with_imported_preferences(saved.java_skill_preferences),
+                .with_imported_preferences(saved.java_skill_preferences)
+                .with_java_providers(saved.java_skill_providers.clone()),
             skill_store: saved.skills.clone(),
             memory: memory::State::new(
                 saved.memory.clone(),
@@ -3423,7 +3428,7 @@ impl Dialog {
                     .flatten();
                 return self
                     .skills
-                    .update(&mut self.skill_store, event, profile)
+                    .update_with_vault(&mut self.skill_store, event, profile, vault)
                     .map(Message::Skills);
             }
             Message::Memory(event)
@@ -3706,15 +3711,34 @@ impl Dialog {
             search::Target::Setting(search::Setting::Knowledge(setting))
                 if setting.needs_store() =>
             {
-                self.local
-                    .can_reveal_knowledge_setting(&self.local_state, setting)
+                self.local.can_reveal_knowledge_setting(
+                    &self.local_state,
+                    self.profiles.catalog(),
+                    setting,
+                )
             }
             search::Target::Setting(search::Setting::Hub(setting)) => self
                 .local
                 .can_reveal_hub_setting(setting, self.editable() && self.general.features_enabled),
+            search::Target::Setting(search::Setting::Managed(setting)) => {
+                self.local.can_reveal_managed_setting(
+                    setting,
+                    self.editable(),
+                    self.general.features_enabled,
+                )
+            }
+            search::Target::Setting(search::Setting::Mlx(setting)) => self
+                .local
+                .can_reveal_mlx_setting(setting, self.editable(), self.general.features_enabled),
+            search::Target::Setting(search::Setting::SkillProvider(setting)) => {
+                self.editable()
+                    && self
+                        .skills
+                        .has_provider_search_setting(setting, &self.skill_store)
+            }
             search::Target::Setting(search::Setting::Control(control)) => match control.page() {
                 Page::Skills => self.editable() && self.skills.has_search_control(control),
-                Page::Memory => self.memory.has_search_controls(),
+                Page::Memory => self.memory.has_search_control(control),
                 Page::LocalModels => self.local.can_reveal_runtime_control(
                     control,
                     self.editable(),
@@ -3760,9 +3784,22 @@ impl Dialog {
             self.revealed.setting = Some(setting);
             return self.revealed.apply();
         }
-        if matches!(target, search::Target::Setting(search::Setting::Hub(_)))
-            && !self.search_target_available(target)
-        {
+        let state_dependent = match target {
+            search::Target::Setting(
+                search::Setting::Hub(_)
+                | search::Setting::Managed(_)
+                | search::Setting::Mlx(_)
+                | search::Setting::SkillProvider(_),
+            ) => true,
+            search::Target::Setting(search::Setting::Knowledge(setting)) => {
+                setting.needs_active_review()
+            }
+            search::Target::Setting(search::Setting::Control(control)) => {
+                control.contextual_memory() || control.contextual_skill()
+            }
+            _ => false,
+        };
+        if state_dependent && !self.search_target_available(target) {
             return Task::none();
         }
         self.page = target.page();
@@ -3791,12 +3828,26 @@ impl Dialog {
                 iced::widget::operation::RelativeOffset::START,
             )
         };
+        if let Some(search::Setting::Managed(setting)) = self.revealed.setting {
+            let load = self.local.reveal_managed_setting(setting, self.editable());
+            return Task::batch([scroll, load.map(Message::Local)]);
+        }
+        if let Some(search::Setting::Mlx(setting)) = self.revealed.setting {
+            return Task::batch([
+                scroll,
+                self.local.reveal_mlx_setting(setting).map(Message::Local),
+            ]);
+        }
         if matches!(
             self.revealed.setting,
             Some(
                 search::Setting::Profile(search::ProfileSetting::Web(_)) | search::Setting::Hub(_)
             )
         ) {
+            return scroll;
+        }
+        if matches!(self.revealed.setting, Some(search::Setting::Control(control)) if control.contextual_memory())
+        {
             return scroll;
         }
         let load = match self.page {
@@ -3942,6 +3993,7 @@ impl Dialog {
                 java_memory_tokens: self.saved.java_memory_tokens,
                 java_memory_preferences: self.saved.java_memory_preferences,
                 java_skill_preferences: self.saved.java_skill_preferences,
+                java_skill_providers: self.saved.java_skill_providers.clone(),
                 java_agent_shortcut: self.saved.java_agent_shortcut.clone(),
                 java_agent_execution_enabled: self.saved.java_agent_execution_enabled,
                 java_agent_confirm_mutating: self.saved.java_agent_confirm_mutating,
@@ -4406,10 +4458,20 @@ impl Dialog {
                 })
     }
 
+    #[cfg(test)]
     pub(crate) fn view(
         &self,
         hub_tokens: Vec<CredentialChoice>,
         qdrant_keys: Vec<CredentialChoice>,
+    ) -> Element<'_, Message> {
+        self.view_with_skill_credentials(hub_tokens, qdrant_keys, &[])
+    }
+
+    pub(crate) fn view_with_skill_credentials(
+        &self,
+        hub_tokens: Vec<CredentialChoice>,
+        qdrant_keys: Vec<CredentialChoice>,
+        skill_credentials: &[CredentialChoice],
     ) -> Element<'_, Message> {
         if let Some(wizard) = &self.setup {
             return container(wizard.view(self.editable(), hub_tokens).map(Message::Setup))
@@ -4484,7 +4546,12 @@ impl Dialog {
                     .map(Message::Profiles),
                 Page::Skills if self.editable() => self
                     .skills
-                    .view(&self.skill_store, self.can_shorten_skill(), &self.revealed)
+                    .view(
+                        &self.skill_store,
+                        self.can_shorten_skill(),
+                        &self.revealed,
+                        skill_credentials,
+                    )
                     .map(Message::Skills),
                 Page::Memory => self
                     .memory

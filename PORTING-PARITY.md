@@ -16,6 +16,192 @@ open until a result is recorded for the tested revision and environment. Both
 Mosh modes are out of scope. The editor has a reduced native scope with structure
 navigation for classes, functions, variables, and placeholders.
 
+## November 20 Java external skill provider suggestions
+
+Java v2.26.0 settings imports retain valid GitHub, SkillsMP and HTTP
+provider metadata as inactive suggestions in the AI Manager. The
+Providers panel opens a selected suggestion as a disabled draft. A
+provider with Java authentication requires an explicit credential
+choice before Apply or Test. Applying the draft adds it under a
+new native ID. A repeat import preserves the existing suggestion
+and provider. The migration report counts omitted provider entries
+and encrypted secret fields separately.
+
+Native desktop acceptance and configured provider tests remain under U3.
+[Java provider model](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/model/AiSkillProvider.java)
+
+## November 20 vault-backed external skill provider requests
+
+The provider editor can assign or clear an unlocked external skill
+credential and retains environment-variable authentication. Saved provider
+profiles contain a vault ID. A change to the provider type, URL or HTTP
+Basic username requires an explicit credential choice before Apply or Test.
+The request client enforces the provider's URL scope, rejects credential
+echoes and discards in-flight results and reviewed changes after the
+vault revision expires.
+
+The loopback regression exercises GitHub and SkillsMP bearer headers,
+HTTP Basic, Markdown review and update, an out-of-scope path, credential
+echo and vault lock. The editor regression checks typed selection and
+retargeting. Native desktop interaction and configured provider deployments
+remain under U3.
+[Apple Silicon tests](target/verification/20261120-skill-provider-auth-macos-final.log)
+· [Windows ARM64 Clippy](target/verification/20261120-skill-provider-auth-clippy-final.log)
+
+## November 20 external skill provider vault credential
+
+The vault has a dedicated entry type for an external skill provider token
+or HTTP Basic password. It uses the existing encrypted envelope and keeps
+the secret separate from SSH, Hugging Face and Qdrant credentials. The
+native vault editor uses a masked input and validates length and control
+characters. Provider selection and request authorization remain under U3.
+
+The vault regression covers invalid input, credential rotation, encrypted
+storage, typed lookup and reopening a vault that also contains an SSH
+entry. The vault editor regression covers input validation and SSH scope.
+[Apple Silicon tests](target/verification/20261120-skill-provider-vault-macos.log)
+· [Windows ARM64 Clippy](target/verification/20261120-skill-provider-vault-clippy.log)
+
+## November 20 Skills provider editor search
+
+When the Providers panel is open, AI Manager search reaches the active
+provider draft, including URL and credential environment fields, HTTP
+Basic username and sample document, and the available Apply, Revert,
+Test and Close actions. A result reveals the control and focuses text
+inputs. Apply and Test still require explicit activation.
+
+The Java provider dialog also stores encrypted tokens and passwords.
+Rust currently supports environment-based credentials. Vault-backed
+provider credentials are tracked under U3.
+[Java provider dialog](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AiSkillProvidersDialog.java#L51)
+· [Apple Silicon tests](target/verification/20261120-skill-provider-search-macos.log)
+· [Windows ARM64 Clippy](target/verification/20261120-skill-provider-search-clippy.log)
+
+## November 20 Skills library controls and provider entry point
+
+The Skills library has a direct Providers button that opens the existing
+provider editor, matching the Java pane. AI Manager search can focus the
+library filter and reveal sorting, provider access, the selected skill's
+target and activation, editor sections, bundled-skill actions and eligible
+Java preference suggestions. The active skill draft and editor-local Find
+stay open when a result is revealed.
+
+The regression verifies the library filter receives keyboard input,
+keeps a dirty skill and its Find session, and rejects a stale skill
+configuration result after the Providers panel opens.
+[Java Skills pane](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AiSkillsPane.java#L235)
+· [Apple Silicon tests](target/verification/20261120-skill-controls-search-macos.log)
+· [Windows ARM64 Clippy](target/verification/20261120-skill-controls-search-clippy.log)
+
+## November 20 Memory editor, history and reference search
+
+The AI Manager can reveal imported Memory preferences, Markdown Find
+and Save, the open entry editor's actions, history restore, and external
+reference actions. Results follow the active Memory view, draft, preview
+and policy. The Memory pane keeps the editor's Find session and unsaved
+text when search reveals a control. Revealing an action leaves activation
+to the user.
+
+The native regression checks a Java budget suggestion, an unsaved
+Markdown draft with Find open, keyboard focus in the external reference
+path and rejection of a stale result after leaving that view.
+[Java Memory controls](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AiMemoryPane.java#L141)
+· [Apple Silicon tests](target/verification/20261120-memory-controls-search-macos.log)
+· [Windows ARM64 Clippy](target/verification/20261120-memory-controls-search-clippy.log)
+
+## November 20 Knowledge Store profile and embedding destination search
+
+The AI Manager reveals the selected store's terminal chat, code analysis
+and Agent usage controls, embedding consent, and the current automatic
+embedding or Qdrant approval action. Search follows the active profile
+assignments, embedding setup and prior approval. Revealing a control
+preserves the store draft and leaves the existing consent actions explicit.
+
+The regression uses a local source and a draft Qdrant destination. It
+checks a resolved chat profile, an unavailable coding profile, the
+Agent usage target and the transition to the Qdrant capacity action.
+[Apple Silicon tests](target/verification/20261120-knowledge-destination-controls-macos.log)
+· [Windows ARM64 Clippy](target/verification/20261120-knowledge-destination-controls-clippy.log)
+
+## November 20 Knowledge Store file-limit and removal search
+
+The AI Manager can reveal and focus the open source file size limit field
+and reveal its Apply and Cancel buttons. The store removal control and
+the active confirmation are searchable. A search reveal preserves the
+draft and leaves the action for the user to activate explicitly. Closing
+an editor or confirmation removes its action targets.
+
+The Apple Silicon regression typed through the revealed widget and
+checked that revealing Apply and the store removal confirmation kept
+the source and store unchanged. Native desktop acceptance remains under D4.
+[Apple Silicon tests](target/verification/20261120-knowledge-source-controls-macos-final.log)
+· [Windows ARM64 Clippy](target/verification/20261120-knowledge-source-controls-clippy-final.log)
+
+## November 20 Knowledge Store folder-review search
+
+The AI Manager can reveal the active folder review's summary, available
+page controls, approval and discard. Revealing a result leaves the
+current review and page in place. The action still requires its own
+activation. Discarding the review removes its search results.
+
+An Apple Silicon test scanned 129 text files into two pages, used the
+search on both pages, and verified that choosing the approval result
+left the store and reviewed manifest intact. All 18 selected AI Manager
+tests passed. Strict workspace Clippy passed on Windows ARM64.
+[Apple Silicon tests](target/verification/20261120-knowledge-folder-search-macos.log)
+· [Windows ARM64 Clippy](target/verification/20261120-knowledge-folder-search-clippy.log)
+
+## November 20 MLX idle timeout and Never unload
+
+The MLX model settings provide the Java Never unload option. It disables
+the timed field and preserves its draft value until the user unchecks the
+option. Saving writes zero minutes for Never unload or a timeout between
+1 and 1,440 minutes. An existing zero-minute model or reviewed Java
+setting opens with the checkbox selected. The AI Manager can reveal the
+checkbox through search.
+
+Apple Silicon passed a native manager-to-registry test that reopened a
+zero-minute registration, toggled back to a 37-minute timeout, saved it,
+and adopted a Java zero-minute setting. All 17 selected AI Manager tests
+passed. Rustfmt and strict workspace Clippy passed on Windows ARM64.
+[Java MLX idle controls](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/LocalModelManagerPane.java#L2049)
+· [Apple Silicon tests](target/verification/20261120-mlx-idle-configuration-macos.log)
+· [Windows ARM64 Clippy](target/verification/20261120-mlx-idle-configuration-windows-clippy.log)
+
+## November 20 managed Apple MLX controls in AI Manager search
+
+On supported Apple Silicon, search opens local model and signed runtime
+fields, the registered model picker, runtime lifecycle controls and the
+matching action in an active review. Runtime download policy removes
+online targets while leaving offline fields available. The model and
+runtime review actions still require an explicit confirmation.
+
+Apple Silicon passed three MLX, six managed GGUF and seven general AI
+Manager search tests. The MLX widget test typed into the revealed
+signature path, display name and idle timeout, checked download policy,
+and selected the removal confirmation without removing the model.
+Rustfmt and strict workspace Clippy passed on Windows ARM64. Native
+desktop acceptance remains under D4.
+[Java MLX configuration](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/LocalModelManagerPane.java#L2038)
+· [Apple Silicon tests](target/verification/20261120-mlx-control-search-macos.log)
+· [Windows ARM64 Clippy](target/verification/20261120-mlx-control-search-windows-clippy.log)
+
+## November 20 managed GGUF controls in AI Manager search
+
+The Local Models page exposes search results for managed GGUF import,
+registration, selection, runtime actions and the active model review.
+Selecting a configuration field opens the draft for the selected model
+and focuses editable text. Selecting another field retains the draft.
+The regular review and save actions remain explicit.
+
+Apple Silicon passed six managed-model tests and seven AI Manager search
+tests, including keyboard focus and draft retention for GPU layers and
+CPU threads. Rustfmt and strict workspace Clippy passed on Windows ARM64.
+Native desktop acceptance remains under D4.
+[Java model controls](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/LocalModelManagerPane.java#L768)
+· [Apple Silicon tests](target/verification/20261120-gguf-control-search-macos.log)
+· [Windows ARM64 Clippy](target/verification/20261120-gguf-control-search-windows-clippy.log)
+
 ## November 20 Hub MLX pause, resume and discard
 
 The MLX transfer saves a private receipt with the reviewed manifest and

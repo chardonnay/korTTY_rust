@@ -1,11 +1,12 @@
 //! External skill discovery and explicitly reviewed library changes.
 
-use std::{collections::HashSet, fmt};
+use std::{collections::HashSet, fmt, sync::Weak};
 
 use serde::{Deserialize, Serialize};
 use url::Url;
 
 use super::{Skill, Store};
+use crate::vault_window::VaultWindow;
 
 mod github;
 mod http;
@@ -58,7 +59,11 @@ pub(crate) struct ProviderProfile {
     pub(crate) provider: Provider,
     pub(crate) base_url: String,
     pub(crate) credential_env: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) vault_credential: Option<String>,
     pub(crate) username: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) java_source: Option<String>,
 }
 
 impl Default for ProviderProfile {
@@ -70,7 +75,9 @@ impl Default for ProviderProfile {
             provider: Provider::default(),
             base_url: String::new(),
             credential_env: String::new(),
+            vault_credential: None,
             username: String::new(),
+            java_source: None,
         }
     }
 }
@@ -90,14 +97,30 @@ impl ProviderProfile {
             return Err("Enter a valid external skill provider name and username.".into());
         }
         let base = self.base()?;
+        if self
+            .java_source
+            .as_deref()
+            .is_some_and(|id| !super::java_providers::valid_source_id(id))
+        {
+            return Err("Invalid Java skill provider source ID.".into());
+        }
         let credential = self.credential_name();
         crate::local_ai::validate_credential(credential)?;
-        if credential.is_some() && base.is_none()
-            || !self.username.is_empty()
-                && (self.provider != Provider::Http || credential.is_none())
+        if self
+            .vault_credential
+            .as_ref()
+            .is_some_and(|id| !kortty_vault::valid_credential_id(id) || credential.is_some())
         {
             return Err(
-                "Set a provider URL and credential variable before enabling authentication.".into(),
+                "Choose one valid credential source for the external skill provider.".into(),
+            );
+        }
+        if self.has_credential() && base.is_none()
+            || !self.username.is_empty()
+                && (self.provider != Provider::Http || !self.has_credential())
+        {
+            return Err(
+                "Set a provider URL and choose a credential before enabling authentication.".into(),
             );
         }
         Ok(())
@@ -107,7 +130,11 @@ impl ProviderProfile {
         (!self.credential_env.is_empty()).then_some(self.credential_env.as_str())
     }
 
-    fn base(&self) -> Result<Option<Url>, String> {
+    fn has_credential(&self) -> bool {
+        self.vault_credential.is_some() || self.credential_name().is_some()
+    }
+
+    pub(super) fn base(&self) -> Result<Option<Url>, String> {
         if self.base_url.trim().is_empty() {
             self.provider.default_base().map(parse_url).transpose()
         } else {
@@ -142,10 +169,18 @@ pub(super) fn validate_profiles(profiles: &[ProviderProfile]) -> Result<(), Stri
         return Err("The external skill provider limit was reached.".into());
     }
     let mut ids = HashSet::new();
+    let mut java_sources = HashSet::new();
     for profile in profiles {
         profile.validate()?;
         if !ids.insert(profile.id) {
             return Err("An external skill provider ID is duplicated.".into());
+        }
+        if profile
+            .java_source
+            .as_deref()
+            .is_some_and(|source| !java_sources.insert(source))
+        {
+            return Err("A Java skill provider source ID is duplicated.".into());
         }
     }
     Ok(())
@@ -292,6 +327,7 @@ pub(crate) struct Candidate {
     route: Route,
     catalogue: ProviderProfile,
     resolve_repository: bool,
+    vault_revision: Option<Weak<()>>,
 }
 
 impl Candidate {
@@ -313,6 +349,7 @@ impl Candidate {
             route,
             catalogue: catalogue.clone(),
             resolve_repository: false,
+            vault_revision: None,
         })
     }
 }
@@ -324,6 +361,7 @@ pub(crate) struct Document {
     pub(crate) revision: String,
     provider: Option<ProviderProfile>,
     catalogue: Option<ProviderProfile>,
+    vault_revision: Option<Weak<()>>,
 }
 
 impl Document {
@@ -340,9 +378,6 @@ impl Document {
         }
         let markdown = String::from_utf8(bytes)
             .map_err(|_| "The external Markdown file is not valid UTF-8.")?;
-        if let Some(profile) = provider {
-            http::require_no_credential_echo(profile, &markdown)?;
-        }
         let mut skill = Skill::parse(&markdown, name, false)?;
         if skill.content.trim().is_empty() {
             return Err("The external Markdown file does not contain skill instructions.".into());
@@ -369,6 +404,7 @@ impl Document {
             revision,
             provider: provider.cloned(),
             catalogue: catalogue.cloned(),
+            vault_revision: None,
         })
     }
 
@@ -380,6 +416,7 @@ impl Document {
     }
 
     fn require_current(&self, store: &Store) -> Result<(), String> {
+        http::require_vault_revision(self.vault_revision.as_ref())?;
         http::require_policy()?;
         if self.source()?.route.current(&store.external_providers)? != self.provider.as_ref()
             || self.catalogue.as_ref().is_some_and(|old| {
@@ -416,14 +453,25 @@ pub(crate) struct Client {
 }
 
 pub(crate) use http::Cancellation;
+pub(super) use http::require_vault_revision;
 
 impl Client {
-    pub(crate) fn new(profiles: &[ProviderProfile], provider_id: u64) -> Result<Self, String> {
+    pub(crate) fn new(
+        profiles: &[ProviderProfile],
+        provider_id: u64,
+        vault: Option<&VaultWindow>,
+    ) -> Result<Self, String> {
         let catalogue = selected_profile(profiles, provider_id)?.clone();
+        let eligible = profiles.iter().filter(|profile| {
+            profile.id == provider_id
+                || (catalogue.provider == Provider::SkillsMp
+                    && profile.provider == Provider::GitHub)
+        });
+        let network = http::Network::new(eligible, vault)?;
         Ok(Self {
             profiles: profiles.to_vec(),
             catalogue,
-            network: http::Network::new()?,
+            network,
         })
     }
 
@@ -431,19 +479,31 @@ impl Client {
         self.network.cancel_handle()
     }
 
+    pub(crate) fn vault_revision(&self) -> Option<Weak<()>> {
+        self.network.vault_revision()
+    }
+
     pub(crate) fn search(&self, query: &str) -> Result<Vec<Candidate>, String> {
         http::require_policy()?;
+        self.network.require_credential(&self.catalogue)?;
         let operation = self.network.operation();
-        match self.catalogue.provider {
+        let mut results = match self.catalogue.provider {
             Provider::Http => Ok(vec![self.http_candidate(query)?]),
             Provider::GitHub => github::search(&operation, &self.catalogue, query),
             Provider::SkillsMp => {
                 skillsmp::search(&operation, &self.catalogue, &self.profiles, query)
             }
+        }?;
+        let revision = self.vault_revision();
+        http::require_vault_revision(revision.as_ref())?;
+        for result in &mut results {
+            result.vault_revision.clone_from(&revision);
         }
+        Ok(results)
     }
 
     pub(crate) fn fetch(&self, candidate: &Candidate) -> Result<Document, String> {
+        http::require_vault_revision(candidate.vault_revision.as_ref())?;
         if candidate.catalogue != self.catalogue {
             return Err("The selected skill provider changed. Search again.".into());
         }
@@ -458,7 +518,9 @@ impl Client {
                 &operation, &base, download, file,
             )?);
         }
-        fetch_route(&operation, &route, &self.profiles, Some(&self.catalogue))
+        let mut document = fetch_route(&operation, &route, &self.profiles, Some(&self.catalogue))?;
+        document.vault_revision = self.vault_revision();
+        Ok(document)
     }
 
     pub(crate) fn test(&self, query: &str) -> Result<(), String> {
@@ -532,6 +594,11 @@ fn fetch_route(
             github::fetch(operation, &base, profile, file)?
         }
     };
+    if let Some(profile) = profile
+        && let Ok(markdown) = std::str::from_utf8(&bytes)
+    {
+        operation.require_no_credential_echo(profile, markdown)?;
+    }
     Document::new(route, profile, catalogue, &name, bytes, revision)
 }
 
@@ -541,10 +608,13 @@ pub(crate) struct UpdateClient {
 }
 
 impl UpdateClient {
-    pub(crate) fn new(profiles: &[ProviderProfile]) -> Result<Self, String> {
+    pub(crate) fn new(
+        profiles: &[ProviderProfile],
+        vault: Option<&VaultWindow>,
+    ) -> Result<Self, String> {
         Ok(Self {
             profiles: profiles.to_vec(),
-            network: http::Network::new()?,
+            network: http::Network::new(profiles.iter(), vault)?,
         })
     }
 
@@ -552,17 +622,22 @@ impl UpdateClient {
         self.network.cancel_handle()
     }
 
+    pub(crate) fn vault_revision(&self) -> Option<Weak<()>> {
+        self.network.vault_revision()
+    }
+
     pub(crate) fn check(&self, id: u64, skill: &Skill) -> Result<Option<Update>, String> {
         let source = skill
             .external
             .as_ref()
             .ok_or("This skill has no external source.")?;
-        let latest = fetch_route(
+        let mut latest = fetch_route(
             &self.network.operation(),
             &source.route,
             &self.profiles,
             None,
         )?;
+        latest.vault_revision = self.vault_revision();
         if latest.revision == source.revision
             || source.skipped_revision.as_ref() == Some(&latest.revision)
         {

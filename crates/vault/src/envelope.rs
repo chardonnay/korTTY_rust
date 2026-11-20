@@ -27,6 +27,7 @@ const COUNT_BYTES: usize = size_of::<u32>();
 const WEBHOOK_WITH_SETTINGS: u8 = 6;
 const QDRANT_API_KEY: u8 = 8;
 const SSH_PASSWORD_COMMAND: u8 = 9;
+const SKILL_PROVIDER_CREDENTIAL: u8 = 10;
 const SALT_START: usize = MAGIC.len() + 1 + 3 * size_of::<u32>();
 const NONCE_START: usize = SALT_START + SALT_BYTES;
 const HEADER_BYTES: usize = NONCE_START + NONCE_BYTES;
@@ -202,6 +203,7 @@ pub(super) fn seal<'a>(
             CredentialKind::SudoGroupPassword => 7,
             CredentialKind::QdrantApiKey => QDRANT_API_KEY,
             CredentialKind::SshPasswordCommand => SSH_PASSWORD_COMMAND,
+            CredentialKind::SkillProviderCredential => SKILL_PROVIDER_CREDENTIAL,
         });
         for field in fields(entry) {
             bytes.extend_from_slice(&(field.len() as u32).to_be_bytes());
@@ -265,6 +267,7 @@ fn decode(mut plaintext: &[u8]) -> Result<BTreeMap<String, Entry>, Error> {
             7 => CredentialKind::SudoGroupPassword,
             QDRANT_API_KEY => CredentialKind::QdrantApiKey,
             SSH_PASSWORD_COMMAND => CredentialKind::SshPasswordCommand,
+            SKILL_PROVIDER_CREDENTIAL => CredentialKind::SkillProviderCredential,
             _ => return Err(Error::InvalidFormat),
         };
         let mut entry = Entry {

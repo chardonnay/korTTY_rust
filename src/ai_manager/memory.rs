@@ -424,8 +424,57 @@ impl State {
         )
     }
 
-    pub(super) fn has_search_controls(&self) -> bool {
-        self.can_read_files() && !self.reviewing_document()
+    pub(super) fn has_search_control(&self, control: super::search::Control) -> bool {
+        use super::search::Control::*;
+
+        if !self.can_read_files() || self.reviewing_document() {
+            return false;
+        }
+        let editable = self.editable && !self.pending && self.decision.is_none();
+        match control {
+            UseImportedMemoryActivation => editable && self.imported_preferences.enabled.is_some(),
+            UseImportedMemoryLearning => {
+                editable
+                    && self.policy.learning.is_none()
+                    && self.imported_preferences.learning.is_some()
+            }
+            UseImportedMemoryBudget => {
+                editable && self.can_adjust_budget() && self.imported_token_budget.is_some()
+            }
+            FindMemoryMarkdown => self.can_find_markdown(),
+            SaveMemoryMarkdown => {
+                matches!(self.page, Page::Markdown)
+                    && self.can_write_files()
+                    && !self.pending
+                    && self.markdown_dirty()
+            }
+            SaveMemoryEntry => {
+                matches!(self.page, Page::Entries)
+                    && self.row_edit.is_some()
+                    && self.can_write_files()
+                    && !self.pending
+            }
+            CancelMemoryEntry => matches!(self.page, Page::Entries) && self.row_edit.is_some(),
+            RestoreMemoryVersion => {
+                matches!(self.page, Page::History(_, Some(_)))
+                    && self.can_edit_rows()
+                    && !self.pending
+                    && self.decision.is_none()
+                    && self.can_restore_history()
+            }
+            MemoryReferencePath | ReviewMemoryReference | ApproveMemoryReference => {
+                matches!(self.page, Page::References(_))
+                    && self.can_edit_references()
+                    && !self.pending
+                    && self.decision.is_none()
+                    && (control != ApproveMemoryReference || self.reference_preview.is_some())
+            }
+            BackFromMemoryView => matches!(
+                self.page,
+                Page::Archive(..) | Page::History(..) | Page::Cleanup(_) | Page::References(_)
+            ),
+            _ => true,
+        }
     }
 
     pub(super) fn find_open(&self) -> bool {
@@ -1191,25 +1240,35 @@ impl State {
                     if enabled { "on" } else { "off" }
                 ))
                 .size(13),
-                button("Use imported activation preference")
-                    .on_press_maybe(can_change_settings.then_some(Message::UseImportedActivation)),
+                action(
+                    UseImportedMemoryActivation,
+                    button("Use imported activation preference").on_press_maybe(
+                        can_change_settings.then_some(Message::UseImportedActivation)
+                    )
+                ),
             ]
             .spacing(10)
             .wrap()),
             self.imported_preferences.learning.map(|learning| row![
                 text(format!("Imported from Java: learning · {learning}")).size(13),
-                button("Use imported learning preference").on_press_maybe(
-                    (can_change_settings && self.policy.learning.is_none())
-                        .then_some(Message::UseImportedLearning)
+                action(
+                    UseImportedMemoryLearning,
+                    button("Use imported learning preference").on_press_maybe(
+                        (can_change_settings && self.policy.learning.is_none())
+                            .then_some(Message::UseImportedLearning)
+                    )
                 ),
             ]
             .spacing(10)
             .wrap()),
             self.imported_token_budget.map(|tokens| row![
                 text(format!("Imported from Java: {tokens} tokens")).size(13),
-                button("Use imported budget").on_press_maybe(
-                    (self.editable && self.can_adjust_budget() && !self.pending)
-                        .then_some(Message::UseImportedTokenBudget)
+                action(
+                    UseImportedMemoryBudget,
+                    button("Use imported budget").on_press_maybe(
+                        (self.editable && self.can_adjust_budget() && !self.pending)
+                            .then_some(Message::UseImportedTokenBudget)
+                    )
                 ),
                 (tokens > *self.budget_range().end()).then(|| text(format!(
                     "Adoption is limited to {} tokens by managed policy.",
@@ -1309,7 +1368,7 @@ impl State {
             ]
             .spacing(6)
             .wrap(),
-            self.current_page(can_edit, cleanup_ai_available),
+            self.current_page(can_edit, cleanup_ai_available, reveal),
             action(
                 ExternalMemory,
                 button("External memory files…").on_press_maybe(
@@ -1445,9 +1504,17 @@ impl State {
             && self.decision.is_none()
     }
 
-    fn current_page(&self, can_edit: bool, cleanup_ai_available: bool) -> Element<'_, Message> {
+    fn current_page(
+        &self,
+        can_edit: bool,
+        cleanup_ai_available: bool,
+        reveal: &super::search::Reveal,
+    ) -> Element<'_, Message> {
+        use super::search::{Control::*, Setting};
+        let action = |control, button| reveal.action(Setting::Control(control), button);
+        let back = || action(BackFromMemoryView, button("Back").on_press(Message::Back));
         match &self.page {
-            Page::Entries => self.entries_page(can_edit),
+            Page::Entries => self.entries_page(can_edit, reveal),
             Page::Markdown => {
                 let editor = text_editor(&self.editor)
                     .height(230)
@@ -1460,18 +1527,22 @@ impl State {
                     editor
                 };
                 column![
-                    can_find
-                        .then(|| button("Find…")
-                            .on_press(Message::Find(document_find::Message::Open))),
+                    can_find.then(|| action(
+                        FindMemoryMarkdown,
+                        button("Find…").on_press(Message::Find(document_find::Message::Open))
+                    )),
                     if can_find {
                         self.find.view(Message::Find)
                     } else {
                         None
                     },
                     editor,
-                    button("Save Markdown").on_press_maybe(
-                        (self.can_write_files() && !self.pending && self.markdown_dirty())
-                            .then_some(Message::SaveMarkdown)
+                    action(
+                        SaveMemoryMarkdown,
+                        button("Save Markdown").on_press_maybe(
+                            (self.can_write_files() && !self.pending && self.markdown_dirty())
+                                .then_some(Message::SaveMarkdown)
+                        )
                     ),
                 ]
                 .spacing(8)
@@ -1494,7 +1565,7 @@ impl State {
                         .spacing(8),
                     );
                 }
-                list.push(button("Back").on_press(Message::Back)).into()
+                list.push(back()).into()
             }
             Page::Cleanup(candidates) => {
                 let can_ask = can_edit && cleanup_ai_available && prompt::environment_enabled();
@@ -1537,7 +1608,7 @@ impl State {
                         ),
                     );
                 }
-                content.push(button("Back").on_press(Message::Back)).into()
+                content.push(back()).into()
             }
             Page::History(versions, preview) => {
                 let mut list = column![text("Memory history").size(17)].spacing(8);
@@ -1560,20 +1631,27 @@ impl State {
                                 .comparison
                                 .view("Selected version", Length::Fixed(210.0)),
                         )
-                        .push(
+                        .push(action(
+                            RestoreMemoryVersion,
                             button("Restore version…").on_press_maybe(
                                 (can_edit && self.can_restore_history())
                                     .then_some(Message::RestoreHistory),
                             ),
-                        );
+                        ));
                 }
-                content.push(button("Back").on_press(Message::Back)).into()
+                content.push(back()).into()
             }
-            Page::References(registry) => self.references_page(registry),
+            Page::References(registry) => self.references_page(registry, reveal),
         }
     }
 
-    fn references_page<'a>(&'a self, registry: &'a references::Registry) -> Element<'a, Message> {
+    fn references_page<'a>(
+        &'a self,
+        registry: &'a references::Registry,
+        reveal: &super::search::Reveal,
+    ) -> Element<'a, Message> {
+        use super::search::{Control::*, Setting};
+        let action = |control, button| reveal.action(Setting::Control(control), button);
         let enabled = self.can_edit_references() && !self.pending && self.decision.is_none();
         let review_allowed = self.can_read_references() && !self.pending && self.decision.is_none();
         let explanation = if self.policy.external_files_allowed() {
@@ -1585,9 +1663,20 @@ impl State {
             text("External memory files").size(17),
             text(explanation).size(13),
             row![
-                text_input("Absolute path to a UTF-8 reference", &self.reference_path)
-                    .on_input_maybe(enabled.then_some(Message::ReferencePath)),
-                button("Review file…").on_press_maybe(enabled.then_some(Message::ReviewReference)),
+                reveal.wrap(
+                    Setting::Control(MemoryReferencePath),
+                    reveal.input(
+                        Setting::Control(MemoryReferencePath),
+                        enabled,
+                        text_input("Absolute path to a UTF-8 reference", &self.reference_path)
+                            .on_input_maybe(enabled.then_some(Message::ReferencePath))
+                    )
+                ),
+                action(
+                    ReviewMemoryReference,
+                    button("Review file…")
+                        .on_press_maybe(enabled.then_some(Message::ReviewReference))
+                ),
             ]
             .spacing(8),
         ]
@@ -1631,15 +1720,21 @@ impl State {
                         .height(180)
                         .on_action(Message::ReadReference),
                 )
-                .push(
+                .push(action(
+                    ApproveMemoryReference,
                     button("Approve this version")
                         .on_press_maybe(enabled.then_some(Message::ApproveReference)),
-                );
+                ));
         }
-        list.push(button("Back").on_press(Message::Back)).into()
+        list.push(action(
+            BackFromMemoryView,
+            button("Back").on_press(Message::Back),
+        ))
+        .into()
     }
 
-    fn entries_page(&self, can_edit: bool) -> Element<'_, Message> {
+    fn entries_page(&self, can_edit: bool, reveal: &super::search::Reveal) -> Element<'_, Message> {
+        use super::search::{Control, Setting};
         let Some(base) = &self.base else {
             return text("Memory has not been loaded.").into();
         };
@@ -1656,10 +1751,16 @@ impl State {
                     column![
                         text_editor(editor).height(100).on_action(Message::RowText),
                         row![
-                            button("Cancel").on_press(Message::Cancel),
-                            button("Save entry").on_press_maybe(
-                                (self.can_write_files() && !self.pending)
-                                    .then_some(Message::SaveRow)
+                            reveal.action(
+                                Setting::Control(Control::CancelMemoryEntry),
+                                button("Cancel").on_press(Message::Cancel)
+                            ),
+                            reveal.action(
+                                Setting::Control(Control::SaveMemoryEntry),
+                                button("Save entry").on_press_maybe(
+                                    (self.can_write_files() && !self.pending)
+                                        .then_some(Message::SaveRow)
+                                )
                             ),
                         ]
                         .spacing(8),
@@ -1835,6 +1936,96 @@ mod tests {
             panic!("memory operation did not finish");
         };
         assert!(iced_runtime::task::into_stream(state.update(message)).is_none());
+    }
+
+    #[test]
+    fn memory_search_keeps_local_find_and_reveals_the_reference_path() {
+        use crate::ai_manager::search::{Control, Setting, Target};
+        use crate::ai_manager::{Configuration, Dialog, Message as ManagerMessage};
+        use crate::settings_search::test_input;
+        use iced::keyboard::Key;
+        use iced_runtime::{UserInterface, user_interface::Cache};
+        use std::sync::Arc;
+
+        let profile = crate::snippets::tests::Profile::new();
+        let mut manager = Dialog::new(
+            Arc::new(Configuration::default()),
+            profile.0.clone(),
+            Vec::new(),
+            true,
+            None,
+        );
+        manager.memory.imported_token_budget = Some(900);
+        let reveal = |manager: &mut Dialog, query: &str, control| {
+            let _ = manager.update(ManagerMessage::Search(query.into()));
+            let target = Setting::Control(control);
+            assert_eq!(
+                manager.search_results().next(),
+                Some(Target::Setting(target))
+            );
+            let task = manager.update(ManagerMessage::SearchChoose);
+            assert_eq!(manager.revealed.setting, Some(target));
+            task
+        };
+        let budget = manager.memory.settings.max_tokens;
+        let _ = reveal(
+            &mut manager,
+            "imported memory token budget",
+            Control::UseImportedMemoryBudget,
+        );
+        assert_eq!(manager.memory.settings.max_tokens, budget);
+        assert!(!manager.memory.busy());
+        manager.memory.base = Some(Snapshot::default());
+        manager.memory.page = Page::Markdown;
+        manager.memory.editor = text_editor::Content::with_text("Unsaved Markdown\n");
+        let _ = manager.update(ManagerMessage::Memory(Message::Find(
+            document_find::Message::Open,
+        )));
+        assert!(manager.memory.find_open());
+        let _ = reveal(
+            &mut manager,
+            "save memory Markdown",
+            Control::SaveMemoryMarkdown,
+        );
+        assert!(manager.memory.find_open());
+        assert!(manager.memory.markdown_dirty());
+        assert!(!manager.memory.busy());
+
+        manager.memory.editor = text_editor::Content::new();
+        let task = manager.memory.update(Message::ShowReferences);
+        finish(&mut manager.memory, task);
+        let task = reveal(
+            &mut manager,
+            "external memory file path",
+            Control::MemoryReferencePath,
+        );
+        let typed = {
+            let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+            let mut interface = UserInterface::build(
+                manager.view(Vec::new(), Vec::new()),
+                Size::new(900.0, 480.0),
+                Cache::default(),
+                &mut renderer,
+            );
+            test_input::apply(&mut interface, &renderer, task);
+            test_input::press(
+                &mut interface,
+                &mut renderer,
+                Key::Character("q".into()),
+                Some("q"),
+            )
+        };
+        assert!(
+            matches!(typed.as_slice(), [ManagerMessage::Memory(Message::ReferencePath(value))] if value == "q")
+        );
+        assert!(manager.memory.reference_preview.is_none());
+        assert!(!manager.memory.busy());
+        let _ = manager.memory.update(Message::Back);
+        let stale = Target::Setting(Setting::Control(Control::MemoryReferencePath));
+        assert!(
+            iced_runtime::task::into_stream(manager.update(ManagerMessage::Reveal(stale)))
+                .is_none()
+        );
     }
 
     #[test]

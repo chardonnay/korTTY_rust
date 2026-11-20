@@ -6,14 +6,78 @@ use std::thread;
 
 use kortty_vault::{
     CredentialAddition, CredentialInput, CredentialKind, Error, MAX_QDRANT_API_KEY_BYTES,
-    MAX_RECOVERY_OUTPUT_BYTES, PreparedState, Secret, Vault, WebhookFormat, WebhookSettings,
-    valid_credential_id,
+    MAX_RECOVERY_OUTPUT_BYTES, MAX_SKILL_PROVIDER_CREDENTIAL_BYTES, PreparedState, Secret, Vault,
+    WebhookFormat, WebhookSettings, valid_credential_id,
 };
 
 const MASTER: &[u8] = b"test master password only";
 const CHANGED: &[u8] = b"new test master password only";
 const WRONG: &[u8] = b"wrong test master password only";
 const TEST_SECRET: &str = "test-only ssh secret ä";
+
+#[test]
+fn skill_provider_credential_stays_typed_and_encrypted_after_reopen() {
+    let directory = Directory::new();
+    let path = directory.0.join("vault");
+    let mut vault = Vault::create(&path, MASTER).unwrap();
+    let input = || CredentialInput {
+        kind: CredentialKind::SkillProviderCredential,
+        label: "External catalogue".into(),
+        ..CredentialInput::default()
+    };
+    for invalid in [
+        "",
+        "  ",
+        "line\nbreak",
+        &"x".repeat(MAX_SKILL_PROVIDER_CREDENTIAL_BYTES + 1),
+    ] {
+        assert!(matches!(
+            vault.save(input(), Secret::new(invalid.into())),
+            Err(Error::InvalidInput(_))
+        ));
+    }
+    let mut scoped = input();
+    scoped.username = "fixture".into();
+    assert!(matches!(
+        vault.save(scoped, Secret::new("fixture-only".into())),
+        Err(Error::InvalidInput(_))
+    ));
+
+    let ssh = vault
+        .save(
+            CredentialInput {
+                label: "SSH fixture".into(),
+                ..CredentialInput::default()
+            },
+            Secret::new(TEST_SECRET.into()),
+        )
+        .unwrap();
+    let initial = "fixture-only Basic password ä";
+    let id = vault.save(input(), Secret::new(initial.into())).unwrap();
+    assert_eq!(vault.skill_provider_credential(&id), Some(initial));
+    assert!(vault.skill_provider_credential(&ssh).is_none());
+    assert!(vault.huggingface_token(&id).is_none());
+    assert!(vault.qdrant_api_key(&id).is_none());
+
+    let updated = "fixture-only-token";
+    let mut edit = input();
+    edit.id = Some(id.clone());
+    assert_eq!(vault.save(edit, Secret::new(updated.into())).unwrap(), id);
+    assert!(
+        !fs::read(&path)
+            .unwrap()
+            .windows(updated.len())
+            .any(|window| window == updated.as_bytes())
+    );
+    drop(vault);
+    let reopened = Vault::unlock(&path, MASTER).unwrap();
+    assert_eq!(reopened.skill_provider_credential(&id), Some(updated));
+    assert_eq!(
+        reopened.get(&id).unwrap().kind,
+        CredentialKind::SkillProviderCredential
+    );
+    assert_eq!(reopened.secret(&ssh), Some(TEST_SECRET));
+}
 
 #[test]
 fn prepared_additions_are_sealed_without_changing_the_live_vault() {

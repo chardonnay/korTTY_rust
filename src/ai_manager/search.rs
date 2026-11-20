@@ -45,6 +45,9 @@ pub(crate) enum Setting {
     Embedding,
     Knowledge(KnowledgeSetting),
     Hub(HubSetting),
+    Managed(ManagedSetting),
+    Mlx(MlxSetting),
+    SkillProvider(SkillProviderSetting),
     Control(Control),
 }
 
@@ -63,7 +66,8 @@ impl Setting {
             Self::Profile(_) | Self::WizardScan | Self::WizardTest => Page::Profiles,
             Self::Role(_) | Self::Embedding => Page::LocalPreferences,
             Self::Knowledge(_) => Page::Knowledge,
-            Self::Hub(_) => Page::LocalModels,
+            Self::Hub(_) | Self::Managed(_) | Self::Mlx(_) => Page::LocalModels,
+            Self::SkillProvider(_) => Page::Skills,
             Self::Control(control) => control.page(),
         }
     }
@@ -86,6 +90,9 @@ impl Setting {
             Self::Embedding => "Default embedding model",
             Self::Knowledge(setting) => setting.title(),
             Self::Hub(setting) => setting.title(),
+            Self::Managed(setting) => setting.title(),
+            Self::Mlx(setting) => setting.title(),
+            Self::SkillProvider(setting) => setting.title(),
             Self::Control(control) => control.title(),
         }
     }
@@ -123,7 +130,292 @@ impl Setting {
             Self::Knowledge(_) => "",
             Self::Hub(HubSetting::Query) => "Hugging Face HuggingFace Hub GGUF search query",
             Self::Hub(_) => "Hugging Face HuggingFace Hub GGUF",
-            Self::Control(_) => "",
+            Self::Managed(ManagedSetting::IdleMinutes | ManagedSetting::NeverUnload) => {
+                "idle unload llama.cpp"
+            }
+            Self::Managed(_) => "llama.cpp",
+            Self::Mlx(MlxSetting::Idle) => "idle timeout unload",
+            Self::Mlx(MlxSetting::NeverUnload) => "keep running",
+            Self::Mlx(_) => "Apple Silicon",
+            Self::SkillProvider(_) | Self::Control(_) => "",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ManagedSetting {
+    Source,
+    Projector,
+    ImportPurpose,
+    Import,
+    Reference,
+    Refresh,
+    Select,
+    SetDefault,
+    ClearDefault,
+    RepairBackend,
+    Reattach,
+    Start,
+    Stop,
+    Test,
+    Configure,
+    ReviewRemoval,
+    Name,
+    Backend,
+    Purpose,
+    Context,
+    CpuThreads,
+    GpuLayers,
+    IdleMinutes,
+    NeverUnload,
+    Save,
+    Cancel,
+    ConfirmReattachment,
+    ConfirmRemoval,
+}
+
+impl ManagedSetting {
+    const ALL: [Self; 28] = [
+        Self::Source,
+        Self::Projector,
+        Self::ImportPurpose,
+        Self::Import,
+        Self::Reference,
+        Self::Refresh,
+        Self::Select,
+        Self::SetDefault,
+        Self::ClearDefault,
+        Self::RepairBackend,
+        Self::Reattach,
+        Self::Start,
+        Self::Stop,
+        Self::Test,
+        Self::Configure,
+        Self::ReviewRemoval,
+        Self::Name,
+        Self::Backend,
+        Self::Purpose,
+        Self::Context,
+        Self::CpuThreads,
+        Self::GpuLayers,
+        Self::IdleMinutes,
+        Self::NeverUnload,
+        Self::Save,
+        Self::Cancel,
+        Self::ConfirmReattachment,
+        Self::ConfirmRemoval,
+    ];
+
+    pub(super) fn configuration_field(self) -> bool {
+        matches!(
+            self,
+            Self::Name
+                | Self::Backend
+                | Self::Purpose
+                | Self::Context
+                | Self::CpuThreads
+                | Self::GpuLayers
+                | Self::IdleMinutes
+                | Self::NeverUnload
+        )
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Source => "GGUF model path",
+            Self::Projector => "Vision projector path",
+            Self::ImportPurpose => "GGUF import purpose",
+            Self::Import => "Import private GGUF copy",
+            Self::Reference => "Register external GGUF",
+            Self::Refresh => "Refresh managed GGUF models",
+            Self::Select => "Select a managed GGUF model",
+            Self::SetDefault => "Set managed GGUF model as default",
+            Self::ClearDefault => "Clear default managed GGUF model",
+            Self::RepairBackend => "Install matching GGUF runtime",
+            Self::Reattach => "Reattach local GGUF",
+            Self::Start => "Start managed GGUF model",
+            Self::Stop => "Stop managed GGUF model",
+            Self::Test => "Test managed GGUF model",
+            Self::Configure => "Configure managed GGUF model",
+            Self::ReviewRemoval => "Remove managed GGUF model",
+            Self::Name => "GGUF model name",
+            Self::Backend => "GGUF model backend",
+            Self::Purpose => "GGUF model purpose",
+            Self::Context => "GGUF context size (tokens)",
+            Self::CpuThreads => "GGUF CPU threads",
+            Self::GpuLayers => "GGUF GPU layers",
+            Self::IdleMinutes => "GGUF idle timeout (minutes)",
+            Self::NeverUnload => "Never unload managed GGUF model while idle",
+            Self::Save => "Save GGUF model settings",
+            Self::Cancel => "Cancel GGUF model review",
+            Self::ConfirmReattachment => "Confirm GGUF model reattachment",
+            Self::ConfirmRemoval => "Confirm GGUF model removal",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MlxSetting {
+    Unpin,
+    CheckOnline,
+    OnlineChoice,
+    ReviewOnline,
+    RuntimeIndex,
+    RuntimeSignature,
+    RuntimeArchive,
+    Refresh,
+    ReviewRuntime,
+    ReviewRuntimeRemoval,
+    Source,
+    ReviewImport,
+    Select,
+    ReviewReattachment,
+    Start,
+    Test,
+    Stop,
+    ReviewRemoval,
+    Name,
+    Idle,
+    NeverUnload,
+    Save,
+    CancelReview,
+    ConfirmOnline,
+    ConfirmRuntime,
+    ConfirmCatalog,
+    ConfirmImport,
+    ConfirmReattachment,
+    ConfirmRemoval,
+    ConfirmRuntimeRemoval,
+}
+
+impl MlxSetting {
+    const ALL: [Self; 30] = [
+        Self::Unpin,
+        Self::CheckOnline,
+        Self::OnlineChoice,
+        Self::ReviewOnline,
+        Self::RuntimeIndex,
+        Self::RuntimeSignature,
+        Self::RuntimeArchive,
+        Self::Refresh,
+        Self::ReviewRuntime,
+        Self::ReviewRuntimeRemoval,
+        Self::Source,
+        Self::ReviewImport,
+        Self::Select,
+        Self::ReviewReattachment,
+        Self::Start,
+        Self::Test,
+        Self::Stop,
+        Self::ReviewRemoval,
+        Self::Name,
+        Self::Idle,
+        Self::NeverUnload,
+        Self::Save,
+        Self::CancelReview,
+        Self::ConfirmOnline,
+        Self::ConfirmRuntime,
+        Self::ConfirmCatalog,
+        Self::ConfirmImport,
+        Self::ConfirmReattachment,
+        Self::ConfirmRemoval,
+        Self::ConfirmRuntimeRemoval,
+    ];
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Unpin => "Follow stable MLX releases",
+            Self::CheckOnline => "Check signed MLX releases",
+            Self::OnlineChoice => "Select a signed MLX release",
+            Self::ReviewOnline => "Review MLX runtime download",
+            Self::RuntimeIndex => "MLX runtime index path",
+            Self::RuntimeSignature => "MLX runtime detached signature path",
+            Self::RuntimeArchive => "MLX runtime package archive path",
+            Self::Refresh => "Refresh managed MLX models and runtime",
+            Self::ReviewRuntime => "Review signed offline MLX runtime",
+            Self::ReviewRuntimeRemoval => "Remove installed MLX runtime",
+            Self::Source => "Local MLX model directory",
+            Self::ReviewImport => "Review MLX model import",
+            Self::Select => "Choose a registered MLX model",
+            Self::ReviewReattachment => "Review local MLX reattachment",
+            Self::Start => "Start managed MLX model",
+            Self::Test => "Test managed MLX model",
+            Self::Stop => "Stop managed MLX model",
+            Self::ReviewRemoval => "Remove managed MLX model",
+            Self::Name => "MLX model display name",
+            Self::Idle => "MLX model idle minutes",
+            Self::NeverUnload => "Never unload MLX model while idle",
+            Self::Save => "Save MLX model settings",
+            Self::CancelReview => "Cancel MLX review",
+            Self::ConfirmOnline => "Download and install signed MLX runtime",
+            Self::ConfirmRuntime => "Install reviewed offline MLX runtime",
+            Self::ConfirmCatalog => "Accept reviewed signed MLX catalog",
+            Self::ConfirmImport => "Import reviewed MLX model",
+            Self::ConfirmReattachment => "Reattach reviewed MLX model",
+            Self::ConfirmRemoval => "Confirm managed MLX model removal",
+            Self::ConfirmRuntimeRemoval => "Confirm installed MLX runtime removal",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SkillProviderSetting {
+    Select,
+    Add,
+    Remove,
+    Name,
+    Type,
+    Enabled,
+    Base,
+    CredentialEnv,
+    VaultCredential,
+    ClearVaultCredential,
+    Username,
+    Sample,
+    Apply,
+    Revert,
+    Test,
+    Close,
+}
+
+impl SkillProviderSetting {
+    const ALL: [Self; 16] = [
+        Self::Select,
+        Self::Add,
+        Self::Remove,
+        Self::Name,
+        Self::Type,
+        Self::Enabled,
+        Self::Base,
+        Self::CredentialEnv,
+        Self::VaultCredential,
+        Self::ClearVaultCredential,
+        Self::Username,
+        Self::Apply,
+        Self::Revert,
+        Self::Test,
+        Self::Sample,
+        Self::Close,
+    ];
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Select => "Choose external skill provider",
+            Self::Add => "Add external skill provider",
+            Self::Remove => "Remove selected external skill provider",
+            Self::Name => "External skill provider name",
+            Self::Type => "External skill provider type",
+            Self::Enabled => "Enable external skill provider",
+            Self::Base => "External skill provider base URL",
+            Self::CredentialEnv => "External skill provider credential environment variable",
+            Self::VaultCredential => "Choose external skill provider vault credential",
+            Self::ClearVaultCredential => "Clear external skill provider vault credential",
+            Self::Username => "External skill provider HTTP Basic username",
+            Self::Sample => "External skill provider test document",
+            Self::Apply => "Apply external skill provider edits",
+            Self::Revert => "Revert external skill provider edits",
+            Self::Test => "Test external skill provider",
+            Self::Close => "Close external skill provider editor",
         }
     }
 }
@@ -246,6 +538,18 @@ pub(crate) enum Control {
     CleanMemory,
     ClearMemory,
     ExternalMemory,
+    UseImportedMemoryActivation,
+    UseImportedMemoryLearning,
+    UseImportedMemoryBudget,
+    FindMemoryMarkdown,
+    SaveMemoryMarkdown,
+    SaveMemoryEntry,
+    CancelMemoryEntry,
+    RestoreMemoryVersion,
+    MemoryReferencePath,
+    ReviewMemoryReference,
+    ApproveMemoryReference,
+    BackFromMemoryView,
     AddSkill,
     ImportSkill,
     ExportSkill,
@@ -264,10 +568,21 @@ pub(crate) enum Control {
     ApplySkill,
     RevertSkill,
     ShortenSkill,
+    SkillLibraryQuery,
+    SkillLibrarySort,
+    DeleteSkill,
+    SkillProviders,
+    SkillActive,
+    SkillTarget,
+    SkillMarkdownContent,
+    SkillLearnedRules,
+    RestoreBundledSkill,
+    ToggleBundledSkill,
+    SkillImported(super::skills::Preference),
 }
 
 impl Control {
-    const ALL: [Self; 45] = [
+    const ALL: [Self; 71] = [
         Self::LocalSetup,
         Self::LocalEndpoint,
         Self::RefreshModels,
@@ -295,6 +610,18 @@ impl Control {
         Self::CleanMemory,
         Self::ClearMemory,
         Self::ExternalMemory,
+        Self::UseImportedMemoryActivation,
+        Self::UseImportedMemoryLearning,
+        Self::UseImportedMemoryBudget,
+        Self::FindMemoryMarkdown,
+        Self::SaveMemoryMarkdown,
+        Self::SaveMemoryEntry,
+        Self::CancelMemoryEntry,
+        Self::RestoreMemoryVersion,
+        Self::MemoryReferencePath,
+        Self::ReviewMemoryReference,
+        Self::ApproveMemoryReference,
+        Self::BackFromMemoryView,
         Self::AddSkill,
         Self::ImportSkill,
         Self::ExportSkill,
@@ -313,6 +640,20 @@ impl Control {
         Self::ApplySkill,
         Self::RevertSkill,
         Self::ShortenSkill,
+        Self::SkillLibraryQuery,
+        Self::SkillLibrarySort,
+        Self::DeleteSkill,
+        Self::SkillProviders,
+        Self::SkillActive,
+        Self::SkillTarget,
+        Self::SkillMarkdownContent,
+        Self::SkillLearnedRules,
+        Self::RestoreBundledSkill,
+        Self::ToggleBundledSkill,
+        Self::SkillImported(super::skills::Preference::Enabled),
+        Self::SkillImported(super::skills::Preference::AutoDetect),
+        Self::SkillImported(super::skills::Preference::LearnedRules),
+        Self::SkillImported(super::skills::Preference::Statistics),
     ];
 
     pub(super) fn page(self) -> Page {
@@ -343,7 +684,19 @@ impl Control {
             | Self::History
             | Self::CleanMemory
             | Self::ClearMemory
-            | Self::ExternalMemory => Page::Memory,
+            | Self::ExternalMemory
+            | Self::UseImportedMemoryActivation
+            | Self::UseImportedMemoryLearning
+            | Self::UseImportedMemoryBudget
+            | Self::FindMemoryMarkdown
+            | Self::SaveMemoryMarkdown
+            | Self::SaveMemoryEntry
+            | Self::CancelMemoryEntry
+            | Self::RestoreMemoryVersion
+            | Self::MemoryReferencePath
+            | Self::ReviewMemoryReference
+            | Self::ApproveMemoryReference
+            | Self::BackFromMemoryView => Page::Memory,
             Self::AddSkill
             | Self::ImportSkill
             | Self::ExportSkill
@@ -361,8 +714,54 @@ impl Control {
             | Self::FindSkill
             | Self::ApplySkill
             | Self::RevertSkill
-            | Self::ShortenSkill => Page::Skills,
+            | Self::ShortenSkill
+            | Self::SkillLibraryQuery
+            | Self::SkillLibrarySort
+            | Self::DeleteSkill
+            | Self::SkillProviders
+            | Self::SkillActive
+            | Self::SkillTarget
+            | Self::SkillMarkdownContent
+            | Self::SkillLearnedRules
+            | Self::RestoreBundledSkill
+            | Self::ToggleBundledSkill
+            | Self::SkillImported(_) => Page::Skills,
         }
+    }
+
+    pub(super) fn contextual_memory(self) -> bool {
+        matches!(
+            self,
+            Self::UseImportedMemoryActivation
+                | Self::UseImportedMemoryLearning
+                | Self::UseImportedMemoryBudget
+                | Self::FindMemoryMarkdown
+                | Self::SaveMemoryMarkdown
+                | Self::SaveMemoryEntry
+                | Self::CancelMemoryEntry
+                | Self::RestoreMemoryVersion
+                | Self::MemoryReferencePath
+                | Self::ReviewMemoryReference
+                | Self::ApproveMemoryReference
+                | Self::BackFromMemoryView
+        )
+    }
+
+    pub(super) fn contextual_skill(self) -> bool {
+        matches!(
+            self,
+            Self::SkillLibraryQuery
+                | Self::SkillLibrarySort
+                | Self::DeleteSkill
+                | Self::SkillProviders
+                | Self::SkillActive
+                | Self::SkillTarget
+                | Self::SkillMarkdownContent
+                | Self::SkillLearnedRules
+                | Self::RestoreBundledSkill
+                | Self::ToggleBundledSkill
+                | Self::SkillImported(_)
+        )
     }
 
     pub(super) fn skill_form(self) -> bool {
@@ -375,6 +774,12 @@ impl Control {
                 | Self::ApplySkill
                 | Self::RevertSkill
                 | Self::ShortenSkill
+                | Self::SkillActive
+                | Self::SkillTarget
+                | Self::SkillMarkdownContent
+                | Self::SkillLearnedRules
+                | Self::RestoreBundledSkill
+                | Self::ToggleBundledSkill
         )
     }
 
@@ -407,6 +812,20 @@ impl Control {
             Self::CleanMemory => "Clean up",
             Self::ClearMemory => "Clear",
             Self::ExternalMemory => "External memory files",
+            Self::UseImportedMemoryActivation => "Use imported memory activation preference",
+            Self::UseImportedMemoryLearning => "Use imported memory learning preference",
+            Self::UseImportedMemoryBudget => "Use imported memory token budget",
+            Self::FindMemoryMarkdown => "Find in memory Markdown",
+            Self::SaveMemoryMarkdown => "Save memory Markdown",
+            Self::SaveMemoryEntry => "Save edited memory entry",
+            Self::CancelMemoryEntry => "Cancel memory entry edit",
+            Self::RestoreMemoryVersion => "Restore selected memory history version",
+            Self::MemoryReferencePath => "External memory file path",
+            Self::ReviewMemoryReference => "Review external memory file",
+            Self::ApproveMemoryReference => "Approve reviewed external memory file version",
+            Self::BackFromMemoryView => {
+                "Back from memory archive, history, cleanup or external files"
+            }
             Self::AddSkill => "Add skill",
             Self::ImportSkill => "Import Markdown",
             Self::ExportSkill => "Export Markdown",
@@ -425,6 +844,26 @@ impl Control {
             Self::ApplySkill => "Apply skill edits",
             Self::RevertSkill => "Revert edits",
             Self::ShortenSkill => "Shorten with local AI",
+            Self::SkillLibraryQuery => "Search skills in the library",
+            Self::SkillLibrarySort => "Sort the skill library",
+            Self::DeleteSkill => "Delete selected skill",
+            Self::SkillProviders => "External skill providers",
+            Self::SkillActive => "Enable selected skill",
+            Self::SkillTarget => "Skill target (Chat, Agent, Both, Connection)",
+            Self::SkillMarkdownContent => "Edit skill Markdown",
+            Self::SkillLearnedRules => "Edit learned rules for the skill",
+            Self::RestoreBundledSkill => "Restore bundled skill version",
+            Self::ToggleBundledSkill => "Hide or unhide bundled skill",
+            Self::SkillImported(preference) => match preference {
+                super::skills::Preference::Enabled => "Use imported skill activation preference",
+                super::skills::Preference::AutoDetect => {
+                    "Use imported automatic skill selection preference"
+                }
+                super::skills::Preference::LearnedRules => {
+                    "Use imported learned skill rules preference"
+                }
+                super::skills::Preference::Statistics => "Use imported skill statistics preference",
+            },
         }
     }
 }
@@ -443,7 +882,15 @@ pub(crate) enum KnowledgeSetting {
     QdrantCredentialVariable,
     SourcePath,
     AddFile,
+    FileSize,
+    ApplyFileSize,
+    CancelFileSize,
     ReviewFolder,
+    FolderReviewSummary,
+    FolderReviewPrevious,
+    FolderReviewNext,
+    FolderReviewApprove,
+    FolderReviewDiscard,
     FolderSync,
     FolderRecursive,
     FolderGitIgnore,
@@ -454,12 +901,21 @@ pub(crate) enum KnowledgeSetting {
     EmbeddingSource,
     EmbeddingEndpoint,
     EmbeddingModel,
+    EmbeddingConsent,
+    AutomaticEmbeddingApproval,
+    AutomaticQdrantCapacity,
+    TerminalChatProfile,
+    CodeAnalysisProfile,
+    AgentKnowledge,
     TestQuery,
     TestSearch,
+    ReviewStoreRemoval,
+    ConfirmStoreRemoval,
+    CancelStoreRemoval,
 }
 
 impl KnowledgeSetting {
-    const ALL: [Self; 25] = [
+    const ALL: [Self; 42] = [
         Self::Name,
         Self::Create,
         Self::Update,
@@ -472,7 +928,15 @@ impl KnowledgeSetting {
         Self::QdrantCredentialVariable,
         Self::SourcePath,
         Self::AddFile,
+        Self::FileSize,
+        Self::ApplyFileSize,
+        Self::CancelFileSize,
         Self::ReviewFolder,
+        Self::FolderReviewSummary,
+        Self::FolderReviewPrevious,
+        Self::FolderReviewNext,
+        Self::FolderReviewApprove,
+        Self::FolderReviewDiscard,
         Self::FolderSync,
         Self::FolderRecursive,
         Self::FolderGitIgnore,
@@ -483,8 +947,17 @@ impl KnowledgeSetting {
         Self::EmbeddingSource,
         Self::EmbeddingEndpoint,
         Self::EmbeddingModel,
+        Self::EmbeddingConsent,
+        Self::AutomaticEmbeddingApproval,
+        Self::AutomaticQdrantCapacity,
+        Self::TerminalChatProfile,
+        Self::CodeAnalysisProfile,
+        Self::AgentKnowledge,
         Self::TestQuery,
         Self::TestSearch,
+        Self::ReviewStoreRemoval,
+        Self::ConfirmStoreRemoval,
+        Self::CancelStoreRemoval,
     ];
 
     fn title(self) -> &'static str {
@@ -501,7 +974,15 @@ impl KnowledgeSetting {
             Self::QdrantCredentialVariable => "Qdrant API key variable",
             Self::SourcePath => "Source file or folder path",
             Self::AddFile => "Add source file",
+            Self::FileSize => "Source file size limit",
+            Self::ApplyFileSize => "Apply source file size limit",
+            Self::CancelFileSize => "Cancel source file size limit edit",
             Self::ReviewFolder => "Review source folder",
+            Self::FolderReviewSummary => "Folder review summary",
+            Self::FolderReviewPrevious => "Previous folder review page",
+            Self::FolderReviewNext => "Next folder review page",
+            Self::FolderReviewApprove => "Approve folder files",
+            Self::FolderReviewDiscard => "Discard folder review",
             Self::FolderSync => "Folder sync mode",
             Self::FolderRecursive => "Include subfolders",
             Self::FolderGitIgnore => "Respect .gitignore",
@@ -512,13 +993,40 @@ impl KnowledgeSetting {
             Self::EmbeddingSource => "Embedding source",
             Self::EmbeddingEndpoint => "Local embedding endpoint",
             Self::EmbeddingModel => "Embedding model",
+            Self::EmbeddingConsent => "Allow embedding source excerpts and searches",
+            Self::AutomaticEmbeddingApproval => "Approve automatic embedding destination",
+            Self::AutomaticQdrantCapacity => "Review automatic Qdrant capacity",
+            Self::TerminalChatProfile => "Offer this store for terminal AI chat",
+            Self::CodeAnalysisProfile => "Offer this store for code analysis",
+            Self::AgentKnowledge => {
+                "Offer this store for Agent, Planning, Swarm, and scheduled AI requests"
+            }
             Self::TestQuery => "Test search query",
             Self::TestSearch => "Run knowledge search",
+            Self::ReviewStoreRemoval => "Review removal of the knowledge store",
+            Self::ConfirmStoreRemoval => "Confirm removal of the knowledge store",
+            Self::CancelStoreRemoval => "Cancel removal of the knowledge store",
         }
     }
 
     pub(super) fn needs_store(self) -> bool {
         !matches!(self, Self::Name | Self::Create)
+    }
+
+    pub(super) fn needs_active_review(self) -> bool {
+        matches!(
+            self,
+            Self::FolderReviewSummary
+                | Self::FolderReviewPrevious
+                | Self::FolderReviewNext
+                | Self::FolderReviewApprove
+                | Self::FolderReviewDiscard
+                | Self::FileSize
+                | Self::ApplyFileSize
+                | Self::CancelFileSize
+                | Self::ConfirmStoreRemoval
+                | Self::CancelStoreRemoval
+        )
     }
 }
 
@@ -844,6 +1352,13 @@ pub(super) fn results<'a>(
     .chain([Setting::Embedding])
     .chain(KnowledgeSetting::ALL.into_iter().map(Setting::Knowledge))
     .chain(HubSetting::ALL.into_iter().map(Setting::Hub))
+    .chain(ManagedSetting::ALL.into_iter().map(Setting::Managed))
+    .chain(MlxSetting::ALL.into_iter().map(Setting::Mlx))
+    .chain(
+        SkillProviderSetting::ALL
+            .into_iter()
+            .map(Setting::SkillProvider),
+    )
     .chain(Control::ALL.into_iter().map(Setting::Control))
     .map(Target::Setting)
     .chain(Page::ALL.into_iter().map(Target::Page));

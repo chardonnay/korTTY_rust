@@ -443,6 +443,14 @@ pub(super) fn convert(
                     imported.skill_preferences_omitted,
                     "invalid Java AI skill preferences omitted",
                 );
+                report.note_count(
+                    imported.skill_providers_omitted,
+                    "invalid or excess Java skill provider suggestions omitted",
+                );
+                report.note_count(
+                    imported.skill_provider_secrets_omitted,
+                    "Java skill provider credentials omitted",
+                );
                 if imported.agent_shortcut_omitted {
                     report.omissions.push(
                         "Invalid or oversized Java Agent command preferences were omitted.".into(),
@@ -488,6 +496,7 @@ pub(super) fn convert(
                     || imported.memory_tokens_hint
                     || imported.memory_preferences_hint
                     || imported.skill_preferences_hint
+                    || imported.skill_provider_hints != 0
                     || imported.agent_shortcut_hint
                     || imported.agent_execution_hint
                     || imported.agent_confirmation_hint
@@ -575,6 +584,12 @@ pub(super) fn convert(
                         if imported.skill_preferences_hint {
                             report.entries.push("Java AI skill preferences were retained as inactive suggestions for explicit adoption in AI Manager.".into());
                         }
+                        if imported.skill_provider_hints != 0 {
+                            report.entries.push(format!(
+                                "External skill provider suggestions requiring review ({})",
+                                imported.skill_provider_hints
+                            ));
+                        }
                         if imported.memory_preferences_hint {
                             report.entries.push(
                                 "AI Memory activation and learning preferences requiring review"
@@ -632,6 +647,10 @@ pub(super) fn convert(
                                 "Java AI skill preferences were omitted by managed policy.".into(),
                             );
                         }
+                        report.note_count(
+                            imported.skill_provider_hints,
+                            "Java skill provider suggestions omitted by managed policy",
+                        );
                         if imported.memory_preferences_hint {
                             report.omissions.push("Java AI Memory activation and learning preferences were omitted by managed policy.".into());
                         }

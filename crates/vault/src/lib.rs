@@ -35,6 +35,7 @@ const MAX_ENTRIES: usize = 1024;
 const MAX_SECRET_BYTES: usize = 65536;
 pub const MAX_ARCHIVE_PASSWORD_BYTES: usize = 1024;
 pub const MAX_QDRANT_API_KEY_BYTES: usize = 4096;
+pub const MAX_SKILL_PROVIDER_CREDENTIAL_BYTES: usize = 4096;
 pub const MAX_RECOVERY_OUTPUT_BYTES: usize = 3 * 1024 * 1024;
 pub const MAX_SEALED_RECOVERY_OUTPUT_BYTES: usize =
     MAX_RECOVERY_OUTPUT_BYTES + envelope::RECOVERY_OVERHEAD_BYTES;
@@ -130,6 +131,7 @@ pub enum CredentialKind {
     SudoGroupPassword,
     QdrantApiKey,
     SshPasswordCommand,
+    SkillProviderCredential,
 }
 
 impl CredentialKind {
@@ -195,6 +197,14 @@ pub fn valid_huggingface_token(token: &str) -> bool {
 pub fn valid_qdrant_api_key(key: &str) -> bool {
     (1..=MAX_QDRANT_API_KEY_BYTES).contains(&key.len())
         && key.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
+/// Validate a secret for an external skill provider. Bearer authentication
+/// applies its ASCII header rules separately when preparing the request.
+pub fn valid_skill_provider_credential(secret: &str) -> bool {
+    secret.len() <= MAX_SKILL_PROVIDER_CREDENTIAL_BYTES
+        && !secret.trim().is_empty()
+        && !secret.chars().any(char::is_control)
 }
 
 /// Whether this value has the format of a stable credential identifier.
@@ -486,6 +496,14 @@ impl Vault {
     pub fn qdrant_api_key(&self, id: &str) -> Option<&str> {
         self.entries.get(id).and_then(|entry| {
             (entry.metadata.kind == CredentialKind::QdrantApiKey).then_some(entry.secret.as_str())
+        })
+    }
+
+    /// Returns a secret only for the external skill provider credential kind.
+    pub fn skill_provider_credential(&self, id: &str) -> Option<&str> {
+        self.entries.get(id).and_then(|entry| {
+            (entry.metadata.kind == CredentialKind::SkillProviderCredential)
+                .then_some(entry.secret.as_str())
         })
     }
 
@@ -870,6 +888,16 @@ fn validate_entry(entry: &Entry) -> Result<(), Error> {
     {
         return Err(Error::InvalidInput(
             "Qdrant API keys require 1 to 4096 printable ASCII bytes without spaces and no SSH scope",
+        ));
+    }
+    if metadata.kind == CredentialKind::SkillProviderCredential
+        && (!metadata.username.is_empty()
+            || !metadata.server_pattern.is_empty()
+            || !metadata.environment.is_empty()
+            || !valid_skill_provider_credential(&entry.secret))
+    {
+        return Err(Error::InvalidInput(
+            "skill provider credentials require a non-blank value of at most 4096 bytes without control characters or SSH scope",
         ));
     }
     if metadata.kind == CredentialKind::JobWebhookUrl

@@ -656,10 +656,36 @@ impl Dialog {
     pub(super) fn can_reveal_knowledge_setting(
         &self,
         state: &State,
+        profiles: &Catalog,
         setting: super::search::KnowledgeSetting,
     ) -> bool {
         use super::search::KnowledgeSetting::*;
 
+        if setting.needs_active_review() {
+            let Some(store) = self.selected.and_then(|index| state.stores.get(index)) else {
+                return false;
+            };
+            return match setting {
+                FileSize | ApplyFileSize | CancelFileSize => {
+                    self.file_size.as_ref().is_some_and(|edit| {
+                        store.sources.contains(&edit.path)
+                            && (self.request.is_none() || setting == CancelFileSize)
+                    })
+                }
+                ConfirmStoreRemoval | CancelStoreRemoval => self.confirm_remove,
+                _ => self
+                    .folder_review
+                    .as_deref()
+                    .is_some_and(|review| match setting {
+                        FolderReviewPrevious => self.folder_review_page > 0,
+                        FolderReviewNext => {
+                            self.folder_review_page + 1 < folder_review_pages(review)
+                        }
+                        FolderReviewApprove => can_approve_folder_review(review),
+                        _ => true,
+                    }),
+            };
+        }
         let Some(store) = self
             .selected
             .and_then(|index| state.stores.get(index))
@@ -677,6 +703,35 @@ impl Dialog {
                 .is_some_and(|settings| settings.vault_key.is_none()),
             EmbeddingEndpoint | EmbeddingModel => state.embedding_fields(store).2.is_none(),
             FolderSync => self.request.is_none(),
+            TerminalChatProfile | CodeAnalysisProfile => {
+                let role = if setting == TerminalChatProfile {
+                    Role::Text
+                } else {
+                    Role::Coding
+                };
+                state
+                    .profile(role)
+                    .and_then(|reference| profiles.resolve_profile_reference(reference))
+                    .is_some_and(|id| {
+                        profiles
+                            .choices()
+                            .iter()
+                            .any(|(candidate, _)| *candidate == id)
+                    })
+            }
+            AgentKnowledge => self.request.is_none(),
+            EmbeddingConsent => knowledge_backend::validate(store).is_ok(),
+            AutomaticEmbeddingApproval | AutomaticQdrantCapacity => {
+                store.has_automatic_sources()
+                    && if self.automatic_destination_approved(state, store) {
+                        setting == AutomaticQdrantCapacity
+                            && store.qdrant.is_some()
+                            && !store.automatic_qdrant_expanded
+                    } else {
+                        setting == AutomaticEmbeddingApproval
+                    }
+            }
+            ReviewStoreRemoval => !self.confirm_remove,
             _ => true,
         }
     }
@@ -735,6 +790,60 @@ impl Dialog {
 
     pub(super) fn backend_repair_open(&self) -> bool {
         self.backend_repair.is_some()
+    }
+
+    pub(super) fn can_reveal_managed_setting(
+        &self,
+        setting: super::search::ManagedSetting,
+        editable: bool,
+        ai_enabled: bool,
+    ) -> bool {
+        let editable = editable && self.request.is_none();
+        self.managed
+            .has_search_setting(setting, editable, editable && ai_enabled)
+    }
+
+    pub(super) fn reveal_managed_setting(
+        &mut self,
+        setting: super::search::ManagedSetting,
+        editable: bool,
+    ) -> Task<Message> {
+        self.managed.reveal_search_setting(setting);
+        if setting == super::search::ManagedSetting::Select
+            && editable
+            && self.request.is_none()
+            && self.managed.picker_needs_models()
+        {
+            self.update_managed(managed::Message::Refresh)
+        } else {
+            Task::none()
+        }
+    }
+
+    pub(super) fn can_reveal_mlx_setting(
+        &self,
+        setting: super::search::MlxSetting,
+        editable: bool,
+        ai_enabled: bool,
+    ) -> bool {
+        self.mlx.has_search_setting(
+            setting,
+            editable && self.request.is_none(),
+            ai_enabled,
+            self.runtime_removal.is_none(),
+            self.runtime_downloads_allowed,
+        )
+    }
+
+    pub(super) fn reveal_mlx_setting(
+        &mut self,
+        setting: super::search::MlxSetting,
+    ) -> Task<Message> {
+        if setting == super::search::MlxSetting::Select && self.mlx.picker_needs_models() {
+            self.update_mlx(mlx::Action::Refresh)
+        } else {
+            Task::none()
+        }
     }
 
     pub(super) fn can_reveal_runtime_control(
@@ -1612,9 +1721,11 @@ impl Dialog {
                 }
             }
             Message::FolderReviewPage(page) => {
-                if self.folder_review.as_ref().is_some_and(|review| {
-                    page < review.rows.len().div_ceil(FOLDER_REVIEW_PAGE_SIZE)
-                }) {
+                if self
+                    .folder_review
+                    .as_deref()
+                    .is_some_and(|review| page < folder_review_pages(review))
+                {
                     self.folder_review_page = page;
                 }
             }
@@ -2298,6 +2409,16 @@ impl Dialog {
         }
     }
 
+    fn automatic_destination_approved(&self, state: &State, store: &Store) -> bool {
+        state.automatic_ready(store)
+            && self
+                .review_policy_embedding(
+                    state.embedding_fields(store).2,
+                    store.automatic_policy_model,
+                )
+                .is_ok()
+    }
+
     fn require_policy_embedding_consent(&self, scope: &Scope) -> Result<(), String> {
         if self.consent_policy_model == scope.profile.policy_authority_fingerprint() {
             Ok(())
@@ -2601,12 +2722,13 @@ impl Dialog {
                 .spacing(8),
             ]
             .spacing(8)),
-            self.managed.view(can_edit, can_request, state.default_managed_model.as_deref()),
+            self.managed.view(can_edit, can_request, state.default_managed_model.as_deref(), reveal),
             self.mlx.view(
                 can_edit,
                 can_request,
                 self.runtime_removal.is_none(),
                 self.runtime_downloads_allowed,
+                reveal,
             ),
             self.java_models_view(hints, can_request),
             self.hf.view(
@@ -2837,48 +2959,65 @@ impl Dialog {
                 .map(|settings| settings.destination());
             let choices = profiles.choices();
             let bindings = [
-                (Role::Text, "terminal AI chat", store.text_profile.as_ref()),
-                (Role::Coding, "code analysis", store.coding_profile.as_ref()),
+                (
+                    Role::Text,
+                    TerminalChatProfile,
+                    "terminal AI chat",
+                    store.text_profile.as_ref(),
+                ),
+                (
+                    Role::Coding,
+                    CodeAnalysisProfile,
+                    "code analysis",
+                    store.coding_profile.as_ref(),
+                ),
             ]
             .into_iter()
-            .fold(column![].spacing(6), |controls, (role, use_case, bound)| {
-                let profile = state.profile(role).and_then(|expected| {
-                    let id = profiles.resolve_profile_reference(expected)?;
-                    let (_, name) = choices.iter().find(|(candidate, _)| *candidate == id)?;
-                    let binding = profiles.profile_reference(id)?;
-                    Some((id, name, expected.clone(), binding))
-                });
-                let control: Element<'_, Message> =
-                    if let Some((id, name, expected_role, binding)) = profile {
-                        checkbox(
-                            bound.and_then(|reference| {
-                                profiles.resolve_profile_reference(reference)
-                            }) == Some(id),
-                        )
-                        .label(format!("Offer this store for {use_case} with {name}"))
-                        .on_toggle(move |enabled| Message::BindKnowledgeProfile {
-                            store: store_index,
-                            role,
-                            expected_role: expected_role.clone(),
-                            binding: enabled.then(|| binding.clone()),
-                        })
-                        .into()
-                    } else if state.profile(role).is_some() {
-                        text(format!(
-                            "The selected profile for {use_case} is unavailable."
-                        ))
-                        .size(13)
-                        .into()
-                    } else {
-                        text(format!(
+            .fold(
+                column![].spacing(6),
+                |controls, (role, setting, use_case, bound)| {
+                    let profile = state.profile(role).and_then(|expected| {
+                        let id = profiles.resolve_profile_reference(expected)?;
+                        let (_, name) = choices.iter().find(|(candidate, _)| *candidate == id)?;
+                        let binding = profiles.profile_reference(id)?;
+                        Some((id, name, expected.clone(), binding))
+                    });
+                    let control: Element<'_, Message> =
+                        if let Some((id, name, expected_role, binding)) = profile {
+                            reveal.action(
+                                Setting::Knowledge(setting),
+                                checkbox(
+                                    bound.and_then(|reference| {
+                                        profiles.resolve_profile_reference(reference)
+                                    }) == Some(id),
+                                )
+                                .label(format!("Offer this store for {use_case} with {name}"))
+                                .on_toggle(move |enabled| {
+                                    Message::BindKnowledgeProfile {
+                                        store: store_index,
+                                        role,
+                                        expected_role: expected_role.clone(),
+                                        binding: enabled.then(|| binding.clone()),
+                                    }
+                                }),
+                            )
+                        } else if state.profile(role).is_some() {
+                            text(format!(
+                                "The selected profile for {use_case} is unavailable."
+                            ))
+                            .size(13)
+                            .into()
+                        } else {
+                            text(format!(
                             "Assign a {} in Local Preferences to offer this store for {use_case}.",
                             role.label()
                         ))
                         .size(13)
                         .into()
-                    };
-                controls.push(control)
-            });
+                        };
+                    controls.push(control)
+                },
+            );
             let can_review = self.request.is_none();
             let can_index = can_request
                 && backend_valid
@@ -2938,8 +3077,14 @@ impl Dialog {
                                 .filter(|edit| &edit.path == source)
                                 .map(|edit| column![
                                     text(knowledge_options::file_size_help(source)).size(13),
-                                    text_input("Use format default", &edit.input)
-                                        .on_input_maybe(can_review.then_some(Message::FileSize)),
+                                    reveal.knowledge_input(
+                                        FileSize,
+                                        can_review,
+                                        text_input("Use format default", &edit.input)
+                                            .on_input_maybe(
+                                                can_review.then_some(Message::FileSize)
+                                            )
+                                    ),
                                     (!edit.edited
                                         && store.file_size_limit(source).is_some_and(|limit| {
                                             let default = DEFAULT_TEXT_BYTES as u64;
@@ -2952,10 +3097,19 @@ impl Dialog {
                                     )
                                     .size(13)),
                                     row![
-                                        button("Apply size limit").on_press_maybe(can_review.then(
-                                            || Message::ApplyFileSize(store_index, source.clone())
-                                        )),
-                                        button("Cancel").on_press(Message::CancelFileSize),
+                                        reveal.action(
+                                            Setting::Knowledge(ApplyFileSize),
+                                            button("Apply size limit").on_press_maybe(
+                                                can_review.then(|| Message::ApplyFileSize(
+                                                    store_index,
+                                                    source.clone()
+                                                ))
+                                            )
+                                        ),
+                                        reveal.action(
+                                            Setting::Knowledge(CancelFileSize),
+                                            button("Cancel").on_press(Message::CancelFileSize)
+                                        ),
                                     ]
                                     .spacing(6)
                                     .wrap(),
@@ -3020,7 +3174,7 @@ impl Dialog {
                 .push(self.folder_options.view(can_review, reveal).map(Message::FolderOptions))
                 .push(sources)
                 .push(folders)
-                .push(self.folder_review.as_deref().map(|review| folder_review_view(review, self.folder_review_page)))
+                .push(self.folder_review.as_deref().map(|review| folder_review_view(review, self.folder_review_page, reveal)))
                 .push(reveal.wrap(Setting::Knowledge(EmbeddingSource), field("Embedding source", embedding_picker(
                     self.embedding_options(), managed, EmbeddingScope::Store, can_review,
                 ))))
@@ -3035,22 +3189,21 @@ impl Dialog {
                     text(format!("Source and query embeddings and opaque identifiers will be sent to {destination}."))
                         .wrapping(text::Wrapping::WordOrGlyph).size(13)
                 }))
-                .push(checkbox(self.consent_current())
+                .push(reveal.action(Setting::Knowledge(EmbeddingConsent), checkbox(self.consent_current())
                     .label(match (managed.is_some(), store.qdrant.is_some()) {
                         (true, false) => "Allow this managed model to process these source excerpts and searches",
                         (false, false) => "Allow these source excerpts and searches to be sent to this local service",
                         (true, true) => "Allow this managed model to embed source excerpts and searches and send vectors to Qdrant",
                         (false, true) => "Allow this local service to embed source excerpts and searches and send vectors to Qdrant",
                     })
-                    .on_toggle_maybe(backend_valid.then_some(Message::Consent)))
+                    .on_toggle_maybe(backend_valid.then_some(Message::Consent))))
                 .push(managed.is_none().then(|| text("Use a local embedding model you trust. The selected service can forward requests.").size(13)))
                 .push(store.has_automatic_sources().then(|| {
                     let destination = managed.map_or_else(
                         || format!("{endpoint} · {model}"),
                         |id| format!("{MANAGED_EMBEDDING_DESTINATION} · {id}"),
                     );
-                    let approved = state.automatic_ready(store)
-                        && self.review_policy_embedding(managed, store.automatic_policy_model).is_ok();
+                    let approved = self.automatic_destination_approved(state, store);
                     let model_available = managed.map_or_else(
                         || Profile::new(endpoint, model).is_ok(),
                         |id| self.embedding_available(id),
@@ -3063,7 +3216,9 @@ impl Dialog {
                             text(format!("Automatic indexing will send source embeddings and opaque identifiers to {destination}."))
                                 .wrapping(text::Wrapping::WordOrGlyph).size(13)
                         }),
-                        (!approved || store.qdrant.is_some() && !store.automatic_qdrant_expanded).then(|| button(if approved {
+                        (!approved || store.qdrant.is_some() && !store.automatic_qdrant_expanded).then(|| reveal.action(
+                            Setting::Knowledge(if approved { AutomaticQdrantCapacity } else { AutomaticEmbeddingApproval }),
+                            button(if approved {
                                 "Review automatic Qdrant capacity…"
                             } else if store.qdrant.is_some() {
                                 "Approve automatic embedding and Qdrant destinations"
@@ -3071,18 +3226,18 @@ impl Dialog {
                                 "Approve automatic embedding destination"
                             })
                             .on_press_maybe((can_request && model_available)
-                                .then_some(Message::ApproveAutomaticEmbedding(store_index)))),
+                                .then_some(Message::ApproveAutomaticEmbedding(store_index))))),
                         approved.then(|| text(self.automatic_status.get(&store.name)
                             .map_or("Automatic sync checks each store in turn and pauses during edits.", String::as_str))
                             .wrapping(text::Wrapping::WordOrGlyph).size(13)),
                     ].spacing(6)
                 }))
                 .push(bindings)
-                .push(checkbox(store.autonomous_enabled)
+                .push(reveal.action(Setting::Knowledge(AgentKnowledge), checkbox(store.autonomous_enabled)
                     .label("Offer this store for Agent, Planning, Swarm, and scheduled AI requests")
                     .on_toggle_maybe(can_review.then_some(move |enabled| {
                         Message::EnableAutonomousKnowledge { store: store_index, enabled }
-                    })))
+                    }))))
                 .push(text("Terminal AI chat and code analysis ask separately before embedding a query and show retrieved excerpts before sending the request.").size(13))
                 .push(text("Saved indexes can be searched again after reopening. Updating changed settings takes effect after Save.").size(13))
                 .push(row![
@@ -3107,17 +3262,25 @@ impl Dialog {
                 details = details.push(
                     row![
                         text("Remove this store from the profile? The source files stay on disk."),
-                        button("Remove store")
-                            .style(button::danger)
-                            .on_press(Message::RemoveStore),
-                        button("Cancel").on_press(Message::ConfirmRemove(false)),
+                        reveal.action(
+                            Setting::Knowledge(ConfirmStoreRemoval),
+                            button("Remove store")
+                                .style(button::danger)
+                                .on_press(Message::RemoveStore)
+                        ),
+                        reveal.action(
+                            Setting::Knowledge(CancelStoreRemoval),
+                            button("Cancel").on_press(Message::ConfirmRemove(false))
+                        ),
                     ]
                     .spacing(8)
                     .wrap(),
                 );
             } else {
-                details =
-                    details.push(button("Remove store…").on_press(Message::ConfirmRemove(true)));
+                details = details.push(reveal.action(
+                    Setting::Knowledge(ReviewStoreRemoval),
+                    button("Remove store…").on_press(Message::ConfirmRemove(true)),
+                ));
             }
         } else {
             details = details.push(text("Select or create a knowledge store."));
@@ -3286,8 +3449,22 @@ impl Dialog {
 
 const FOLDER_REVIEW_PAGE_SIZE: usize = 128;
 
-fn folder_review_view(review: &folder::Review, page: usize) -> Element<'_, Message> {
-    let pages = review.rows.len().div_ceil(FOLDER_REVIEW_PAGE_SIZE);
+fn folder_review_pages(review: &folder::Review) -> usize {
+    review.rows.len().div_ceil(FOLDER_REVIEW_PAGE_SIZE)
+}
+
+fn can_approve_folder_review(review: &folder::Review) -> bool {
+    review.existing || review.folder.len() > 0
+}
+
+fn folder_review_view<'a>(
+    review: &'a folder::Review,
+    page: usize,
+    reveal: &Reveal,
+) -> Element<'a, Message> {
+    use super::search::{KnowledgeSetting::*, Setting};
+    let action = |setting, button| reveal.action(Setting::Knowledge(setting), button);
+    let pages = folder_review_pages(review);
     let rows = review
         .rows
         .iter()
@@ -3339,11 +3516,11 @@ fn folder_review_view(review: &folder::Review, page: usize) -> Element<'_, Messa
                 limit.bytes()
             ))
             .size(13)),
-        text(summary).wrapping(text::Wrapping::WordOrGlyph),
+        reveal.wrap(Setting::Knowledge(FolderReviewSummary), text(summary).wrapping(text::Wrapping::WordOrGlyph)),
         (pages > 1).then(|| row![
-            button("Previous page").on_press_maybe((page > 0).then(|| Message::FolderReviewPage(page - 1))),
+            action(FolderReviewPrevious, button("Previous page").on_press_maybe((page > 0).then(|| Message::FolderReviewPage(page - 1)))),
             text(format!("{} of {pages}", page + 1)),
-            button("Next page").on_press_maybe((page + 1 < pages).then_some(Message::FolderReviewPage(page + 1))),
+            action(FolderReviewNext, button("Next page").on_press_maybe((page + 1 < pages).then_some(Message::FolderReviewPage(page + 1)))),
         ].spacing(8).align_y(Alignment::Center)),
         (!review.rows.is_empty()).then(|| scrollable(rows).height(150)),
         text(
@@ -3351,9 +3528,9 @@ fn folder_review_view(review: &folder::Review, page: usize) -> Element<'_, Messa
         )
         .size(13),
         row![
-            button("Approve folder files")
-                .on_press_maybe((review.existing || count > 0).then_some(Message::ApproveFolder)),
-            button("Discard review").on_press(Message::DiscardFolderReview),
+            action(FolderReviewApprove, button("Approve folder files")
+                .on_press_maybe(can_approve_folder_review(review).then_some(Message::ApproveFolder))),
+            action(FolderReviewDiscard, button("Discard review").on_press(Message::DiscardFolderReview)),
         ]
         .spacing(8)
         .wrap(),
@@ -3769,6 +3946,255 @@ fn limited(value: &str, bytes: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn knowledge_search_routes_to_current_profile_and_destination_controls() {
+        use crate::ai_manager::search::{KnowledgeSetting, Setting, Target};
+        use crate::ai_manager::{Dialog as Manager, Message as ManagerMessage};
+
+        let profile = crate::snippets::tests::Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        let source = root.join("notes.txt");
+        std::fs::write(&source, "Profile and destination fixture.").unwrap();
+        let mut store = Store::new("Profile search").unwrap();
+        store.add_source(source.clone()).unwrap();
+        assert!(store.set_file_sync(source, SyncMode::Automatic));
+        store.qdrant = Some(Default::default());
+        let mut config = Configuration {
+            profiles: profile_catalog(&[7]),
+            ..Configuration::default()
+        };
+        config.local.stores.push(store);
+        config
+            .local
+            .set_profile(Role::Text, Some(ProfileRef::Numeric(7)));
+        config
+            .local
+            .set_profile(Role::Coding, Some(ProfileRef::Numeric(99)));
+        let mut manager = Manager::new(Arc::new(config), root, Vec::new(), true, None);
+        let reveal = |manager: &mut Manager, query: &str, setting| {
+            let _ = manager.update(ManagerMessage::Search(query.into()));
+            assert_eq!(
+                manager.search_results().next(),
+                Some(Target::Setting(Setting::Knowledge(setting)))
+            );
+            let _ = manager.update(ManagerMessage::SearchChoose);
+            assert_eq!(manager.revealed.setting, Some(Setting::Knowledge(setting)));
+        };
+        let baseline = manager.local_state.clone();
+        reveal(
+            &mut manager,
+            "offer this store for terminal AI chat",
+            KnowledgeSetting::TerminalChatProfile,
+        );
+        let _ = manager.update(ManagerMessage::Search(
+            "offer this store for code analysis".into(),
+        ));
+        assert_eq!(manager.search_results().next(), None);
+        reveal(
+            &mut manager,
+            "scheduled AI requests",
+            KnowledgeSetting::AgentKnowledge,
+        );
+        reveal(
+            &mut manager,
+            "allow embedding source excerpts",
+            KnowledgeSetting::EmbeddingConsent,
+        );
+        reveal(
+            &mut manager,
+            "approve automatic embedding destination",
+            KnowledgeSetting::AutomaticEmbeddingApproval,
+        );
+        assert_eq!(manager.local_state, baseline);
+        assert!(!manager.local.consent_current());
+        assert!(!manager.local.busy());
+
+        let embedding = manager
+            .local_state
+            .automatic_embedding(&manager.local_state.stores[0]);
+        let store = &mut manager.local_state.stores[0];
+        store.automatic_embedding = Some(embedding);
+        store.automatic_qdrant = store.qdrant.clone();
+        let approved = manager.local_state.clone();
+        reveal(
+            &mut manager,
+            "review automatic Qdrant capacity",
+            KnowledgeSetting::AutomaticQdrantCapacity,
+        );
+        assert_eq!(manager.local_state, approved);
+        manager.local_state.stores[0].automatic_qdrant_expanded = true;
+        let _ = manager.update(ManagerMessage::Search(
+            "review automatic Qdrant capacity".into(),
+        ));
+        assert_eq!(manager.search_results().next(), None);
+    }
+
+    #[test]
+    fn knowledge_search_reveals_the_active_file_limit_and_store_removal() {
+        use crate::ai_manager::search::{KnowledgeSetting, Setting, Target};
+        use crate::ai_manager::{Dialog as Manager, Message as ManagerMessage};
+        use crate::settings_search::test_input;
+        use iced::keyboard::Key;
+        use iced::{Font, Renderer, Size};
+        use iced_runtime::{UserInterface, user_interface::Cache};
+
+        let profile = crate::snippets::tests::Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        let source = root.join("notes.txt");
+        std::fs::write(&source, "A reviewed source file.").unwrap();
+        let mut store = Store::new("Searchable store").unwrap();
+        store.add_source(source.clone()).unwrap();
+        let baseline = store.clone();
+        let mut config = Configuration::default();
+        config.local.stores.push(store);
+        let mut manager = Manager::new(Arc::new(config), root, Vec::new(), true, None);
+        let _ = manager.update(ManagerMessage::Reveal(Target::Setting(Setting::Knowledge(
+            KnowledgeSetting::ReviewStoreRemoval,
+        ))));
+        assert_eq!(manager.local.selected, Some(0));
+        assert!(!manager.local.confirm_remove);
+        let _ = manager.update(ManagerMessage::Local(Message::ConfigureFileSize(
+            0,
+            source.clone(),
+        )));
+        let _ = manager.update(ManagerMessage::Search("source file size limit".into()));
+        let setting = Setting::Knowledge(KnowledgeSetting::FileSize);
+        assert_eq!(
+            manager.search_results().next(),
+            Some(Target::Setting(setting))
+        );
+        let task = manager.update(ManagerMessage::SearchChoose);
+        assert_eq!(manager.revealed.setting, Some(setting));
+        let typed = {
+            let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+            let mut interface = UserInterface::build(
+                manager.view(Vec::new(), Vec::new()),
+                Size::new(900.0, 480.0),
+                Cache::default(),
+                &mut renderer,
+            );
+            test_input::apply(&mut interface, &renderer, task);
+            test_input::press(
+                &mut interface,
+                &mut renderer,
+                Key::Character("7".into()),
+                Some("7"),
+            )
+        };
+        assert!(
+            matches!(typed.as_slice(), [ManagerMessage::Local(Message::FileSize(value))] if value.ends_with('7'))
+        );
+        for event in typed {
+            let _ = manager.update(event);
+        }
+        let _ = manager.update(ManagerMessage::Search(
+            "apply source file size limit".into(),
+        ));
+        let _ = manager.update(ManagerMessage::SearchChoose);
+        assert_eq!(
+            manager.revealed.setting,
+            Some(Setting::Knowledge(KnowledgeSetting::ApplyFileSize))
+        );
+        let edit = manager.local.file_size.as_ref().unwrap();
+        assert_eq!(edit.path, source);
+        assert!(edit.input.ends_with('7'));
+        assert_eq!(
+            manager.local_state.stores.as_slice(),
+            std::slice::from_ref(&baseline)
+        );
+        let _ = manager.update(ManagerMessage::Local(Message::CancelFileSize));
+        let _ = manager.update(ManagerMessage::Local(Message::ConfirmRemove(true)));
+        let _ = manager.update(ManagerMessage::Search(
+            "confirm removal of the knowledge store".into(),
+        ));
+        let _ = manager.update(ManagerMessage::SearchChoose);
+        let removal = Setting::Knowledge(KnowledgeSetting::ConfirmStoreRemoval);
+        assert_eq!(manager.revealed.setting, Some(removal));
+        assert!(manager.local.confirm_remove);
+        assert_eq!(manager.local_state.stores, [baseline]);
+        let _ = manager.update(ManagerMessage::Local(Message::ConfirmRemove(false)));
+        let stale = manager.update(ManagerMessage::Reveal(Target::Setting(removal)));
+        assert!(iced_runtime::task::into_stream(stale).is_none());
+    }
+
+    #[test]
+    fn folder_review_search_reveals_actions_without_changing_pages_or_approving() {
+        use crate::ai_manager::search::{KnowledgeSetting, Setting, Target};
+        use crate::ai_manager::{Dialog as Manager, Message as ManagerMessage};
+
+        let profile = crate::snippets::tests::Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        let source = root.join("sources");
+        std::fs::create_dir(&source).unwrap();
+        for index in 0..=FOLDER_REVIEW_PAGE_SIZE {
+            std::fs::write(
+                source.join(format!("{index:03}.txt")),
+                "Folder review fixture.",
+            )
+            .unwrap();
+        }
+        let (reply, _cancel) = folder::start(
+            source,
+            None,
+            FOLDER_REVIEW_PAGE_SIZE + 1,
+            Vec::new(),
+            knowledge::source::Options::default(),
+        )
+        .unwrap();
+        let review = reply.recv_blocking().unwrap().unwrap();
+        assert_eq!(folder_review_pages(&review), 2);
+
+        let mut config = Configuration::default();
+        config
+            .local
+            .stores
+            .push(Store::new("Folder review").unwrap());
+        let mut manager = Manager::new(Arc::new(config), root, Vec::new(), true, None);
+        manager.local.select_store(Some(0));
+        manager.local.folder_review = Some(Arc::clone(&review));
+        let reveal = |manager: &mut Manager, query: &str, target| {
+            let _ = manager.update(ManagerMessage::Search(query.into()));
+            assert_eq!(
+                manager.search_results().next(),
+                Some(Target::Setting(Setting::Knowledge(target)))
+            );
+            let _ = manager.update(ManagerMessage::SearchChoose);
+            assert_eq!(manager.revealed.setting, Some(Setting::Knowledge(target)));
+        };
+        reveal(
+            &mut manager,
+            "next folder review page",
+            KnowledgeSetting::FolderReviewNext,
+        );
+        assert_eq!(manager.local.folder_review_page, 0);
+        let _ = manager.update(ManagerMessage::Local(Message::FolderReviewPage(1)));
+        reveal(
+            &mut manager,
+            "previous folder review page",
+            KnowledgeSetting::FolderReviewPrevious,
+        );
+        reveal(
+            &mut manager,
+            "approve folder files",
+            KnowledgeSetting::FolderReviewApprove,
+        );
+        assert_eq!(manager.local.folder_review_page, 1);
+        assert!(Arc::ptr_eq(
+            manager.local.folder_review.as_ref().unwrap(),
+            &review
+        ));
+        assert!(manager.local_state.stores[0].folders.is_empty());
+        assert!(!manager.local.busy());
+        let _ = manager.update(ManagerMessage::Local(Message::DiscardFolderReview));
+        let stale = Target::Setting(Setting::Knowledge(KnowledgeSetting::FolderReviewApprove));
+        let _ = manager.update(ManagerMessage::Search("approve folder files".into()));
+        assert_eq!(manager.search_results().next(), None);
+        assert!(
+            iced_runtime::task::into_stream(manager.update(ManagerMessage::Reveal(stale)))
+                .is_none()
+        );
+    }
 
     #[test]
     fn java_knowledge_adoption_requires_explicit_store_and_exact_source_review() {
