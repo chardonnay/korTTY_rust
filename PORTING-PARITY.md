@@ -92,8 +92,78 @@ selection and scroll it into view. Enter and Space open the selected
 details. Escape closes details and releases table focus when no details
 are open. Tab releases table focus. Held navigation keys stay out of the
 terminal until released. The tests exercise Iced event routing and scroll
-position. Native desktop acceptance and keyboard navigation in the
-Settings preview remain open under A2.
+position.
+
+The Design 16 Settings preview is in the dialog's Tab order and scrolls into
+view when focused. It uses the live table's row navigation and details keys.
+Preview actions apply only to the current sample. On Apple Silicon, 21
+selected tests passed. The new Iced regression exercises Tab, scrolling,
+End, Enter, Escape and replay isolation in the Settings layout. Docked and
+detached live-table regressions passed in the same run. Windows ARM64 passed
+strict workspace Clippy. Native desktop acceptance remains open under A2.
+[Apple Silicon preview tests](target/verification/20261120-agent-log-preview-macos.log)
+· [Windows ARM64 Clippy](target/verification/20261120-agent-log-preview-windows-clippy.log)
+
+Ctrl+Shift+F6 focuses the visible Log Table for the active terminal pane
+when the chord has no assigned action. Tab reaches the table in detached
+history. Entering either table selects and reveals a row. The native
+Iced regressions checked that plain Tab still reaches the unfocused
+terminal, a hidden or inactive pane's table cannot claim the chord, and
+detached keyboard actions carry the owned run ID. Apple Silicon passed
+all 23 selected tests, and Windows ARM64 passed strict workspace Clippy.
+[Apple Silicon keyboard tests](target/verification/20261120-agent-log-entry-macos-final.log)
+· [Windows ARM64 Clippy](target/verification/20261120-agent-log-entry-windows-clippy-final.log)
+
+An outstanding command review adds a temporary Approval row before the final
+answer. Its details reuse the masked command and destination preview. A
+password-backed review shows the instruction to open the Activity window.
+Replacing or cancelling the review removes its row and closes its details.
+Opening a row leaves the run in its current review phase. Apple Silicon
+passed 81 selected Agent and Settings tests, including masking, keyboard
+navigation, replacement and cancellation. Windows ARM64 passed strict
+workspace Clippy.
+[Apple Silicon approval tests](target/verification/20261120-agent-log-approval-macos.log)
+· [Windows ARM64 Clippy](target/verification/20261120-agent-log-approval-windows-clippy.log)
+
+The log table now fits its columns to the available width. The Step and
+Result columns take the spare space. Time, Duration and Tokens align on
+the right in a fixed-width font. Minimum column widths scale with the
+activity font, and narrow views scroll horizontally. Apple Silicon
+passed all 25 selected tests, including narrow-to-wide resizing, zoom,
+fractional viewport widths, token alignment and live and detached table
+interaction. Windows ARM64 passed strict workspace Clippy.
+[Apple Silicon table layout tests](target/verification/20261120-agent-log-columns-macos-final.log)
+· [Windows ARM64 Clippy](target/verification/20261120-agent-log-columns-windows-clippy-final.log)
+
+The chronological Log Table follows new rows while at the bottom.
+Scrolling up, sorting, or selecting a row preserves the reading position.
+Latest activity restores chronological order and resumes following.
+Apple Silicon passed 26 selected Iced and Agent tests. The new regression
+checks append, scrolling away, opening details, and resuming at the bottom
+with the horizontal offset preserved. The detached narrow-table pointer
+test also passed. Windows ARM64 passed strict workspace Clippy.
+[Apple Silicon follow tests](target/verification/20261120-agent-log-follow-macos-final.log)
+· [Windows ARM64 Clippy](target/verification/20261120-agent-log-follow-windows-clippy-final.log)
+
+Dragging a column divider adjusts the widths for the displayed run or
+sample. The table redistributes width on both sides of the divider and
+respects the font-scaled limits. Headers and cells share the resulting
+widths and refit when the pane changes size. Apple Silicon passed 28
+selected tests, including a batched drag in a table with horizontal and
+parent vertical scrolling, separation from sorting, and width limits
+after refitting. Windows ARM64 passed strict workspace Clippy.
+[Apple Silicon column-drag tests](target/verification/20261120-agent-log-resize-macos-final.log)
+· [Windows ARM64 Clippy](target/verification/20261120-agent-log-resize-windows-clippy-final.log)
+
+The fixed Log Table header shares the horizontal scroll offset with the
+data cells. The body scrolls vertically beneath it. Sort buttons and
+column dividers stay reachable at the bottom of a long run. A native
+Iced regression checks sort and divider gestures with both table axes
+and the parent Settings pane scrolled. Apple Silicon passed 117 selected
+tests, including Settings and Coding Agents. Windows ARM64 passed
+strict workspace Clippy. Native desktop acceptance remains open under A2.
+[Apple Silicon fixed-header tests](target/verification/20261120-agent-log-header-macos.log)
+· [Windows ARM64 Clippy](target/verification/20261120-agent-log-header-windows-clippy.log)
 
 ## November 20 Java external skill provider suggestions
 

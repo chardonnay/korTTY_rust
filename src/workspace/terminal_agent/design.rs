@@ -19,6 +19,9 @@ pub(crate) use actions::Action;
 pub(in crate::workspace::terminal_agent) mod handoff;
 mod history;
 pub(super) mod log_table;
+pub(in crate::workspace) use log_table::{
+    Key as SampleLogKey, keyboard::PreviewCommand as SampleLogCommand,
+};
 pub(in crate::workspace) mod pip;
 mod placement;
 mod presentation;

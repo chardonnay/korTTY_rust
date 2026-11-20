@@ -278,37 +278,7 @@ impl Run {
             Phase::SudoPassword => Some(Prompt::Password {
                 summary: "Open the Activity window to provide the password.".into(),
             }),
-            Phase::ProbeApproval | Phase::Approval => {
-                self.reviewed_command().map(|(purpose, command)| {
-                    if self.reviewed_password_sudo().is_some() {
-                        Prompt::Password {
-                            summary: "Review the sudo request in the Activity window.".into(),
-                        }
-                    } else {
-                        let destination = self.target.as_ref().map_or_else(
-                            || purpose.into(),
-                            |target| format!("{purpose} · {}", target.directory()),
-                        );
-                        let message =
-                            mask::prompt(&self.redactor, &destination).unwrap_or_else(|_| {
-                                "Review the destination in the Activity window.".into()
-                            });
-                        let masked_command =
-                            mask::prompt(&self.redactor, command).unwrap_or_else(|_| {
-                                "Review the command in the Activity window.".into()
-                            });
-                        let keyboard = !self.reviewing_sudo()
-                            && message == destination
-                            && masked_command == command;
-                        Prompt::Approval {
-                            message,
-                            commands: vec![masked_command],
-                            allow_always: false,
-                            keyboard,
-                        }
-                    }
-                })
-            }
+            Phase::ProbeApproval | Phase::Approval => self.masked_command_review(),
             _ => None,
         };
         Some(Update {
@@ -317,6 +287,31 @@ impl Run {
             style,
             transcript,
             animations,
+        })
+    }
+
+    pub(super) fn masked_command_review(&self) -> Option<Prompt> {
+        let (purpose, command) = self.reviewed_command()?;
+        if self.reviewed_password_sudo().is_some() {
+            return Some(Prompt::Password {
+                summary: "Review the sudo request in the Activity window.".into(),
+            });
+        }
+        let destination = self.target.as_ref().map_or_else(
+            || purpose.into(),
+            |target| format!("{purpose} · {}", target.directory()),
+        );
+        let message = mask::prompt(&self.redactor, &destination)
+            .unwrap_or_else(|_| "Review the destination in the Activity window.".into());
+        let masked_command = mask::prompt(&self.redactor, command)
+            .unwrap_or_else(|_| "Review the command in the Activity window.".into());
+        let keyboard =
+            !self.reviewing_sudo() && message == destination && masked_command == command;
+        Some(Prompt::Approval {
+            message,
+            commands: vec![masked_command],
+            allow_always: false,
+            keyboard,
         })
     }
 }

@@ -2011,6 +2011,20 @@ impl Workspace {
                     Edit::ReducedAnimations(reduced) => {
                         preferences.ai_agent_design_reduced_animations = Some(reduced);
                     }
+                    Edit::FocusPreview(backwards)
+                        if dialog.agent_design.preview_log_enabled(preferences) =>
+                    {
+                        return agent_design_settings::focus_preview(
+                            id,
+                            dialog.page_scroll.clone(),
+                            backwards,
+                        );
+                    }
+                    Edit::NavigatePreview(token, key)
+                        if dialog.agent_design.preview_log_enabled(preferences) =>
+                    {
+                        return dialog.agent_design.navigate_preview(token, key);
+                    }
                     edit => dialog.agent_design.update(
                         &mut preferences.ai_agent_designs,
                         &mut preferences.ai_agent_design,
@@ -3122,6 +3136,7 @@ impl Workspace {
             container(
                 scrollable(container(page).width(Length::Fill).padding(20))
                     .id(dialog.page_scroll.clone())
+                    .translate_cursor_moves(dialog.section == Section::AgentDesign)
             )
             .height(Length::Fill)
             .width(Length::Fill)
@@ -3159,6 +3174,13 @@ impl Workspace {
             })
         } else {
             on_escape(content, msg(Message::Escape(id)))
+        };
+        let content = if dialog.section == Section::AgentDesign {
+            dialog
+                .agent_design
+                .preview_keyboard(content, &dialog.draft.preferences, id)
+        } else {
+            content
         };
         let modal = self
             .highlight_rules_for_settings(id)

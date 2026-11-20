@@ -3,10 +3,12 @@
 use std::time::{Duration, Instant};
 
 use iced::widget::{Canvas, button, column, container, pick_list, responsive, row, text};
-use iced::{Element, Length, window};
+use iced::{Element, Length, Task, window};
 
 use crate::terminal_agent::design::{Approval, Arrangement, Layout, Status, inline};
-use crate::workspace::terminal_agent::design::{Sample, SampleAction, SampleGrid, SampleView};
+use crate::workspace::terminal_agent::design::{
+    Sample, SampleAction, SampleGrid, SampleLogCommand, SampleLogKey, SampleView,
+};
 use inline::{Kind, Prompt, State, Step, StepState, Transcript};
 
 use super::{Desktop, Edit, Message};
@@ -64,6 +66,30 @@ impl Default for Demo {
 }
 
 impl Demo {
+    pub(super) fn navigate_log(&mut self, token: Token, key: SampleLogKey) -> Task<Desktop> {
+        if token == self.token() {
+            self.sample.navigate_log(key)
+        } else {
+            Task::none()
+        }
+    }
+
+    pub(super) fn log_keyboard<'a>(
+        &'a self,
+        content: Element<'a, Desktop>,
+        id: window::Id,
+    ) -> Element<'a, Desktop> {
+        let token = self.token();
+        self.sample
+            .log_keyboard(content, is_log_pointer_action, move |action| {
+                let edit = match action {
+                    SampleLogCommand::Navigate(key) => Edit::NavigatePreview(token, key),
+                    SampleLogCommand::Tab(backwards) => Edit::FocusPreview(backwards),
+                };
+                Desktop::Settings(Message::AgentDesignCatalog(id, edit))
+            })
+    }
+
     pub(super) fn replay(&mut self) {
         self.generation = self.generation.saturating_add(1);
         self.stage = 0;
@@ -249,6 +275,18 @@ impl Demo {
         }
         model
     }
+}
+
+fn is_log_pointer_action(message: &Desktop) -> bool {
+    use crate::workspace::terminal_agent::design::Message as Presentation;
+
+    matches!(
+        message,
+        Desktop::Settings(Message::AgentDesignCatalog(
+            _,
+            Edit::Demo(Action::Interact(_, SampleAction::Detail(Presentation::LogTable(action)))),
+        )) if action.takes_focus()
+    )
 }
 
 fn message(id: window::Id, action: Action) -> Desktop {

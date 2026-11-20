@@ -290,3 +290,138 @@ fn native_replay_button_emits_only_an_isolated_settings_demo_event() {
         matches!(messages.as_slice(), [Desktop::Settings(Message::AgentDesignCatalog(id, Edit::Demo(Action::Replay)))] if *id == owner)
     );
 }
+
+#[test]
+fn tab_reveals_preview_and_navigation_opens_only_the_current_sample() {
+    use iced::Vector;
+    use iced::advanced::widget::operation;
+    use iced::keyboard::{Key, key::Named};
+
+    use super::super::super::{Section, Workspace};
+    use crate::settings_search::test_input;
+    use crate::terminal_agent::design::History;
+
+    struct PreviewMeasure {
+        page: Id,
+        offset: f32,
+        has_details: bool,
+    }
+
+    impl Operation for PreviewMeasure {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+
+        fn scrollable(
+            &mut self,
+            id: Option<&Id>,
+            _: Rectangle,
+            _: Rectangle,
+            translation: Vector,
+            _: &mut dyn operation::Scrollable,
+        ) {
+            if id == Some(&self.page) {
+                self.offset = translation.y;
+            }
+        }
+
+        fn text(&mut self, _: Option<&Id>, _: Rectangle, value: &str) {
+            self.has_details |= value == "Close details";
+        }
+    }
+
+    let mut workspace = Workspace::default();
+    let (owner, _) = workspace.open_window(false);
+    let _ = workspace.open_settings(owner, Some(Section::AgentDesign));
+    let id = workspace.settings.for_owner(owner).unwrap();
+    let _ = workspace.update_settings(Message::AgentDesignCatalog(
+        id,
+        Edit::Preview(Some(super::super::Module::History(History::LogTable))),
+    ));
+    let dialog = workspace.settings.0.as_mut().unwrap();
+    let demo = &mut dialog.agent_design.demo;
+    while demo.active() {
+        demo.update(Action::Next(demo.token()));
+    }
+    let token = demo.token();
+    let mut measure = PreviewMeasure {
+        page: dialog.page_scroll.clone(),
+        offset: 0.0,
+        has_details: false,
+    };
+    let size = Size::new(880.0, 475.0);
+    let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
+    let mut ui = UserInterface::build(
+        workspace.settings_view(id).unwrap(),
+        size,
+        Cache::default(),
+        &mut renderer,
+    );
+    let press = |ui: &mut UserInterface<'_, Desktop, _, _>, renderer: &mut Renderer, key| {
+        let mut messages = test_input::press(ui, renderer, Key::Named(key), None);
+        assert_eq!(messages.len(), 1);
+        messages.remove(0)
+    };
+    let tab = press(&mut ui, &mut renderer, Named::Tab);
+    assert!(
+        matches!(tab, Desktop::Settings(Message::AgentDesignCatalog(window, Edit::FocusPreview(false))) if window == id)
+    );
+    let cache = ui.into_cache();
+    let task = workspace.update(tab);
+    let mut ui = UserInterface::build(
+        workspace.settings_view(id).unwrap(),
+        size,
+        cache,
+        &mut renderer,
+    );
+    test_input::apply(&mut ui, &renderer, task);
+    ui.operate(&renderer, &mut measure);
+    assert!(
+        measure.offset > 0.0,
+        "focus reveals the preview in the Settings page"
+    );
+
+    for (key, expected) in [
+        (Named::End, SampleLogKey::Last),
+        (Named::Enter, SampleLogKey::Open),
+    ] {
+        let action = press(&mut ui, &mut renderer, key);
+        assert!(
+            matches!(action, Desktop::Settings(Message::AgentDesignCatalog(window, Edit::NavigatePreview(current, key))) if window == id && current == token && key == expected)
+        );
+        let cache = ui.into_cache();
+        let task = workspace.update(action);
+        ui = UserInterface::build(
+            workspace.settings_view(id).unwrap(),
+            size,
+            cache,
+            &mut renderer,
+        );
+        test_input::apply(&mut ui, &renderer, task);
+    }
+    ui.operate(&renderer, &mut measure);
+    assert!(measure.has_details);
+    let escape = press(&mut ui, &mut renderer, Named::Escape);
+    assert!(
+        matches!(escape, Desktop::Settings(Message::AgentDesignCatalog(window, Edit::NavigatePreview(current, SampleLogKey::Close))) if window == id && current == token)
+    );
+    let cache = ui.into_cache();
+    let _ = workspace.update(escape);
+    let mut ui = UserInterface::build(
+        workspace.settings_view(id).unwrap(),
+        size,
+        cache,
+        &mut renderer,
+    );
+    measure.has_details = false;
+    ui.operate(&renderer, &mut measure);
+    assert!(!measure.has_details);
+    drop(ui);
+
+    let _ = workspace.update_settings(Message::AgentDesignCatalog(id, Edit::Demo(Action::Replay)));
+    let stale = workspace.update_settings(Message::AgentDesignCatalog(
+        id,
+        Edit::NavigatePreview(token, SampleLogKey::Open),
+    ));
+    assert!(iced_runtime::task::into_stream(stale).is_none());
+}

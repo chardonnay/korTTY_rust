@@ -1,13 +1,17 @@
 //! Edits the profile-local design catalog and previews an isolated sample run.
 
+use iced::advanced::widget::operation::{focusable, scope};
+use iced::widget::{Id, container};
 use iced::widget::{button, checkbox, column, pick_list, row, slider, text, text_input};
-use iced::{Element, window};
+use iced::{Element, Length, Task, window};
 
 use crate::terminal_agent::design::{
     Approval, Arrangement, Catalog, History, Layout, Preset, Status,
 };
 use crate::workspace::tab_titles::WindowSettings;
-use crate::workspace::terminal_agent::design::{AUTO_HIDE_SECONDS, DockPlacement, DockPreferences};
+use crate::workspace::terminal_agent::design::{
+    AUTO_HIDE_SECONDS, DockPlacement, DockPreferences, SampleLogKey,
+};
 
 use super::{Desktop, Message};
 
@@ -16,6 +20,8 @@ mod preview;
 #[derive(Clone, Debug)]
 pub(crate) enum Edit {
     Demo(preview::Action),
+    NavigatePreview(preview::Token, SampleLogKey),
+    FocusPreview(bool),
     Select(String),
     Default(String),
     Duplicate(String),
@@ -82,6 +88,37 @@ pub(super) struct Editor {
 }
 
 impl Editor {
+    pub(super) fn preview_log_enabled(&self, preferences: &WindowSettings) -> bool {
+        self.preview_layout(&preferences.ai_agent_designs, preferences.ai_agent_design)
+            .history
+            == History::LogTable
+    }
+
+    pub(super) fn preview_keyboard<'a>(
+        &'a self,
+        content: Element<'a, Desktop>,
+        preferences: &WindowSettings,
+        id: window::Id,
+    ) -> Element<'a, Desktop> {
+        if self.preview_log_enabled(preferences) {
+            container(self.demo.log_keyboard(content, id))
+                .id(preview_focus_scope(id))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else {
+            content
+        }
+    }
+
+    pub(super) fn navigate_preview(
+        &mut self,
+        token: preview::Token,
+        key: SampleLogKey,
+    ) -> Task<Desktop> {
+        self.demo.navigate_log(token, key)
+    }
+
     fn selected<'a>(&'a self, catalog: &'a Catalog, preset: Preset) -> &'a str {
         self.selected
             .as_deref()
@@ -328,4 +365,20 @@ impl Editor {
             ))
             .into()
     }
+}
+
+fn preview_focus_scope(id: window::Id) -> Id {
+    Id::from(format!("agent-design-settings/{id:?}"))
+}
+
+pub(super) fn focus_preview(id: window::Id, page: Id, backwards: bool) -> Task<Desktop> {
+    use crate::workspace::coding_agents::roster_scroll::reveal_focused;
+
+    let root = preview_focus_scope(id);
+    let action = if backwards {
+        iced_runtime::Action::widget(scope(root.clone(), focusable::focus_previous()))
+    } else {
+        iced_runtime::Action::widget(scope(root.clone(), focusable::focus_next()))
+    };
+    iced_runtime::task::effect(action).chain(reveal_focused(root, page))
 }
