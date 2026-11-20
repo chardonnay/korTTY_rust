@@ -1142,16 +1142,11 @@ impl SchedulerView {
             );
         }
         let content: Element<'_, Message> = match self.page {
-            Page::Job => scrollable(self.draft.job_view(
-                runtime.scheduler.graph(),
-                &runtime.connection_choices,
-                &runtime.connection_group_choices,
-                runtime.can_browse_directory(),
-            ))
-            .spacing(6)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into(),
+            Page::Job => scrollable(self.draft.job_view(runtime))
+                .spacing(6)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into(),
             Page::Action => {
                 let fresh_web = self.saved_fresh_web_requirement();
                 let unattended = self.saved_unattended_web_lookup();

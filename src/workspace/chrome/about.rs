@@ -10,7 +10,10 @@ use iced::{Alignment, Element, Length, Size, Task, window};
 
 use crate::application_update::{self, Check, Offer, Pending, Progress, Saved};
 
-use super::super::dialog_placement::Kind;
+use super::super::{
+    application_updates::{PromptAction, record_downloaded_version, save_prompt_choice},
+    dialog_placement::Kind,
+};
 use super::{Message, Workspace, WorkspaceMessage, wrap};
 
 pub(super) const TITLE: &str = "About kortty";
@@ -27,6 +30,7 @@ pub enum Event {
     UpdatesChecked(u64, Result<Check, String>),
     UpdateFolder(String),
     DownloadUpdate,
+    DeferUpdate(String, PromptAction),
     UpdateProgress(u64, Progress),
     UpdateDownloaded(u64, Result<Saved, String>),
     CancelUpdate,
@@ -184,6 +188,21 @@ impl Updates {
                     (allowed && idle && !self.folder.trim().is_empty())
                         .then_some(event(Event::DownloadUpdate))
                 ),
+                row![
+                    button("Remind me tomorrow").on_press_maybe((allowed && idle).then(|| {
+                        event(Event::DeferUpdate(
+                            offer.version().into(),
+                            PromptAction::RemindTomorrow,
+                        ))
+                    })),
+                    button("Skip this version").on_press_maybe((allowed && idle).then(|| {
+                        event(Event::DeferUpdate(
+                            offer.version().into(),
+                            PromptAction::SkipVersion,
+                        ))
+                    })),
+                ]
+                .spacing(6),
             ]
             .spacing(6)
         });
@@ -363,7 +382,10 @@ impl Workspace {
                     return Task::none();
                 };
                 let folder = PathBuf::from(dialog.updates.folder.trim());
-                match application_update::download(offer, folder) {
+                let settings = crate::profile::window_settings_path();
+                match application_update::download(offer, folder, move |version| {
+                    record_downloaded_version(&settings?, version)
+                }) {
                     Ok(download) => {
                         dialog.updates.background = false;
                         dialog.updates.status =
@@ -387,6 +409,38 @@ impl Workspace {
                     }
                 }
             }
+            Event::DeferUpdate(version, action)
+                if updates_allowed
+                    && dialog.updates.pending.is_none()
+                    && dialog
+                        .updates
+                        .offer
+                        .as_ref()
+                        .is_some_and(|offer| offer.version() == version) =>
+            {
+                let result = crate::profile::window_settings_path()
+                    .and_then(|settings| save_prompt_choice(&settings, &version, action));
+                match result {
+                    Ok(()) => {
+                        dialog.updates.background = false;
+                        dialog.updates.offer = None;
+                        dialog.updates.status = match action {
+                            PromptAction::RemindTomorrow => format!(
+                                "Automatic reminders resume tomorrow for version {version} when background checks are enabled."
+                            ),
+                            PromptAction::SkipVersion => {
+                                format!("Automatic prompts for version {version} are skipped.")
+                            }
+                        };
+                        self.application_update_prompt_changed(&version);
+                    }
+                    Err(error) => {
+                        dialog.updates.status =
+                            format!("Could not save the update preference ({error}).");
+                    }
+                }
+                Task::none()
+            }
             Event::UpdateProgress(ticket, progress)
                 if progress.total > 0
                     && progress.received <= progress.total
@@ -409,8 +463,19 @@ impl Workspace {
                             } else {
                                 "Archive verified and saved. Install the portable package when ready."
                             }.into();
+                            if saved.prompt_save_failed {
+                                dialog
+                                    .updates
+                                    .status
+                                    .push_str(" Could not save the automatic update preference.");
+                            }
                             dialog.updates.offer = None;
+                            let version =
+                                (!saved.prompt_save_failed).then(|| saved.version.clone());
                             dialog.updates.saved = Some(saved);
+                            if let Some(version) = version {
+                                self.remove_background_update_offer(&version);
+                            }
                         }
                         Err(error) => dialog.updates.status = error,
                     }
@@ -664,5 +729,17 @@ mod tests {
         updates.present_background(Some(&Check::Current));
         assert!(!updates.background);
         assert!(updates.status.contains("No stable release"));
+    }
+
+    #[test]
+    fn about_manual_check_can_present_a_release_without_a_background_offer() {
+        let mut updates = Updates::default();
+        updates.present_background(None);
+        assert!(updates.offer.is_none());
+        updates.checked(Ok(Check::Available(Offer::fixture("9.0.0"))));
+        assert_eq!(updates.offer.as_ref().map(Offer::version), Some("9.0.0"));
+        assert!(!updates.background);
+        updates.present_background(None);
+        assert_eq!(updates.offer.as_ref().map(Offer::version), Some("9.0.0"));
     }
 }

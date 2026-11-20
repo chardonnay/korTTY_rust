@@ -290,6 +290,17 @@ pub(super) fn merge_java_backup(
             connection.terminal.remap_java_highlight(highlight_sets);
             let mut entry = ImportedProfile::new(connection, group(id));
             entry.badge = source.library.os_badges.get(&id).cloned();
+            entry.java_badge = source.library.java_os_badges.get(&id).cloned();
+            if entry
+                .badge
+                .as_deref()
+                .is_some_and(super::super::custom_os_badges::is_reference)
+                && let Some(reference) = entry.badge.take()
+            {
+                entry.java_badge = Some(super::super::custom_os_badges::JavaBadgeHint::unresolved(
+                    reference,
+                ));
+            }
             entry
         })
         .collect();
@@ -533,6 +544,12 @@ pub(super) fn stage_with_insertions(
         candidate
             .library
             .set_os_badge(connection.id, entry.badge.as_deref());
+        if let Some(hint) = &entry.java_badge {
+            candidate
+                .library
+                .java_os_badges
+                .insert(connection.id, hint.clone());
+        }
         inserted(Inserted::Ssh(entry, &connection));
         candidate.connections.push(connection);
         outcome.imported += 1;

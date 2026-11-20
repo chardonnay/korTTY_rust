@@ -122,14 +122,110 @@ fn network_map_selects_collapsed_connections_and_restores_a_moved_folder() {
         Store::open(profile.path()).unwrap().group_of(id),
         Some(to.as_str())
     );
-    complete_persisted(&mut manager, Message::MapUndo);
+    complete_persisted(&mut manager, Message::UndoFolderMove);
     assert_eq!(
         Store::open(profile.path()).unwrap().group_of(id),
         Some(from.as_str())
     );
-    assert!(task::into_stream(manager.update(Message::MapUndo)).is_none());
+    assert!(task::into_stream(manager.update(Message::UndoFolderMove)).is_none());
     let _ = manager.update(Message::MapView(false));
     assert_eq!(manager.selected().unwrap().id, id);
+}
+
+#[test]
+fn tree_and_map_folder_moves_share_successive_undo() {
+    use folder_moves::Profile as Movable;
+    use iced_runtime::task;
+
+    let profile = Profile::new();
+    let mut store = Store::open(profile.path()).unwrap();
+    let first = store.create_group(None, "First folder").unwrap();
+    let second = store.create_group(Some(&first), "Second folder").unwrap();
+    let ssh = store.save(connection("SSH fixture", "")).unwrap();
+    let serial = store
+        .save_serial(SerialProfile::new(
+            "Serial fixture",
+            crate::session::SerialConnection {
+                device: "COM14".into(),
+                ..Default::default()
+            },
+            kortty_terminal::TerminalProfile::Vt220,
+        ))
+        .unwrap();
+    let mut manager = ConnectionWindow::open(profile.path()).unwrap();
+    complete_persisted(
+        &mut manager,
+        Message::TreeMove(Movable::Serial(serial), first.clone()),
+    );
+    complete_persisted(
+        &mut manager,
+        Message::TreeMove(Movable::Ssh(ssh), first.clone()),
+    );
+    assert!(
+        task::into_stream(manager.update(Message::TreeMove(Movable::Ssh(ssh), first.clone())))
+            .is_none()
+    );
+    let _ = manager.update(Message::MapView(true));
+    complete_persisted(&mut manager, Message::MapMove(ssh, Some(second.clone())));
+    assert_eq!(manager.store.group_of(ssh), Some(second.as_str()));
+
+    let _ = manager.update(Message::MapView(false));
+    let _ = manager.update(Message::Scope(Scope::Teamwork));
+    assert!(task::into_stream(manager.update(Message::UndoFolderMove)).is_none());
+    assert!(
+        task::into_stream(manager.update(Message::TreeMove(Movable::Ssh(ssh), first.clone())))
+            .is_none()
+    );
+    let _ = manager.update(Message::Scope(Scope::All));
+    complete_persisted(&mut manager, Message::UndoFolderMove);
+    assert_eq!(manager.store.group_of(ssh), Some(first.as_str()));
+    complete_persisted(&mut manager, Message::UndoFolderMove);
+    assert_eq!(manager.store.group_of(ssh), None);
+    assert_eq!(manager.store.group_of(serial), Some(first.as_str()));
+    complete_persisted(&mut manager, Message::UndoFolderMove);
+    let saved = Store::open(profile.path()).unwrap();
+    assert_eq!(saved.group_of(ssh), None);
+    assert_eq!(saved.group_of(serial), None);
+    assert!(!manager.can_undo_folder_move());
+}
+
+#[test]
+fn folder_undo_refuses_a_concurrent_edit_and_keeps_earlier_valid_moves() {
+    use folder_moves::Profile as Movable;
+    use iced::futures::{StreamExt, executor::block_on};
+    use iced_runtime::{Action, task};
+
+    let profile = Profile::new();
+    let mut store = Store::open(profile.path()).unwrap();
+    let first = store.create_group(None, "First folder").unwrap();
+    let second = store.create_group(None, "Second folder").unwrap();
+    let earlier = store.save(connection("Earlier", "")).unwrap();
+    let later = store.save(connection("Later", "")).unwrap();
+    let mut manager = ConnectionWindow::open(profile.path()).unwrap();
+    for id in [earlier, later] {
+        complete_persisted(
+            &mut manager,
+            Message::TreeMove(Movable::Ssh(id), first.clone()),
+        );
+    }
+
+    let mut other = Store::open(profile.path()).unwrap();
+    other
+        .save_in_group(other.get(later).unwrap().clone(), Some(&second))
+        .unwrap();
+    let mut result = task::into_stream(manager.update(Message::UndoFolderMove)).unwrap();
+    let Some(Action::Output(completed @ Message::Completed(Err(_)))) = block_on(result.next())
+    else {
+        panic!("a stale store cannot write an undo");
+    };
+    let _ = manager.update(completed);
+    assert!(manager.can_undo_folder_move());
+    complete_persisted(&mut manager, Message::Reload);
+    complete_persisted(&mut manager, Message::UndoFolderMove);
+    let saved = Store::open(profile.path()).unwrap();
+    assert_eq!(saved.group_of(later), Some(second.as_str()));
+    assert_eq!(saved.group_of(earlier), None);
+    assert!(!manager.can_undo_folder_move());
 }
 
 #[test]
@@ -1125,6 +1221,140 @@ fn a_changed_folder_invalidates_the_pending_delete_confirmation() {
     assert!(window.folder.is_none());
     assert_eq!(window.update(Message::CommitGroup).units(), 0);
     assert!(window.store.has_group(&child));
+}
+
+#[test]
+fn connection_manager_pointer_drags_accept_local_folders_and_refuse_teamwork_sources() {
+    use folder_moves::Profile as Movable;
+    use iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
+    use iced::{Event, Font, Renderer, Size, mouse};
+
+    let profile = Profile::new();
+    let mut store = Store::open(profile.path()).unwrap();
+    let destination = store.create_group(None, "Destination").unwrap();
+    let id = store.save(connection("Writable", "")).unwrap();
+    let shared_file = profile.0.join("shared.xml");
+    fs::write(
+        &shared_file,
+        r#"<connections><connection id="one"><name>Shared</name><host>shared.example.test</host><username>operator</username></connection></connections>"#,
+    )
+    .unwrap();
+    let settings = teamwork::Settings {
+        sources: vec![teamwork::Source {
+            location: shared_file.to_str().unwrap().into(),
+            enabled: true,
+            kind: teamwork::SourceKind::File,
+            check_interval_minutes: teamwork::DEFAULT_CHECK_INTERVAL_MINUTES,
+        }],
+        ..Default::default()
+    };
+    let catalog =
+        teamwork::Catalog::default().refreshed(&settings.active_sources(true, &[]).unwrap());
+    let mut manager = ConnectionWindow::open(profile.path()).unwrap();
+    manager.set_teamwork(catalog, None);
+    let keys = manager.visible_row_keys();
+    assert!(matches!(keys.last(), Some(RowKey::Shared(_))));
+    let row_index = |key: &RowKey| keys.iter().position(|row| row == key).unwrap();
+    let themes = crate::terminal_theme::Themes::default();
+    let mut view = manager.view(ViewChoices {
+        journal_max_parts: None,
+        serial_allowed: true,
+        passwords: &[],
+        passphrases: &[],
+        keys: &[],
+        ai_profiles: &[],
+        java_ai_profiles: &[],
+        ai_skills: &[],
+        ai_agent_designs: &[],
+        highlighting: HighlightChoices::default(),
+        themes: &themes,
+        incognito_allowed: true,
+        terminal_effects: Some(&Effect::ALL),
+        default_paste_warning: Default::default(),
+        minimum_paste_warning: PasteWarningMode::Off,
+    });
+    let renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+    let mut tree = Tree::new(view.as_widget());
+    let node = view.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &layout::Limits::new(Size::ZERO, Size::new(1240.0, 760.0)),
+    );
+    let layout = Layout::new(&node);
+    let workbench = layout.children().nth(2).unwrap();
+    let results = workbench
+        .children()
+        .nth(2)
+        .unwrap()
+        .children()
+        .next()
+        .unwrap();
+    let rows = results
+        .children()
+        .nth(1)
+        .unwrap()
+        .children()
+        .next()
+        .unwrap();
+    let sidebar = workbench
+        .children()
+        .next()
+        .unwrap()
+        .children()
+        .next()
+        .unwrap();
+    let sidebar_destination = sidebar
+        .children()
+        .next()
+        .unwrap()
+        .children()
+        .last()
+        .unwrap()
+        .bounds()
+        .center();
+    let row_point = |key| {
+        rows.children()
+            .nth(row_index(&key))
+            .unwrap()
+            .bounds()
+            .center()
+    };
+    let start = row_point(RowKey::Connection(id));
+    let group = row_point(RowKey::Group(destination.clone()));
+    let shared = rows.children().last().unwrap().bounds().center();
+    let mut drag = |start, end| {
+        let mut messages = Vec::new();
+        for event in [
+            mouse::Event::CursorMoved { position: start },
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+            mouse::Event::CursorMoved { position: end },
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+        ] {
+            // A platform event batch can report the final cursor for every event.
+            view.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(event),
+                layout,
+                mouse::Cursor::Available(end),
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &node.bounds(),
+            );
+        }
+        messages
+    };
+    for target in [group, sidebar_destination] {
+        assert!(matches!(
+            drag(start, target).as_slice(),
+            [Message::TreeMove(Movable::Ssh(source), folder)] if *source == id && *folder == destination
+        ));
+    }
+    assert!(
+        drag(shared, sidebar_destination)
+            .iter()
+            .all(|message| !matches!(message, Message::TreeMove(..)))
+    );
 }
 
 #[test]

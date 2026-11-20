@@ -8,10 +8,8 @@ use iced::{
     Alignment, Color, Element, Event, Length, Point, Rectangle, Renderer, Size, Task, Theme, window,
 };
 
-use crate::connection_store::Store;
-
 use super::view::icons::Icon;
-use super::{ConnectionWindow, Message, Persisted, RowKey};
+use super::{ConnectionWindow, Message, RowKey, folder_moves::Profile};
 
 pub(crate) mod layout;
 pub(crate) mod pdf;
@@ -28,8 +26,6 @@ pub(super) struct State {
     pub(super) jumps: bool,
     pub(super) tunnels: bool,
     pub(super) zoom: Zoom,
-    undo: Option<Move>,
-    pending: Option<PendingMove>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -40,18 +36,6 @@ pub(super) enum Zoom {
     Manual(f32),
 }
 
-#[derive(Clone)]
-struct Move {
-    id: u64,
-    from: Option<String>,
-    to: Option<String>,
-}
-
-enum PendingMove {
-    Move(Move),
-    Undo,
-}
-
 impl Default for State {
     fn default() -> Self {
         Self {
@@ -59,33 +43,7 @@ impl Default for State {
             jumps: true,
             tunnels: true,
             zoom: Zoom::Initial,
-            undo: None,
-            pending: None,
         }
-    }
-}
-
-impl State {
-    pub(super) fn finish_move(&mut self, saved: bool) {
-        if let Some(pending) = self.pending.take()
-            && saved
-        {
-            self.undo = match pending {
-                PendingMove::Move(moved) => Some(moved),
-                PendingMove::Undo => None,
-            };
-        }
-    }
-
-    fn undoable(&self, store: &Store) -> Option<&Move> {
-        let moved = self.undo.as_ref()?;
-        (store.get(moved.id).is_some()
-            && store.group_of(moved.id) == moved.to.as_deref()
-            && moved
-                .from
-                .as_deref()
-                .is_none_or(|group| store.has_group(group)))
-        .then_some(moved)
     }
 }
 
@@ -137,56 +95,10 @@ impl ConnectionWindow {
     }
 
     pub(super) fn move_map_connection(&mut self, id: u64, folder: Option<String>) -> Task<Message> {
-        if !self.map_has_row(&RowKey::Connection(id))
-            || self.store.group_of(id) == folder.as_deref()
-            || folder
-                .as_deref()
-                .is_some_and(|path| !self.store.has_group(path))
-        {
+        if !self.map_has_row(&RowKey::Connection(id)) {
             return Task::none();
         }
-        self.network_map.pending = Some(PendingMove::Move(Move {
-            id,
-            from: self.store.group_of(id).map(str::to_owned),
-            to: folder.clone(),
-        }));
-        self.persist_map_move(id, folder, "Connection moved to another folder.")
-    }
-
-    pub(super) fn undo_map_move(&mut self) -> Task<Message> {
-        let Some(moved) = self.network_map.undoable(&self.store).cloned() else {
-            return Task::none();
-        };
-        self.network_map.pending = Some(PendingMove::Undo);
-        self.persist_map_move(moved.id, moved.from, "Connection folder restored.")
-    }
-
-    fn persist_map_move(
-        &mut self,
-        id: u64,
-        folder: Option<String>,
-        status: &'static str,
-    ) -> Task<Message> {
-        if let Some(folder) = &folder {
-            self.collapsed.retain(|ancestor| {
-                folder != ancestor
-                    && !folder
-                        .strip_prefix(ancestor.as_str())
-                        .is_some_and(|suffix| suffix.starts_with('/'))
-            });
-        }
-        self.persist(move |mut store| {
-            let connection = store.get(id).cloned().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "Saved connection no longer exists.",
-                )
-            })?;
-            store.save_in_group(connection, folder.as_deref())?;
-            let mut done = Persisted::saved(store, id);
-            done.status = status;
-            Ok(done)
-        })
+        self.move_profile(Profile::Ssh(id), folder)
     }
 
     pub(super) fn network_map_view(&self, count: usize) -> Element<'_, Message> {
@@ -208,9 +120,6 @@ impl ConnectionWindow {
             checkbox(map.tunnels)
                 .label("Tunnels")
                 .on_toggle_maybe(enabled.then_some(Message::MapTunnels)),
-            button("Undo").on_press_maybe(
-                (enabled && map.undoable(&self.store).is_some()).then_some(Message::MapUndo)
-            ),
             button("PDF…").on_press_maybe(enabled.then_some(Message::ExportMapPdf)),
         ]
         .spacing(8)

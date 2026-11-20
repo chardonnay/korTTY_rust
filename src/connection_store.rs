@@ -757,6 +757,10 @@ impl Store {
         self.set_os_badges(&[id], badge)
     }
 
+    pub(crate) fn java_badge_hint(&self, id: u64) -> Option<&custom_os_badges::JavaBadgeHint> {
+        self.document.library.java_os_badges.get(&id)
+    }
+
     pub(crate) fn set_os_badges(&mut self, ids: &[u64], badge: Option<&str>) -> io::Result<()> {
         let ids = self.require_connections(ids)?;
         if badge.is_some_and(|value| !valid_os_badge_reference(value)) {
@@ -765,6 +769,7 @@ impl Store {
         let mut candidate = self.document.clone();
         for id in ids {
             candidate.library.set_os_badge(id, badge);
+            candidate.library.java_os_badges.remove(&id);
         }
         self.commit(candidate)
     }
@@ -1093,6 +1098,9 @@ impl Store {
     ) -> io::Result<u64> {
         self.save_entry(connection, group, |library, id| {
             library.set_os_badge(id, badge);
+            if badge.is_some() {
+                library.java_os_badges.remove(&id);
+            }
         })
     }
 

@@ -777,6 +777,12 @@ pub(super) fn convert(
                 unresolved,
                 "Java connection AI assignments have no matching profile in the backup",
             );
+            let badge_hints = preview.java_badge_hint_count();
+            if badge_hints != 0 {
+                report.entries.push(format!(
+                    "Java OS symbol assignments to review in Connection Manager ({badge_hints})"
+                ));
+            }
             Ok((bytes, count))
         }) {
             Ok((bytes, count)) if count > 0 => {

@@ -13,6 +13,7 @@ use crate::serial_dialog;
 use crate::terminal_effects::Effect;
 
 mod color;
+mod folder_moves;
 mod form;
 mod journal_settings;
 mod local;
@@ -45,7 +46,8 @@ pub enum Message {
     MapFit,
     MapSelect(RowKey),
     MapMove(u64, Option<String>),
-    MapUndo,
+    TreeMove(folder_moves::Profile, String),
+    UndoFolderMove,
     ExportMapPdf,
     Select(u64),
     SelectShared(teamwork::Identity),
@@ -328,6 +330,7 @@ pub struct ConnectionWindow {
     badge_picker: Option<u64>,
     scope: Scope,
     network_map: network_map::State,
+    folder_moves: folder_moves::History,
     collapsed: BTreeSet<String>,
     open_counts: Option<BTreeMap<u64, usize>>,
     draft: Option<Draft>,
@@ -396,6 +399,7 @@ impl ConnectionWindow {
             badge_picker: None,
             scope: Scope::All,
             network_map: network_map::State::default(),
+            folder_moves: folder_moves::History::default(),
             collapsed: BTreeSet::new(),
             open_counts: None,
             store,
@@ -1122,8 +1126,13 @@ impl ConnectionWindow {
             Message::MapMove(id, folder) if self.network_map.visible && self.can_browse() => {
                 return self.move_map_connection(id, folder);
             }
-            Message::MapUndo if self.network_map.visible && self.can_browse() => {
-                return self.undo_map_move();
+            Message::TreeMove(profile, folder)
+                if !self.network_map.visible && self.can_move_folders() =>
+            {
+                return self.move_tree_profile(profile, folder);
+            }
+            Message::UndoFolderMove if self.can_move_folders() => {
+                return self.undo_folder_move();
             }
             Message::Select(id) if self.can_browse() => self.select_row(RowKey::Connection(id)),
             Message::SelectSerial(id) if self.can_browse() => self.select_row(RowKey::Serial(id)),
@@ -1200,8 +1209,29 @@ impl ConnectionWindow {
                     && self.valid_os_badge(badge.as_deref()) =>
             {
                 self.badge_picker = None;
-                if self.store.os_badge_id(id) != badge.as_deref() {
+                if self.store.os_badge_id(id) != badge.as_deref()
+                    || self.store.java_badge_hint(id).is_some()
+                {
+                    let reviewed_image = badge.as_deref().and_then(|reference| {
+                        self.custom_badges
+                            .find(reference)
+                            .map(|badge| badge.png().to_vec())
+                    });
                     return self.persist(move |mut store| {
+                        if let (Some(reference), Some(reviewed)) = (&badge, reviewed_image) {
+                            let root = store.path().parent().ok_or_else(|| {
+                                std::io::Error::other("Missing profile directory")
+                            })?;
+                            let catalog = Catalog::load(root)?;
+                            if !catalog
+                                .find(reference)
+                                .is_some_and(|current| current.png() == reviewed)
+                            {
+                                return Err(std::io::Error::other(
+                                    "The selected OS symbol changed. Reopen the symbol picker.",
+                                ));
+                            }
+                        }
                         store.set_os_badge_id(id, badge.as_deref())?;
                         let mut done = Persisted::saved(store, id);
                         done.status = "OS symbol saved.";
@@ -1511,7 +1541,7 @@ impl ConnectionWindow {
             }
             Message::Completed(result) => {
                 self.busy = false;
-                self.network_map.finish_move(result.is_ok());
+                self.folder_moves.finish(result.is_ok());
                 match result {
                     Ok(done) => {
                         self.tree_context.clear_prompt();

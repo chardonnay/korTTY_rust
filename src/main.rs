@@ -15,6 +15,7 @@ mod horizontal_divider;
 mod host_memory;
 mod input;
 mod internal_clipboard;
+mod internal_folder_drag;
 mod java_pattern;
 mod job_executor;
 mod kitty_view;

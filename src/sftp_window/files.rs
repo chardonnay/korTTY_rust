@@ -359,11 +359,13 @@ pub(super) fn set_permissions(_: &Path, _: u32) -> io::Result<()> {
 pub(super) struct StagedFile {
     path: Option<PathBuf>,
     file: File,
+    _active: super::partials::Reservation,
 }
 
 impl StagedFile {
     pub(super) fn create(parent: &Path) -> io::Result<Self> {
-        let path = parent.join(nonce()?);
+        let (name, active) = super::partials::stage()?;
+        let path = parent.join(name);
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -375,6 +377,7 @@ impl StagedFile {
         Ok(Self {
             path: Some(path),
             file,
+            _active: active,
         })
     }
 

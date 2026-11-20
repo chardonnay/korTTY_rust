@@ -18,6 +18,51 @@ impl Drop for Server {
 }
 
 #[test]
+#[ignore = "requires an installed OpenSSH sftp-server"]
+fn openssh_partial_cleanup_keeps_active_changed_and_nonpart_entries() {
+    let profile = crate::snippets::tests::Profile::new();
+    let root = profile.0.canonicalize().unwrap();
+    let (_, remote) = roots(&root);
+    let context = context(&root);
+    let active = remote.join("live-remote.kortty-part");
+    let changed = remote.join("changed-remote.kortty-part");
+    let leftover = remote.join("old-remote.kortty-part");
+    let backup = remote.join("file.kortty-old");
+    for path in [&active, &changed, &leftover, &backup] {
+        private_file(path, b"original").unwrap();
+    }
+    let recovery = remote.join(".kortty-checkpoint.kortty-part");
+    private_dir(&recovery);
+    let _active = crate::sftp_window::partials::reserve(b"live-remote.kortty-part").unwrap();
+    let (mut server, reader) = open_server(&remote);
+    let writer = Box::new(server.0.stdin.take().unwrap()) as _;
+    let mut client: Client = Sftp::new(reader, writer).unwrap();
+
+    super::upload::window(&context, |window, incoming, control| {
+        window.remote.load(Arc::new(
+            list_remote(&mut client, remote.as_os_str().as_bytes()).unwrap(),
+        ));
+        let _ = window.update(WindowMessage::CleanPartialFiles(Side::Remote));
+        let command = incoming.try_recv().expect("queue a cleanup review");
+        let reply = finish_command(window, &mut client, control, command);
+        assert!(matches!(&*reply, Reply::PartialCleanupReviewed(plan)
+            if plan.paths() == ["changed-remote.kortty-part", "old-remote.kortty-part"]));
+        fs::write(&changed, b"updated after preview").unwrap();
+
+        let _ = window.update(WindowMessage::ConfirmChange);
+        let command = incoming.try_recv().expect("queue confirmed cleanup");
+        let reply = finish_command(window, &mut client, control, command);
+        assert!(
+            matches!(&*reply, Reply::Changed { note, directory: Some(_), .. }
+            if note.contains("Removed 1 of 2 reviewed transfer parts"))
+        );
+        assert!(!leftover.exists());
+        assert_eq!(fs::read(&changed).unwrap(), b"updated after preview");
+        assert!(active.exists() && backup.exists() && recovery.is_dir());
+    });
+}
+
+#[test]
 #[ignore = "requires an installed OpenSSH sftp-server with POSIX rename"]
 fn openssh_recursive_deletion_rejects_a_stale_review_and_reloads_the_remaining_directory() {
     let profile = crate::snippets::tests::Profile::new();

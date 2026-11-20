@@ -2697,6 +2697,136 @@ fn java_marker_restore_matches_entries_preserves_local_rules_and_replays() {
 }
 
 #[test]
+fn java_os_badge_restore_requires_a_local_image_choice_even_when_the_id_exists() {
+    use crate::connection_store::{Store, custom_os_badges::Catalog};
+    use crate::connection_window::{ConnectionWindow, Message};
+    use iced::futures::{StreamExt, executor::block_on};
+    use iced_runtime::{Action, task};
+    use zip::{AesMode, ZipWriter, write::SimpleFileOptions};
+
+    let local = Scratch::new();
+    let source = Scratch::new();
+    let collision_png = source.0.join("collision.png");
+    let original_png = source.0.join("original.png");
+    for (path, color) in [
+        (&collision_png, image::Rgba([190_u8, 80, 40, 255])),
+        (&original_png, image::Rgba([35_u8, 114, 190, 255])),
+    ] {
+        image::RgbaImage::from_pixel(24, 24, color)
+            .save(path)
+            .unwrap();
+    }
+    let mut catalog = Catalog::load(&local.0).unwrap();
+    let collision = catalog
+        .add("Existing local symbol", "Custom", &collision_png)
+        .unwrap();
+    let java_id = collision.strip_prefix("custom:").unwrap();
+    let missing = "custom:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    let connections = format!(
+        r#"
+        <connections>
+            <connection id="mapped"><name>Java router</name><host>router.example.test</host><username>fixture</username><osBadge>{collision}</osBadge></connection>
+            <connection id="missing"><name>Unknown image</name><host>unknown.example.test</host><username>fixture</username><osBadge>{missing}</osBadge></connection>
+            <connection id="builtin"><name>Built-in image</name><host>builtin.example.test</host><username>fixture</username><osBadge>debian</osBadge></connection>
+        </connections>"#
+    );
+    let settings = format!(
+        r#"<globalSettings><customOsBadges>
+        <badge id="{java_id}" name="Java blue router" file="{java_id}.png"/>
+        <badge id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" name="Unsafe original path" file="../missing.png"/>
+    </customOsBadges></globalSettings>"#
+    );
+    let path = source.0.join("symbols.zip");
+    let mut archive = ZipWriter::new(File::create(&path).unwrap());
+    for (name, bytes) in [
+        ("connections.xml", &connections),
+        ("global-settings.xml", &settings),
+    ] {
+        archive
+            .start_file(
+                name,
+                SimpleFileOptions::default()
+                    .with_aes_encryption_bytes(AesMode::Aes256, b"archive-password"),
+            )
+            .unwrap();
+        archive.write_all(bytes.as_bytes()).unwrap();
+    }
+    archive.finish().unwrap();
+    let inspect = || {
+        super::super::inspect_java_password(&path, &Secret::new("archive-password".into())).unwrap()
+    };
+    assert!(
+        inspect()
+            .java_review()
+            .unwrap()
+            .1
+            .iter()
+            .any(|line| line.contains("OS symbol assignments"))
+    );
+    super::super::queue_restore_at(&local.0, inspect(), RestoreMode::JavaAdditive).unwrap();
+    drop(ProfileLease::acquire(&local.0, || false).unwrap());
+
+    let path = local.0.join(CONNECTIONS);
+    let store = Store::open(path.clone()).unwrap();
+    let find = |host: &str| {
+        store
+            .connections()
+            .iter()
+            .find(|entry| entry.login.endpoint.host == host)
+            .unwrap()
+            .id
+    };
+    let id = find("router.example.test");
+    let unresolved = find("unknown.example.test");
+    let hint = store.java_badge_hint(id).unwrap();
+    assert_eq!(hint.reference, collision);
+    assert_eq!(hint.name.as_deref(), Some("Java blue router"));
+    assert_eq!(
+        hint.file.as_deref(),
+        Some(format!("{java_id}.png").as_str())
+    );
+    assert_eq!(store.os_badge_id(id), None);
+    assert_eq!(
+        store.java_badge_hint(unresolved).unwrap().reference,
+        missing
+    );
+    assert_eq!(store.java_badge_hint(unresolved).unwrap().file, None);
+    assert_eq!(
+        store.os_badge_id(find("builtin.example.test")),
+        Some("debian")
+    );
+
+    let adopted = catalog
+        .add("Imported blue router", "Custom", &original_png)
+        .unwrap();
+    assert_ne!(adopted, collision);
+    let mut manager = ConnectionWindow::open(path.clone()).unwrap();
+    let _ = manager.update(Message::Select(unresolved));
+    let _ = manager.update(Message::ToggleOsBadgePicker(unresolved));
+    assert!(
+        task::into_stream(manager.update(Message::SetOsBadge(unresolved, Some(missing.into()))))
+            .is_none()
+    );
+    let _ = manager.update(Message::Select(id));
+    let _ = manager.update(Message::ToggleOsBadgePicker(id));
+    let mut operation =
+        task::into_stream(manager.update(Message::SetOsBadge(id, Some(adopted.clone())))).unwrap();
+    let Some(Action::Output(completed @ Message::Completed(Ok(_)))) = block_on(operation.next())
+    else {
+        panic!("expected a verified local OS symbol assignment");
+    };
+    let _ = manager.update(completed);
+    drop(manager);
+    super::super::queue_restore_at(&local.0, inspect(), RestoreMode::JavaAdditive).unwrap();
+    drop(ProfileLease::acquire(&local.0, || false).unwrap());
+    let reopened = Store::open(path).unwrap();
+    assert_eq!(reopened.os_badge_id(id), Some(adopted.as_str()));
+    assert!(reopened.java_badge_hint(id).is_none());
+    assert_eq!(reopened.os_badge_id(unresolved), None);
+    assert!(Catalog::load(&local.0).unwrap().find(&collision).is_some());
+}
+
+#[test]
 fn java_connection_library_restore_remaps_only_unambiguous_insertions() {
     use crate::connection_store::{Store, TabColor, import::Preview as ConnectionPreview};
     use zip::{AesMode, ZipWriter, write::SimpleFileOptions};

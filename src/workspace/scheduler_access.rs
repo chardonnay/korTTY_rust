@@ -1005,6 +1005,10 @@ impl Workspace {
         }
         let refresh_targets = match &message {
             scheduler_window::Message::RefreshConnectionGroups
+            | scheduler_window::Message::TargetPicker(
+                scheduler_window::target_picker::Event::Open
+                | scheduler_window::target_picker::Event::Apply,
+            )
             | scheduler_window::Message::ConnectionGroupAdded(
                 scheduler_window::ConnectionGroup::Teamwork(_),
             ) => true,

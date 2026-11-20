@@ -17,6 +17,7 @@ use crate::terminal_effects::Effect;
 use crate::terminal_theme::Themes;
 
 use super::color::ColorDraft;
+use super::folder_moves::{DragZone, Profile as MovableProfile};
 use super::selection::{RowKey, VisualRow};
 use super::{
     ConnectionWindow, CredentialChoice, FolderDialog, JavaTeamworkAuth, Message, Scope,
@@ -483,25 +484,32 @@ impl ConnectionWindow {
         .spacing(10)
         .align_y(Alignment::Center)
         .padding([8, 10]);
+        let panes = crate::internal_folder_drag::scope(
+            |zone| {
+                row![
+                    container(self.sidebar(&zone))
+                        .width(SIDEBAR_WIDTH)
+                        .height(Length::Fill)
+                        .style(sidebar_background),
+                    rule::vertical(4),
+                    container(self.results(&zone))
+                        .width(Length::Fill)
+                        .height(Length::Fill),
+                    rule::vertical(4),
+                    scrollable(self.inspector(&choices))
+                        .width(INSPECTOR_WIDTH)
+                        .height(Length::Fill),
+                ]
+                .height(Length::Fill)
+                .into()
+            },
+            |profile, folder: &str| Message::TreeMove(profile, folder.to_owned()),
+        );
         column![
             self.toolbar(choices.serial_allowed),
             rule::horizontal(1),
             teamwork_auth,
-            row![
-                container(self.sidebar())
-                    .width(SIDEBAR_WIDTH)
-                    .height(Length::Fill)
-                    .style(sidebar_background),
-                rule::vertical(4),
-                container(self.results())
-                    .width(Length::Fill)
-                    .height(Length::Fill),
-                rule::vertical(4),
-                scrollable(self.inspector(&choices))
-                    .width(INSPECTOR_WIDTH)
-                    .height(Length::Fill),
-            ]
-            .height(Length::Fill),
+            panes,
             rule::horizontal(1),
             footer,
         ]
@@ -738,7 +746,7 @@ impl ConnectionWindow {
         .into()
     }
 
-    fn sidebar(&self) -> Element<'_, Message> {
+    fn sidebar<'a>(&'a self, zone: &DragZone<'a>) -> Element<'a, Message> {
         let profiles = self.store.connections();
         let shared_count = self.shared_entries().count();
         let mut items = column![
@@ -814,13 +822,18 @@ impl ConnectionWindow {
         if !folders.is_empty() {
             items = items.push(heading("Folders"));
             for path in folders {
-                items = items.push(self.scope_item(
+                let item = self.scope_item(
                     Scope::Group(path.to_owned()),
                     Icon::Folder,
                     basename(path),
                     counts.get(path).copied().unwrap_or(0),
                     depth(path) - 1,
-                ));
+                );
+                items = items.push(if self.can_move_folders() && !self.network_map.visible {
+                    zone.item(item, None, Some(path))
+                } else {
+                    item
+                });
             }
         }
         let mut tags = BTreeMap::new();
@@ -882,7 +895,7 @@ impl ConnectionWindow {
         .into()
     }
 
-    fn results(&self) -> Element<'_, Message> {
+    fn results<'a>(&'a self, zone: &DragZone<'a>) -> Element<'a, Message> {
         let entries = self.visible_entries();
         let count = entries.len();
         let scope = match &self.scope {
@@ -916,6 +929,10 @@ impl ConnectionWindow {
         .vertical_spacing(2);
         let header = row![
             container(summary).width(Length::Fill),
+            button("Undo move").on_press_maybe(
+                self.can_undo_folder_move()
+                    .then_some(Message::UndoFolderMove)
+            ),
             row![
                 button("List")
                     .style(selectable(!self.network_map.visible))
@@ -939,6 +956,14 @@ impl ConnectionWindow {
         let mut list = column![].spacing(1);
         let mut shared_group = None;
         for entry in rows {
+            let (source, folder) = match &entry {
+                VisualRow::Connection(connection, _) => {
+                    (Some(MovableProfile::Ssh(connection.id)), None)
+                }
+                VisualRow::Serial(profile, _) => (Some(MovableProfile::Serial(profile.id)), None),
+                VisualRow::Group { path, .. } => (None, Some(*path)),
+                _ => (None, None),
+            };
             let row = match entry {
                 VisualRow::Connection(connection, indent) => {
                     self.connection_row(connection, indent)
@@ -959,7 +984,13 @@ impl ConnectionWindow {
                     collapsed,
                 } => self.group_row(path, indent, count, collapsed),
             };
-            list = list.push(row);
+            list = list.push(
+                if self.can_move_folders() && (source.is_some() || folder.is_some()) {
+                    zone.item(row, source, folder)
+                } else {
+                    row
+                },
+            );
         }
         if !has_rows {
             list = list.push(
@@ -1537,6 +1568,18 @@ impl ConnectionWindow {
                 fact("Terminal", entry.emulation.as_str()),
             ]
             .spacing(4),
+            self.store.java_badge_hint(id).map(|hint| {
+                column![
+                    text("Review imported Java OS symbol").size(14),
+                    text(hint.name.as_deref().unwrap_or(&hint.reference)).size(13),
+                    hint.name.as_ref().map(|_| text(&hint.reference).size(12)),
+                    hint.file
+                        .as_ref()
+                        .map(|file| text(format!("Original image: {file}")).size(13)),
+                    text("Choose a local symbol, or add an image through Manage symbols.").size(13),
+                ]
+                .spacing(4)
+            }),
             os_badge::picker(
                 badge,
                 &self.custom_badges,

@@ -77,6 +77,7 @@ struct ImportedProfile {
     java_rsync_folder: Option<String>,
     group: String,
     badge: Option<String>,
+    java_badge: Option<super::custom_os_badges::JavaBadgeHint>,
     has_password: bool,
     jump_has_password: bool,
 }
@@ -110,6 +111,7 @@ impl ImportedProfile {
             java_rsync_folder: None,
             group,
             badge: None,
+            java_badge: None,
             has_password: false,
             jump_has_password: false,
         }
@@ -206,6 +208,7 @@ impl Preview {
             return Err(invalid("connection import exceeds its size limit"));
         }
         xml::parse_java_backup(bytes, kortty::Source::Backup)
+            .map(|preview| preview.with_java_library(JavaLibrarySettings::default()))
     }
 
     pub(crate) fn portable_java_backup(&self) -> io::Result<(Vec<u8>, usize)> {
@@ -240,6 +243,23 @@ impl Preview {
     }
 
     pub(crate) fn with_java_library(mut self, settings: JavaLibrarySettings) -> Self {
+        for entry in &mut self.entries {
+            if entry
+                .badge
+                .as_deref()
+                .is_some_and(super::custom_os_badges::is_reference)
+                && let Some(reference) = entry.badge.take()
+            {
+                entry.java_badge = Some(super::custom_os_badges::JavaBadgeHint::unresolved(
+                    reference,
+                ));
+            }
+            if let Some(hint) = &mut entry.java_badge
+                && let Some(metadata) = settings.os_badges.get(&hint.reference)
+            {
+                hint.clone_from(metadata);
+            }
+        }
         if let Some(ids) = &settings.highlight_sets {
             for overrides in self
                 .entries
@@ -263,6 +283,13 @@ impl Preview {
         }
         self.java_library = settings;
         self
+    }
+
+    pub(crate) fn java_badge_hint_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| entry.java_badge.is_some())
+            .count()
     }
 
     pub(crate) fn merge_java_backup(

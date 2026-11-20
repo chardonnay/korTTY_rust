@@ -585,6 +585,123 @@ fn imported_privileged_archive_needs_native_approval_for_its_exact_local_copy() 
 }
 
 #[test]
+fn scheduler_target_picker_filters_and_applies_a_reviewed_batch_atomically() {
+    use target_picker::{Choice, Event};
+
+    let scratch = Profile::temporary();
+    let path = scratch.file();
+    let mut store = ConnectionStore::open(scratch.0.join("connections.json")).unwrap();
+    let parent = store.create_group(None, "Fleet").unwrap();
+    let child = store.create_group(Some(&parent), "Testing").unwrap();
+    let primary = store
+        .save_in_group(grouped_connection("primary.example.test"), Some(&parent))
+        .unwrap();
+    let mut node = grouped_connection("runtime.example.test");
+    node.name = "Night build node".into();
+    let selected = store.save_in_group(node, Some(&child)).unwrap();
+    let descendant = store
+        .save_in_group(grouped_connection("descendant.example.test"), Some(&child))
+        .unwrap();
+    let mut app = TestWindow::open(path.clone()).unwrap();
+    app.runtime.set_connections(Some(&store));
+    let find = |app: &TestWindow, id: u64| {
+        app.runtime
+            .connection_choices
+            .iter()
+            .find(|choice| {
+                choice
+                    .reference()
+                    .is_some_and(|reference| reference.id == id)
+            })
+            .unwrap()
+            .clone()
+    };
+    app.update(Message::Edit(Field::Name, "Reviewed target batch".into()));
+    app.update(Message::EditCommand(text_editor::Action::Edit(
+        text_editor::Edit::Paste(Arc::new("true".into())),
+    )));
+    let primary_choice = find(&app, primary);
+    app.update(Message::ConnectionSelected(primary_choice));
+    app.update(Message::Save);
+    let original = app.selected_job().unwrap().action().clone();
+    assert!(!app.view.dirty);
+
+    app.update(Message::TargetPicker(Event::Open));
+    let matching = |app: &TestWindow| {
+        app.view
+            .draft
+            .target_picker
+            .as_ref()
+            .unwrap()
+            .matching(
+                &app.runtime.connection_choices,
+                &app.runtime.connection_group_choices,
+                &app.runtime.connection_group_paths,
+            )
+            .map(|(choice, _)| choice)
+            .collect::<Vec<_>>()
+    };
+    let node = Choice::Connection(find(&app, selected));
+    app.update(Message::TargetPicker(Event::Search(
+        "  NIGHT BUILD  ".into(),
+    )));
+    assert!(matching(&app) == [node.clone()]);
+    app.update(Message::TargetPicker(Event::Search(
+        "RUNTIME.EXAMPLE".into(),
+    )));
+    assert!(matching(&app) == [node.clone()]);
+    app.update(Message::TargetPicker(Event::Select(node, true)));
+    app.update(Message::TargetPicker(Event::Search("Testing".into())));
+    let child_choice = Choice::Group(child.clone().into());
+    let child_matches = matching(&app);
+    assert_eq!(child_matches.len(), 3);
+    assert!(child_matches.contains(&child_choice));
+    assert!(child_matches.contains(&Choice::Connection(find(&app, descendant))));
+    let parent_choice = Choice::Group(parent.clone().into());
+    for group in [&parent_choice, &child_choice] {
+        app.update(Message::TargetPicker(Event::Select(group.clone(), true)));
+    }
+
+    let mut updated = store.get(selected).unwrap().clone();
+    updated.login.endpoint.host = "replacement.example.test".into();
+    store.save(updated).unwrap();
+    app.update(Message::TargetPicker(Event::Apply));
+    assert!(
+        app.status()
+            .unwrap()
+            .contains("selected SSH connection changed")
+    );
+    assert!(app.view.draft.target_picker.is_some());
+    assert!(!app.view.dirty);
+    assert!(app.selected_job().unwrap().action() == &original);
+
+    app.update(Message::TargetPicker(Event::Clear));
+    let replacement = Choice::Connection(find(&app, selected));
+    for choice in [replacement, parent_choice, child_choice] {
+        app.update(Message::TargetPicker(Event::Select(choice, true)));
+    }
+    app.update(Message::TargetPicker(Event::Apply));
+    assert!(app.view.draft.target_picker.is_none());
+    assert!(app.view.dirty);
+    app.update(Message::Save);
+    assert_eq!(app.status(), Some("Job saved"));
+    drop(app);
+
+    let reopened = TestWindow::open(path).unwrap();
+    let action = reopened.selected_job().unwrap().action();
+    assert_eq!(
+        action.targets().map(|target| target.id).collect::<Vec<_>>(),
+        [primary, selected, descendant]
+    );
+    let groups = action.target_groups.as_ref().unwrap();
+    assert_eq!(
+        groups.groups,
+        [ConnectionGroup::from(parent), ConnectionGroup::from(child)]
+    );
+    assert_eq!(groups.explicit[1].target.host, "replacement.example.test");
+}
+
+#[test]
 fn scheduler_target_groups_persist_source_and_block_changed_membership_until_refresh() {
     let scratch = Profile::temporary();
     let path = scratch.file();
@@ -941,10 +1058,33 @@ fn scheduler_teamwork_targets_round_trip_and_require_current_membership_and_pins
     app.update(Message::EditCommand(text_editor::Action::Edit(
         text_editor::Edit::Paste(Arc::new("true".into())),
     )));
-    app.update(Message::ConnectionSelected(one));
-    app.update(Message::ConnectionGroupAdded(parent));
-    app.update(Message::ConnectionGroupAdded(second_parent));
-    app.update(Message::ConnectionGroupAdded(local_group.into()));
+    use target_picker::{Choice, Event};
+    app.update(Message::TargetPicker(Event::Open));
+    app.update(Message::TargetPicker(Event::Search("Fleet".into())));
+    let picks = [
+        Choice::Connection(one),
+        Choice::Group(parent),
+        Choice::Group(second_parent),
+        Choice::Group(local_group.into()),
+    ];
+    let visible: Vec<_> = app
+        .view
+        .draft
+        .target_picker
+        .as_ref()
+        .unwrap()
+        .matching(
+            &app.runtime.connection_choices,
+            &app.runtime.connection_group_choices,
+            &app.runtime.connection_group_paths,
+        )
+        .map(|(choice, _)| choice)
+        .collect();
+    for pick in picks {
+        assert!(visible.contains(&pick));
+        app.update(Message::TargetPicker(Event::Select(pick, true)));
+    }
+    app.update(Message::TargetPicker(Event::Apply));
     app.update(Message::Save);
     let saved = app
         .selected_job()
