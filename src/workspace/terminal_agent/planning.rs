@@ -574,7 +574,12 @@ impl Workspace {
         )?;
         run.transport = Some((transport.clone(), *limit));
         run.ai_cancel = Some(pending.cancel);
-        let epoch = run.next(Phase::Thinking, "Waiting for the planning response…");
+        let notice = if stage == Stage::Triage {
+            "Checking the complexity of the request…"
+        } else {
+            "Waiting for the planning response…"
+        };
+        let epoch = run.next(Phase::Thinking, notice);
         run.begin_model_decision();
         let completion = Task::perform(
             async move {
@@ -585,11 +590,21 @@ impl Workspace {
                 })
             },
             move |reply| {
-                Desktop::TerminalAgent(id, RunMessage::Planning(Message::Reply(epoch, reply)))
+                let message = if stage == Stage::Triage {
+                    RunMessage::Triage(super::triage::Message::Reply(epoch, reply))
+                } else {
+                    RunMessage::Planning(Message::Reply(epoch, reply))
+                };
+                Desktop::TerminalAgent(id, message)
             },
         );
         let progress = Task::run(updates, move |progress| {
-            Desktop::TerminalAgent(id, RunMessage::Planning(Message::Progress(epoch, progress)))
+            let message = if stage == Stage::Triage {
+                RunMessage::Progress(epoch, progress)
+            } else {
+                RunMessage::Planning(Message::Progress(epoch, progress))
+            };
+            Desktop::TerminalAgent(id, message)
         });
         Ok(progress.chain(completion))
     }

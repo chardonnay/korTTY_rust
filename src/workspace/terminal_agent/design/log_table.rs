@@ -694,6 +694,9 @@ impl super::Workspace {
         use keyboard::{EntryKey, MENU_KEY, MENU_MODIFIERS, PANE_FOCUS_KEY, PANE_FOCUS_MODIFIERS};
 
         if self.windows.contains_key(&window) || self.terminal_agents.window_run(window).is_some() {
+            let hosted = self
+                .active_hosted_tab(window)
+                .filter(|tab| tab.kind == crate::workspace::tool_tabs::Kind::TerminalAgent);
             let entry = self
                 .terminal_agents
                 .pip_run_for_window(window)
@@ -709,10 +712,10 @@ impl super::Workspace {
                     }
                     let pane = self.windows.get(&window)?.tab()?.focused_session()?;
                     let stream = self.sessions.get(&pane)?.stream_generation;
-                    let (run, _) = self
+                    let (id, run) = self
                         .terminal_agents
                         .agent_activity_for_stream(pane, stream)?;
-                    Some((run, EntryKey::Pane))
+                    (!run.runs_in_chat_tab()).then_some((id, EntryKey::Pane))
                 });
             let shift_f10_available = self
                 .window_settings
@@ -722,7 +725,7 @@ impl super::Workspace {
             keyboard::wrap(
                 content,
                 &self.terminal_agents,
-                window,
+                hosted.map_or(window, |tab| tab.instance),
                 entry,
                 shift_f10_available,
             )

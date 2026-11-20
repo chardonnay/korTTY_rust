@@ -18,7 +18,7 @@ impl Run {
         if results.is_empty() {
             return Err(TURN_LIMIT_REACHED.into());
         }
-        let mask = |value| mask::prompt(&self.redactor, value);
+        let mask = |value: &str| mask::prompt(&self.redactor, value);
         let mut input = json!({
             "goal": mask(self.goal.trim())?,
             "target": {
@@ -33,6 +33,10 @@ impl Run {
             "probe": self.final_evidence.probe(&self.redactor)?,
             "commandResults": results,
         });
+        let clarifications = self.clarification_input(mask)?;
+        if !clarifications.is_empty() {
+            input["clarifications"] = json!(clarifications);
+        }
         if let Some(evidence) = web_evidence {
             input["web_evidence"] = json!(evidence);
         }
@@ -89,7 +93,7 @@ impl Run {
     ) -> Result<(), String> {
         match result {
             Ok(decision) if matches!(decision.action, Action::Done | Action::Blocked) => {
-                self.accept_decision(workspace, decision)
+                self.accept_decision(workspace, decision).map(|_| ())
             }
             Ok(_) => Err(self.final_advice_failed("The final response requires done or blocked.")),
             Err(error) => Err(self.final_advice_failed(error)),

@@ -141,6 +141,7 @@ impl Workspace {
                 return self.agent_directory(id, run, Phase::Directory);
             }
             Message::Planning(message) => return self.planning_action(id, run, message),
+            Message::Triage(message) => return self.triage_action(id, run, message),
             Message::ReviewModel(message) => return self.model_review_action(id, run, message),
             Message::Password(message) => return self.password_sudo_action(id, run, message),
             Message::Implement(epoch)
@@ -210,20 +211,7 @@ impl Workspace {
                 }
                 return self.accept_target_review(id, run, probe);
             }
-            Message::Answer(epoch, answer)
-                if epoch == run.epoch
-                    && !run.paused
-                    && run.phase == Phase::Question
-                    && answer.len() <= 1024
-                    && !answer.trim().is_empty() =>
-            {
-                let answer = mask::prompt(&run.redactor, &answer)?;
-                run.question = None;
-                run.clarification_answers.push(answer.clone());
-                run.record(format!("Your answer\n{answer}"));
-                run.turns = run.turns.saturating_sub(1);
-                return self.agent_turn(id, run);
-            }
+            Message::Clarification(message) => return self.clarify_agent(id, run, message),
             Message::Pause if !run.phase.finished() && !run.cancel.requested() => {
                 run.auto_approve_root = false;
                 let had_approval = run.revoke_command_approval();
@@ -297,13 +285,17 @@ impl Workspace {
                 let skill_usage = run.model_review.take().and_then(Review::into_skill_usage);
                 run.record_model_response(epoch, &report);
                 run.finish_model_repair(epoch, false);
-                if run.phase == Phase::FinalAdvice {
+                let review_next = if run.phase == Phase::FinalAdvice {
                     run.accept_final_advice(self, &report.result)?;
+                    false
                 } else {
-                    run.accept_decision(self, report.result.as_ref().map_err(Clone::clone)?)?;
-                }
+                    run.accept_decision(self, report.result.as_ref().map_err(Clone::clone)?)?
+                };
                 if let Some(usage) = skill_usage {
                     usage.record();
+                }
+                if review_next {
+                    return self.agent_turn(id, run);
                 }
                 if let Some(task) = self.continue_agent_commands(id, run)? {
                     return Ok(task);
@@ -789,6 +781,25 @@ impl Workspace {
             run.next(Phase::Paused, "Paused between agent steps.");
             return Ok(Task::none());
         }
+        if !run.triage.checked && self.triage_mode(run).is_some() {
+            run.triage.checked = true;
+            let triage = self.agent_transport(run).and_then(|(_, limit)| {
+                let input = run.decision_input(false, limit, None)?;
+                self.prepare_model_review(
+                    id,
+                    run,
+                    request_review::Draft::Plan {
+                        stage: engine::planning::Stage::Triage,
+                        input,
+                        evidence: run.context.clone(),
+                    },
+                )
+            });
+            if let Ok(task) = triage {
+                return Ok(task);
+            }
+            run.record("The complexity check could not be prepared.".into());
+        }
         let draft = match (run.mode, &run.purpose) {
             (Mode::Ask, Purpose::Agent(_)) => request_review::Draft::Ask,
             (Mode::Run, Purpose::Agent(_)) => {
@@ -861,6 +872,8 @@ impl Run {
             .as_deref()
             .map(|value| self.decision_text(value))
             .transpose()?;
+        let clarifications =
+            self.clarification_input(|value| self.decision_text(value).map(Cow::into_owned))?;
         let mut steps = self
             .activity
             .iter()
@@ -872,6 +885,9 @@ impl Run {
         let data = |steps: &[Cow<'_, str>]| {
             let mut request = json!({"goal":goal,"target":target,"context":context,"acceptedPlan":plan,"steps":steps,
                 "turn":self.turns + 1,"turnLimit":engine::MAX_TURNS});
+            if !clarifications.is_empty() {
+                request["clarifications"] = json!(clarifications);
+            }
             if let Some(evidence) = web_evidence {
                 request["web_evidence"] = json!(evidence);
             }
@@ -956,7 +972,7 @@ impl Run {
         &mut self,
         workspace: &Workspace,
         decision: &Decision,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let outbound = self
             .profile()
             .is_some_and(ProfileChoice::is_reviewed_outbound);
@@ -1023,16 +1039,22 @@ impl Run {
                     "Review the exact command and its destination.",
                 );
             }
-            Action::Input { question, answers }
-                if self.mode == Mode::Run && self.questions < engine::MAX_QUESTIONS =>
-            {
+            Action::Input { question, answers } if self.mode == Mode::Run => {
                 let question = mask_response(question)?;
+                if self.questions >= engine::MAX_QUESTIONS {
+                    self.clarification_answers
+                        .push(clarification::Answer::unanswered(question));
+                    self.record(
+                        "The clarification limit was reached. Review the next request.".into(),
+                    );
+                    return Ok(true);
+                }
                 let answers = answers
                     .iter()
                     .map(|answer| mask_response(answer))
                     .collect::<Result<Vec<_>, _>>()?;
                 self.questions += 1;
-                self.question = Some((question, answers));
+                self.question = Some(clarification::Question::new(question, answers, detail));
                 self.next(Phase::Question, "The agent needs your input.");
             }
             Action::Done => {
@@ -1043,7 +1065,7 @@ impl Run {
             }
             _ => return Err("The decision is unavailable in this agent mode.".into()),
         }
-        Ok(())
+        Ok(false)
     }
 
     fn record_result(&mut self, outcome: &Outcome) -> Result<(), String> {

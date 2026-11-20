@@ -13,10 +13,12 @@ mod designs;
 mod final_advice;
 mod handoff;
 mod history;
+mod hosted;
 mod knowledge;
 mod live_repair;
 mod pip;
 mod shortcut;
+pub(in crate::workspace::terminal_agent) mod triage;
 
 #[test]
 fn agent_text_zoom_keeps_independent_sizes_and_remembered_defaults() {
@@ -930,7 +932,10 @@ fn no_task(task: Task<Desktop>) {
     assert!(iced_runtime::task::into_stream(task).is_none());
 }
 
-fn finish_agent_task(fixture: &mut Fixture, first: Task<Desktop>) {
+pub(in crate::workspace::terminal_agent) fn finish_agent_task(
+    fixture: &mut Fixture,
+    first: Task<Desktop>,
+) {
     use iced::futures::{StreamExt as _, executor::block_on};
 
     let mut tasks = vec![first];

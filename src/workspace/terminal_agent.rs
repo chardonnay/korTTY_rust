@@ -18,7 +18,7 @@ use crate::terminal_agent::design::Layout as AgentLayout;
 use crate::terminal_agent::design::Preset as AgentDesign;
 use crate::terminal_agent::{
     self as engine, Action, Cancel, Command, Decision, Elevation, LocalDirectory, Mode, Outcome,
-    Shell, Target,
+    RunPresentation, Shell, Target,
 };
 use crate::terminal_logging::{Redactor, Secrets};
 
@@ -29,6 +29,7 @@ use self::binding::{ApprovedExecution, Binding, CommandToRun, Live as LiveBindin
 
 mod activity_export;
 mod binding;
+mod clarification;
 mod cursor;
 pub(super) mod design;
 mod final_evidence;
@@ -47,6 +48,7 @@ mod request_review;
 pub(super) mod shortcut;
 pub(super) mod spotlight;
 pub(in crate::workspace) mod swarm;
+mod triage;
 mod view;
 mod workflow;
 
@@ -121,9 +123,10 @@ pub enum Message {
     ApproveRemaining(u64),
     ConfirmEveryCommand(bool),
     AutoApproveRoot(bool),
-    Answer(u64, String),
+    Clarification(clarification::Message),
     Implement(u64),
     Planning(planning::Message),
+    Triage(triage::Message),
     History(history::Message),
     ActivityExport(activity_export::Message),
     Design(design::Message),
@@ -190,6 +193,7 @@ enum Phase {
     PlanReady,
     PlanQuestions,
     PlanOptions,
+    TriageChoice,
     PlanLibrary,
     PlanStorage,
     Finished,
@@ -236,7 +240,9 @@ impl Phase {
             return None;
         }
         match self {
-            Self::ProbeApproval | Self::Approval | Self::PlanOptions => Some(AiRunNotice::Approval),
+            Self::ProbeApproval | Self::Approval | Self::PlanOptions | Self::TriageChoice => {
+                Some(AiRunNotice::Approval)
+            }
             Self::SudoPassword => Some(AiRunNotice::Password),
             Self::Finished => Some(AiRunNotice::Finished),
             Self::Failed | Self::Blocked if before != Self::Setup => Some(AiRunNotice::Stopped),
@@ -248,6 +254,7 @@ impl Phase {
 struct Run {
     binding: Binding,
     mode: Mode,
+    surface: RunPresentation,
     phase: Phase,
     label: String,
     target: Option<RunTarget>,
@@ -257,9 +264,10 @@ struct Run {
     model_review: Option<request_review::Review>,
     plan: Option<String>,
     planning: Option<planning::Flow>,
+    triage: triage::State,
     history: history::State,
     activity_export: activity_export::Export,
-    question: Option<(String, Vec<String>)>,
+    question: Option<clarification::Question>,
     profiles: Vec<ProfileChoice>,
     profile_pending: bool,
     purpose: Purpose,
@@ -297,7 +305,7 @@ struct Run {
     epoch: u64,
     turns: usize,
     questions: usize,
-    clarification_answers: Vec<String>,
+    clarification_answers: Vec<clarification::Answer>,
     paused: bool,
     closing: bool,
     cancel: Cancel,
@@ -425,6 +433,7 @@ impl Run {
         Self {
             binding: setup.binding,
             mode: setup.mode,
+            surface: RunPresentation::TerminalWindow,
             phase: Phase::Setup,
             label: setup.label,
             target: None,
@@ -434,6 +443,7 @@ impl Run {
             model_review: None,
             plan: None,
             planning: None,
+            triage: triage::State::default(),
             history: history::State::default(),
             activity_export: activity_export::Export::default(),
             question: None,
@@ -535,6 +545,7 @@ impl Run {
                     | Phase::PlanReady
                     | Phase::PlanQuestions
                     | Phase::PlanOptions
+                    | Phase::TriageChoice
                     | Phase::PlanLibrary
             )
     }
@@ -595,6 +606,7 @@ impl Run {
         self.cancel.request();
         self.ai_cancel = None;
         self.model_review = None;
+        self.triage.choice = None;
         self.commands.clear();
         self.batch_commands = None;
         self.question = None;
@@ -619,12 +631,17 @@ impl Run {
         self.commands.clear();
         self.batch_commands = None;
         self.question = None;
+        self.triage.choice = None;
         self.ai_cancel = None;
         self.password = None;
     }
 }
 
 impl Run {
+    fn runs_in_chat_tab(&self) -> bool {
+        self.surface == RunPresentation::ChatTab
+    }
+
     fn ordinary_command_review(&self) -> bool {
         self.mode == Mode::Run
             && self.phase == Phase::Approval
@@ -993,10 +1010,15 @@ impl Workspace {
         match result {
             Ok((mut run, direct)) => {
                 run.chat_handoff_enabled = self.ai_chat_enabled();
-                let (kind, settings) = design::window(run.design);
-                let (id, opened) = self.open_placed_dialog(kind, settings);
+                if run.mode == Mode::Run && !run.swarm {
+                    run.surface = self
+                        .ai_configuration()
+                        .map_or_else(RunPresentation::default, |config| {
+                            config.agent_run_presentation()
+                        });
+                }
+                let (id, opened) = self.open_agent_surface(owner, &run);
                 self.terminal_agents.runs.insert(id, run);
-                let opened = opened.map(|_| Desktop::Noop);
                 if direct {
                     opened.chain(self.update_terminal_agent(id, Message::StartFromShortcut))
                 } else {
@@ -1007,6 +1029,42 @@ impl Workspace {
                 self.notice(owner, error);
                 Task::none()
             }
+        }
+    }
+
+    fn open_agent_surface(&mut self, owner: window::Id, run: &Run) -> (window::Id, Task<Desktop>) {
+        if run.runs_in_chat_tab() {
+            let id = window::Id::unique();
+            (
+                id,
+                self.host_tool(owner, super::tool_tabs::Kind::TerminalAgent, id),
+            )
+        } else {
+            let (kind, settings) = design::window(run.design);
+            let (id, opened) = self.open_placed_dialog(kind, settings);
+            (id, opened.map(|_| Desktop::Noop))
+        }
+    }
+
+    pub(super) fn focus_agent_surface(&mut self, id: window::Id) -> Task<Desktop> {
+        self.focus_hosted_tool(id).unwrap_or_else(|| {
+            if self
+                .terminal_agents
+                .runs
+                .get(&id)
+                .is_some_and(Run::runs_in_chat_tab)
+            {
+                Task::none()
+            } else {
+                window::minimize(id, false).chain(window::gain_focus(id))
+            }
+        })
+    }
+
+    fn close_agent_container(&mut self, id: window::Id, surface: RunPresentation) -> Task<Desktop> {
+        match surface {
+            RunPresentation::ChatTab => Task::none(),
+            RunPresentation::TerminalWindow => self.close_placed_dialog(id),
         }
     }
 
@@ -1322,7 +1380,7 @@ impl Workspace {
                 self.agent_pane(source.session)
                     .is_some_and(|(_, pane, _)| pane.stream_generation == source.stream)
             }) {
-                window::minimize(id, false).chain(window::gain_focus(id))
+                self.focus_agent_surface(id)
             } else {
                 Task::none()
             };
@@ -1422,7 +1480,7 @@ impl Workspace {
             let workflow = self.close_run_workflow(id);
             self.retain_finished_agent_run(id, &mut run);
             let closed = Task::batch([
-                self.close_placed_dialog(id),
+                self.close_agent_container(id, run.surface),
                 detached.map_or_else(Task::none, |pip| self.close_placed_dialog(pip)),
                 workflow,
             ]);
@@ -1474,6 +1532,9 @@ impl Workspace {
         if self.terminal_agents.swarms.contains_key(&id) {
             return Some(self.swarm_action(id, swarm::Message::Close));
         }
+        if self.terminal_agents.runs.contains_key(&id) && self.hosted_tool_owner(id).is_some() {
+            return Some(self.request_hosted_tool_close(id));
+        }
         let run = self
             .terminal_agents
             .runs
@@ -1491,6 +1552,7 @@ impl Workspace {
             return Some(Task::none());
         }
         let detached = run.presentation.pip.detached.take();
+        let surface = run.surface;
         let workflow = self.close_run_workflow(id);
         if let Some(mut run) = self.terminal_agents.runs.remove(&id) {
             let finished = run.phase.finished();
@@ -1503,7 +1565,7 @@ impl Workspace {
             }
         }
         let closed = Task::batch([
-            self.close_placed_dialog(id),
+            self.close_agent_container(id, surface),
             detached.map_or_else(Task::none, |pip| self.close_placed_dialog(pip)),
             workflow,
         ]);

@@ -7,7 +7,8 @@ use iced::{Task, window};
 
 use super::{
     AgentLayout, Binding, Desktop, LiveBinding, MAX_RUNS, Mode, Phase, ProfileChoice, Purpose, Run,
-    RunSetup, Workspace, activity_export, design, final_evidence, font, inline_history, mask,
+    RunPresentation, RunSetup, Workspace, activity_export, design, final_evidence, font,
+    inline_history, mask,
 };
 use crate::session::SessionId;
 
@@ -20,6 +21,7 @@ pub(super) struct FinishedRun {
     pub(super) mode: Mode,
     pub(super) order: u64,
     phase: Phase,
+    surface: RunPresentation,
     label: String,
     goal: String,
     plan: Option<String>,
@@ -76,6 +78,7 @@ impl Archive {
             mode: run.mode,
             order: run.started_order,
             phase: run.phase,
+            surface: run.surface,
             label,
             goal: history.status_transcript().goal.clone(),
             plan: run
@@ -233,6 +236,7 @@ impl Workspace {
             redactor,
         });
         run.phase = entry.phase;
+        run.surface = entry.surface;
         run.reopened_history = true;
         run.started_order = entry.order;
         run.goal = entry.goal;
@@ -249,13 +253,12 @@ impl Workspace {
         run.chat_handoff_elapsed_ms = entry.chat_handoff_elapsed_ms;
         run.presentation.load_activity(&self.window_settings);
         run.presentation.reveal_finished(entry.finished);
-        let (kind, settings) = design::window(run.design);
-        let (window, opened) = self.open_placed_dialog(kind, settings);
+        let (window, opened) = self.open_agent_surface(owner, &run);
         self.terminal_agents.runs.insert(window, run);
         self.terminal_agents
             .presented_runs
             .insert(session, (stream, window));
-        Task::batch([opened.map(|_| Desktop::Noop), self.reconcile_agent_pip()])
+        Task::batch([opened, self.reconcile_agent_pip()])
     }
 }
 

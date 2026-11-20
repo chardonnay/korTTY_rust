@@ -1139,11 +1139,31 @@ an English answer. Keep this difference visible when comparing transcripts.
 | A4 | Acceptance. All eight pinned Agent verbs, events, wait/start/rename and `notification.show` have native Control/CLI routes. Windows socket backpressure and native notification submission have evidence. | Native visible delivery and exact focus/target routing, stale agents, moved splits, timeouts and losses across desktops. Admission/native submission receipts alone do not prove a displayed notice or activation. |
 | A5 | Acceptance. Explicit `control-api = "allow"` starts the listener and locks the setting while retaining the personal preference. The parser normalizes feature keys and values. MCP stdio keeps its independent opt-in, retains its write tools preference while disabled, and gates writes on effective policy and consent. Masked reads, reconnect identity guards and managed MCP denial exist. | Verify managed activation, lock display and relaxation on native desktops. Complete affirmative write consent and invalidation across those desktops. P1 owns shared policy acceptance. |
 
-Implement the managed and personal Agent triage preferences from Java v2.26.0.
-Eligible runs without an accepted plan need a reviewed complexity assessment
-and solution choice. Preserve explicit request review and the existing
-execution permissions.
+Interactive Run can review a complexity assessment after the environment
+probe. The AI Manager preference and the managed override select when to
+offer solutions. A selected approach, an original idea or additional
+instructions enter the next reviewed request as plan context. The pinned
+OpenSSH fixture verifies the reviewed directory and rejects a directory
+change before sending the next request. Verify the choice card,
+cancellation, timeout and policy locking on native desktops with local
+and SSH targets and a configured provider.
 [Java triage](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/core/TerminalAgentService.java#L927)
+
+Run clarification offers the model's suggestions, an editable answer, optional
+instructions and a choice to let the model decide. Expiry discards the draft.
+Answers remain tied to the question across later decisions and the final
+response. After the interactive question limit, the next review includes the
+unanswered question and consumes the previous model turn. Verify response
+entry, cancellation and the next masked preview in native Agent and Swarm
+windows. [Java question handling](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/core/TerminalAgentService.java#L1108)
+
+AI Manager General offers a default presentation for interactive Run. Its
+Chat tab keeps the source terminal binding, reviewed requests and command
+approvals. Closing the tab cancels its owned operation. Java backups fill the
+unset preference. Ask and Planning retain their own views. Verify tab-based
+review and cancellation on native desktops and compare how Java places a run
+started from an accepted plan.
+[Java Run tab](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/MainWindow.java#L12244)
 
 Interactive Agent and Swarm member reviews include masked memory for the exact
 saved target. Swarm workflow script generation and comparison review global

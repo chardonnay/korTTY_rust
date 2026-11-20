@@ -19,6 +19,8 @@ use crate::local_ai::web_search::{McpMode, McpSettings};
 use crate::local_ai::{self, PromptPreset, RemoteProtocol, Tokenizer, UsageBudget};
 use crate::session_journal::summary_plan::EvidenceLimits;
 use crate::ssh_dialog::unsafe_text;
+use crate::terminal_agent::RunPresentation;
+use crate::terminal_agent::planning::TriageMode;
 
 mod minimax;
 
@@ -159,6 +161,8 @@ pub(in crate::ai_manager) struct Report {
     pub(in crate::ai_manager) general_preferences: JavaGeneralPreferences,
     pub(in crate::ai_manager) request_timeout_omitted: bool,
     pub(in crate::ai_manager) code_text_language_omitted: bool,
+    pub(in crate::ai_manager) agent_triage_omitted: bool,
+    pub(in crate::ai_manager) agent_run_presentation_omitted: bool,
     pub(in crate::ai_manager) roles: crate::ai_manager::java_roles::Hints,
     pub(in crate::ai_manager) roles_omitted: usize,
     pub(in crate::ai_manager) https_imported: usize,
@@ -477,6 +481,22 @@ pub(in crate::ai_manager) fn decode(bytes: &[u8]) -> io::Result<(Catalog, Report
     }) {
         Ok(language) => report.general_preferences.code_text_language = language,
         Err(()) => report.code_text_language_omitted = true,
+    }
+    match scalar(root, "aiAgentTriageMode").and_then(|value| {
+        value
+            .map(|value| TriageMode::parse(value).ok_or(()))
+            .transpose()
+    }) {
+        Ok(mode) => report.general_preferences.agent_triage = mode,
+        Err(()) => report.agent_triage_omitted = true,
+    }
+    match scalar(root, "terminalAgentExecutionTarget").and_then(|value| {
+        value
+            .map(|value| RunPresentation::from_java(value).ok_or(()))
+            .transpose()
+    }) {
+        Ok(target) => report.general_preferences.agent_run_presentation = target,
+        Err(()) => report.agent_run_presentation_omitted = true,
     }
     report.journal_profiles = JavaJournalProfiles {
         preferences: match journal_preferences(root) {

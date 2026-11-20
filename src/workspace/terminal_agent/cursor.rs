@@ -71,6 +71,9 @@ impl Workspace {
         let (id, run) = self
             .terminal_agents
             .agent_activity_for_stream(session, pane.stream_generation)?;
+        if run.runs_in_chat_tab() {
+            return None;
+        }
         let command = run.cursor_command()?;
         let (current_owner, _) = self.current_run_pane(run).ok()?;
         if current_owner != owner

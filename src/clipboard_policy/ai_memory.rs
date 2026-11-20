@@ -4,6 +4,8 @@ use std::sync::Arc;
 
 use toml_edit::Table;
 
+use crate::terminal_agent::planning::TriageMode;
+
 use super::{allowed, invalid, optional_table, string, trim_java};
 
 mod organization;
@@ -33,6 +35,7 @@ pub(crate) struct AiMemoryPolicy {
     pub(crate) statistics: Option<bool>,
     pub(crate) external_files_allowed: bool,
     pub(crate) max_tokens: Option<u16>,
+    pub(crate) agent_triage: Option<TriageMode>,
     external_roots: Vec<Vec<PathBuf>>,
     organization: Arc<[OrganizationMemoryBlock]>,
 }
@@ -47,6 +50,7 @@ impl Default for AiMemoryPolicy {
             statistics: None,
             external_files_allowed: true,
             max_tokens: None,
+            agent_triage: None,
             external_roots: Vec::new(),
             organization: Arc::default(),
         }
@@ -57,6 +61,7 @@ impl AiMemoryPolicy {
     pub(super) fn lockdown() -> Self {
         Self {
             feature_allowed: false,
+            agent_triage: Some(TriageMode::Never),
             ..Self::default()
         }
     }
@@ -113,6 +118,7 @@ impl AiMemoryPolicy {
                 "external-files",
                 "external-file-roots",
                 "max-tokens",
+                "triage",
             ],
         )?;
         if let Some(value) = string(memory, TABLE, "user-memory")? {
@@ -182,6 +188,11 @@ impl AiMemoryPolicy {
                     invalid("rule.ai-memory.max-tokens must be an integer between 300 and 4000")
                 })? as u16;
             self.max_tokens = Some(self.max_tokens.map_or(cap, |previous| previous.min(cap)));
+        }
+        if let Some(value) = string(memory, TABLE, "triage")? {
+            let mode = TriageMode::parse(trim_java(value))
+                .ok_or_else(|| invalid("rule.ai-memory.triage must be auto, always or never"))?;
+            self.agent_triage = self.agent_triage.max(Some(mode));
         }
         Ok(())
     }

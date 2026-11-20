@@ -156,6 +156,7 @@ pub(super) fn phase(run: &Run) -> (&'static str, usize) {
         Phase::ProbeApproval => ("Review the environment probe", 1),
         Phase::Approval => ("Review the command", 1),
         Phase::Question => ("Answer the agent", 1),
+        Phase::TriageChoice => ("Choose an approach", 1),
         Phase::SudoPassword => ("Waiting for sudo password", 1),
         Phase::PlanQuestions | Phase::PlanOptions | Phase::PlanReady | Phase::PlanLibrary => {
             ("Planning review", 1)

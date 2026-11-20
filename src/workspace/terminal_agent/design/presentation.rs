@@ -147,6 +147,7 @@ impl Presentation {
                 | Phase::PlanReady
                 | Phase::PlanQuestions
                 | Phase::PlanOptions
+                | Phase::TriageChoice
         ) {
             self.drawer = true;
         }

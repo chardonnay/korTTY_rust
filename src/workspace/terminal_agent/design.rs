@@ -178,6 +178,7 @@ fn controls(run: &Run, has_archive: bool) -> Element<'_, AgentMessage> {
                 "Review and approve…"
             }
             Phase::SudoPassword => "Review and approve…",
+            Phase::TriageChoice => "Choose an approach…",
             _ => "Activity window",
         })
         .on_press(AgentMessage::Focus),
@@ -390,6 +391,9 @@ fn pane_status(
 
 impl Workspace {
     pub(super) fn run_uses_spotlight_status(&self, run: &Run) -> bool {
+        if run.runs_in_chat_tab() {
+            return false;
+        }
         if run.design.arrangement != Arrangement::Adaptive {
             return run.design.status == Status::Spotlight;
         }
@@ -421,6 +425,7 @@ impl Workspace {
             .filter(|run| {
                 !run.swarm
                     && !run.closing
+                    && !run.runs_in_chat_tab()
                     && (run.design.status != Status::Hidden
                         || run.design.arrangement == Arrangement::Adaptive)
                     && run.presentation.status_visibility.visible(seconds, now)
@@ -446,6 +451,13 @@ impl Workspace {
             .chain(self.terminal_agents.runs.iter().filter_map(|(&id, run)| {
                 self.agent_log_table_interval(id, run, now, reduced_motion)
             }))
+            .chain(
+                self.terminal_agents
+                    .runs
+                    .values()
+                    .any(Run::has_timed_input)
+                    .then_some(1000),
+            )
             .chain(self.spotlight_animating(now).then_some(16))
             .min();
         interval.map_or_else(Subscription::none, |millis| {
@@ -476,6 +488,13 @@ impl Workspace {
             !run.paused && !run.cancel.requested(),
             reduced_motion,
         )?;
+        if run.runs_in_chat_tab() {
+            return self
+                .hosted_tool_owner(id)
+                .and_then(|owner| self.active_hosted_tab(owner))
+                .is_some_and(|tool| tool.instance == id)
+                .then_some(interval);
+        }
         if self.placed_dialog_owner(id).is_some() {
             return Some(interval);
         }
@@ -511,7 +530,9 @@ impl Workspace {
         let (id, run) = self
             .terminal_agents
             .agent_activity_for_stream(session, stream)?;
-        (run.design.status != Status::Hidden || run.design.arrangement == Arrangement::Adaptive)
+        (!run.runs_in_chat_tab()
+            && (run.design.status != Status::Hidden
+                || run.design.arrangement == Arrangement::Adaptive))
             .then_some(id)
     }
 
@@ -607,7 +628,10 @@ impl Workspace {
         reduced_motion: bool,
     ) -> Element<'a, Desktop> {
         let agents = &self.terminal_agents;
-        let Some((id, run)) = agents.agent_activity_for_stream(session, stream) else {
+        let Some((id, run)) = agents
+            .agent_activity_for_stream(session, stream)
+            .filter(|(_, run)| !run.runs_in_chat_tab())
+        else {
             return terminal;
         };
         let palette = self.agent_panel_palette(self.pane_theme_id(session));

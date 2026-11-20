@@ -131,7 +131,7 @@ impl fmt::Debug for Message {
 pub enum MemberAction {
     ApproveRemaining(u64),
     Approve(u64),
-    Answer(u64, String),
+    Clarification(super::clarification::Message),
     ReviewModel(request_review::Message),
 }
 
@@ -939,19 +939,10 @@ impl Group {
                             .spacing(5),
                         );
                     }
-                    if let Some((question, answers)) = &run.question {
-                        let mut controls = row![].spacing(6);
-                        for answer in answers {
-                            controls = controls.push(button(text(answer)).on_press_maybe(
-                                (!run.paused && !run.cancel.requested()).then(|| {
-                                    Message::Member(
-                                        id,
-                                        MemberAction::Answer(run.epoch, answer.clone()),
-                                    )
-                                }),
-                            ));
-                        }
-                        view = view.push(column![text(question), controls.wrap()].spacing(6));
+                    if let Some(question) = &run.question {
+                        view = view.push(question.view(run).map(move |answer| {
+                            Message::Member(id, MemberAction::Clarification(answer))
+                        }));
                     }
                 }
             }
@@ -2001,7 +1992,7 @@ impl Workspace {
                 let message = match action {
                     MemberAction::Approve(epoch) => RunMessage::Approve(epoch),
                     MemberAction::ApproveRemaining(epoch) => RunMessage::ApproveRemaining(epoch),
-                    MemberAction::Answer(epoch, answer) => RunMessage::Answer(epoch, answer),
+                    MemberAction::Clarification(message) => RunMessage::Clarification(message),
                     MemberAction::ReviewModel(message) => RunMessage::ReviewModel(message),
                 };
                 return self.update_terminal_agent(member, message);
