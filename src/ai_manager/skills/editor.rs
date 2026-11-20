@@ -141,6 +141,7 @@ pub(in crate::ai_manager) struct Editor {
     statistics_root: Option<PathBuf>,
     statistics_policy: Option<bool>,
     imported_preferences: super::JavaPreferences,
+    java_providers: super::java_providers::Hints,
     statistics: Option<statistics_view::Panel>,
     notice: Option<String>,
 }
@@ -193,6 +194,14 @@ impl Editor {
         self
     }
 
+    pub(in crate::ai_manager) fn with_java_providers(
+        mut self,
+        hints: super::java_providers::Hints,
+    ) -> Self {
+        self.java_providers = hints;
+        self
+    }
+
     pub(in crate::ai_manager) fn with_statistics_root(mut self, root: PathBuf) -> Self {
         self.statistics_root = Some(root);
         self
@@ -232,6 +241,8 @@ impl Editor {
     }
 
     pub(in crate::ai_manager) fn has_search_control(&self, control: Control) -> bool {
+        use Control::*;
+
         self.external.is_none()
             && self.statistics.is_none()
             && self.chooser.is_none()
@@ -242,6 +253,41 @@ impl Editor {
                     && self.shortening.is_none()
                     && self.proposal.is_none()
                     && self.confirmation.is_none()))
+            && match control {
+                DeleteSkill => self
+                    .form
+                    .as_ref()
+                    .is_some_and(|form| form.skill.builtin.is_none()),
+                RestoreBundledSkill | ToggleBundledSkill => self
+                    .form
+                    .as_ref()
+                    .is_some_and(|form| form.skill.builtin.is_some()),
+                SkillImported(preference) => {
+                    self.imported_preferences.get(preference).is_some()
+                        && self.can_adopt_preference(preference)
+                }
+                SkillProviders => !self.busy(),
+                _ => true,
+            }
+    }
+
+    pub(in crate::ai_manager) fn has_provider_search_setting(
+        &self,
+        setting: crate::ai_manager::search::SkillProviderSetting,
+        store: &Store,
+    ) -> bool {
+        self.external
+            .as_ref()
+            .is_some_and(|panel| panel.has_provider_search_setting(setting, store))
+    }
+
+    fn can_adopt_preference(&self, preference: super::Preference) -> bool {
+        !self.busy()
+            && match preference {
+                super::Preference::LearnedRules => self.skill_creation_override.is_none(),
+                super::Preference::Statistics => self.statistics_policy.is_none(),
+                _ => true,
+            }
     }
 
     pub(in crate::ai_manager) fn find_open(&self) -> bool {
@@ -283,11 +329,22 @@ impl Editor {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(in crate::ai_manager) fn update(
         &mut self,
         store: &mut Store,
         message: Message,
         profile: Option<local_ai::Profile>,
+    ) -> Task<Message> {
+        self.update_with_vault(store, message, profile, None)
+    }
+
+    pub(in crate::ai_manager) fn update_with_vault(
+        &mut self,
+        store: &mut Store,
+        message: Message,
+        profile: Option<local_ai::Profile>,
+        vault: Option<&crate::vault_window::VaultWindow>,
     ) -> Task<Message> {
         if self.statistics.is_some() {
             return match message {
@@ -306,7 +363,7 @@ impl Editor {
         }
         if self.external.is_some() {
             return match message {
-                Message::External(message) => self.update_external(store, message),
+                Message::External(message) => self.update_external(store, message, vault),
                 Message::Cancel => {
                     self.external = None;
                     Task::none()
@@ -446,7 +503,7 @@ impl Editor {
                         super::Preference::LearnedRules => Message::LearnedRulesEnabled(value),
                         super::Preference::Statistics => Message::UsageStatistics(value),
                     };
-                    return self.update(store, message, profile);
+                    return self.update_with_vault(store, message, profile, vault);
                 }
             }
             Message::EnableLibrary(value) => store.enabled = value,
@@ -504,7 +561,7 @@ impl Editor {
             Message::Shorten if self.commit_or_notice(store) => {
                 return self.start_shortening(store, profile);
             }
-            Message::External(message) => return self.update_external(store, message),
+            Message::External(message) => return self.update_external(store, message, vault),
             Message::Statistics(statistics_view::Message::Open)
                 if !self.pending_edit() && self.statistics_root.is_some() =>
             {
@@ -849,6 +906,7 @@ impl Editor {
         store: &'a Store,
         shorten_available: bool,
         reveal: &'a Reveal,
+        vault_credentials: &[crate::connection_window::CredentialChoice],
     ) -> Element<'a, Message> {
         if let Some(panel) = &self.statistics {
             return panel
@@ -856,7 +914,9 @@ impl Editor {
                 .map(Message::Statistics);
         }
         if let Some(panel) = &self.external {
-            return panel.view(store).map(Message::External);
+            return panel
+                .view(store, reveal, vault_credentials, &self.java_providers)
+                .map(Message::External);
         }
         if let Some(chooser) = &self.chooser {
             let (count, label, can_run, typed_path) = if self.importing() {
@@ -954,11 +1014,6 @@ impl Editor {
             );
             for preference in super::Preference::ALL {
                 if let Some(value) = self.imported_preferences.get(preference) {
-                    let allowed = match preference {
-                        super::Preference::LearnedRules => self.skill_creation_override.is_none(),
-                        super::Preference::Statistics => self.statistics_policy.is_none(),
-                        _ => true,
-                    };
                     imported = imported.push(
                         row![
                             text(format!(
@@ -967,9 +1022,12 @@ impl Editor {
                                 if value { "enabled" } else { "disabled" }
                             ))
                             .size(13),
-                            button("Use imported value").on_press_maybe(
-                                (allowed && !self.busy())
-                                    .then_some(Message::UseImported(preference))
+                            action(
+                                Control::SkillImported(preference),
+                                button("Use imported value").on_press_maybe(
+                                    self.can_adopt_preference(preference)
+                                        .then_some(Message::UseImported(preference))
+                                )
                             ),
                         ]
                         .spacing(8)
@@ -1016,8 +1074,16 @@ impl Editor {
                     .on_press(Message::Select(*id)),
             );
         }
+        let library_search = Setting::Control(Control::SkillLibraryQuery);
         let library = column![
-            text_input("Search skills…", &self.search).on_input(Message::Search),
+            reveal.wrap(
+                library_search,
+                reveal.input(
+                    library_search,
+                    true,
+                    text_input("Search skills…", &self.search).on_input(Message::Search)
+                )
+            ),
             row![
                 text(format!(
                     "{} of {} skills",
@@ -1026,19 +1092,25 @@ impl Editor {
                 ))
                 .size(13)
                 .width(Length::Fill),
-                pick_list([Sort::Name, Sort::Status], Some(self.sort), Message::Sort)
-                    .dismiss_on_escape()
+                reveal.action(
+                    Setting::Control(Control::SkillLibrarySort),
+                    pick_list([Sort::Name, Sort::Status], Some(self.sort), Message::Sort)
+                        .dismiss_on_escape()
+                )
             ]
             .spacing(6)
             .align_y(Alignment::Center),
             scrollable(items).height(Length::Fill),
             row![
                 action(Control::AddSkill, button("Add").on_press(Message::Add)),
-                button("Delete…").on_press_maybe(
-                    self.form
-                        .as_ref()
-                        .filter(|form| form.skill.builtin.is_none())
-                        .map(|_| Message::Delete)
+                action(
+                    Control::DeleteSkill,
+                    button("Delete…").on_press_maybe(
+                        self.form
+                            .as_ref()
+                            .filter(|form| form.skill.builtin.is_none())
+                            .map(|_| Message::Delete)
+                    )
                 )
             ]
             .spacing(6)
@@ -1067,6 +1139,13 @@ impl Editor {
                     button("Check external updates…").on_press_maybe(
                         external::Panel::can_check(store)
                             .then_some(Message::External(external::Message::OpenUpdates))
+                    )
+                ),
+                action(
+                    Control::SkillProviders,
+                    button("Providers…").on_press_maybe(
+                        (!self.busy())
+                            .then_some(Message::External(external::Message::OpenProviders))
                     )
                 ),
             ]
@@ -1243,13 +1322,20 @@ impl Editor {
             let setting = Setting::Control(control);
             reveal.wrap(setting, field(label, reveal.input(setting, true, input)))
         };
+        let action = |control, button| reveal.action(Setting::Control(control), button);
         let skill = &form.skill;
         let builtin = skill.builtin.as_ref().map(|_| {
             row![
                 text("Bundled skill").width(Length::Fill),
-                button("Restore bundled version…").on_press(Message::Reset),
-                button(if skill.hidden { "Unhide" } else { "Hide" })
-                    .on_press(Message::Hide(!skill.hidden))
+                action(
+                    Control::RestoreBundledSkill,
+                    button("Restore bundled version…").on_press(Message::Reset)
+                ),
+                action(
+                    Control::ToggleBundledSkill,
+                    button(if skill.hidden { "Unhide" } else { "Hide" })
+                        .on_press(Message::Hide(!skill.hidden))
+                )
             ]
             .spacing(6)
             .align_y(Alignment::Center)
@@ -1274,16 +1360,31 @@ impl Editor {
                 text_input("Comma-separated tags", &form.tags).on_input(Message::EditTags)
             ),
             row![
-                checkbox(skill.enabled)
-                    .label("Enabled")
-                    .on_toggle(Message::EnableSkill),
-                pick_list(Target::ALL, Some(skill.target), Message::EditTarget).dismiss_on_escape()
+                reveal.action(
+                    Setting::Control(Control::SkillActive),
+                    checkbox(skill.enabled)
+                        .label("Enabled")
+                        .on_toggle(Message::EnableSkill)
+                ),
+                reveal.action(
+                    Setting::Control(Control::SkillTarget),
+                    row![
+                        text("Target").size(13),
+                        pick_list(Target::ALL, Some(skill.target), Message::EditTarget)
+                            .dismiss_on_escape()
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center)
+                )
             ]
             .spacing(8)
             .align_y(Alignment::Center),
             column![
                 row![
-                    text("Skill Markdown").size(13).width(Length::Fill),
+                    reveal.wrap(
+                        Setting::Control(Control::SkillMarkdownContent),
+                        text("Skill Markdown").size(13)
+                    ),
                     reveal.action(
                         Setting::Control(Control::FindSkill),
                         button("Find…").on_press(Message::Find(document_find::Message::Open))
@@ -1300,7 +1401,10 @@ impl Editor {
                     .on_action(Message::EditContent),
                 Message::Find,
             ),
-            text("Learned rules · one per line").size(13),
+            reveal.wrap(
+                Setting::Control(Control::SkillLearnedRules),
+                text("Learned rules · one per line").size(13)
+            ),
             text_editor(&form.rules)
                 .height(85)
                 .on_action(Message::EditRules),
@@ -1425,6 +1529,98 @@ fn edit_document(content: &mut text_editor::Content, action: text_editor::Action
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn skill_library_search_focuses_the_filter_and_keeps_the_active_form() {
+        use crate::ai_manager::search::Target as SearchTarget;
+        use crate::ai_manager::{Configuration, Dialog, Message as ManagerMessage};
+        use crate::settings_search::test_input;
+        use iced::keyboard::Key;
+        use iced_runtime::{UserInterface, user_interface::Cache};
+        use std::sync::Arc;
+
+        let profile = crate::snippets::tests::Profile::new();
+        let mut manager = Dialog::new(
+            Arc::new(Configuration::default()),
+            profile.0.clone(),
+            Vec::new(),
+            true,
+            None,
+        );
+        let skill_target = Setting::Control(Control::SkillTarget);
+        let _ = manager.update(ManagerMessage::Search("skill target".into()));
+        assert!(
+            !manager
+                .search_results()
+                .any(|target| target == SearchTarget::Setting(skill_target))
+        );
+        let _ = manager.open_skill_find_for_test();
+        assert!(manager.skills.find_open());
+        let _ = manager.update(ManagerMessage::Skills(Message::EditName(
+            "Unsaved fixture skill".into(),
+        )));
+        assert!(manager.skills.pending_edit());
+        let id = manager.skills.form.as_ref().unwrap().id;
+        let old_target = manager.skills.form.as_ref().unwrap().skill.target;
+        let reveal = |manager: &mut Dialog, query: &str, control| {
+            let _ = manager.update(ManagerMessage::Search(query.into()));
+            let setting = Setting::Control(control);
+            assert_eq!(
+                manager.search_results().next(),
+                Some(SearchTarget::Setting(setting))
+            );
+            let task = manager.update(ManagerMessage::SearchChoose);
+            assert_eq!(manager.revealed.setting, Some(setting));
+            task
+        };
+        let _ = reveal(&mut manager, "skill target", Control::SkillTarget);
+        let _ = reveal(
+            &mut manager,
+            "external skill providers",
+            Control::SkillProviders,
+        );
+        assert!(!manager.skills.file_prompt_open());
+        let task = reveal(
+            &mut manager,
+            "search skills library",
+            Control::SkillLibraryQuery,
+        );
+        let typed = {
+            let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+            let mut interface = UserInterface::build(
+                manager.view(Vec::new(), Vec::new()),
+                Size::new(900.0, 480.0),
+                Cache::default(),
+                &mut renderer,
+            );
+            test_input::apply(&mut interface, &renderer, task);
+            test_input::press(
+                &mut interface,
+                &mut renderer,
+                Key::Character("q".into()),
+                Some("q"),
+            )
+        };
+        assert!(
+            matches!(typed.as_slice(), [ManagerMessage::Skills(Message::Search(value))] if value == "q")
+        );
+        for event in typed {
+            let _ = manager.update(event);
+        }
+        assert_eq!(manager.skills.search, "q");
+        assert!(manager.skills.find_open());
+        let form = manager.skills.form.as_ref().unwrap();
+        assert_eq!(form.id, id);
+        assert_eq!(form.skill.target, old_target);
+        assert_eq!(form.skill.name, "Unsaved fixture skill");
+        assert!(form.dirty);
+        let _ = manager.update(ManagerMessage::Skills(Message::External(
+            external::Message::OpenProviders,
+        )));
+        assert!(manager.skills.file_prompt_open());
+        let stale = manager.update(ManagerMessage::Reveal(SearchTarget::Setting(skill_target)));
+        assert!(iced_runtime::task::into_stream(stale).is_none());
+    }
+
     #[test]
     fn imported_skill_switches_keep_confirmation_and_managed_overrides() {
         use super::*;

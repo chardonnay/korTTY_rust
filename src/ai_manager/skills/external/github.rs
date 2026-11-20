@@ -369,7 +369,7 @@ fn keyword_search(
     if query.len() > MAX_QUERY_BYTES {
         return Err("The GitHub skill search is too long.".into());
     }
-    if profile.credential_name().is_none() {
+    if !profile.has_credential() {
         return Err(
             "GitHub keyword search requires a token. Repository references also work anonymously."
                 .into(),

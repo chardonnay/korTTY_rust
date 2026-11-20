@@ -1,18 +1,21 @@
 //! Bounded external skill requests with scope-bound authentication.
 
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::sync::{
-    Arc,
+    Arc, Weak,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
+use kortty_vault::Secret;
 use ureq::http::{HeaderValue, header};
 use url::Url;
 use zeroize::Zeroizing;
 
 use super::{ProviderProfile, within};
+use crate::vault_window::VaultWindow;
 
 pub(super) const MAX_JSON_BYTES: usize = 4 * 1024 * 1024;
 const OPERATION_LIMIT: Duration = Duration::from_secs(30);
@@ -21,6 +24,8 @@ const CANCELLED: &str = "The external skill request was cancelled.";
 pub(super) struct Network {
     agent: ureq::Agent,
     cancelled: Arc<AtomicBool>,
+    credentials: BTreeMap<String, Secret>,
+    vault_revision: Option<Weak<()>>,
 }
 
 pub(crate) struct Cancellation {
@@ -36,10 +41,27 @@ impl Drop for Cancellation {
 }
 
 impl Network {
-    pub(super) fn new() -> Result<Self, String> {
+    pub(super) fn new<'a>(
+        profiles: impl Iterator<Item = &'a ProviderProfile>,
+        vault: Option<&VaultWindow>,
+    ) -> Result<Self, String> {
+        let credentials: BTreeMap<_, _> = profiles
+            .filter(|profile| profile.enabled)
+            .filter_map(|profile| profile.vault_credential.as_ref())
+            .filter_map(|id| {
+                vault?
+                    .skill_provider_credential(id)
+                    .map(|secret| (id.clone(), secret))
+            })
+            .collect();
+        let vault_revision = (!credentials.is_empty())
+            .then(|| vault.and_then(VaultWindow::credential_revision))
+            .flatten();
         Ok(Self {
             agent: crate::local_ai::service_agent(None, OPERATION_LIMIT)?,
             cancelled: Arc::new(AtomicBool::new(false)),
+            credentials,
+            vault_revision,
         })
     }
 
@@ -56,6 +78,24 @@ impl Network {
             deadline: Instant::now() + OPERATION_LIMIT,
         }
     }
+
+    pub(super) fn vault_revision(&self) -> Option<Weak<()>> {
+        self.vault_revision.clone()
+    }
+
+    fn vault_credential(&self, id: &str) -> Result<&Secret, String> {
+        require_vault_revision(self.vault_revision.as_ref())?;
+        self.credentials.get(id).ok_or_else(|| {
+            "Unlock the vault and select a valid external skill provider credential.".into()
+        })
+    }
+
+    pub(super) fn require_credential(&self, profile: &ProviderProfile) -> Result<(), String> {
+        if let Some(id) = &profile.vault_credential {
+            self.vault_credential(id)?;
+        }
+        Ok(())
+    }
 }
 
 pub(super) struct Operation<'a> {
@@ -67,6 +107,15 @@ pub(super) fn require_policy() -> Result<(), String> {
     let policy = crate::clipboard_policy::ClipboardPolicy::load();
     if policy.problem.is_some() || !policy.ai_allowed {
         return Err("External skills are unavailable under the current AI policy.".into());
+    }
+    Ok(())
+}
+
+pub(in crate::ai_manager::skills) fn require_vault_revision(
+    revision: Option<&Weak<()>>,
+) -> Result<(), String> {
+    if revision.is_some_and(|revision| revision.strong_count() == 0) {
+        return Err("The vault changed. Unlock it and start a new external skill request.".into());
     }
     Ok(())
 }
@@ -103,10 +152,11 @@ impl Operation<'_> {
             request = request.header("X-GitHub-Api-Version", "2022-11-28");
         }
         if let Some(profile) = profile
-            && let Some(authorization) = authorization(profile, url)?
+            && let Some(authorization) = self.authorization(profile, url)?
         {
             request = request.header(header::AUTHORIZATION, authorization);
         }
+        self.remaining()?;
         let response = request
             .config()
             .http_status_as_error(false)
@@ -174,7 +224,7 @@ impl Operation<'_> {
         if let Some(profile) = profile
             && let Ok(text) = std::str::from_utf8(&body)
         {
-            require_no_credential_echo(profile, text)?;
+            self.require_no_credential_echo(profile, text)?;
         }
         Ok(body)
     }
@@ -183,53 +233,79 @@ impl Operation<'_> {
         if self.network.cancelled.load(Ordering::Acquire) {
             return Err(CANCELLED.into());
         }
+        require_vault_revision(self.network.vault_revision.as_ref())?;
         let remaining = self.deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err("The external skill provider timed out.".into());
         }
         Ok(remaining)
     }
-}
 
-pub(super) fn require_no_credential_echo(
-    profile: &ProviderProfile,
-    body: &str,
-) -> Result<(), String> {
-    let Some(name) = profile.credential_name() else {
-        return Ok(());
-    };
-    let credential = Zeroizing::new(
-        std::env::var(name)
-            .map_err(|_| "The configured skill provider credential is unavailable or invalid.")?,
-    );
-    if crate::local_ai::credential_echo(body, &credential) {
-        return Err("The skill provider response echoed a credential.".into());
+    pub(super) fn require_no_credential_echo(
+        &self,
+        profile: &ProviderProfile,
+        body: &str,
+    ) -> Result<(), String> {
+        self.with_credential(profile, |secret| {
+            if secret.is_some_and(|secret| crate::local_ai::credential_echo(body, secret)) {
+                return Err("The skill provider response echoed a credential.".into());
+            }
+            Ok(())
+        })
     }
-    Ok(())
-}
 
-fn authorization(profile: &ProviderProfile, url: &Url) -> Result<Option<HeaderValue>, String> {
-    let Some(name) = profile.credential_name() else {
-        return Ok(None);
-    };
-    if !profile.base()?.is_some_and(|base| within(url, &base)) {
-        return Err("The skill provider credential does not authorize this URL.".into());
-    }
-    let invalid =
-        || "The configured skill provider credential is unavailable or invalid.".to_owned();
-    let header = if profile.username.is_empty() {
-        let token = crate::local_ai::credential_value(name).map_err(|_| invalid())?;
-        Zeroizing::new(format!("Bearer {}", token.as_str()))
-    } else {
-        let password = Zeroizing::new(std::env::var(name).map_err(|_| invalid())?);
-        if password.is_empty() || password.len() > 4_096 || password.chars().any(char::is_control) {
-            return Err(invalid());
+    fn with_credential<T>(
+        &self,
+        profile: &ProviderProfile,
+        use_secret: impl FnOnce(Option<&str>) -> Result<T, String>,
+    ) -> Result<T, String> {
+        if let Some(id) = &profile.vault_credential {
+            let secret = self.network.vault_credential(id)?;
+            return use_secret(Some(secret.as_str()));
         }
-        let pair = Zeroizing::new(format!("{}:{}", profile.username, password.as_str()));
-        let encoded = Zeroizing::new(STANDARD.encode(pair.as_bytes()));
-        Zeroizing::new(format!("Basic {}", encoded.as_str()))
-    };
-    let mut header = HeaderValue::from_str(&header).map_err(|_| invalid())?;
-    header.set_sensitive(true);
-    Ok(Some(header))
+        if let Some(name) = profile.credential_name() {
+            let secret = Zeroizing::new(std::env::var(name).map_err(
+                |_| "The configured skill provider credential is unavailable or invalid.",
+            )?);
+            return use_secret(Some(&secret));
+        }
+        use_secret(None)
+    }
+
+    fn authorization(
+        &self,
+        profile: &ProviderProfile,
+        url: &Url,
+    ) -> Result<Option<HeaderValue>, String> {
+        if profile.has_credential() && !profile.base()?.is_some_and(|base| within(url, &base)) {
+            return Err("The skill provider credential does not authorize this URL.".into());
+        }
+        self.with_credential(profile, |secret| {
+            let Some(secret) = secret else {
+                return Ok(None);
+            };
+            let invalid =
+                || "The configured skill provider credential is unavailable or invalid.".to_owned();
+            let header = if profile.username.is_empty() {
+                if secret.is_empty()
+                    || secret.len() > 4096
+                    || !secret.bytes().all(|byte| byte.is_ascii_graphic())
+                {
+                    return Err(invalid());
+                }
+                Zeroizing::new(format!("Bearer {secret}"))
+            } else {
+                if secret.is_empty() || secret.len() > 4096 || secret.chars().any(char::is_control)
+                {
+                    return Err(invalid());
+                }
+                let pair = Zeroizing::new(format!("{}:{secret}", profile.username));
+                let encoded = Zeroizing::new(STANDARD.encode(pair.as_bytes()));
+                Zeroizing::new(format!("Basic {}", encoded.as_str()))
+            };
+            let mut header = HeaderValue::from_str(&header).map_err(|_| invalid())?;
+            header.set_sensitive(true);
+            Ok(Some(header))
+        })
+    }
 }

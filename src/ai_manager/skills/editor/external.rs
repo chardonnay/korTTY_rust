@@ -2,17 +2,21 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 
 use iced::widget::{button, column, container, pick_list, row, scrollable, text, text_input};
 use iced::{Alignment, Element, Font, Length, Task};
 
 use crate::ai_manager::profiles::picker::DismissOnEscape as _;
+use crate::ai_manager::search::{Reveal, Setting, SkillProviderSetting};
+use crate::connection_window::CredentialChoice;
+use crate::vault_window::VaultWindow;
 
 use super::super::external::{
     self as remote, Candidate, Client, Decision, Document, ProviderProfile, Update, UpdateClient,
 };
+use super::super::java_providers;
 use super::{Editor, Skill, Store, bounded};
 
 mod providers;
@@ -86,6 +90,7 @@ struct Pending {
     profiles: Vec<ProviderProfile>,
     cancelled: Arc<AtomicBool>,
     _cancel_request: Option<remote::Cancellation>,
+    vault_revision: Option<Weak<()>>,
 }
 
 impl Drop for Pending {
@@ -135,6 +140,7 @@ impl Panel {
         profiles: Vec<ProviderProfile>,
         ticket: &mut u64,
         cancel_request: Option<remote::Cancellation>,
+        vault_revision: Option<Weak<()>>,
         work: impl FnOnce(&AtomicBool) -> Result<Completion, String> + Send + 'static,
     ) -> Task<Message> {
         if WORKER_ACTIVE.swap(true, Ordering::AcqRel) {
@@ -165,6 +171,7 @@ impl Panel {
             profiles,
             cancelled,
             _cancel_request: cancel_request,
+            vault_revision,
         });
         self.notice = None;
         Task::future(async move {
@@ -187,6 +194,10 @@ impl Panel {
         let pending = self.pending.take().expect("checked request");
         if pending.profiles != store.external_providers {
             self.notice = Some("The provider settings changed. Start a fresh review.".into());
+            return;
+        }
+        if let Err(error) = remote::require_vault_revision(pending.vault_revision.as_ref()) {
+            self.notice = Some(error);
             return;
         }
         match (&mut self.screen, result) {
@@ -213,7 +224,12 @@ impl Panel {
         }
     }
 
-    fn search(&mut self, store: &Store, ticket: &mut u64) -> Task<Message> {
+    fn search(
+        &mut self,
+        store: &Store,
+        ticket: &mut u64,
+        vault: Option<&VaultWindow>,
+    ) -> Task<Message> {
         let Screen::Import(catalog) = &mut self.screen else {
             return Task::none();
         };
@@ -226,7 +242,7 @@ impl Panel {
         let query = catalog.query.trim().to_owned();
         catalog.clear_results();
         let profiles = store.external_providers.clone();
-        let client = match Client::new(&profiles, id) {
+        let client = match Client::new(&profiles, id, vault) {
             Ok(client) => client,
             Err(error) => {
                 self.notice = Some(error);
@@ -234,11 +250,17 @@ impl Panel {
             }
         };
         let cancel = client.cancel_handle();
-        self.start(profiles, ticket, Some(cancel), move |_| {
-            client
-                .search(&query)
-                .map(|results| Completion::Search(Arc::new(results)))
-        })
+        self.start(
+            profiles,
+            ticket,
+            Some(cancel),
+            client.vault_revision(),
+            move |_| {
+                client
+                    .search(&query)
+                    .map(|results| Completion::Search(Arc::new(results)))
+            },
+        )
     }
 
     fn preview(
@@ -247,6 +269,7 @@ impl Panel {
         ticket: &mut u64,
         generation: u64,
         index: usize,
+        vault: Option<&VaultWindow>,
     ) -> Task<Message> {
         let Screen::Import(catalog) = &mut self.screen else {
             return Task::none();
@@ -266,7 +289,7 @@ impl Panel {
         }
         catalog.preview = None;
         let profiles = store.external_providers.clone();
-        let client = match Client::new(&profiles, id) {
+        let client = match Client::new(&profiles, id, vault) {
             Ok(client) => client,
             Err(error) => {
                 self.notice = Some(error);
@@ -274,14 +297,25 @@ impl Panel {
             }
         };
         let cancel = client.cancel_handle();
-        self.start(profiles, ticket, Some(cancel), move |_| {
-            client
-                .fetch(&results[index])
-                .map(|document| Completion::Preview(index, Arc::new(document)))
-        })
+        self.start(
+            profiles,
+            ticket,
+            Some(cancel),
+            client.vault_revision(),
+            move |_| {
+                client
+                    .fetch(&results[index])
+                    .map(|document| Completion::Preview(index, Arc::new(document)))
+            },
+        )
     }
 
-    fn check(&mut self, store: &Store, ticket: &mut u64) -> Task<Message> {
+    fn check(
+        &mut self,
+        store: &Store,
+        ticket: &mut u64,
+        vault: Option<&VaultWindow>,
+    ) -> Task<Message> {
         let Screen::Updates(updates) = &mut self.screen else {
             return Task::none();
         };
@@ -296,7 +330,7 @@ impl Panel {
             return Task::none();
         }
         let profiles = store.external_providers.clone();
-        let client = match UpdateClient::new(&profiles) {
+        let client = match UpdateClient::new(&profiles, vault) {
             Ok(client) => client,
             Err(error) => {
                 self.notice = Some(error);
@@ -304,9 +338,13 @@ impl Panel {
             }
         };
         let cancel = client.cancel_handle();
-        self.start(profiles, ticket, Some(cancel), move |cancelled| {
-            check_updates(&client, &sources, cancelled)
-        })
+        self.start(
+            profiles,
+            ticket,
+            Some(cancel),
+            client.vault_revision(),
+            move |cancelled| check_updates(&client, &sources, cancelled),
+        )
     }
 
     fn import(&mut self, store: &mut Store, generation: u64) -> Result<u64, String> {
@@ -330,13 +368,27 @@ impl Panel {
         store: &mut Store,
         ticket: &mut u64,
         message: providers::Message,
+        vault: Option<&VaultWindow>,
+        java_providers: &java_providers::Hints,
     ) -> Task<Message> {
         let Screen::Providers(providers) = &mut self.screen else {
             return Task::none();
         };
+        if let providers::Message::VaultCredential(Some(id)) = &message
+            && !vault.is_some_and(|vault| {
+                vault
+                    .choices(crate::vault_window::Kind::SkillProviderCredential)
+                    .iter()
+                    .any(|entry| &entry.id == id)
+            })
+        {
+            self.notice =
+                Some("Unlock the vault and choose an external skill provider credential.".into());
+            return Task::none();
+        }
         if matches!(message, providers::Message::Test) {
             let prepared = providers.test(store).and_then(|(profiles, id, sample)| {
-                let client = Client::new(&profiles, id)?;
+                let client = Client::new(&profiles, id, vault)?;
                 Ok((client, sample))
             });
             let (client, sample) = match prepared {
@@ -351,23 +403,54 @@ impl Panel {
                 store.external_providers.clone(),
                 ticket,
                 Some(cancel),
+                client.vault_revision(),
                 move |_| client.test(&sample).map(|()| Completion::Tested),
             );
         }
-        self.notice = match providers.update(store, message) {
+        self.notice = match providers.update(store, message, java_providers) {
             Ok(notice) => notice.map(str::to_owned),
             Err(error) => Some(error),
         };
         Task::none()
     }
 
-    pub(super) fn view<'a>(&'a self, store: &'a Store) -> Element<'a, Message> {
+    pub(super) fn has_provider_search_setting(
+        &self,
+        setting: SkillProviderSetting,
+        store: &Store,
+    ) -> bool {
+        matches!(&self.screen, Screen::Providers(providers)
+            if providers.has_search_setting(setting, store, self.busy()))
+    }
+
+    pub(super) fn view<'a>(
+        &'a self,
+        store: &'a Store,
+        reveal: &Reveal,
+        vault_credentials: &[CredentialChoice],
+        java_providers: &java_providers::Hints,
+    ) -> Element<'a, Message> {
         let busy = self.busy();
         let can_switch = !busy && !self.pending_edit();
         let body = match &self.screen {
             Screen::Import(catalog) => catalog.view(store, busy),
             Screen::Updates(updates) => updates.view(store, busy),
-            Screen::Providers(providers) => providers.view(store, busy).map(Message::Providers),
+            Screen::Providers(providers) => providers
+                .view(store, busy, reveal, vault_credentials, java_providers)
+                .map(Message::Providers),
+        };
+        let close = button(if busy {
+            "Cancel request"
+        } else if self.pending_edit() {
+            "Discard provider edits and close"
+        } else {
+            "Close"
+        })
+        .on_press(Message::Close);
+        let close = if matches!(self.screen, Screen::Providers(_)) {
+            reveal.action(Setting::SkillProvider(SkillProviderSetting::Close), close)
+        } else {
+            close.into()
         };
         column![
             row![
@@ -393,14 +476,7 @@ impl Panel {
                 .as_deref()
                 .map(|notice| text(notice).size(13).wrapping(text::Wrapping::WordOrGlyph)),
             busy.then(|| text("Contacting the selected provider…").size(13)),
-            button(if busy {
-                "Cancel request"
-            } else if self.pending_edit() {
-                "Discard provider edits and close"
-            } else {
-                "Close"
-            })
-            .on_press(Message::Close),
+            close,
         ]
         .height(Length::Fill)
         .spacing(8)
@@ -413,6 +489,7 @@ impl Editor {
         &mut self,
         store: &mut Store,
         message: Message,
+        vault: Option<&VaultWindow>,
     ) -> Task<super::Message> {
         match message {
             Message::Close => {
@@ -458,12 +535,18 @@ impl Editor {
         }
 
         let task = match message {
-            Message::Search => panel.search(store, &mut self.ticket),
+            Message::Search => panel.search(store, &mut self.ticket, vault),
             Message::Preview(generation, index) => {
-                panel.preview(store, &mut self.ticket, generation, index)
+                panel.preview(store, &mut self.ticket, generation, index, vault)
             }
-            Message::Check => panel.check(store, &mut self.ticket),
-            Message::Providers(message) => panel.update_providers(store, &mut self.ticket, message),
+            Message::Check => panel.check(store, &mut self.ticket, vault),
+            Message::Providers(message) => panel.update_providers(
+                store,
+                &mut self.ticket,
+                message,
+                vault,
+                &self.java_providers,
+            ),
             Message::Import(generation) => {
                 match panel.import(store, generation) {
                     Ok(id) => {
@@ -957,6 +1040,7 @@ mod tests {
             profiles: store.external_providers.clone(),
             cancelled: Arc::new(AtomicBool::new(false)),
             _cancel_request: None,
+            vault_revision: None,
         };
         let _ = editor.update(
             &mut store,
@@ -993,6 +1077,242 @@ mod tests {
         assert_eq!(
             panel.notice.as_deref(),
             Some("The provider settings changed. Start a fresh review.")
+        );
+
+        let revision = Arc::new(());
+        let mut authenticated = pending(3, &store);
+        authenticated.vault_revision = Some(Arc::downgrade(&revision));
+        editor.external.as_mut().unwrap().pending = Some(authenticated);
+        drop(revision);
+        let _ = editor.update(&mut store, complete(3), None);
+        let panel = editor.external.as_ref().unwrap();
+        assert!(matches!(&panel.screen, Screen::Import(catalog) if catalog.results.is_none()));
+        assert!(
+            panel
+                .notice
+                .as_deref()
+                .unwrap()
+                .contains("The vault changed")
+        );
+    }
+
+    #[test]
+    fn provider_search_focuses_the_active_draft_without_applying_or_testing_it() {
+        use crate::ai_manager::search::Target;
+        use crate::ai_manager::{Configuration, Dialog, Message as ManagerMessage, Page};
+        use crate::settings_search::test_input;
+        use iced::keyboard::Key;
+        use iced::{Font, Renderer, Size};
+        use iced_runtime::{UserInterface, user_interface::Cache};
+
+        let profile = crate::snippets::tests::Profile::new();
+        let mut manager = Dialog::new(
+            Arc::new(Configuration::default()),
+            profile.0.clone(),
+            Vec::new(),
+            true,
+            None,
+        );
+        let name = Setting::SkillProvider(SkillProviderSetting::Name);
+        let stale = manager.update(ManagerMessage::Reveal(Target::Setting(name)));
+        assert!(iced_runtime::task::into_stream(stale).is_none());
+        let _ = manager.update(ManagerMessage::Page(Page::Skills));
+        let _ = manager.update(ManagerMessage::Skills(EditorMessage::External(
+            Message::OpenProviders,
+        )));
+        let username = Setting::SkillProvider(SkillProviderSetting::Username);
+        let _ = manager.update(ManagerMessage::Search(
+            "external skill provider HTTP Basic username".into(),
+        ));
+        assert!(
+            !manager
+                .search_results()
+                .any(|result| result == Target::Setting(username))
+        );
+        let _ = manager.update(ManagerMessage::SearchEscape);
+        let edit =
+            |message| ManagerMessage::Skills(EditorMessage::External(Message::Providers(message)));
+        let _ = manager.update(edit(providers::Message::Type(remote::Provider::Http)));
+        let original = manager.skill_store.clone();
+        let reveal = |manager: &mut Dialog, query: &str, setting| {
+            let _ = manager.update(ManagerMessage::Search(query.into()));
+            assert_eq!(
+                manager.search_results().next(),
+                Some(Target::Setting(setting))
+            );
+            let task = manager.update(ManagerMessage::SearchChoose);
+            assert_eq!(manager.revealed.setting, Some(setting));
+            task
+        };
+        let task = reveal(
+            &mut manager,
+            "external skill provider HTTP Basic username",
+            username,
+        );
+        let typed = {
+            let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+            let mut interface = UserInterface::build(
+                manager.view(Vec::new(), Vec::new()),
+                Size::new(900.0, 480.0),
+                Cache::default(),
+                &mut renderer,
+            );
+            test_input::apply(&mut interface, &renderer, task);
+            test_input::press(
+                &mut interface,
+                &mut renderer,
+                Key::Character("q".into()),
+                Some("q"),
+            )
+        };
+        assert!(matches!(typed.as_slice(),
+            [ManagerMessage::Skills(EditorMessage::External(Message::Providers(providers::Message::Username(value))))] if value == "q"));
+        for event in typed {
+            let _ = manager.update(event);
+        }
+        for (query, setting) in [
+            (
+                "apply external skill provider edits",
+                SkillProviderSetting::Apply,
+            ),
+            ("test external skill provider", SkillProviderSetting::Test),
+        ] {
+            let _ = reveal(&mut manager, query, Setting::SkillProvider(setting));
+        }
+        assert!(manager.skills.pending_edit());
+        assert!(!manager.skills.busy());
+        assert_eq!(manager.skill_store, original);
+        let _ = manager.update(ManagerMessage::Skills(EditorMessage::External(
+            Message::Close,
+        )));
+        let stale = manager.update(ManagerMessage::Reveal(Target::Setting(name)));
+        assert!(iced_runtime::task::into_stream(stale).is_none());
+    }
+
+    #[test]
+    fn java_skill_provider_review_requires_a_credential_choice_and_applies_disabled() {
+        let mut hints = java_providers::Hints::default();
+        assert!(hints.insert(
+            "java-http",
+            java_providers::Hint {
+                name: "Java catalogue".into(),
+                provider: remote::Provider::Http,
+                base_url: "https://catalogue.invalid/skills".into(),
+                authentication: java_providers::Authentication::Basic,
+                username: "reader".into(),
+            }
+        ));
+        let mut editor = Editor::default().with_java_providers(hints);
+        let mut store = Store::default();
+        let original = store.external_providers.clone();
+        let event = |message| EditorMessage::External(Message::Providers(message));
+        let suggestion = || event(providers::Message::JavaProvider("java-http".into()));
+        let apply = || event(providers::Message::Apply);
+        let _ = editor.update(
+            &mut store,
+            EditorMessage::External(Message::OpenProviders),
+            None,
+        );
+        let _ = editor.update(&mut store, suggestion(), None);
+        let _ = editor.update(&mut store, apply(), None);
+        assert!(editor.pending_edit());
+        assert_eq!(store.external_providers, original);
+        let _ = editor.update(
+            &mut store,
+            event(providers::Message::CredentialEnv(
+                "KORTTY_PROVIDER_FIXTURE".into(),
+            )),
+            None,
+        );
+        let _ = editor.update(&mut store, apply(), None);
+        assert!(!editor.pending_edit());
+        let imported = store.external_providers.last().unwrap();
+        assert!(!imported.enabled);
+        assert_eq!(imported.java_source.as_deref(), Some("java-http"));
+        assert_eq!(imported.username, "reader");
+        assert_eq!(imported.base_url, "https://catalogue.invalid/skills");
+        assert_eq!(&store.external_providers[..original.len()], original);
+        let _ = editor.update(&mut store, suggestion(), None);
+        assert!(!editor.pending_edit());
+        assert_eq!(store.external_providers.len(), original.len() + 1);
+    }
+
+    #[test]
+    fn provider_vault_assignment_is_typed_and_requires_a_fresh_choice_after_retargeting() {
+        use kortty_vault::{CredentialInput, CredentialKind, Secret, Vault};
+
+        let scratch = crate::snippets::tests::Profile::new();
+        let path = scratch.0.join("skills-vault.bin");
+        let mut vault = Vault::create(&path, b"test provider fixture password").unwrap();
+        let save = |vault: &mut Vault, label: &str, kind| {
+            vault
+                .save(
+                    CredentialInput {
+                        label: label.into(),
+                        kind,
+                        ..Default::default()
+                    },
+                    Secret::new("fixture only credential".into()),
+                )
+                .unwrap()
+        };
+        let id = save(
+            &mut vault,
+            "Provider fixture",
+            CredentialKind::SkillProviderCredential,
+        );
+        let ssh = save(&mut vault, "SSH fixture", CredentialKind::Password);
+        let vault = VaultWindow::with_unlocked_fixture(path, vault);
+        let mut editor = Editor::default();
+        let mut store = Store::default();
+        let _ = editor.update(
+            &mut store,
+            EditorMessage::External(Message::OpenProviders),
+            None,
+        );
+        let event = |message| EditorMessage::External(Message::Providers(message));
+        let _ = editor.update_with_vault(
+            &mut store,
+            event(providers::Message::VaultCredential(Some(ssh))),
+            None,
+            Some(&vault),
+        );
+        assert!(!editor.pending_edit());
+        let _ = editor.update_with_vault(
+            &mut store,
+            event(providers::Message::VaultCredential(Some(id.clone()))),
+            None,
+            Some(&vault),
+        );
+        let _ = editor.update(&mut store, event(providers::Message::Apply), None);
+        assert_eq!(
+            store.external_providers[0].vault_credential,
+            Some(id.clone())
+        );
+        let _ = editor.update(
+            &mut store,
+            event(providers::Message::Base(
+                "https://second.invalid/catalogue".into(),
+            )),
+            None,
+        );
+        let _ = editor.update(&mut store, event(providers::Message::Apply), None);
+        assert!(editor.pending_edit());
+        assert!(store.external_providers[0].base_url.is_empty());
+        assert!(
+            editor.has_provider_search_setting(SkillProviderSetting::ClearVaultCredential, &store)
+        );
+        assert!(!editor.has_provider_search_setting(SkillProviderSetting::Test, &store));
+        let _ = editor.update(
+            &mut store,
+            event(providers::Message::VaultCredential(None)),
+            None,
+        );
+        let _ = editor.update(&mut store, event(providers::Message::Apply), None);
+        assert!(store.external_providers[0].vault_credential.is_none());
+        assert_eq!(
+            store.external_providers[0].base_url,
+            "https://second.invalid/catalogue"
         );
     }
 

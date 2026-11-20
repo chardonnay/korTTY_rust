@@ -182,6 +182,9 @@ pub(in crate::ai_manager) struct Report {
     pub(in crate::ai_manager) memory_preferences_omitted: usize,
     pub(in crate::ai_manager) skill_preferences: crate::ai_manager::skills::JavaPreferences,
     pub(in crate::ai_manager) skill_preferences_omitted: usize,
+    pub(in crate::ai_manager) skill_providers: crate::ai_manager::skills::java_providers::Hints,
+    pub(in crate::ai_manager) skill_providers_omitted: usize,
+    pub(in crate::ai_manager) skill_provider_secrets_omitted: usize,
     pub(in crate::ai_manager) agent_shortcut: Option<JavaAgentShortcut>,
     pub(in crate::ai_manager) agent_shortcut_omitted: bool,
     pub(in crate::ai_manager) agent_execution_enabled: Option<bool>,
@@ -381,6 +384,7 @@ pub(in crate::ai_manager) fn decode(bytes: &[u8]) -> io::Result<(Catalog, Report
             Err(()) => report.skill_preferences_omitted += 1,
         }
     }
+    import_skill_providers(root, &mut report);
     match scalar(root, "aiMemoryEnabled").and_then(|value| {
         value
             .map(|value| match value {
@@ -1237,6 +1241,62 @@ fn persisted_lm_studio_endpoint(endpoint: &local_ai::LmStudioEndpoint) -> String
 
 fn named(node: Node<'_, '_>, field: &str) -> bool {
     node.is_element() && node.tag_name().namespace().is_none() && node.has_tag_name(field)
+}
+
+fn import_skill_providers(root: Node<'_, '_>, report: &mut Report) {
+    use crate::ai_manager::skills::{
+        ExternalProvider,
+        java_providers::{Authentication, Hint},
+    };
+
+    let list = match child(root, "aiSkillProviders") {
+        Ok(Some(list)) => list,
+        Ok(None) => return,
+        Err(()) => {
+            report.skill_providers_omitted += 1;
+            return;
+        }
+    };
+    fn parse<'a>(node: Node<'a, '_>) -> Result<(&'a str, Hint), ()> {
+        let id = scalar(node, "id")?.ok_or(())?;
+        let provider = match scalar(node, "type")?.unwrap_or("GITHUB") {
+            "GITHUB" => ExternalProvider::GitHub,
+            "SKILLSMP" => ExternalProvider::SkillsMp,
+            "HTTP" => ExternalProvider::Http,
+            _ => return Err(()),
+        };
+        let authentication = match scalar(node, "auth")?.unwrap_or("NONE") {
+            "NONE" => Authentication::None,
+            "TOKEN" => Authentication::Token,
+            "BASIC" => Authentication::Basic,
+            _ => return Err(()),
+        };
+        let name = scalar(node, "name")?
+            .filter(|name| !name.is_empty())
+            .map_or_else(|| provider.to_string(), str::to_owned);
+        let base_url = scalar(node, "baseUrl")?.unwrap_or_default().to_owned();
+        let username = if authentication == Authentication::Basic {
+            scalar(node, "username")?.unwrap_or_default().to_owned()
+        } else {
+            String::new()
+        };
+        Ok((
+            id,
+            Hint {
+                name,
+                provider,
+                base_url,
+                authentication,
+                username,
+            },
+        ))
+    }
+    for node in list.children().filter(|node| named(*node, "provider")) {
+        report.skill_provider_secrets_omitted +=
+            usize::from(node.children().any(|child| named(child, "encryptedSecret")));
+        let accepted = parse(node).is_ok_and(|(id, hint)| report.skill_providers.insert(id, hint));
+        report.skill_providers_omitted += usize::from(!accepted);
+    }
 }
 
 fn child<'a, 'input>(node: Node<'a, 'input>, field: &str) -> Result<Option<Node<'a, 'input>>, ()> {

@@ -16,6 +16,7 @@ use super::Message::Managed;
 use super::{BackendRepair, Dialog, Message as LocalMessage, Output, field, limited};
 use crate::ai_manager::java_models::{self, Hint, Metadata};
 use crate::ai_manager::profiles::picker::DismissOnEscape as _;
+use crate::ai_manager::search::{ManagedSetting, Reveal, Setting};
 
 mod preference;
 pub(in crate::ai_manager) use preference::Change as DefaultChange;
@@ -174,55 +175,94 @@ impl Configuration {
         &self,
         enabled: bool,
         active_backend: Option<PackageBackend>,
+        reveal: &Reveal,
     ) -> Element<'_, LocalMessage> {
+        use ManagedSetting::*;
+        let input = |setting, label, editable, widget| {
+            reveal.wrap(
+                Setting::Managed(setting),
+                field(
+                    label,
+                    reveal.input(Setting::Managed(setting), editable, widget),
+                ),
+            )
+        };
         column![
             text("Configure managed model").size(16),
-            field(
+            input(
+                Name,
                 "Model name",
+                enabled,
                 text_input("Name", &self.name)
                     .on_input_maybe(enabled.then_some(|name| Managed(Message::Name(name)))),
             ),
-            field(
-                "Backend",
-                backend_picker(self.backend, active_backend, enabled)
+            reveal.wrap(
+                Setting::Managed(Backend),
+                field(
+                    "Backend",
+                    backend_picker(self.backend, active_backend, enabled)
+                )
             ),
             unavailable_backend(self.backend, active_backend).map(|reason| text(reason).size(13)),
-            field(
-                "Purpose",
-                purpose_picker(self.purpose, enabled, Message::ConfigurePurpose),
+            reveal.wrap(
+                Setting::Managed(Purpose),
+                field(
+                    "Purpose",
+                    purpose_picker(self.purpose, enabled, Message::ConfigurePurpose)
+                )
             ),
-            field(
+            input(
+                Context,
                 "Context size (tokens)",
+                enabled,
                 text_input("512–2097152", &self.context).on_input_maybe(
                     enabled.then_some(|context| Managed(Message::Context(context)))
                 ),
             ),
-            field(
+            input(
+                CpuThreads,
                 "CPU threads (0 = auto)",
+                enabled,
                 text_input("0 = automatic", &self.cpu_threads).on_input_maybe(
                     enabled.then_some(|threads| Managed(Message::CpuThreads(threads)))
                 ),
             ),
-            field(
+            input(
+                GpuLayers,
                 "GPU layers (-1 = auto)",
+                enabled,
                 text_input("-1 = automatic", &self.gpu_layers).on_input_maybe(
                     enabled.then_some(|layers| Managed(Message::GpuLayers(layers)))
                 ),
             ),
-            field(
+            input(
+                IdleMinutes,
                 "Idle timeout (minutes)",
+                enabled && !self.never_unload,
                 text_input("1–1440", &self.idle_minutes).on_input_maybe(
                     (enabled && !self.never_unload)
                         .then_some(|minutes| Managed(Message::IdleMinutes(minutes))),
                 ),
             ),
-            checkbox(self.never_unload)
-                .label("Never unload while idle")
-                .on_toggle_maybe(enabled.then_some(|value| Managed(Message::NeverUnload(value)))),
+            reveal.action(
+                Setting::Managed(NeverUnload),
+                checkbox(self.never_unload)
+                    .label("Never unload while idle")
+                    .on_toggle_maybe(
+                        enabled.then_some(|value| Managed(Message::NeverUnload(value)))
+                    )
+            ),
             row![
-                button("Save model settings")
-                    .on_press_maybe(enabled.then_some(Managed(Message::SaveConfiguration))),
-                button("Cancel").on_press_maybe(enabled.then_some(Managed(Message::CancelAction))),
+                reveal.action(
+                    Setting::Managed(Save),
+                    button("Save model settings")
+                        .on_press_maybe(enabled.then_some(Managed(Message::SaveConfiguration)))
+                ),
+                reveal.action(
+                    Setting::Managed(Cancel),
+                    button("Cancel")
+                        .on_press_maybe(enabled.then_some(Managed(Message::CancelAction)))
+                ),
             ]
             .spacing(8)
             .wrap(),
@@ -234,11 +274,8 @@ impl Configuration {
 
 impl Models {
     pub(super) fn java_target(&self, purpose: Purpose) -> Option<&Model> {
-        let model = &self.selected.as_ref()?.model;
-        (!self.has_action()
-            && model.purpose == purpose
-            && !matches!(self.status, Some(ModelStatus::Starting | ModelStatus::Busy)))
-        .then_some(model)
+        self.configurable_model()
+            .filter(|model| model.purpose == purpose)
     }
 
     pub(super) fn stage_java_settings(&mut self, hint: &Hint) -> bool {
@@ -417,12 +454,83 @@ impl Models {
         });
     }
 
+    fn configurable_model(&self) -> Option<&Model> {
+        self.selected
+            .as_ref()
+            .filter(|_| {
+                !self.has_action()
+                    && !matches!(self.status, Some(ModelStatus::Starting | ModelStatus::Busy))
+            })
+            .map(|choice| &choice.model)
+    }
+
+    fn begin_configuration(&mut self) {
+        if let Some(model) = self.configurable_model() {
+            self.action = Some(Action::Configure(Configuration::new(model)));
+        }
+    }
+
+    pub(super) fn has_search_setting(
+        &self,
+        setting: ManagedSetting,
+        editable: bool,
+        ai_allowed: bool,
+    ) -> bool {
+        use ManagedSetting::*;
+        match setting {
+            Name | Backend | Purpose | Context | CpuThreads | GpuLayers | IdleMinutes
+            | NeverUnload => {
+                ai_allowed
+                    && match &self.action {
+                        Some(Action::Configure(draft)) => {
+                            setting != IdleMinutes || !draft.never_unload
+                        }
+                        None => self.configurable_model().is_some_and(|model| {
+                            setting != IdleMinutes || model.idle_timeout_minutes > 0
+                        }),
+                        _ => false,
+                    }
+            }
+            Source | Projector | ImportPurpose | Import | Reference => {
+                ai_allowed && !self.has_action()
+            }
+            Refresh | ClearDefault => editable && !self.has_action(),
+            Select => true,
+            SetDefault | Stop => editable && self.selected.is_some() && !self.has_action(),
+            Start | Test | ReviewRemoval => {
+                ai_allowed && self.selected.is_some() && !self.has_action()
+            }
+            Configure => ai_allowed && self.configurable_model().is_some(),
+            RepairBackend => ai_allowed && !self.has_action() && self.backend_repair().is_some(),
+            Reattach => ai_allowed && !self.has_action() && self.can_reattach,
+            Save => ai_allowed && matches!(self.action, Some(Action::Configure(_))),
+            ConfirmReattachment => {
+                ai_allowed && matches!(self.action, Some(Action::Reattach { .. }))
+            }
+            ConfirmRemoval => ai_allowed && matches!(self.action, Some(Action::ConfirmRemoval)),
+            Cancel => ai_allowed && self.has_action(),
+        }
+    }
+
+    pub(super) fn reveal_search_setting(&mut self, setting: ManagedSetting) {
+        if setting.configuration_field() {
+            self.begin_configuration();
+        }
+    }
+
+    pub(super) fn picker_needs_models(&self) -> bool {
+        self.choices.is_empty()
+    }
+
     pub(super) fn view(
         &self,
         editable: bool,
         ai_allowed: bool,
         legacy: Option<&str>,
+        reveal: &Reveal,
     ) -> Element<'_, LocalMessage> {
+        use ManagedSetting as Target;
+        let reveal_action = |setting, button| reveal.action(Setting::Managed(setting), button);
         let models = pick_list(self.choices.as_slice(), self.selected.as_ref(), |choice| {
             Managed(Message::Select(Box::new(choice)))
         })
@@ -444,7 +552,7 @@ impl Models {
             .as_ref()
             .and_then(|Choice { model, .. }| match &self.action {
                 Some(Action::Configure(configuration)) => {
-                    Some(configuration.view(ai_allowed, self.active_backend))
+                    Some(configuration.view(ai_allowed, self.active_backend, reveal))
                 }
                 Some(Action::Reattach { weights, projector }) => Some(
                     column![
@@ -460,12 +568,12 @@ impl Models {
                         text("Choose files you trust. The backup records component sizes and shard layout. The application validates the selected GGUF files.")
                             .size(13),
                         row![
-                            button("Cancel").on_press_maybe(
+                            reveal_action(Target::Cancel, button("Cancel").on_press_maybe(
                                 ai_allowed.then_some(Managed(Message::CancelAction))
-                            ),
-                            button("Reattach model").on_press_maybe(
+                            )),
+                            reveal_action(Target::ConfirmReattachment, button("Reattach model").on_press_maybe(
                                 ai_allowed.then_some(Managed(Message::ConfirmReattachment))
-                            ),
+                            )),
                         ]
                         .spacing(8)
                         .wrap(),
@@ -482,16 +590,16 @@ impl Models {
                         })
                         .wrapping(text::Wrapping::WordOrGlyph),
                         row![
-                            button("Cancel").on_press_maybe(
+                            reveal_action(Target::Cancel, button("Cancel").on_press_maybe(
                                 ai_allowed.then_some(Managed(Message::CancelAction))
-                            ),
-                            button(if model.external.is_some() {
+                            )),
+                            reveal_action(Target::ConfirmRemoval, button(if model.external.is_some() {
                                 "Remove registration"
                             } else {
                                 "Remove managed copy"
                             })
                             .style(button::danger)
-                            .on_press_maybe(ai_allowed.then_some(Managed(Message::Remove))),
+                            .on_press_maybe(ai_allowed.then_some(Managed(Message::Remove)))),
                         ]
                         .spacing(8)
                         .wrap(),
@@ -508,48 +616,50 @@ impl Models {
                 || "Active signed package backend · Unavailable".into(),
                 |backend| format!("Active signed package backend · {backend}"),
             )).size(13),
-            field(
+            reveal.wrap(Setting::Managed(Target::Source), field(
                 "GGUF model path",
-                text_input("Absolute path to the local GGUF", &self.source)
-                    .on_input_maybe(enabled.then_some(|path| Managed(Message::Source(path)))),
-            ),
-            field(
+                reveal.input(Setting::Managed(Target::Source), enabled,
+                    text_input("Absolute path to the local GGUF", &self.source)
+                        .on_input_maybe(enabled.then_some(|path| Managed(Message::Source(path)))))
+            )),
+            reveal.wrap(Setting::Managed(Target::Projector), field(
                 "Vision projector path (optional)",
-                text_input("Absolute path to a compatible GGUF projector", &self.projector_path)
-                    .on_input_maybe(enabled.then_some(|path| Managed(Message::ProjectorPath(path)))),
-            ),
-            field(
+                reveal.input(Setting::Managed(Target::Projector), enabled,
+                    text_input("Absolute path to a compatible GGUF projector", &self.projector_path)
+                        .on_input_maybe(enabled.then_some(|path| Managed(Message::ProjectorPath(path)))))
+            )),
+            reveal.wrap(Setting::Managed(Target::ImportPurpose), field(
                 "Import purpose",
-                purpose_picker(self.import_purpose, enabled, Message::ImportPurpose),
-            ),
+                purpose_picker(self.import_purpose, enabled, Message::ImportPurpose)
+            )),
             row![
-                button("Import private copy").on_press_maybe(
+                reveal_action(Target::Import, button("Import private copy").on_press_maybe(
                     (enabled && !self.source.trim().is_empty()
                         && (self.projector_path.trim().is_empty() || self.import_purpose == Purpose::Chat))
                         .then_some(Managed(Message::Import)),
-                ),
-                button("Register external GGUF").on_press_maybe(
+                )),
+                reveal_action(Target::Reference, button("Register external GGUF").on_press_maybe(
                     (enabled && !self.source.trim().is_empty() && self.projector_path.trim().is_empty())
                         .then_some(Managed(Message::Reference)),
-                ),
-                button("Refresh managed models").on_press_maybe(
+                )),
+                reveal_action(Target::Refresh, button("Refresh managed models").on_press_maybe(
                     (editable && !self.has_action()).then_some(Managed(Message::Refresh)),
-                ),
+                )),
             ]
             .spacing(8)
             .wrap(),
             (!self.projector_path.trim().is_empty()).then(|| text(
                 "Vision pairs use the Chat purpose. Import both components as a private copy."
             ).size(13)),
-            models,
+            reveal.wrap(Setting::Managed(Target::Select), models),
             row![
-                button("Set as default").on_press_maybe(
+                reveal_action(Target::SetDefault, button("Set as default").on_press_maybe(
                     (can_mark && self.selected.as_ref().is_some_and(|choice| !choice.is_default))
                         .then_some(Managed(Message::SetDefault)),
-                ),
-                button("Clear default").on_press_maybe(
+                )),
+                reveal_action(Target::ClearDefault, button("Clear default").on_press_maybe(
                     (can_mark && has_default).then_some(Managed(Message::ClearDefault)),
-                ),
+                )),
             ]
             .spacing(8)
             .wrap(),
@@ -573,30 +683,30 @@ impl Models {
                         model.purpose, model.backend, model.bytes, model.context_tokens
                     )).size(13),
                     unavailable_backend(model.backend, self.active_backend).map(|reason| text(reason).size(13)),
-                    self.backend_repair().map(|_| button("Install matching runtime…")
+                    self.backend_repair().map(|_| reveal_action(Target::RepairBackend, button("Install matching runtime…")
                         .style(button::secondary)
-                        .on_press_maybe(enabled.then_some(Managed(Message::RepairBackend)))),
+                        .on_press_maybe(enabled.then_some(Managed(Message::RepairBackend))))),
                     row![
-                        self.can_reattach.then(|| button("Reattach local GGUF…")
+                        self.can_reattach.then(|| reveal_action(Target::Reattach, button("Reattach local GGUF…")
                             .on_press_maybe(
                                 (enabled && idle && !self.source.trim().is_empty()
                                     && model.projector_bytes.is_some() != self.projector_path.trim().is_empty())
                                     .then_some(Managed(Message::AskReattachment)),
-                            )),
-                        button("Start model")
+                            ))),
+                        reveal_action(Target::Start, button("Start model")
                             .on_press_maybe((enabled && startable && !self.can_reattach && model.backend.available(self.active_backend))
-                                .then_some(Managed(Message::Start))),
-                        button("Stop model").on_press_maybe(
+                                .then_some(Managed(Message::Start)))),
+                        reveal_action(Target::Stop, button("Stop model").on_press_maybe(
                             (editable && !self.has_action() && idle && !matches!(status, ModelStatus::Stopped))
                                 .then_some(Managed(Message::Stop)),
-                        ),
-                        button("Test model")
+                        )),
+                        reveal_action(Target::Test, button("Test model")
                             .on_press_maybe((enabled && idle && !self.can_reattach && model.backend.available(self.active_backend))
-                                .then_some(Managed(Message::Test))),
-                        button("Configure model")
-                            .on_press_maybe((enabled && idle).then_some(Managed(Message::Configure))),
-                        button("Remove model")
-                            .on_press_maybe((enabled && idle).then_some(Managed(Message::AskRemoval))),
+                                .then_some(Managed(Message::Test)))),
+                        reveal_action(Target::Configure, button("Configure model")
+                            .on_press_maybe((ai_allowed && self.configurable_model().is_some()).then_some(Managed(Message::Configure)))),
+                        reveal_action(Target::ReviewRemoval, button("Remove model")
+                            .on_press_maybe((enabled && idle).then_some(Managed(Message::AskRemoval)))),
                     ]
                     .spacing(8)
                     .wrap(),
@@ -754,11 +864,7 @@ impl Dialog {
                     );
                 }
             }
-            Message::Configure => {
-                if let Some(Choice { model, .. }) = &self.managed.selected {
-                    self.managed.action = Some(Action::Configure(Configuration::new(model)));
-                }
-            }
+            Message::Configure => self.managed.begin_configuration(),
             Message::RepairBackend => {
                 if let Some((model, required)) = self.managed.backend_repair() {
                     self.runtime_removal = None;
@@ -1064,6 +1170,106 @@ mod tests {
                 notice: "Models loaded.".into(),
             }),
         ))
+    }
+
+    #[test]
+    fn gguf_setting_search_focuses_the_draft_without_saving_or_replacing_it() {
+        use iced::keyboard::Key;
+        use iced::{Font, Renderer, Size};
+        use iced_runtime::{UserInterface, user_interface::Cache};
+
+        use crate::ai_manager::search::Target;
+        use crate::settings_search::test_input;
+
+        let profile = crate::snippets::tests::Profile::new();
+        let root = &profile.0;
+        let mut manager = Manager::new(
+            Arc::new(Configuration::default()),
+            root.clone(),
+            Vec::new(),
+            true,
+            None,
+        );
+        let gpu = Target::Setting(Setting::Managed(ManagedSetting::GpuLayers));
+        let _ = manager.update(ManagerMessage::Search("gguf gpu layers".into()));
+        assert!(!manager.search_results().any(|target| target == gpu));
+        let hidden = manager.update(ManagerMessage::Reveal(gpu));
+        assert!(iced_runtime::task::into_stream(hidden).is_none());
+
+        let registered = model(
+            "0123456789abcdef0123456789abcdef",
+            "GGUF fixture",
+            Purpose::Chat,
+        );
+        let _ = manager.update(loaded(vec![registered.clone()], root));
+        let choice = manager.local.managed.choices[0].clone();
+        let _ = manager.update(ManagerMessage::Local(Managed(Message::Select(Box::new(
+            choice,
+        )))));
+
+        for (query, setting, key) in [
+            ("gguf gpu layers", ManagedSetting::GpuLayers, "7"),
+            ("gguf cpu threads", ManagedSetting::CpuThreads, "8"),
+        ] {
+            let _ = manager.update(ManagerMessage::Search(query.into()));
+            let destination = Setting::Managed(setting);
+            assert_eq!(
+                manager.search_results().next(),
+                Some(Target::Setting(destination))
+            );
+            let task = manager.update(ManagerMessage::SearchChoose);
+            assert_eq!(manager.page, Page::LocalModels);
+            assert_eq!(manager.revealed.setting, Some(destination));
+            let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+            let mut interface = UserInterface::build(
+                manager.view(Vec::new(), Vec::new()),
+                Size::new(900.0, 480.0),
+                Cache::default(),
+                &mut renderer,
+            );
+            test_input::apply(&mut interface, &renderer, task);
+            let typed = test_input::press(
+                &mut interface,
+                &mut renderer,
+                Key::Character(key.into()),
+                Some(key),
+            );
+            assert!(match (setting, typed.as_slice()) {
+                (
+                    ManagedSetting::GpuLayers,
+                    [ManagerMessage::Local(Managed(Message::GpuLayers(value)))],
+                )
+                | (
+                    ManagedSetting::CpuThreads,
+                    [ManagerMessage::Local(Managed(Message::CpuThreads(value)))],
+                ) => value.ends_with(key),
+                _ => false,
+            });
+            drop(interface);
+            for message in typed {
+                let _ = manager.update(message);
+            }
+        }
+        let Some(Action::Configure(draft)) = &manager.local.managed.action else {
+            panic!("the configuration draft should still be open");
+        };
+        assert!(draft.gpu_layers.ends_with('7'));
+        assert!(draft.cpu_threads.ends_with('8'));
+        assert_eq!(
+            manager.local.managed.selected.as_ref().unwrap().model,
+            registered
+        );
+        assert!(!manager.local.busy());
+        let _ = manager.update(ManagerMessage::Local(Managed(Message::NeverUnload(true))));
+        let _ = manager.update(ManagerMessage::Search("gguf idle timeout".into()));
+        assert!(
+            !manager
+                .search_results()
+                .any(|target| target
+                    == Target::Setting(Setting::Managed(ManagedSetting::IdleMinutes)))
+        );
+        let _ = manager.update(ManagerMessage::Local(Managed(Message::CancelAction)));
+        assert!(manager.local.managed.action.is_none());
     }
 
     fn change_default(manager: &mut Manager, action: Message) {

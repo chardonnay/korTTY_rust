@@ -343,9 +343,10 @@ impl Workspace {
             .surface
             .as_ref()
             .filter(|(owner, _)| *owner == id)?;
-        let view = dialog.view(
+        let view = dialog.view_with_skill_credentials(
             self.credential_choices(crate::vault_window::Kind::HuggingFaceToken),
             self.credential_choices(crate::vault_window::Kind::QdrantApiKey),
+            &self.credential_choices(crate::vault_window::Kind::SkillProviderCredential),
         );
         Some(on_escape(view, ai_manager::Message::Escape).map(move |event| wrap(id, event)))
     }

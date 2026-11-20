@@ -13,10 +13,10 @@ use kortty_jobs::WebhookOutcome;
 use kortty_ssh::{Endpoint, SensitiveLine};
 use kortty_vault::{
     Credential, CredentialInput, CredentialKind, Error as VaultError, MAX_MASTER_PASSWORD_BYTES,
-    MAX_QDRANT_API_KEY_BYTES, MAX_SUDO_GROUP_BYTES, MAX_SUDO_SCOPE_BYTES,
-    MIN_MASTER_PASSWORD_BYTES, Secret, Vault, WebhookFormat, WebhookSettings, sudo_scope,
-    valid_archive_password, valid_huggingface_token, valid_qdrant_api_key, valid_sudo_group,
-    valid_sudo_password,
+    MAX_QDRANT_API_KEY_BYTES, MAX_SKILL_PROVIDER_CREDENTIAL_BYTES, MAX_SUDO_GROUP_BYTES,
+    MAX_SUDO_SCOPE_BYTES, MIN_MASTER_PASSWORD_BYTES, Secret, Vault, WebhookFormat, WebhookSettings,
+    sudo_scope, valid_archive_password, valid_huggingface_token, valid_qdrant_api_key,
+    valid_skill_provider_credential, valid_sudo_group, valid_sudo_password,
 };
 
 use crate::clipboard_policy::ClipboardPolicy;
@@ -111,6 +111,7 @@ pub enum Kind {
     ArchivePassword,
     HuggingFaceToken,
     QdrantApiKey,
+    SkillProviderCredential,
     SudoPassword,
     SudoGroupPassword,
     JobWebhookUrl,
@@ -125,6 +126,7 @@ impl Kind {
             Self::ArchivePassword => CredentialKind::ArchivePassword,
             Self::HuggingFaceToken => CredentialKind::HuggingFaceToken,
             Self::QdrantApiKey => CredentialKind::QdrantApiKey,
+            Self::SkillProviderCredential => CredentialKind::SkillProviderCredential,
             Self::SudoPassword => CredentialKind::SudoPassword,
             Self::SudoGroupPassword => CredentialKind::SudoGroupPassword,
             Self::JobWebhookUrl => CredentialKind::JobWebhookUrl,
@@ -139,6 +141,7 @@ impl Kind {
             CredentialKind::ArchivePassword => Self::ArchivePassword,
             CredentialKind::HuggingFaceToken => Self::HuggingFaceToken,
             CredentialKind::QdrantApiKey => Self::QdrantApiKey,
+            CredentialKind::SkillProviderCredential => Self::SkillProviderCredential,
             CredentialKind::SudoPassword => Self::SudoPassword,
             CredentialKind::SudoGroupPassword => Self::SudoGroupPassword,
             CredentialKind::JobWebhookUrl => Self::JobWebhookUrl,
@@ -167,6 +170,7 @@ impl fmt::Display for Kind {
             Self::ArchivePassword => "ZIP archive password",
             Self::HuggingFaceToken => "Hugging Face access token",
             Self::QdrantApiKey => "Qdrant API key",
+            Self::SkillProviderCredential => "External skill provider credential",
             Self::SudoPassword => "Scheduler sudo password",
             Self::SudoGroupPassword => "Scheduler group sudo password",
             Self::JobWebhookUrl => "Scheduler webhook URL",
@@ -550,6 +554,13 @@ impl VaultWindow {
             .huggingface_token(id)
             .map(|token| Secret::new(token.to_owned()))
             .ok_or("The selected Hugging Face token is missing or has the wrong type.")
+    }
+
+    pub(crate) fn skill_provider_credential(&self, id: &str) -> Option<Secret> {
+        self.vault
+            .as_ref()?
+            .skill_provider_credential(id)
+            .map(|secret| Secret::new(secret.to_owned()))
     }
 
     pub(crate) fn qdrant_api_key(&self, id: &str) -> Result<Secret, &'static str> {
@@ -1736,6 +1747,7 @@ impl EntryDraft {
                     Kind::ArchivePassword => valid_archive_password(&self.secret),
                     Kind::HuggingFaceToken => valid_huggingface_token(&self.secret),
                     Kind::QdrantApiKey => valid_qdrant_api_key(&self.secret),
+                    Kind::SkillProviderCredential => valid_skill_provider_credential(&self.secret),
                     Kind::SudoPassword | Kind::SudoGroupPassword => {
                         valid_sudo_password(&self.secret)
                     }
@@ -1781,9 +1793,19 @@ impl EntryDraft {
                 }
                 self.kind = kind;
             }
-            Field::Secret(SecretEdit(value)) if self.kind == Kind::QdrantApiKey => {
-                // Keep an over-limit paste invalid even when an empty edit would retain the saved key.
-                let limit = MAX_QDRANT_API_KEY_BYTES + char::MAX.len_utf8();
+            Field::Secret(SecretEdit(value))
+                if matches!(
+                    self.kind,
+                    Kind::QdrantApiKey | Kind::SkillProviderCredential
+                ) =>
+            {
+                // Preserve enough of an over-limit paste to keep it invalid.
+                let maximum = if self.kind == Kind::QdrantApiKey {
+                    MAX_QDRANT_API_KEY_BYTES
+                } else {
+                    MAX_SKILL_PROVIDER_CREDENTIAL_BYTES
+                };
+                let limit = maximum + char::MAX.len_utf8();
                 self.secret = if value.len() > limit {
                     Secret::new(value[..value.floor_char_boundary(limit)].to_owned())
                 } else {
@@ -1841,6 +1863,7 @@ impl EntryDraft {
                 Kind::ArchivePassword,
                 Kind::HuggingFaceToken,
                 Kind::QdrantApiKey,
+                Kind::SkillProviderCredential,
                 Kind::SudoPassword,
                 Kind::SudoGroupPassword,
                 Kind::JobWebhookUrl,
@@ -1860,6 +1883,10 @@ impl EntryDraft {
                 .into()
         } else if self.kind == Kind::QdrantApiKey {
             text("Use an ASCII key without spaces, up to 4096 bytes. Reviewed Qdrant requests require the vault to be unlocked.")
+                .size(13)
+                .into()
+        } else if self.kind == Kind::SkillProviderCredential {
+            text("Store a token or HTTP Basic password for an external skill provider.")
                 .size(13)
                 .into()
         } else if self.kind == Kind::JobWebhookUrl {
@@ -1955,6 +1982,7 @@ impl EntryDraft {
                     let prompt = match (self.kind, self.id.is_some()) {
                         (Kind::JobWebhookUrl, _) => "HTTPS webhook URL",
                         (Kind::QdrantApiKey, false) => "Qdrant API key",
+                        (Kind::SkillProviderCredential, false) => "Token or password",
                         (_, true) => "New secret (blank keeps the stored value)",
                         _ => "Secret",
                     };
@@ -2034,6 +2062,30 @@ fn bound_secret(value: Secret, max: usize) -> Secret {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skill_provider_credential_draft_rejects_invalid_paste_and_clears_ssh_scope() {
+        let mut draft = EntryDraft::new();
+        draft.update(Field::Label("External catalogue fixture".into()));
+        draft.update(Field::Username("old login".into()));
+        draft.update(Field::HostPattern("fixture.test".into()));
+        draft.update(Field::Environment("old environment".into()));
+        draft.update(Field::Kind(Kind::SkillProviderCredential));
+        assert!(!draft.valid());
+        draft.update(Field::Secret(SecretEdit::new("fixture password ä".into())));
+        assert!(draft.valid());
+        let input = draft.input();
+        assert_eq!(input.kind, CredentialKind::SkillProviderCredential);
+        assert!(input.username.is_empty());
+        assert!(input.server_pattern.is_empty());
+        assert!(input.environment.is_empty());
+
+        let too_long = format!("{}ä", "x".repeat(MAX_SKILL_PROVIDER_CREDENTIAL_BYTES));
+        draft.update(Field::Secret(SecretEdit::new(too_long)));
+        assert!(!draft.valid());
+        draft.update(Field::Secret(SecretEdit::new("line\nbreak".into())));
+        assert!(!draft.valid());
+    }
 
     #[test]
     fn qdrant_key_draft_rejects_an_over_limit_paste_and_keeps_dedicated_metadata() {

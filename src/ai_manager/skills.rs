@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 mod builtin;
 mod editor;
 mod external;
+pub(super) mod java_providers;
 mod learning;
 mod markdown;
 mod relevance;
@@ -19,6 +20,7 @@ pub(super) mod usage;
 
 pub(super) use editor::Editor;
 pub(crate) use editor::Message;
+pub(super) use external::Provider as ExternalProvider;
 pub(crate) use learning::{Options, SavedSkillRule, SkillRuleProposal, SkillRuleTarget};
 pub(crate) use usage::SkillUsageReceipt;
 

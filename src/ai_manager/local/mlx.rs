@@ -1,6 +1,6 @@
 //! Explicit local installation and lifecycle controls for Apple MLX.
 
-use iced::widget::{button, column, pick_list, row, text, text_input};
+use iced::widget::{button, checkbox, column, pick_list, row, text, text_input};
 use iced::{Element, Length, Task};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -14,6 +14,7 @@ use mlx_runtime::{InstallationState, online};
 use super::{Dialog, Message, Output, limited};
 use crate::ai_manager::java_models::{self, Hint, Metadata};
 use crate::ai_manager::profiles::picker::DismissOnEscape as _;
+use crate::ai_manager::search::{MlxSetting, Reveal, Setting};
 
 #[derive(Clone, Copy)]
 pub(crate) enum Field {
@@ -28,6 +29,7 @@ pub(crate) enum Field {
 #[derive(Clone)]
 pub(crate) enum Action {
     Edit(Field, String),
+    NeverUnload(bool),
     Refresh,
     ReviewRuntime,
     CheckOnline,
@@ -91,6 +93,18 @@ impl Review {
     fn removal(&self) -> bool {
         matches!(self, Self::Remove(_) | Self::RemoveRuntime(_))
     }
+
+    fn confirmation_setting(&self) -> MlxSetting {
+        match self {
+            Self::Runtime(_) => MlxSetting::ConfirmRuntime,
+            Self::OnlineRuntime { .. } => MlxSetting::ConfirmOnline,
+            Self::Catalog(_) => MlxSetting::ConfirmCatalog,
+            Self::Model(_, None) => MlxSetting::ConfirmImport,
+            Self::Model(_, Some(_)) => MlxSetting::ConfirmReattachment,
+            Self::Remove(_) => MlxSetting::ConfirmRemoval,
+            Self::RemoveRuntime(_) => MlxSetting::ConfirmRuntimeRemoval,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -132,6 +146,7 @@ pub(super) struct State {
     source: String,
     name: String,
     idle: String,
+    never_unload: bool,
     java_review: bool,
     review: Option<Review>,
     choices: Vec<Choice>,
@@ -170,7 +185,7 @@ impl State {
             return false;
         }
         self.name.clone_from(&hint.name);
-        self.idle = idle_minutes.to_string();
+        self.set_idle_draft(idle_minutes);
         self.java_review = true;
         true
     }
@@ -314,10 +329,74 @@ impl State {
             .as_ref()
             .map(|choice| choice.name.clone())
             .unwrap_or_default();
-        self.idle = choice
-            .as_ref()
-            .map(|choice| choice.idle_minutes.to_string())
-            .unwrap_or_default();
+        if let Some(choice) = choice {
+            self.set_idle_draft(choice.idle_minutes);
+        } else {
+            self.idle.clear();
+            self.never_unload = false;
+        }
+    }
+
+    fn set_idle_draft(&mut self, minutes: u16) {
+        self.never_unload = minutes == 0;
+        self.idle = if self.never_unload {
+            mlx_models::DEFAULT_IDLE_MINUTES
+        } else {
+            minutes
+        }
+        .to_string();
+    }
+
+    pub(super) fn has_search_setting(
+        &self,
+        setting: MlxSetting,
+        can_edit: bool,
+        ai_allowed: bool,
+        can_review_runtime_removal: bool,
+        runtime_downloads_allowed: bool,
+    ) -> bool {
+        use MlxSetting::*;
+
+        if !mlx_runtime::supported() || !can_edit {
+            return false;
+        }
+        if let Some(review) = &self.review {
+            return setting == CancelReview
+                || (setting == review.confirmation_setting()
+                    && (ai_allowed || review.removal())
+                    && (setting != ConfirmOnline || runtime_downloads_allowed));
+        }
+        let online = ai_allowed && runtime_downloads_allowed;
+        let has_signed_releases = || {
+            self.online
+                .as_ref()
+                .is_some_and(|catalog| !catalog.choices().is_empty())
+        };
+        match setting {
+            Unpin => self.runtime.pinned_runtime_id().is_some(),
+            CheckOnline => online,
+            OnlineChoice | ReviewOnline => online && has_signed_releases(),
+            RuntimeIndex | RuntimeSignature | RuntimeArchive | Refresh | Source | Select => true,
+            ReviewRuntime | ReviewImport => ai_allowed,
+            ReviewRuntimeRemoval => can_review_runtime_removal,
+            ReviewReattachment => ai_allowed && self.choice().is_some() && self.detached,
+            Start | Test => ai_allowed && self.choice().is_some() && !self.detached,
+            Stop | ReviewRemoval | Name | NeverUnload => self.choice().is_some(),
+            Idle => self.choice().is_some() && !self.never_unload,
+            Save => ai_allowed && self.choice().is_some(),
+            CancelReview
+            | ConfirmOnline
+            | ConfirmRuntime
+            | ConfirmCatalog
+            | ConfirmImport
+            | ConfirmReattachment
+            | ConfirmRemoval
+            | ConfirmRuntimeRemoval => false,
+        }
+    }
+
+    pub(super) fn picker_needs_models(&self) -> bool {
+        self.choices.is_empty()
     }
 
     pub(super) fn view(
@@ -326,20 +405,34 @@ impl State {
         ai_allowed: bool,
         can_review_runtime_removal: bool,
         runtime_downloads_allowed: bool,
+        reveal: &Reveal,
     ) -> Option<Element<'_, Message>> {
+        use MlxSetting as Target;
         if !mlx_runtime::supported() {
             return None;
         }
         let editing = can_edit && self.review.is_none();
         let can_request = editing && ai_allowed;
         let can_download = can_request && runtime_downloads_allowed;
-        let field = |placeholder, value, field| {
-            text_input(placeholder, value).on_input_maybe(
-                editing.then_some(move |value| Message::Mlx(Action::Edit(field, value))),
+        let field = |target, placeholder, value, field| {
+            let setting = Setting::Mlx(target);
+            let enabled = editing && !(matches!(field, Field::Idle) && self.never_unload);
+            reveal.wrap(
+                setting,
+                reveal.input(
+                    setting,
+                    enabled,
+                    text_input(placeholder, value).on_input_maybe(
+                        enabled.then_some(move |value| Message::Mlx(Action::Edit(field, value))),
+                    ),
+                ),
             )
         };
-        let action = |label, action, enabled: bool| {
-            button(label).on_press_maybe(enabled.then_some(Message::Mlx(action)))
+        let action = |setting, label, action, enabled: bool| {
+            reveal.action(
+                Setting::Mlx(setting),
+                button(label).on_press_maybe(enabled.then_some(Message::Mlx(action))),
+            )
         };
         let selected = self.choice();
         let models = pick_list(self.choices.as_slice(), selected, |choice| {
@@ -373,11 +466,11 @@ impl State {
                 } else {
                     format!("Pinned MLX release awaiting installation · {pin}")
                 }).size(13).wrapping(text::Wrapping::WordOrGlyph),
-                action("Follow stable MLX releases", Action::Unpin(pin.to_owned()), editing),
+                action(Target::Unpin, "Follow stable MLX releases", Action::Unpin(pin.to_owned()), editing),
             ].spacing(8).wrap()),
             text("The signed stable MLX catalog is hosted in the korTTY runtime release repository on GitHub.").size(13),
             (!runtime_downloads_allowed).then(|| text("Managed policy blocks runtime downloads.").size(13)),
-            action("Check signed MLX releases", Action::CheckOnline, can_download),
+            action(Target::CheckOnline, "Check signed MLX releases", Action::CheckOnline, can_download),
             self.online.as_ref().filter(|catalog| !catalog.choices().is_empty()).map(|catalog| {
                 let picker: Element<'_, Message> = if can_download {
                     pick_list(catalog.choices(), self.online_choice.as_ref(), |choice| {
@@ -390,8 +483,8 @@ impl State {
                     text(self.online_choice.as_ref().map(ToString::to_string).unwrap_or_default()).into()
                 };
                 column![
-                    picker,
-                    action("Review MLX download…", Action::ReviewOnline, can_download && self.online_choice.is_some()),
+                    reveal.wrap(Setting::Mlx(Target::OnlineChoice), picker),
+                    action(Target::ReviewOnline, "Review MLX download…", Action::ReviewOnline, can_download && self.online_choice.is_some()),
                 ].spacing(8)
             }),
             self.review.as_ref().and_then(|review| {
@@ -408,35 +501,39 @@ impl State {
                         "This selection follows stable MLX releases."
                     }).size(13),
                     row![
-                        action("Cancel", Action::Discard, can_edit),
-                        action("Download and install MLX runtime", Action::ConfirmOnline(*ticket), can_edit && ai_allowed && runtime_downloads_allowed),
+                        action(Target::CancelReview, "Cancel", Action::Discard, can_edit),
+                        action(Target::ConfirmOnline, "Download and install MLX runtime", Action::ConfirmOnline(*ticket), can_edit && ai_allowed && runtime_downloads_allowed),
                     ].spacing(8).wrap(),
                 ].spacing(8))
             }),
-            field("Absolute path to mlx-runtime-index-v1.json", &self.paths[0], Field::Index),
-            field("Absolute path to the detached signature", &self.paths[1], Field::Signature),
-            field("Absolute path to the signed MLX package ZIP or TAR.ZST (optional for catalog review)", &self.paths[2], Field::Archive),
+            field(Target::RuntimeIndex, "Absolute path to mlx-runtime-index-v1.json", &self.paths[0], Field::Index),
+            field(Target::RuntimeSignature, "Absolute path to the detached signature", &self.paths[1], Field::Signature),
+            field(Target::RuntimeArchive, "Absolute path to the signed MLX package ZIP or TAR.ZST (optional for catalog review)", &self.paths[2], Field::Archive),
             row![
-                action("Refresh MLX", Action::Refresh, editing),
-                action("Review signed runtime…", Action::ReviewRuntime, can_request && self.runtime_paths_ready()),
-                action("Remove installed MLX runtime…", Action::ReviewRuntimeRemoval, editing && can_review_runtime_removal),
+                action(Target::Refresh, "Refresh MLX", Action::Refresh, editing),
+                action(Target::ReviewRuntime, "Review signed runtime…", Action::ReviewRuntime, can_request && self.runtime_paths_ready()),
+                action(Target::ReviewRuntimeRemoval, "Remove installed MLX runtime…", Action::ReviewRuntimeRemoval, editing && can_review_runtime_removal),
             ].spacing(8).wrap(),
-            field("Absolute path to a local MLX model directory", &self.source, Field::Source),
-            action("Review model import…", Action::ReviewModel, can_request && Path::new(self.source.trim()).is_absolute()),
-            model_pick,
+            field(Target::Source, "Absolute path to a local MLX model directory", &self.source, Field::Source),
+            action(Target::ReviewImport, "Review model import…", Action::ReviewModel, can_request && Path::new(self.source.trim()).is_absolute()),
+            reveal.wrap(Setting::Mlx(Target::Select), model_pick),
             selected.map(|choice| column![
                 text(format!("{} bytes · {}", choice.bytes, self.status.map_or_else(|| "Checking status".into(), |status| status.to_string()))).size(13),
                 row![
-                    self.detached.then(|| action("Reattach local MLX…", Action::ReviewReattachment,
+                    self.detached.then(|| action(Target::ReviewReattachment, "Reattach local MLX…", Action::ReviewReattachment,
                         can_request && Path::new(self.source.trim()).is_absolute())),
-                    action("Start", Action::Start, can_request && !self.detached),
-                    action("Test model", Action::Test, can_request && !self.detached),
-                    action("Stop", Action::Stop, editing),
-                    action("Remove model…", Action::ReviewRemoval, editing),
+                    action(Target::Start, "Start", Action::Start, can_request && !self.detached),
+                    action(Target::Test, "Test model", Action::Test, can_request && !self.detached),
+                    action(Target::Stop, "Stop", Action::Stop, editing),
+                    action(Target::ReviewRemoval, "Remove model…", Action::ReviewRemoval, editing),
                 ].spacing(8).wrap(),
-                field("Model display name", &self.name, Field::Name),
-                field("Idle minutes (0 keeps the process running)", &self.idle, Field::Idle),
-                action("Save MLX model settings", Action::Configure, can_request && !self.name.trim().is_empty() && self.idle_value().is_some()),
+                field(Target::Name, "Model display name", &self.name, Field::Name),
+                field(Target::Idle, "Idle timeout (1–1440 minutes)", &self.idle, Field::Idle),
+                reveal.action(Setting::Mlx(Target::NeverUnload),
+                    checkbox(self.never_unload)
+                        .label("Never unload while idle")
+                        .on_toggle_maybe(editing.then_some(|value| Message::Mlx(Action::NeverUnload(value))))),
+                action(Target::Save, "Save MLX model settings", Action::Configure, can_request && !self.name.trim().is_empty() && self.idle_value().is_some()),
             ].spacing(8)),
             self.review.as_ref().and_then(|review| {
                 let (heading, detail, confirm) = match review {
@@ -473,8 +570,9 @@ impl State {
                     Message::Mlx(Action::Discard)
                 };
                 Some(column![text(heading).size(16), text(detail).size(13).wrapping(text::Wrapping::WordOrGlyph), row![
-                    button("Cancel").on_press_maybe(can_edit.then_some(cancel)),
-                    action(confirm, Action::Confirm, can_edit && (ai_allowed || review.removal())),
+                    reveal.action(Setting::Mlx(Target::CancelReview),
+                        button("Cancel").on_press_maybe(can_edit.then_some(cancel))),
+                    action(review.confirmation_setting(), confirm, Action::Confirm, can_edit && (ai_allowed || review.removal())),
                 ].spacing(8).wrap()].spacing(8))
             }),
         ].spacing(8).into())
@@ -488,11 +586,14 @@ impl State {
     }
 
     fn idle_value(&self) -> Option<u16> {
+        if self.never_unload {
+            return Some(0);
+        }
         self.idle
             .trim()
             .parse()
             .ok()
-            .filter(|minutes| *minutes <= 1_440)
+            .filter(|minutes| (1..=1_440).contains(minutes))
     }
 }
 
@@ -621,6 +722,11 @@ impl Dialog {
                     mlx_runtime::unpin(&profile, &expected, cancelled).map(ResultValue::Unpinned)
                 })
             }
+            Action::NeverUnload(value) if self.mlx.choice().is_some() => {
+                self.mlx.never_unload = value;
+                return Task::none();
+            }
+            Action::Edit(Field::Idle, _) if self.mlx.never_unload => return Task::none(),
             Action::Edit(field, value) => {
                 let target = match field {
                     Field::Index => &mut self.mlx.paths[0],
@@ -742,7 +848,7 @@ impl Dialog {
                         }
                         Action::Configure => {
                             let idle =
-                                idle.ok_or("Enter an MLX idle timeout from 0 to 1440 minutes.")?;
+                                idle.ok_or("Enter an MLX idle timeout from 1 to 1440 minutes or choose Never unload.")?;
                             runtime_package::with_stopped_mlx_model(&profile, &choice.id, || {
                                 let registry = mlx_models::Registry::new(&profile);
                                 if java_review {
@@ -836,6 +942,214 @@ mod tests {
     use super::*;
     use crate::ai_manager::{Configuration, Dialog as Manager, Message as ManagerMessage, Page};
     use crate::private_files::Directory;
+
+    #[test]
+    fn mlx_search_focuses_local_fields_and_retains_the_active_review() {
+        use iced::keyboard::Key;
+        use iced::{Font, Renderer, Size};
+        use iced_runtime::{UserInterface, user_interface::Cache};
+
+        use crate::ai_manager::search::Target;
+        use crate::settings_search::test_input;
+
+        let profile = crate::snippets::tests::Profile::new();
+        let mut manager = Manager::new(
+            Arc::new(Configuration::default()),
+            profile.0.clone(),
+            Vec::new(),
+            true,
+            None,
+        );
+        let signature = Target::Setting(Setting::Mlx(MlxSetting::RuntimeSignature));
+        let _ = manager.update(ManagerMessage::Search("MLX detached signature".into()));
+        assert_eq!(
+            manager.search_results().next(),
+            mlx_runtime::supported().then_some(signature)
+        );
+        if !mlx_runtime::supported() {
+            let hidden = manager.update(ManagerMessage::Reveal(signature));
+            assert!(iced_runtime::task::into_stream(hidden).is_none());
+            return;
+        }
+
+        let choice = Choice {
+            id: "0123456789abcdef0123456789abcdef".into(),
+            name: "Fixture".into(),
+            bytes: 1024,
+            idle_minutes: 10,
+        };
+        manager.local.mlx.choices.push(choice.clone());
+        manager.local.mlx.selected = Some(choice.id.clone());
+        manager.local.mlx.name.clone_from(&choice.name);
+        manager.local.mlx.idle = choice.idle_minutes.to_string();
+        for (query, setting) in [
+            ("MLX detached signature", MlxSetting::RuntimeSignature),
+            ("MLX model display name", MlxSetting::Name),
+            ("MLX idle timeout", MlxSetting::Idle),
+        ] {
+            let _ = manager.update(ManagerMessage::Search(query.into()));
+            let destination = Setting::Mlx(setting);
+            assert_eq!(
+                manager.search_results().next(),
+                Some(Target::Setting(destination))
+            );
+            let task = manager.update(ManagerMessage::SearchChoose);
+            assert_eq!(manager.page, Page::LocalModels);
+            assert_eq!(manager.revealed.setting, Some(destination));
+            let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+            let mut interface = UserInterface::build(
+                manager.view(Vec::new(), Vec::new()),
+                Size::new(900.0, 480.0),
+                Cache::default(),
+                &mut renderer,
+            );
+            test_input::apply(&mut interface, &renderer, task);
+            let typed = test_input::press(
+                &mut interface,
+                &mut renderer,
+                Key::Character("7".into()),
+                Some("7"),
+            );
+            assert!(match (setting, typed.as_slice()) {
+                (
+                    MlxSetting::RuntimeSignature,
+                    [ManagerMessage::Local(Message::Mlx(Action::Edit(Field::Signature, value)))],
+                )
+                | (
+                    MlxSetting::Name,
+                    [ManagerMessage::Local(Message::Mlx(Action::Edit(Field::Name, value)))],
+                )
+                | (
+                    MlxSetting::Idle,
+                    [ManagerMessage::Local(Message::Mlx(Action::Edit(Field::Idle, value)))],
+                ) => value.ends_with('7'),
+                _ => false,
+            });
+            drop(interface);
+            for message in typed {
+                let _ = manager.update(message);
+            }
+        }
+        assert_eq!(manager.local.mlx.paths[1], "7");
+        assert_eq!(manager.local.mlx.name, "Fixture7");
+        assert_eq!(manager.local.mlx.idle, "107");
+        assert!(manager.local.mlx.choice() == Some(&choice));
+        assert!(!manager.local.busy());
+
+        let online = Target::Setting(Setting::Mlx(MlxSetting::CheckOnline));
+        let _ = manager.update(ManagerMessage::Search("check signed MLX releases".into()));
+        assert!(manager.search_results().any(|target| target == online));
+        manager.set_runtime_downloads_allowed(false);
+        assert!(!manager.search_results().any(|target| target == online));
+        let denied = manager.update(ManagerMessage::Reveal(online));
+        assert!(iced_runtime::task::into_stream(denied).is_none());
+        assert!(!manager.local.busy());
+        let _ = manager.update(ManagerMessage::SearchEscape);
+
+        let _ = manager.update(ManagerMessage::Local(Message::Mlx(Action::ReviewRemoval)));
+        let destination = Setting::Mlx(MlxSetting::ConfirmRemoval);
+        let _ = manager.update(ManagerMessage::Search(
+            "confirm managed MLX model removal".into(),
+        ));
+        assert_eq!(
+            manager.search_results().next(),
+            Some(Target::Setting(destination))
+        );
+        let _ = manager.update(ManagerMessage::SearchChoose);
+        assert_eq!(manager.revealed.setting, Some(destination));
+        assert!(
+            matches!(manager.local.mlx.review.as_ref(), Some(Review::Remove(model)) if model == &choice)
+        );
+        assert!(!manager.local.busy());
+        let _ = manager.update(ManagerMessage::Local(Message::Mlx(Action::Discard)));
+        assert!(manager.local.mlx.review.is_none());
+        assert!(manager.local.mlx.choice() == Some(&choice));
+    }
+
+    #[test]
+    fn mlx_never_unload_round_trips_through_model_settings() {
+        use iced::futures::{StreamExt, executor::block_on};
+
+        if !mlx_runtime::supported() {
+            return;
+        }
+        let profile = crate::snippets::tests::Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        let stop = AtomicBool::new(false);
+        let source = mlx_models::test_fixture(&root);
+        let review = mlx_models::Review::prepare(&source, &stop).unwrap();
+        let registry = mlx_models::Registry::new(&root);
+        let model = registry.import(&review, &stop).unwrap();
+        let existing = registry.configure(&model.id, &model.name, 0).unwrap();
+        let mut manager = Manager::new(
+            Arc::new(Configuration::default()),
+            root.clone(),
+            Vec::new(),
+            true,
+            None,
+        );
+        manager.page = Page::LocalModels;
+        manager.local.mlx.add_hub_model(existing, &root);
+        assert!(manager.local.mlx.never_unload);
+        assert_eq!(manager.local.mlx.idle_value(), Some(0));
+        assert_eq!(
+            manager.local.mlx.idle,
+            mlx_models::DEFAULT_IDLE_MINUTES.to_string()
+        );
+
+        let send = |manager: &mut Manager, action| {
+            manager.update(ManagerMessage::Local(Message::Mlx(action)))
+        };
+        let save = |manager: &mut Manager, expected| {
+            let task = send(manager, Action::Configure);
+            let mut events = iced_runtime::task::into_stream(task).unwrap();
+            let Some(iced_runtime::Action::Output(event)) = block_on(events.next()) else {
+                panic!("expected the MLX settings result");
+            };
+            let _ = manager.update(event);
+            assert_eq!(
+                manager.local.status.as_deref(),
+                Some("Saved the MLX model settings.")
+            );
+            let stored = registry.open(&model.id).unwrap();
+            assert_eq!(stored.model.idle_minutes, expected);
+            assert_eq!(manager.local.mlx.idle_value(), Some(expected));
+        };
+        let _ = send(&mut manager, Action::NeverUnload(false));
+        let _ = send(&mut manager, Action::Edit(Field::Idle, "1441".into()));
+        assert_eq!(manager.local.mlx.idle_value(), None);
+        let _ = send(&mut manager, Action::Edit(Field::Idle, "37".into()));
+        let _ = send(&mut manager, Action::NeverUnload(true));
+        let _ = send(&mut manager, Action::Edit(Field::Idle, "9".into()));
+        let _ = send(&mut manager, Action::NeverUnload(false));
+        assert_eq!(manager.local.mlx.idle_value(), Some(37));
+        save(&mut manager, 37);
+
+        let hint = Hint {
+            id: "java-model".into(),
+            name: model.name.clone(),
+            published_at: None,
+            metadata: Metadata::Mlx {
+                context: 4096,
+                idle_minutes: 0,
+                quantization: None,
+            },
+        };
+        assert!(manager.local.mlx.stage_java_settings(&hint));
+        let idle = crate::ai_manager::search::Target::Setting(Setting::Mlx(MlxSetting::Idle));
+        let _ = manager.update(ManagerMessage::Search("MLX idle timeout".into()));
+        assert!(!manager.search_results().any(|target| target == idle));
+        let never =
+            crate::ai_manager::search::Target::Setting(Setting::Mlx(MlxSetting::NeverUnload));
+        let _ = manager.update(ManagerMessage::Search("never unload MLX".into()));
+        assert!(manager.search_results().any(|target| target == never));
+        let _ = manager.update(ManagerMessage::SearchChoose);
+        assert_eq!(
+            manager.revealed.setting,
+            Some(Setting::Mlx(MlxSetting::NeverUnload))
+        );
+        save(&mut manager, 0);
+    }
 
     #[test]
     fn mlx_connectivity_test_profile_uses_a_short_output_limit() {

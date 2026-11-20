@@ -235,6 +235,9 @@ pub(crate) struct JavaProfileReport {
     pub(crate) memory_preferences_omitted: usize,
     pub(crate) skill_preferences_hint: bool,
     pub(crate) skill_preferences_omitted: usize,
+    pub(crate) skill_provider_hints: usize,
+    pub(crate) skill_providers_omitted: usize,
+    pub(crate) skill_provider_secrets_omitted: usize,
     pub(crate) agent_shortcut_hint: bool,
     pub(crate) agent_shortcut_omitted: bool,
     pub(crate) agent_execution_hint: bool,
@@ -262,6 +265,7 @@ pub(crate) fn portable_java_profiles(bytes: &[u8]) -> io::Result<(Vec<u8>, JavaP
         java_memory_tokens: report.memory_tokens,
         java_memory_preferences: report.memory_preferences,
         java_skill_preferences: report.skill_preferences,
+        java_skill_providers: report.skill_providers,
         java_agent_shortcut: report.agent_shortcut,
         java_agent_execution_enabled: report.agent_execution_enabled,
         java_agent_confirm_mutating: report.agent_confirm_mutating,
@@ -300,6 +304,9 @@ pub(crate) fn portable_java_profiles(bytes: &[u8]) -> io::Result<(Vec<u8>, JavaP
             memory_preferences_omitted: report.memory_preferences_omitted,
             skill_preferences_hint: !settings.java_skill_preferences.is_empty(),
             skill_preferences_omitted: report.skill_preferences_omitted,
+            skill_provider_hints: settings.java_skill_providers.len(),
+            skill_providers_omitted: report.skill_providers_omitted,
+            skill_provider_secrets_omitted: report.skill_provider_secrets_omitted,
             agent_shortcut_hint: settings.java_agent_shortcut.is_some(),
             agent_shortcut_omitted: report.agent_shortcut_omitted,
             agent_execution_hint: settings.java_agent_execution_enabled.is_some(),
@@ -367,6 +374,9 @@ pub(crate) fn merge_java_profiles(
     let skill_preferences_added = local
         .java_skill_preferences
         .merge(incoming.java_skill_preferences);
+    let skill_provider_hints_added = local
+        .java_skill_providers
+        .merge(incoming.java_skill_providers);
     let memory_preferences_added = local
         .java_memory_preferences
         .merge(incoming.java_memory_preferences);
@@ -439,6 +449,7 @@ pub(crate) fn merge_java_profiles(
         && !execution_added
         && !memory_preferences_added
         && !skill_preferences_added
+        && !skill_provider_hints_added
         && !semantic_search_added
         && !agent_shortcut_added
         && !memory_tokens_added
@@ -648,6 +659,54 @@ mod java_profile_tests {
         );
         let (_, report) = portable_java_profiles(br#"<globalSettings><aiRequestTimeoutMinutes>1441</aiRequestTimeoutMinutes></globalSettings>"#).unwrap();
         assert!(report.request_timeout_omitted);
+    }
+
+    #[test]
+    fn java_skill_provider_metadata_remains_inactive_and_omits_secrets() {
+        let (bytes, report) = portable_java_profiles(
+            br#"
+            <globalSettings><aiSkillProviders>
+                <provider>
+                    <id>java-http</id><name>Private catalogue</name><type>HTTP</type>
+                    <baseUrl>https://catalogue.invalid/skills</baseUrl><auth>BASIC</auth>
+                    <username>reader</username><encryptedSecret>ciphertext-fixture</encryptedSecret>
+                    <enabled>true</enabled>
+                </provider>
+                <provider>
+                    <id>invalid-url</id><type>HTTP</type>
+                    <baseUrl>https://fixture:private@catalogue.invalid/skills</baseUrl>
+                </provider>
+            </aiSkillProviders></globalSettings>
+        "#,
+        )
+        .unwrap();
+        assert_eq!(report.skill_provider_hints, 1);
+        assert_eq!(report.skill_providers_omitted, 1);
+        assert_eq!(report.skill_provider_secrets_omitted, 1);
+        let serialized = std::str::from_utf8(&bytes).unwrap();
+        assert!(!serialized.contains("ciphertext-fixture"));
+        assert!(!serialized.contains("fixture:private"));
+        let restored = Configuration::decode(&bytes).unwrap();
+        assert_eq!(restored.skills, super::super::skills::Store::default());
+        assert_eq!(
+            restored
+                .java_skill_providers
+                .get("java-http")
+                .unwrap()
+                .username,
+            "reader"
+        );
+        let policy = ClipboardPolicy::default();
+        let merged = merge_java_profiles(None, &bytes, &policy).unwrap().unwrap();
+        assert_eq!(
+            Configuration::decode(&merged).unwrap().java_skill_providers,
+            restored.java_skill_providers
+        );
+        assert!(
+            merge_java_profiles(Some(&merged), &bytes, &policy)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
