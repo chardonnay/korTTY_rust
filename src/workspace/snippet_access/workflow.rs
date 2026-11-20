@@ -8,6 +8,28 @@ use super::{Message, SnippetWindow, Workspace, snippets};
 use crate::snippets::diagrams::Saved;
 
 impl Workspace {
+    pub(in crate::workspace) fn open_agent_step_snippet(
+        &mut self,
+        source: window::Id,
+        content: std::sync::Arc<str>,
+    ) -> Task<Message> {
+        self.open_generated_snippet(source, |editor| {
+            editor.seed_workflow(
+                snippets::Input {
+                    name: unique_name(editor.latest_library(), "Agent step")?,
+                    language: "text".into(),
+                    category: String::new(),
+                    content,
+                },
+                snippets::Metadata {
+                    description: "Draft from a terminal Agent step.".into(),
+                    ..Default::default()
+                },
+            );
+            Ok(())
+        })
+    }
+
     pub(in crate::workspace) fn open_file_comparison_snippet(
         &mut self,
         source: window::Id,

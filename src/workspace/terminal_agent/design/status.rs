@@ -1,15 +1,136 @@
 //! Status modules expose existing run actions without creating approvals.
 
-use iced::widget::{button, column, container, row, scrollable, text, tooltip};
+use std::f32::consts::TAU;
+use std::time::{Duration, Instant};
+
+use iced::widget::{
+    button, column, container, mouse_area, progress_bar, row, scrollable, text, tooltip,
+};
 use iced::{Alignment, Element, Font, Length};
 
 use crate::terminal_agent::design::Status;
+use crate::terminal_agent::design::inline::{State, Step, StepState, Transcript};
 
 use super::super::{Message as AgentMessage, Phase};
 use super::{
     Message, Run, history,
     palette::{self, Palette},
+    presentation::{Notice, TOAST_LIFETIME},
 };
+
+mod meter;
+pub(super) use meter::adaptive_countdown;
+use meter::{Ring, Tone};
+
+pub(super) struct Trace<'a> {
+    run: Option<&'a Run>,
+    steps: &'a [Step],
+    answer: &'a str,
+    elapsed: Duration,
+    animation_age: Duration,
+    active: bool,
+    waiting: bool,
+    paused: bool,
+    tone: Tone,
+    reduced_motion: bool,
+    now: Instant,
+}
+
+impl<'a> Trace<'a> {
+    fn live(run: &'a Run, now: Instant, reduced_motion: bool) -> Self {
+        let (transcript, elapsed) =
+            run.status_transcript()
+                .map_or((None, Duration::ZERO), |(transcript, start)| {
+                    let end = run
+                        .presentation
+                        .status_visibility
+                        .finished_at
+                        .unwrap_or(now);
+                    (Some(transcript), end.saturating_duration_since(start))
+                });
+        Self {
+            run: Some(run),
+            steps: transcript.map_or(&[], |trace| trace.steps.as_slice()),
+            answer: transcript.map_or("", |trace| trace.final_answer.as_str()),
+            elapsed,
+            animation_age: elapsed,
+            active: run.active() && !run.cancel.requested(),
+            waiting: run.awaiting_input(),
+            paused: run.paused || run.phase == Phase::Paused,
+            tone: match run.phase {
+                Phase::Finished => Tone::Finished,
+                Phase::Failed | Phase::Blocked | Phase::Cancelled => Tone::Stopped,
+                _ => Tone::Active,
+            },
+            reduced_motion,
+            now,
+        }
+    }
+
+    pub(super) fn sample(
+        transcript: &'a Transcript,
+        start: Instant,
+        now: Instant,
+        reduced_motion: bool,
+    ) -> Self {
+        Self {
+            run: None,
+            steps: &transcript.steps,
+            answer: &transcript.final_answer,
+            elapsed: Duration::from_millis(transcript.elapsed_ms),
+            animation_age: now.saturating_duration_since(start),
+            active: !transcript.state.finished(),
+            waiting: transcript.prompt.is_some(),
+            paused: transcript.state == State::Paused,
+            tone: match transcript.state {
+                State::Finished => Tone::Finished,
+                State::Failed | State::Cancelled => Tone::Stopped,
+                _ => Tone::Active,
+            },
+            reduced_motion,
+            now,
+        }
+    }
+
+    fn step(&self, id: u64) -> Option<&Step> {
+        self.steps.iter().find(|step| step.id == id)
+    }
+
+    fn progress(&self) -> (usize, usize) {
+        let finished = self
+            .steps
+            .iter()
+            .filter(|step| step.state != StepState::Running)
+            .count();
+        (finished, self.steps.len())
+    }
+
+    fn current_label(&self, phase: &str) -> String {
+        if self.waiting {
+            return format!("? {phase}");
+        }
+        if !self.active || self.paused || phase != "Working" {
+            return phase.to_owned();
+        }
+        if let Some(step) = self
+            .steps
+            .iter()
+            .rev()
+            .find(|step| step.state == StepState::Running)
+        {
+            return history::summary(step.command.as_deref().unwrap_or(&step.title));
+        }
+        if let Some(step) = self.steps.last() {
+            return history::summary(&step.title);
+        }
+        phase.to_owned()
+    }
+
+    fn elapsed_label(&self) -> String {
+        let seconds = self.elapsed.as_secs();
+        format!("{}:{:02}", seconds / 60, seconds % 60)
+    }
+}
 
 pub(super) fn phase(run: &Run) -> (&'static str, usize) {
     if run.cancel.requested() && run.phase.working() {
@@ -30,10 +151,10 @@ pub(super) fn phase(run: &Run) -> (&'static str, usize) {
             1,
         ),
         Phase::DirectoryConfirmation => ("Confirm directory", 1),
-        Phase::ReviewedDirectory { .. }
-        | Phase::ProbeApproval
-        | Phase::Approval
-        | Phase::Question => ("Review", 1),
+        Phase::ReviewedDirectory { .. } => ("Checking directory", 2),
+        Phase::ProbeApproval => ("Review the environment probe", 1),
+        Phase::Approval => ("Review the command", 1),
+        Phase::Question => ("Answer the agent", 1),
         Phase::SudoPassword => ("Waiting for sudo password", 1),
         Phase::PlanQuestions | Phase::PlanOptions | Phase::PlanReady | Phase::PlanLibrary => {
             ("Planning review", 1)
@@ -100,11 +221,13 @@ pub(super) fn view(
     run: &Run,
     status: Status,
     palette: Option<Palette>,
+    now: Instant,
+    reduced_motion: bool,
 ) -> Element<'_, AgentMessage> {
     render(
         run.into(),
         phase(run),
-        matches!(run.phase, Phase::Failed | Phase::Blocked),
+        Trace::live(run, now, reduced_motion),
         status,
         palette,
         || super::controls(run),
@@ -114,13 +237,13 @@ pub(super) fn view(
 pub(super) fn render<'a>(
     run: history::Activity<'a>,
     (phase, stage): (&'static str, usize),
-    failed: bool,
+    trace: Trace<'a>,
     status: Status,
     palette: Option<Palette>,
-    controls: impl FnOnce() -> Element<'a, AgentMessage>,
+    controls: impl Fn() -> Element<'a, AgentMessage>,
 ) -> Element<'a, AgentMessage> {
     let accent = palette.map(|palette| palette.accent.color());
-    let heading_color = if failed {
+    let heading_color = if matches!(trace.tone, Tone::Stopped) {
         palette.map(|palette| palette.error.color())
     } else {
         None
@@ -261,78 +384,197 @@ pub(super) fn render<'a>(
         ]
         .spacing(5)
         .into(),
-        Status::Spotlight => button(
-            text(format!("● Agent · {phase}"))
-                .size(13)
-                .style(heading_style),
-        )
-        .style(button::secondary)
-        .on_press(toggle())
-        .into(),
-        Status::Toasts => {
-            let mut cards = column![
-                text(format!("Agent · {phase}"))
-                    .size(12)
-                    .style(heading_style)
-            ]
-            .spacing(5);
-            for (index, entry) in run
-                .activity
-                .iter()
-                .enumerate()
-                .skip(run.activity.len().saturating_sub(3))
-            {
-                cards = cards.push(
-                    button(text(history::summary(entry)).size(12))
-                        .style(button::secondary)
-                        .width(Length::Fill)
-                        .on_press(AgentMessage::Design(Message::Select(
-                            run.presentation.identity(index),
-                        ))),
-                );
-            }
-            cards
-                .push(
-                    button("Activity window")
-                        .style(button::text)
-                        .on_press(AgentMessage::Focus),
-                )
-                .into()
-        }
-        Status::Orbit => column![
-            text("○  ●  ○").size(13),
+        Status::Spotlight => {
+            let (finished, total) = trace.progress();
             button(
-                text(format!("Agent\n{phase}\n{} activities", run.activity.len()))
-                    .size(12)
-                    .style(heading_style)
+                column![
+                    text(trace.current_label(phase))
+                        .size(13)
+                        .style(heading_style),
+                    text(format!(
+                        "{finished}/{total} steps · {}",
+                        trace.elapsed_label()
+                    ))
+                    .size(11),
+                ]
+                .spacing(2),
             )
             .style(button::secondary)
-            .on_press(toggle()),
-            text("○  ○  ○").size(13),
-        ]
-        .align_x(Alignment::Center)
-        .spacing(2)
-        .into(),
+            .on_press(toggle())
+            .into()
+        }
+        Status::Toasts => {
+            let (_, total) = trace.progress();
+            let mut cards = column![
+                button(
+                    text(format!("Agent · {phase} · {total} steps"))
+                        .size(12)
+                        .style(heading_style)
+                )
+                .style(button::secondary)
+                .on_press(toggle()),
+            ]
+            .spacing(5);
+            let limit = if trace.waiting { 3 } else { 4 };
+            let recent: Vec<_> = run
+                .presentation
+                .status_events
+                .recent(trace.now)
+                .rev()
+                .take(limit)
+                .collect();
+            for (notice, left) in recent.into_iter().rev() {
+                let title = match notice {
+                    Notice::Step(id) => {
+                        let Some(step) = trace.step(id) else { continue };
+                        let title =
+                            history::summary(step.command.as_deref().unwrap_or(&step.title));
+                        button(text(title).size(12))
+                            .on_press(AgentMessage::Design(Message::SelectStep(id)))
+                    }
+                    Notice::Answer => {
+                        button(text(history::summary(trace.answer)).size(12)).on_press(toggle())
+                    }
+                };
+                let card = column![
+                    title.style(button::secondary).width(Length::Fill),
+                    (!trace.reduced_motion).then(|| progress_bar(
+                        0.0..=TOAST_LIFETIME.as_secs_f32(),
+                        left.as_secs_f32()
+                    )
+                    .girth(2)),
+                ];
+                cards = cards.push(card.width(Length::Fill).max_width(320));
+            }
+            if trace.waiting {
+                cards = cards.push(
+                    column![text(trace.current_label(phase)).size(12), controls()].spacing(4),
+                );
+            }
+            cards.into()
+        }
+        Status::Orbit => {
+            let (finished, total) = trace.progress();
+            let fraction = if matches!(trace.tone, Tone::Finished | Tone::Stopped) {
+                1.0
+            } else if total == 0 {
+                0.0
+            } else {
+                finished as f32 / total as f32
+            };
+            let orbit = (trace.active && !trace.waiting).then(|| {
+                if trace.reduced_motion || trace.paused {
+                    0.0
+                } else {
+                    trace.animation_age.as_secs_f32() % 1.6 / 1.6 * TAU
+                }
+            });
+            let glyph = meter::graphic(
+                72.0,
+                Ring {
+                    fraction,
+                    orbit,
+                    tone: trace.tone,
+                },
+                column![
+                    text(format!("{finished}/{total}")).size(13),
+                    text(trace.elapsed_label()).size(11),
+                ]
+                .align_x(Alignment::Center)
+                .into(),
+            );
+            button(
+                row![
+                    glyph,
+                    text(trace.current_label(phase))
+                        .size(12)
+                        .style(heading_style)
+                ]
+                .spacing(5)
+                .align_y(Alignment::Center),
+            )
+            .style(button::secondary)
+            .on_press(toggle())
+            .into()
+        }
     };
     let drawer = run.presentation.drawer;
     let simple = matches!(status, Status::Steps | Status::Pill);
-    let mut panel = column![header, usage_label(run, palette)].spacing(5);
+    let action_menu = trace.run.and_then(super::actions::run_menu);
+    let mut panel = column![header, usage_label(run, palette), action_menu].spacing(5);
     if drawer && !simple {
-        let selected = run.presentation.selection(run.activity.len());
-        panel = panel.push(
-            scrollable(
-                text(
-                    run.activity
-                        .get(selected)
-                        .map_or("No activity yet.", String::as_str),
+        if matches!(status, Status::Spotlight | Status::Toasts | Status::Orbit) {
+            panel = panel.push(trace_drawer(
+                &trace,
+                run.presentation.selected_step,
+                124.into(),
+            ));
+        } else {
+            let selected = run.presentation.selection(run.activity.len());
+            panel = panel.push(
+                scrollable(
+                    text(
+                        run.activity
+                            .get(selected)
+                            .map_or("No activity yet.", String::as_str),
+                    )
+                    .size(13),
                 )
-                .size(13),
-            )
-            .height(140),
-        );
-        panel = panel.push(controls());
+                .height(140),
+            );
+        }
+        if status != Status::Toasts || !trace.waiting {
+            panel = panel.push(controls());
+        }
     }
     palette::panel(palette, container(panel).padding(5))
+}
+
+pub(super) fn step_list(run: &Run) -> Element<'_, AgentMessage> {
+    trace_drawer(
+        &Trace::live(run, Instant::now(), true),
+        run.presentation.selected_step,
+        Length::Fill,
+    )
+}
+
+fn trace_drawer<'a>(
+    trace: &Trace<'a>,
+    selected_id: Option<u64>,
+    height: Length,
+) -> Element<'a, AgentMessage> {
+    let selected = selected_id
+        .and_then(|id| trace.steps.iter().find(|step| step.id == id))
+        .or_else(|| trace.steps.last());
+    let mut rows = column![].spacing(3);
+    for step in trace.steps {
+        let label = history::summary(&step.title);
+        let chosen = selected.is_some_and(|selected| selected.id == step.id);
+        let select = AgentMessage::Design(Message::SelectStep(step.id));
+        rows = rows.push(
+            mouse_area(
+                button(text(label).size(12))
+                    .width(Length::Fill)
+                    .style(if chosen {
+                        button::secondary
+                    } else {
+                        button::text
+                    })
+                    .on_press(select.clone()),
+            )
+            .on_right_press(select),
+        );
+        if chosen && !step.detail.is_empty() && step.detail != step.title {
+            rows = rows.push(text(&step.detail).size(12));
+        }
+        if chosen && let Some(run) = trace.run {
+            rows = rows.push(super::actions::step_menu(run, step));
+        }
+    }
+    if trace.steps.is_empty() {
+        rows = rows.push(text("No steps yet.").size(12));
+    }
+    scrollable(rows).height(height).into()
 }
 
 fn usage_label(
@@ -352,4 +594,42 @@ fn usage_label(
         )
         .into(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_status_reports_the_running_command_and_settled_steps() {
+        let now = Instant::now();
+        let mut transcript = Transcript {
+            elapsed_ms: 61_000,
+            steps: vec![
+                Step {
+                    id: 1,
+                    title: "Read the directory".into(),
+                    state: StepState::Completed,
+                    ..Step::default()
+                },
+                Step {
+                    id: 2,
+                    title: "Check the volume".into(),
+                    command: Some("df -h".into()),
+                    state: StepState::Running,
+                    ..Step::default()
+                },
+            ],
+            ..Transcript::default()
+        };
+        let trace = Trace::sample(&transcript, now, now, false);
+        assert_eq!(trace.progress(), (1, 2));
+        assert_eq!(trace.current_label("Working"), "df -h");
+        assert_eq!(trace.elapsed_label(), "1:01");
+        transcript.steps[1].state = StepState::Failed;
+        transcript.state = State::Failed;
+        let trace = Trace::sample(&transcript, now, now, true);
+        assert_eq!(trace.progress(), (2, 2));
+        assert_eq!(trace.current_label("Failed"), "Failed");
+    }
 }

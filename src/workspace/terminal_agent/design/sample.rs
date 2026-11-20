@@ -1,6 +1,7 @@
 //! Renders example activity through the same presenters as a terminal run.
 
 use std::collections::VecDeque;
+use std::time::Instant;
 
 use iced::widget::{button, column, container, row, text};
 use iced::{Element, Length, Size, window};
@@ -64,6 +65,8 @@ impl std::fmt::Display for Grid {
 pub(in crate::workspace) struct Sample {
     id: window::Id,
     entries: VecDeque<String>,
+    transcript: inline::Transcript,
+    started: Instant,
     presentation: Presentation,
     pub(in crate::workspace) grid: Grid,
 }
@@ -73,6 +76,8 @@ impl Default for Sample {
         Self {
             id: window::Id::unique(),
             entries: VecDeque::new(),
+            transcript: inline::Transcript::default(),
+            started: Instant::now(),
             presentation: Presentation::default(),
             grid: Grid::default(),
         }
@@ -87,6 +92,7 @@ pub(in crate::workspace) struct View {
     pub(in crate::workspace) approval: Option<&'static str>,
     pub(in crate::workspace) status_visible: bool,
     pub(in crate::workspace) reduced_motion: bool,
+    pub(in crate::workspace) countdown: Option<(Instant, u8)>,
 }
 
 impl Sample {
@@ -98,6 +104,9 @@ impl Sample {
     }
 
     pub(in crate::workspace) fn sync(&mut self, transcript: &inline::Transcript) {
+        self.transcript.clone_from(transcript);
+        self.presentation
+            .sync_status(transcript, transcript.state.finished(), Instant::now());
         self.entries = transcript
             .steps
             .iter()
@@ -123,6 +132,10 @@ impl Sample {
         }
     }
 
+    pub(in crate::workspace) fn has_live_toasts(&self, now: Instant) -> bool {
+        self.presentation.status_events.recent(now).next().is_some()
+    }
+
     pub(in crate::workspace) fn interact(&mut self, action: Action) {
         match action {
             Action::Detail(action) => self.presentation.update(action, self.entries.len()),
@@ -141,6 +154,7 @@ impl Sample {
     ) -> Element<'a, Desktop> {
         let forward = move |message: AgentMessage| map(message.into());
         let layout = view.layout;
+        let now = Instant::now();
         let fonts = super::super::font::Sizes::default();
         let activity = history::Activity {
             activity: &self.entries,
@@ -203,11 +217,23 @@ impl Sample {
             Some(adaptive_timeline(activity, view.phase.0, controls(), None).map(forward))
         } else {
             Some(
-                status::render(activity, view.phase, false, status_kind, None, controls)
-                    .map(forward),
+                status::render(
+                    activity,
+                    view.phase,
+                    status::Trace::sample(&self.transcript, self.started, now, view.reduced_motion),
+                    status_kind,
+                    None,
+                    controls,
+                )
+                .map(forward),
             )
         };
         let side_width = view.dock.side_width(260.0);
+        let terminal = if layout.arrangement == Arrangement::Adaptive {
+            status::adaptive_countdown(terminal, view.countdown, now, view.reduced_motion, None)
+        } else {
+            terminal
+        };
         let terminal = compose(
             terminal,
             history_position.map(|_| history_panel().map(forward)),

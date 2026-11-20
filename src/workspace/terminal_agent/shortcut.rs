@@ -1083,17 +1083,6 @@ while ($null -ne ($line = [Console]::ReadLine())) {
     fn agent_shortcut_tab_reads_masked_history_and_discards_stale_results() {
         use crate::ai_manager::Configuration;
         use crate::snippets::tests::Profile;
-        use iced::futures::{StreamExt, executor::block_on};
-
-        fn loaded(task: Task<Desktop>) -> Desktop {
-            let mut stream = iced_runtime::task::into_stream(task).expect("history read");
-            let Some(iced_runtime::Action::Output(message @ Desktop::AgentShortcut(_))) =
-                block_on(stream.next())
-            else {
-                panic!("missing shortcut history response");
-            };
-            message
-        }
 
         let profile = Profile::new();
         let root = profile.0.canonicalize().unwrap();
@@ -1116,7 +1105,7 @@ while ($null -ne ($line = [Console]::ReadLine())) {
         .unwrap();
 
         fixture.type_text("agent-ask ");
-        let result = loaded(fixture.press(Named::Tab));
+        let result = shortcut_history_message(fixture.press(Named::Tab));
         let _ = fixture.workspace.update(result);
         assert_history_resize_messages(&fixture);
         fixture.enter();
@@ -1124,7 +1113,7 @@ while ($null -ne ($line = [Console]::ReadLine())) {
         assert!(fixture.workspace.terminal_agents.runs.is_empty());
         let _ = fixture.press(Named::Escape);
         fixture.type_text("agent ");
-        let result = loaded(fixture.press(Named::Tab));
+        let result = shortcut_history_message(fixture.press(Named::Tab));
         fixture.session().send(b"new-prompt\r".to_vec()).unwrap();
         fixture.wait_for_prompt("line=new-prompt");
         let _ = fixture.workspace.update(result);
@@ -1141,6 +1130,101 @@ while ($null -ne ($line = [Console]::ReadLine())) {
         assert!(iced_runtime::task::into_stream(fixture.press(Named::Tab)).is_none());
         fixture.enter();
         assert_eq!(fixture.draft().line.text(), "agent ");
+        assert!(fixture.workspace.terminal_agents.runs.is_empty());
+    }
+
+    fn shortcut_history_message(task: Task<Desktop>) -> Desktop {
+        use iced::futures::{StreamExt, executor::block_on};
+
+        let mut stream = iced_runtime::task::into_stream(task).expect("history task");
+        let Some(iced_runtime::Action::Output(message @ Desktop::AgentShortcut(_))) =
+            block_on(stream.next())
+        else {
+            panic!("missing shortcut history response");
+        };
+        message
+    }
+
+    #[test]
+    fn terminal_history_removes_one_entry_and_requires_fresh_confirmation_to_clear() {
+        use crate::ai_manager::Configuration;
+        use crate::snippets::tests::Profile;
+        use crate::terminal_agent::history as storage;
+
+        let profile = Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        let mut fixture = Fixture::new();
+        fixture
+            .workspace
+            .ai_configuration()
+            .unwrap()
+            .save_fixture_at(&root, &Configuration::default())
+            .unwrap();
+        fixture
+            .workspace
+            .set_test_ai_configuration(Configuration::load_fixture_from(&root).unwrap());
+        let save =
+            |prompt: &str| storage::remember(&root, prompt.into(), Mode::Ask, false).unwrap();
+        let saved = || {
+            storage::list(&root, false)
+                .unwrap()
+                .entries
+                .into_iter()
+                .map(|entry| entry.goal)
+                .collect::<Vec<_>>()
+        };
+        save("A multiline\nprompt");
+        save("Keep this prompt");
+        save("Remove this prompt");
+        fixture.type_text("agent-ask ");
+        let load = shortcut_history_message(fixture.press(Named::Tab));
+        let Desktop::AgentShortcut(Message::Loaded(first, _)) = &load else {
+            panic!("expected history")
+        };
+        let first = *first;
+        let _ = fixture.workspace.update(load);
+        let _ = fixture
+            .workspace
+            .update(Desktop::AgentShortcut(Message::ConfirmClear(first)));
+        assert_eq!(saved().len(), 3);
+
+        let delete = shortcut_history_message(fixture.press(Named::Delete));
+        let updated = shortcut_history_message(fixture.workspace.update(delete));
+        let Desktop::AgentShortcut(Message::Loaded(current, _)) = &updated else {
+            panic!("expected history")
+        };
+        let current = *current;
+        let _ = fixture.workspace.update(updated);
+        assert_eq!(saved(), ["Keep this prompt", "A multiline\nprompt"]);
+        let _ = fixture
+            .workspace
+            .update(Desktop::AgentShortcut(Message::Choose(first, 0)));
+        assert_eq!(fixture.draft().line.text(), "agent-ask ");
+
+        let clear = |ticket| Desktop::AgentShortcut(Message::Clear(ticket, true));
+        let confirm = |ticket| Desktop::AgentShortcut(Message::ConfirmClear(ticket));
+        let _ = fixture.workspace.update(clear(current));
+        let _ = fixture.press(Named::Escape);
+        let _ = fixture.workspace.update(confirm(current));
+        assert_eq!(saved().len(), 2);
+
+        let _ = fixture.workspace.update(clear(current));
+        save("Added elsewhere while confirming");
+        let updated = shortcut_history_message(fixture.workspace.update(confirm(current)));
+        let Desktop::AgentShortcut(Message::Loaded(reloaded, _)) = &updated else {
+            panic!("expected refreshed history")
+        };
+        let reloaded = *reloaded;
+        let _ = fixture.workspace.update(updated);
+        assert_eq!(saved().len(), 3);
+        let _ = fixture.workspace.update(confirm(reloaded));
+        assert_eq!(saved().len(), 3);
+
+        let _ = fixture.workspace.update(clear(reloaded));
+        let updated = shortcut_history_message(fixture.workspace.update(confirm(reloaded)));
+        let _ = fixture.workspace.update(updated);
+        assert!(saved().is_empty());
+        assert_eq!(fixture.draft().line.text(), "agent-ask ");
         assert!(fixture.workspace.terminal_agents.runs.is_empty());
     }
 

@@ -38,6 +38,10 @@ pub(super) struct History {
 }
 
 impl History {
+    pub(super) fn status_transcript(&self) -> &Transcript {
+        &self.transcript
+    }
+
     fn new(goal: String) -> Self {
         let now = Instant::now();
         Self {
@@ -128,6 +132,12 @@ impl History {
 impl Run {
     pub(super) fn agent_history_elapsed_ms(&self) -> Option<u64> {
         u64::try_from(self.inline.as_ref()?.started.elapsed().as_millis()).ok()
+    }
+
+    pub(super) fn status_transcript(&self) -> Option<(&Transcript, Instant)> {
+        self.inline
+            .as_ref()
+            .map(|history| (&history.transcript, history.started))
     }
 
     pub(super) fn initialize_inline(&mut self) {

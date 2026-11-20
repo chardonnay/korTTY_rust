@@ -264,6 +264,7 @@ pub enum Message {
         crate::session::inline_history::Key,
     ),
     AgentShortcut(terminal_agent::shortcut::Message),
+    AgentSpotlight(terminal_agent::spotlight::Message),
     AsciiArt(window::Id, ascii_art::Message),
     OpenEditor(window::Id),
     Editor(window::Id, editor_window::Message),
@@ -1487,6 +1488,7 @@ impl Workspace {
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         self.revalidate_native_file_drag();
         self.revalidate_agent_cursor();
+        self.revalidate_agent_spotlights();
         self.revalidate_agent_chat_handoffs();
         self.revalidate_agent_journal_synchronizations();
         self.revalidate_private_agent_chats();
@@ -1976,6 +1978,7 @@ impl Workspace {
             Message::AgentCursor(action) => return self.update_agent_cursor(action),
             Message::AgentInline(binding, key) => return self.update_agent_inline(binding, key),
             Message::AgentShortcut(action) => return self.update_agent_shortcut(action),
+            Message::AgentSpotlight(action) => return self.update_agent_spotlight(action),
             Message::AsciiArt(id, message) => return self.update_ascii_art(id, message),
             Message::Diagram(id, diagram_window::Message::Close) => return self.close_window(id),
             Message::Diagram(id, diagram_window::Message::SnippetAppearance(edit)) => {
@@ -5894,6 +5897,9 @@ impl Workspace {
         if key == Key::Named(Named::Escape) && self.dismiss_journal_dock_screenshot(id) {
             return Task::none();
         }
+        if let Some(task) = self.agent_spotlight_key(id, &key, modifiers) {
+            return task;
+        }
         let focused_ibm_kind = self
             .focused_session(id)
             .and_then(|pane| pane.frame.ibm.as_ref().map(|ibm| ibm.kind));
@@ -7135,7 +7141,8 @@ impl Workspace {
                     terminal_view::cell_size(font_size, font),
                     !self.window_settings.agent_animations(),
                 );
-                if let Some(draft) = session_state.agent_shortcut_preview(id, tab.incognito, bounds)
+                let view = if let Some(draft) =
+                    session_state.agent_shortcut_preview(id, tab.incognito, bounds)
                 {
                     iced::widget::stack![
                         view,
@@ -7148,7 +7155,8 @@ impl Workspace {
                     .into()
                 } else {
                     view
-                }
+                };
+                self.agent_spotlight_view(id, session_id, view)
             })
             .into();
             pane_grid::Content::new(self.with_restored_output(session_id, view)).title_bar(bar)
