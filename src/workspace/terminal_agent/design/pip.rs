@@ -144,6 +144,9 @@ fn body<'a>(
             }
             content = content.push(tabs.wrap());
         }
+        if let Some(picker) = state.finished_run_picker(run) {
+            content = content.push(picker);
+        }
         // There is only one presenter for the selected history. Status stays outside PiP.
         content = content
             .push(super::history_with_steps(run, palette))

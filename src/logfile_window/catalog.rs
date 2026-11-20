@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Read};
@@ -542,6 +542,22 @@ pub struct Report {
 #[serde(default, deny_unknown_fields)]
 struct Preferences {
     folders: BTreeSet<PathBuf>,
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    logger_folders: BTreeSet<PathBuf>,
+}
+
+impl Preferences {
+    fn valid(&self) -> bool {
+        self.folders
+            .union(&self.logger_folders)
+            .take(MAX_FOLDERS + 1)
+            .count()
+            <= MAX_FOLDERS
+            && self
+                .folders
+                .union(&self.logger_folders)
+                .all(|folder| check_path(folder).is_ok())
+    }
 }
 
 fn load(path: &Path) -> io::Result<Preferences> {
@@ -549,18 +565,21 @@ fn load(path: &Path) -> io::Result<Preferences> {
         return Ok(Preferences::default());
     };
     let prefs: Preferences = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-    if prefs.folders.len() > MAX_FOLDERS
-        || prefs
-            .folders
-            .iter()
-            .any(|folder| check_path(folder).is_err())
-    {
+    if !prefs.valid() {
         return Err(invalid("Invalid logfile folder settings"));
     }
     Ok(prefs)
 }
 
 pub fn add_folder(root: &Path, path: &Path) -> io::Result<()> {
+    remember_folder(root, path, false)
+}
+
+pub(crate) fn remember_logger_folder(root: &Path, path: &Path) -> io::Result<()> {
+    remember_folder(root, path, true)
+}
+
+fn remember_folder(root: &Path, path: &Path, logger: bool) -> io::Result<()> {
     check_path(path)?;
     let path = path.canonicalize()?;
     if !path.is_dir() {
@@ -571,8 +590,15 @@ pub fn add_folder(root: &Path, path: &Path) -> io::Result<()> {
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     let mut prefs = load(&settings)?;
-    prefs.folders.insert(path);
-    if prefs.folders.len() > MAX_FOLDERS {
+    let folders = if logger {
+        &mut prefs.logger_folders
+    } else {
+        &mut prefs.folders
+    };
+    if !folders.insert(path) {
+        return Ok(());
+    }
+    if !prefs.valid() {
         return Err(invalid(
             "The logfile manager supports up to 32 additional folders",
         ));
@@ -580,10 +606,25 @@ pub fn add_folder(root: &Path, path: &Path) -> io::Result<()> {
     save_folders(&settings, &prefs)
 }
 
+fn same_folder(path: &Path, canonical: &Path) -> bool {
+    path == canonical || path.canonicalize().is_ok_and(|path| path == canonical)
+}
+
+fn configured_folders(root: &Path) -> io::Result<BTreeSet<PathBuf>> {
+    let store = crate::connection_store::Store::open(profile::connections_path_at(root))?;
+    Ok(store
+        .connections()
+        .iter()
+        .filter_map(|connection| connection.logging.custom_folder())
+        .map(Path::to_path_buf)
+        .collect())
+}
+
 pub(super) fn forget_folder(root: &Path, folder: &Path) -> io::Result<()> {
     check_path(folder)?;
+    let canonical = folder.canonicalize().unwrap_or_else(|_| folder.to_owned());
     let default = root.join("terminal-logs");
-    if folder == default || default.canonicalize().is_ok_and(|path| path == folder) {
+    if same_folder(&default, &canonical) {
         return Err(invalid("The default logfile folder cannot be forgotten"));
     }
     let settings = root.join("terminal-log-folders.json");
@@ -591,13 +632,20 @@ pub(super) fn forget_folder(root: &Path, folder: &Path) -> io::Result<()> {
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     let mut prefs = load(&settings)?;
+    if prefs
+        .logger_folders
+        .iter()
+        .any(|path| same_folder(path, &canonical))
+        || configured_folders(root)?
+            .iter()
+            .any(|path| same_folder(path, &canonical))
+    {
+        return Err(invalid(
+            "A saved connection or terminal logger also lists this folder",
+        ));
+    }
     let previous = prefs.folders.len();
-    prefs.folders.retain(|path| {
-        path != folder
-            && !path
-                .canonicalize()
-                .is_ok_and(|canonical| canonical == folder)
-    });
+    prefs.folders.retain(|path| !same_folder(path, &canonical));
     if previous == prefs.folders.len() {
         return Err(invalid(
             "This logfile folder is no longer in the additional folder list",
@@ -681,30 +729,38 @@ pub(crate) fn expire_owned_archive(
 }
 
 pub fn scan(root: &Path, cancelled: impl Fn() -> bool) -> io::Result<Report> {
-    let mut folders = load(&root.join("terminal-log-folders.json"))?.folders;
-    let default = root.join("terminal-logs");
-    let default_canonical = default.canonicalize().ok();
-    folders.insert(default.clone());
+    let prefs = load(&root.join("terminal-log-folders.json"))?;
+    let configured = configured_folders(root);
     let now = SystemTime::now();
     let mut report = Report {
         entries: Vec::new(),
-        skipped: 0,
+        skipped: usize::from(configured.is_err()),
         bounded: false,
     };
     let mut inspected = 0;
-    let mut seen = BTreeSet::new();
-    'folders: for folder in folders {
-        let default_origin = folder == default;
-        let folder = match folder.canonicalize() {
-            Ok(folder) if seen.insert(folder.clone()) => folder,
-            Ok(_) => continue,
+    let known_only = configured.is_err();
+    let mut folders = BTreeMap::new();
+    let candidates = std::iter::once(root.join("terminal-logs"))
+        .chain(configured.unwrap_or_default())
+        .chain(prefs.logger_folders)
+        .map(|path| (path, false))
+        .chain(prefs.folders.into_iter().map(|path| (path, !known_only)));
+    for (path, manual) in candidates {
+        check_cancel(&cancelled)?;
+        match path.canonicalize() {
+            Ok(folder) => {
+                folders
+                    .entry(folder)
+                    .and_modify(|existing| *existing &= manual)
+                    .or_insert(manual);
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(_) => {
                 report.skipped += 1;
-                continue;
             }
-        };
-        let manual_folder = !default_origin && default_canonical.as_ref() != Some(&folder);
+        }
+    }
+    'folders: for (folder, manual_folder) in folders {
         let directory = match fs::read_dir(&folder) {
             Ok(directory) => directory,
             Err(_) => {

@@ -1489,6 +1489,12 @@ impl Workspace {
         self.revalidate_native_file_drag();
         self.revalidate_agent_cursor();
         self.revalidate_agent_spotlights();
+        let finished_runs = self.prune_finished_agent_runs();
+        let task = if finished_runs.units() > 0 {
+            Task::batch([task, finished_runs])
+        } else {
+            task
+        };
         self.revalidate_agent_chat_handoffs();
         self.revalidate_agent_journal_synchronizations();
         self.revalidate_private_agent_chats();

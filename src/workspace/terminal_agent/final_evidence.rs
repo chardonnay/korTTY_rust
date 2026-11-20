@@ -18,6 +18,32 @@ pub(super) struct Evidence {
 }
 
 impl Evidence {
+    pub(super) fn completed_snapshot(&self, redactor: &Redactor) -> Result<Self, String> {
+        let results = self
+            .results
+            .iter()
+            .map(|entry| {
+                let mut command = entry.command.clone();
+                command.command = mask::prompt(redactor, &command.command)?;
+                command.purpose = mask::prompt(redactor, &command.purpose)?;
+                let output = entry
+                    .output
+                    .as_ref()
+                    .map(|output| output.masked(redactor))
+                    .transpose()?;
+                Ok(ResultEntry {
+                    command,
+                    exit_status: entry.exit_status,
+                    output,
+                })
+            })
+            .collect::<Result<_, String>>()?;
+        Ok(Self {
+            results,
+            ..Self::default()
+        })
+    }
+
     pub(super) fn is_empty(&self) -> bool {
         self.results.is_empty()
     }
@@ -125,18 +151,28 @@ struct Output {
 }
 
 impl Output {
-    fn input(&self, redactor: &Redactor) -> Result<Value, String> {
+    fn masked(&self, redactor: &Redactor) -> Result<Self, String> {
         // A password learned after an earlier command must be masked before
         // taking a tail or escaping quotes and backslashes for JSON.
         let stdout = Zeroizing::new(mask::prompt(redactor, &self.stdout)?);
         let stderr = Zeroizing::new(mask::prompt(redactor, &self.stderr)?);
         let (stdout, stdout_truncated) = tail(&stdout, self.stdout_truncated);
         let (stderr, stderr_truncated) = tail(&stderr, self.stderr_truncated);
+        Ok(Self {
+            stdout: Zeroizing::new(stdout.to_owned()),
+            stderr: Zeroizing::new(stderr.to_owned()),
+            stdout_truncated,
+            stderr_truncated,
+        })
+    }
+
+    fn input(&self, redactor: &Redactor) -> Result<Value, String> {
+        let masked = self.masked(redactor)?;
         Ok(json!({
-            "stdoutTail": stdout,
-            "stderrTail": stderr,
-            "stdoutTruncated": stdout_truncated,
-            "stderrTruncated": stderr_truncated,
+            "stdoutTail": masked.stdout.as_str(),
+            "stderrTail": masked.stderr.as_str(),
+            "stdoutTruncated": masked.stdout_truncated,
+            "stderrTruncated": masked.stderr_truncated,
         }))
     }
 }

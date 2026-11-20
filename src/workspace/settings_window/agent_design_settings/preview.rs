@@ -278,10 +278,21 @@ pub(super) fn view(
     let countdown = deadline
         .filter(|&deadline| now < deadline && layout.arrangement == Arrangement::Adaptive)
         .map(|deadline| (deadline, auto_hide_seconds));
+    let toasts =
+        layout.status == Status::Toasts && demo.sample.has_live_toasts(now, reduced_motion);
+    let spotlight =
+        !reduced_motion && demo.active() && demo.sample.has_spotlight_preview(now, layout);
     let status_frame = (countdown.is_some()
         || layout.status == Status::Orbit && demo.active() && demo.playing && !reduced_motion
-        || layout.status == Status::Toasts && demo.sample.has_live_toasts(now))
-    .then(|| now + Duration::from_millis(100));
+        || toasts
+        || spotlight)
+        .then(|| {
+            now + Duration::from_millis(if spotlight || toasts && !reduced_motion {
+                16
+            } else {
+                100
+            })
+        });
     let preview = SampleView {
         layout,
         dock,

@@ -2,10 +2,11 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Instant;
 
 use iced::keyboard::{Key, Modifiers, key::Named};
 use iced::widget::{
-    Id, button, column, container, opaque, operation, pick_list, row, stack, text, text_input,
+    Id, button, column, container, operation, pick_list, row, stack, text, text_input,
 };
 use iced::{Alignment, Element, Length, Task, window};
 
@@ -16,6 +17,8 @@ use super::{
     ClipboardPolicy, Desktop, LiveBinding, MAX_GOAL, MAX_RUNS, Mode, ProfileChoice, Run, Workspace,
     history, palette,
 };
+
+mod motion;
 
 #[derive(Clone)]
 pub struct Message {
@@ -68,6 +71,60 @@ pub(super) struct Composer {
     profile: Choice,
     choosing_profile: bool,
     notice: Option<String>,
+    opened: Instant,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct Submission {
+    owner: window::Id,
+    tab: u64,
+    source: LiveBinding,
+}
+
+pub(super) struct Departure {
+    submission: Submission,
+    started: Instant,
+    into_pill: bool,
+}
+
+impl Departure {
+    fn frame(&self, now: Instant) -> Option<motion::Frame> {
+        motion::Frame::submitted(now.saturating_duration_since(self.started), self.into_pill)
+    }
+}
+
+fn submitted_card<'a>(prompt: &'a str) -> Element<'a, Desktop> {
+    container(column![text("Ask in Spotlight").size(15), text(prompt).size(13),].spacing(7))
+        .height(104)
+        .into()
+}
+
+pub(super) fn preview_frame(age: std::time::Duration) -> Option<motion::Frame> {
+    let hold = std::time::Duration::from_millis(320);
+    if age < hold {
+        Some(motion::Frame::opening(age))
+    } else {
+        motion::Frame::submitted(age - hold, true)
+    }
+}
+
+pub(super) fn preview<'a>(
+    terminal: Element<'a, Desktop>,
+    frame: motion::Frame,
+    prompt: &'a str,
+) -> Element<'a, Desktop> {
+    let card = palette::faded_panel(
+        None,
+        container(submitted_card(prompt))
+            .width(Length::Fill)
+            .max_width(460)
+            .padding(12),
+        frame.opacity,
+    );
+    stack![terminal, motion::layer(card, frame, false)]
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
 }
 
 impl Composer {
@@ -123,10 +180,20 @@ impl Composer {
         operation::move_cursor_to_end(self.field.clone())
     }
 
-    fn view(&self, owner: window::Id) -> Element<'_, Desktop> {
+    fn view(&self, owner: window::Id, opacity: f32) -> Element<'_, Desktop> {
         let field = self.field.clone();
         let input = text_input("Ask the terminal agent…", &self.prompt)
             .id(field.clone())
+            .style(move |theme, status| {
+                let mut style = text_input::default(theme, status);
+                style.background = style.background.scale_alpha(opacity);
+                style.border.color = style.border.color.scale_alpha(opacity);
+                style.icon = style.icon.scale_alpha(opacity);
+                style.placeholder = style.placeholder.scale_alpha(opacity);
+                style.value = style.value.scale_alpha(opacity);
+                style.selection = style.selection.scale_alpha(opacity);
+                style
+            })
             .on_input(move |value| {
                 Desktop::AgentSpotlight(Message {
                     owner,
@@ -154,16 +221,35 @@ impl Composer {
                 })
             },
         )
-        .width(Length::Fill);
+        .width(Length::Fill)
+        .style(move |theme, status| {
+            let mut style = pick_list::default(theme, status);
+            style.background = style.background.scale_alpha(opacity);
+            style.border.color = style.border.color.scale_alpha(opacity);
+            style.text_color = style.text_color.scale_alpha(opacity);
+            style.handle_color = style.handle_color.scale_alpha(opacity);
+            style.placeholder_color = style.placeholder_color.scale_alpha(opacity);
+            style
+        });
+        let button_style = move |theme: &iced::Theme, status| {
+            let mut style = button::primary(theme, status);
+            style.background = style.background.map(|bg| bg.scale_alpha(opacity));
+            style.border.color = style.border.color.scale_alpha(opacity);
+            style.shadow.color = style.shadow.color.scale_alpha(opacity);
+            style.text_color = style.text_color.scale_alpha(opacity);
+            style
+        };
         column![
             text("Ask in Spotlight").size(15),
             input,
             profiles,
             row![
-                button("Start").on_press_maybe(
+                button("Start").style(button_style).on_press_maybe(
                     (!self.prompt.trim().is_empty()).then(|| self.message(owner, Event::Submit))
                 ),
-                button("Cancel").on_press(self.message(owner, Event::Close)),
+                button("Cancel")
+                    .style(button_style)
+                    .on_press(self.message(owner, Event::Close)),
                 text(if self.choosing_profile {
                     "↑/↓ Choose profile · Tab Prompt"
                 } else if self.history.is_empty() {
@@ -184,13 +270,11 @@ impl Composer {
 }
 
 impl Workspace {
-    fn agent_spotlight_source(&self, owner: window::Id) -> Option<(u64, LiveBinding)> {
+    fn spotlight_binding(&self, owner: window::Id) -> Option<(u64, LiveBinding)> {
         let tab = self.windows.get(&owner)?.tab()?;
         let session = tab.focused_session()?;
         let pane = self.sessions.get(&session)?;
         if self.exiting
-            || self.terminal_agents.runs.len() >= MAX_RUNS
-            || self.terminal_agents.owns_session(session)
             || !self.current_targets(owner, tab.id, &[session])
             || self.hosted_close_prompt(owner).is_some()
             || self.project_panel_open(owner)
@@ -208,6 +292,13 @@ impl Workspace {
                 private: tab.incognito,
             },
         ))
+    }
+
+    fn agent_spotlight_source(&self, owner: window::Id) -> Option<(u64, LiveBinding)> {
+        let (tab, source) = self.spotlight_binding(owner)?;
+        (self.terminal_agents.runs.len() < MAX_RUNS
+            && !self.terminal_agents.owns_session(source.session))
+        .then_some((tab, source))
     }
 
     pub(in crate::workspace) fn agent_spotlight_available(&self, owner: window::Id) -> bool {
@@ -250,6 +341,7 @@ impl Workspace {
         let mut profiles = vec![Choice::PaneDefault];
         profiles.extend(available.into_iter().map(Choice::Profile));
         let field = Id::unique();
+        self.terminal_agents.spotlight_exits.remove(&owner);
         self.terminal_agents.spotlights.insert(
             owner,
             Composer {
@@ -264,6 +356,7 @@ impl Workspace {
                 profile: Choice::PaneDefault,
                 choosing_profile: false,
                 notice: None,
+                opened: Instant::now(),
             },
         );
         let focus = crate::settings_search::focus_if_present(field.clone());
@@ -295,6 +388,48 @@ impl Workspace {
             });
             self.terminal_agents.spotlights = composers;
         }
+        if !self.terminal_agents.spotlight_exits.is_empty() {
+            let now = Instant::now();
+            let mut exits = std::mem::take(&mut self.terminal_agents.spotlight_exits);
+            if self.window_settings.agent_animations() {
+                exits.retain(|&owner, departure| {
+                    let submission = departure.submission;
+                    departure.frame(now).is_some()
+                        && self.spotlight_binding(owner)
+                            == Some((submission.tab, submission.source))
+                });
+                self.terminal_agents.spotlight_exits = exits;
+            }
+        }
+    }
+
+    pub(super) fn show_spotlight_departure(&mut self, submission: Submission, into_pill: bool) {
+        if self.window_settings.agent_animations()
+            && self.spotlight_binding(submission.owner) == Some((submission.tab, submission.source))
+            && !self
+                .terminal_agents
+                .spotlights
+                .contains_key(&submission.owner)
+        {
+            self.terminal_agents.spotlight_exits.insert(
+                submission.owner,
+                Departure {
+                    submission,
+                    started: Instant::now(),
+                    into_pill,
+                },
+            );
+        }
+    }
+
+    pub(super) fn spotlight_animating(&self, now: Instant) -> bool {
+        self.window_settings.agent_animations()
+            && (self
+                .terminal_agents
+                .spotlights
+                .values()
+                .any(|composer| now.saturating_duration_since(composer.opened) < motion::OPEN)
+                || !self.terminal_agents.spotlight_exits.is_empty())
     }
 
     pub(in crate::workspace) fn update_agent_spotlight(
@@ -342,13 +477,21 @@ impl Workspace {
                 return composer.browse(matches!(message.event, Event::Earlier));
             }
             Event::Submit if !composer.prompt.trim().is_empty() => {
-                let source = composer.source;
+                let submission = Submission {
+                    owner,
+                    tab: composer.tab,
+                    source: composer.source,
+                };
                 let profile = composer.profile.clone();
                 let prompt = composer.prompt.trim().to_owned();
-                match self.build_spotlight_run(source, &profile, prompt) {
-                    Ok(run) => {
+                match self.build_spotlight_run(submission.source, &profile, prompt) {
+                    Ok((mut run, direct)) => {
                         self.terminal_agents.spotlights.remove(&owner);
-                        return self.open_agent_result(owner, Ok(run));
+                        self.show_spotlight_departure(submission, false);
+                        if direct {
+                            run.spotlight_submission = Some(submission);
+                        }
+                        return self.open_agent_result(owner, Ok((run, direct)));
                     }
                     Err(error) => {
                         if let Some(composer) = self.terminal_agents.spotlights.get_mut(&owner) {
@@ -427,29 +570,45 @@ impl Workspace {
         session: crate::session::SessionId,
         terminal: Element<'a, Desktop>,
     ) -> Element<'a, Desktop> {
-        let Some(composer) = self
+        let now = Instant::now();
+        let animations = self.window_settings.agent_animations();
+        let (content, frame, interactive) = if let Some(composer) = self
             .terminal_agents
             .spotlights
             .get(&owner)
             .filter(|composer| composer.source.session == session)
-        else {
+        {
+            let age = if animations {
+                now.saturating_duration_since(composer.opened)
+            } else {
+                motion::OPEN
+            };
+            let frame = motion::Frame::opening(age);
+            (composer.view(owner, frame.opacity), frame, true)
+        } else if let Some(frame) = self
+            .terminal_agents
+            .spotlight_exits
+            .get(&owner)
+            .filter(|departure| animations && departure.submission.source.session == session)
+            .and_then(|departure| departure.frame(now))
+        {
+            (submitted_card("Prompt submitted"), frame, false)
+        } else {
             return terminal;
         };
         let theme = self.agent_panel_palette(self.pane_theme_id(session));
-        let card = palette::panel(
+        let card = palette::faded_panel(
             theme,
-            container(composer.view(owner))
+            container(content)
                 .width(Length::Fill)
                 .max_width(460)
                 .padding(12),
+            frame.opacity,
         );
-        stack![
-            terminal,
-            container(opaque(card)).center(Length::Fill).padding(8)
-        ]
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+        stack![terminal, motion::layer(card, frame, interactive)]
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 }
 

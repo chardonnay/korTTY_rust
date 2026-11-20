@@ -32,6 +32,7 @@ mod binding;
 mod cursor;
 pub(super) mod design;
 mod final_evidence;
+mod finished_runs;
 mod flow;
 pub(super) mod font;
 mod handoff;
@@ -267,6 +268,8 @@ struct Run {
     fonts: font::Sizes,
     presentation: design::Presentation,
     started_order: u64,
+    reopened_history: bool,
+    spotlight_submission: Option<spotlight::Submission>,
     chat_handoff_id: Option<String>,
     chat_follow_up: String,
     chat_handoff_dismissed: bool,
@@ -442,6 +445,8 @@ impl Run {
             fonts: font::Sizes::default(),
             presentation: design::Presentation::default(),
             started_order: 0,
+            reopened_history: false,
+            spotlight_submission: None,
             chat_handoff_id: None,
             chat_follow_up: String::new(),
             chat_handoff_dismissed: false,
@@ -630,6 +635,7 @@ impl Drop for Run {
 pub(super) struct State {
     runs: HashMap<window::Id, Run>,
     spotlights: HashMap<window::Id, spotlight::Composer>,
+    spotlight_exits: HashMap<window::Id, spotlight::Departure>,
     cursor_keys: u8,
     inline_details_held: bool,
     cursor_takeover: Option<cursor::Pending>,
@@ -638,6 +644,7 @@ pub(super) struct State {
     swarms: HashMap<window::Id, swarm::Group>,
     workflows: HashMap<window::Id, workflow::Dialog>,
     activity: activity_export::Archive,
+    finished_runs: finished_runs::Archive,
     chat_handoffs: VecDeque<handoff::Snapshot>,
     pending_chat_handoffs: HashMap<String, handoff::Pending>,
 }
@@ -715,6 +722,8 @@ impl State {
 
     pub(super) fn invalidate_session(&mut self, session: SessionId) {
         self.activity.remove_session(session);
+        self.finished_runs.remove_session(session);
+        self.presented_runs.remove(&session);
         for (&id, run) in self
             .runs
             .iter_mut()
@@ -1336,7 +1345,15 @@ impl Workspace {
         );
         let task = self.agent_action(id, &mut run, message);
         let started = start_requested && run.epoch != before_epoch && run.active();
+        let spotlight_submission = if start_requested {
+            run.spotlight_submission.take()
+        } else {
+            None
+        };
         if started {
+            if let Some(submission) = spotlight_submission {
+                self.show_spotlight_departure(submission, self.run_uses_spotlight_status(&run));
+            }
             self.terminal_agents.next_run_order =
                 self.terminal_agents.next_run_order.saturating_add(1);
             run.started_order = self.terminal_agents.next_run_order;
@@ -1364,6 +1381,7 @@ impl Workspace {
             run.presentation.sync_status(
                 history.status_transcript(),
                 run.phase.finished(),
+                run.awaiting_input(),
                 std::time::Instant::now(),
             );
         }
@@ -1390,6 +1408,7 @@ impl Workspace {
         {
             let detached = run.presentation.pip.detached.take();
             let workflow = self.close_run_workflow(id);
+            self.retain_finished_agent_run(id, &mut run);
             let closed = Task::batch([
                 self.close_placed_dialog(id),
                 detached.map_or_else(Task::none, |pip| self.close_placed_dialog(pip)),
@@ -1462,10 +1481,14 @@ impl Workspace {
         let detached = run.presentation.pip.detached.take();
         let workflow = self.close_run_workflow(id);
         if let Some(mut run) = self.terminal_agents.runs.remove(&id) {
+            let finished = run.phase.finished();
             if run.active() {
                 run.stop("Agent run cancelled.");
             }
             self.publish_agent_inline_history(&run);
+            if finished {
+                self.retain_finished_agent_run(id, &mut run);
+            }
         }
         let closed = Task::batch([
             self.close_placed_dialog(id),

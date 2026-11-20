@@ -24,6 +24,7 @@ mod presentation;
 mod runs;
 mod sample;
 mod status;
+mod toast;
 
 pub(crate) use activity::Change as ActivityChange;
 pub(in crate::workspace) use activity::Height;
@@ -34,7 +35,7 @@ pub(in crate::workspace) use placement::{
 };
 use presentation::Dock;
 pub(crate) use presentation::Message;
-pub(super) use presentation::Presentation;
+pub(super) use presentation::{Presentation, Usage};
 pub(in crate::workspace) use sample::{
     Action as SampleAction, Grid as SampleGrid, Sample, View as SampleView,
 };
@@ -350,34 +351,66 @@ fn pane_status(
 }
 
 impl Workspace {
+    pub(super) fn run_uses_spotlight_status(&self, run: &Run) -> bool {
+        if run.design.arrangement != Arrangement::Adaptive {
+            return run.design.status == Status::Spotlight;
+        }
+        run.binding
+            .live()
+            .ok()
+            .and_then(|source| self.sessions.get(&source.session))
+            .is_some_and(|pane| {
+                let screen = &pane.frame.screen;
+                run.presentation
+                    .dock
+                    .get()
+                    .choose(usize::from(screen.columns), usize::from(screen.rows))
+                    == Dock::Pill
+            })
+    }
+
     pub(in crate::workspace) fn agent_status_subscription(&self) -> Subscription<Desktop> {
         let seconds = self.window_settings.agent_status_auto_hide_seconds();
+        let reduced_motion = !self.window_settings.agent_animations();
         let now = Instant::now();
-        let waiting = !self.exiting
-            && self.terminal_agents.runs.values().any(|run| {
+        if self.exiting {
+            return Subscription::none();
+        }
+        let interval = self
+            .terminal_agents
+            .runs
+            .values()
+            .filter(|run| {
                 !run.swarm
                     && !run.closing
                     && (run.design.status != Status::Hidden
                         || run.design.arrangement == Arrangement::Adaptive)
                     && run.presentation.status_visibility.visible(seconds, now)
-                    && (run
+            })
+            .filter_map(|run| {
+                let toasts = run.design.status == Status::Toasts
+                    && run.presentation.status_events.ticking(now, reduced_motion);
+                if toasts && !reduced_motion {
+                    return Some(16);
+                }
+                (toasts
+                    || run
                         .presentation
                         .status_visibility
                         .deadline(seconds)
                         .is_some()
-                        || run.design.status == Status::Toasts
-                            && run.presentation.status_events.recent(now).next().is_some()
-                        || run.active()
-                            && (matches!(run.design.status, Status::Spotlight | Status::Orbit)
-                                || run.design.arrangement == Arrangement::Adaptive
-                                    && run.presentation.dock.get() == Dock::Pill))
-            });
-        if waiting {
-            crate::workspace::scheduler_access::desktop_clock(Duration::from_millis(100))
+                    || run.active()
+                        && (matches!(run.design.status, Status::Spotlight | Status::Orbit)
+                            || run.design.arrangement == Arrangement::Adaptive
+                                && run.presentation.dock.get() == Dock::Pill))
+                    .then_some(100)
+            })
+            .chain(self.spotlight_animating(now).then_some(16))
+            .min();
+        interval.map_or_else(Subscription::none, |millis| {
+            crate::workspace::scheduler_access::desktop_clock(Duration::from_millis(millis))
                 .map(|()| Desktop::AgentStatusClock)
-        } else {
-            Subscription::none()
-        }
+        })
     }
 
     fn agent_status_target(&self, owner: window::Id) -> Option<window::Id> {

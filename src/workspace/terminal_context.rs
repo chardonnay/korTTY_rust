@@ -116,6 +116,7 @@ pub enum Action {
     ContinueAgentChat,
     AgentRunItem(window::Id, super::terminal_agent::design::Action),
     ShowAgentRun(window::Id, u64, window::Id),
+    ShowFinishedAgentRun(u64, window::Id),
 }
 
 impl Action {
@@ -152,6 +153,7 @@ impl Action {
             Self::Ai(action) => action.label(),
             Self::AgentRunItem(_, action) => action.label(),
             Self::ShowAgentRun(..) => "Show Agent run",
+            Self::ShowFinishedAgentRun(..) => "Reopen finished Agent run",
             Self::ContinueAgentChat => "Continue Last Agent Run in Chat…",
         }
     }
@@ -388,6 +390,9 @@ impl Workspace {
                 current,
                 super::terminal_agent::Message::SelectPresentedRun(epoch, selected),
             ),
+            ShowFinishedAgentRun(stream, archived) => {
+                self.reopen_finished_agent_run(owner, session, stream, archived)
+            }
             AgentRunItem(run, action) => self
                 .update_terminal_agent(run, super::terminal_agent::Message::DesignAction(action)),
             Paste => self.update(Desktop::Paste(owner)),
@@ -759,6 +764,11 @@ impl Workspace {
                             Item(ShowAgentRun(current, epoch, selected))
                         }),
                 )
+                .chain(
+                    self.finished_agent_run_choices(session, pane.stream_generation)
+                        .into_iter()
+                        .map(|id| Item(ShowFinishedAgentRun(pane.stream_generation, id))),
+                )
                 .collect(),
         }
     }
@@ -788,6 +798,7 @@ impl Workspace {
                     .is_some()
                     || self.terminal_ai_available(pane, None)
                     || self.agent_chat_handoff_available(session)
+                    || self.terminal_context_agent_runs_available(session, pane.stream_generation)
             }
             Item(Agent(action)) => action
                 .agent_mode()
@@ -803,6 +814,12 @@ impl Workspace {
             Item(ShowAgentRun(current, epoch, selected)) => self
                 .alternate_agent_runs(session, pane.stream_generation)
                 .contains(&(current, epoch, selected)),
+            Item(ShowFinishedAgentRun(stream, selected)) => {
+                stream == pane.stream_generation
+                    && self
+                        .finished_agent_run_choices(session, stream)
+                        .contains(&selected)
+            }
             Item(ClearBuffer) => pane.frame.ibm.is_none() && !pane.frame.screen.alternate_screen,
             Item(Find) => pane.session.supports_search(),
             Item(Sftp) => self.remote_pane(session).is_some(),
@@ -832,6 +849,7 @@ impl Workspace {
             .terminal_agent_design_actions(session, stream)
             .is_empty()
             || !self.alternate_agent_runs(session, stream).is_empty()
+            || !self.finished_agent_run_choices(session, stream).is_empty()
     }
 
     pub(super) fn terminal_context_view<'a>(
@@ -886,6 +904,9 @@ impl Workspace {
             }
             let (label, child) = match entry {
                 Item(ShowAgentRun(_, _, selected)) => (self.agent_run_choice_label(selected), None),
+                Item(ShowFinishedAgentRun(_, selected)) => {
+                    (self.agent_run_choice_label(selected), None)
+                }
                 Item(action) => (action.label().to_owned(), None),
                 Branch(child) => (child.label().to_owned(), Some(child)),
                 Separator => continue,

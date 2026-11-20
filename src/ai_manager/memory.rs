@@ -424,6 +424,10 @@ impl State {
         )
     }
 
+    pub(super) fn has_search_controls(&self) -> bool {
+        self.can_read_files() && !self.reviewing_document()
+    }
+
     pub(super) fn find_open(&self) -> bool {
         self.can_find_markdown() && self.find.is_open()
     }
@@ -1061,7 +1065,13 @@ impl State {
         })
     }
 
-    pub(super) fn view(&self, cleanup_ai_available: bool) -> Element<'_, Message> {
+    pub(super) fn view(
+        &self,
+        cleanup_ai_available: bool,
+        reveal: &super::search::Reveal,
+    ) -> Element<'_, Message> {
+        use super::search::{Control::*, Setting};
+        let action = |control, button| reveal.action(Setting::Control(control), button);
         let environment_notice = (!prompt::environment_enabled()).then(|| {
             text("KORTTY_AI_MEMORY=off keeps personal memory out of AI requests for this session.")
                 .size(13)
@@ -1135,7 +1145,7 @@ impl State {
         let learning: Element<'_, Message> =
             if can_change_settings && self.policy.learning.is_none() {
                 pick_list(
-                    [Learning::Propose, Learning::Off],
+                    [self::Learning::Propose, self::Learning::Off],
                     Some(self.settings.learning),
                     Message::Learning,
                 )
@@ -1145,11 +1155,15 @@ impl State {
             };
         let bounds = self.budget_range();
         let budget_hint = format!("{}–{}", bounds.start(), bounds.end());
-        let tokens = text_input(&budget_hint, &self.token_input)
-            .on_input_maybe(
-                (can_change_settings && self.can_adjust_budget()).then_some(Message::Tokens),
-            )
-            .width(115);
+        let budget_field = Setting::Control(Budget);
+        let can_edit_budget = can_change_settings && self.can_adjust_budget();
+        let tokens = reveal.input(
+            budget_field,
+            can_edit_budget,
+            text_input(&budget_hint, &self.token_input)
+                .on_input_maybe(can_edit_budget.then_some(Message::Tokens))
+                .width(115),
+        );
         let budget = f32::from(self.effective_budget());
         let token_label = format!(
             "Approx. {} / {:.0} tokens in this file",
@@ -1170,7 +1184,7 @@ impl State {
             environment_notice,
             self.organization_rules(),
             text("Memory settings").size(19),
-            enabled,
+            reveal.wrap(Setting::Control(MemoryEnabled), enabled),
             self.imported_preferences.enabled.map(|enabled| row![
                 text(format!(
                     "Imported from Java: Memory {}",
@@ -1205,29 +1219,38 @@ impl State {
             ]
             .spacing(10)
             .wrap()),
-            row![
-                text("Learning").width(140),
-                learning,
-                self.policy
-                    .learning
-                    .map(|_| text("Managed by policy").size(13)),
-            ]
-            .spacing(10)
-            .align_y(Alignment::Center),
-            row![
-                text("Token budget").width(140),
-                tokens,
-                self.policy
-                    .max_tokens
-                    .map(|cap| text(format!("Policy limit: {cap} tokens")).size(13)),
-            ]
-            .spacing(10)
-            .align_y(Alignment::Center),
+            reveal.wrap(
+                Setting::Control(Learning),
+                row![
+                    text("Learning").width(140),
+                    learning,
+                    self.policy
+                        .learning
+                        .map(|_| text("Managed by policy").size(13)),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center)
+            ),
+            reveal.wrap(
+                budget_field,
+                row![
+                    text("Token budget").width(140),
+                    tokens,
+                    self.policy
+                        .max_tokens
+                        .map(|cap| text(format!("Policy limit: {cap} tokens")).size(13)),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center)
+            ),
             rule::horizontal(1),
             row![
                 text("Scope").width(85),
-                selector,
-                button("Reload").on_press_maybe((!self.pending).then_some(Message::Reload)),
+                reveal.wrap(Setting::Control(Scope), selector),
+                action(
+                    ReloadMemory,
+                    button("Reload").on_press_maybe((!self.pending).then_some(Message::Reload))
+                ),
             ]
             .spacing(10)
             .align_y(Alignment::Center),
@@ -1238,40 +1261,63 @@ impl State {
             .spacing(10)
             .align_y(Alignment::Center),
             row![
-                button("Entries")
-                    .style(if matches!(self.page, Page::Entries) {
-                        button::primary
-                    } else {
-                        button::secondary
-                    })
-                    .on_press(Message::Entries),
-                button("Markdown")
-                    .style(if matches!(self.page, Page::Markdown) {
-                        button::primary
-                    } else {
-                        button::secondary
-                    })
-                    .on_press_maybe(self.row_edit.is_none().then_some(Message::Markdown)),
-                button("Archive…").on_press_maybe(
-                    (!self.has_unsaved_document() && !self.pending).then_some(Message::ShowArchive)
+                action(
+                    Entries,
+                    button("Entries")
+                        .style(if matches!(self.page, Page::Entries) {
+                            button::primary
+                        } else {
+                            button::secondary
+                        })
+                        .on_press(Message::Entries)
                 ),
-                button("History…").on_press_maybe(
-                    (!self.has_unsaved_document() && !self.pending).then_some(Message::ShowHistory)
+                action(
+                    MemoryMarkdown,
+                    button("Markdown")
+                        .style(if matches!(self.page, Page::Markdown) {
+                            button::primary
+                        } else {
+                            button::secondary
+                        })
+                        .on_press_maybe(self.row_edit.is_none().then_some(Message::Markdown))
                 ),
-                button("Clean up…").on_press_maybe(can_edit.then_some(Message::ShowCleanup)),
-                button("Clear…").on_press_maybe(
-                    (can_edit && self.base.as_ref().is_some_and(|base| !base.text.is_empty()))
-                        .then_some(Message::Clear)
+                action(
+                    Archive,
+                    button("Archive…").on_press_maybe(
+                        (!self.has_unsaved_document() && !self.pending)
+                            .then_some(Message::ShowArchive)
+                    )
+                ),
+                action(
+                    History,
+                    button("History…").on_press_maybe(
+                        (!self.has_unsaved_document() && !self.pending)
+                            .then_some(Message::ShowHistory)
+                    )
+                ),
+                action(
+                    CleanMemory,
+                    button("Clean up…").on_press_maybe(can_edit.then_some(Message::ShowCleanup))
+                ),
+                action(
+                    ClearMemory,
+                    button("Clear…").on_press_maybe(
+                        (can_edit && self.base.as_ref().is_some_and(|base| !base.text.is_empty()))
+                            .then_some(Message::Clear)
+                    )
                 ),
             ]
             .spacing(6)
             .wrap(),
             self.current_page(can_edit, cleanup_ai_available),
-            button("External memory files…").on_press_maybe(
-                (!self.pending
-                    && !self.has_unsaved_document()
-                    && !matches!(self.page, Page::References(_)))
-                .then_some(Message::ShowReferences)
+            action(
+                ExternalMemory,
+                button("External memory files…").on_press_maybe(
+                    (!self.pending
+                        && !self.has_unsaved_document()
+                        && !matches!(self.page, Page::References(_)))
+                    .then_some(Message::ShowReferences)
+                )
             ),
         ]
         .spacing(11);

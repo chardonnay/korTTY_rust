@@ -38,6 +38,30 @@ pub(super) struct History {
 }
 
 impl History {
+    pub(super) fn finish_snapshot(&mut self, redactor: &super::Redactor) -> Result<(), String> {
+        self.id = NEXT.fetch_add(1, Ordering::Relaxed);
+        self.transcript.prompt = None;
+        self.model_steps = None;
+        self.command_started = None;
+        let redact = |value: &mut String| {
+            *value = mask::prompt(redactor, value)?;
+            Ok::<_, String>(())
+        };
+        redact(&mut self.transcript.goal)?;
+        redact(&mut self.transcript.final_answer)?;
+        for step in &mut self.transcript.steps {
+            redact(&mut step.title)?;
+            redact(&mut step.detail)?;
+            if let Some(command) = &mut step.command {
+                redact(command)?;
+            }
+            for line in &mut step.output {
+                redact(line)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn status_transcript(&self) -> &Transcript {
         &self.transcript
     }
@@ -307,6 +331,9 @@ impl Run {
 
 impl Workspace {
     pub(super) fn publish_agent_inline_history(&self, run: &Run) {
+        if run.reopened_history {
+            return;
+        }
         let Some(update) = run.inline_update(self.window_settings.agent_animations()) else {
             return;
         };

@@ -71,7 +71,7 @@ impl Archive {
             _ => return,
         };
         let usage = &run.presentation.model_usage;
-        let snapshot = Arc::new(report::Run {
+        let snapshot = report::Run {
             mode: match run.mode {
                 Mode::Run => "Run",
                 Mode::Ask => "Ask",
@@ -97,7 +97,14 @@ impl Archive {
                 total_tokens: report::TokenCount::new(summary.total.sum, summary.total.known),
             }),
             model_attempts: usage.attempts().map(report::ModelAttempt::from).collect(),
-        });
+        };
+        let Ok(redactor) = run.finished_redactor() else {
+            return;
+        };
+        let Ok(snapshot) = remask(&snapshot, &redactor, &Cancel::default()) else {
+            return;
+        };
+        let snapshot = Arc::new(snapshot);
         let mut recent = 0;
         self.0.retain(|(old, _)| {
             if same_stream(*old, source) {
@@ -160,6 +167,13 @@ pub(super) struct Export {
 }
 
 impl Export {
+    pub(super) fn completed_snapshot(&self) -> Self {
+        Self {
+            snapshot: self.snapshot.clone(),
+            ..Self::default()
+        }
+    }
+
     pub(super) fn start(&mut self) {
         self.started
             .get_or_insert_with(|| (Instant::now(), jiff::Timestamp::now()));

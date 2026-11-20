@@ -124,6 +124,9 @@ impl Default for State {
 }
 
 impl State {
+    pub(super) fn has_knowledge_stores(&self) -> bool {
+        !self.stores.is_empty()
+    }
     pub(super) fn set_guided_profile(&mut self, role: Role, reference: ProfileRef) {
         self.set_profile(role, Some(reference));
     }
@@ -649,6 +652,15 @@ pub(crate) enum Output {
 }
 
 impl Dialog {
+    pub(super) fn reveal_knowledge_index(&mut self, state: &State) {
+        if self
+            .selected
+            .is_none_or(|index| index >= state.stores.len())
+            && state.has_knowledge_stores()
+        {
+            self.select_store(Some(0));
+        }
+    }
     pub(super) fn new(profile: PathBuf) -> Self {
         Self {
             cache: Cache::new(profile.clone()),
@@ -2418,11 +2430,16 @@ impl Dialog {
         };
         let page = match page {
             Page::Models(tokens, hints) => {
-                self.models_view(state, can_edit, can_request, tokens, hints)
+                self.models_view(state, can_edit, can_request, tokens, hints, reveal)
             }
-            Page::Knowledge(vault_keys, hints, models) => {
-                self.knowledge_view(state, profiles, can_request, vault_keys, hints, models)
-            }
+            Page::Knowledge(vault_keys, hints, models) => self.knowledge_view(
+                state,
+                profiles,
+                can_request,
+                vault_keys,
+                (hints, models),
+                reveal,
+            ),
             Page::Preferences => preferences(
                 state,
                 profiles,
@@ -2452,7 +2469,11 @@ impl Dialog {
         can_request: bool,
         hub_tokens: Vec<CredentialChoice>,
         hints: &'a Hints,
+        reveal: &Reveal,
     ) -> Element<'a, Message> {
+        use super::search::{Control::*, Setting};
+        let action = |control, button| reveal.action(Setting::Control(control), button);
+        let endpoint = Setting::Control(LocalEndpoint);
         let models = pick_list(self.models.as_slice(), self.model.as_ref(), Message::Model)
             .placeholder("Select an installed model")
             .width(Length::Fill)
@@ -2460,13 +2481,14 @@ impl Dialog {
         column![
             text("Local Models").size(20),
             text("Discover installed models from an explicitly configured local service."),
-            endpoint_field(state),
+            reveal.wrap(endpoint, field("Local endpoint", reveal.input(endpoint, can_edit,
+                text_input("Numeric loopback address and port", &state.endpoint).on_input(Message::Endpoint)))),
             row![
-                button("Refresh").on_press_maybe(can_request.then_some(Message::Discover)),
-                models,
-                button("Test model").on_press_maybe(
+                action(RefreshModels, button("Refresh").on_press_maybe(can_request.then_some(Message::Discover))),
+                reveal.wrap(Setting::Control(InstalledModel), models),
+                action(TestModel, button("Test model").on_press_maybe(
                     (can_request && self.model.is_some()).then_some(Message::TestModel)
-                ),
+                )),
             ]
             .spacing(8)
             .align_y(Alignment::Center),
@@ -2480,18 +2502,18 @@ impl Dialog {
                 .then(|| text(crate::clipboard_policy::AI_RUNTIME_DOWNLOADS_DISABLED).size(13)),
             text("Offline llama.cpp Runtime Package").size(17),
             text("Enter the absolute paths to the stable runtime index, its detached signature and the package ZIP.").size(13),
-            self.runtime_fields(can_edit),
+            self.runtime_fields(can_edit, Some(reveal)),
             row![
-                button("Install signed runtime").on_press_maybe(
+                action(InstallRuntime, button("Install signed runtime").on_press_maybe(
                     (can_request && self.runtime_removal.is_none() && self.runtime_paths_ready())
                         .then_some(Message::ImportRuntime),
-                ),
-                button("Remove installed runtime…")
+                )),
+                action(RemoveRuntime, button("Remove installed runtime…")
                     .style(button::secondary)
                     .on_press_maybe(
                         (can_edit && self.runtime_removal.is_none() && !self.mlx.runtime_removal_open())
                             .then_some(Message::ReviewRuntimeRemoval),
-                    ),
+                    )),
             ]
             .spacing(8),
             self.runtime_removal.as_ref().map(|_| column![
@@ -2589,7 +2611,7 @@ impl Dialog {
             column![
                 text("Choose the stable signed runtime index, its detached signature and the matching package ZIP using absolute paths.")
                     .wrapping(text::Wrapping::WordOrGlyph),
-                self.runtime_fields(can_request),
+                self.runtime_fields(can_request, None),
                 self.online.view(
                     can_request && self.runtime_downloads_allowed,
                     can_edit,
@@ -2630,34 +2652,45 @@ impl Dialog {
         .into()
     }
 
-    fn runtime_fields(&self, enabled: bool) -> Element<'_, Message> {
-        column![
-            field(
-                "Signed index",
-                self.runtime_path(RuntimeFile::Index, "runtime-index-v1.json", enabled)
-            ),
-            field(
-                "Index signature",
-                self.runtime_path(RuntimeFile::Signature, "runtime-index-v1.sig", enabled)
-            ),
-            field(
-                "Runtime package",
-                self.runtime_path(RuntimeFile::Archive, "Package ZIP", enabled)
-            ),
-        ]
+    fn runtime_fields(&self, enabled: bool, reveal: Option<&Reveal>) -> Element<'_, Message> {
+        use super::search::{Control, Setting};
+        column(
+            [
+                (
+                    Control::SignedIndex,
+                    "Signed index",
+                    RuntimeFile::Index,
+                    "runtime-index-v1.json",
+                ),
+                (
+                    Control::IndexSignature,
+                    "Index signature",
+                    RuntimeFile::Signature,
+                    "runtime-index-v1.sig",
+                ),
+                (
+                    Control::RuntimePackage,
+                    "Runtime package",
+                    RuntimeFile::Archive,
+                    "Package ZIP",
+                ),
+            ]
+            .into_iter()
+            .map(|(control, label, file, placeholder)| {
+                let setting = Setting::Control(control);
+                let input = text_input(placeholder, &self.runtime_paths()[file as usize])
+                    .on_input_maybe(
+                        enabled.then_some(move |path| Message::RuntimePath(file, path)),
+                    );
+                if let Some(reveal) = reveal {
+                    reveal.wrap(setting, field(label, reveal.input(setting, enabled, input)))
+                } else {
+                    field(label, input)
+                }
+            }),
+        )
         .spacing(8)
         .into()
-    }
-
-    fn runtime_path(
-        &self,
-        file: RuntimeFile,
-        placeholder: &str,
-        enabled: bool,
-    ) -> Element<'_, Message> {
-        text_input(placeholder, &self.runtime_paths()[file as usize])
-            .on_input_maybe(enabled.then_some(move |path| Message::RuntimePath(file, path)))
-            .into()
     }
 
     fn knowledge_view<'a>(
@@ -2666,9 +2699,12 @@ impl Dialog {
         profiles: &Catalog,
         can_request: bool,
         vault_keys: Vec<CredentialChoice>,
-        hints: &'a java_knowledge::Hints,
-        models: &'a Hints,
+        (hints, models): (&'a java_knowledge::Hints, &'a Hints),
+        reveal: &Reveal,
     ) -> Element<'a, Message> {
+        use super::search::{KnowledgeSetting, Setting};
+        use KnowledgeSetting::{Create, Name, Rebuild, Update};
+        let store_name = Setting::Knowledge(Name);
         let selected = self
             .selected
             .and_then(|index| state.stores.get(index).map(|store| (index, store)));
@@ -2690,10 +2726,20 @@ impl Dialog {
                     )
                 });
         let sidebar = column![
-            text_input("New store name", &self.store_name)
-                .on_input(Message::StoreName)
-                .on_submit(Message::CreateStore),
-            button("Create store").on_press(Message::CreateStore),
+            reveal.wrap(
+                store_name,
+                reveal.input(
+                    store_name,
+                    can_request,
+                    text_input("New store name", &self.store_name)
+                        .on_input(Message::StoreName)
+                        .on_submit(Message::CreateStore)
+                )
+            ),
+            reveal.action(
+                Setting::Knowledge(Create),
+                button("Create store").on_press(Message::CreateStore)
+            ),
             self.java_store_origin
                 .as_ref()
                 .map(|_| button("Cancel Java store review")
@@ -2962,12 +3008,12 @@ impl Dialog {
                 .push(text("Terminal AI chat and code analysis ask separately before embedding a query and show retrieved excerpts before sending the request.").size(13))
                 .push(text("Saved indexes can be searched again after reopening. Updating changed settings takes effect after Save.").size(13))
                 .push(row![
-                    button("Update index").on_press_maybe(
+                    reveal.action(Setting::Knowledge(Update), button("Update index").on_press_maybe(
                         can_index.then_some(Message::Index { rebuild: false }),
-                    ),
-                    button("Rebuild index").style(button::secondary).on_press_maybe(
+                    )),
+                    reveal.action(Setting::Knowledge(Rebuild), button("Rebuild index").style(button::secondary).on_press_maybe(
                         can_index.then_some(Message::Index { rebuild: true }),
-                    ),
+                    )),
                 ].spacing(8).wrap())
                 .push(text("Update reuses unchanged enabled files. Rebuild replaces enabled vectors and keeps disabled vectors that fit the embedding dimensions.").size(13))
                 .push(row![
@@ -3394,14 +3440,6 @@ impl SaveIndexes {
         }
         Ok((!warning.is_empty()).then_some(warning))
     }
-}
-
-fn endpoint_field(state: &State) -> Element<'_, Message> {
-    field(
-        "Local endpoint",
-        text_input("Numeric loopback address and port", &state.endpoint)
-            .on_input(Message::Endpoint),
-    )
 }
 
 fn preferences(

@@ -111,6 +111,34 @@ pub(super) fn panel<'a, M: 'a>(palette: Option<Palette>, view: Container<'a, M>)
     }
 }
 
+pub(super) fn faded_panel<'a, M: 'a>(
+    palette: Option<Palette>,
+    view: Container<'a, M>,
+    opacity: f32,
+) -> Element<'a, M> {
+    if opacity == 1.0 {
+        return panel(palette, view);
+    }
+    let surface = move |theme: &Theme| {
+        let mut style = palette.map_or_else(|| container::bordered_box(theme), Palette::surface);
+        style.background = style.background.map(|bg| bg.scale_alpha(opacity));
+        style.text_color = Some(
+            style
+                .text_color
+                .unwrap_or(theme.palette().text)
+                .scale_alpha(opacity),
+        );
+        style.border.color = style.border.color.scale_alpha(opacity);
+        style.shadow.color = style.shadow.color.scale_alpha(opacity);
+        style
+    };
+    if let Some(palette) = palette {
+        scope(Some(palette), view.style(surface).into())
+    } else {
+        view.style(surface).into()
+    }
+}
+
 pub(super) fn notice_color(palette: Option<Palette>, phase: Phase) -> Option<Color> {
     palette.map(|palette| {
         if matches!(phase, Phase::Failed | Phase::Blocked) {

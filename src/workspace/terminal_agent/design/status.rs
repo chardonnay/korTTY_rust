@@ -15,7 +15,8 @@ use super::super::{Message as AgentMessage, Phase};
 use super::{
     Message, Run, history,
     palette::{self, Palette},
-    presentation::{Notice, TOAST_LIFETIME},
+    presentation::Notice,
+    toast,
 };
 
 mod meter;
@@ -419,11 +420,11 @@ pub(super) fn render<'a>(
             let recent: Vec<_> = run
                 .presentation
                 .status_events
-                .recent(trace.now)
+                .recent(trace.now, trace.reduced_motion)
                 .rev()
                 .take(limit)
                 .collect();
-            for (notice, left) in recent.into_iter().rev() {
+            for (notice, frame) in recent.into_iter().rev() {
                 let title = match notice {
                     Notice::Step(id) => {
                         let Some(step) = trace.step(id) else { continue };
@@ -436,20 +437,48 @@ pub(super) fn render<'a>(
                         button(text(history::summary(trace.answer)).size(12)).on_press(toggle())
                     }
                 };
-                let card = column![
-                    title.style(button::secondary).width(Length::Fill),
-                    (!trace.reduced_motion).then(|| progress_bar(
-                        0.0..=TOAST_LIFETIME.as_secs_f32(),
-                        left.as_secs_f32()
-                    )
-                    .girth(2)),
-                ];
-                cards = cards.push(card.width(Length::Fill).max_width(320));
+                let title = title
+                    .style(move |theme, status| {
+                        let mut style = button::secondary(theme, status);
+                        style.text_color = style.text_color.scale_alpha(frame.opacity);
+                        style.border.color = style.border.color.scale_alpha(frame.opacity);
+                        style.shadow.color = style.shadow.color.scale_alpha(frame.opacity);
+                        style.background = style.background.map(|bg| bg.scale_alpha(frame.opacity));
+                        style
+                    })
+                    .width(Length::Fill);
+                let lifetime = toast::LIFETIME.as_secs_f32();
+                let remaining = if trace.reduced_motion {
+                    lifetime
+                } else {
+                    frame.remaining.as_secs_f32()
+                };
+                let timer = progress_bar(0.0..=lifetime, remaining)
+                    .girth(2)
+                    .style(move |theme| {
+                        let mut style = progress_bar::primary(theme);
+                        style.background = style.background.scale_alpha(frame.opacity);
+                        style.bar = style.bar.scale_alpha(frame.opacity);
+                        style.border.color = style.border.color.scale_alpha(frame.opacity);
+                        style
+                    });
+                cards = cards.push(toast::view(
+                    column![title, timer].width(Length::Fill).max_width(320),
+                    frame,
+                ));
             }
             if trace.waiting {
-                cards = cards.push(
-                    column![text(trace.current_label(phase)).size(12), controls()].spacing(4),
+                let review = toast::review_frame(
+                    run.presentation
+                        .status_events
+                        .review_age(trace.now)
+                        .unwrap_or(Duration::MAX),
+                    trace.reduced_motion,
                 );
+                cards = cards.push(toast::view(
+                    column![text(trace.current_label(phase)).size(12), controls()].spacing(4),
+                    review,
+                ));
             }
             cards.into()
         }

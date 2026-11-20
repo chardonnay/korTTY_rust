@@ -105,8 +105,12 @@ impl Sample {
 
     pub(in crate::workspace) fn sync(&mut self, transcript: &inline::Transcript) {
         self.transcript.clone_from(transcript);
-        self.presentation
-            .sync_status(transcript, transcript.state.finished(), Instant::now());
+        self.presentation.sync_status(
+            transcript,
+            transcript.state.finished(),
+            transcript.prompt.is_some(),
+            Instant::now(),
+        );
         self.entries = transcript
             .steps
             .iter()
@@ -132,8 +136,23 @@ impl Sample {
         }
     }
 
-    pub(in crate::workspace) fn has_live_toasts(&self, now: Instant) -> bool {
-        self.presentation.status_events.recent(now).next().is_some()
+    pub(in crate::workspace) fn has_live_toasts(&self, now: Instant, reduced_motion: bool) -> bool {
+        self.presentation.status_events.ticking(now, reduced_motion)
+    }
+
+    pub(in crate::workspace) fn has_spotlight_preview(&self, now: Instant, layout: Layout) -> bool {
+        self.status_position(layout).0 == Status::Spotlight
+            && super::super::spotlight::preview_frame(now.saturating_duration_since(self.started))
+                .is_some()
+    }
+
+    fn status_position(&self, layout: Layout) -> (Status, Slot) {
+        if layout.arrangement == Arrangement::Adaptive {
+            let (columns, rows) = self.grid.dimensions();
+            adaptive_status(&self.presentation.dock, columns, rows)
+        } else {
+            (layout.status, status_slot(layout.status))
+        }
     }
 
     pub(in crate::workspace) fn interact(&mut self, action: Action) {
@@ -200,12 +219,7 @@ impl Sample {
             .height(Length::Fill)
             .into()
         };
-        let (status_kind, position) = if layout.arrangement == Arrangement::Adaptive {
-            let (columns, rows) = self.grid.dimensions();
-            adaptive_status(&self.presentation.dock, columns, rows)
-        } else {
-            (layout.status, status_slot(layout.status))
-        };
+        let (status_kind, position) = self.status_position(layout);
         let history_position = view.dock.history_slot(layout);
         let adaptive_side = layout.arrangement == Arrangement::Adaptive && position == Slot::Right;
         let status = if !view.status_visible
@@ -251,6 +265,16 @@ impl Sample {
                 bottom: None,
             },
         );
+        let terminal = if status_kind == Status::Spotlight
+            && !view.reduced_motion
+            && !self.transcript.state.finished()
+            && let Some(frame) =
+                super::super::spotlight::preview_frame(now.saturating_duration_since(self.started))
+        {
+            super::super::spotlight::preview(terminal, frame, view.goal)
+        } else {
+            terminal
+        };
         if layout.arrangement == Arrangement::PictureInPicture {
             pip::sample(
                 terminal,

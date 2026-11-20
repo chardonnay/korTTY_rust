@@ -3650,6 +3650,26 @@ impl Dialog {
 
     fn search_results(&self) -> impl Iterator<Item = search::Target> + '_ {
         search::results(&self.search, self.profiles.searchable_profile())
+            .filter(|&target| self.search_target_available(target))
+    }
+
+    fn search_target_available(&self, target: search::Target) -> bool {
+        match target {
+            search::Target::Setting(search::Setting::Knowledge(setting))
+                if setting.needs_store() =>
+            {
+                self.local_state.has_knowledge_stores()
+            }
+            search::Target::Setting(search::Setting::Control(control)) => match control.page() {
+                Page::Skills => self.editable() && self.skills.has_search_control(control),
+                Page::Memory => self.memory.has_search_controls(),
+                Page::LocalModels => {
+                    control == search::Control::LocalSetup || !self.local.backend_repair_open()
+                }
+                _ => true,
+            },
+            _ => true,
+        }
     }
 
     fn open_page(&mut self, target: search::Target) -> Task<Message> {
@@ -3657,12 +3677,19 @@ impl Dialog {
         self.search.clear();
         self.search_selection = 0;
         self.revealed.setting = match target {
-            search::Target::Setting(setting) => Some(setting),
-            search::Target::Page(_) => None,
+            search::Target::Setting(setting) if self.search_target_available(target) => {
+                Some(setting)
+            }
+            _ => None,
         };
         if let Some(search::Setting::Profile(setting)) = self.revealed.setting {
             self.profiles
                 .update(profiles::Message::Section(setting.section()), false);
+        }
+        if let Some(search::Setting::Knowledge(setting)) = self.revealed.setting
+            && setting.needs_store()
+        {
+            self.local.reveal_knowledge_index(&self.local_state);
         }
         let scroll = if self.revealed.setting.is_some() {
             self.revealed.apply()
@@ -3673,8 +3700,28 @@ impl Dialog {
             )
         };
         let load = match self.page {
-            Page::Memory => self.memory.load().map(Message::Memory),
+            Page::Memory
+                if self.revealed.setting
+                    != Some(search::Setting::Control(search::Control::Budget)) =>
+            {
+                self.memory.load().map(Message::Memory)
+            }
             Page::Profiles => self.refresh_managed_models(),
+            Page::LocalModels
+                if matches!(
+                    self.revealed.setting,
+                    Some(search::Setting::Control(
+                        search::Control::LocalEndpoint
+                            | search::Control::SignedIndex
+                            | search::Control::IndexSignature
+                            | search::Control::RuntimePackage
+                    ))
+                ) =>
+            {
+                // Inventory loading temporarily disables these inputs. A direct reveal can
+                // edit them independently of the managed-model inventory.
+                Task::none()
+            }
             Page::LocalModels | Page::Knowledge | Page::LocalPreferences if self.editable() => {
                 self.local.open_managed_models().map(Message::Local)
             }
@@ -4306,7 +4353,7 @@ impl Dialog {
                     .map(Message::Profiles),
                 Page::Skills if self.editable() => self
                     .skills
-                    .view(&self.skill_store, self.can_shorten_skill())
+                    .view(&self.skill_store, self.can_shorten_skill(), &self.revealed)
                     .map(Message::Skills),
                 Page::Memory => self
                     .memory
@@ -4315,6 +4362,7 @@ impl Dialog {
                             && self.general.features_enabled
                             && self.saved.enabled()
                             && self.saved.profiles.default_profile().is_some(),
+                        &self.revealed,
                     )
                     .map(Message::Memory),
                 Page::Skills => text("AI skill editing is unavailable.").into(),
@@ -4362,22 +4410,27 @@ impl Dialog {
                                 },
                             )
                         });
-                        column![
-                            button(if role.is_some() {
-                                "Set up an embedding model…"
-                            } else {
-                                "Set up local AI…"
-                            })
-                            .on_press_maybe(
-                                self.can_open_guided_setup(role)
-                                    .then_some(Message::Setup(setup::Message::Open(role)))
-                            ),
-                            catalog.map(|label| text(label).size(13)),
-                            content
-                        ]
-                        .spacing(8)
-                        .height(Length::Fill)
-                        .into()
+                        let setup = button(if role.is_some() {
+                            "Set up an embedding model…"
+                        } else {
+                            "Set up local AI…"
+                        })
+                        .on_press_maybe(
+                            self.can_open_guided_setup(role)
+                                .then_some(Message::Setup(setup::Message::Open(role))),
+                        );
+                        let setup = if role.is_none() {
+                            self.revealed.action(
+                                search::Setting::Control(search::Control::LocalSetup),
+                                setup,
+                            )
+                        } else {
+                            setup.into()
+                        };
+                        column![setup, catalog.map(|label| text(label).size(13)), content]
+                            .spacing(8)
+                            .height(Length::Fill)
+                            .into()
                     } else {
                         content
                     }

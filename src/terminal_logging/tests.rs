@@ -146,6 +146,42 @@ fn capture_is_lazy_and_refuses_an_authentication_value_with_controls() {
 }
 
 #[test]
+fn writer_registers_an_existing_custom_folder_as_logger_owned() {
+    let profile = Profile::new();
+    let root = profile.0.canonicalize().unwrap();
+    let folder = root.join("custom");
+    fs::create_dir(&folder).unwrap();
+    let config = Config {
+        enabled: true,
+        folder: folder.to_str().unwrap().into(),
+        ..Config::default()
+    };
+    let (redraw, _) = async_channel::bounded(1);
+    let warning = Warning::new(redraw);
+    let prepared = Prepared::new(
+        config,
+        Policy::default(),
+        "fixture".into(),
+        "localhost".into(),
+        "user".into(),
+    )
+    .with_test_profile(root.clone());
+    let mut capture = prepared.start(warning.clone()).unwrap();
+    capture.advance(b"fixture terminal output\r\n");
+    capture.finish().wait().unwrap();
+    assert!(warning.current().is_none(), "{:?}", warning.current());
+    let listing = crate::logfile_window::catalog::scan(&root, || false).unwrap();
+    assert_eq!(listing.entries.len(), 1);
+    let entry = &listing.entries[0];
+    assert_eq!(entry.path.parent(), Some(folder.as_path()));
+    assert!(!entry.live);
+    let registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("terminal-log-folders.json")).unwrap()).unwrap();
+    assert_eq!(registry["folders"], serde_json::json!([]));
+    assert_eq!(registry["logger_folders"], serde_json::json!([folder]));
+}
+
+#[test]
 fn xml_capture_replaces_invalid_unicode_and_keeps_writing_later_lines() {
     let profile = Profile::new();
     let root = profile.0.canonicalize().unwrap();
