@@ -559,13 +559,22 @@ impl Frame {
         }
     }
 
-    pub(crate) fn visible(&self, id: u64, epoch: u64) -> bool {
-        self.layout.blocks.iter().any(|block| {
-            block.id == id
-                && block.epoch == epoch
-                && block.start < self.top + usize::from(self.rows)
-                && block.start + block.lines.len() > self.top
-        })
+    pub(crate) fn visible_start(&self, id: u64, epoch: u64) -> Option<usize> {
+        self.layout
+            .blocks
+            .iter()
+            .find(|block| {
+                block.id == id
+                    && block.epoch == epoch
+                    && block.start < self.top + usize::from(self.rows)
+                    && block.start + block.lines.len() > self.top
+            })
+            .map(|block| block.start)
+    }
+
+    #[cfg(test)]
+    fn visible(&self, id: u64, epoch: u64) -> bool {
+        self.visible_start(id, epoch).is_some()
     }
 
     pub(crate) fn approval_visible(&self, id: u64, epoch: u64) -> bool {

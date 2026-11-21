@@ -446,9 +446,7 @@ impl Workspace {
         }
         self.agent_dispatch_policy(run)?.check()?;
         let live = run.binding.live()?;
-        if self.terminal_agents.owns_session(live.session) {
-            return Err("Another agent run already owns this terminal pane.".into());
-        }
+        self.terminal_agents.check_live_run_slot(live, run.swarm)?;
         self.current_run_pane(run)?;
         run.goal = mask::prompt(&run.redactor, &run.goal)?;
         self.mask_https_agent_input(run)?;
@@ -649,6 +647,14 @@ impl Workspace {
             );
             return Ok(Task::none());
         }
+        let Some(slot) = self.terminal_agents.shell_slots.reserve(run) else {
+            run.return_to_busy_shell_review(if probe {
+                Phase::ProbeApproval
+            } else {
+                Phase::Approval
+            });
+            return Ok(Task::none());
+        };
         let batch = match self.take_batch_command(run, probe) {
             Ok(batch) => batch,
             Err(error) => {
@@ -732,7 +738,7 @@ impl Workspace {
                 let worker = std::thread::Builder::new()
                     .name("kortty-agent-command".into())
                     .spawn(move || {
-                        let _ = send.send_blocking(execution.run(
+                        let result = execution.run(
                             command,
                             &cancel,
                             || {
@@ -754,7 +760,9 @@ impl Workspace {
                                     dispatch.store(true, std::sync::atomic::Ordering::Release);
                                 }
                             },
-                        ));
+                        );
+                        drop(slot);
+                        let _ = send.send_blocking(result);
                     });
                 Arc::new(match worker {
                     Ok(_) => receive

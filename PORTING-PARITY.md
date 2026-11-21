@@ -208,13 +208,117 @@ token count. Both stations remained visible after the source terminal
 narrowed from 112 to 54 columns. The mock provider received one reviewed
 request. Twelve focused Apple Silicon tests passed, including the shared
 design preview, usage labels, overflow and reduced motion. Windows ARM64
-passed targeted Clippy with warnings denied. The concurrent-run badge,
-the Java standard preset and remaining native desktop and rail motion
-checks are open.
+passed targeted Clippy with warnings denied. Remaining native desktop
+and rail motion checks are open.
 [Java Metro model](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/agentdesign/MetroStationModel.java)
 · [Fedora Wayland Metro acceptance](target/verification/20261121-agent-metro-wayland-fixed.log)
 · [Apple Silicon tests](target/verification/20261121-agent-metro-macos-fixed.log)
 · [Windows ARM64 Clippy](target/verification/20261121-agent-metro-windows-fixed.log).
+
+## November 21 Terminal Agent Standard design
+
+Standard combines d03 in-terminal blocks, the d08 Metro line, approval
+in history and a fixed arrangement. A valid connection choice takes
+precedence over the global default. Missing and unrecognized roles in
+custom designs independently inherit the corresponding Standard module.
+Explicitly saved transcript and step-strip modules retain their existing
+IDs. Classic and Floating retain their layouts. Metro shows a `+N` badge
+for additional unfinished runs on the same stream with the same status
+and history panel. Paused runs contribute to the count. This checkpoint
+allowed up to five unfinished Ask requests, each with a separate review.
+Inline keyboard actions bind to the rendered block closest to the prompt.
+
+A fresh private Fedora Wayland profile showed the inline review and
+Metro rail together. Two open Ask reviews showed `+1` before the mock
+provider received a request. Escape stopped the visible inline run and
+kept the older Metro review pending. The badge disappeared. Approving
+the surviving request produced one loopback call. Selecting its result
+in the run picker showed the completed rail with 20 reported tokens.
+The Apple Silicon workspace suite passed 4,785 tests with 218 ignored.
+The regressions exercise the Standard modules, scoped counting and the
+five-request limit. Windows ARM64 passed application and test-target
+Clippy with warnings denied.
+[Java Standard preset](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/agentdesign/AgentDesignPresets.java)
+· [Java resolution](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/agentdesign/AgentDesignResolver.java)
+· [Java pane run counts](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignHost.java)
+· [Fedora Wayland acceptance](target/verification/20261121-agent-standard-wayland-accepted.log)
+· [Apple Silicon suite](target/verification/20261121-agent-standard-macos-accepted.log)
+· [Windows ARM64 Clippy](target/verification/20261121-agent-standard-windows-accepted.log).
+
+## November 21 Overlapping Terminal Agent runs
+
+A pane accepts up to five standalone Run, Ask and Planning runs on its
+current stream. Each run owns its reviews, results and cancellation.
+Environment probes, ordinary commands and sudo operations use the same
+per-pane execution slot through worker completion. During contention a
+command stays in review with a fresh epoch and any automatic approval for
+that run is revoked. Saved Swarm routes retain their existing ownership
+checks. Choosing a hosted-only Planning or Agent run opens its own tab
+while the visible terminal status stays attached to its source run.
+
+In a private Fedora Wayland session, Run, Ask and Planning each reached
+review from one local Bash pane. The run picker opened the Planning tab.
+Returning to the terminal showed the same pending Run probe. Approving
+that probe recorded its output in Run and opened a separate model review.
+Approving Ask produced one loopback request and its answer while the Run
+and Planning model requests stayed pending.
+
+The native workspace suites passed 4,830 tests on Fedora and 4,786 on
+Apple Silicon. The first Apple Silicon run hit a transient busy lock in
+the Snippet Analysis export test. The unchanged rerun passed. The
+concurrency regressions cover the shared cap, fresh review after a
+contended probe, cancellation, and invalidation on stream replacement.
+Fedora and Windows ARM64 passed application and test-target Clippy with
+warnings denied. Native SSH desktop review and sudo contention still
+need acceptance against a real privileged route.
+[Java run limit](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/MainWindow.java)
+· [Fedora Wayland acceptance](target/verification/20261121-agent-mixed-wayland.log)
+· [Fedora workspace suite and Clippy](target/verification/20261121-agent-mixed-fedora.log)
+· [Apple Silicon suite](target/verification/20261121-agent-mixed-macos-retry.log)
+· [Windows ARM64 Clippy](target/verification/20261121-agent-mixed-windows.log).
+
+The local OpenSSH fixture on Fedora also holds a competing probe while
+the implementation run reviews sudo preflight and later an elevated
+command. Each busy attempt kept its pending review, issued a fresh
+epoch, and left the simulated sudo endpoint untouched. A fresh approval
+could continue the existing workflow after the probe finished.
+[OpenSSH sudo contention fixture](target/verification/20261121-agent-typed-sudo-contention-fedora.log).
+
+## November 21 Overlapping starts from terminal shortcuts
+
+The configured `agent`, `agent-ask` and `agent-plan` aliases share the
+same per-stream start limit as the menus. On a verified empty prompt, a
+recognized command stays in the app even when the pane is full. An
+ordinary line that stops matching the alias is passed to the shell.
+The composer and its completion popup are bound to the original window,
+stream, privacy state and prompt. A changed binding discards an unfinished
+shortcut before Enter can submit it.
+
+The private Fedora Wayland session typed `agent-ask`, `agent`, and
+`agent-plan` from one Bash prompt. Ask and Planning reached their own
+model reviews, while Run reached the separate environment-probe review.
+No request or probe was approved. The native PTY regressions verify five
+overlapping launches, a locally rejected sixth shortcut, ordinary shell
+input at the limit, and a replacement stream that reuses the prompt ID.
+The Fedora test with a pinned loopback OpenSSH shell verified literal
+input with shortcuts disabled, followed by enabled Run, Ask and Planning
+aliases. Planning opened while the independent Ask model review remained
+pending.
+[Fedora Wayland acceptance](target/verification/20261121-agent-typed-wayland.log)
+· [OpenSSH shortcut test](target/verification/20261121-agent-typed-openssh-retry.log).
+
+The native workspace suites passed 4,832 tests on Fedora, 4,788 on
+Apple Silicon, and 4,681 on Windows ARM64. Windows ARM64 and Fedora
+passed application and test-target Clippy with warnings denied. On
+Windows the contention test checks the reserved worker task and its
+release when dropped. The test executable has no desktop worker entry
+point. The targeted Apple Silicon rerun also executes the reviewed
+probe to completion. The OpenSSH retry starts its listener after the
+binary is built.
+[Fedora suite](target/verification/20261121-agent-typed-fedora.log)
+· [Apple Silicon suite](target/verification/20261121-agent-typed-macos.log)
+· [Apple Silicon corrected probe test](target/verification/20261121-agent-typed-probe-macos.log)
+· [Windows ARM64 suite](target/verification/20261121-agent-typed-windows-retry.log).
 
 ## November 21 Terminal Agent status auto-hide fade
 

@@ -32,6 +32,7 @@ pub(super) struct Trace<'a> {
     elapsed: Duration,
     animation_age: Duration,
     active: bool,
+    active_runs: usize,
     waiting: bool,
     paused: bool,
     tone: Tone,
@@ -63,6 +64,7 @@ impl<'a> Trace<'a> {
             elapsed,
             animation_age: elapsed,
             active: run.active() && !run.cancel.requested(),
+            active_runs: 0,
             waiting: run.awaiting_input(),
             paused: run.paused || run.phase == Phase::Paused,
             tone: match run.phase {
@@ -89,6 +91,7 @@ impl<'a> Trace<'a> {
             elapsed: Duration::from_millis(transcript.elapsed_ms),
             animation_age: now.saturating_duration_since(start),
             active: !transcript.state.finished(),
+            active_runs: 0,
             waiting: transcript.prompt.is_some(),
             paused: transcript.state == State::Paused,
             tone: match transcript.state {
@@ -226,18 +229,23 @@ fn station(
     )
 }
 
-pub(super) fn view(
-    run: &Run,
+pub(super) fn view<'a>(
+    run: &'a Run,
     status: Status,
     palette: Option<Palette>,
     now: Instant,
     reduced_motion: bool,
-    has_archive: bool,
-) -> Element<'_, AgentMessage> {
+    agents: &super::State,
+) -> Element<'a, AgentMessage> {
+    let has_archive = agents.has_archived_activity(run);
+    let mut trace = Trace::live(run, now, reduced_motion);
+    if status == Status::Metro {
+        trace.active_runs = agents.active_metro_runs(run);
+    }
     render(
         run.into(),
         phase(run),
-        Trace::live(run, now, reduced_motion),
+        trace,
         status,
         palette,
         has_archive,

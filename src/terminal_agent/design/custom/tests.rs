@@ -31,10 +31,15 @@ fn in_terminal_histories_preserve_java_ids_and_leave_other_roles_independent() {
 
 #[test]
 fn native_java_modules_round_trip_without_changing_legacy_role_ids() {
-    assert_eq!(
-        serde_json::to_string(&Layout::default()).unwrap(),
-        r#"{"history":"transcript","status":"steps","approval":"below_activity","arrangement":"normal"}"#
-    );
+    let legacy = Layout {
+        history: History::Transcript,
+        status: Status::Steps,
+        approval: Approval::BelowActivity,
+        arrangement: Arrangement::Normal,
+    };
+    let saved = r#"{"history":"transcript","status":"steps","approval":"below_activity","arrangement":"normal"}"#;
+    assert_eq!(serde_json::from_str::<Layout>(saved).unwrap(), legacy);
+    assert_eq!(serde_json::to_string(&legacy).unwrap(), saved);
     assert_eq!(
         serde_json::to_string(&History::StepCards).unwrap(),
         r#""step_cards""#
@@ -86,7 +91,7 @@ fn custom_agent_design_resolves_roles_and_never_reuses_deleted_ids() {
     catalog.set_layout(&original.id, layout);
     assert!(catalog.set_custom_default(&original.id));
     assert_eq!(
-        catalog.resolve(Some("classic"), Preset::Standard),
+        catalog.resolve(Some(" classic "), Preset::Standard),
         Preset::Classic.layout()
     );
     assert_eq!(catalog.resolve(Some("unknown"), Preset::Standard), layout);
@@ -127,6 +132,37 @@ fn unknown_custom_agent_modules_fall_back_by_role() {
             ..Layout::default()
         }
     );
+}
+
+#[test]
+fn standard_design_and_absent_modules_use_the_java_combination() {
+    let expected = Layout {
+        history: History::InlineBlocks,
+        status: Status::Metro,
+        approval: Approval::BelowActivity,
+        arrangement: Arrangement::Normal,
+    };
+    let mut catalog: Catalog = serde_json::from_str(
+        r#"{
+            "default_id":" custom-1 ",
+            "designs":[
+                {"id":"custom-1","name":"Incomplete","layout":{"status":"future_status"}},
+                {"id":"custom-2","name":"Empty"}
+            ]
+        }"#,
+    )
+    .unwrap();
+    assert_eq!(Preset::Standard.layout(), expected);
+    assert_eq!(catalog.default_id(Preset::Classic), "custom-1");
+    assert_eq!(catalog.resolve(Some("missing"), Preset::Classic), expected);
+    assert_eq!(
+        catalog.resolve(Some(" custom-2 "), Preset::Classic),
+        expected
+    );
+    catalog.clear_custom_default();
+    assert_eq!(catalog.resolve(None, Preset::default()), expected);
+    let copy = catalog.duplicate("standard").unwrap();
+    assert_eq!(catalog.layout(&copy.id), Some(expected));
 }
 
 #[test]

@@ -414,6 +414,7 @@ impl Capture {
         let replacement = match &completion.options {
             Options::Commands(variants) => variants.get(index).map(|variant| format!("{variant} ")),
             Options::History(history) if !history.clearing => self
+                .scope
                 .aliases
                 .history_prefix(self.line.text())
                 .zip(history.single_line.get(index))
@@ -444,11 +445,13 @@ impl Workspace {
         let planning_allowed = self.clipboard.policy.ai_planning_allowed();
         let allowed = |command: &str| {
             capture
+                .scope
                 .aliases
                 .alias_mode(command)
                 .is_some_and(|mode| mode != Mode::Plan || planning_allowed)
         };
         let variants: Vec<_> = capture
+            .scope
             .aliases
             .completion_variants(capture.line.text())
             .into_iter()
@@ -458,7 +461,7 @@ impl Workspace {
             owner,
             session,
             stream: pane.stream_generation,
-            prompt: capture.prompt,
+            prompt: capture.scope.prompt,
             nonce: NEXT_COMPLETION.fetch_add(1, Ordering::Relaxed),
             private: tab.incognito,
             planning_allowed,
@@ -466,6 +469,7 @@ impl Workspace {
         let (options, task) = if !variants.is_empty() {
             (Options::Commands(variants), Task::none())
         } else if capture
+            .scope
             .aliases
             .history_prefix(capture.line.text())
             .is_some_and(allowed)
@@ -632,12 +636,12 @@ impl Workspace {
                 .is_some_and(|route| route.predict && route.panes == [ticket.session])
             && self
                 .agent_shortcut_scope(ticket.session)
-                .is_some_and(|(aliases, prompt)| {
-                    prompt == ticket.prompt
+                .is_some_and(|scope| {
+                    scope.prompt == ticket.prompt
                         && pane
                             .agent_shortcut
                             .as_ref()
-                            .is_some_and(|draft| draft.aliases == aliases)
+                            .is_some_and(|draft| draft.scope == scope)
                 })
     }
 }

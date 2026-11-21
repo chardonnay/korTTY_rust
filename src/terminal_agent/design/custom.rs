@@ -15,8 +15,6 @@ pub(crate) enum History {
     StepCards,
     #[serde(rename = "d02")]
     Timeline,
-    #[serde(rename = "d03")]
-    InlineBlocks,
     #[serde(rename = "d06")]
     PlanExecution,
     #[serde(rename = "d07")]
@@ -29,9 +27,10 @@ pub(crate) enum History {
     LogTable,
     #[serde(rename = "d17")]
     Focus,
-    #[default]
-    #[serde(other)]
     Transcript,
+    #[default]
+    #[serde(rename = "d03", other)]
+    InlineBlocks,
 }
 
 impl History {
@@ -79,8 +78,6 @@ impl fmt::Display for History {
 pub(crate) enum Status {
     Hidden,
     Pill,
-    #[serde(rename = "d08")]
-    Metro,
     #[serde(rename = "d01")]
     Powerline,
     #[serde(rename = "d11")]
@@ -97,9 +94,10 @@ pub(crate) enum Status {
     Toasts,
     #[serde(rename = "d15")]
     Orbit,
-    #[default]
-    #[serde(other)]
     Steps,
+    #[default]
+    #[serde(rename = "d08", other)]
+    Metro,
 }
 
 impl Status {
@@ -222,10 +220,13 @@ impl Preset {
         match self {
             Self::Standard => Layout::default(),
             Self::Classic => Layout {
+                history: History::Transcript,
                 status: Status::Hidden,
                 ..Layout::default()
             },
             Self::Floating => Layout {
+                history: History::Transcript,
+                status: Status::Steps,
                 arrangement: Arrangement::Floating,
                 ..Layout::default()
             },
@@ -237,6 +238,7 @@ impl Preset {
 struct Combination {
     id: String,
     name: String,
+    #[serde(default)]
     layout: Layout,
 }
 
@@ -308,6 +310,7 @@ impl Catalog {
     }
 
     pub(crate) fn layout(&self, id: &str) -> Option<Layout> {
+        let id = id.trim();
         Preset::from_id(id)
             .map(Preset::layout)
             .or_else(|| self.find(id).map(|design| design.layout))
@@ -325,6 +328,7 @@ impl Catalog {
     }
 
     pub(crate) fn set_custom_default(&mut self, id: &str) -> bool {
+        let id = id.trim();
         if self.find(id).is_none() {
             return false;
         }

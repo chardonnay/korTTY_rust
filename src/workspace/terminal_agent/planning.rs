@@ -496,6 +496,13 @@ impl Workspace {
         }
         if matches!(message, Message::Browse) && run.phase == Phase::Setup && !run.binding.private()
         {
+            if let Err(reason) = self
+                .terminal_agents
+                .check_live_run_slot(run.binding.live()?, run.swarm)
+            {
+                run.notice = reason.into();
+                return Ok(Task::none());
+            }
             let flow = Flow::new(self.planning_destination(run)?);
             run.planning = Some(flow);
             let root = self.plan_root()?;

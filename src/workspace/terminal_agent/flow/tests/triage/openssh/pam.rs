@@ -92,6 +92,32 @@ fn check_real_pam(isolation: IsolationLevel, name: &str) {
     assert!(run.sudo_terminal.is_none());
     assert_idle(&model);
 
+    let epoch = run.epoch;
+    let (peer, probe) = hold_peer_probe(&mut fixture);
+    no_task(fixture.send(
+        id,
+        Message::Password(password::Message::AuthenticatePlan(
+            epoch,
+            password::Source::Vault,
+        )),
+    ));
+    let run = fixture.run(id);
+    assert!(run.phase == Phase::SudoPreflight, "{}", run.notice);
+    assert!(run.notice.contains("Another Agent command"));
+    assert_ne!(run.epoch, epoch);
+    assert!(run.sudo_preflight.is_some() && run.sudo_terminal.is_none());
+    assert_eq!(run.sudo_preflight_attempts, 0);
+    assert_idle(&model);
+    finish_peer_probe(&mut fixture, peer, probe);
+    no_task(fixture.send(
+        id,
+        Message::Password(password::Message::AuthenticatePlan(
+            epoch,
+            password::Source::Vault,
+        )),
+    ));
+    assert_eq!(fixture.run(id).sudo_preflight_attempts, 0);
+
     authenticate_plan_with_vault(&mut fixture, id, &model, |fixture| {
         set_sudo_vault(
             fixture,
@@ -130,10 +156,30 @@ fn check_real_pam(isolation: IsolationLevel, name: &str) {
     assert!(run.phase == Phase::Approval, "{}", run.notice);
     assert!(run.reviewed_password_sudo().is_some());
     assert!(!receipt.exists() && !owner.exists());
+    let epoch = run.epoch;
+    let (peer, probe) = hold_peer_probe(&mut fixture);
+    no_task(fixture.send(
+        id,
+        Message::Password(password::Message::Approve(epoch, password::Source::Ticket)),
+    ));
+    let run = fixture.run(id);
+    assert!(run.phase == Phase::Approval, "{}", run.notice);
+    assert!(run.notice.contains("Another Agent command"));
+    assert_ne!(run.epoch, epoch);
+    assert!(run.reviewed_password_sudo().is_some() && run.sudo_terminal.is_some());
+    assert!(!receipt.exists() && !owner.exists());
+    finish_peer_probe(&mut fixture, peer, probe);
+    no_task(fixture.send(
+        id,
+        Message::Password(password::Message::Approve(epoch, password::Source::Ticket)),
+    ));
+    assert!(!receipt.exists() && !owner.exists());
+    assert_idle(&model);
+
     let command = fixture.send(
         id,
         Message::Password(password::Message::Approve(
-            run.epoch,
+            fixture.run(id).epoch,
             password::Source::Ticket,
         )),
     );
