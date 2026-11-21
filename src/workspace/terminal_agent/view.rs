@@ -267,7 +267,7 @@ impl Run {
                         text(if self.sudo_terminal.is_some() {
                             "This command will use the sudo ticket from this run."
                         } else {
-                            "Choose the password source. The run requests it after the SSH challenge."
+                            "Choose the password source. The run requests the password after sudo prompts in the private terminal."
                         }).size(13),
                     ].spacing(3)),
                     scrollable(text(command.1).font(iced::Font::MONOSPACE))

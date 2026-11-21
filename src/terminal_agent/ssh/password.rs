@@ -1,4 +1,4 @@
-//! Password sudo on a private terminal bound to the original SSH connection.
+//! Password sudo on a private terminal bound to the reviewed SSH or local target.
 
 use std::fmt::Write as _;
 use std::io;
@@ -27,22 +27,42 @@ pub(crate) const AUTHENTICATION_REJECTED: &str =
 mod local;
 
 #[cfg(unix)]
-pub(crate) fn local_available() -> bool {
-    local::supported()
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum LocalRoute {
+    Native,
+    #[cfg(target_os = "linux")]
+    FlatpakHost,
+}
+
+#[cfg(unix)]
+impl LocalRoute {
+    pub(crate) fn available(self) -> bool {
+        match self {
+            Self::Native => {
+                #[cfg(target_os = "linux")]
+                if kortty_pty::flatpak::running() {
+                    return false;
+                }
+                std::path::Path::new("/usr/bin/sudo").is_file()
+            }
+            #[cfg(target_os = "linux")]
+            Self::FlatpakHost => kortty_pty::flatpak::running(),
+        }
+    }
 }
 
 #[derive(Clone)]
 pub(crate) enum Endpoint {
     Ssh(ExecOpener),
     #[cfg(unix)]
-    Local(LocalDirectory),
+    Local(LocalDirectory, LocalRoute),
 }
 
 impl Endpoint {
     pub(crate) fn is_local(&self) -> bool {
         #[cfg(unix)]
         {
-            matches!(self, Self::Local(_))
+            matches!(self, Self::Local(..))
         }
         #[cfg(not(unix))]
         {
@@ -54,7 +74,9 @@ impl Endpoint {
         match (self, other) {
             (Self::Ssh(left), Self::Ssh(right)) => left.same_connection(right),
             #[cfg(unix)]
-            (Self::Local(left), Self::Local(right)) => left == right,
+            (Self::Local(left, left_route), Self::Local(right, right_route)) => {
+                left_route == right_route && left == right
+            }
             #[cfg(unix)]
             _ => false,
         }
@@ -206,8 +228,8 @@ impl Terminal {
                 }
             }
             #[cfg(unix)]
-            Endpoint::Local(directory) => Streams::Local(Box::new(local::open(
-                directory, nonce, permitted, answers, challenge,
+            Endpoint::Local(directory, route) => Streams::Local(Box::new(local::open(
+                directory, *route, nonce, permitted, answers, challenge,
             )?)),
         };
         Ok(Self { endpoint, streams })

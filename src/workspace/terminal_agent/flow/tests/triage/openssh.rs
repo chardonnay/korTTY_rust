@@ -2,16 +2,20 @@ use std::fs;
 use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
 
-use kortty_ssh::{Authentication, Connect, Endpoint, SshSession};
+use kortty_ssh::{Authentication, Connect, Endpoint, SshSession, TrustStore};
 
 use super::*;
 use crate::session::StreamOptions;
 use crate::ssh_connection::Connected;
+use crate::ssh_dialog::{LoginTarget, Request};
 use crate::ssh_worker::OpenSshFixture;
 use crate::terminal_logging::Prepared;
 use crate::workspace::ssh_access::SshTarget;
 use crate::workspace::terminal_agent::planning;
 use kortty_terminal::TerminalProfile;
+
+#[cfg(target_os = "linux")]
+mod pam;
 
 #[test]
 #[ignore = "requires OpenSSH sshd and ssh-keygen and a local account"]
@@ -207,8 +211,6 @@ fn isolated_ssh_implementation_sudo_preflight_uses_the_authenticated_terminal() 
 
 fn check_implementation_sudo_preflight(isolation: IsolationLevel) {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-    use iced::futures::{StreamExt as _, executor::block_on};
-    use kortty_vault::{CredentialInput, CredentialKind, Secret, Vault};
 
     let _serial = exclusive_run();
     let (model, _) = listener();
@@ -229,25 +231,12 @@ fn check_implementation_sudo_preflight(isolation: IsolationLevel) {
     let server = start_shell_with_exec(&ssh, &root, &root, &receipt, SUDO_PREFLIGHT_FIXTURE);
     attach_shell_with_isolation(&mut fixture, &ssh, &root, isolation);
     let login = ssh.request(root.join("client")).target.endpoint;
-    let vault_path = root.join("fixture-vault");
-    let mut master = [0; 32];
-    getrandom::fill(&mut master).unwrap();
-    let mut vault = Vault::create(&vault_path, &master).unwrap();
-    vault
-        .save(
-            CredentialInput {
-                label: "Fixture sudo credential".into(),
-                username: login.username,
-                server_pattern: format!("{}:{}", login.host, login.port),
-                kind: CredentialKind::SudoPassword,
-                ..CredentialInput::default()
-            },
-            Secret::new(sudo_password),
-        )
-        .unwrap();
-    fixture.workspace.vault = Some(crate::vault_window::VaultWindow::with_unlocked_fixture(
-        vault_path, vault,
-    ));
+    set_sudo_vault(
+        &mut fixture,
+        root.join("fixture-vault"),
+        &login,
+        sudo_password,
+    );
 
     let id = fixture.open(Mode::Run);
     no_task(fixture.send(id, Message::Goal("Check directory metadata".into())));
@@ -295,35 +284,7 @@ fn check_implementation_sudo_preflight(isolation: IsolationLevel) {
     assert_idle(&model);
 
     for expected_phase in [Phase::SudoPreflight, Phase::ModelReview] {
-        let authenticate = fixture.send(
-            id,
-            Message::Password(password::Message::AuthenticatePlan(
-                fixture.run(id).epoch,
-                password::Source::Vault,
-            )),
-        );
-        let mut stream = iced_runtime::task::into_stream(authenticate).unwrap();
-        let mut challenged = false;
-        while let Some(action) = block_on(stream.next()) {
-            if let iced_runtime::Action::Output(Desktop::TerminalAgent(owner, message)) = action {
-                assert_eq!(owner, id);
-                let challenge =
-                    matches!(&message, Message::Password(password::Message::Challenge(_)));
-                let next = fixture.send(id, message);
-                finish_agent_task(&mut fixture, next);
-                if challenge {
-                    challenged = true;
-                    assert!(fixture.run(id).phase == Phase::SudoPassword);
-                    assert_idle(&model);
-                    let password_epoch = fixture.run(id).epoch;
-                    no_task(fixture.send(
-                        id,
-                        Message::Password(password::Message::Use(password_epoch)),
-                    ));
-                }
-            }
-        }
-        assert!(challenged);
+        authenticate_plan_with_vault(&mut fixture, id, &model, |_| {});
         let run = fixture.run(id);
         assert!(run.phase == expected_phase, "{}", run.notice);
         if expected_phase == Phase::SudoPreflight {
@@ -415,6 +376,78 @@ fn check_implementation_sudo_preflight(isolation: IsolationLevel) {
     drop(fixture);
     let output = server.join().unwrap();
     assert!(String::from_utf8_lossy(&output.stderr).contains("Accepted publickey for "));
+}
+
+fn set_sudo_vault(
+    fixture: &mut Fixture,
+    vault_path: std::path::PathBuf,
+    login: &LoginTarget,
+    secret: String,
+) {
+    use kortty_vault::{CredentialInput, CredentialKind, Secret, Vault};
+
+    let mut master = [0; 32];
+    getrandom::fill(&mut master).unwrap();
+    let mut vault = Vault::create(&vault_path, &master).unwrap();
+    vault
+        .save(
+            CredentialInput {
+                label: "Fixture sudo credential".into(),
+                username: login.username.clone(),
+                server_pattern: format!("{}:{}", login.host, login.port),
+                kind: CredentialKind::SudoPassword,
+                ..CredentialInput::default()
+            },
+            Secret::new(secret),
+        )
+        .unwrap();
+    fixture.workspace.vault = Some(crate::vault_window::VaultWindow::with_unlocked_fixture(
+        vault_path, vault,
+    ));
+}
+
+fn authenticate_plan_with_vault(
+    fixture: &mut Fixture,
+    id: window::Id,
+    model: &TcpListener,
+    before_result: impl FnOnce(&mut Fixture),
+) {
+    use iced::futures::{StreamExt as _, executor::block_on};
+
+    let authenticate = fixture.send(
+        id,
+        Message::Password(password::Message::AuthenticatePlan(
+            fixture.run(id).epoch,
+            password::Source::Vault,
+        )),
+    );
+    let mut stream = iced_runtime::task::into_stream(authenticate).unwrap();
+    let mut challenged = false;
+    let mut before_result = Some(before_result);
+    while let Some(action) = block_on(stream.next()) {
+        if let iced_runtime::Action::Output(Desktop::TerminalAgent(owner, message)) = action {
+            assert_eq!(owner, id);
+            let challenge = matches!(&message, Message::Password(password::Message::Challenge(_)));
+            if matches!(
+                &message,
+                Message::Password(password::Message::Finished(_, _))
+            ) && let Some(before_result) = before_result.take()
+            {
+                before_result(fixture);
+            }
+            let next = fixture.send(id, message);
+            finish_agent_task(fixture, next);
+            if challenge {
+                challenged = true;
+                assert!(fixture.run(id).phase == Phase::SudoPassword);
+                assert_idle(model);
+                let epoch = fixture.run(id).epoch;
+                no_task(fixture.send(id, Message::Password(password::Message::Use(epoch))));
+            }
+        }
+    }
+    assert!(challenged);
+    assert!(before_result.is_none());
 }
 
 const SUDO_PREFLIGHT_FIXTURE: &str = r#"
@@ -651,11 +684,28 @@ fn attach_shell_with_isolation(
     directory: &Path,
     isolation: IsolationLevel,
 ) {
-    let key = ssh.directory().join("client");
-    let mut request = ssh.request(key.clone());
+    attach_reviewed_shell(
+        fixture,
+        ssh.request(ssh.directory().join("client")),
+        &ssh.pinned_trust(),
+        directory,
+        isolation,
+    );
+}
+
+fn attach_reviewed_shell(
+    fixture: &mut Fixture,
+    mut request: Request,
+    trust: &TrustStore,
+    directory: &Path,
+    isolation: IsolationLevel,
+) {
     let login = request.target.endpoint.clone();
     let grid = GridSize::default();
     let connection = if isolation == IsolationLevel::None {
+        let crate::ssh_dialog::Authentication::PrivateKey(key) = request.target.auth else {
+            panic!("The OpenSSH fixture requires an unencrypted private key");
+        };
         let direct = SshSession::connect(
             Connect {
                 address: SocketAddr::from(([127, 0, 0, 1], login.port)),
@@ -665,7 +715,7 @@ fn attach_shell_with_isolation(
                 term: TerminalProfile::Xterm.term_name().into(),
                 size: crate::session::ssh_size(grid),
             },
-            ssh.pinned_trust(),
+            trust.clone(),
         )
         .unwrap();
         Connected::Direct(Box::new(direct))
@@ -675,7 +725,7 @@ fn attach_shell_with_isolation(
             request,
             false,
             &crate::ssh_worker::test_executable(),
-            &ssh.pinned_trust(),
+            trust,
         )
         .unwrap();
         assert!(worker.sandbox_backend().is_some());

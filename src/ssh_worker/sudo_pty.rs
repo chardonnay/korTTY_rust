@@ -1,4 +1,4 @@
-//! Run-scoped SSH terminal protocol. Validation finishes before command input is enabled.
+//! Run-scoped sudo terminal protocol. Validation finishes before command input is enabled.
 
 use std::io;
 use std::time::{Duration, Instant};

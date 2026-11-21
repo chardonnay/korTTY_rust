@@ -920,19 +920,32 @@ impl Workspace {
 }
 
 impl Run {
-    pub(super) fn supports_native_local_sudo(&self) -> bool {
+    #[cfg(unix)]
+    pub(super) fn local_sudo_route(&self) -> Option<engine::password::LocalRoute> {
+        use engine::password::LocalRoute;
+
+        if self.mode != Mode::Run || self.swarm {
+            return None;
+        }
+        let route = match self.target.as_ref() {
+            Some(RunTarget::Attached(Target::Local {
+                shell: Shell::Posix(_),
+                ..
+            })) => LocalRoute::Native,
+            #[cfg(target_os = "linux")]
+            Some(RunTarget::Attached(Target::Local {
+                shell: Shell::FlatpakHost,
+                ..
+            })) => LocalRoute::FlatpakHost,
+            _ => return None,
+        };
+        route.available().then_some(route)
+    }
+
+    pub(super) fn supports_local_sudo(&self) -> bool {
         #[cfg(unix)]
         {
-            self.mode == Mode::Run
-                && !self.swarm
-                && matches!(
-                    self.target,
-                    Some(RunTarget::Attached(Target::Local {
-                        shell: Shell::Posix(_),
-                        ..
-                    }))
-                )
-                && engine::password::local_available()
+            self.local_sudo_route().is_some()
         }
         #[cfg(not(unix))]
         {
@@ -945,7 +958,7 @@ impl Run {
             && !self.swarm
             && self.plan.is_some()
             && (matches!(self.target, Some(RunTarget::Attached(Target::Ssh { .. })))
-                || self.supports_native_local_sudo())
+                || self.supports_local_sudo())
     }
 
     pub(super) fn environment_probe(&self, target: &RunTarget) -> &'static str {

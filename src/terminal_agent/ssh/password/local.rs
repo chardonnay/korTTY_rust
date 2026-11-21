@@ -1,7 +1,6 @@
 //! Private POSIX PTY for sudo validation and later reviewed commands.
 
 use std::io::{self, Write};
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 use kortty::ssh_runtime::sudo_pty;
@@ -9,7 +8,10 @@ use kortty_pty::{Pty, PtyReader, PtyWriter};
 use kortty_ssh::SensitiveLine;
 use zeroize::{Zeroize, Zeroizing};
 
-use super::{LocalDirectory, POLL, Status, auth_status, retry, stopped_or_failed};
+use super::{LocalDirectory, LocalRoute, POLL, Status, auth_status, retry, stopped_or_failed};
+
+#[cfg(target_os = "linux")]
+mod flatpak;
 
 const CHALLENGE_LIMIT: Duration = Duration::from_secs(30);
 const ANSWER_LIMIT: Duration = Duration::from_secs(5 * 60);
@@ -18,21 +20,39 @@ pub(super) struct Streams {
     _pty: Pty,
     reader: PtyReader,
     writer: PtyWriter,
+    #[cfg(target_os = "linux")]
+    _host_directory: Option<std::fs::File>,
 }
 
 impl Streams {
-    fn spawn(directory: &LocalDirectory, arguments: Vec<String>) -> Result<Self, Status> {
+    fn spawn(
+        directory: &LocalDirectory,
+        route: LocalRoute,
+        arguments: Vec<String>,
+    ) -> Result<Self, Status> {
         let file = directory
             .open_verified()
             .map_err(|_| Status::TransportFailed)?;
-        let mut pty =
-            Pty::spawn_in_directory(arguments, file).map_err(|_| Status::TransportFailed)?;
+        #[cfg(target_os = "linux")]
+        let mut host_directory = None;
+        let mut pty = match route {
+            LocalRoute::Native => Pty::spawn_in_directory(arguments, file),
+            #[cfg(target_os = "linux")]
+            LocalRoute::FlatpakHost => {
+                let result = flatpak::spawn(directory.path(), arguments, &file);
+                host_directory = Some(file);
+                result
+            }
+        }
+        .map_err(|_| Status::TransportFailed)?;
         let reader = pty.take_reader().ok_or(Status::TransportFailed)?;
         let writer = pty.take_writer().ok_or(Status::TransportFailed)?;
         Ok(Self {
             _pty: pty,
             reader,
             writer,
+            #[cfg(target_os = "linux")]
+            _host_directory: host_directory,
         })
     }
 
@@ -53,16 +73,9 @@ impl Streams {
     }
 }
 
-pub(super) fn supported() -> bool {
-    #[cfg(target_os = "linux")]
-    if kortty_pty::flatpak::running() {
-        return false;
-    }
-    Path::new("/usr/bin/sudo").is_file()
-}
-
 pub(super) fn open(
     directory: &LocalDirectory,
+    route: LocalRoute,
     nonce: [u8; 16],
     permitted: impl Fn() -> bool,
     answers: async_channel::Receiver<SensitiveLine>,
@@ -71,10 +84,10 @@ pub(super) fn open(
     if !permitted() {
         return Err(Status::Cancelled);
     }
-    if !supported() {
+    if !route.available() {
         return Err(Status::TransportFailed);
     }
-    let mut streams = Streams::spawn(directory, sudo_pty::local_arguments(nonce))?;
+    let mut streams = Streams::spawn(directory, route, sudo_pty::local_arguments(nonce))?;
     authenticate(&mut streams, nonce, &permitted, answers, challenge)?;
     Ok(streams)
 }
@@ -181,7 +194,11 @@ mod tests {
     #[test]
     fn local_sudo_owns_the_pty_and_keeps_authentication_separate_from_command_input() {
         let profile = Profile::new();
-        let directory = LocalDirectory::capture(profile.0.canonicalize().unwrap()).unwrap();
+        check_private_sudo_pty(&profile.0, LocalRoute::Native);
+    }
+
+    fn check_private_sudo_pty(path: &std::path::Path, route: LocalRoute) {
+        let directory = LocalDirectory::capture(path.canonicalize().unwrap()).unwrap();
         let mut nonce = [0; 16];
         getrandom::fill(&mut nonce).unwrap();
         let mut arguments = sudo_pty::local_arguments(nonce);
@@ -198,7 +215,7 @@ printf '%s\n' "$PWD" > approved-command
 printf '\036%s:0\n' "$request"
 "#
         .into();
-        let mut streams = Streams::spawn(&directory, arguments).unwrap();
+        let mut streams = Streams::spawn(&directory, route, arguments).unwrap();
         let (submit, answers) = async_channel::bounded(1);
         authenticate(&mut streams, nonce, &|| true, answers, || {
             submit
@@ -209,7 +226,7 @@ printf '\036%s:0\n' "$request"
         let receipt = directory.path().join("approved-command");
         assert!(!receipt.exists());
         let mut terminal = Terminal {
-            endpoint: Endpoint::Local(directory.clone()),
+            endpoint: Endpoint::Local(directory.clone(), route),
             streams: super::super::Streams::Local(Box::new(streams)),
         };
         let mut request_nonce = [0; 16];
@@ -224,20 +241,115 @@ printf '\036%s:0\n' "$request"
 
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "requires the disposable Fedora sudo/PAM fixture root"]
+    #[ignore = "requires a Flatpak installation and a disposable host-shared test directory"]
+    fn flatpak_host_sudo_uses_a_private_pty_and_cancels_a_pending_challenge() {
+        use std::path::{Path, PathBuf};
+
+        assert!(LocalRoute::FlatpakHost.available());
+        assert!(!LocalRoute::Native.available());
+        let path = PathBuf::from(std::env::var_os("KORTTY_FLATPAK_HOST_TEST_ROOT").unwrap());
+        assert!(path.is_absolute() && path.join("private-flatpak-test").is_file());
+        let workspace = path.join("sudo workspace with 'quotes'");
+        std::fs::create_dir(&workspace).unwrap();
+        check_private_sudo_pty(&workspace, LocalRoute::FlatpakHost);
+
+        let directory = LocalDirectory::capture(workspace.clone()).unwrap();
+        let host = Endpoint::Local(directory.clone(), LocalRoute::FlatpakHost);
+        assert!(!host.matches(&Endpoint::Local(directory.clone(), LocalRoute::Native)));
+
+        let mut nonce = [0; 16];
+        getrandom::fill(&mut nonce).unwrap();
+        let mut arguments = sudo_pty::local_arguments(nonce);
+        arguments[2] = r#"
+[ ! -e /.flatpak-info ] && [ -t 0 ] && [ -t 1 ] && (: <>/dev/tty) || exit 1
+/bin/stty raw -echo -echonl || exit 2
+printf '%s' "$$" > waiting-sudo-fixture.pid
+printf '%s\n%s' "$3" "$1"
+IFS= read -r answer || exit 3
+printf '%s' "$answer" > cancelled-command
+"#
+        .into();
+        let runtime = LocalDirectory::capture("/usr".into()).unwrap();
+        let mut refused =
+            Streams::spawn(&runtime, LocalRoute::FlatpakHost, arguments.clone()).unwrap();
+        let (_submit, answers) = async_channel::bounded(1);
+        assert!(
+            authenticate(&mut refused, nonce, &|| true, answers, || {
+                panic!("a different host directory must never request a password")
+            })
+            .is_err()
+        );
+        drop(refused);
+
+        let mut streams = Streams::spawn(&directory, LocalRoute::FlatpakHost, arguments).unwrap();
+        let (_submit, answers) = async_channel::bounded(1);
+        let mut prompted = false;
+        assert_eq!(
+            authenticate(&mut streams, nonce, &|| true, answers, || {
+                prompted = true;
+                false
+            }),
+            Err(Status::Cancelled)
+        );
+        assert!(prompted);
+        drop(streams);
+        let pid = std::fs::read_to_string(workspace.join("waiting-sudo-fixture.pid")).unwrap();
+        assert!(pid.parse::<u32>().is_ok_and(|pid| pid > 1));
+        let mut check =
+            kortty_pty::flatpak::host_command(Path::new("/usr/bin/test"), &workspace).unwrap();
+        assert!(
+            check
+                .args(["!", "-e", &format!("/proc/{pid}")])
+                .status()
+                .unwrap()
+                .success(),
+            "the cancelled host PTY process is still running"
+        );
+        assert!(!workspace.join("cancelled-command").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the disposable Fedora sudo/PAM host or Flatpak fixture"]
     fn local_sudo_authenticates_with_real_pam_in_a_disposable_root() {
         use std::os::unix::fs::MetadataExt as _;
+        use std::path::{Path, PathBuf};
 
         use crate::terminal_agent::Cancel;
         use crate::terminal_agent::password::{AUTHENTICATION_REJECTED, Command};
 
+        let (path, marker, route) = if kortty_pty::flatpak::running() {
+            let path =
+                PathBuf::from(std::env::var_os("KORTTY_FLATPAK_PAM_TEST_WORKSPACE").unwrap());
+            let output = kortty_pty::flatpak::host_command(Path::new("/usr/bin/hostname"), &path)
+                .unwrap()
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"kortty-flatpak-fixture\n");
+            let output = kortty_pty::flatpak::host_command(Path::new("/usr/bin/id"), &path)
+                .unwrap()
+                .arg("-un")
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"fixture\n");
+            let marker = path.join("kortty-sudo-test-root");
+            (path, marker, LocalRoute::FlatpakHost)
+        } else {
+            (
+                PathBuf::from("/work"),
+                PathBuf::from("/etc/kortty-sudo-test-root"),
+                LocalRoute::Native,
+            )
+        };
         assert_eq!(
-            std::fs::read_to_string("/etc/kortty-sudo-test-root").unwrap(),
+            std::fs::read_to_string(marker).unwrap(),
             "Disposable korTTY sudo/PAM fixture\n"
         );
         assert_eq!(rustix::process::geteuid().as_raw(), 1000);
-        let directory = LocalDirectory::capture("/work".into()).unwrap();
-        let endpoint = Endpoint::Local(directory.clone());
+        let directory = LocalDirectory::capture(path).unwrap();
+        let endpoint = Endpoint::Local(directory.clone(), route);
         let validate = |secret| {
             let (submit, answers) = async_channel::bounded(1);
             let mut challenged = false;
@@ -263,7 +375,12 @@ printf '\036%s:0\n' "$request"
         let terminal = validate("correct-fixture-password").unwrap().unwrap();
         let result = directory.path().join("effective-uid");
         assert!(!result.exists());
-        let command = Command::new("/work", "/usr/bin/id -u > /work/effective-uid", true).unwrap();
+        let command = Command::new(
+            directory.path().to_str().unwrap(),
+            "/usr/bin/id -u > effective-uid",
+            true,
+        )
+        .unwrap();
         let (_submit, answers) = async_channel::bounded(1);
         let (status, terminal) = command
             .run_with_terminal(
@@ -277,7 +394,18 @@ printf '\036%s:0\n' "$request"
             .unwrap();
         assert_eq!(status, Status::Exited(0));
         assert_eq!(std::fs::read_to_string(&result).unwrap(), "0\n");
-        assert_eq!(std::fs::metadata(result).unwrap().uid(), 0);
         drop(terminal);
+        if route == LocalRoute::FlatpakHost {
+            let output =
+                kortty_pty::flatpak::host_command(Path::new("/usr/bin/stat"), directory.path())
+                    .unwrap()
+                    .args(["-c", "%u", "effective-uid"])
+                    .output()
+                    .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"0\n");
+        } else {
+            assert_eq!(std::fs::metadata(result).unwrap().uid(), 0);
+        }
     }
 }
