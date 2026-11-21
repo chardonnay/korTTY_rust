@@ -330,12 +330,12 @@ pub(super) fn view(
         } else {
             100
         });
-    let log_table_interval = demo
+    let history_interval = demo
         .sample
-        .log_table_refresh_interval(layout, now, reduced_motion);
+        .history_refresh_interval(layout, now, reduced_motion);
     let status_frame = status_interval
         .into_iter()
-        .chain(log_table_interval)
+        .chain(history_interval)
         .min()
         .map(|ms| now + Duration::from_millis(ms));
     let preview = SampleView {

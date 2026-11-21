@@ -165,7 +165,7 @@ fn columns(value: &str) -> usize {
         .sum()
 }
 
-fn clean(value: &str, multiline: bool) -> String {
+pub(crate) fn clean(value: &str, multiline: bool) -> String {
     value.chars().take(MAX_TEXT).map(|ch| {
         if multiline && ch == '\n' { '\n' }
         else if ch.is_control() || matches!(ch, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}') { ' ' }

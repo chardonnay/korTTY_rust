@@ -137,8 +137,10 @@ The native Wayland check with OpenSSH exposed a rejected takeover when
 the directory report and prompt arrived in separate output batches.
 Takeover now uses the directory report associated with the current
 verified prompt. A regression test covers split output batches and
-rejects a directory report received after the prompt. The native SSH
-retest remains part of desktop acceptance.
+rejects a directory report received after the prompt. Fedora Wayland
+then verified the editable Bash draft over pinned OpenSSH. Tab left the
+SSH exec log unchanged and the fixture command's receipt remained absent.
+[Merged checkpoint and native results](https://github.com/chardonnay/korTTY_rust/pull/27).
 
 ## November 21 Numeric decisions in Terminal Agent cursor approval
 
@@ -186,6 +188,91 @@ strict Clippy passed.
 · [Fedora X11 acceptance](target/verification/20261121-agent-cursor-fade-x11-pane.log)
 · [Apple Silicon tests](target/verification/20261121-agent-cursor-fade-macos-pane.log)
 · [Windows ARM64 Clippy](target/verification/20261121-agent-cursor-fade-windows-pane.log).
+
+## November 21 Terminal Agent tmux history
+
+The d09 history and Settings preview display the masked goal, recorded
+steps and their results in a monospace pane. A right-click on a step
+opens the actions for its exact recorded ID. The footer names the shell
+and agent panes and displays the current phase and local time.
+
+The finished answer reveals one Unicode character every 24 ms and the
+block cursor fades on a 530 ms half-cycle during activity and typing.
+Reduced animations shows the full answer immediately and keeps the
+cursor still. The default side width follows the available pane width,
+while explicit dock settings retain priority.
+Apple Silicon and Fedora ARM64 each passed the reveal-timing test,
+the exact step-menu test and eight preview tests. Targeted Windows ARM64
+Clippy passed with warnings denied.
+[Java d09 reference](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignTmuxPane.java)
+· [Apple Silicon tests](target/verification/20261121-agent-tmux-macos.log)
+· [Fedora tests](target/verification/20261121-agent-tmux-fedora.log)
+· [Windows ARM64 Clippy](target/verification/20261121-agent-tmux-windows.log).
+
+The dock's numbered controls share the existing Activity approval
+decisions. Digit 1 approves the current command once. Digit 2 allows
+remaining ordinary commands when policy offers that choice, with digit
+3 cancelling. Under per-command confirmation, digit 2 cancels.
+Both pointer and keyboard actions bind to the active terminal stream,
+exact review, and displayed decision. A clipped card ignores decisions.
+A new review clears an in-progress pointer press. When the reviewed
+command or destination was masked, the Activity window owns the approval.
+The focused native suites passed on Apple Silicon and Fedora ARM64.
+They exercised keyboard and pointer decisions, clipping, changed
+approval policy and a replaced review during a pointer press.
+Targeted Windows ARM64 Clippy passed with warnings denied.
+[Apple Silicon review tests](target/verification/20261121-agent-tmux-review-macos-card.log)
+· [Fedora review tests](target/verification/20261121-agent-tmux-review-fedora-card.log)
+· [Windows ARM64 review Clippy](target/verification/20261121-agent-tmux-review-windows-final.log).
+
+The docked history stays visible after a run and keeps the block cursor
+blinking until the user hides the pane or reduces animations. Run
+actions hides the history, and View › AI Agent Panel restores it.
+Selecting an earlier run or reaching a new review shows the history.
+Fedora Wayland restored the same completed answer on the original
+terminal stream. The terminal widened from 66 to 112 columns while the
+history was hidden and returned to 66 columns when it reappeared. The
+fixture observed only one model request. The finished cursor changed
+over six captures. After saving reduced animations, three cursor
+captures were identical and the answer remained visible. In a separate
+run, pressing 1 in the tmux review approved the read-only environment
+probe and opened the separate model review. The original terminal bytes
+and model request count were unchanged.
+[Fedora Wayland verification](target/verification/20261121-agent-tmux-visibility-wayland.log)
+· [Apple Silicon visibility tests](target/verification/20261121-agent-tmux-visibility-macos.log)
+· [Windows ARM64 visibility Clippy](target/verification/20261121-agent-tmux-visibility-windows.log).
+
+Fedora Wayland reproduced a clipped command card at the bottom of a
+long history. Placing the cursor before the pending review makes the
+card the last scrollable item. The same fixture then reached the older
+rows, forwarded 2 only while the review was out of view, and accepted
+2 after returning to the bottom. Two ordinary commands produced one
+receipt each, in order, and the next model request still required
+review. A second run kept the card clipped in the smaller window.
+After maximizing, 3 cancelled the displayed review. Its command
+produced no receipt and the original shell prompt was unchanged.
+Four focused native tests passed on Windows ARM64 before the layout
+change. The final layout passed the focused macOS tests and targeted
+Windows ARM64 Clippy with warnings denied.
+[Fedora baseline](target/verification/20261121-agent-tmux-scroll-wayland.log)
+· [Fedora scroll and decision verification](target/verification/20261121-agent-tmux-scroll-wayland-fixed.log)
+· [Windows ARM64 native tests](target/verification/20261121-agent-tmux-scroll-windows.log)
+· [Windows ARM64 final Clippy](target/verification/20261121-agent-tmux-scroll-windows-fixed-clippy.log)
+· [Apple Silicon tests](target/verification/20261121-agent-tmux-scroll-macos-fixed.log).
+
+## November 21 Terminal Agent Neon Ticker
+
+The live d18 status and Settings preview share the 28 px ticker. Its
+opening flicker lasts 360 ms. Changes roll vertically and fade the
+outgoing label over 320 ms. The activity light pulses during a run,
+remains steady while paused, and uses amber when input is pending.
+Reduced animations shows each updated label immediately and keeps the
+light steady. The ticker retains elapsed time, step and token counts,
+and access to the run menu. Review opens the current Activity controls.
+The close button hides the ticker, and the Agent Panel menu restores it.
+The timing test covers the transition, pulse and reduced-motion state.
+Native desktop acceptance of the ticker remains open.
+[Java d18 reference](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignNeonTicker.java).
 
 ## November 21 Real OpenSSH sudo/PAM for the Terminal Agent
 

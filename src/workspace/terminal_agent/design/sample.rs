@@ -11,7 +11,7 @@ use crate::terminal_agent::design::{Arrangement, History, Layout, Status, inline
 use super::{
     AgentMessage, Desktop, DockExtents, DockPreferences, Message, Presentation, SampleLogCommand,
     SampleLogKey, Slot, adaptive_status, adaptive_timeline, compose, history, history_body,
-    log_table, pip, status, status_slot,
+    log_table, pip, placement, status, status_slot, tmux,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -149,6 +149,9 @@ impl Sample {
         if !next.final_answer.is_empty() {
             next.final_answer_at = self.transcript.final_answer_at.or(Some(clock));
         }
+        if next.state.finished() && !self.transcript.state.finished() {
+            self.presentation.finished(now);
+        }
         self.transcript = next;
         self.presentation.sync_status(
             transcript,
@@ -188,25 +191,30 @@ impl Sample {
         self.presentation.status_events.ticking(now, reduced_motion)
     }
 
-    pub(in crate::workspace) fn log_table_refresh_interval(
+    pub(in crate::workspace) fn history_refresh_interval(
         &self,
         layout: Layout,
         now: Instant,
         reduced_motion: bool,
     ) -> Option<u64> {
-        if layout.history != History::LogTable
-            || (layout.arrangement == Arrangement::PictureInPicture
-                && !self.presentation.pip.shows_history())
+        if layout.arrangement == Arrangement::PictureInPicture
+            && !self.presentation.pip.shows_history()
         {
             return None;
         }
-        self.presentation.log_table.refresh_interval(
-            &self.transcript,
-            now,
-            !self.transcript.state.finished(),
-            self.transcript.state == inline::State::Running,
-            reduced_motion,
-        )
+        match layout.history {
+            History::LogTable => self.presentation.log_table.refresh_interval(
+                &self.transcript,
+                now,
+                !self.transcript.state.finished(),
+                self.transcript.state == inline::State::Running,
+                reduced_motion,
+            ),
+            History::Tmux => {
+                tmux::refresh_interval(&self.transcript, &self.presentation, now, reduced_motion)
+            }
+            _ => None,
+        }
     }
 
     pub(in crate::workspace) fn has_spotlight_preview(&self, now: Instant, layout: Layout) -> bool {
@@ -256,9 +264,10 @@ impl Sample {
             live_run: None,
             surface: super::log_table::Surface::Activity,
             owner: None,
+            tmux_review: None,
         };
         let controls = || -> Element<'a, AgentMessage> {
-            if let Some(command) = view.approval {
+            if let Some(command) = view.approval.filter(|_| layout.history != History::Tmux) {
                 column![
                     text(command).font(iced::Font::MONOSPACE).size(12),
                     row![
@@ -316,7 +325,11 @@ impl Sample {
                 .map(forward),
             )
         };
-        let side_width = view.dock.side_width(260.0);
+        let side_width = view.dock.side_width(placement::history_width(
+            layout.history,
+            bounds.width,
+            260.0,
+        ));
         let terminal = if layout.arrangement == Arrangement::Adaptive {
             status::adaptive_countdown(terminal, view.countdown, now, view.reduced_motion, None)
         } else {

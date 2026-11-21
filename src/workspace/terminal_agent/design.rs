@@ -28,7 +28,18 @@ mod presentation;
 mod runs;
 mod sample;
 mod status;
+mod tmux;
 mod toast;
+
+impl Run {
+    fn has_tmux_dock(&self) -> bool {
+        self.design.history == History::Tmux
+            && self.design.arrangement != Arrangement::PictureInPicture
+            && self.has_terminal_presentation()
+            && !self.closing
+            && !self.swarm
+    }
+}
 
 pub(crate) use activity::Change as ActivityChange;
 pub(in crate::workspace) use activity::Height;
@@ -43,6 +54,7 @@ pub(super) use presentation::{Presentation, Usage};
 pub(in crate::workspace) use sample::{
     Action as SampleAction, Grid as SampleGrid, Sample, View as SampleView,
 };
+pub(crate) use tmux::ReviewAction as TmuxReviewAction;
 
 pub(in crate::workspace) const AUTO_HIDE_SECONDS: std::ops::RangeInclusive<u8> = 0..=60;
 pub(in crate::workspace) const DEFAULT_AUTO_HIDE_SECONDS: u8 = 6;
@@ -161,6 +173,7 @@ pub(super) fn history_view<'a>(
         reduced_motion,
         log_table::Surface::Activity,
         owner,
+        None,
     )
 }
 
@@ -217,6 +230,7 @@ fn history_panel<'a>(
     palette: Option<Palette>,
     reduced_motion: bool,
     owner: (&'a State, window::Id),
+    tmux_review: Option<tmux::Review>,
 ) -> Element<'a, AgentMessage> {
     let (phase, _) = status::phase(run);
     let activity = history_with_steps(
@@ -225,6 +239,7 @@ fn history_panel<'a>(
         reduced_motion,
         log_table::Surface::Pane,
         owner,
+        tmux_review,
     );
     let controls = controls(run, owner.0.has_archived_activity(run));
     let body = history_body(activity, controls, run.design.approval);
@@ -254,6 +269,7 @@ fn history_with_steps<'a>(
     reduced_motion: bool,
     surface: log_table::Surface,
     owner: (&'a State, window::Id),
+    tmux_review: Option<tmux::Review>,
 ) -> Element<'a, AgentMessage> {
     if run.presentation.step_list_open {
         let surface = if surface == log_table::Surface::Detached {
@@ -263,7 +279,14 @@ fn history_with_steps<'a>(
         };
         status::step_list(run, surface)
     } else {
-        history::view(run, palette, reduced_motion, surface, Some(owner))
+        history::view(
+            run,
+            palette,
+            reduced_motion,
+            surface,
+            Some(owner),
+            tmux_review,
+        )
     }
 }
 
@@ -430,76 +453,79 @@ impl Workspace {
         if self.exiting {
             return Subscription::none();
         }
-        let interval = self
-            .terminal_agents
-            .runs
-            .values()
-            .filter(|run| {
-                !run.swarm
-                    && !run.closing
-                    && run.has_terminal_presentation()
-                    && (run.design.status != Status::Hidden
-                        || run.design.arrangement == Arrangement::Adaptive)
-                    && run.presentation.status_visibility.visible(seconds, now)
-            })
-            .filter_map(|run| {
-                let toasts = run.design.status == Status::Toasts
-                    && run.presentation.status_events.ticking(now, reduced_motion);
-                if toasts && !reduced_motion {
-                    return Some(16);
-                }
-                (toasts
-                    || run
-                        .presentation
-                        .status_visibility
-                        .deadline(seconds)
-                        .is_some()
-                    || run.active()
-                        && (matches!(run.design.status, Status::Spotlight | Status::Orbit)
-                            || run.design.arrangement == Arrangement::Adaptive
-                                && run.presentation.dock.get() == Dock::Pill))
-                    .then_some(100)
-            })
-            .chain(self.terminal_agents.runs.iter().filter_map(|(&id, run)| {
-                self.agent_log_table_interval(id, run, now, reduced_motion)
-            }))
-            .chain(
-                self.terminal_agents
-                    .runs
-                    .values()
-                    .any(Run::has_timed_input)
-                    .then_some(1000),
-            )
-            .chain(self.spotlight_animating(now).then_some(16))
-            .min();
+        let interval =
+            self.terminal_agents
+                .runs
+                .values()
+                .filter(|run| {
+                    !run.swarm
+                        && !run.closing
+                        && run.has_terminal_presentation()
+                        && (run.design.status != Status::Hidden
+                            || run.design.arrangement == Arrangement::Adaptive)
+                        && run.presentation.status_visibility.visible(seconds, now)
+                })
+                .filter_map(|run| {
+                    let toasts = run.design.status == Status::Toasts
+                        && run.presentation.status_events.ticking(now, reduced_motion);
+                    if toasts && !reduced_motion {
+                        return Some(16);
+                    }
+                    (toasts
+                        || run
+                            .presentation
+                            .status_visibility
+                            .deadline(seconds)
+                            .is_some()
+                        || run.active()
+                            && (matches!(run.design.status, Status::Spotlight | Status::Orbit)
+                                || run.design.arrangement == Arrangement::Adaptive
+                                    && run.presentation.dock.get() == Dock::Pill))
+                        .then_some(100)
+                })
+                .chain(self.terminal_agents.runs.iter().filter_map(|(&id, run)| {
+                    self.agent_history_interval(id, run, now, reduced_motion)
+                }))
+                .chain(
+                    self.terminal_agents
+                        .runs
+                        .values()
+                        .any(Run::has_timed_input)
+                        .then_some(1000),
+                )
+                .chain(self.spotlight_animating(now).then_some(16))
+                .min();
         interval.map_or_else(Subscription::none, |millis| {
             crate::workspace::scheduler_access::desktop_clock(Duration::from_millis(millis))
                 .map(|()| Desktop::AgentStatusClock)
         })
     }
 
-    fn agent_log_table_interval(
+    fn agent_history_interval(
         &self,
         id: window::Id,
         run: &Run,
         now: Instant,
         reduced_motion: bool,
     ) -> Option<u64> {
-        if run.design.history != History::LogTable
-            || run.swarm
-            || run.closing
-            || run.reopened_history
+        if run.swarm || run.closing || (run.reopened_history && run.design.history != History::Tmux)
         {
             return None;
         }
         let (transcript, _) = run.status_transcript()?;
-        let interval = run.presentation.log_table.refresh_interval(
-            transcript,
-            now,
-            run.active(),
-            !run.paused && !run.cancel.requested(),
-            reduced_motion,
-        )?;
+        let interval = match run.design.history {
+            History::LogTable => run.presentation.log_table.refresh_interval(
+                transcript,
+                now,
+                run.active(),
+                !run.paused && !run.cancel.requested(),
+                reduced_motion,
+            ),
+            History::Tmux => {
+                tmux::refresh_interval(transcript, &run.presentation, now, reduced_motion)
+            }
+            _ => None,
+        }?;
         if run.runs_in_chat_tab()
             && self
                 .hosted_tool_owner(id)
@@ -514,7 +540,8 @@ impl Workspace {
         if self.placed_dialog_owner(id).is_some() {
             return Some(interval);
         }
-        if run.presentation.step_list_open {
+        if run.presentation.step_list_open || (run.has_tmux_dock() && run.presentation.tmux_hidden)
+        {
             return None;
         }
         let source = run.binding.live().ok()?;
@@ -567,6 +594,28 @@ impl Workspace {
         }
     }
 
+    fn agent_tmux_target(&self, owner: window::Id) -> Option<window::Id> {
+        let session = self.windows.get(&owner)?.tab()?.focused_session()?;
+        let stream = self.sessions.get(&session)?.stream_generation;
+        let (id, run) = self
+            .terminal_agents
+            .agent_activity_for_stream(session, stream)?;
+        (run.has_tmux_dock() && self.current_run_pane(run).is_ok()).then_some(id)
+    }
+
+    pub(in crate::workspace) fn agent_tmux_available(&self, owner: window::Id) -> bool {
+        self.agent_tmux_target(owner).is_some()
+    }
+
+    pub(in crate::workspace) fn toggle_agent_tmux(&mut self, owner: window::Id) {
+        if let Some(id) = self.agent_tmux_target(owner)
+            && let Some(run) = self.terminal_agents.runs.get_mut(&id)
+        {
+            run.presentation
+                .set_tmux_hidden(!run.presentation.tmux_hidden);
+        }
+    }
+
     pub(in crate::workspace) fn cancel_agent_dock_resizes(&mut self) {
         for run in self.terminal_agents.runs.values_mut() {
             run.presentation.dock_resize = None;
@@ -586,6 +635,7 @@ impl Workspace {
         let current = self.terminal_agents.runs.get(&id).and_then(|run| {
             if run.swarm
                 || run.closing
+                || (run.has_tmux_dock() && run.presentation.tmux_hidden)
                 || run.design.arrangement != Arrangement::Normal
                 || dock.history_slot(run.design) != Some(resize.side)
                 || !matches!(resize.side, Slot::Left | Slot::Right | Slot::Bottom)
@@ -670,19 +720,24 @@ impl Workspace {
         let has_archive = agents.has_archived_activity(run);
         let picture_in_picture = run.design.arrangement == Arrangement::PictureInPicture;
         let dock = self.window_settings.ai_agent_panel;
-        let history_position = dock.history_slot(run.design);
+        let history_position = dock
+            .history_slot(run.design)
+            .filter(|_| !run.has_tmux_dock() || !run.presentation.tmux_hidden);
+        let tmux_review = self.tmux_review(id, run);
         let activity = &run.presentation.activity;
         let bottom_height = fitted_activity_height(
             bounds.height,
             activity.preview.unwrap_or(activity.height),
             activity.collapsed,
         );
+        let nominal_width =
+            placement::history_width(run.design.history, bounds.width, cell.width * 40.0);
         let side_width = run
             .presentation
             .dock_resize
             .filter(|(expected, _)| *expected == dock)
             .map_or_else(
-                || dock.side_width(cell.width * 40.0),
+                || dock.side_width(nominal_width),
                 |(_, width)| f32::from(width),
             );
         let history = history_position.map(|side| {
@@ -714,14 +769,28 @@ impl Workspace {
                 panel = panel.push(header);
                 if !activity.collapsed {
                     panel = panel.push(
-                        history_panel(run, chooser(), palette, reduced_motion, (agents, id))
-                            .map(move |message| Desktop::TerminalAgent(id, message)),
+                        history_panel(
+                            run,
+                            chooser(),
+                            palette,
+                            reduced_motion,
+                            (agents, id),
+                            tmux_review,
+                        )
+                        .map(move |message| Desktop::TerminalAgent(id, message)),
                     );
                 }
                 return panel.height(Length::Fill).into();
             }
-            let history = history_panel(run, chooser(), palette, reduced_motion, (agents, id))
-                .map(move |message| Desktop::TerminalAgent(id, message));
+            let history = history_panel(
+                run,
+                chooser(),
+                palette,
+                reduced_motion,
+                (agents, id),
+                tmux_review,
+            )
+            .map(move |message| Desktop::TerminalAgent(id, message));
             if run.design.arrangement != Arrangement::Normal
                 || !matches!(side, Slot::Left | Slot::Right)
             {
@@ -851,7 +920,7 @@ mod dock_tests {
         );
         let interval = |fixture: &Fixture, time, reduced_motion| {
             let workspace = &fixture.workspace;
-            workspace.agent_log_table_interval(
+            workspace.agent_history_interval(
                 id,
                 &workspace.terminal_agents.runs[&id],
                 time,

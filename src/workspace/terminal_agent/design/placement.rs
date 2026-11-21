@@ -254,6 +254,14 @@ pub(super) fn fitted_side_width(available: f32, requested: f32, both_sides: bool
     requested.min(available * if both_sides { 0.30 } else { 0.45 })
 }
 
+pub(super) fn history_width(history: History, available: f32, default: f32) -> f32 {
+    if history == History::Tmux {
+        (available * 0.4).clamp(280.0, 640.0)
+    } else {
+        default
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

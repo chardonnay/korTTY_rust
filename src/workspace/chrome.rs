@@ -348,6 +348,7 @@ pub enum Action {
     AgentPanelLeft,
     AgentPanelRight,
     ToggleAgentStatus,
+    ToggleAgentTmux,
     AgentSpotlight,
 }
 
@@ -462,6 +463,7 @@ impl Branch {
                 Item(AgentPanelDesign),
                 Item(AgentSpotlight),
                 Item(ToggleAgentStatus),
+                Item(ToggleAgentTmux),
             ],
             Self::RemoteSidebar => &[
                 Item(RemoteSidebarLeft),
@@ -916,6 +918,7 @@ impl Action {
             AgentPanelRight => "Dock Right",
             AgentSpotlight => "Ask in Spotlight…",
             ToggleAgentStatus => "Show or Hide Status Bar",
+            ToggleAgentTmux => "Show or Hide Agent History",
             TeamworkSettings => "Teamwork Settings…",
             LogfileManager => "Logfile Manager…",
             SessionProcesses => "Session Processes…",
@@ -1551,6 +1554,10 @@ impl Workspace {
                 self.toggle_agent_status(id);
                 return Task::none();
             }
+            ToggleAgentTmux => {
+                self.toggle_agent_tmux(id);
+                return Task::none();
+            }
             AgentSpotlight => return self.open_agent_spotlight(id),
             QuickConnect => return self.show_quick_connect(id),
             QuickSelect => return self.start_quick_select(id),
@@ -1669,6 +1676,7 @@ impl Workspace {
             | HideTerminalScrollbarsFullscreen => self.windows.contains_key(&id),
             ToggleSessionJournal => self.journal_toggle_enabled(id),
             ToggleAgentStatus => self.agent_status_available(id),
+            ToggleAgentTmux => self.agent_tmux_available(id),
             AgentSpotlight => self.agent_spotlight_available(id),
             SavedChats => self.windows.contains_key(&id) && self.ai_chat_enabled(),
             AgentSwarm => self.windows.contains_key(&id) && self.agent_swarm_available(),
@@ -2737,6 +2745,7 @@ fn native_menu_requires_focused_owner(action: Action) -> bool {
             | AgentPanelRight
             | AgentSpotlight
             | ToggleAgentStatus
+            | ToggleAgentTmux
             | ToggleCodingAgents
             | NextBlockedCodingAgent
             | TerminalAgent

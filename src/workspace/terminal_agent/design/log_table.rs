@@ -811,7 +811,7 @@ fn event(message: Message) -> AgentMessage {
     AgentMessage::Design(presentation::Message::LogTable(message))
 }
 
-fn kind(step: &Step) -> &'static str {
+pub(super) fn kind(step: &Step) -> &'static str {
     match step.kind {
         Kind::Thinking => "AI",
         Kind::Action => "Command",
@@ -1416,6 +1416,7 @@ mod tests {
             live_run: None,
             surface: Surface::Activity,
             owner: None,
+            tmux_review: None,
         };
         let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
         let mut cache = Cache::default();
@@ -1519,6 +1520,7 @@ mod tests {
                 live_run: None,
                 surface: Surface::Activity,
                 owner: None,
+                tmux_review: None,
             };
             scrollable(iced::widget::column![
                 space().height(90.0),
@@ -1709,6 +1711,7 @@ mod tests {
                 live_run: None,
                 surface: Surface::Activity,
                 owner: None,
+                tmux_review: None,
             };
             UserInterface::build(
                 view(info, transcript, None, true),

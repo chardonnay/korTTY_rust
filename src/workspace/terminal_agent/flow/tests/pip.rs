@@ -493,7 +493,7 @@ fn focused_agent_log_table_gets_keys_before_the_embedded_terminal() {
     assert_eq!(fixture.run(id).epoch, epoch);
 }
 
-fn click_log_label(
+pub(super) fn click_log_label(
     ui: &mut UserInterface<'_, Desktop, iced::Theme, Renderer>,
     renderer: &mut Renderer,
     label: &str,
@@ -542,7 +542,7 @@ fn history_modules_open_the_actions_for_the_exact_recorded_step() {
         (History::PlanExecution, "1  First receipt"),
         (History::CardStack, "1 · First receipt"),
         (History::Conversation, "Agent · First receipt"),
-        (History::Tmux, "First receipt"),
+        (History::Tmux, "printf fixture"),
         (History::Transcript, "First receipt"),
     ] {
         let mut fixture = Fixture::new(false, false);

@@ -174,6 +174,7 @@ fn body<'a>(
                     super::log_table::Surface::Pane
                 },
                 (state, id),
+                None,
             ))
             .push(super::controls_with_menu(run, None));
     }
