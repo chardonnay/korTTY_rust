@@ -16,6 +16,82 @@ open until a result is recorded for the tested revision and environment. Both
 Mosh modes are out of scope. The editor has a reduced native scope with structure
 navigation for classes, functions, variables, and placeholders.
 
+## November 21 Real OpenSSH sudo/PAM for the Terminal Agent
+
+Fedora ARM64 verified the accepted-plan preflight over a pinned OpenSSH
+connection with system sudo and PAM. A private loopback server used a
+synthetic login and isolated sudo policy and timestamps. The direct
+transport and the native Landlock-confined worker each rejected a wrong
+vault password. Both requested a fresh approval for the retry and reached
+model review after successful authentication. The separately approved
+command reused the run's authenticated PTY and wrote receipts with
+effective UID and file-owner UID zero in the reviewed directory. The model
+received no implementation request before authentication, and the
+receipts did not exist before command approval.
+
+Fedora ARM64 passed 228 selected application tests and both opt-in real
+PAM tests. Apple Silicon passed 227 selected application tests and the
+separate OpenSSH test with simulated sudo. Native macOS system sudo
+acceptance remains open.
+[Fedora direct and sandboxed OpenSSH](target/verification/20261121-agent-openssh-real-pam-fedora.log)
+· [Apple Silicon regression](target/verification/20261121-agent-ssh-pam-macos-regression.log).
+
+## November 21 Flatpak host sudo for the Terminal Agent
+
+A standalone run can offer manual sudo authentication on its reviewed
+Flatpak host shell. The application keeps the reviewed directory open. The
+private host PTY checks the physical path and filesystem identity before
+starting sudo. The authenticated PTY stays bound to the host route and each
+elevated command requires its own approval.
+
+Fedora ARM64 passed 228 selected native tests. A separate application test
+inside a disposable Flatpak build used the actual host D-Bus service and a
+simulated sudo challenge. It verified that the reviewed shared directory
+could receive the challenge and accept command input after authentication.
+It also verified that the runtime's private `/usr` could never request a
+password, and that cancelling a challenge closed the private host process.
+
+A second Fedora ARM64 test used the system sudo and PAM modules through
+the actual Flatpak host service. The fixture ran as a synthetic account
+with a private filesystem, PAM configuration and sudo timestamps. The
+wrong password was rejected. The correct password authenticated the
+private PTY. A separately approved command reused that PTY without
+another prompt and wrote a root-owned result in the reviewed directory.
+[Fedora Flatpak system sudo/PAM tests](target/verification/20261121-agent-flatpak-real-pam-fedora.log).
+
+The ARM64 release bundle built against the Freedesktop 25.08 SDK,
+installed in a private Flatpak deployment and passed the runtime link
+checks. The packaged CLI answered a desktop Control API request under
+headless native Wayland and verified output from a connected host
+terminal. The bundle contains 28,974,336 bytes and has SHA-256
+`074bc0080cb32057078704cce1d8b532c88ff77e2767aaaba9cb20cbc473af8c`.
+[Flatpak build and installation](target/verification/20261121-agent-flatpak-release-wording.log)
+· [Flatpak Wayland desktop](target/verification/20261121-agent-flatpak-wayland-release-final.log).
+
+The installed ARM64 desktop also passed the interactive flow on native
+X11 in a disposable Fedora account. The test loaded the shipped Bash
+integration for prompt marks and the working directory. The `agent-plan`
+shortcut opened Planning. The test exercised separate approvals for the
+probe, planning requests and completed report, then approved a fresh
+probe in the separate Agent window. The private host terminal rejected one wrong
+password. The separately authorized retry authenticated successfully.
+There was no implementation request before authentication and no
+privileged result before command approval. The approved command reused
+the private terminal and wrote a root-owned receipt with effective UID
+zero. The run finished after its final model review. The loopback model
+fixture and checked profile files contained neither test password.
+The repeated test also checked that the model review describes a private
+sudo terminal for the local route.
+[Packaged interactive approval](target/verification/20261121-agent-flatpak-pam-desktop-final.log).
+
+Apple Silicon passed 227 selected tests and the separate local sudo review
+test. The Ask attachment test now waits for native directory verification
+before starting its review. It passed 20 consecutive repetitions after an
+initial startup race. Windows ARM64 passed strict workspace Clippy.
+[Fedora native and Flatpak tests](target/verification/20261121-agent-flatpak-sudo-fedora-retry.log)
+· [Apple Silicon tests](target/verification/20261121-agent-flatpak-sudo-macos-retry.log)
+· [Windows ARM64 Clippy](target/verification/20261121-agent-flatpak-sudo-windows.log).
+
 ## November 21 Native Agent entry from saved custom shell profiles
 
 The saved-profile test reopens the catalogue, starts the configured shell in

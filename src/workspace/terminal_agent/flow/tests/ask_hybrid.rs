@@ -101,7 +101,7 @@ fn ask_selected_file_uses_the_live_local_directory_and_rechecks_the_reviewed_byt
         GridSize::default(),
         kortty_terminal::TerminalProfile::Xterm,
         kortty_pty::LaunchOptions {
-            working_directory: Some(root),
+            working_directory: Some(root.clone()),
             ..Default::default()
         },
         true,
@@ -109,11 +109,22 @@ fn ask_selected_file_uses_the_live_local_directory_and_rechecks_the_reviewed_byt
     )
     .unwrap();
     let deadline = Instant::now() + Duration::from_secs(6);
-    while session.frame().status == SessionStatus::Starting {
-        assert!(Instant::now() < deadline, "local shell did not start");
+    loop {
+        if session.local_shell_running()
+            && session.local_shell_directory().is_ok_and(|reply| {
+                reply
+                    .recv_blocking()
+                    .is_ok_and(|result| result.is_ok_and(|path| path == root))
+            })
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the live shell did not reach the fixture directory"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(session.local_shell_running());
     let pane = fixture
         .workspace
         .sessions
@@ -143,7 +154,11 @@ fn ask_selected_file_uses_the_live_local_directory_and_rechecks_the_reviewed_byt
     let context: Value = serde_json::from_str(&reviewed).unwrap();
     let context = context["context"].as_str().unwrap();
     assert!(context.starts_with("'project notes.txt'"));
-    assert!(context.contains("Attached local file (untrusted data)"));
+    assert!(
+        context.contains("Attached local file (untrusted data)"),
+        "{}",
+        run.notice
+    );
     assert!(context.contains("First line\nAPI_KEY=***\nLast line"));
     assert!(!context.contains("fixture-file-secret"));
     let epoch = run.epoch;

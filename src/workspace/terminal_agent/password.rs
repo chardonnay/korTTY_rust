@@ -193,13 +193,16 @@ impl Workspace {
         }
         #[cfg(unix)]
         if run.local_sudo_available
-            && run.supports_native_local_sudo()
-            && let Some(RunTarget::Attached(Target::Local { directory, .. })) = &run.target
+            && let Some(route) = run.local_sudo_route()
+            && let Some(RunTarget::Attached(Target::Local { directory, shell })) = &run.target
         {
-            self.current_run_pane(run)?;
+            let (_, pane) = self.current_run_pane(run)?;
+            if super::flow::local_agent_shell(pane).as_ref() != Ok(shell) {
+                return Err("The reviewed local shell is no longer available.".into());
+            }
             directory.require_current()?;
             return Ok(Connection {
-                endpoint: Endpoint::Local(directory.clone()),
+                endpoint: Endpoint::Local(directory.clone(), route),
                 ssh: None,
                 directory: directory
                     .path()
@@ -280,8 +283,13 @@ impl Workspace {
                     .fingerprint(),
             ),
             #[cfg(unix)]
-            Endpoint::Local(_) => format!(
+            Endpoint::Local(_, engine::password::LocalRoute::Native) => format!(
                 "Local shell · {}",
+                mask::prompt(&run.redactor, &connection.directory)?
+            ),
+            #[cfg(target_os = "linux")]
+            Endpoint::Local(_, engine::password::LocalRoute::FlatpakHost) => format!(
+                "Flatpak host shell · {}",
                 mask::prompt(&run.redactor, &connection.directory)?
             ),
         };
@@ -320,7 +328,7 @@ impl Workspace {
         };
         let plan_probe = run.uses_plan_sudo_probe();
         #[cfg(unix)]
-        if run.supports_native_local_sudo() && !plan_probe {
+        if run.supports_local_sudo() && !plan_probe {
             run.local_sudo_available = local_probe_has_sudo(outcome, target.directory());
         }
         if !plan_probe {
@@ -330,7 +338,7 @@ impl Workspace {
             mask::prompt(&run.redactor, text)
         })?;
         #[cfg(unix)]
-        if run.supports_native_local_sudo() {
+        if run.supports_local_sudo() {
             run.local_sudo_available = snapshot.has_sudo_as_non_root();
         }
         if !snapshot.needs_password_sudo() {
@@ -425,7 +433,7 @@ impl Workspace {
     ) -> Result<Task<Desktop>, String> {
         let AuthenticationReview { scope, credential } = authentication;
         let preflight = command.is_none();
-        let target = (preflight || run.supports_native_local_sudo())
+        let target = (preflight || run.supports_local_sudo())
             .then(|| self.planning_probe_target(run).map(Arc::new))
             .transpose()?;
         let authorization = match (source, &run.sudo_terminal) {

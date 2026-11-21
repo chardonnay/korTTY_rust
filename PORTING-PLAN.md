@@ -1175,19 +1175,36 @@ Run with a fresh probe approval. Keep plan for later retains the report in
 Planning. Verify both actions and the report preview on native desktops.
 [Java implementation entry point](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AiAgentPlanTab.java#L561)
 
-An implementation run on SSH or in a native POSIX shell offers sudo
-authentication before its first model request when the fresh approved probe
-finds a non-root account with sudo and passwordless sudo is unavailable.
+An implementation run on SSH, in a native POSIX shell or in a Flatpak host
+shell offers sudo authentication before its first model request when the
+fresh approved probe finds a non-root account with sudo and passwordless
+sudo is unavailable.
 The user can authorize manual password entry or continue to model review.
 SSH also offers a matching vault credential. The run retains its private
 authenticated terminal and continues to review each elevated command
 separately. Rejected preflight authentication permits up to three separately
 approved retries. The native local PTY starts from the opened directory
 descriptor and checks its working directory before privileged commands.
-Fedora ARM64 passed isolated SSH with simulated sudo and local system
-sudo/PAM for a synthetic account in a disposable namespace. Verify the
-desktop choices and policy changes, configured SSH sudo/PAM, native macOS
-sudo, and the Flatpak host route.
+Flatpak checks the physical path and identity against the opened directory
+before prompting on a private host PTY. Authentication stays bound to that
+route for subsequent approved commands.
+Fedora ARM64 passed native local system sudo/PAM and real OpenSSH sudo/PAM
+for synthetic accounts in disposable namespaces. The direct and
+Landlock-confined SSH paths rejected a wrong vault password, approved a
+fresh retry, and reused the authenticated terminal for a separately
+approved command in the pinned directory. A separate
+Flatpak test used the actual host service to verify prompt handling,
+directory rejection and cancellation. The system sudo/PAM fixture also
+passed through the Flatpak host service. It rejected an incorrect password
+and reused the authenticated private PTY for a separately approved elevated
+command. The ARM64 release bundle passed installation, native Wayland
+startup and a packaged CLI check of the host terminal. A separate native
+X11 run of the installed bundle accepted a plan, rejected a wrong password,
+accepted an explicitly approved retry and ran the separately approved step
+through its private sudo terminal. Verify the remaining desktop choices
+and policy changes and native macOS sudo.
+[OpenSSH sudo/PAM verification](PORTING-PARITY.md#november-21-real-openssh-sudopam-for-the-terminal-agent)
+[Flatpak sudo and package verification](PORTING-PARITY.md#november-21-flatpak-host-sudo-for-the-terminal-agent)
 [Java sudo preflight](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/core/TerminalAgentService.java#L1620)
 
 The Planning tab shows all clarifying questions together. Users can revise
