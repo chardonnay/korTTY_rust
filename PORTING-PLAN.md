@@ -1184,8 +1184,10 @@ authenticated terminal and continues to review each elevated command
 separately. Rejected preflight authentication permits up to three separately
 approved retries. The native local PTY starts from the opened directory
 descriptor and checks its working directory before privileged commands.
-Verify the desktop choices, policy changes, isolated SSH and configured
-sudo/PAM. Assess the Flatpak host route separately.
+Fedora ARM64 passed isolated SSH with simulated sudo and local system
+sudo/PAM for a synthetic account in a disposable namespace. Verify the
+desktop choices and policy changes, configured SSH sudo/PAM, native macOS
+sudo, and the Flatpak host route.
 [Java sudo preflight](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/core/TerminalAgentService.java#L1620)
 
 The Planning tab shows all clarifying questions together. Users can revise

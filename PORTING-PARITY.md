@@ -30,9 +30,13 @@ one optional local directory-replacement regression and 14 local PTY tests.
 Fedora ARM64 passed the same Agent, OpenSSH and directory-replacement
 checks and 13 local PTY tests. The new PTY regression used a simulated sudo
 dialogue and verified that the approved input reached the authenticated
-terminal from the original directory. Windows ARM64 passed strict workspace
-Clippy. Real sudo/PAM, interactive desktop acceptance and the Flatpak host
-route remain under A2.
+terminal from the original directory. A separate Fedora test with system
+sudo and PAM in a disposable namespace rejected a wrong password, accepted
+the test account's password, and reused the authenticated PTY for a
+separately approved command. Five pinned OpenSSH tests passed, including
+preflight with simulated sudo through the isolated worker. Windows ARM64
+passed strict workspace Clippy. Configured SSH sudo/PAM, native desktop
+acceptance and the Flatpak host route remain under A2.
 [Apple Silicon tests](target/verification/20261121-local-sudo-macos-final.log)
 · [Fedora ARM64 tests](target/verification/20261121-local-sudo-fedora-final.log)
 · [Windows ARM64 Clippy](target/verification/20261121-local-sudo-windows-clippy-final.log)
@@ -51,9 +55,9 @@ Apple Silicon passed 238 selected tests with seven ignored and passed four
 separately enabled OpenSSH regressions. The new live SSH fixture simulated
 sudo rejection and acceptance. It verified the retry, the skip path, the
 separate command review and reuse of the authenticated terminal. Windows
-ARM64 passed strict workspace Clippy. Desktop password entry, actual
-sudo/PAM for the new preflight, the isolated SSH route and local POSIX sudo
-remain under A2.
+ARM64 passed strict workspace Clippy. The Fedora follow-up also covers
+simulated sudo on the isolated SSH route. Configured SSH sudo/PAM and
+interactive desktop password entry remain under A2.
 [Apple Silicon tests](target/verification/20261121-planning-sudo-macos-final.log)
 · [Windows ARM64 Clippy](target/verification/20261121-planning-sudo-windows-clippy-final.log)
 
