@@ -33,6 +33,11 @@ impl SensitiveLine {
         writer.write_all(&self.0)
     }
 
+    /// Consumes the line while writing it to a private authentication terminal.
+    pub fn write_unframed(self, writer: &mut impl io::Write) -> io::Result<()> {
+        writer.write_all(&self.0)
+    }
+
     /// Reads one length-prefixed line directly into zeroizing storage.
     pub fn read_wire(reader: &mut impl io::Read) -> io::Result<Self> {
         let mut length = [0; 4];

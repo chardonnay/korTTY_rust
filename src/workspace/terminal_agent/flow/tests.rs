@@ -1995,3 +1995,67 @@ fn agent_password_sudo_completion_cannot_restore_a_cancelled_run() {
     assert!(fixture.run(id).phase == Phase::Cancelled);
     assert!(fixture.run(id).sudo_terminal.is_none());
 }
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires installed system sudo on a native POSIX desktop"]
+fn native_local_sudo_preflight_rechecks_the_reviewed_directory() {
+    use crate::local_ai::test_support::{exclusive_run, listener};
+
+    let _serial = exclusive_run();
+    let (model, _) = listener();
+    let mut fixture =
+        Fixture::with_endpoint(false, false, &model.local_addr().unwrap().to_string());
+    fixture
+        .workspace
+        .window_settings
+        .terminal_notifications
+        .ai_runs = false;
+    let root = fixture.profile.0.canonicalize().unwrap();
+    let directory = root.join("reviewed");
+    std::fs::create_dir(&directory).unwrap();
+    let target = Target::Local {
+        shell: Shell::Posix(PathBuf::from("/bin/sh")),
+        directory: LocalDirectory::capture(directory.clone()).unwrap(),
+    };
+    let outcome = target.clone().execute(
+        "printf '%s\n' osRelease=Fixture alreadyRoot=false sudoAvailable=true passwordlessSudo=false; printf 'currentDir='; /bin/pwd -P",
+        &engine::Cancel::default(),
+        || {},
+    ).unwrap();
+
+    let id = fixture.open(Mode::Run);
+    let run = fixture.run_mut(id);
+    run.goal = "Review local directory metadata".into();
+    run.plan = Some("Inspect the reviewed directory.".into());
+    run.target = Some(RunTarget::Attached(target));
+    let epoch = run.next(Phase::Probe, "Running the approved probe");
+    let done = fixture.send(id, Message::Command(epoch, Arc::new(Ok(outcome))));
+    finish_agent_task(&mut fixture, done);
+    let run = fixture.run(id);
+    assert!(run.phase == Phase::SudoPreflight, "{}", run.notice);
+    let review = run.sudo_preflight.as_ref().unwrap();
+    assert!(review.destination().contains(directory.to_str().unwrap()));
+    assert!(review.credential_label().is_none());
+    assert!(fixture.workspace.password_sudo_available(run));
+    let epoch = run.epoch;
+
+    std::fs::rename(&directory, root.join("original")).unwrap();
+    std::fs::create_dir(&directory).unwrap();
+    let stale = fixture.send(
+        id,
+        Message::Password(password::Message::AuthenticatePlan(
+            epoch,
+            password::Source::Manual,
+        )),
+    );
+    finish_agent_task(&mut fixture, stale);
+    let run = fixture.run(id);
+    assert!(
+        run.phase == Phase::Blocked && run.notice.contains("directory changed"),
+        "{}",
+        run.notice
+    );
+    assert!(run.sudo_terminal.is_none());
+    assert!(matches!(model.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
+}

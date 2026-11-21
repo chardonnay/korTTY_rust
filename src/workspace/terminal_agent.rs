@@ -193,12 +193,14 @@ enum Phase {
     Question,
     Running,
     Elevated,
+    SudoPreflight,
     SudoChallenge,
     SudoPassword,
     SudoRunning,
     ScriptValidation,
     Paused,
     PlanReady,
+    PlanImplementationReview,
     PlanHandedOff,
     PlanQuestions,
     PlanOptions,
@@ -250,9 +252,11 @@ impl Phase {
             return None;
         }
         match self {
-            Self::ProbeApproval | Self::Approval | Self::PlanOptions | Self::TriageChoice => {
-                Some(AiRunNotice::Approval)
-            }
+            Self::ProbeApproval
+            | Self::Approval
+            | Self::SudoPreflight
+            | Self::PlanOptions
+            | Self::TriageChoice => Some(AiRunNotice::Approval),
             Self::SudoPassword => Some(AiRunNotice::Password),
             Self::Finished => Some(AiRunNotice::Finished),
             Self::Failed | Self::Blocked if before != Self::Setup => Some(AiRunNotice::Stopped),
@@ -322,7 +326,11 @@ struct Run {
     cancel: Cancel,
     ai_cancel: Option<local_ai::Cancel>,
     password: Option<password::Pending>,
+    sudo_preflight: Option<password::AuthenticationReview>,
+    sudo_preflight_attempts: u8,
     sudo_terminal: Option<password::Authenticated>,
+    #[cfg(unix)]
+    local_sudo_available: bool,
 }
 
 struct ReviewedCommand {
@@ -503,6 +511,10 @@ impl Run {
             ai_cancel: None,
             password: None,
             sudo_terminal: None,
+            sudo_preflight: None,
+            sudo_preflight_attempts: 0,
+            #[cfg(unix)]
+            local_sudo_available: false,
         }
     }
 
@@ -553,8 +565,10 @@ impl Run {
                     | Phase::ProbeApproval
                     | Phase::Approval
                     | Phase::Question
+                    | Phase::SudoPreflight
                     | Phase::SudoPassword
                     | Phase::PlanReady
+                    | Phase::PlanImplementationReview
                     | Phase::PlanQuestions
                     | Phase::PlanOptions
                     | Phase::TriageChoice
@@ -582,6 +596,7 @@ impl Run {
             self.auto_approve_root = false;
             self.revoke_command_approval();
             self.model_review = None;
+            self.sudo_preflight = None;
             self.sudo_terminal = None;
             self.chat_handoff_notice = Some(notice.into());
         }
@@ -625,6 +640,7 @@ impl Run {
         self.batch_commands = None;
         self.question = None;
         self.password = None;
+        self.sudo_preflight = None;
         self.sudo_terminal = None;
         if self.phase.working() {
             self.notice = "Cancelling the active agent operation…".into();

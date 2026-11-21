@@ -143,8 +143,10 @@ impl Presentation {
                 | Phase::ProbeApproval
                 | Phase::Approval
                 | Phase::Question
+                | Phase::SudoPreflight
                 | Phase::SudoPassword
                 | Phase::PlanReady
+                | Phase::PlanImplementationReview
                 | Phase::PlanQuestions
                 | Phase::PlanOptions
                 | Phase::TriageChoice

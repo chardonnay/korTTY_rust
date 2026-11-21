@@ -64,6 +64,50 @@ fn armed_marker(nonce: [u8; 16]) -> String {
     format!("KORTTY_SUDO_ARMED_{}", token(nonce))
 }
 
+#[cfg(unix)]
+pub fn local_arguments(nonce: [u8; 16]) -> Vec<String> {
+    vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        SCRIPT.into(),
+        "kortty-sudo".into(),
+        password::marker(nonce),
+        token(nonce),
+        armed_marker(nonce),
+    ]
+}
+
+pub struct Validation<'a> {
+    armed: Marker,
+    prompt: Prompt<'a>,
+    status: Reply,
+}
+
+impl<'a> Validation<'a> {
+    pub fn new(nonce: [u8; 16], prompt: &'a str) -> Self {
+        Self {
+            armed: Marker::new(&armed_marker(nonce)),
+            prompt: Prompt::new(prompt),
+            status: Reply::new(&token(nonce)),
+        }
+    }
+
+    pub fn observe(&mut self, bytes: &[u8]) -> Result<(Option<u32>, bool), Status> {
+        let status = self
+            .status
+            .observe(bytes)
+            .map_err(|_| Status::TransportFailed)?;
+        let prompted = self
+            .armed
+            .after(bytes)
+            .is_some_and(|bytes| self.prompt.observe(bytes));
+        if status == Some(0) && !self.armed.found() {
+            return Err(Status::TransportFailed);
+        }
+        Ok((status, prompted))
+    }
+}
+
 pub struct Authenticated {
     pub reader: SshReader,
     pub writer: SshWriter,
@@ -79,9 +123,7 @@ pub fn authenticate(
 ) -> Result<Authenticated, Status> {
     let mut reader = lease.take_reader().ok_or(Status::TransportFailed)?;
     let marker = password::marker(nonce);
-    let mut prompt = Prompt::new(&marker);
-    let mut status = Reply::new(&token(nonce));
-    let mut armed = Marker::new(&armed_marker(nonce));
+    let mut validation = Validation::new(nonce, &marker);
     let mut buffer = Zeroizing::new([0; 8192]);
     let mut deadline = Instant::now() + CHALLENGE_LIMIT;
     let mut challenge = Some(challenge);
@@ -100,16 +142,14 @@ pub fn authenticate(
                     .map_or(Status::MissingExitCode, Status::Exited));
             }
             Ok(count) => {
-                let completed = status.observe(&buffer[..count]);
-                let prompted = armed
-                    .after(&buffer[..count])
-                    .is_some_and(|bytes| prompt.observe(bytes));
+                let event = validation.observe(&buffer[..count]);
                 buffer[..count].zeroize();
-                if let Some(code) = completed.map_err(|_| Status::TransportFailed)? {
+                let (completed, prompted) = event?;
+                if let Some(code) = completed {
                     if code != 0 {
                         return Err(Status::Exited(code));
                     }
-                    if !armed.found() || (challenge.is_none() && writer.is_none()) {
+                    if challenge.is_none() && writer.is_none() {
                         return Err(Status::TransportFailed);
                     }
                     let writer = writer

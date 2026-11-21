@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use iced::widget::{button, column, row, scrollable, text, text_editor, text_input};
+use iced::widget::{button, column, row, scrollable, text, text_editor};
 use iced::{Element, Length, Task, window};
 
 use crate::terminal_agent::planning::store::{self, Destination, Record};
@@ -22,14 +22,20 @@ use super::{
 mod tests;
 
 const MAX_REFINEMENT_BYTES: usize = 2048;
+const MAX_CUSTOM_ANSWER_BYTES: usize = 1024;
 
 #[derive(Clone)]
 pub enum Message {
-    CustomAnswer(String),
-    Answer(u64, String),
+    SelectAnswer(u64, usize, usize),
+    EditCustomAnswer(u64, usize, text_editor::Action),
+    SubmitAnswers(u64),
+    EditAnswers(u64),
+    ReturnToResults(u64),
     EditRefinement(u64, text_editor::Action),
     Revise(u64),
     Choose(u64, usize),
+    PrepareImplementation(u64, usize),
+    KeepReport(u64),
     Progress(u64, usage::Progress),
     Reply(u64, Arc<usage::Report<Reply>>),
     Save,
@@ -41,15 +47,23 @@ pub enum Message {
     Storage(u64, Arc<Result<Vec<Record>, String>>),
 }
 
+#[derive(Default)]
+struct AnswerDraft {
+    selected: usize,
+    custom: text_editor::Content,
+}
+
 pub(super) struct Flow {
     destination: Destination,
     probe: Option<planning_probe::Snapshot>,
     questions: Vec<Question>,
     answers: Vec<String>,
-    custom_answer: String,
+    answer_drafts: Vec<AnswerDraft>,
+    pending_answers: Option<Vec<String>>,
     refinement: text_editor::Content,
     options: Vec<Approach>,
     chosen: Option<usize>,
+    review_implementation: bool,
     report: Option<Report>,
     records: Vec<Record>,
     deleting: Option<Record>,
@@ -64,10 +78,12 @@ impl Flow {
             probe: None,
             questions: Vec::new(),
             answers: Vec::new(),
-            custom_answer: String::new(),
+            answer_drafts: Vec::new(),
+            pending_answers: None,
             refinement: text_editor::Content::new(),
             options: Vec::new(),
             chosen: None,
+            review_implementation: false,
             report: None,
             records: Vec::new(),
             deleting: None,
@@ -85,49 +101,11 @@ impl Flow {
         let enabled = !run.paused && !run.cancel.requested();
         let size = run.fonts.plan;
         match run.phase {
-            Phase::PlanQuestions => {
-                let question = self.questions.get(self.answers.len())?;
-                let mut answers = row![].spacing(6);
-                for answer in &question.options {
-                    answers = answers.push(button(text(answer).size(size)).on_press_maybe(
-                        enabled.then(|| message(Message::Answer(run.epoch, answer.clone()))),
-                    ));
-                }
-                let mut controls = column![
-                    text(format!(
-                        "Question {} of {}",
-                        self.answers.len() + 1,
-                        self.questions.len()
-                    ))
-                    .size(size - 1.0),
-                    text(&question.question).size(size),
-                    answers.wrap(),
-                ]
-                .spacing(6);
-                if question.allow_custom_answer {
-                    controls = controls.push(
-                        row![
-                            text_input("Your answer", &self.custom_answer)
-                                .size(size)
-                                .on_input(move |answer| message(Message::CustomAnswer(answer))),
-                            button("Use answer").on_press_maybe(
-                                (enabled && !self.custom_answer.trim().is_empty()).then(
-                                    || message(Message::Answer(
-                                        run.epoch,
-                                        self.custom_answer.clone()
-                                    ))
-                                )
-                            ),
-                        ]
-                        .spacing(6),
-                    );
-                }
-                Some(controls.into())
-            }
+            Phase::PlanQuestions => Some(self.question_form(run, enabled)),
             Phase::PlanOptions => {
                 Some(scrollable(self.approaches(run)).height(Length::Fill).into())
             }
-            Phase::PlanReady | Phase::PlanHandedOff => {
+            Phase::PlanReady | Phase::PlanImplementationReview | Phase::PlanHandedOff => {
                 let report = run.plan.as_deref()?;
                 Some(
                     scrollable(
@@ -197,6 +175,64 @@ impl Flow {
         }
     }
 
+    fn question_form<'a>(&'a self, run: &'a Run, enabled: bool) -> Element<'a, RunMessage> {
+        let epoch = run.epoch;
+        let size = run.fonts.plan;
+        let mut questions = column![].spacing(12);
+        for (index, (question, draft)) in self.questions.iter().zip(&self.answer_drafts).enumerate()
+        {
+            let mut choices = row![].spacing(6);
+            for (option, answer) in question.options.iter().enumerate() {
+                choices = choices.push(
+                    button(text(answer).size(size))
+                        .style(if draft.selected == option {
+                            button::primary
+                        } else {
+                            button::secondary
+                        })
+                        .on_press_maybe(enabled.then_some(RunMessage::Planning(
+                            Message::SelectAnswer(epoch, index, option),
+                        ))),
+                );
+            }
+            let mut fields =
+                column![text(&question.question).size(size), choices.wrap()].spacing(6);
+            if question.allow_custom_answer {
+                let editor = text_editor(&draft.custom)
+                    .placeholder("Additional details (optional)")
+                    .size(size)
+                    .height(70);
+                fields = fields.push(if enabled {
+                    editor.on_action(move |action| {
+                        RunMessage::Planning(Message::EditCustomAnswer(epoch, index, action))
+                    })
+                } else {
+                    editor
+                });
+            }
+            questions = questions.push(fields);
+        }
+        questions = questions.push(
+            row![
+                button("Review answers…").on_press_maybe(
+                    enabled.then_some(RunMessage::Planning(Message::SubmitAnswers(epoch)))
+                ),
+                self.previous_results().map(|phase| {
+                    button(if phase == Phase::PlanReady {
+                        "Back to plan"
+                    } else {
+                        "Back to approaches"
+                    })
+                    .on_press_maybe(
+                        enabled.then_some(RunMessage::Planning(Message::ReturnToResults(epoch))),
+                    )
+                }),
+            ]
+            .spacing(6),
+        );
+        scrollable(questions).height(Length::Fill).into()
+    }
+
     fn approaches<'a>(&'a self, run: &'a Run) -> Element<'a, RunMessage> {
         let epoch = run.epoch;
         let size = run.fonts.plan;
@@ -214,6 +250,11 @@ impl Flow {
         };
         let mut options = column![
             text("Choose an implementation approach").size(size),
+            (!self.questions.is_empty()).then(|| {
+                button("Edit answers…").on_press_maybe(
+                    enabled.then_some(RunMessage::Planning(Message::EditAnswers(epoch))),
+                )
+            }),
             editor,
             button("Review revised approaches…")
                 .on_press_maybe(enabled.then_some(RunMessage::Planning(Message::Revise(epoch)))),
@@ -224,14 +265,33 @@ impl Flow {
                 column![
                     text(&option.title).size(size + 3.0),
                     text(option.render()).size(size),
-                    button("Draft plan for this approach").on_press_maybe(
-                        enabled.then_some(RunMessage::Planning(Message::Choose(epoch, index))),
-                    ),
+                    row![
+                        button("Draft plan").on_press_maybe(
+                            enabled.then_some(RunMessage::Planning(Message::Choose(epoch, index))),
+                        ),
+                        button("Implement this approach…").on_press_maybe(enabled.then_some(
+                            RunMessage::Planning(Message::PrepareImplementation(epoch, index)),
+                        )),
+                    ]
+                    .spacing(6)
+                    .wrap(),
                 ]
                 .spacing(4),
             );
         }
         options.into()
+    }
+
+    fn previous_results(&self) -> Option<Phase> {
+        (!self.options.is_empty()).then_some(if self.report.is_some() {
+            Phase::PlanReady
+        } else {
+            Phase::PlanOptions
+        })
+    }
+
+    fn can_answer(&self, run: &Run, epoch: u64) -> bool {
+        run.phase == Phase::PlanQuestions && run.epoch == epoch && !run.paused
     }
 
     fn can_refine(&self, run: &Run, epoch: u64) -> bool {
@@ -252,7 +312,10 @@ impl Workspace {
             return Task::none();
         };
         if plan.mode != Mode::Plan
-            || plan.phase != Phase::PlanReady
+            || !matches!(
+                plan.phase,
+                Phase::PlanReady | Phase::PlanImplementationReview
+            )
             || plan.epoch != epoch
             || plan.swarm
             || plan.paused
@@ -289,8 +352,9 @@ impl Workspace {
                 opened.chain(started)
             }
             Err(error) => {
+                let before = plan.phase;
                 plan.block(error);
-                match (plan.binding.live(), plan.phase.notice(Phase::PlanReady)) {
+                match (plan.binding.live(), plan.phase.notice(before)) {
                     (Ok(source), Some(notice)) if !source.private => {
                         self.notify_agent_run(planner, source.session, source.stream, notice)
                     }
@@ -307,6 +371,9 @@ impl Workspace {
         let source = plan.binding.live()?;
         let (owner, _) = self.current_agent_pane(source, Mode::Run)?;
         self.validate_plan_destination(plan)?;
+        if plan.target.is_some() {
+            self.planning_probe_target(plan)?;
+        }
         let profile = plan
             .profile()
             .ok_or("The planning profile is unavailable.")?;
@@ -321,6 +388,7 @@ impl Workspace {
         );
         run.goal.clone_from(&plan.goal);
         run.manual_directory.clone_from(&plan.manual_directory);
+        run.target.clone_from(&plan.target);
         run.surface = self.agent_run_presentation();
         run.chat_handoff_enabled = self.ai_chat_enabled();
         Ok((owner, run))
@@ -478,30 +546,68 @@ impl Workspace {
             return Err(error);
         }
         match message {
-            Message::CustomAnswer(answer)
-                if run.phase == Phase::PlanQuestions && !run.paused && answer.len() <= 1024 =>
+            Message::SelectAnswer(epoch, index, option)
+                if flow.can_answer(run, epoch)
+                    && flow
+                        .questions
+                        .get(index)
+                        .is_some_and(|question| option < question.options.len()) =>
             {
-                flow.custom_answer = answer
+                flow.answer_drafts[index].selected = option;
             }
-            Message::Answer(epoch, answer)
-                if run.phase == Phase::PlanQuestions && epoch == run.epoch && !run.paused =>
+            Message::EditCustomAnswer(epoch, index, action)
+                if flow.can_answer(run, epoch)
+                    && flow
+                        .questions
+                        .get(index)
+                        .is_some_and(|question| question.allow_custom_answer) =>
             {
-                let question = flow
+                super::swarm::edit_bounded(
+                    &mut flow.answer_drafts[index].custom,
+                    action,
+                    MAX_CUSTOM_ANSWER_BYTES,
+                );
+            }
+            Message::SubmitAnswers(epoch)
+                if flow.can_answer(run, epoch) && !flow.questions.is_empty() =>
+            {
+                let answers = flow
                     .questions
-                    .get(flow.answers.len())
-                    .ok_or("The planning question changed.")?;
-                if answer.trim().is_empty()
-                    || answer.len() > 1024
-                    || (!question.allow_custom_answer && !question.options.contains(&answer))
-                {
-                    return Err("Choose an allowed planning answer.".into());
+                    .iter()
+                    .zip(&flow.answer_drafts)
+                    .map(|(question, draft)| {
+                        let mut answer =
+                            mask::prompt(&run.redactor, &question.options[draft.selected])?;
+                        if question.allow_custom_answer {
+                            let custom = zeroize::Zeroizing::new(draft.custom.text());
+                            let custom = custom.trim();
+                            if !custom.is_empty() {
+                                answer.push_str("\nAdditional details\n");
+                                answer.push_str(&mask::prompt(&run.redactor, custom)?);
+                            }
+                        }
+                        Ok::<_, String>(answer)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                flow.pending_answers = Some(answers);
+                let review = self.prepare_plan_review(id, run, flow, Stage::Options);
+                if review.is_err() {
+                    flow.pending_answers = None;
                 }
-                flow.answers.push(mask::prompt(&run.redactor, &answer)?);
-                flow.custom_answer.clear();
-                if flow.answers.len() == flow.questions.len() {
-                    return self.prepare_plan_review(id, run, flow, Stage::Options);
+                return review;
+            }
+            Message::EditAnswers(epoch)
+                if flow.can_refine(run, epoch) && !flow.questions.is_empty() =>
+            {
+                run.next(
+                    Phase::PlanQuestions,
+                    "Review or edit your planning answers.",
+                );
+            }
+            Message::ReturnToResults(epoch) if flow.can_answer(run, epoch) => {
+                if let Some(phase) = flow.previous_results() {
+                    run.next(phase, "");
                 }
-                run.next(Phase::PlanQuestions, "Answer the next planning question.");
             }
             Message::EditRefinement(epoch, action) if flow.can_refine(run, epoch) => {
                 super::swarm::edit_bounded(&mut flow.refinement, action, MAX_REFINEMENT_BYTES);
@@ -509,11 +615,27 @@ impl Workspace {
             Message::Revise(epoch) if flow.can_refine(run, epoch) => {
                 return self.prepare_plan_review(id, run, flow, Stage::Options);
             }
-            Message::Choose(epoch, choice)
+            Message::Choose(epoch, choice) | Message::PrepareImplementation(epoch, choice)
                 if flow.can_refine(run, epoch) && choice < flow.options.len() =>
             {
+                let implement = matches!(message, Message::PrepareImplementation(..));
+                if implement
+                    && let Err(error) = self.current_agent_pane(run.binding.live()?, Mode::Run)
+                {
+                    run.notice = error.into();
+                    return Ok(Task::none());
+                }
                 flow.chosen = Some(choice);
-                return self.prepare_plan_review(id, run, flow, Stage::Report);
+                let review = self.prepare_plan_review(id, run, flow, Stage::Report);
+                flow.review_implementation = review.is_ok() && implement;
+                return review;
+            }
+            Message::KeepReport(epoch)
+                if run.phase == Phase::PlanImplementationReview
+                    && run.epoch == epoch
+                    && !run.paused =>
+            {
+                run.next(Phase::PlanReady, "Plan ready for later implementation.");
             }
             Message::Reply(epoch, report) if run.phase == Phase::Thinking && epoch == run.epoch => {
                 let stage = self.require_plan_model_review(run).inspect_err(|_| {
@@ -534,10 +656,15 @@ impl Workspace {
                     });
                 match (stage, reply) {
                     (Stage::Questions, Ok(Reply::Questions { message, questions })) => {
+                        flow.answer_drafts =
+                            questions.iter().map(|_| AnswerDraft::default()).collect();
                         flow.questions = questions;
                         run.next(Phase::PlanQuestions, &message);
                     }
                     (Stage::Options, Ok(Reply::Options { message, options })) => {
+                        if let Some(answers) = flow.pending_answers.take() {
+                            flow.answers = answers;
+                        }
                         flow.options = options;
                         flow.chosen = None;
                         flow.report = None;
@@ -551,15 +678,24 @@ impl Workspace {
                         run.plan = Some(text);
                         flow.report = Some(report);
                         flow.saved = false;
-                        run.next(Phase::PlanReady, &message);
-                    }
-                    (Stage::Options | Stage::Report, Err(error) | Ok(Reply::Blocked(error)))
-                        if !flow.options.is_empty() =>
-                    {
-                        let phase = if flow.report.is_some() {
-                            Phase::PlanReady
+                        if std::mem::take(&mut flow.review_implementation) {
+                            run.next(
+                                Phase::PlanImplementationReview,
+                                "Review the plan before opening its Agent run.",
+                            );
                         } else {
-                            Phase::PlanOptions
+                            run.next(Phase::PlanReady, &message);
+                        }
+                    }
+                    (Stage::Options | Stage::Report, Err(error) | Ok(Reply::Blocked(error))) => {
+                        flow.review_implementation = false;
+                        let phase = if flow.pending_answers.take().is_some() {
+                            Some(Phase::PlanQuestions)
+                        } else {
+                            flow.previous_results()
+                        };
+                        let Some(phase) = phase else {
+                            return Err(error);
                         };
                         run.next(phase, &error);
                         return Ok(Task::none());
@@ -761,11 +897,16 @@ impl Workspace {
         let refinement = (!notes.is_empty() && stage != Stage::Questions)
             .then(|| mask::prompt(&run.redactor, notes))
             .transpose()?;
+        let answers = if stage == Stage::Options {
+            flow.pending_answers.as_ref().unwrap_or(&flow.answers)
+        } else {
+            &flow.answers
+        };
         let mut input = json!({
             "goal": run.goal,
             "destination": flow.destination.label(),
             "questions": flow.questions,
-            "answers": flow.answers,
+            "answers": answers,
             "selectedApproach": chosen,
         });
         mask_json_strings(&mut input, &|text| mask::prompt(&run.redactor, text))?;
@@ -774,7 +915,7 @@ impl Workspace {
             input["probe"] = probe.input().clone();
             let _ = writeln!(evidence, "{}", probe.summary());
         }
-        for (question, answer) in flow.questions.iter().zip(&flow.answers) {
+        for (question, answer) in flow.questions.iter().zip(answers) {
             let _ = writeln!(evidence, "{}\n{answer}\n", question.question);
         }
         if let Some(refinement) = &refinement {

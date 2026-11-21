@@ -427,6 +427,51 @@ impl Pty {
         term: &str,
         options: &LaunchOptions,
     ) -> io::Result<Self> {
+        Self::spawn_configured(
+            columns,
+            rows,
+            term,
+            options,
+            #[cfg(unix)]
+            None,
+        )
+    }
+
+    /// Starts a private native PTY in a directory identified by an owned descriptor.
+    #[cfg(unix)]
+    pub fn spawn_in_directory(command: Vec<String>, directory: std::fs::File) -> io::Result<Self> {
+        if !directory.metadata()?.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a directory descriptor is required",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        if flatpak::running() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "a native directory descriptor cannot be forwarded to the host",
+            ));
+        }
+        Self::spawn_configured(
+            80,
+            24,
+            "xterm-256color",
+            &LaunchOptions {
+                command: Some(command),
+                ..LaunchOptions::default()
+            },
+            Some(directory),
+        )
+    }
+
+    fn spawn_configured(
+        columns: u16,
+        rows: u16,
+        term: &str,
+        options: &LaunchOptions,
+        #[cfg(unix)] directory: Option<std::fs::File>,
+    ) -> io::Result<Self> {
         if !matches!(
             term,
             "xterm-256color"
@@ -532,7 +577,13 @@ impl Pty {
                 options.shell != LocalShell::Wsl
             }
         };
-        let (control, reader, writer) = platform::Control::spawn(size, term, options)?;
+        let (control, reader, writer) = platform::Control::spawn(
+            size,
+            term,
+            options,
+            #[cfg(unix)]
+            directory,
+        )?;
         let sandbox_backend = control.sandbox_backend();
         if options.sandbox.is_some() && sandbox_backend.is_none() {
             return Err(io::Error::other("local PTY sandbox was not verified"));
