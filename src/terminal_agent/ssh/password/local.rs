@@ -182,7 +182,8 @@ mod tests {
     fn local_sudo_owns_the_pty_and_keeps_authentication_separate_from_command_input() {
         let profile = Profile::new();
         let directory = LocalDirectory::capture(profile.0.canonicalize().unwrap()).unwrap();
-        let nonce = [13; 16];
+        let mut nonce = [0; 16];
+        getrandom::fill(&mut nonce).unwrap();
         let mut arguments = sudo_pty::local_arguments(nonce);
         arguments[2] = r#"
 /bin/stty raw -echo -echonl
@@ -211,8 +212,10 @@ printf '\036%s:0\n' "$request"
             endpoint: Endpoint::Local(directory.clone()),
             streams: super::super::Streams::Local(Box::new(streams)),
         };
+        let mut request_nonce = [0; 16];
+        getrandom::fill(&mut request_nonce).unwrap();
         assert_eq!(
-            terminal.execute(&sudo_pty::token([22; 16]), "id -u", &|| true),
+            terminal.execute(&sudo_pty::token(request_nonce), "id -u", &|| true),
             Status::Exited(0)
         );
         let received = std::fs::read_to_string(receipt).unwrap();

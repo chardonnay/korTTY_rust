@@ -206,6 +206,7 @@ fn isolated_ssh_implementation_sudo_preflight_uses_the_authenticated_terminal() 
 }
 
 fn check_implementation_sudo_preflight(isolation: IsolationLevel) {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use iced::futures::{StreamExt as _, executor::block_on};
     use kortty_vault::{CredentialInput, CredentialKind, Secret, Vault};
 
@@ -221,11 +222,17 @@ fn check_implementation_sudo_preflight(isolation: IsolationLevel) {
     let ssh = OpenSshFixture::new();
     let root = ssh.directory().canonicalize().unwrap();
     let receipt = root.join("reviewed-exec");
+    let mut password_bytes = [0; 32];
+    getrandom::fill(&mut password_bytes).unwrap();
+    let sudo_password = URL_SAFE_NO_PAD.encode(password_bytes);
+    fs::write(root.join("sudo-password"), &sudo_password).unwrap();
     let server = start_shell_with_exec(&ssh, &root, &root, &receipt, SUDO_PREFLIGHT_FIXTURE);
     attach_shell_with_isolation(&mut fixture, &ssh, &root, isolation);
     let login = ssh.request(root.join("client")).target.endpoint;
     let vault_path = root.join("fixture-vault");
-    let mut vault = Vault::create(&vault_path, b"implementation-fixture-master").unwrap();
+    let mut master = [0; 32];
+    getrandom::fill(&mut master).unwrap();
+    let mut vault = Vault::create(&vault_path, &master).unwrap();
     vault
         .save(
             CredentialInput {
@@ -235,7 +242,7 @@ fn check_implementation_sudo_preflight(isolation: IsolationLevel) {
                 kind: CredentialKind::SudoPassword,
                 ..CredentialInput::default()
             },
-            Secret::new("test-sudo-preflight".into()),
+            Secret::new(sudo_password),
         )
         .unwrap();
     fixture.workspace.vault = Some(crate::vault_window::VaultWindow::with_unlocked_fixture(
@@ -424,7 +431,7 @@ case "$SSH_ORIGINAL_COMMAND" in
         [ "${#token}" -eq 32 ] || exit 1
         printf '%s\n[kortty-sudo-%s] ' "$armed" "$token"
         IFS= read -r supplied || exit 1
-        [ "$supplied" = test-sudo-preflight ] || exit 1
+        [ "$supplied" = "$(cat "$FIXTURE_ROOT/sudo-password")" ] || exit 1
         if ! [ -e "$FIXTURE_ROOT/rejected-once" ]; then
             touch "$FIXTURE_ROOT/rejected-once"
             printf '\036%s:1\n' "$token"
