@@ -30,6 +30,10 @@ impl Run {
                 "The agent plan is ready for review.",
                 self.plan.as_deref().unwrap_or_default(),
             ),
+            Phase::PlanHandedOff => (
+                "The accepted plan was passed to a separate Agent run.",
+                self.plan.as_deref().unwrap_or_default(),
+            ),
             Phase::Finished => (
                 "Agent run finished.",
                 history.transcript.final_answer.as_str(),

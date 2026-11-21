@@ -241,7 +241,7 @@ impl Run {
         transcript.elapsed_ms = history.started.elapsed().as_millis() as u64;
         transcript.state = match self.phase {
             _ if self.cancel.requested() => State::Cancelled,
-            Phase::Finished | Phase::PlanReady => State::Finished,
+            Phase::Finished | Phase::PlanReady | Phase::PlanHandedOff => State::Finished,
             Phase::Cancelled => State::Cancelled,
             Phase::Failed | Phase::Blocked => State::Failed,
             Phase::Paused => State::Paused,
@@ -318,7 +318,7 @@ impl Run {
 
 impl Workspace {
     pub(super) fn publish_agent_inline_history(&self, run: &Run) {
-        if run.reopened_history || run.runs_in_chat_tab() {
+        if run.reopened_history || !run.has_terminal_presentation() {
             return;
         }
         let Some(update) = run.inline_update(self.window_settings.agent_animations()) else {
@@ -354,7 +354,7 @@ impl Workspace {
             .iter_mut()
             .filter_map(|(&id, run)| {
                 if !run.active()
-                    || run.runs_in_chat_tab()
+                    || !run.has_terminal_presentation()
                     || run.cancel.requested()
                     || run.design.history.inline_style().is_none()
                 {

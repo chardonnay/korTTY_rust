@@ -46,8 +46,11 @@ impl Workspace {
         if let Message::ActivityExport(export) = message {
             return self.agent_activity_export(id, run, export);
         }
-        let remember = matches!(message, Message::Start | Message::StartFromShortcut)
-            && run.phase == Phase::Setup
+        let remember = matches!(
+            message,
+            Message::Start | Message::StartFromShortcut | Message::StartPlanWithoutProbe
+        ) && run.phase == Phase::Setup
+            && run.plan.is_none()
             && !run.swarm
             && !run.binding.private();
         let mode = run.mode;
@@ -70,7 +73,7 @@ impl Workspace {
         run: &mut Run,
         message: Message,
     ) -> Result<Task<Desktop>, String> {
-        let completion = matches!(message, Message::Directory(epoch, _) | Message::Decision(epoch, _) | Message::Command(epoch, _) | Message::ScriptRevision(epoch, _) | Message::SavedReady(epoch, _) if epoch == run.epoch);
+        let completion = matches!(message, Message::AskAttachment(epoch, _) | Message::Directory(epoch, _) | Message::Decision(epoch, _) | Message::Command(epoch, _) | Message::ScriptRevision(epoch, _) | Message::SavedReady(epoch, _) if epoch == run.epoch);
         if run.cancel.requested() && completion {
             if let Message::Decision(epoch, report) = &message
                 && run.phase.deciding()
@@ -104,7 +107,8 @@ impl Workspace {
             }
             Message::DirectoryChoice(value)
                 if value.len() <= 4096
-                    && (run.phase == Phase::Setup && run.mode == Mode::Run
+                    && (run.phase == Phase::Setup
+                        && matches!(run.mode, Mode::Run | Mode::Plan)
                         || matches!(
                             run.phase,
                             Phase::DirectoryConfirmation | Phase::PlanReady
@@ -120,13 +124,32 @@ impl Workspace {
                 run.purpose = Purpose::Agent(profile);
                 run.profile_pending = false;
             }
-            Message::Start | Message::StartFromShortcut
+            Message::Start | Message::StartFromShortcut | Message::StartPlanWithoutProbe
                 if run.phase == Phase::Setup
                     && !run.profile_pending
                     && !run.history.visible()
+                    && (!matches!(message, Message::StartPlanWithoutProbe)
+                        || run.mode == Mode::Plan)
                     && !run.goal.trim().is_empty() =>
             {
-                return self.start_agent(id, run, matches!(message, Message::StartFromShortcut));
+                return self.start_agent(
+                    id,
+                    run,
+                    matches!(message, Message::StartFromShortcut),
+                    !matches!(message, Message::StartPlanWithoutProbe),
+                );
+            }
+            Message::SkipPlanProbe(epoch)
+                if run.mode == Mode::Plan
+                    && epoch == run.epoch
+                    && !run.paused
+                    && matches!(
+                        run.phase,
+                        Phase::DirectoryConfirmation | Phase::ProbeApproval
+                    ) =>
+            {
+                run.target = None;
+                return self.planning_questions(id, run);
             }
             Message::ConfirmDirectory(epoch)
                 if epoch == run.epoch
@@ -141,25 +164,20 @@ impl Workspace {
                 return self.agent_directory(id, run, Phase::Directory);
             }
             Message::Planning(message) => return self.planning_action(id, run, message),
+            Message::AskAttachment(epoch, result)
+                if run.phase == Phase::AskAttachment && epoch == run.epoch =>
+            {
+                return self.finish_ask_attachment(id, run, result);
+            }
             Message::Triage(message) => return self.triage_action(id, run, message),
             Message::ReviewModel(message) => return self.model_review_action(id, run, message),
             Message::Password(message) => return self.password_sudo_action(id, run, message),
-            Message::Implement(epoch)
-                if run.phase == Phase::PlanReady && epoch == run.epoch && !run.paused =>
-            {
-                self.check_run_destination(run)?;
-                self.current_agent_pane(run.binding.live()?, Mode::Run)?;
-                policy::agent_mode(&ClipboardPolicy::load(), Mode::Run)?;
-                self.validate_plan_destination(run)?;
-                run.mode = Mode::Run;
-                run.turns = 0;
-                return self.start_agent(id, run, false);
-            }
             Message::Approve(epoch)
             | Message::ApproveBatch(epoch)
             | Message::ApproveRemaining(epoch)
                 if epoch == run.epoch
                     && !run.paused
+                    && (run.mode != Mode::Plan || matches!(message, Message::Approve(_)))
                     && run.reviewed_password_sudo().is_none()
                     && matches!(run.phase, Phase::ProbeApproval | Phase::Approval) =>
             {
@@ -235,14 +253,24 @@ impl Workspace {
             }
             Message::Cancel if !run.phase.finished() => run.stop("Agent run cancelled."),
             Message::Directory(epoch, result) if epoch == run.epoch => {
-                let directory = result?;
+                let directory = match result {
+                    Ok(directory) => directory,
+                    Err(error) if run.mode == Mode::Plan && run.phase == Phase::Directory => {
+                        return self.plan_without_probe_after_failure(id, run, &error);
+                    }
+                    Err(error) => return Err(error),
+                };
                 let (_, pane) = self.current_run_pane(run)?;
                 match run.phase {
                     Phase::Directory => {
-                        run.target = Some(RunTarget::Attached(Target::Local {
-                            shell: local_agent_shell(pane)?,
-                            directory,
-                        }));
+                        let shell = match local_agent_shell(pane) {
+                            Ok(shell) => shell,
+                            Err(error) if run.mode == Mode::Plan => {
+                                return self.plan_without_probe_after_failure(id, run, &error);
+                            }
+                            Err(error) => return Err(error),
+                        };
+                        run.target = Some(RunTarget::Attached(Target::Local { shell, directory }));
                         run.review_initial_command()?;
                     }
                     Phase::ReviewedDirectory { probe } => {
@@ -319,6 +347,9 @@ impl Workspace {
                 if epoch == run.epoch
                     && matches!(run.phase, Phase::Probe | Phase::Running | Phase::Elevated) =>
             {
+                if run.mode == Mode::Plan && run.phase == Phase::Probe {
+                    return self.finish_planning_probe(id, run, &result);
+                }
                 if run.phase == Phase::Probe
                     && result
                         .as_ref()
@@ -381,6 +412,7 @@ impl Workspace {
         id: window::Id,
         run: &mut Run,
         direct: bool,
+        plan_with_probe: bool,
     ) -> Result<Task<Desktop>, String> {
         if run.binding.saved().is_some() {
             return self.start_saved_swarm_member(id, run);
@@ -390,20 +422,31 @@ impl Workspace {
         if self.terminal_agents.owns_session(live.session) {
             return Err("Another agent run already owns this terminal pane.".into());
         }
-        let (owner, pane) = self.current_run_pane(run)?;
+        self.current_run_pane(run)?;
         run.goal = mask::prompt(&run.redactor, &run.goal)?;
         self.mask_https_agent_input(run)?;
         if !run.swarm && !live.private {
             run.activity_export.start();
         }
         match run.mode {
-            Mode::Ask => return self.agent_turn(id, run),
-            Mode::Plan => return self.planning_start(id, run),
+            Mode::Ask => return self.start_ask_review(id, run),
+            Mode::Plan => return self.planning_start(id, run, direct, plan_with_probe),
             Mode::Run => {}
         }
         if matches!(run.purpose, Purpose::Agent(_)) {
             run.transport = Some(self.agent_transport(run)?);
         }
+        self.prepare_attached_probe(id, run, direct)
+    }
+
+    pub(super) fn prepare_attached_probe(
+        &self,
+        id: window::Id,
+        run: &mut Run,
+        direct: bool,
+    ) -> Result<Task<Desktop>, String> {
+        let live = run.binding.live()?;
+        let (owner, pane) = self.current_run_pane(run)?;
         if pane.ssh.is_some() {
             run.target = Some(RunTarget::Attached(Target::Ssh {
                 opener: pane
@@ -415,7 +458,9 @@ impl Workspace {
             run.review_initial_command()?;
             return Ok(Task::none());
         }
-        if direct && run.manual_directory.is_some() {
+        if run.manual_directory.as_ref().is_some_and(|directory| {
+            direct || run.mode == Mode::Plan && directory.trim().is_empty()
+        }) {
             run.next(
                 Phase::DirectoryConfirmation,
                 "Confirm the working directory before reviewing the environment probe.",
@@ -544,6 +589,18 @@ impl Workspace {
         probe: bool,
     ) -> Result<Task<Desktop>, String> {
         self.check_run_destination(run)?;
+        let plan_probe = if run.mode == Mode::Plan {
+            if !probe {
+                return Err("Planning can run only the reviewed environment probe.".into());
+            }
+            self.require_plan_review_route(run)?;
+            self.current_agent_pane(run.binding.live()?, Mode::Run)?;
+            let policy = self.planning_probe_dispatch_policy(run)?;
+            policy.check()?;
+            Some((policy, self.planning_probe_target(run)?))
+        } else {
+            None
+        };
         if matches!(run.purpose, Purpose::Agent(_)) {
             let _ = self.agent_transport(run)?;
         }
@@ -598,7 +655,10 @@ impl Workspace {
         let (command, proposal) = if let Purpose::Script(review) = &run.purpose {
             (CommandToRun::Plain(review.prepared.command.clone()), None)
         } else if probe {
-            (CommandToRun::Plain(target.probe_command().to_owned()), None)
+            (
+                CommandToRun::Plain(run.environment_probe(&target).to_owned()),
+                None,
+            )
         } else {
             let reviewed = run
                 .commands
@@ -642,6 +702,10 @@ impl Workspace {
                             &cancel,
                             || {
                                 policy.check()?;
+                                if let Some((policy, target)) = &plan_probe {
+                                    policy.check()?;
+                                    target.check_worker()?;
+                                }
                                 if let Some(batch) = &batch {
                                     batch.check()?;
                                 }
@@ -819,6 +883,14 @@ impl Workspace {
 }
 
 impl Run {
+    pub(super) fn environment_probe(&self, target: &RunTarget) -> &'static str {
+        if self.mode == Mode::Plan
+            && let RunTarget::Attached(target) = target
+        {
+            return engine::planning_probe::command(target);
+        }
+        target.probe_command()
+    }
     pub(super) fn await_model(
         &mut self,
         id: window::Id,
@@ -867,6 +939,11 @@ impl Run {
             .transpose()?;
         let goal = self.decision_text(&self.goal)?;
         let context = self.decision_text(&self.context)?;
+        let context = if let Some(snapshot) = &self.ask_file.snapshot {
+            Cow::Owned(snapshot.append_to(&context))
+        } else {
+            context
+        };
         let plan = self
             .plan
             .as_deref()
@@ -922,6 +999,7 @@ impl Run {
 
     fn mask_decision_fields(&self) -> bool {
         self.learned_sudo.is_some()
+            || self.ask_file.snapshot.is_some()
             || self
                 .profile()
                 .is_some_and(ProfileChoice::is_reviewed_outbound)

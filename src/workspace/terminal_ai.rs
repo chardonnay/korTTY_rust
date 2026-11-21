@@ -1,7 +1,7 @@
 //! Terminal selection requests and temporary, explicitly reviewed AI conversations.
 
 pub(in crate::workspace) mod agent_follow_up;
-mod attachment;
+pub(super) mod attachment;
 mod automatic_rule_classifier;
 mod automatic_rule_ledger;
 mod automatic_rules;
@@ -903,6 +903,7 @@ pub(super) struct Chat {
     source_pane: Option<SessionId>,
     source_stream: Option<u64>,
     agent_run_id: Option<String>,
+    agent_ask: bool,
     agent_source_exact: bool,
     agent_has_learned_sudo: bool,
     agent_mask_unavailable: bool,
@@ -978,6 +979,7 @@ impl Chat {
         }
     }
 
+    #[cfg(test)]
     fn new(
         config: &Configuration,
         action: Action,
@@ -1090,6 +1092,7 @@ impl Chat {
             source_pane: None,
             source_stream: None,
             agent_run_id: None,
+            agent_ask: false,
             agent_source_exact: false,
             agent_has_learned_sudo: false,
             agent_mask_unavailable: false,
@@ -1230,6 +1233,7 @@ impl Chat {
             source_pane: None,
             source_stream: None,
             agent_run_id,
+            agent_ask: false,
             agent_source_exact,
             agent_has_learned_sudo: false,
             agent_mask_unavailable: false,
@@ -2314,6 +2318,13 @@ impl Workspace {
     }
 
     fn host_terminal_chat(&mut self, owner: window::Id, mut chat: Chat) -> Task<Desktop> {
+        self.prepare_hosted_chat(&mut chat);
+        let id = window::Id::unique();
+        self.terminal_chats.insert(id, chat);
+        self.host_tool(owner, tool_tabs::Kind::AiChat, id)
+    }
+
+    fn prepare_hosted_chat(&mut self, chat: &mut Chat) {
         if let Some(root) = chat.prompt_history_root()
             && self
                 .terminal_question_history
@@ -2329,18 +2340,18 @@ impl Workspace {
         }
         chat.conversation
             .set_font_size(self.window_settings.ai_result_font());
-        let id = window::Id::unique();
-        self.terminal_chats.insert(id, chat);
-        self.host_tool(owner, tool_tabs::Kind::AiChat, id)
     }
 
     pub(super) fn terminal_chat_title(&self, id: window::Id) -> std::borrow::Cow<'static, str> {
-        self.terminal_chats
-            .get(&id)
-            .and_then(|chat| chat.saved.as_ref())
-            .map_or(std::borrow::Cow::Borrowed(TITLE), |saved| {
-                std::borrow::Cow::Owned(saved.title.clone())
-            })
+        if let Some(chat) = self.terminal_chats.get(&id) {
+            if let Some(saved) = &chat.saved {
+                return std::borrow::Cow::Owned(saved.title.clone());
+            }
+            if chat.agent_ask {
+                return std::borrow::Cow::Borrowed("Ask Agent");
+            }
+        }
+        std::borrow::Cow::Borrowed(TITLE)
     }
 
     pub(super) fn open_stored_terminal_chat(
@@ -2447,9 +2458,9 @@ impl Workspace {
         ) && self
             .terminal_chats
             .get(&id)
-            .is_some_and(|chat| self.private_agent_source_changed(chat))
+            .is_some_and(|chat| self.bound_agent_source_changed(chat))
         {
-            self.revoke_private_agent_chat(id);
+            self.revoke_bound_agent_chat(id);
             return Task::none();
         }
         if matches!(message, Message::Finished(..) | Message::StreamFinished(..)) {
@@ -3240,6 +3251,7 @@ impl Workspace {
                 let redactor = Arc::clone(&chat.redactor);
                 let system = review.system().to_owned();
                 let web_scope = review.web_scope.clone();
+                let agent_ask = chat.agent_ask;
                 let remote_attachment = review.remote_attachment().is_some();
                 let (attachment, attachment_cancel) = match review.attachment.clone() {
                     Some(attachment) => match attachment.prepare_verification(attachment_access) {
@@ -3282,6 +3294,9 @@ impl Workspace {
                     let mut emitted_at = None;
                     let turns = request.turn_refs();
                     let before_dispatch = || {
+                        if agent_ask && !ClipboardPolicy::load().ai_agent_allowed() {
+                            return Err("Managed policy blocks AI Agent.".into());
+                        }
                         if let Some(scope) = &web_scope {
                             scope.require_current()?;
                         }

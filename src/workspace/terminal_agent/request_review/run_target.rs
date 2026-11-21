@@ -15,7 +15,7 @@ const SSH_CHANGED: &str = "The reviewed SSH connection changed. Start a new run.
 const DIRECTORY_CHANGED: &str = "The SSH directory changed after review. Start a new run.";
 const SUDO_CHANGED: &str = "The reviewed sudo capabilities changed. Start a new run.";
 
-pub(super) struct RunTargetReview {
+pub(in crate::workspace::terminal_agent) struct RunTargetReview {
     target: Attached,
     sudo: Option<SudoCapabilities>,
 }
@@ -48,7 +48,10 @@ impl RunTargetReview {
         run: &Run,
         kind: engine::RunModel,
     ) -> Result<Self, String> {
-        if run.mode != Mode::Run || !matches!(run.purpose, Purpose::Agent(_)) {
+        if !(run.mode == Mode::Run
+            || run.mode == Mode::Plan && kind == engine::RunModel::FinalAdvice)
+            || !matches!(run.purpose, Purpose::Agent(_))
+        {
             return Err("A Run model review requires an attached agent.".into());
         }
         let (owner, pane) = workspace.current_run_pane(run)?;
@@ -141,7 +144,7 @@ impl RunTargetReview {
         }
     }
 
-    pub(super) fn check_worker(&self) -> Result<(), String> {
+    pub(in crate::workspace::terminal_agent) fn check_worker(&self) -> Result<(), String> {
         match &self.target {
             Attached::Local { directory, .. } => directory.require_current()?,
             Attached::Ssh(reviewed) => reviewed.check_worker()?,

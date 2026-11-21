@@ -33,7 +33,8 @@ impl Run {
             .spacing(8)
             .padding(12);
         let plan_view = self.mode == Mode::Plan;
-        let showing_plan = self.phase == Phase::PlanReady && self.plan.is_some();
+        let showing_plan =
+            matches!(self.phase, Phase::PlanReady | Phase::PlanHandedOff) && self.plan.is_some();
         let reviewing_model = self.phase == Phase::ModelReview;
         let body_size = if plan_view {
             self.fonts.plan
@@ -51,7 +52,7 @@ impl Run {
             page = page.push(super::design::activity_controls(self));
         }
         if self.design.arrangement == crate::terminal_agent::design::Arrangement::PictureInPicture
-            && !self.runs_in_chat_tab()
+            && self.has_terminal_presentation()
             && !self.swarm
             && !self.closing
             && self.binding.live().is_ok()
@@ -64,10 +65,18 @@ impl Run {
         if let Some(target) = &self.target {
             page = page.push(text(format!("{} · {}", target.shell(), target.directory())).size(13));
         }
-        if self.binding.private() {
-            page = page.push(text("Private run. Activity is kept in this window.").size(13));
+        if let Some(summary) = self
+            .planning
+            .as_ref()
+            .and_then(super::planning::Flow::probe_summary)
+        {
+            page = page.push(text(summary).size(13));
         }
-        let show_directory = self.phase == Phase::Setup && self.mode == Mode::Run
+        if self.binding.private() {
+            page = page.push(text("Private run. Activity is kept in memory.").size(13));
+        }
+        let show_directory = self.phase == Phase::Setup
+            && matches!(self.mode, Mode::Run | Mode::Plan)
             || matches!(self.phase, Phase::DirectoryConfirmation | Phase::PlanReady);
         if show_directory && let Some(directory) = &self.manual_directory {
             page = page.push(
@@ -100,17 +109,31 @@ impl Run {
                         Mode::Run if self.confirm_every_command => "Each command, including the environment probe, requires a separate approval.",
                         Mode::Run => "Review the environment probe first. Read-only commands may continue automatically; mutating commands require approval.",
                         Mode::Ask => "Review your question and any selected terminal text before sending them to this AI profile.",
-                        Mode::Plan => "Review each planning request before sending it to this AI profile. Implement is a separate action.",
+                        Mode::Plan => "Review the environment probe and each model request separately. Implement is a separate action.",
                     }).size(13),
                     button(match self.mode {
                         Mode::Run => "Review environment probe",
                         Mode::Ask => "Review question",
-                        Mode::Plan => "Review planning request",
+                        Mode::Plan => "Start planning",
                     }).on_press_maybe((!self.profile_pending && !self.goal.trim().is_empty() && (self.mode != Mode::Run || directory_ready)).then_some(Message::Start)),
+                    (self.mode == Mode::Plan).then(|| button("Plan without environment details").on_press_maybe(
+                        (!self.profile_pending && !self.goal.trim().is_empty()).then_some(Message::StartPlanWithoutProbe),
+                    )),
                 ].spacing(8)
             );
         } else if !reviewing_model {
             page = page.push(text(&self.goal).size(body_size));
+        }
+        if self.mode == Mode::Plan
+            && matches!(
+                self.phase,
+                Phase::DirectoryConfirmation | Phase::ProbeApproval
+            )
+        {
+            page = page.push(
+                button("Skip environment probe")
+                    .on_press_maybe((!self.paused).then_some(Message::SkipPlanProbe(self.epoch))),
+            );
         }
         if self.phase == Phase::Setup && self.mode == Mode::Plan && !self.binding.private() {
             page = page.push(
@@ -150,6 +173,10 @@ impl Run {
                 .and_then(|planning| planning.view(self))
         {
             page = page.push(controls);
+        } else if showing_plan && let Some(report) = &self.plan {
+            page = page.push(
+                scrollable(text(report).size(body_size).width(Length::Fill)).height(Length::Fill),
+            );
         }
 
         if let Some(command) = self.reviewed_command() {
@@ -411,6 +438,11 @@ impl Run {
                 })
                 .height(request_height),
                 row![
+                    self.ask_file.snapshot.as_ref().map(|_| {
+                        button("Remove selected file").on_press_maybe(
+                            ready.then_some(Review::RemoveAskAttachment(self.epoch)),
+                        )
+                    }),
                     review.triage_mode().map(|_| {
                         button("Skip complexity check")
                             .on_press_maybe(ready.then_some(Review::SkipTriage(self.epoch)))
@@ -480,7 +512,7 @@ impl Run {
         match self.phase {
             Phase::ProbeApproval => Some((
                 "Fixed environment probe",
-                self.target.as_ref()?.probe_command(),
+                self.environment_probe(self.target.as_ref()?),
             )),
             Phase::Approval if let Purpose::Script(review) = &self.purpose => {
                 Some(("Saved script", review.prepared.preview()))

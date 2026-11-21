@@ -20,6 +20,7 @@ pub(in crate::workspace::terminal_agent) fn bar(run: &Run) -> Option<Element<'_,
         match run.phase {
             Phase::Finished => "Run finished",
             Phase::PlanReady => "Plan ready",
+            Phase::PlanHandedOff => "Plan accepted",
             _ => "Run stopped",
         },
     ))

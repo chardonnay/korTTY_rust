@@ -16,6 +16,97 @@ open until a result is recorded for the tested revision and environment. Both
 Mosh modes are out of scope. The editor has a reduced native scope with structure
 navigation for classes, functions, variables, and placeholders.
 
+## November 21 Planning environment probe
+
+The Planning tab offers an environmental probe before drafting its questions
+when the source local shell or SSH stream and managed policy allow reviewed
+commands. The snapshot includes the available system, account, directory,
+disk, tool and sudo information. The user reviews the fixed command and can
+skip it. Later question, approach and report previews include the same masked
+snapshot. Windows Command Prompt supplies system, account and directory
+details. A later implementation run requires fresh approval.
+
+The native local-shell regression checks approval, skip, masking and snapshot
+reuse across requests. Live SSH planning and interactive desktop acceptance
+remain under A2.
+[Java probe fields](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/core/TerminalAgentService.java#L3504)
+
+## November 21 Ask attachment from the terminal selection
+
+A single selected filename resolves against the original local shell's
+directory or the authenticated SSH shell and its SFTP connection. The
+snapshot is bounded UTF-8 text, with its filename and contents masked for
+review. The Send action verifies the file version before contacting the
+model. Removing the file creates a new request preview. A missing or
+unavailable attachment leaves the terminal selection available. The approved
+masked snapshot can follow the conversation into Chat.
+
+Apple Silicon passed 308 selected tests with six ignored, then passed the
+opt-in pinned OpenSSH test. The native local-shell and loopback-model test
+checked quoting, masking across lines, the exact reviewed payload, removal,
+missing-file fallback, and rejection of a file changed after review. The
+live SFTP test loaded the file through the pinned connection and detected
+subsequent modification. Strict workspace Clippy passed on Windows ARM64.
+Interactive desktop acceptance remains under A2.
+[Apple Silicon tests](target/verification/20261121-agent-ask-attachment-macos-final.log)
+· [Windows ARM64 Clippy](target/verification/20261121-agent-ask-attachment-windows-clippy-final.log)
+
+## November 21 Ask tab and follow-up conversation
+
+Ask opens its own tab with the existing profile and model review. The source
+terminal still supports the Agent design, including picture-in-picture. A
+follow-up replaces the Ask contents with the Chat composer in the same tab.
+It carries the original masked selection, question and response. Chat keeps
+the original live stream and requires an explicit Save. Private sources stay
+in memory. The settled first request remains eligible for Agent history.
+
+Apple Silicon passed 305 selected tests with five ignored. The loopback test
+verified the unchanged tab identity, frozen and masked terminal selection,
+both send gates, the follow-up payload, and source-stream invalidation. The
+final suite includes the existing docked and detached Agent presentations
+and the separate Run-to-saved-Chat workflow. Strict workspace Clippy passed
+on Windows ARM64. Desktop acceptance remains under A2. The later Ask
+attachment checkpoint records the selected-file workflow.
+[Apple Silicon tests](target/verification/20261121-agent-ask-tab-macos.log)
+· [Windows ARM64 Clippy](target/verification/20261121-agent-ask-tab-windows-clippy.log)
+
+## November 20 Planning refinement
+
+The Planning tab accepts multiline notes for revised approaches and for
+the final report. Each action prepares a separate reviewed model request.
+The notes reach the preview as masked text and never become commands. A
+failed provider revision preserves the previously available approaches or
+report. A successful revision invalidates the earlier choice, and saved
+reports remain stored independently.
+
+Apple Silicon passed 223 selected tests with four ignored. The loopback
+test verified a failed revision and retry, a new approach, and different
+notes for the final report. It checked the preview against the submitted
+requests, including masking a credential assignment while retaining the
+following line, discarding oversized paste and ignoring outdated events.
+Strict workspace Clippy passed on Windows ARM64. Native desktop acceptance
+of the editor and repetition remains under A2.
+[Apple Silicon tests](target/verification/20261120-agent-plan-refinement-macos.log)
+· [Windows ARM64 Clippy](target/verification/20261120-agent-plan-refinement-windows-clippy.log)
+
+## November 20 Planning tab and accepted-plan execution
+
+Planning opens in its own tab. Implement keeps the accepted report readable
+and opens a separate Agent run with the latest presentation preference. The
+implementation rechecks the source stream, the plan destination and profile
+eligibility. It starts with a fresh environment-probe approval. Closing the
+planner after handoff leaves the implementation run open.
+
+Apple Silicon passed 218 selected Agent and tool-tab tests with four ignored.
+The suite covers both presentations, adopting a preference changed after the
+planner opened, focusing the original planner, rejecting repeated and outdated
+acceptance events, and blocking a changed saved-plan destination. The Chat tab
+regression verifies that no request reaches the loopback model before the
+environment-probe approval. Strict workspace Clippy passed on Windows ARM64.
+Interactive desktop acceptance remains under A2.
+[Apple Silicon tests](target/verification/20261120-agent-accepted-plan-macos-final.log)
+· [Windows ARM64 Clippy](target/verification/20261120-agent-accepted-plan-windows-clippy-final.log)
+
 ## November 20 Terminal Agent complexity assessment
 
 Interactive Run offers a reviewed assessment after a successful environment

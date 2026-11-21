@@ -318,7 +318,9 @@ impl Workspace {
         owner: window::Id,
         session: SessionId,
     ) -> Option<Vec<u8>> {
-        let tab = self.windows.get(&owner)?.tab()?;
+        let window = self.windows.get(&owner)?;
+        let (index, _) = window.pane_location(session)?;
+        let tab = window.tabs.get(index)?.terminal()?;
         let pane = self.sessions.get(&session)?;
         let ssh = pane.ssh.as_ref()?;
         let frame = pane.session.frame();

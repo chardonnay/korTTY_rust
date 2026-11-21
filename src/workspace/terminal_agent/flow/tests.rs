@@ -47,7 +47,11 @@ fn agent_text_zoom_keeps_independent_sizes_and_remembered_defaults() {
     no_task(
         fixture
             .workspace
-            .agent_plan_zoom_shortcut(plan, &Key::Character("=".into()), Modifiers::COMMAND)
+            .agent_plan_zoom_shortcut(
+                fixture.owner,
+                &Key::Character("=".into()),
+                Modifiers::COMMAND,
+            )
             .unwrap(),
     );
     assert_eq!(fixture.run(plan).fonts.plan, 22.0);
@@ -588,7 +592,7 @@ fn agent_design_keeps_status_and_focus_bound_to_the_saved_connection_stream() {
 
     let mut fixture = Fixture::new(false, false);
     fixture.workspace.window_settings.ai_agent_design = AgentDesign::Classic;
-    let classic = fixture.open(Mode::Plan);
+    let classic = fixture.open(Mode::Run);
     let session = fixture.session;
     let stream = fixture.workspace.sessions[&session].stream_generation;
     assert_eq!(fixture.run(classic).design, AgentDesign::Classic.layout());
@@ -626,7 +630,7 @@ fn agent_design_keeps_status_and_focus_bound_to_the_saved_connection_stream() {
     fixture
         .workspace
         .refresh_saved_terminal_preferences(&reopened);
-    let floating = fixture.open(Mode::Plan);
+    let floating = fixture.open(Mode::Run);
     assert_eq!(fixture.run(floating).design, AgentDesign::Floating.layout());
     let (_, settings) = design::window(fixture.run(floating).design);
     assert!(matches!(settings.level, window::Level::AlwaysOnTop));
@@ -909,6 +913,13 @@ impl Fixture {
             .keys()
             .find(|id| !old.contains(id))
             .unwrap()
+    }
+
+    fn open_ask_with_source_tab_visible(&mut self) -> window::Id {
+        let id = self.open(Mode::Ask);
+        let (_, _, tab) = self.workspace.agent_pane(self.session).unwrap();
+        self.workspace.select_tab(self.owner, tab.id, false);
+        id
     }
 
     pub(in crate::workspace::terminal_agent) fn send(
@@ -1525,12 +1536,8 @@ fn agent_completion_marks_the_original_nonprivate_tab_with_fixed_text() {
             no_task(task);
         }
         assert!(fixture.run(id).phase == Phase::Finished);
-        let mark = fixture
-            .workspace
-            .active_tab_mut(fixture.owner)
-            .unwrap()
-            .watch
-            .attention_text();
+        let (_, _, source) = fixture.workspace.agent_pane(fixture.session).unwrap();
+        let mark = source.watch.attention_text();
         assert_eq!(mark.as_deref(), (!private).then_some("An AI run finished."));
     }
 }

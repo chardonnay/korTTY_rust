@@ -253,7 +253,7 @@ impl Workspace {
         else {
             return Task::none();
         };
-        if run.runs_in_chat_tab()
+        if !run.has_terminal_presentation()
             || !matches(run, session, stream)
             || run.design.arrangement != Arrangement::PictureInPicture
         {
@@ -428,7 +428,7 @@ impl Workspace {
                         .agent_activity_for_stream(source.session, source.stream)
                 })
                 .filter(|(_, run)| {
-                    !run.runs_in_chat_tab()
+                    run.has_terminal_presentation()
                         && run.design.arrangement == Arrangement::PictureInPicture
                 })
                 .map(|(id, _)| id);

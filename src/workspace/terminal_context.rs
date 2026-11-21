@@ -1293,8 +1293,17 @@ mod tests {
         assert!(opened.units() > 0);
         assert!(!workspace.terminal_agents.is_empty());
         assert!(workspace.terminal_context.is_none());
+        let planner = workspace.active_hosted_tab(owner).expect("Planning tab");
+        assert_eq!(planner.kind, super::super::tool_tabs::Kind::TerminalAgent);
         assert_eq!(
-            workspace.windows[&owner].tab().unwrap().focused_session(),
+            workspace.hosted_agent_title(planner.instance),
+            "AI Planning"
+        );
+        assert_eq!(
+            workspace.windows[&owner]
+                .terminal_tabs()
+                .next()
+                .and_then(|tab| tab.focused_session()),
             Some(source)
         );
     }

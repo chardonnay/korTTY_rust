@@ -20,12 +20,9 @@ fn completed(private: bool) -> (Fixture, window::Id, TcpListener) {
             .unwrap();
         listener
     });
-    let id = fixture.open(Mode::Ask);
-    no_task(fixture.send(
-        id,
-        Message::Goal("Inspect service password=original-secret".into()),
-    ));
-    let task = fixture.send(id, Message::Start);
+    let id = fixture.open(Mode::Run);
+    final_advice::prepare_local_run(&mut fixture, id, "Inspect service password=original-secret");
+    let task = final_advice::complete_review(&mut fixture, id, true, 0);
     finish_agent_task(&mut fixture, task);
     assert!(fixture.run(id).phase == Phase::ModelReview);
     let epoch = fixture.run(id).epoch;

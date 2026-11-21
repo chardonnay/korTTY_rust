@@ -9,8 +9,8 @@ use std::{
 };
 
 use super::{
-    Desktop, LiveBinding, Message, Phase, ProfileChoice, Run, SessionId, State, Task, Workspace,
-    inline_history::FollowUpTrace, mask, window,
+    Desktop, LiveBinding, Message, Mode, Phase, ProfileChoice, Run, SessionId, State, Task,
+    Workspace, inline_history::FollowUpTrace, mask, window,
 };
 use crate::workspace::{
     journal_agent_chat::{AgentJournal, authorized},
@@ -126,6 +126,13 @@ pub struct Loaded {
 }
 
 impl Run {
+    pub(super) fn is_live_ask_answer(&self) -> bool {
+        self.mode == Mode::Ask
+            && self.phase == Phase::Finished
+            && self.runs_in_chat_tab()
+            && !self.reopened_history
+    }
+
     pub(super) fn can_chat_handoff(&self) -> bool {
         !self.closing
             && !self.swarm
@@ -287,6 +294,12 @@ impl Workspace {
             })
             .cloned();
         snapshot.map_or_else(Task::none, |snapshot| {
+            if let Some(id) = self.terminal_agents.runs.iter().find_map(|(&id, run)| {
+                (run.is_live_ask_answer() && run.chat_handoff_id.as_deref() == Some(&snapshot.id))
+                    .then_some(id)
+            }) {
+                return self.continue_ask_tab(id, "");
+            }
             self.start_agent_chat(snapshot, String::new(), None)
         })
     }
@@ -312,6 +325,10 @@ impl Workspace {
                 run.chat_follow_up.clear();
             }
             Message::ContinueInChat(epoch) => {
+                let question = run.chat_follow_up.clone();
+                if run.is_live_ask_answer() {
+                    return self.continue_ask_tab(id, &question);
+                }
                 let snapshot = match Snapshot::capture(run) {
                     Ok(snapshot) => snapshot,
                     Err(error) => {
@@ -319,7 +336,6 @@ impl Workspace {
                         return Task::none();
                     }
                 };
-                let question = run.chat_follow_up.clone();
                 return self.start_agent_chat(
                     snapshot,
                     question,
@@ -329,6 +345,82 @@ impl Workspace {
             _ => {}
         }
         Task::none()
+    }
+
+    fn continue_ask_tab(&mut self, id: window::Id, question: &str) -> Task<Desktop> {
+        let result = (|| {
+            let run = self
+                .terminal_agents
+                .runs
+                .get(&id)
+                .filter(|run| run.is_live_ask_answer() && run.can_chat_handoff())
+                .ok_or("The finished Ask tab is unavailable.")?;
+            let source = run.binding.live()?;
+            let owner = self
+                .handoff_owner(source)
+                .ok_or("The original terminal or AI Chat is unavailable.")?;
+            self.current_agent_pane(source, Mode::Ask)?;
+            let redactor = self.handoff_redactor(source, None)?;
+            let profile = run.profile().ok_or("The Ask profile is unavailable.")?;
+            let (transcript, _) = run
+                .status_transcript()
+                .ok_or("The Ask response is unavailable.")?;
+            let context = mask::prompt(&redactor, run.context.trim())?;
+            let attachment = run
+                .ask_file
+                .snapshot
+                .as_ref()
+                .map(|file| file.stored().remasked(&redactor))
+                .transpose()?;
+            let context = attachment
+                .as_ref()
+                .map_or(context.clone(), |file| file.append_to(&context));
+            let turn = Turn::from_parts(
+                (!context.trim().is_empty()).then_some(context.as_str()),
+                mask::prompt(&redactor, &run.goal)?,
+                mask::prompt(&redactor, &transcript.final_answer)?,
+            );
+            if !turn.is_native_pair() || !turn.valid_initial() {
+                return Err("The Ask response does not fit the Chat limits.".into());
+            }
+            let draft = store::Draft {
+                profile: profile.reference.clone(),
+                profile_name: metadata(&mask::prompt(&redactor, &profile.label)?, 256),
+                connection: metadata(&mask::prompt(&redactor, &run.label)?, 120),
+                response_language: None,
+                turns: vec![turn],
+                attachment,
+            };
+            let origin = Origin {
+                owner,
+                session: source.session,
+                stream: source.stream,
+                id: run
+                    .chat_handoff_id
+                    .clone()
+                    .ok_or("The Ask run identity is unavailable.")?,
+            };
+            self.replace_ask_with_chat(id, origin, draft, question.trim(), redactor)
+        })();
+        match result {
+            Ok(task) => {
+                let detached = self.terminal_agents.runs.remove(&id).and_then(|mut run| {
+                    self.retain_finished_agent_run(id, &mut run);
+                    run.presentation.pip.detached.take()
+                });
+                Task::batch([
+                    task,
+                    detached.map_or_else(Task::none, |window| self.close_placed_dialog(window)),
+                    self.reconcile_agent_pip(),
+                ])
+            }
+            Err(error) => {
+                if let Some(run) = self.terminal_agents.runs.get_mut(&id) {
+                    run.notice = error;
+                }
+                Task::none()
+            }
+        }
     }
 
     fn start_agent_chat(

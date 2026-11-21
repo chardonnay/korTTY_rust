@@ -17,7 +17,7 @@ fn expired_status_releases_its_dock_without_removing_the_history() {
     use std::time::{Duration, Instant};
 
     let mut fixture = Fixture::new(false, false);
-    let id = fixture.open(Mode::Ask);
+    let id = fixture.open_ask_with_source_tab_visible();
     let stream = fixture.workspace.sessions[&fixture.session].stream_generation;
     let size = Size::new(840.0, 540.0);
     let run = fixture.run_mut(id);
@@ -108,7 +108,7 @@ impl Operation for Histories {
 #[test]
 fn native_adaptive_timeline_reuses_the_selected_timeline_history() {
     let mut fixture = Fixture::new(false, false);
-    let id = fixture.open(Mode::Ask);
+    let id = fixture.open_ask_with_source_tab_visible();
     let stream = fixture.workspace.sessions[&fixture.session].stream_generation;
     let size = Size::new(1280.0, 640.0);
     fixture.run_mut(id).design.history = History::Timeline;
@@ -142,7 +142,7 @@ fn native_adaptive_timeline_reuses_the_selected_timeline_history() {
 #[test]
 fn native_agent_docks_restore_terminal_space_after_close_or_stream_replacement() {
     let mut fixture = Fixture::new(false, false);
-    let id = fixture.open(Mode::Ask);
+    let id = fixture.open_ask_with_source_tab_visible();
     let stream = fixture.workspace.sessions[&fixture.session].stream_generation;
     let size = Size::new(800.0, 500.0);
     fixture.run_mut(id).design.history = History::Timeline;
@@ -163,7 +163,7 @@ fn native_agent_docks_restore_terminal_space_after_close_or_stream_replacement()
 #[test]
 fn native_adaptive_dock_uses_full_pane_size_and_floating_pill_preserves_terminal() {
     let mut fixture = Fixture::new(false, false);
-    let id = fixture.open(Mode::Ask);
+    let id = fixture.open_ask_with_source_tab_visible();
     let stream = fixture.workspace.sessions[&fixture.session].stream_generation;
     fixture.run_mut(id).design.arrangement = Arrangement::Adaptive;
     let wide = Size::new(160.0 * 8.0, 40.0 * 16.0);
@@ -178,8 +178,8 @@ fn native_adaptive_dock_uses_full_pane_size_and_floating_pill_preserves_terminal
 #[test]
 fn native_status_click_opens_only_its_own_drawer_without_authorizing_work() {
     let mut fixture = Fixture::new(false, false);
-    let id = fixture.open(Mode::Ask);
-    let other = fixture.open(Mode::Ask);
+    let id = fixture.open_ask_with_source_tab_visible();
+    let other = fixture.open_ask_with_source_tab_visible();
     let run = fixture.run_mut(id);
     run.design.status = Status::Spotlight;
     let epoch = run.next(Phase::Thinking, "Fixture activity");

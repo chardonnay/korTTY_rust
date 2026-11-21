@@ -173,6 +173,40 @@ pub(in crate::workspace) enum Seed {
 }
 
 impl Chat {
+    fn from_agent_draft(
+        config: &crate::ai_manager::Configuration,
+        draft: store::Draft,
+        redactor: Redactor,
+        allow_cli: bool,
+    ) -> Result<Self, String> {
+        let mut chat = Self::with_cli_preference(
+            config,
+            Action::Ask,
+            "",
+            redactor,
+            Some(&draft.profile),
+            allow_cli,
+        )?;
+        if !allow_cli {
+            chat.choices
+                .retain(|choice| !config.is_terminal_cli_profile(choice.id));
+        }
+        let (profile, available) = Self::saved_profile(config, &chat.choices, &draft.profile);
+        chat.profile = profile;
+        chat.policy_selection = Self::saved_policy(config, &draft.profile);
+        if !available {
+            chat.notice = SAVED_PROFILE_UNAVAILABLE.into();
+        }
+        chat.last_profile = Some((draft.profile, draft.profile_name));
+        chat.initial_context_chars = draft
+            .turns
+            .first()
+            .and_then(|turn| turn.context())
+            .map_or(0, |text| text.chars().count());
+        chat.turns = draft.turns.into_iter().map(Arc::new).collect();
+        Ok(chat)
+    }
+
     fn stage_agent_question(&mut self, question: &str) -> bool {
         if question.is_empty() {
             return true;
@@ -322,29 +356,36 @@ impl Workspace {
         Ok(())
     }
 
-    pub(super) fn private_agent_source_changed(&self, chat: &Chat) -> bool {
-        chat.private_source
+    pub(super) fn bound_agent_source_changed(&self, chat: &Chat) -> bool {
+        (chat.private_source || chat.agent_ask)
             && chat.agent_source_exact
-            && (!self.ai_chat_enabled() || self.terminal_chat_source(chat).is_none())
+            && (!self.ai_chat_enabled()
+                || self.terminal_chat_source(chat).is_none()
+                || chat.agent_ask
+                    && !chat.source_pane.is_some_and(|source| {
+                        self.terminal_agent_available(source, crate::terminal_agent::Mode::Ask)
+                    }))
     }
 
-    pub(super) fn revoke_private_agent_chat(&mut self, id: window::Id) {
+    pub(super) fn revoke_bound_agent_chat(&mut self, id: window::Id) {
         if let Some(chat) = self.terminal_chats.get_mut(&id) {
             chat.review = None;
             chat.pending = None;
             chat.visuals.cancel_copy();
-            chat.notice = "The private Agent chat requires its original terminal stream.".into();
+            chat.notice =
+                "The Agent chat requires its original terminal stream and current permissions."
+                    .into();
         }
     }
 
-    pub(in crate::workspace) fn revalidate_private_agent_chats(&mut self) {
+    pub(in crate::workspace) fn revalidate_bound_agent_chats(&mut self) {
         let stale: Vec<_> = self
             .terminal_chats
             .iter()
-            .filter_map(|(&id, chat)| self.private_agent_source_changed(chat).then_some(id))
+            .filter_map(|(&id, chat)| self.bound_agent_source_changed(chat).then_some(id))
             .collect();
         for id in stale {
-            self.revoke_private_agent_chat(id);
+            self.revoke_bound_agent_chat(id);
         }
     }
 
@@ -367,6 +408,70 @@ impl Workspace {
 
     pub(in crate::workspace) fn agent_chat_has_capacity(&self) -> bool {
         self.terminal_chats.len() < MAX_CHATS
+    }
+
+    pub(in crate::workspace) fn replace_ask_with_chat(
+        &mut self,
+        id: window::Id,
+        origin: Origin,
+        draft: store::Draft,
+        question: &str,
+        redactor: Redactor,
+    ) -> Result<Task<Desktop>, String> {
+        if !self.agent_chat_has_capacity() {
+            return Err("Close an AI Chat tab before opening another.".into());
+        }
+        let config = self
+            .ai_chat_configuration()
+            .ok_or("AI Chat is unavailable under the current settings.")?;
+        let window = self
+            .windows
+            .get(&origin.owner)
+            .ok_or("The original terminal is unavailable.")?;
+        let (index, _) = window
+            .pane_location(origin.session)
+            .ok_or("The original terminal is unavailable.")?;
+        let private = window
+            .tabs
+            .get(index)
+            .and_then(|entry| entry.terminal())
+            .ok_or("The original terminal is unavailable.")?
+            .incognito;
+        let allow_cli = !private
+            && crate::local_ai::cli::allowed(&self.clipboard.policy, true)
+            && crate::local_ai::cli::allowed(
+                &crate::clipboard_policy::ClipboardPolicy::load(),
+                true,
+            );
+        let connection = draft.connection.clone();
+        let attachment = draft.attachment.clone();
+        let mut chat = Chat::from_agent_draft(&config, draft, redactor, allow_cli)?;
+        chat.conversation = super::conversation::State::with_archived_attachment(attachment);
+        chat.agent_ask = true;
+        chat.agent_run_id = Some(origin.id);
+        chat.agent_source_exact = true;
+        chat.source_pane = Some(origin.session);
+        chat.source_stream = Some(origin.stream);
+        chat.private_source = private;
+        chat.include_memory = false;
+        let pane = self
+            .terminal_chat_source(&chat)
+            .ok_or("The original terminal stream changed.")?;
+        if !private {
+            chat.knowledge_root = config.saved_root().map(std::path::Path::to_owned);
+            chat.storage.clone_from(&chat.knowledge_root);
+            chat.connection = connection;
+            chat.memory_target = super::MemoryTarget::capture(pane);
+        }
+        if !chat.stage_agent_question(question) {
+            return Err("Shorten the follow-up question to fit the Chat limit.".into());
+        }
+        if !self.replace_hosted_agent_with_chat(id) {
+            return Err("The original Ask tab closed.".into());
+        }
+        self.prepare_hosted_chat(&mut chat);
+        self.terminal_chats.insert(id, chat);
+        Ok(self.focus_hosted_tool(id).unwrap_or_else(Task::none))
     }
 
     pub(in crate::workspace) fn install_agent_terminal_chat(
@@ -403,21 +508,7 @@ impl Workspace {
                 chat
             }
             Seed::Private(draft) => {
-                let mut chat = Chat::new(&config, Action::Ask, "", redactor, Some(&draft.profile))?;
-                let (profile, profile_available) =
-                    Chat::saved_profile(&config, &chat.choices, &draft.profile);
-                chat.profile = profile;
-                chat.policy_selection = Chat::saved_policy(&config, &draft.profile);
-                if !profile_available {
-                    chat.notice = SAVED_PROFILE_UNAVAILABLE.into();
-                }
-                chat.last_profile = Some((draft.profile, draft.profile_name));
-                chat.initial_context_chars = draft
-                    .turns
-                    .first()
-                    .and_then(|turn| turn.context())
-                    .map_or(0, |text| text.chars().count());
-                chat.turns = draft.turns.into_iter().map(Arc::new).collect();
+                let mut chat = Chat::from_agent_draft(&config, draft, redactor, false)?;
                 chat.private_source = true;
                 chat
             }

@@ -20,7 +20,7 @@ use designs::{Histories, inspect_design, terminal_bounds};
 #[test]
 fn picture_in_picture_adopts_one_history_without_resizing_terminal_or_authorizing_work() {
     let mut fixture = Fixture::new(false, false);
-    let id = fixture.open(Mode::Ask);
+    let id = fixture.open_ask_with_source_tab_visible();
     let run = fixture.run_mut(id);
     run.design.arrangement = Arrangement::PictureInPicture;
     run.design.history = History::Timeline;
@@ -65,7 +65,7 @@ fn picture_in_picture_adopts_one_history_without_resizing_terminal_or_authorizin
 #[test]
 fn picture_in_picture_detaches_with_separate_identity_and_close_only_reattaches() {
     let mut fixture = Fixture::new(false, false);
-    let id = fixture.open(Mode::Ask);
+    let id = fixture.open_ask_with_source_tab_visible();
     fixture.run_mut(id).design.arrangement = Arrangement::PictureInPicture;
     let epoch = fixture.run(id).epoch;
     let task = fixture.send(id, Message::Pip(Pip::Detach));
@@ -195,7 +195,7 @@ fn keyboard_entry_uses_only_the_focused_panes_visible_agent_log() {
     use design::log_table::{Key as LogKey, Message as LogMessage};
 
     let mut fixture = Fixture::new(false, false);
-    let id = fixture.open(Mode::Ask);
+    let id = fixture.open_ask_with_source_tab_visible();
     let run = fixture.run_mut(id);
     run.design.arrangement = Arrangement::Normal;
     run.design.history = History::LogTable;
@@ -263,7 +263,7 @@ fn detached_log_accepts_tab_and_routes_keys_to_its_owned_run() {
     use design::log_table::{Key as LogKey, Message as LogMessage};
 
     let mut fixture = Fixture::new(false, false);
-    let id = fixture.open(Mode::Ask);
+    let id = fixture.open_ask_with_source_tab_visible();
     let run = fixture.run_mut(id);
     run.design.arrangement = Arrangement::PictureInPicture;
     run.design.history = History::LogTable;
@@ -403,7 +403,7 @@ fn focused_agent_log_table_gets_keys_before_the_embedded_terminal() {
     use design::log_table::{Key as LogKey, Message as LogMessage};
 
     let mut fixture = Fixture::new(false, false);
-    let id = fixture.open(Mode::Ask);
+    let id = fixture.open_ask_with_source_tab_visible();
     let run = fixture.run_mut(id);
     run.design.arrangement = Arrangement::Normal;
     run.design.history = History::LogTable;
@@ -529,7 +529,7 @@ fn docked_log_answer_context_menu_copies_the_selected_run_answer() {
 
     let mut fixture = Fixture::new(false, false);
     fixture.workspace.clipboard.policy.internal = true;
-    let id = fixture.open(Mode::Ask);
+    let id = fixture.open_ask_with_source_tab_visible();
     let run = fixture.run_mut(id);
     run.design.arrangement = Arrangement::Normal;
     run.design.history = History::LogTable;
@@ -581,7 +581,7 @@ fn docked_log_answer_context_menu_copies_the_selected_run_answer() {
 #[test]
 fn docked_log_run_menu_reopens_the_exact_archived_run() {
     let mut fixture = Fixture::new(false, false);
-    let archived_id = fixture.open(Mode::Ask);
+    let archived_id = fixture.open_ask_with_source_tab_visible();
     let archived = fixture.run_mut(archived_id);
     archived.started_order = 1;
     archived.goal = "Inspect previous result".into();
@@ -597,7 +597,7 @@ fn docked_log_run_menu_reopens_the_exact_archived_run() {
         [archived_id],
     );
 
-    let current_id = fixture.open(Mode::Ask);
+    let current_id = fixture.open_ask_with_source_tab_visible();
     let current = fixture.run_mut(current_id);
     current.started_order = 2;
     current.goal = "Inspect current result".into();
@@ -655,7 +655,7 @@ fn keyboard_opens_the_focused_log_menu_without_leaking_action_key_releases() {
 
     let mut fixture = Fixture::new(false, false);
     fixture.workspace.clipboard.policy.internal = true;
-    let id = fixture.open(Mode::Ask);
+    let id = fixture.open_ask_with_source_tab_visible();
     let run = fixture.run_mut(id);
     run.design.arrangement = Arrangement::Normal;
     run.design.history = History::LogTable;
@@ -750,7 +750,7 @@ fn log_detail_editor_copies_a_read_only_selection_and_rechecks_its_full_source()
 
     let mut fixture = Fixture::new(false, false);
     fixture.workspace.clipboard.policy.internal = true;
-    let id = fixture.open(Mode::Ask);
+    let id = fixture.open_ask_with_source_tab_visible();
     let run = fixture.run_mut(id);
     run.design.history = History::LogTable;
     run.goal = "Review retained output".into();
@@ -857,7 +857,7 @@ fn narrow_detached_log_table_scrolls_to_the_exact_step_and_keeps_actions_in_view
 
     let mut fixture = Fixture::new(false, false);
     fixture.workspace.clipboard.policy.internal = true;
-    let id = fixture.open(Mode::Ask);
+    let id = fixture.open_ask_with_source_tab_visible();
     let run = fixture.run_mut(id);
     run.design.arrangement = Arrangement::Normal;
     run.design.history = History::LogTable;
@@ -1088,8 +1088,8 @@ fn narrow_detached_log_table_scrolls_to_the_exact_step_and_keeps_actions_in_view
 #[test]
 fn picture_in_picture_tabs_and_detached_cleanup_follow_only_the_exact_stream() {
     let mut fixture = Fixture::new(false, false);
-    let first = fixture.open(Mode::Ask);
-    let second = fixture.open(Mode::Ask);
+    let first = fixture.open_ask_with_source_tab_visible();
+    let second = fixture.open_ask_with_source_tab_visible();
     for id in [first, second] {
         fixture.run_mut(id).design.arrangement = Arrangement::PictureInPicture;
     }
@@ -1132,8 +1132,8 @@ fn picture_in_picture_tabs_and_detached_cleanup_follow_only_the_exact_stream() {
 #[test]
 fn picture_in_picture_can_be_restored_after_following_another_design_but_not_an_old_stream() {
     let mut fixture = Fixture::new(false, false);
-    let pip = fixture.open(Mode::Ask);
-    let other = fixture.open(Mode::Ask);
+    let pip = fixture.open_ask_with_source_tab_visible();
+    let other = fixture.open_ask_with_source_tab_visible();
     fixture.run_mut(pip).design.arrangement = Arrangement::PictureInPicture;
     let stream = fixture.workspace.sessions[&fixture.session].stream_generation;
     no_task(fixture.send(pip, Message::Pip(Pip::Show)));
@@ -1356,8 +1356,8 @@ fn picture_in_picture_new_input_moves_the_detached_window_and_rejects_old_owner_
 #[test]
 fn picture_in_picture_detachment_follows_completion_without_creating_a_history_pin() {
     let mut fixture = Fixture::new(false, false);
-    let first = fixture.open(Mode::Ask);
-    let second = fixture.open(Mode::Ask);
+    let first = fixture.open_ask_with_source_tab_visible();
+    let second = fixture.open_ask_with_source_tab_visible();
     for (order, id) in [first, second].into_iter().enumerate() {
         let run = fixture.run_mut(id);
         run.design.arrangement = Arrangement::PictureInPicture;
