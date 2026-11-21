@@ -1567,6 +1567,10 @@ In **Diagrams → Script → Local AI…** you can configure the numeric loopbac
 
 **AI → AI Agent…** opens a modeless activity window for the selected terminal pane. Choose a profile and review the fixed environment probe. Each proposed command has its own approval showing the command, shell and working directory. Local Windows runs use the absolute directory entered in the setup. Other local runs use the current shell directory. SSH runs use the reported directory and a separate exec channel on the authenticated connection. Pause takes effect between steps. Cancel stops the local process group or closes the SSH command channel and preserves the transcript collected so far.
 
+Local profiles with a direct interactive Bash, Zsh or Fish startup can use the Agent on POSIX. The review shows `/bin/sh` as the interpreter for a custom start or an interactive Fish shell. Windows profiles with supported PowerShell or CMD startup flags use the corresponding system interpreter for reviewed commands. The live pane retains its own startup arguments. Local Agent execution requires **Isolation → None** and an effective policy that allows it.
+
+Windows PowerShell and CMD use a conventional drive-letter working directory. For an extended local path, kortty checks that the conventional path resolves to the same directory before starting the shell or Agent command.
+
 Interactive Agent and Swarm member reviews include masked AI Memory for the selected target. Organization rules and global memory apply across eligible non-private targets. Each saved target receives its own connection memory. Private terminal reviews can include organization rules. Swarm comparison and workflow script generation use organization and global memory. Review the request again if its memory changes.
 
 A standalone agent on an attached SSH pane can propose a typed passwordless sudo command. The activity window shows the complete command and requires a separate approval. The remote account must allow that exact invocation as root without a password. The run stops if the elevated command fails.

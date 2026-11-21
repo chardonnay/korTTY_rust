@@ -474,17 +474,7 @@ while ($null -ne ($line = [Console]::ReadLine())) {
             initial_output: &str,
         ) -> Self {
             let shell = options.shell;
-            let mut workspace = Workspace::default();
-            workspace.set_test_ai_configuration(
-                serde_json::from_value(serde_json::json!({
-                    "general": {"agent_shortcut": {"enabled": true}, "show_agent_setup": show_setup},
-                    "profiles": {
-                        "profiles": [{"id":1,"name":"Fixture","endpoint":"127.0.0.1:12345","model":"fixture"}],
-                        "default":1, "last_id":1
-                    }
-                })).unwrap()
-            );
-            let (owner, _) = workspace.open_window(false);
+            let (mut workspace, owner) = Self::workspace(show_setup);
             let grid = GridSize::default();
             let session =
                 Session::start_local(grid, TerminalProfile::Xterm, options, true, None).unwrap();
@@ -503,6 +493,21 @@ while ($null -ne ($line = [Console]::ReadLine())) {
             fixture
         }
 
+        fn workspace(show_setup: bool) -> (Workspace, window::Id) {
+            let mut workspace = Workspace::default();
+            workspace.set_test_ai_configuration(
+                serde_json::from_value(serde_json::json!({
+                    "general": {"agent_shortcut": {"enabled": true}, "show_agent_setup": show_setup},
+                    "profiles": {
+                        "profiles": [{"id":1,"name":"Fixture","endpoint":"127.0.0.1:12345","model":"fixture"}],
+                        "default":1, "last_id":1
+                    }
+                })).unwrap()
+            );
+            let (owner, _) = workspace.open_window(false);
+            (workspace, owner)
+        }
+
         fn session(&self) -> &Session {
             &self.workspace.sessions[&self.pane].session
         }
@@ -512,20 +517,25 @@ while ($null -ne ($line = [Console]::ReadLine())) {
             let frame: Arc<Frame> = loop {
                 let session = self.session();
                 let frame = session.frame();
-                let visible = (0..frame.screen.rows).any(|index| {
-                    frame.screen.row(index).is_some_and(|cells| {
-                        cells
-                            .iter()
-                            .map(|cell| cell.text.as_str())
-                            .collect::<String>()
-                            .trim_end()
-                            == output
-                    })
-                });
+                let visible = output.is_empty()
+                    || (0..frame.screen.rows).any(|index| {
+                        frame.screen.row(index).is_some_and(|cells| {
+                            cells
+                                .iter()
+                                .map(|cell| cell.text.as_str())
+                                .collect::<String>()
+                                .trim_end()
+                                == output
+                        })
+                    });
                 if visible && session.agent_shortcut_prompt(&frame).is_some() {
                     break frame;
                 }
-                assert!(Instant::now() < deadline, "missing prompt after {output}");
+                assert!(
+                    Instant::now() < deadline,
+                    "missing prompt after {output:?} in {:?}",
+                    frame.status
+                );
                 std::thread::sleep(Duration::from_millis(10));
             };
             self.workspace.sessions.get_mut(&self.pane).unwrap().frame = frame;
@@ -569,6 +579,128 @@ while ($null -ne ($line = [Console]::ReadLine())) {
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = self.session().stop().recv_blocking();
+        }
+    }
+
+    fn check_saved_custom_shell(command: Vec<String>, expected_runner: &std::path::Path) {
+        use iced::futures::{StreamExt as _, executor::block_on};
+
+        use super::super::{Message as AgentMessage, RunTarget};
+        use crate::connection_store::{LocalProfile, Store};
+        use crate::snippets::tests::Profile;
+
+        let scratch = Profile::new();
+        let root = scratch.0.canonicalize().unwrap();
+        std::fs::write(root.join("fixture.txt"), "kortty-custom-forwarded\n").unwrap();
+        let catalog = root.join("connections.json");
+        let mut store = Store::open(catalog.clone()).unwrap();
+        let saved = store
+            .save_local(LocalProfile {
+                id: 0,
+                name: "Custom Agent shell".into(),
+                shell: Default::default(),
+                command: Some(command.clone()),
+                working_directory: Some(root.clone()),
+                shell_integration: true,
+                emulation: TerminalProfile::Xterm.term_name().into(),
+                terminal_effect: None,
+                terminal: Default::default(),
+            })
+            .unwrap();
+        drop(store);
+        let store = Store::open(catalog).unwrap();
+        let (mut workspace, owner) = Fixture::workspace(true);
+        let pane = workspace
+            .store_saved_local_session(store.local(saved).unwrap().clone(), None)
+            .unwrap();
+        workspace.add_tab(owner, pane);
+        assert_eq!(
+            workspace.sessions[&pane]
+                .local_security
+                .as_ref()
+                .unwrap()
+                .command
+                .as_ref(),
+            Some(&command)
+        );
+        let mut fixture = Fixture {
+            workspace,
+            owner,
+            pane,
+        };
+        fixture.wait_for_prompt("");
+        #[cfg(unix)]
+        fixture.type_text("cat fixture.txt");
+        #[cfg(windows)]
+        fixture.type_text("type fixture.txt");
+        fixture.enter();
+        fixture.wait_for_prompt("kortty-custom-forwarded");
+
+        fixture.type_text("agent Inspect the custom shell directory");
+        fixture.enter();
+        let (&id, run) = fixture
+            .workspace
+            .terminal_agents
+            .runs
+            .iter()
+            .next()
+            .unwrap();
+        assert_eq!(run.binding.session(), Some(pane));
+        assert_eq!(run.mode, Mode::Run);
+        assert_eq!(run.goal, "Inspect the custom shell directory");
+        assert!(run.phase == Phase::Setup);
+        assert!(
+            fixture
+                .session()
+                .agent_shortcut_prompt(&fixture.session().frame())
+                .is_some()
+        );
+
+        let task = fixture
+            .workspace
+            .update_terminal_agent(id, AgentMessage::Start);
+        let mut events = iced_runtime::task::into_stream(task).unwrap();
+        while let Some(action) = block_on(events.next()) {
+            if let iced_runtime::Action::Output(Desktop::TerminalAgent(actual, result)) = action {
+                assert_eq!(actual, id);
+                drop(fixture.workspace.update_terminal_agent(actual, result));
+            }
+        }
+        let run = &fixture.workspace.terminal_agents.runs[&id];
+        assert!(run.phase == Phase::ProbeApproval, "{}", run.notice);
+        let Some(RunTarget::Attached(target)) = &run.target else {
+            panic!("the probe review must be bound to the live local pane");
+        };
+        assert_eq!(std::path::Path::new(target.shell()), expected_runner);
+        assert_eq!(std::path::Path::new(target.directory()), root);
+        assert!(run.reviewed_command().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires a private HOME and KORTTY_TEST_CUSTOM_AGENT_SHELL containing a supported absolute shell path"]
+    fn agent_shortcut_native_saved_custom_posix_shell_reaches_probe_review() {
+        let home = std::fs::canonicalize(std::env::var_os("HOME").unwrap()).unwrap();
+        let scratch = std::env::temp_dir().canonicalize().unwrap();
+        assert!(home.starts_with(&scratch) && home != scratch);
+        let shell = std::env::var("KORTTY_TEST_CUSTOM_AGENT_SHELL").unwrap();
+        assert!(std::path::Path::new(&shell).is_absolute());
+        check_saved_custom_shell(vec![shell, "-i".into()], std::path::Path::new("/bin/sh"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn agent_shortcut_native_saved_custom_windows_shells_reach_probe_review() {
+        use kortty_pty::LocalShell;
+
+        for (shell, flags) in [
+            (LocalShell::PowerShell, ["-NoLogo", "-NoProfile"]),
+            (LocalShell::CommandPrompt, ["/d", "/q"]),
+        ] {
+            let program = kortty_pty::shell_program(shell).unwrap();
+            let mut command = vec![program.to_str().unwrap().into()];
+            command.extend(flags.map(str::to_owned));
+            check_saved_custom_shell(command, &program);
         }
     }
 

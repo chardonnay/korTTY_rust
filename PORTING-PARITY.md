@@ -16,6 +16,48 @@ open until a result is recorded for the tested revision and environment. Both
 Mosh modes are out of scope. The editor has a reduced native scope with structure
 navigation for classes, functions, variables, and placeholders.
 
+## November 21 Native Agent entry from saved custom shell profiles
+
+The saved-profile test reopens the catalogue, starts the configured shell in
+its native PTY, and reads a fixture file through ordinary terminal input.
+The new prompt accepts `agent` through the workspace keyboard handler.
+The run reaches the environment-probe review for that pane, interpreter and
+working directory.
+
+Zsh on Apple Silicon and Bash and Fish on Fedora ARM64 passed the separate
+native fixture. Each platform passed 233 selected application tests. Windows
+ARM64 passed 233 selected application tests, including the saved PowerShell
+and CMD case. Windows PowerShell and CMD receive an equivalent drive-letter
+working directory when the saved path uses extended syntax. ConPTY and the
+separate native Agent process verified the directory by reading a fixture
+file. The Agent worker also verified cleanup of a child process at exit.
+Visual desktop and package acceptance remain under A1.
+[Apple Silicon tests](target/verification/20261121-agent-custom-live-macos-retry.log)
+· [Fedora ARM64 tests](target/verification/20261121-agent-custom-live-fedora-verified.log)
+· [Windows ARM64 tests](target/verification/20261121-agent-custom-live-windows-complete.log)
+
+## November 21 Terminal Agent with custom local shells
+
+The native Agent accepts direct custom Bash, Zsh and Fish starts with
+validated interactive arguments. It runs reviewed POSIX commands through
+`/bin/sh`, matching the Java runner. Fish also uses that interpreter when
+selected as the system shell. Supported custom PowerShell and CMD starts
+use separate system interpreters on Windows. The terminal retains its
+configured startup arguments. Command and model reviews check the active
+interpreter and directory. A saved plan binds the custom startup arguments
+through a fingerprint. Effective local isolation still governs execution.
+
+Apple Silicon and Fedora ARM64 each passed 233 selected Agent and terminal
+context tests. The regression executes a command through the selected
+POSIX interpreter and checks rejection of a script argument and a managed
+isolation requirement. Windows ARM64 passed 232 selected tests, including the
+native CMD runner selection, and strict workspace Clippy. Live desktop and
+packaged custom shell acceptance remain under A1.
+[Apple Silicon tests](target/verification/20261121-agent-custom-shell-macos-verified.log)
+· [Fedora ARM64 tests](target/verification/20261121-agent-custom-shell-fedora-verified.log)
+· [Windows ARM64 tests](target/verification/20261121-agent-custom-shell-windows-verified.log)
+· [Windows ARM64 Clippy](target/verification/20261121-agent-custom-shell-windows.log)
+
 ## November 21 Local POSIX sudo for the Terminal Agent
 
 A standalone Agent can review password sudo on a native POSIX shell. An

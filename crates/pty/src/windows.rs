@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
     DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NO_DATA,
-    ERROR_PIPE_NOT_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    ERROR_PIPE_NOT_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, MAX_PATH,
     WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Globalization::{
@@ -547,6 +547,13 @@ fn spawn_shell(
     } else {
         shell_program(options.shell)?
     };
+    let directory = if sandbox.is_none() {
+        directory
+            .map(|path| windows_shell_directory(&program, path))
+            .transpose()?
+    } else {
+        directory
+    };
     let arguments = options
         .command
         .as_ref()
@@ -790,6 +797,34 @@ fn custom_program(program: &str, directory: Option<&Path>) -> io::Result<PathBuf
         ));
     }
     Ok(program)
+}
+
+/// Windows PowerShell and Command Prompt expect a DOS working directory.
+pub fn windows_shell_directory<'a>(program: &Path, directory: &'a Path) -> io::Result<&'a Path> {
+    use std::path::{Component, Prefix};
+
+    if !program.file_name().is_some_and(|name| {
+        name.eq_ignore_ascii_case(OsStr::new("powershell.exe"))
+            || name.eq_ignore_ascii_case(OsStr::new("cmd.exe"))
+    }) || !matches!(directory.components().next(), Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::VerbatimDisk(_)))
+    {
+        return Ok(directory);
+    }
+
+    let dos = directory
+        .to_str()
+        .and_then(|text| text.strip_prefix(r"\\?\"))
+        .map(Path::new)
+        .filter(|path| path.as_os_str().encode_wide().count() < MAX_PATH as usize)
+        .ok_or_else(|| {
+            io::Error::other("The Windows shell requires a short DOS working directory")
+        })?;
+    if dos.canonicalize()? != directory.canonicalize()? {
+        return Err(io::Error::other(
+            "The DOS path resolves to a different Windows shell working directory",
+        ));
+    }
+    Ok(dos)
 }
 
 fn custom_command_line(program: &[u16], arguments: &[String]) -> io::Result<Vec<u16>> {

@@ -21,6 +21,57 @@ mod shortcut;
 pub(in crate::workspace::terminal_agent) mod triage;
 
 #[test]
+fn custom_interactive_shell_uses_a_reviewable_runner_and_preserves_isolation() {
+    let mut fixture = Fixture::new(false, false);
+    let pane = fixture
+        .workspace
+        .sessions
+        .get_mut(&fixture.session)
+        .unwrap();
+    let settings = pane.local_security.as_mut().unwrap();
+    #[cfg(unix)]
+    let program = ["/opt/terminal-fixture/bin/fish", "--interactive"];
+    #[cfg(windows)]
+    let program = [r"C:\Windows\System32\cmd.exe", "/d"];
+    settings.command = Some(program.map(str::to_owned).into());
+    let shell = local_agent_shell(pane).unwrap();
+    #[cfg(unix)]
+    {
+        let directory = LocalDirectory::capture(fixture.profile.0.canonicalize().unwrap()).unwrap();
+        let target = Target::Local { shell, directory };
+        let outcome = target
+            .execute(r#"printf '%s' "$0""#, &engine::Cancel::default(), || {})
+            .unwrap();
+        assert_eq!(outcome.status, engine::Status::Exited(0));
+        assert_eq!(outcome.stdout.text().as_str(), "/bin/sh");
+    }
+    #[cfg(windows)]
+    assert!(matches!(shell, Shell::CommandPrompt(path) if path.is_absolute()));
+    let pane = &fixture.workspace.sessions[&fixture.session];
+    assert!(fixture.workspace.agent_execution_target(pane).is_ok());
+    fixture.workspace.clipboard.policy.minimum_isolation = IsolationLevel::Process;
+    assert!(fixture.workspace.agent_execution_target(pane).is_err());
+
+    fixture.workspace.clipboard.policy.minimum_isolation = IsolationLevel::None;
+    let pane = fixture
+        .workspace
+        .sessions
+        .get_mut(&fixture.session)
+        .unwrap();
+    let command = pane
+        .local_security
+        .as_mut()
+        .unwrap()
+        .command
+        .as_mut()
+        .unwrap();
+    command.push("script-to-run".into());
+    let pane = &fixture.workspace.sessions[&fixture.session];
+    assert!(local_agent_shell(pane).is_err());
+    assert!(fixture.workspace.agent_execution_target(pane).is_err());
+}
+
+#[test]
 fn agent_text_zoom_keeps_independent_sizes_and_remembered_defaults() {
     use crate::workspace::terminal_agent::font::View;
     use iced::keyboard::{Key, Modifiers};
@@ -2015,7 +2066,7 @@ fn native_local_sudo_preflight_rechecks_the_reviewed_directory() {
     let directory = root.join("reviewed");
     std::fs::create_dir(&directory).unwrap();
     let target = Target::Local {
-        shell: Shell::Posix(PathBuf::from("/bin/sh")),
+        shell: local_agent_shell(&fixture.workspace.sessions[&fixture.session]).unwrap(),
         directory: LocalDirectory::capture(directory.clone()).unwrap(),
     };
     let outcome = target.clone().execute(

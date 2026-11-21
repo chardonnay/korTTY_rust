@@ -14,6 +14,8 @@ fn native_agent_windows_worker_runs_exact_shell_and_owns_background_children() {
         .canonicalize()
         .unwrap();
     let profile = Profile::new();
+    let directory = profile.0.canonicalize().unwrap();
+    std::fs::write(directory.join("agent-cwd.txt"), "reviewed directory\r\n").unwrap();
     let shell =
         Shell::PowerShell(kortty_pty::shell_program(kortty_pty::LocalShell::PowerShell).unwrap());
     let background = "Start-Sleep -Milliseconds 1100; [IO.File]::WriteAllText('escaped', 'leaked')";
@@ -26,6 +28,7 @@ fn native_agent_windows_worker_runs_exact_shell_and_owns_background_children() {
     let command = format!(
         concat!(
             "$ProgressPreference = 'SilentlyContinue'; ",
+            "if ([IO.File]::ReadAllText((Join-Path (Get-Location).Path 'agent-cwd.txt')).Trim() -ne 'reviewed directory') {{ exit 14 }}; ",
             "$worker = Start-Process -PassThru -WindowStyle Hidden -FilePath (Join-Path $PSHOME 'powershell.exe') ",
             "-WorkingDirectory (Get-Location).Path -ArgumentList '-NoProfile','-NonInteractive','-EncodedCommand','{}'; ",
             "[Console]::Out.WriteLine($worker.Id); [Console]::Out.Write('Grüße 東京'); [Console]::Error.Write('Fehler 東京'); exit 19"
@@ -34,7 +37,7 @@ fn native_agent_windows_worker_runs_exact_shell_and_owns_background_children() {
     );
     let result = run_executable(
         &shell,
-        &profile.0,
+        &directory,
         &command,
         &Cancel::default(),
         &executable,
@@ -65,10 +68,11 @@ fn native_agent_windows_worker_runs_exact_shell_and_owns_background_children() {
             (chars.next().is_none() && !first.is_ascii() && first.is_alphabetic()).then_some(first)
         })
         .unwrap_or('ü');
-    let command = format!("echo agent-{letter}& echo err-{letter} 1>&2& exit /b 13");
+    let command =
+        format!("type agent-cwd.txt& echo agent-{letter}& echo err-{letter} 1>&2& exit /b 13");
     let result = run_executable(
         &shell,
-        &profile.0,
+        &directory,
         &command,
         &Cancel::default(),
         &executable,
@@ -76,6 +80,9 @@ fn native_agent_windows_worker_runs_exact_shell_and_owns_background_children() {
     )
     .unwrap();
     assert_eq!(result.status, Status::Exited(13));
-    assert_eq!(result.stdout.text().trim(), format!("agent-{letter}"));
+    assert_eq!(
+        result.stdout.text().lines().collect::<Vec<_>>(),
+        ["reviewed directory", &format!("agent-{letter}")]
+    );
     assert_eq!(result.stderr.text().trim(), format!("err-{letter}"));
 }

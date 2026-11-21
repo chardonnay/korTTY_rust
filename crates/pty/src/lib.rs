@@ -55,7 +55,10 @@ pub use platform::{PtyReader, PtyWriter};
 #[cfg(windows)]
 pub use platform::{WINDOWS_LOCAL_SANDBOX_BROKER_ARGUMENT, run_windows_local_sandbox_broker};
 #[cfg(windows)]
-pub use platform::{contain_child, contain_pdf_worker, decode_oem_output, inherited_bridge_pipes};
+pub use platform::{
+    contain_child, contain_pdf_worker, decode_oem_output, inherited_bridge_pipes,
+    windows_shell_directory,
+};
 pub use process_usage::{ProcessUsage, child_usage, current_process_usage};
 pub use shell_integration::{ShellIntegrationSnippet, validate_shell_integration};
 pub use tcp_keepalive::set_tcp_keepalive;
