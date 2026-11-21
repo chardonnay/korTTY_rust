@@ -11,7 +11,7 @@ use crate::terminal_view::agent_cursor::{
 
 use super::{Cancel, Desktop, PaneSession, Phase, Purpose, Run, RunTarget, Target, Workspace};
 
-fn review_frame(frame: &Frame) -> bool {
+pub(super) fn review_frame(frame: &Frame) -> bool {
     frame.status == SessionStatus::Running
         && frame.at_live_viewport()
         && !frame.screen.alternate_screen

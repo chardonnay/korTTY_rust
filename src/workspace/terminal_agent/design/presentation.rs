@@ -42,6 +42,10 @@ impl StatusVisibility {
     pub(super) fn show(&mut self) {
         self.manual = Some(true);
     }
+
+    pub(super) fn hide(&mut self) {
+        self.manual = Some(false);
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -99,9 +103,19 @@ pub(in crate::workspace::terminal_agent) struct Presentation {
     pub(super) selected_step: Option<u64>,
     pub(super) step_list_open: bool,
     pub(super) log_table: super::log_table::State,
+    pub(super) tmux_started: Option<Instant>,
+    pub(in crate::workspace::terminal_agent) tmux_hidden: bool,
 }
 
 impl Presentation {
+    pub(super) fn set_tmux_hidden(&mut self, hidden: bool) {
+        self.tmux_hidden = hidden;
+        if hidden {
+            self.dock_resize = None;
+            self.activity.preview = None;
+        }
+    }
+
     pub(in crate::workspace::terminal_agent) fn reveal_finished(&mut self, finished: Instant) {
         self.status_visibility.finished(finished);
         self.status_visibility.show();
@@ -125,6 +139,7 @@ impl Presentation {
         self.status_events.sync(transcript, finished, now);
         self.status_events.track_review(waiting, now);
         self.log_table.sync(transcript, now);
+        self.tmux_started.get_or_insert(now);
     }
 
     pub(in crate::workspace::terminal_agent) fn load_activity(

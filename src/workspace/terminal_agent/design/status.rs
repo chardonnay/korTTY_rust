@@ -4,7 +4,7 @@ use std::f32::consts::TAU;
 use std::time::{Duration, Instant};
 
 use iced::widget::{button, column, container, progress_bar, row, scrollable, text, tooltip};
-use iced::{Alignment, Element, Font, Length};
+use iced::{Alignment, Element, Length};
 
 use crate::terminal_agent::design::Status;
 use crate::terminal_agent::design::inline::{State, Step, StepState, Transcript};
@@ -19,11 +19,13 @@ use super::{
 };
 
 mod meter;
+mod neon;
 pub(super) use meter::adaptive_countdown;
 use meter::{Ring, Tone};
 
 pub(super) struct Trace<'a> {
     run: Option<&'a Run>,
+    started_at: Option<Instant>,
     steps: &'a [Step],
     answer: &'a str,
     elapsed: Duration,
@@ -38,18 +40,23 @@ pub(super) struct Trace<'a> {
 
 impl<'a> Trace<'a> {
     fn live(run: &'a Run, now: Instant, reduced_motion: bool) -> Self {
-        let (transcript, elapsed) =
+        let (transcript, elapsed, started_at) =
             run.status_transcript()
-                .map_or((None, Duration::ZERO), |(transcript, start)| {
+                .map_or((None, Duration::ZERO, None), |(transcript, start)| {
                     let end = run
                         .presentation
                         .status_visibility
                         .finished_at
                         .unwrap_or(now);
-                    (Some(transcript), end.saturating_duration_since(start))
+                    (
+                        Some(transcript),
+                        end.saturating_duration_since(start),
+                        Some(start),
+                    )
                 });
         Self {
             run: Some(run),
+            started_at,
             steps: transcript.map_or(&[], |trace| trace.steps.as_slice()),
             answer: transcript.map_or("", |trace| trace.final_answer.as_str()),
             elapsed,
@@ -75,6 +82,7 @@ impl<'a> Trace<'a> {
     ) -> Self {
         Self {
             run: None,
+            started_at: Some(start),
             steps: &transcript.steps,
             answer: &transcript.final_answer,
             elapsed: Duration::from_millis(transcript.elapsed_ms),
@@ -366,23 +374,7 @@ pub(super) fn render<'a>(
         .align_y(Alignment::Center)
         .wrap()
         .into(),
-        Status::Neon => row![
-            text(format!("[{}]", phase.to_uppercase()))
-                .font(Font::MONOSPACE)
-                .size(12)
-                .style(heading_style),
-            text(run.activity.back().map_or_else(
-                || "Waiting for activity".into(),
-                |entry| history::summary(entry)
-            ))
-            .font(Font::MONOSPACE)
-            .size(12),
-            button("Details").style(button::text).on_press(toggle()),
-        ]
-        .spacing(6)
-        .align_y(Alignment::Center)
-        .wrap()
-        .into(),
+        Status::Neon => return neon::view(run, phase, &trace, palette, has_archive),
         Status::Hud => column![
             text(format!("Agent · {phase}"))
                 .size(14)

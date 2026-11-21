@@ -9,7 +9,7 @@ source and environment for earlier checks. Detailed logs under
 
 **Java v2.26.0 parity remains partial.** The comparison uses Java tag
 `v2.26.0` (`b235d91f2035`). The current Rust worktree is based on merged
-PR #26 (`3d310ee1`). Agent-to-Chat continuation, the Agent profile
+PR #27 (`2e6faa3a`). Agent-to-Chat continuation, the Agent profile
 role, Journal chat exports, command summaries, the snippet structure panel
 and Lua editor tools are implemented. AI Manager search reaches every page
 and a subset of individual controls. The [source comparison](PORTING-PARITY.md#november-19-java-release-source-comparison)
@@ -1187,14 +1187,50 @@ Reduced animations clears the suggestion immediately. A fading suggestion
 has no keyboard actions. Fedora X11 verified both settings and input
 delivery during the fade. Verify the cursor interactions on Windows,
 macOS, and Wayland, including reduced animations and SSH takeover.
-The SSH takeover now binds the reported working directory to the current
+The SSH takeover binds the reported working directory to the current
 shell prompt, including when the directory and prompt arrive in separate
-transport reads. The native Wayland SSH retest is tracked separately from
-the completed local X11 takeover.
+transport reads. Fedora Wayland verified that Tab inserted an editable
+draft at an authenticated Bash prompt without sending an SSH exec request.
 [Java cursor approval](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignCursorApproval.java)
 · [Cursor verification](PORTING-PARITY.md#november-21-terminal-agent-cursor-suggestion-motion)
 · [Numeric decision verification](PORTING-PARITY.md#november-21-numeric-decisions-in-terminal-agent-cursor-approval)
 · [Dismissal animation verification](PORTING-PARITY.md#november-21-terminal-agent-cursor-dismissal-animation)
+
+The d09 tmux history shows the masked goal, one entry per typed step with
+its command or title and result, and a terminal-style footer. A completed
+answer appears behind a block cursor at 24 ms per character. Reduced
+animations displays the full answer and keeps the cursor still. The
+Settings preview uses the same history renderer. The side dock defaults
+to about 40% of the pane and retains custom placement and width.
+The docked d09 review uses numbered buttons and accepts the same choices
+from the digit row or numeric keypad. A complete visible review is
+required. The choice is rechecked against the pane, stream, review
+revision, and current approval policy before dispatch. Per-command
+confirmation offers only a single approval and cancellation. Java keeps
+the d09 history visible after completion. Its timed setting applies to
+eligible status displays. The block cursor keeps blinking while the
+finished history is visible. Run actions and View › AI Agent Panel
+hide and restore the history, releasing and reclaiming its dock space.
+A new review brings the history back. Fedora Wayland verified hide and
+restore, the animated and reduced-motion cursor, and digit 1 on the
+environment-probe review. The review ends the scrollable history so
+the cursor does not push it past the bottom anchor. Fedora Wayland
+verified that a hidden card leaves digit 2 with the shell, a complete
+card at the bottom accepts approval for remaining ordinary commands,
+and digit 3 cancels a complete review. Verify these interactions in the
+Windows and macOS desktop windows.
+[Java tmux pane](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignTmuxPane.java)
+· [Tmux history verification](PORTING-PARITY.md#november-21-terminal-agent-tmux-history)
+
+The d18 Neon Ticker and Settings preview share the flicker, rolling
+message transition and pulsing activity light. Reduced animations keeps
+the complete label and light steady. Amber identifies pending input, and
+Review opens the Activity window. Pause, resume, cancel and run actions
+use the existing run. The close button hides the status and View › AI
+Agent Panel can restore it. Verify the transition, review handoff and
+visibility controls on native desktops.
+[Java Neon Ticker](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignNeonTicker.java)
+· [Ticker implementation](PORTING-PARITY.md#november-21-terminal-agent-neon-ticker)
 
 Interactive Run can review a complexity assessment after the environment
 probe. The AI Manager preference and the managed override select when to

@@ -19,6 +19,9 @@ pub enum Item {
     Repeat,
     CopyAnswer,
     Chat,
+    HideHistory,
+    ShowHistory,
+    HideStatus,
     CopyCommand,
     CopyOutput,
     CopyEntry,
@@ -41,6 +44,9 @@ impl Item {
             Self::Repeat => "Set up this run again…",
             Self::CopyAnswer => "Copy answer",
             Self::Chat => "Continue in AI Chat",
+            Self::HideHistory => "Hide Agent history",
+            Self::ShowHistory => "Show Agent history",
+            Self::HideStatus => "Hide Agent status",
             Self::CopyCommand => "Copy command",
             Self::CopyOutput => "Copy output",
             Self::CopyEntry => "Copy entry",
@@ -93,6 +99,13 @@ fn run_items(run: &Run, has_archive: bool) -> Vec<Item> {
     }
     if run.chat_handoff_enabled && run.can_chat_handoff() {
         choices.push(Item::Chat);
+    }
+    if run.has_tmux_dock() {
+        choices.push(if run.presentation.tmux_hidden {
+            Item::ShowHistory
+        } else {
+            Item::HideHistory
+        });
     }
     choices
 }
@@ -169,6 +182,14 @@ pub(super) fn copy_log_detail(run: &Run, revision: u64) -> Message {
     })
 }
 
+pub(super) fn hide_status(run: &Run) -> Message {
+    Message::DesignAction(Action {
+        epoch: run.epoch,
+        step: None,
+        item: Item::HideStatus,
+    })
+}
+
 impl Workspace {
     pub(in crate::workspace) fn terminal_agent_design_actions(
         &self,
@@ -231,6 +252,21 @@ impl Workspace {
             ),
             (None, Item::Chat) => {
                 self.update_terminal_agent(id, Message::ContinueInChat(action.epoch))
+            }
+            (None, Item::HideHistory | Item::ShowHistory) if run.has_tmux_dock() => {
+                if let Some(run) = self.terminal_agents.runs.get_mut(&id) {
+                    run.presentation
+                        .set_tmux_hidden(action.item == Item::HideHistory);
+                }
+                Task::none()
+            }
+            (None, Item::HideStatus)
+                if run.design.status == crate::terminal_agent::design::Status::Neon =>
+            {
+                if let Some(run) = self.terminal_agents.runs.get_mut(&id) {
+                    run.presentation.status_visibility.hide();
+                }
+                Task::none()
             }
             (None, Item::ExportRun | Item::ExportAll) if self.agent_export_pane(run).is_ok() => {
                 let scope = if action.item == Item::ExportAll {

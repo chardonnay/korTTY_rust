@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 
 use iced::widget::{button, column, container, responsive, row, scrollable, text};
-use iced::{Element, Font, Length, window};
+use iced::{Element, Length, window};
 
 use crate::terminal_agent::design::History;
 
@@ -23,6 +23,7 @@ pub(super) struct Activity<'a> {
     pub(super) live_run: Option<&'a Run>,
     pub(super) surface: Surface,
     pub(super) owner: Option<(&'a State, window::Id)>,
+    pub(super) tmux_review: Option<super::tmux::Review>,
 }
 
 impl<'a> From<&'a Run> for Activity<'a> {
@@ -38,6 +39,7 @@ impl<'a> From<&'a Run> for Activity<'a> {
             live_run: Some(run),
             surface: Surface::Activity,
             owner: None,
+            tmux_review: None,
         }
     }
 }
@@ -116,11 +118,13 @@ pub(super) fn view<'a>(
     reduced_motion: bool,
     surface: Surface,
     owner: Option<(&'a State, window::Id)>,
+    tmux_review: Option<super::tmux::Review>,
 ) -> Element<'a, AgentMessage> {
     view_as(
         Activity {
             surface,
             owner,
+            tmux_review,
             ..run.into()
         },
         run.design.history,
@@ -328,26 +332,7 @@ fn entries(
             );
         }
         History::Tmux => {
-            for (index, entry) in run.activity.iter().enumerate() {
-                entries = entries.push(
-                    run.entry_menu(
-                        index,
-                        column![
-                            text(format!("── activity {} ──", index + 1))
-                                .font(Font::MONOSPACE)
-                                .size(size - 1.0),
-                            text(entry).font(Font::MONOSPACE).size(size),
-                        ]
-                        .spacing(4),
-                    ),
-                );
-            }
-            return container(scrollable(entries).height(Length::Fill))
-                .padding(8)
-                .style(container::bordered_box)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into();
+            return super::tmux::view(run, palette, reduced_motion);
         }
         History::Conversation => {
             entries = entries.push(

@@ -122,6 +122,7 @@ pub enum Message {
     Approve(u64),
     ApproveBatch(u64),
     ApproveRemaining(u64),
+    TmuxReview(design::TmuxReviewAction),
     ConfirmEveryCommand(bool),
     AutoApproveRoot(bool),
     Clarification(clarification::Message),
@@ -1349,6 +1350,9 @@ impl Workspace {
         id: window::Id,
         message: Message,
     ) -> Task<Desktop> {
+        if let Message::TmuxReview(action) = message {
+            return self.update_tmux_review(id, action);
+        }
         if let Message::ChatHandoffLoaded(loaded) = message {
             return self.finish_agent_chat(loaded);
         }
@@ -1520,6 +1524,7 @@ impl Workspace {
                 .is_some_and(|(_, pane, _)| pane.stream_generation == source.stream)
         {
             self.terminal_agents.presented_runs.remove(&source.session);
+            run.presentation.tmux_hidden = false;
         }
         if let Some(history) = &run.inline {
             run.presentation.sync_status(
