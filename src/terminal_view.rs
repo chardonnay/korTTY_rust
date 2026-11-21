@@ -156,7 +156,7 @@ pub struct TerminalView<'a> {
     pub selection: Option<Selection>,
     pub(crate) projected: Option<projected_selection::View<'a>>,
     pub search: Option<SearchHighlight<'a>>,
-    pub(crate) agent_cursor: Option<agent_cursor::Review<'a>>,
+    pub(crate) agent_cursor: Option<agent_cursor::Surface<'a>>,
     pub(crate) inline_agent: Option<inline_history::Interaction>,
 }
 
@@ -487,8 +487,22 @@ impl canvas::Program<Message> for TerminalView<'_> {
         }
         let metrics = Metrics::with_font(self.font_size, self.font);
         if let Event::Window(window::Event::RedrawRequested(now)) = event {
+            let next_agent_review = self.agent_cursor.as_ref().and_then(|surface| {
+                let visible = surface.review.as_ref().filter(|review| {
+                    self.projected_cursor().is_some_and(|cursor| {
+                        review.position(bounds.size(), cursor, metrics).is_some()
+                    })
+                });
+                surface.motion.borrow_mut().advance(
+                    visible,
+                    surface.departure,
+                    *now,
+                    self.reduced_motion,
+                )
+            });
             let redraw = [
                 state.cursor.advance(*now, self),
+                next_agent_review,
                 inline_visual::next_redraw(self, *now),
             ]
             .into_iter()
@@ -512,19 +526,25 @@ impl canvas::Program<Message> for TerminalView<'_> {
             state.cursor.start = None;
             if modifiers.is_empty()
                 && let Some(key) = agent_cursor::Key::from_key(key)
-                && let Some(review) = &self.agent_cursor
+                && let Some(surface) = &self.agent_cursor
+                && let Some(review) = &surface.review
                 && let Some(projected) = self.projected_cursor()
                 && review.position(bounds.size(), projected, metrics).is_some()
             {
-                return Some(if *repeat {
-                    Action::request_redraw().and_capture()
-                } else {
-                    Action::publish(Message::AgentCursor(agent_cursor::Message::Key(
-                        review.binding,
-                        key,
-                    )))
-                    .and_capture()
+                if *repeat {
+                    return Some(Action::capture());
+                }
+                let decision = key.decision(review.remaining_allowed).filter(|decision| {
+                    !decision.approves_command()
+                        || surface
+                            .motion
+                            .borrow_mut()
+                            .ready_to_approve(review, self.reduced_motion)
                 });
+                let action = decision.map_or(agent_cursor::Message::Consumed(key), |decision| {
+                    agent_cursor::Message::Key(review.binding, key, decision)
+                });
+                return Some(Action::publish(Message::AgentCursor(action)).and_capture());
             }
             if self.frame.at_live_viewport()
                 && let Some(interaction) = self.inline_agent
@@ -721,6 +741,9 @@ impl canvas::Program<Message> for TerminalView<'_> {
             }
             Event::Window(window::Event::Unfocused) => {
                 state.selection_drag = None;
+                if let Some(surface) = &self.agent_cursor {
+                    *surface.motion.borrow_mut() = agent_cursor::Motion::default();
+                }
                 None
             }
             Event::Mouse(mouse::Event::WheelScrolled { delta })
@@ -788,8 +811,18 @@ impl canvas::Program<Message> for TerminalView<'_> {
                 metrics,
             ));
         }
-        if let Some(review) = &self.agent_cursor {
-            geometry.push(review.draw(self, renderer, bounds.size()));
+        if let Some(surface) = &self.agent_cursor {
+            let motion = surface.motion.borrow();
+            if let Some(review) = &surface.review {
+                let frame = motion.frame(review.binding, self.reduced_motion);
+                geometry.push(review.draw(self, renderer, bounds.size(), frame));
+            } else if !self.reduced_motion
+                && let Some(departure) = surface.departure
+                && let Some(drawn) =
+                    motion.draw_departure(self, renderer, bounds.size(), departure, Instant::now())
+            {
+                geometry.push(drawn);
+            }
         }
         geometry
     }

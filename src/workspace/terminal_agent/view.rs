@@ -241,20 +241,19 @@ impl Run {
                         "Approve command once"
                     })
                     .on_press_maybe((!self.paused).then_some(Message::Approve(self.epoch))),
-                    (remaining_allowed
-                        && !self.confirm_every_command
-                        && self.ordinary_command_review())
-                    .then(|| button("Approve future ordinary commands for this run")
-                        .on_press_maybe(
-                            (!self.paused).then_some(Message::ApproveRemaining(self.epoch))
-                        )),
+                    (remaining_allowed && self.offers_remaining_approval()).then(|| button(
+                        "Approve future ordinary commands for this run"
+                    )
+                    .on_press_maybe(
+                        (!self.paused).then_some(Message::ApproveRemaining(self.epoch))
+                    )),
                 ]
                 .into()
             };
             page = page.push(
                 column![
                     text(command.0).size(15),
-                    (remaining_allowed && !self.confirm_every_command && self.ordinary_command_review()).then(|| text("Run-wide approval ends on pause, failure, elevation or changed settings. Password and elevation requests require separate review.").size(13)),
+                    (remaining_allowed && self.offers_remaining_approval()).then(|| text("Run-wide approval ends on pause, failure, elevation or changed settings. Password and elevation requests require separate review.").size(13)),
                     (self.reviewing_sudo() && password.is_none())
                         .then(|| text("Passwordless sudo as root over SSH").size(13)),
                     password.map(|review| column![

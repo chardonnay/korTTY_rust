@@ -696,6 +696,10 @@ impl Run {
                 command.sudo.is_none() && swarm::batch::ordinary(&command.proposal)
             })
     }
+
+    fn offers_remaining_approval(&self) -> bool {
+        !self.confirm_every_command && self.ordinary_command_review()
+    }
 }
 
 impl Drop for Run {
@@ -713,6 +717,7 @@ pub(super) struct State {
     cursor_keys: u8,
     inline_details_held: bool,
     cursor_takeover: Option<cursor::Pending>,
+    cursor_departure: Option<crate::terminal_view::agent_cursor::Departure>,
     presented_runs: HashMap<SessionId, (u64, window::Id)>,
     next_run_order: u64,
     swarms: HashMap<window::Id, swarm::Group>,
@@ -843,17 +848,7 @@ impl Workspace {
         let state = &self.terminal_agents;
         let palette = self.agent_window_palette(id);
         let reduced_motion = !self.window_settings.agent_animations();
-        let allow_execution = self.clipboard.policy.ai_agent_execution
-            == crate::clipboard_policy::AiAgentExecution::Allow;
-        let approvals = policy::Approvals {
-            batch: allow_execution,
-            remaining: allow_execution
-                && self.ai_configuration().is_some_and(|config| {
-                    config.saved_root().is_some()
-                        && config.agent_execution_enabled()
-                        && !config.agent_requires_command_confirmation()
-                }),
-        };
+        let approvals = self.agent_approval_options();
 
         let view = if let Some(dialog) = state.workflows.get(&id) {
             dialog.view().map(Message::Workflow)
@@ -1468,6 +1463,12 @@ impl Workspace {
                 });
             return transcript.map_or_else(Task::none, |text| self.write_clipboard(text));
         }
+        let cursor = matches!(
+            message,
+            Message::Approve(_) | Message::ApproveRemaining(_) | Message::Cancel
+        )
+        .then(|| self.cursor_departure_binding(id))
+        .flatten();
         let Some(mut run) = self.terminal_agents.runs.remove(&id) else {
             return Task::none();
         };
@@ -1481,6 +1482,11 @@ impl Workspace {
             Message::Start | Message::StartFromShortcut | Message::StartPlanWithoutProbe
         );
         let task = self.agent_action(id, &mut run, message);
+        if let Some(binding) = cursor
+            && (run.phase != before || run.epoch != before_epoch)
+        {
+            self.begin_cursor_departure(binding);
+        }
         run.sync_log_detail();
         let started = start_requested && run.epoch != before_epoch && run.active();
         let spotlight_submission = if start_requested {
@@ -1647,9 +1653,13 @@ impl Workspace {
         } else if self.terminal_agents.workflows.contains_key(&id) {
             self.workflow_action(id, workflow::Message::Cancel)
         } else {
+            let cursor = self.cursor_departure_binding(id);
             self.terminal_agents.request_cancel(id);
             if let Some(run) = self.terminal_agents.runs.get(&id) {
                 self.publish_agent_inline_history(run);
+                if let Some(binding) = cursor {
+                    self.begin_cursor_departure(binding);
+                }
             }
             Task::none()
         }

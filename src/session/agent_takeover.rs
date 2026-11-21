@@ -89,10 +89,7 @@ impl Request {
             return Err(CHANGED);
         }
         let shell = activity.snapshot();
-        let report = shell
-            .directory
-            .as_ref()
-            .filter(|report| report.sequence.saturating_add(2) >= shell.prompt);
+        let report = activity.directory_at_prompt();
         let destination = match (self.destination, live.transport) {
             (Destination::Local(expected), StreamTransport::Pty(pty)) => {
                 #[cfg(unix)]

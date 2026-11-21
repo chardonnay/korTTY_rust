@@ -667,6 +667,7 @@ struct PaneSession {
     frame: Arc<Frame>,
     coding_agent: coding_agents::PaneState,
     agent_shortcut: Option<terminal_agent::shortcut::Capture>,
+    agent_cursor_motion: std::cell::RefCell<terminal_view::agent_cursor::Motion>,
     grid: GridSize,
     project_initial_size: InitialTerminalSize,
     project_initial_ssh_pending: bool,
@@ -3719,6 +3720,7 @@ impl Workspace {
                 frame: session.frame(),
                 coding_agent: coding_agents::PaneState::default(),
                 agent_shortcut: None,
+                agent_cursor_motion: Default::default(),
                 session,
                 stream_generation: 0,
                 control_ssh_provisional: false,
@@ -7044,7 +7046,11 @@ impl Workspace {
                     reduced_motion: !self.window_settings.agent_animations(),
                     typeahead_enabled: session_state.typeahead_enabled && !mirrored,
                     owner: id,
-                    agent_cursor: self.agent_cursor_review(id, session_id, frame),
+                    agent_cursor: Some(terminal_view::agent_cursor::Surface {
+                        review: self.agent_cursor_review(id, session_id, frame),
+                        departure: self.agent_cursor_departure(id, session_id, frame),
+                        motion: &session_state.agent_cursor_motion,
+                    }),
                     inline_agent: self.agent_inline_interaction(id, session_id, frame),
                     plain_text_links: self.window_settings.terminal_link_detection_enabled,
                     selection: session_state

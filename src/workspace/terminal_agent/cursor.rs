@@ -5,9 +5,28 @@ use kortty_terminal::{TerminalProfile, TextEncoding};
 
 use crate::session::{Frame, PromptState, SessionId, Status as SessionStatus, agent_takeover};
 use crate::terminal_agent::design::Approval;
-use crate::terminal_view::agent_cursor::{Binding, Key, Message, Review};
+use crate::terminal_view::agent_cursor::{
+    Binding, Decision, Departure, Fade, Key, Message, Review,
+};
 
 use super::{Cancel, Desktop, PaneSession, Phase, Purpose, Run, RunTarget, Target, Workspace};
+
+fn review_frame(frame: &Frame) -> bool {
+    frame.status == SessionStatus::Running
+        && frame.at_live_viewport()
+        && !frame.screen.alternate_screen
+        && !frame.password_prompt
+        && !frame.coding_agent_visible()
+        && frame.coding_agent().is_none()
+        && !frame.approval_prompt_visible()
+}
+
+fn overlay_frame(pane: &PaneSession, frame: &Frame) -> bool {
+    pane.effect.is_none()
+        && frame.screen.images.is_empty()
+        && frame.typeahead.is_none()
+        && frame.shell_activity().code_prompt.state != PromptState::Busy
+}
 
 pub(super) struct Pending {
     binding: Binding,
@@ -76,15 +95,7 @@ impl Workspace {
         }
         let command = run.cursor_command()?;
         let (current_owner, _) = self.current_run_pane(run).ok()?;
-        if current_owner != owner
-            || frame.status != SessionStatus::Running
-            || !frame.at_live_viewport()
-            || frame.screen.alternate_screen
-            || frame.password_prompt
-            || frame.coding_agent_visible()
-            || frame.coding_agent().is_some()
-            || frame.approval_prompt_visible()
-        {
+        if current_owner != owner || !review_frame(frame) {
             return None;
         }
         let target = run.target.as_ref()?;
@@ -100,11 +111,7 @@ impl Workspace {
         }
         // Floating history, effects and graphics can cover the reviewed command.
         // In these combinations the Activity window keeps the approval visible.
-        let inline = run.design.cursor_overlay()
-            && pane.effect.is_none()
-            && frame.screen.images.is_empty()
-            && frame.typeahead.is_none()
-            && frame.shell_activity().code_prompt.state != PromptState::Busy;
+        let inline = run.design.cursor_overlay() && overlay_frame(pane, frame);
         let kind = if run.phase == Phase::ProbeApproval {
             "Agent waiting for probe approval"
         } else {
@@ -134,8 +141,55 @@ impl Workspace {
             destination,
             inline,
             editable: prompt.is_some(),
+            remaining_allowed: inline
+                && run.offers_remaining_approval()
+                && self.agent_approval_options().remaining,
             prompt,
         })
+    }
+
+    pub(in crate::workspace) fn agent_cursor_departure(
+        &self,
+        owner: window::Id,
+        session: SessionId,
+        frame: &Frame,
+    ) -> Option<Departure> {
+        let departure = self.terminal_agents.cursor_departure?;
+        let source = departure.binding;
+        if source.owner != owner
+            || source.session != session
+            || !self.window_settings.agent_animations()
+            || !review_frame(frame)
+        {
+            return None;
+        }
+        departure.fade.opacity(std::time::Instant::now())?;
+        let pane = self.agent_cursor_pane(owner, session)?;
+        let run = self.terminal_agents.runs.get(&source.run)?;
+        (source.stream == pane.stream_generation
+            && source.input_revision == pane.session.mcp_input_revision()
+            && overlay_frame(pane, frame)
+            && self.current_run_pane(run).is_ok())
+        .then_some(departure)
+    }
+
+    pub(super) fn cursor_departure_binding(&self, id: window::Id) -> Option<Binding> {
+        if !self.window_settings.agent_animations() {
+            return None;
+        }
+        let run = self.terminal_agents.runs.get(&id)?;
+        run.cursor_command()?;
+        let source = run.binding.live().ok()?;
+        let (owner, pane) = self.current_run_pane(run).ok()?;
+        let review = self.agent_cursor_review(owner, source.session, &pane.session.frame())?;
+        (review.binding.run == id && review.inline).then_some(review.binding)
+    }
+
+    pub(super) fn begin_cursor_departure(&mut self, binding: Binding) {
+        self.terminal_agents.cursor_departure = Some(Departure {
+            binding,
+            fade: Fade::new(std::time::Instant::now()),
+        });
     }
 
     pub(in crate::workspace) fn agent_cursor_repeated(&self, key: &iced::keyboard::Key) -> bool {
@@ -149,7 +203,11 @@ impl Workspace {
     }
 
     pub(in crate::workspace) fn update_agent_cursor(&mut self, message: Message) -> Task<Desktop> {
-        let (binding, key) = match message {
+        let (binding, key, decision) = match message {
+            Message::Consumed(key) => {
+                self.terminal_agents.cursor_keys |= key.mask();
+                return Task::none();
+            }
             Message::Edited(binding, result) => {
                 if self
                     .terminal_agents
@@ -164,7 +222,7 @@ impl Workspace {
                 }
                 return Task::none();
             }
-            Message::Key(binding, key) => (binding, key),
+            Message::Key(binding, key, decision) => (binding, key, decision),
         };
         // Even a review that went stale after drawing consumed its physical key.
         self.terminal_agents.cursor_keys |= key.mask();
@@ -181,17 +239,19 @@ impl Workspace {
         else {
             return Task::none();
         };
-        if !review.inline {
+        if !review.inline || key.decision(review.remaining_allowed) != Some(decision) {
             return Task::none();
         }
-        match key {
-            Key::Enter | Key::One => {
+        match decision {
+            Decision::ApproveOnce => {
                 self.update_terminal_agent(binding.run, super::Message::Approve(binding.epoch))
             }
-            Key::Escape | Key::Two => {
-                self.update_terminal_agent(binding.run, super::Message::Cancel)
-            }
-            Key::Tab => {
+            Decision::ApproveRemaining => self.update_terminal_agent(
+                binding.run,
+                super::Message::ApproveRemaining(binding.epoch),
+            ),
+            Decision::Dismiss => self.update_terminal_agent(binding.run, super::Message::Cancel),
+            Decision::Edit => {
                 let command = review.command.to_owned();
                 if let Some(prompt) = review.prompt {
                     self.edit_agent_cursor(binding, prompt, command)
@@ -263,6 +323,19 @@ impl Workspace {
     }
 
     pub(in crate::workspace) fn revalidate_agent_cursor(&mut self) {
+        if self
+            .terminal_agents
+            .cursor_departure
+            .is_some_and(|departure| {
+                let source = departure.binding;
+                self.sessions.get(&source.session).is_none_or(|pane| {
+                    self.agent_cursor_departure(source.owner, source.session, &pane.session.frame())
+                        .is_none()
+                })
+            })
+        {
+            self.terminal_agents.cursor_departure = None;
+        }
         if let Some(pending) = &self.terminal_agents.cursor_takeover {
             let binding = pending.binding;
             let current = self

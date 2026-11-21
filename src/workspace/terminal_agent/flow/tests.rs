@@ -1765,8 +1765,9 @@ fn inline_review_masks_the_destination_and_withholds_keyboard_approval() {
 
 #[test]
 fn terminal_agent_cursor_keys_bind_the_review_to_the_visible_stream_and_epoch() {
+    use crate::clipboard_policy::AiAgentExecution;
     use crate::terminal_agent::design::Approval;
-    use crate::terminal_view::agent_cursor::{Key, Message as Cursor};
+    use crate::terminal_view::agent_cursor::{Decision as CursorDecision, Key, Message as Cursor};
 
     let mut fixture = Fixture::new(false, false);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -1851,32 +1852,94 @@ fn terminal_agent_cursor_keys_bind_the_review_to_the_visible_stream_and_epoch() 
         .binding;
     assert!(fixture.run(id).phase == Phase::ProbeApproval);
 
-    let mut stale = binding;
-    stale.epoch -= 1;
     no_task(
         fixture
             .workspace
-            .update_agent_cursor(Cursor::Key(stale, Key::Escape)),
+            .update_agent_cursor(Cursor::Consumed(Key::Enter)),
     );
     assert!(fixture.run(id).phase == Phase::ProbeApproval);
-    stale = binding;
-    stale.stream += 1;
-    no_task(
-        fixture
-            .workspace
-            .update_agent_cursor(Cursor::Key(stale, Key::Enter)),
-    );
-    assert!(fixture.run(id).phase == Phase::ProbeApproval);
-    let _ = fixture
-        .workspace
-        .update_agent_cursor(Cursor::Key(binding, Key::Escape));
-    assert!(fixture.run(id).phase == Phase::Cancelled);
     assert!(
         fixture
             .workspace
             .agent_cursor_repeated(&iced::keyboard::Key::Named(
-                iced::keyboard::key::Named::Escape
+                iced::keyboard::key::Named::Enter
             ))
+    );
+
+    let mut stale = binding;
+    stale.epoch -= 1;
+    no_task(fixture.workspace.update_agent_cursor(Cursor::Key(
+        stale,
+        Key::Escape,
+        CursorDecision::Dismiss,
+    )));
+    assert!(fixture.run(id).phase == Phase::ProbeApproval);
+    stale = binding;
+    stale.stream += 1;
+    no_task(fixture.workspace.update_agent_cursor(Cursor::Key(
+        stale,
+        Key::Enter,
+        CursorDecision::ApproveOnce,
+    )));
+    assert!(fixture.run(id).phase == Phase::ProbeApproval);
+
+    let run = fixture.run_mut(id);
+    run.commands.push_back(ReviewedCommand {
+        proposal: Command {
+            command: "printf fixture".into(),
+            purpose: "Show fixture output".into(),
+            risk: engine::Risk::RequiresConfirmation,
+            elevation: Elevation::None,
+        },
+        sudo: None,
+    });
+    run.next(Phase::Approval, "Review an ordinary command");
+    fixture.workspace.clipboard.policy.ai_agent_execution = AiAgentExecution::Allow;
+    let review = fixture
+        .workspace
+        .agent_cursor_review(fixture.owner, fixture.session, &frame)
+        .unwrap();
+    assert!(review.remaining_allowed);
+    let binding = review.binding;
+    let approve_remaining = Cursor::Key(binding, Key::Two, CursorDecision::ApproveRemaining);
+
+    fixture.workspace.clipboard.policy.ai_agent_execution = AiAgentExecution::Confirm;
+    no_task(fixture.workspace.update_agent_cursor(approve_remaining));
+    assert!(fixture.run(id).phase == Phase::Approval);
+    assert!(fixture.run(id).run_approval.is_none());
+
+    fixture.workspace.clipboard.policy.ai_agent_execution = AiAgentExecution::Allow;
+    no_task(fixture.workspace.update_agent_cursor(Cursor::Key(
+        binding,
+        Key::Two,
+        CursorDecision::Dismiss,
+    )));
+    assert!(fixture.run(id).phase == Phase::Approval);
+    drop(fixture.workspace.update_agent_cursor(approve_remaining));
+    assert!(matches!(
+        fixture.run(id).phase,
+        Phase::ReviewedDirectory { probe: false }
+    ));
+    assert!(fixture.run(id).run_approval.is_some());
+
+    fixture.run_mut(id).next(Phase::Approval, "Review again");
+    let review = fixture
+        .workspace
+        .agent_cursor_review(fixture.owner, fixture.session, &frame)
+        .unwrap();
+    assert!(review.remaining_allowed);
+    let outgoing = review.binding;
+    let _ = fixture.workspace.update_agent_cursor(Cursor::Key(
+        outgoing,
+        Key::Three,
+        CursorDecision::Dismiss,
+    ));
+    assert!(fixture.run(id).phase == Phase::Cancelled);
+    assert!(fixture.run(id).run_approval.is_none());
+    assert!(
+        fixture
+            .workspace
+            .agent_cursor_repeated(&iced::keyboard::Key::Character("3".into()))
     );
     assert!(
         fixture
@@ -1884,6 +1947,18 @@ fn terminal_agent_cursor_keys_bind_the_review_to_the_visible_stream_and_epoch() 
             .agent_cursor_review(fixture.owner, fixture.session, &frame)
             .is_none()
     );
+    assert!(
+        fixture
+            .workspace
+            .agent_cursor_departure(fixture.owner, fixture.session, &frame)
+            .is_some_and(|transition| transition.binding == outgoing)
+    );
+    fixture
+        .workspace
+        .window_settings
+        .ai_agent_design_reduced_animations = Some(true);
+    fixture.workspace.revalidate_agent_cursor();
+    assert!(fixture.workspace.terminal_agents.cursor_departure.is_none());
     let _ = fixture.workspace.sessions[&fixture.session]
         .session
         .stop()

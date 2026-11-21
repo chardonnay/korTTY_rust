@@ -66,7 +66,6 @@ pub(super) struct State {
     sequence: u64,
     at_prompt: bool,
     saw_command_start: bool,
-    #[cfg(target_os = "linux")]
     prompt_directory: Option<u64>,
     ignored_line: bool,
     input: Vec<u8>,
@@ -111,7 +110,6 @@ impl State {
         (self.at_prompt && self.activity.prompt != 0).then_some(self.activity.prompt)
     }
 
-    #[cfg(target_os = "linux")]
     pub(super) fn directory_at_prompt(&self) -> Option<&ReportedDirectory> {
         self.agent_shortcut_prompt()?;
         self.activity
@@ -161,17 +159,14 @@ impl State {
                     });
                 }
                 ShellEventKind::PromptStart => {
-                    #[cfg(target_os = "linux")]
-                    {
-                        self.prompt_directory = self
-                            .activity
-                            .directory
-                            .as_ref()
-                            .filter(|directory| {
-                                !self.at_prompt && directory.sequence > self.activity.prompt
-                            })
-                            .map(|directory| directory.sequence);
-                    }
+                    self.prompt_directory = self
+                        .activity
+                        .directory
+                        .as_ref()
+                        .filter(|directory| {
+                            !self.at_prompt && directory.sequence > self.activity.prompt
+                        })
+                        .map(|directory| directory.sequence);
                     self.update_code_prompt(PromptState::Ready);
                     self.activity.prompt = self.next_sequence();
                     self.at_prompt = true;
@@ -426,18 +421,18 @@ mod tests {
         assert_eq!(alternate.directory.unwrap().sequence, directory.sequence);
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn flatpak_directory_requires_a_fresh_full_prompt() {
+    fn cursor_directory_requires_a_fresh_full_prompt_across_output_batches() {
         let now = Instant::now();
         let mut state = State::default();
         let mut terminal = Terminal::new(80, 24);
         output(
             &mut state,
             &mut terminal,
-            b"\x1b]7;file:///host/old\x07\x1b]133;A\x07",
+            b"\x1b]7;file:///host/old\x07",
             now,
         );
+        output(&mut state, &mut terminal, b"\x1b]133;A\x07", now);
         assert!(state.directory_at_prompt().is_none());
         output(&mut state, &mut terminal, b"\x1b]133;B\x07", now);
         assert_eq!(&*state.directory_at_prompt().unwrap().path, "/host/old");
@@ -464,6 +459,13 @@ mod tests {
             now,
         );
         assert_eq!(&*state.directory_at_prompt().unwrap().path, "/host/new");
+        output(
+            &mut state,
+            &mut terminal,
+            b"\x1b]7;file:///host/unrelated\x07",
+            now,
+        );
+        assert!(state.directory_at_prompt().is_none());
     }
 
     #[test]

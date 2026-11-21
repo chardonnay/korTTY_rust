@@ -171,11 +171,24 @@ impl Dispatch {
 }
 
 impl Workspace {
+    pub(super) fn agent_approval_options(&self) -> Approvals {
+        let batch = self.clipboard.policy.ai_agent_execution == AiAgentExecution::Allow;
+        Approvals {
+            batch,
+            remaining: batch
+                && self.ai_configuration().is_some_and(|config| {
+                    config.saved_root().is_some()
+                        && config.agent_execution_enabled()
+                        && !config.agent_requires_command_confirmation()
+                }),
+        }
+    }
+
     pub(super) fn approve_remaining_agent_commands(
         &self,
         run: &Run,
     ) -> Result<RunApproval, String> {
-        if !run.ordinary_command_review() || run.paused || run.confirm_every_command {
+        if !run.offers_remaining_approval() || run.paused {
             return Err("Review an ordinary Agent command first.".into());
         }
         let configuration = self
