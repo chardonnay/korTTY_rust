@@ -251,7 +251,7 @@ mod tests {
         prior
             .presentation
             .status_visibility
-            .toggle(0, std::time::Instant::now());
+            .toggle(0, std::time::Instant::now(), false);
         let active = fixture.run_mut(current);
         active.goal = "Review active logs".into();
         let epoch = active.next(Phase::Thinking, "");
@@ -273,7 +273,8 @@ mod tests {
                 .run_mut(old)
                 .presentation
                 .status_visibility
-                .visible(0, std::time::Instant::now())
+                .opacity(0, std::time::Instant::now(), false)
+                .is_some()
         );
         let decision = Decision {
             summary: "Choose log".into(),

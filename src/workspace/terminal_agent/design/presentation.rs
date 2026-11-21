@@ -10,6 +10,72 @@ pub(in crate::workspace::terminal_agent) use usage::Usage;
 
 use super::toast;
 
+const STATUS_FADE: Duration = Duration::from_millis(250);
+const FRAME: Duration = Duration::from_millis(16);
+
+#[derive(Clone, Copy)]
+pub(in crate::workspace) struct StatusTiming {
+    deadline: Option<Instant>,
+    fade: Duration,
+}
+
+impl StatusTiming {
+    pub(in crate::workspace) fn new(deadline: Option<Instant>, reduced_motion: bool) -> Self {
+        Self {
+            deadline,
+            fade: if reduced_motion {
+                Duration::ZERO
+            } else {
+                STATUS_FADE
+            },
+        }
+    }
+
+    pub(in crate::workspace) fn opacity(self, now: Instant) -> Option<f32> {
+        let Some(start) = self.deadline.filter(|&start| now >= start) else {
+            return Some(1.0);
+        };
+        let age = now.saturating_duration_since(start);
+        if age >= self.fade {
+            return None;
+        }
+
+        // The Java transition eases in and out using 20% acceleration and braking ramps.
+        let phase = age.as_secs_f32() / self.fade.as_secs_f32();
+        const RAMP: f32 = 0.2;
+        const SPEED: f32 = 1.0 / (1.0 - RAMP);
+        let ramp = |t: f32| SPEED * t * t / (2.0 * RAMP);
+        Some(if phase < RAMP {
+            1.0 - ramp(phase)
+        } else if phase > 1.0 - RAMP {
+            ramp(1.0 - phase)
+        } else {
+            1.0 - SPEED * (phase - RAMP / 2.0)
+        })
+    }
+
+    pub(in crate::workspace) fn next_frame(self, now: Instant) -> Option<Instant> {
+        let start = self.deadline?;
+        if now < start {
+            return Some(start);
+        }
+        let end = start + self.fade;
+        (now < end).then(|| (now + FRAME).min(end))
+    }
+
+    pub(super) fn clock_interval(self, now: Instant) -> Option<u64> {
+        let start = self.deadline?;
+        self.next_frame(now)?;
+        Some(
+            if !self.fade.is_zero() && start <= now + Duration::from_millis(100) {
+                FRAME.as_millis() as u64
+            } else {
+                100
+            },
+        )
+    }
+}
+
 #[derive(Default)]
 pub(super) struct StatusVisibility {
     pub(super) finished_at: Option<Instant>,
@@ -30,13 +96,15 @@ impl StatusVisibility {
             .then(|| finished + Duration::from_secs(seconds.into()))
     }
 
-    pub(super) fn visible(&self, seconds: u8, now: Instant) -> bool {
-        self.manual
-            .unwrap_or_else(|| self.deadline(seconds).is_none_or(|deadline| now < deadline))
+    pub(super) fn opacity(&self, seconds: u8, now: Instant, reduced_motion: bool) -> Option<f32> {
+        if self.manual == Some(false) {
+            return None;
+        }
+        StatusTiming::new(self.deadline(seconds), reduced_motion).opacity(now)
     }
 
-    pub(super) fn toggle(&mut self, seconds: u8, now: Instant) {
-        self.manual = Some(!self.visible(seconds, now));
+    pub(super) fn toggle(&mut self, seconds: u8, now: Instant, reduced_motion: bool) {
+        self.manual = Some(self.opacity(seconds, now, reduced_motion).is_none());
     }
 
     pub(super) fn show(&mut self) {
@@ -328,24 +396,57 @@ mod tests {
     }
 
     #[test]
-    fn status_hides_at_its_deadline_and_can_be_shown_until_the_next_run() {
+    fn status_fades_after_its_deadline_and_manual_visibility_is_immediate() {
         let now = Instant::now();
         let mut status = StatusVisibility::default();
-        assert!(status.visible(6, now));
+        assert_eq!(status.opacity(6, now, false), Some(1.0));
         assert_eq!(status.deadline(6), None);
         status.finished(now);
         let deadline = now + Duration::from_secs(6);
+        let end = deadline + STATUS_FADE;
         assert_eq!(status.deadline(6), Some(deadline));
-        assert!(status.visible(6, deadline - Duration::from_millis(1)));
-        assert!(!status.visible(6, deadline));
-        assert!(status.visible(0, deadline));
+        assert_eq!(
+            status.opacity(6, deadline - Duration::from_millis(1), false),
+            Some(1.0)
+        );
+        assert_eq!(status.opacity(6, deadline, false), Some(1.0));
+        assert_eq!(
+            status.opacity(6, deadline + STATUS_FADE / 2, false),
+            Some(0.5)
+        );
+        assert_eq!(status.opacity(6, deadline, true), None);
+        assert_eq!(status.opacity(6, end, false), None);
+        assert_eq!(status.opacity(0, end, false), Some(1.0));
         assert_eq!(status.deadline(0), None);
-        status.toggle(6, deadline);
-        assert!(status.visible(6, deadline + Duration::from_secs(60)));
+        status.toggle(6, end, false);
+        assert_eq!(
+            status.opacity(6, end + Duration::from_secs(60), false),
+            Some(1.0)
+        );
         assert_eq!(status.deadline(6), None);
-        status.toggle(6, deadline);
-        assert!(!status.visible(0, deadline));
-        assert!(StatusVisibility::default().visible(6, deadline));
+        status.toggle(6, end, false);
+        assert_eq!(status.opacity(0, end, false), None);
+        assert_eq!(
+            StatusVisibility::default().opacity(6, end, false),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn status_fade_clock_wakes_at_the_boundaries() {
+        let deadline = Instant::now();
+        let before = deadline - Duration::from_millis(1);
+        let end = deadline + STATUS_FADE;
+        let fade = StatusTiming::new(Some(deadline), false);
+        assert_eq!(fade.next_frame(before), Some(deadline));
+        assert_eq!(fade.next_frame(deadline), Some(deadline + FRAME));
+        assert_eq!(fade.next_frame(end - Duration::from_millis(1)), Some(end));
+        assert_eq!(fade.next_frame(end), None);
+        assert_eq!(fade.clock_interval(before), Some(16));
+        assert_eq!(fade.clock_interval(end), None);
+        let still = StatusTiming::new(Some(deadline), true);
+        assert_eq!(still.next_frame(before), Some(deadline));
+        assert_eq!(still.next_frame(deadline), None);
     }
 
     #[test]

@@ -189,6 +189,55 @@ strict Clippy passed.
 · [Apple Silicon tests](target/verification/20261121-agent-cursor-fade-macos-pane.log)
 · [Windows ARM64 Clippy](target/verification/20261121-agent-cursor-fade-windows-pane.log).
 
+## November 21 Terminal Agent Metro line
+
+The d08 rail uses masked command, analysis and question steps and an
+Answer station. Station state colors distinguish reached, active,
+pending and failed steps. A pending review opens the bound Activity or
+Ask view. The rail pulses at the current station and moves the light on
+transitions. Reduced animations snaps directly to the current station.
+An overflow station summarizes the oldest retained steps and opens the
+typed detail list. The header retains the goal, elapsed time, reported
+tokens and the common run actions. Auto-hide uses the existing interval.
+
+A private Fedora Wayland run clicked the Review station before sending
+the request. The completed Ask showed Analysis and Answer with 20
+reported tokens. The Analysis station reopened the recorded decision in
+the drawer. Hiding and restoring the rail retained the same stations and
+token count. Both stations remained visible after the source terminal
+narrowed from 112 to 54 columns. The mock provider received one reviewed
+request. Twelve focused Apple Silicon tests passed, including the shared
+design preview, usage labels, overflow and reduced motion. Windows ARM64
+passed targeted Clippy with warnings denied. The concurrent-run badge,
+the Java standard preset and remaining native desktop and rail motion
+checks are open.
+[Java Metro model](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/agentdesign/MetroStationModel.java)
+· [Fedora Wayland Metro acceptance](target/verification/20261121-agent-metro-wayland-fixed.log)
+· [Apple Silicon tests](target/verification/20261121-agent-metro-macos-fixed.log)
+· [Windows ARM64 Clippy](target/verification/20261121-agent-metro-windows-fixed.log).
+
+## November 21 Terminal Agent status auto-hide fade
+
+The live status and Settings replay keep a finished status at full
+opacity for its configured interval. The renderer composites the status
+as a group over 250 ms and releases its layout space at the end. Reduced
+animations removes the status at the deadline. Zero seconds keeps it
+visible. A manual hide takes effect immediately, and restoring a finished
+status through the Agent Panel keeps it visible.
+
+Fedora Wayland captured the completed Metro line and intermediate
+composited frames before the terminal recovered its space. The same
+three-second delay with reduced animations went directly from the steady
+status to the restored terminal. The private profile also verified the
+zero setting and manual restoration. Fourteen targeted Apple Silicon
+tests passed for the timing, compositing, clipping and Settings preview.
+Windows ARM64 targeted Clippy passed with warnings denied. Repeat the
+native desktop checks for the other status designs and platforms.
+[Java fade controller](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentStatusVisibility.java)
+· [Fedora Wayland status fade](target/verification/20261121-agent-status-fade-wayland-fixed.log)
+· [Apple Silicon tests](target/verification/20261121-agent-status-fade-macos-final.log)
+· [Windows ARM64 Clippy](target/verification/20261121-agent-status-fade-windows-final.log).
+
 ## November 21 Terminal Agent tmux history
 
 The d09 history and Settings preview display the masked goal, recorded
@@ -271,8 +320,28 @@ light steady. The ticker retains elapsed time, step and token counts,
 and access to the run menu. Review opens the current Activity controls.
 The close button hides the ticker, and the Agent Panel menu restores it.
 The timing test covers the transition, pulse and reduced-motion state.
-Native desktop acceptance of the ticker remains open.
-[Java d18 reference](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignNeonTicker.java).
+Fedora Wayland displayed a reviewed Ask response and its reported token
+count and restored the same result after hiding the ticker. An earlier
+Mutter run left the Activity window behind the terminal when Review
+requested focus. The Terminal Agent now passes the live terminal window
+as the source. On Wayland, Winit requests activation for the existing
+Activity surface with the seat and serial from recent input in the
+source window. The compositor still controls the resulting focus.
+
+A private Fedora Wayland session verified both the ticker's Review
+button and the shared Review and approve control. The protocol trace
+matched each activation request to its own click serial and confirmed
+keyboard focus on the same Activity surface. The probe remained pending
+and the mock provider received no request. Two focused tests passed on
+Apple Silicon, including the origin and stream checks. Windows ARM64
+passed targeted Clippy with warnings denied. Desktop acceptance on
+Windows, macOS and X11 is still open, as is testing additional Wayland
+compositors and keyboard and touch activation.
+[Java d18 reference](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignNeonTicker.java)
+· [Fedora Wayland ticker acceptance](target/verification/20261121-agent-checkpoint-neon-wayland.log)
+· [Fedora Wayland Review activation](target/verification/20261121-agent-review-focus-wayland-final.log)
+· [Apple Silicon tests](target/verification/20261121-agent-review-focus-macos-fixed.log)
+· [Windows ARM64 Clippy](target/verification/20261121-agent-review-focus-windows-fixed.log).
 
 ## November 21 Real OpenSSH sudo/PAM for the Terminal Agent
 

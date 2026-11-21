@@ -7,7 +7,7 @@ use iced::{Element, Length, Task, window};
 
 use crate::terminal_agent::design::{Approval, Arrangement, Layout, Status, inline};
 use crate::workspace::terminal_agent::design::{
-    Sample, SampleAction, SampleGrid, SampleLogCommand, SampleLogKey, SampleView,
+    Sample, SampleAction, SampleGrid, SampleLogCommand, SampleLogKey, SampleView, StatusTiming,
 };
 use inline::{Kind, Prompt, State, Step, StepState, Transcript};
 
@@ -314,6 +314,7 @@ pub(super) fn view(
         .filter(|_| auto_hide_seconds > 0)
         .map(|finished| finished + Duration::from_secs(auto_hide_seconds.into()));
     let now = Instant::now();
+    let timing = StatusTiming::new(deadline, reduced_motion);
     let countdown = deadline
         .filter(|&deadline| now < deadline && layout.arrangement == Arrangement::Adaptive)
         .map(|deadline| (deadline, auto_hide_seconds));
@@ -337,14 +338,17 @@ pub(super) fn view(
         .into_iter()
         .chain(history_interval)
         .min()
-        .map(|ms| now + Duration::from_millis(ms));
+        .map(|ms| now + Duration::from_millis(ms))
+        .into_iter()
+        .chain(timing.next_frame(now))
+        .min();
     let preview = SampleView {
         layout,
         dock,
         phase: (demo.phase(), usize::from(demo.stage).min(3)),
         goal: GOAL,
         approval: (approval && !cursor_review).then_some(VACUUM),
-        status_visible: deadline.is_none_or(|deadline| now < deadline),
+        status_opacity: timing.opacity(now),
         reduced_motion,
         countdown,
     };
@@ -359,7 +363,6 @@ pub(super) fn view(
             reduced_motion,
             cursor_design,
             cursor_review,
-            deadline: deadline.filter(|deadline| now < *deadline),
             status_frame,
         })
         .width(Length::Fill)

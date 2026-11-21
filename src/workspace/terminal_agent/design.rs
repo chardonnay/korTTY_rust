@@ -15,6 +15,7 @@ use super::{Desktop, Message as AgentMessage, Phase, Run, State, Workspace, dial
 
 pub(in crate::workspace) mod actions;
 mod activity;
+mod fade;
 pub(crate) use actions::Action;
 pub(in crate::workspace::terminal_agent) mod handoff;
 mod history;
@@ -50,6 +51,7 @@ pub(in crate::workspace) use placement::{
 };
 use presentation::Dock;
 pub(crate) use presentation::Message;
+pub(in crate::workspace) use presentation::StatusTiming;
 pub(super) use presentation::{Presentation, Usage};
 pub(in crate::workspace) use sample::{
     Action as SampleAction, Grid as SampleGrid, Sample, View as SampleView,
@@ -453,48 +455,57 @@ impl Workspace {
         if self.exiting {
             return Subscription::none();
         }
-        let interval =
-            self.terminal_agents
-                .runs
-                .values()
-                .filter(|run| {
-                    !run.swarm
-                        && !run.closing
-                        && run.has_terminal_presentation()
-                        && (run.design.status != Status::Hidden
-                            || run.design.arrangement == Arrangement::Adaptive)
-                        && run.presentation.status_visibility.visible(seconds, now)
-                })
-                .filter_map(|run| {
-                    let toasts = run.design.status == Status::Toasts
-                        && run.presentation.status_events.ticking(now, reduced_motion);
-                    if toasts && !reduced_motion {
-                        return Some(16);
-                    }
+        let interval = self
+            .terminal_agents
+            .runs
+            .values()
+            .filter(|run| {
+                !run.swarm
+                    && !run.closing
+                    && run.has_terminal_presentation()
+                    && (run.design.status != Status::Hidden
+                        || run.design.arrangement == Arrangement::Adaptive)
+                    && run
+                        .presentation
+                        .status_visibility
+                        .opacity(seconds, now, reduced_motion)
+                        .is_some()
+            })
+            .filter_map(|run| {
+                let toasts = run.design.status == Status::Toasts
+                    && run.presentation.status_events.ticking(now, reduced_motion);
+                if toasts && !reduced_motion {
+                    return Some(16);
+                }
+                StatusTiming::new(
+                    run.presentation.status_visibility.deadline(seconds),
+                    reduced_motion,
+                )
+                .clock_interval(now)
+                .or_else(|| {
                     (toasts
-                        || run
-                            .presentation
-                            .status_visibility
-                            .deadline(seconds)
-                            .is_some()
                         || run.active()
                             && (matches!(run.design.status, Status::Spotlight | Status::Orbit)
                                 || run.design.arrangement == Arrangement::Adaptive
                                     && run.presentation.dock.get() == Dock::Pill))
                         .then_some(100)
                 })
-                .chain(self.terminal_agents.runs.iter().filter_map(|(&id, run)| {
+                .or_else(|| (run.active() && run.design.status == Status::Metro).then_some(1000))
+            })
+            .chain(
+                self.terminal_agents.runs.iter().filter_map(|(&id, run)| {
                     self.agent_history_interval(id, run, now, reduced_motion)
-                }))
-                .chain(
-                    self.terminal_agents
-                        .runs
-                        .values()
-                        .any(Run::has_timed_input)
-                        .then_some(1000),
-                )
-                .chain(self.spotlight_animating(now).then_some(16))
-                .min();
+                }),
+            )
+            .chain(
+                self.terminal_agents
+                    .runs
+                    .values()
+                    .any(Run::has_timed_input)
+                    .then_some(1000),
+            )
+            .chain(self.spotlight_animating(now).then_some(16))
+            .min();
         interval.map_or_else(Subscription::none, |millis| {
             crate::workspace::scheduler_access::desktop_clock(Duration::from_millis(millis))
                 .map(|()| Desktop::AgentStatusClock)
@@ -590,6 +601,7 @@ impl Workspace {
             run.presentation.status_visibility.toggle(
                 self.window_settings.agent_status_auto_hide_seconds(),
                 Instant::now(),
+                !self.window_settings.agent_animations(),
             );
         }
     }
@@ -715,7 +727,7 @@ impl Workspace {
         let now = Instant::now();
         let seconds = self.window_settings.agent_status_auto_hide_seconds();
         let visibility = &run.presentation.status_visibility;
-        let status_visible = visibility.visible(seconds, now);
+        let status_opacity = visibility.opacity(seconds, now, reduced_motion);
         let chooser = || agents.run_picker(id, run);
         let has_archive = agents.has_archived_activity(run);
         let picture_in_picture = run.design.arrangement == Arrangement::PictureInPicture;
@@ -800,7 +812,7 @@ impl Workspace {
             let extent = placement::fitted_side_width(
                 bounds.width,
                 side_width,
-                left && status_visible && status_position == Slot::Right,
+                left && status_opacity.is_some() && status_position == Slot::Right,
             );
             let resize = DockResize {
                 expected: dock,
@@ -821,44 +833,46 @@ impl Workspace {
                 row![grip, history].height(Length::Fill).into()
             }
         });
-        let status = if !status_visible || adaptive_side && run.design.history == History::Timeline
-        {
-            // Both roles resolve to Java d02. Keep its single history presenter.
-            None
-        } else if adaptive_side {
-            let controls = column![chooser(), controls(run, has_archive)]
-                .spacing(4)
-                .into();
-            let panel = adaptive_timeline(run.into(), status::phase(run).0, controls, palette);
-            Some(panel.map(move |message| Desktop::TerminalAgent(id, message)))
-        } else {
-            pane_status(
-                id,
-                run,
-                status_kind,
-                palette,
-                now,
-                reduced_motion,
-                has_archive,
-            )
-            .map(|status| {
-                let picker = if history_position.is_none() && !picture_in_picture {
-                    chooser().map(|picker| {
-                        picker.map(move |message| Desktop::TerminalAgent(id, message))
-                    })
-                } else {
-                    None
-                };
-                if let Some(picker) = picker {
-                    palette::panel(
-                        palette,
-                        container(column![status, picker].spacing(3)).padding(2),
-                    )
-                } else {
-                    status
-                }
-            })
-        };
+        let status = status_opacity.and_then(|opacity| {
+            if adaptive_side && run.design.history == History::Timeline {
+                // Both roles resolve to Java d02. Keep its single history presenter.
+                None
+            } else if adaptive_side {
+                let controls = column![chooser(), controls(run, has_archive)]
+                    .spacing(4)
+                    .into();
+                let panel = adaptive_timeline(run.into(), status::phase(run).0, controls, palette);
+                Some(panel.map(move |message| Desktop::TerminalAgent(id, message)))
+            } else {
+                pane_status(
+                    id,
+                    run,
+                    status_kind,
+                    palette,
+                    now,
+                    reduced_motion,
+                    has_archive,
+                )
+                .map(|status| {
+                    let picker = if history_position.is_none() && !picture_in_picture {
+                        chooser().map(|picker| {
+                            picker.map(move |message| Desktop::TerminalAgent(id, message))
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(picker) = picker {
+                        palette::panel(
+                            palette,
+                            container(column![status, picker].spacing(3)).padding(2),
+                        )
+                    } else {
+                        status
+                    }
+                })
+            }
+            .map(|status| fade::view(status, opacity))
+        });
         let terminal = if run.design.arrangement == Arrangement::Adaptive {
             status::adaptive_countdown(
                 terminal,

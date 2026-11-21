@@ -1601,6 +1601,22 @@ fn run_action<'a, P, C>(
                     window.raw.focus_window();
                 }
             }
+            window::Action::GainFocusFrom { target, source } => {
+                if let (Some(target), Some(source)) =
+                    (window_manager.get(target), window_manager.get(source))
+                {
+                    #[cfg(all(target_os = "linux", feature = "wayland"))]
+                    {
+                        use winit::platform::wayland::WindowExtWayland as _;
+                        target.raw.focus_window_from(&source.raw);
+                    }
+                    #[cfg(not(all(target_os = "linux", feature = "wayland")))]
+                    {
+                        let _ = source;
+                        target.raw.focus_window();
+                    }
+                }
+            }
             window::Action::SetLevel(id, level) => {
                 if let Some(window) = window_manager.get_mut(id) {
                     window.raw.set_window_level(conversion::window_level(level));

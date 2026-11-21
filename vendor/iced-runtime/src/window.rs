@@ -128,6 +128,14 @@ pub enum Action {
     /// - **Web / Wayland:** Unsupported.
     GainFocus(Id),
 
+    /// Focus an existing window in response to input in another window.
+    GainFocusFrom {
+        /// The window to bring to the foreground.
+        target: Id,
+        /// The window that received the triggering input.
+        source: Id,
+    },
+
     /// Change the window [`Level`].
     SetLevel(Id, Level),
 
@@ -442,6 +450,14 @@ pub fn request_user_attention<T>(id: Id, user_attention: Option<UserAttention>) 
 /// user experience.
 pub fn gain_focus<T>(id: Id) -> Task<T> {
     task::effect(crate::Action::Window(Action::GainFocus(id)))
+}
+
+/// Requests focus for `target` in response to user input in `source`.
+pub fn gain_focus_from<T>(target: Id, source: Id) -> Task<T> {
+    task::effect(crate::Action::Window(Action::GainFocusFrom {
+        target,
+        source,
+    }))
 }
 
 /// Changes the window [`Level`].

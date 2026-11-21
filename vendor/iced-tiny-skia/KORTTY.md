@@ -23,3 +23,9 @@ blinking caret quad. The scope replaces the adapter's marker in those two
 draw operations and leaves the widget's layout, selection, events and IME
 handling in iced. The block caret repaints the same shaped glyph in a
 clipped layer with contrasting ink.
+
+The terminal Agent status fade uses a clipped opacity group. The renderer
+paints the group's layers into a temporary transparent pixmap and blends
+that pixmap once. This keeps the internal overlap of text, geometry and
+backgrounds intact. A group contributes its clipped bounds to the damage
+calculation while the fade is active.

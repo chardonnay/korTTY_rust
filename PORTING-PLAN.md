@@ -1196,6 +1196,21 @@ draft at an authenticated Bash prompt without sending an SSH exec request.
 · [Numeric decision verification](PORTING-PARITY.md#november-21-numeric-decisions-in-terminal-agent-cursor-approval)
 · [Dismissal animation verification](PORTING-PARITY.md#november-21-terminal-agent-cursor-dismissal-animation)
 
+The d08 Metro line follows typed command, analysis and question steps
+and reserves an Answer station. Active stations pulse, a pending review
+is amber, and a light moves to the current station. Reduced animations
+keeps the rail still. The visible stations fit the terminal width and
+the oldest retained stations collapse into a count. Clicking a station
+opens its typed detail or the current review. The live status and the
+Settings preview share the rail. Fedora Wayland verified station selection,
+request review, completion, hiding and restoring the rail, and a vertical
+split that narrowed the source terminal from 112 to 54 columns. Verify
+the remaining native desktops and the rail's station motion in the live
+renderer. Audit the Java standard combination and the active-run count
+separately.
+[Java Metro line](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignMetroBar.java)
+· [Metro line verification](PORTING-PARITY.md#november-21-terminal-agent-metro-line)
+
 The d09 tmux history shows the masked goal, one entry per typed step with
 its command or title and result, and a terminal-style footer. A completed
 answer appears behind a block cursor at 24 ms per character. Reduced
@@ -1227,10 +1242,25 @@ message transition and pulsing activity light. Reduced animations keeps
 the complete label and light steady. Amber identifies pending input, and
 Review opens the Activity window. Pause, resume, cancel and run actions
 use the existing run. The close button hides the status and View › AI
-Agent Panel can restore it. Verify the transition, review handoff and
-visibility controls on native desktops.
+Agent Panel can restore it. Fedora Wayland verified the visibility
+controls and the activation of the existing Activity window from both
+Review controls. The activation uses the click's serial and leaves the
+probe awaiting approval. Verify the transition, review handoff and
+visibility controls on Windows, macOS and X11. Exercise the Wayland
+handoff on additional compositors and with keyboard and touch input.
 [Java Neon Ticker](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignNeonTicker.java)
 · [Ticker implementation](PORTING-PARITY.md#november-21-terminal-agent-neon-ticker)
+
+Timed status displays and the Settings preview share a 250 ms fade after
+the configured delay. During the fade, the status retains its place in
+the layout. Reduced animations removes the status at the deadline.
+With a zero delay or a manually restored status, the display stays until
+the next visibility change. Fedora Wayland verified the intermediate
+frames, reduced motion, zero delay and manual restoration for the Metro
+line. Repeat the visibility checks for the other status designs and on
+the remaining native desktops.
+[Java status visibility](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentStatusVisibility.java)
+· [Status fade verification](PORTING-PARITY.md#november-21-terminal-agent-status-auto-hide-fade)
 
 Interactive Run can review a complexity assessment after the environment
 probe. The AI Manager preference and the managed override select when to

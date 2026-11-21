@@ -261,7 +261,11 @@ impl Workspace {
                 Task::none()
             }
             (None, Item::HideStatus)
-                if run.design.status == crate::terminal_agent::design::Status::Neon =>
+                if matches!(
+                    run.design.status,
+                    crate::terminal_agent::design::Status::Metro
+                        | crate::terminal_agent::design::Status::Neon
+                ) =>
             {
                 if let Some(run) = self.terminal_agents.runs.get_mut(&id) {
                     run.presentation.status_visibility.hide();

@@ -3,7 +3,7 @@
 use std::f32::consts::TAU;
 use std::time::{Duration, Instant};
 
-use iced::widget::{button, column, container, progress_bar, row, scrollable, text, tooltip};
+use iced::widget::{Row, button, column, container, progress_bar, row, scrollable, text, tooltip};
 use iced::{Alignment, Element, Length};
 
 use crate::terminal_agent::design::Status;
@@ -19,6 +19,7 @@ use super::{
 };
 
 mod meter;
+mod metro;
 mod neon;
 pub(super) use meter::adaptive_countdown;
 use meter::{Ring, Tone};
@@ -183,7 +184,6 @@ pub(super) fn phase(run: &Run) -> (&'static str, usize) {
 fn station(
     run: history::Activity<'_>,
     index: usize,
-    vertical: bool,
     palette: Option<Palette>,
 ) -> Element<'_, AgentMessage> {
     let selected = run.presentation.selection(run.activity.len()) == index;
@@ -197,13 +197,9 @@ fn station(
     });
     let station = tooltip(
         button(
-            text(if vertical {
-                format!("{marker} {}", index + 1)
-            } else {
-                marker.to_owned()
-            })
-            .size(13)
-            .style(move |_| text::Style { color }),
+            text(format!("{marker} {}", index + 1))
+                .size(13)
+                .style(move |_| text::Style { color }),
         )
         .style(button::text)
         .on_press(AgentMessage::Design(Message::Select(
@@ -220,22 +216,14 @@ fn station(
         .padding(7)
         .max_width(420)
         .style(container::bordered_box),
-        if vertical {
-            tooltip::Position::Left
-        } else {
-            tooltip::Position::Top
-        },
+        tooltip::Position::Left,
     )
     .into();
-    if vertical {
-        run.step_context(
-            index,
-            Surface::Minimap(run.presentation.identity(index)),
-            station,
-        )
-    } else {
-        station
-    }
+    run.step_context(
+        index,
+        Surface::Minimap(run.presentation.identity(index)),
+        station,
+    )
 }
 
 pub(super) fn view(
@@ -288,39 +276,14 @@ pub(super) fn render<'a>(
         .align_y(Alignment::Center)
         .wrap()
         .into(),
-        Status::Metro => {
-            let mut stations = row![
-                text(format!("Agent · {phase}"))
-                    .size(12)
-                    .style(heading_style)
-            ]
-            .spacing(3)
-            .align_y(Alignment::Center);
-            let first = run.activity.len().saturating_sub(8);
-            if first > 0 {
-                stations = stations.push(
-                    button(text(format!("+{first}")))
-                        .style(button::text)
-                        .on_press(AgentMessage::Design(Message::Select(
-                            run.presentation.identity(first - 1),
-                        ))),
-                );
-            }
-            for index in first..run.activity.len() {
-                stations = stations.push(station(run, index, false, palette));
-            }
-            stations
-                .push(button("Details").style(button::text).on_press(toggle()))
-                .wrap()
-                .into()
-        }
+        Status::Metro => metro::view(run, phase, &trace, palette, has_archive),
         Status::Minimap => {
             let mut rail = column![text(phase).size(11).style(heading_style)].spacing(2);
             if let Some(usage) = usage_label(run, palette) {
                 rail = rail.push(usage);
             }
             for index in 0..run.activity.len() {
-                rail = rail.push(station(run, index, true, palette));
+                rail = rail.push(station(run, index, palette));
             }
             let rail = column![
                 scrollable(rail).height(Length::Fill),
@@ -552,11 +515,12 @@ pub(super) fn render<'a>(
         }
     };
     let drawer = run.presentation.drawer;
-    if status == Status::Neon && !drawer {
+    let has_own_controls = matches!(status, Status::Metro | Status::Neon);
+    if has_own_controls && !drawer {
         return header;
     }
     let simple = matches!(status, Status::Steps | Status::Pill);
-    let mut panel = if status == Status::Neon {
+    let mut panel = if has_own_controls {
         column![header]
     } else {
         let action_menu = trace
@@ -566,7 +530,10 @@ pub(super) fn render<'a>(
     }
     .spacing(5);
     if drawer && !simple {
-        if matches!(status, Status::Spotlight | Status::Toasts | Status::Orbit) {
+        if matches!(
+            status,
+            Status::Metro | Status::Spotlight | Status::Toasts | Status::Orbit
+        ) {
             panel = panel.push(trace_drawer(
                 &trace,
                 run.presentation.selected_step,
@@ -659,6 +626,60 @@ fn usage_label(
             tooltip::Position::Bottom,
         )
         .into(),
+    )
+}
+
+fn bar_controls<'a>(
+    trace: &Trace<'a>,
+    has_archive: bool,
+    drawer: bool,
+) -> Option<Row<'a, AgentMessage>> {
+    let run = trace.run?;
+    let mut controls = row![].spacing(6).align_y(Alignment::Center);
+    if trace.waiting {
+        controls = controls.push(
+            button("Review…")
+                .style(button::text)
+                .padding(3)
+                .on_press(AgentMessage::Focus),
+        );
+    }
+    for (label, title, message) in [
+        (
+            if trace.paused { "▶" } else { "Ⅱ" },
+            if trace.paused { "Resume" } else { "Pause" },
+            (trace.active && !trace.waiting).then_some(AgentMessage::Pause),
+        ),
+        (
+            "■",
+            "Cancel run",
+            trace.active.then_some(AgentMessage::Cancel),
+        ),
+        (
+            "×",
+            "Hide Agent status",
+            Some(super::actions::hide_status(run)),
+        ),
+    ] {
+        controls = controls.push(tooltip(
+            button(label)
+                .style(button::text)
+                .padding(3)
+                .on_press_maybe(message),
+            text(title).size(12),
+            tooltip::Position::Top,
+        ));
+    }
+    if let Some(menu) = super::actions::run_menu(run, has_archive) {
+        controls = controls.push(menu);
+    }
+    Some(
+        controls.push(
+            button(if drawer { "Close details" } else { "Details" })
+                .padding(3)
+                .style(button::text)
+                .on_press(AgentMessage::Design(Message::ToggleDrawer)),
+        ),
     )
 }
 

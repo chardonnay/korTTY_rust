@@ -8,3 +8,7 @@ The internal `window::Action::Open` carries an optional Wayland owner ID.
 Ordinary `window::open(settings)` still creates an unowned window. The
 [iced_winit patch](../iced-winit/KORTTY-PATCH.md) resolves the ID in its
 window manager and attaches the toplevel during native creation.
+
+`window::gain_focus_from(target, source)` carries the two live window IDs
+for a user-initiated focus transfer. The backend resolves both IDs before
+requesting activation.

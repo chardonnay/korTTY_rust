@@ -1,4 +1,4 @@
-//! Handling of xdg activation, which is used for user attention requests.
+//! Handling of xdg activation and user attention requests.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Weak;
@@ -15,6 +15,7 @@ use sctk::globals::GlobalData;
 
 use crate::event_loop::AsyncRequestSerial;
 use crate::platform_impl::wayland::state::WinitState;
+use crate::platform_impl::wayland::window::WindowRequests;
 use crate::platform_impl::WindowId;
 use crate::window::ActivationToken;
 
@@ -85,6 +86,15 @@ impl Dispatch<XdgActivationTokenV1, XdgActivationTokenData, WinitState> for XdgA
                     *window_id,
                 );
             },
+            XdgActivationTokenData::Activate { surface, target } => {
+                if surface.is_alive()
+                    && target.upgrade().is_some_and(|target| {
+                        !target.closed.load(std::sync::atomic::Ordering::Relaxed)
+                    })
+                {
+                    global.activate(token, surface);
+                }
+            },
         }
 
         proxy.destroy();
@@ -97,6 +107,13 @@ pub enum XdgActivationTokenData {
     Attention((WlSurface, Weak<AtomicBool>)),
     /// Get a token to be passed outside of the winit.
     Obtain((WindowId, AsyncRequestSerial)),
+    /// Activate an existing surface if its window is still alive.
+    Activate {
+        /// Surface to activate when the compositor issues the token.
+        surface: WlSurface,
+        /// Used to discard replies for a closing window.
+        target: Weak<WindowRequests>,
+    },
 }
 
 delegate_dispatch!(WinitState: [ XdgActivationV1: GlobalData] => XdgActivationState);

@@ -14,7 +14,6 @@ pub(super) struct Preview {
     pub reduced_motion: bool,
     pub cursor_design: bool,
     pub cursor_review: bool,
-    pub deadline: Option<Instant>,
     pub status_frame: Option<Instant>,
 }
 
@@ -78,12 +77,7 @@ impl canvas::Program<Desktop> for Preview {
             )));
         }
         if !self.playing {
-            let deadline = self
-                .deadline
-                .into_iter()
-                .chain(self.status_frame)
-                .chain(fade_frame)
-                .min()?;
+            let deadline = self.status_frame.into_iter().chain(fade_frame).min()?;
             return Some(if *now >= deadline {
                 Action::publish(message(self.owner, super::Action::StatusDeadline))
             } else {

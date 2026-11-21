@@ -11,7 +11,7 @@ use iced::advanced::{
     widget::{Operation, Tree, tree},
 };
 use iced::font::Weight;
-use iced::widget::{button, canvas, container, row, text, tooltip};
+use iced::widget::{canvas, container, row, text};
 use iced::{
     Alignment, Border, Color, Element, Event, Font, Length, Pixels, Point, Rectangle, Renderer,
     Size, Theme, Vector, alignment, mouse, theme, window,
@@ -331,55 +331,8 @@ pub(super) fn view<'a>(
     if let Some(usage) = super::usage_label(activity, palette) {
         ticker = ticker.push(usage);
     }
-    if let Some(run) = trace.run {
-        if trace.waiting {
-            ticker = ticker.push(
-                button("Review…")
-                    .style(button::text)
-                    .padding(3)
-                    .on_press(AgentMessage::Focus),
-            );
-        }
-        let pause = if trace.paused { "Resume" } else { "Pause" };
-        for (label, title, message) in [
-            (
-                if trace.paused { "▶" } else { "Ⅱ" },
-                pause,
-                (trace.active && !trace.waiting).then_some(AgentMessage::Pause),
-            ),
-            (
-                "■",
-                "Cancel run",
-                trace.active.then_some(AgentMessage::Cancel),
-            ),
-            (
-                "×",
-                "Hide Agent status",
-                Some(super::super::actions::hide_status(run)),
-            ),
-        ] {
-            ticker = ticker.push(tooltip(
-                button(label)
-                    .style(button::text)
-                    .padding(3)
-                    .on_press_maybe(message),
-                text(title).size(12),
-                tooltip::Position::Top,
-            ));
-        }
-        if let Some(menu) = super::super::actions::run_menu(run, has_archive) {
-            ticker = ticker.push(menu);
-        }
-        ticker = ticker.push(
-            button(if activity.presentation.drawer {
-                "Close details"
-            } else {
-                "Details"
-            })
-            .padding(3)
-            .style(button::text)
-            .on_press(AgentMessage::Design(super::Message::ToggleDrawer)),
-        );
+    if let Some(controls) = super::bar_controls(trace, has_archive, activity.presentation.drawer) {
+        ticker = ticker.push(controls);
     }
     palette::scope(
         palette,

@@ -118,7 +118,6 @@ fn canvas_clock_publishes_only_a_scoped_demo_tick_and_stops_while_paused() {
         reduced_motion: false,
         cursor_design: false,
         cursor_review: false,
-        deadline: None,
         status_frame: None,
     };
     let mut clock = canvas::Clock::default();
@@ -188,7 +187,6 @@ fn reduced_motion_skips_intermediate_frames_and_keeps_demo_timing() {
         reduced_motion: true,
         cursor_design: false,
         cursor_review: false,
-        deadline: None,
         status_frame: None,
     };
     let bounds = Rectangle::with_size(Size::new(640.0, 320.0));
@@ -219,7 +217,7 @@ fn reduced_motion_skips_intermediate_frames_and_keeps_demo_timing() {
     ));
 
     preview.playing = false;
-    preview.deadline = Some(next);
+    preview.status_frame = Some(next);
     assert_eq!(
         redraw(&preview, &mut clock, now).1,
         window::RedrawRequest::At(next)
@@ -251,7 +249,6 @@ fn cursor_preview_fades_after_cancellation_and_reduced_motion_stops_the_frames()
         reduced_motion: false,
         cursor_design: true,
         cursor_review: true,
-        deadline: None,
         status_frame: None,
     };
     let bounds = Rectangle::with_size(Size::new(640.0, 320.0));
