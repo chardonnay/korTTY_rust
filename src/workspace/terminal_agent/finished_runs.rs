@@ -1,6 +1,6 @@
 //! Bounded masked history for completed Activity windows.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 use iced::{Task, window};
@@ -30,6 +30,7 @@ pub(super) struct FinishedRun {
     fonts: font::Sizes,
     history: inline_history::History,
     activity: VecDeque<String>,
+    activity_steps: HashMap<usize, u64>,
     export: activity_export::Export,
     usage: design::Usage,
     final_evidence: final_evidence::Evidence,
@@ -90,6 +91,11 @@ impl Archive {
             fonts: std::mem::take(&mut run.fonts),
             history,
             activity,
+            activity_steps: run
+                .activity_steps
+                .iter()
+                .map(|(&identity, &step)| (identity - run.presentation.identity(0), step))
+                .collect(),
             export: run.activity_export.completed_snapshot(),
             usage: std::mem::take(&mut run.presentation.model_usage),
             final_evidence: run
@@ -243,6 +249,7 @@ impl Workspace {
         run.plan = entry.plan;
         run.inline = Some(entry.history);
         run.activity = entry.activity;
+        run.activity_steps = entry.activity_steps;
         run.activity_export = entry.export;
         run.fonts = entry.fonts;
         run.confirm_every_command = entry.confirm_every_command;
@@ -297,9 +304,15 @@ mod tests {
         let secrets = Secrets::default();
         secrets.add(marker);
         run.learned_sudo = Some(secrets.seal().unwrap());
+        for _ in 0..super::super::MAX_ACTIVITY {
+            run.record("Fixture note".into());
+        }
         run.record(format!("Old output: {marker}"));
         run.inline_command(&format!("printf {marker}"));
-        run.inline_result(super::super::engine::Status::Exited(0), marker, "");
+        let retained = run.inline_result(super::super::engine::Status::Exited(0), marker, "");
+        run.record("Retained command result".into());
+        run.bind_activity_step(retained);
+        assert!(run.presentation.identity(0) > 0);
         let old_history_id = run.inline.as_ref().unwrap().id;
         drop(fixture.send(first, Message::Close));
         assert!(!fixture.workspace.terminal_agents.runs.contains_key(&first));
@@ -335,6 +348,10 @@ mod tests {
         assert!(restored.context.is_empty() && restored.learned_sudo.is_none());
         assert_ne!(restored.inline.as_ref().unwrap().id, old_history_id);
         let trace = restored.status_transcript().unwrap().0;
+        assert_eq!(
+            restored.activity_steps.get(&(restored.activity.len() - 1)),
+            retained.as_ref()
+        );
         assert_eq!(trace.goal, "Inspect service");
         assert!(
             trace

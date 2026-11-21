@@ -42,6 +42,38 @@ impl<'a> From<&'a Run> for Activity<'a> {
     }
 }
 
+impl<'a> Activity<'a> {
+    pub(super) fn step_context(
+        self,
+        index: usize,
+        surface: Surface,
+        content: Element<'a, AgentMessage>,
+    ) -> Element<'a, AgentMessage> {
+        let Some(run) = self.live_run else {
+            return content;
+        };
+        let Some(step) = run
+            .activity_steps
+            .get(&run.presentation.identity(index))
+            .and_then(|id| self.transcript?.steps.iter().find(|step| step.id == *id))
+        else {
+            return content;
+        };
+        super::log_table::step_context(content, run, step, surface)
+    }
+
+    fn entry_menu(
+        self,
+        index: usize,
+        content: impl Into<Element<'a, AgentMessage>>,
+    ) -> Element<'a, AgentMessage> {
+        let surface = self
+            .surface
+            .activity_entry(self.presentation.identity(index));
+        self.step_context(index, surface, content.into())
+    }
+}
+
 pub(super) fn summary(value: &str) -> String {
     let line = value
         .lines()
@@ -166,25 +198,32 @@ fn entries(
     match history {
         History::Transcript | History::StepCards | History::InlineBlocks | History::Focus => {
             for (index, entry) in run.activity.iter().enumerate() {
-                entries = entries.push(super::activity_entry(history, index, entry, size));
+                entries = entries.push(
+                    run.entry_menu(index, super::activity_entry(history, index, entry, size)),
+                );
             }
         }
         History::Timeline => {
             for (index, entry) in run.activity.iter().enumerate() {
                 entries = entries.push(
-                    row![
-                        text(if index == selected { "●" } else { "│" }),
-                        column![
-                            button(text(format!("{} · {}", index + 1, summary(entry))).size(size))
+                    run.entry_menu(
+                        index,
+                        row![
+                            text(if index == selected { "●" } else { "│" }),
+                            column![
+                                button(
+                                    text(format!("{} · {}", index + 1, summary(entry))).size(size)
+                                )
                                 .on_press(select(run, index))
                                 .style(button::text),
-                            (index == selected || run.presentation.activity.expand_all)
-                                .then(|| text(entry).size(size)),
+                                (index == selected || run.presentation.activity.expand_all)
+                                    .then(|| text(entry).size(size)),
+                            ]
+                            .spacing(4)
+                            .width(Length::Fill),
                         ]
-                        .spacing(4)
-                        .width(Length::Fill),
-                    ]
-                    .spacing(5),
+                        .spacing(5),
+                    ),
                 );
             }
         }
@@ -198,13 +237,16 @@ fn entries(
             steps = steps.push(text("Activity").size(size + 1.0));
             for (index, entry) in run.activity.iter().enumerate() {
                 steps = steps.push(
-                    button(text(format!("{}  {}", index + 1, summary(entry))).size(size - 1.0))
-                        .on_press(select(run, index))
-                        .style(if index == selected {
-                            button::primary
-                        } else {
-                            button::text
-                        }),
+                    run.entry_menu(
+                        index,
+                        button(text(format!("{}  {}", index + 1, summary(entry))).size(size - 1.0))
+                            .on_press(select(run, index))
+                            .style(if index == selected {
+                                button::primary
+                            } else {
+                                button::text
+                            }),
+                    ),
                 );
             }
             return row![
@@ -226,65 +268,78 @@ fn entries(
         }
         History::CardStack if run.presentation.activity.expand_all => {
             for (index, entry) in run.activity.iter().enumerate() {
-                entries = entries.push(super::activity_entry(history, index, entry, size));
+                entries = entries.push(
+                    run.entry_menu(index, super::activity_entry(history, index, entry, size)),
+                );
             }
         }
         History::CardStack => {
             for index in selected.saturating_sub(2)..selected {
                 if let Some(entry) = run.activity.get(index) {
                     entries = entries.push(
-                        button(
-                            text(format!("{} · {}", index + 1, summary(entry))).size(size - 1.0),
-                        )
-                        .width(Length::Fill)
-                        .on_press(select(run, index))
-                        .style(button::secondary),
+                        run.entry_menu(
+                            index,
+                            button(
+                                text(format!("{} · {}", index + 1, summary(entry)))
+                                    .size(size - 1.0),
+                            )
+                            .width(Length::Fill)
+                            .on_press(select(run, index))
+                            .style(button::secondary),
+                        ),
                     );
                 }
             }
             entries = entries.push(
-                container(
-                    column![
-                        row![
-                            button("Previous").on_press_maybe(
-                                (selected > 0).then_some(AgentMessage::Design(Message::Previous))
-                            ),
-                            text(format!(
-                                "Activity {} of {}",
-                                if run.activity.is_empty() {
-                                    0
-                                } else {
-                                    selected + 1
-                                },
-                                run.activity.len()
-                            ))
-                            .size(size),
-                            button("Next").on_press_maybe(
-                                (selected + 1 < run.activity.len())
-                                    .then_some(AgentMessage::Design(Message::Next))
-                            ),
+                run.entry_menu(
+                    selected,
+                    container(
+                        column![
+                            row![
+                                button("Previous").on_press_maybe(
+                                    (selected > 0)
+                                        .then_some(AgentMessage::Design(Message::Previous))
+                                ),
+                                text(format!(
+                                    "Activity {} of {}",
+                                    if run.activity.is_empty() {
+                                        0
+                                    } else {
+                                        selected + 1
+                                    },
+                                    run.activity.len()
+                                ))
+                                .size(size),
+                                button("Next").on_press_maybe(
+                                    (selected + 1 < run.activity.len())
+                                        .then_some(AgentMessage::Design(Message::Next))
+                                ),
+                            ]
+                            .spacing(6)
+                            .wrap(),
+                            detail(run, selected),
                         ]
-                        .spacing(6)
-                        .wrap(),
-                        detail(run, selected),
-                    ]
-                    .spacing(8),
-                )
-                .padding(10)
-                .style(container::bordered_box)
-                .width(Length::Fill),
+                        .spacing(8),
+                    )
+                    .padding(10)
+                    .style(container::bordered_box)
+                    .width(Length::Fill),
+                ),
             );
         }
         History::Tmux => {
             for (index, entry) in run.activity.iter().enumerate() {
                 entries = entries.push(
-                    column![
-                        text(format!("── activity {} ──", index + 1))
-                            .font(Font::MONOSPACE)
-                            .size(size - 1.0),
-                        text(entry).font(Font::MONOSPACE).size(size),
-                    ]
-                    .spacing(4),
+                    run.entry_menu(
+                        index,
+                        column![
+                            text(format!("── activity {} ──", index + 1))
+                                .font(Font::MONOSPACE)
+                                .size(size - 1.0),
+                            text(entry).font(Font::MONOSPACE).size(size),
+                        ]
+                        .spacing(4),
+                    ),
                 );
             }
             return container(scrollable(entries).height(Length::Fill))
@@ -307,19 +362,22 @@ fn entries(
             );
             for (index, entry) in run.activity.iter().enumerate() {
                 entries = entries.push(
-                    container(
-                        column![
-                            button(text(format!("Agent · {}", summary(entry))).size(size))
-                                .on_press(select(run, index))
-                                .style(button::text),
-                            (index == selected || run.presentation.activity.expand_all)
-                                .then(|| text(entry).size(size)),
-                        ]
-                        .spacing(4),
-                    )
-                    .padding(7)
-                    .style(container::bordered_box)
-                    .width(Length::Fill),
+                    run.entry_menu(
+                        index,
+                        container(
+                            column![
+                                button(text(format!("Agent · {}", summary(entry))).size(size))
+                                    .on_press(select(run, index))
+                                    .style(button::text),
+                                (index == selected || run.presentation.activity.expand_all)
+                                    .then(|| text(entry).size(size)),
+                            ]
+                            .spacing(4),
+                        )
+                        .padding(7)
+                        .style(container::bordered_box)
+                        .width(Length::Fill),
+                    ),
                 );
             }
         }

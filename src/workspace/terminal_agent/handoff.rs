@@ -404,15 +404,15 @@ impl Workspace {
         })();
         match result {
             Ok(task) => {
-                let detached = self.terminal_agents.runs.remove(&id).and_then(|mut run| {
-                    self.retain_finished_agent_run(id, &mut run);
-                    run.presentation.pip.detached.take()
-                });
-                Task::batch([
-                    task,
-                    detached.map_or_else(Task::none, |window| self.close_placed_dialog(window)),
-                    self.reconcile_agent_pip(),
-                ])
+                let pip =
+                    self.terminal_agents
+                        .runs
+                        .remove(&id)
+                        .map_or_else(Task::none, |mut run| {
+                            self.retain_finished_agent_run(id, &mut run);
+                            self.follow_released_agent_pip(&mut run)
+                        });
+                Task::batch([task, pip, self.reconcile_agent_pip()])
             }
             Err(error) => {
                 if let Some(run) = self.terminal_agents.runs.get_mut(&id) {

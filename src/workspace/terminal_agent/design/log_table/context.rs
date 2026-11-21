@@ -10,7 +10,7 @@ use super::{AgentMessage, Message, Row, Surface, event};
 #[derive(Clone, Copy)]
 pub(super) struct Menu {
     pub(super) surface: Surface,
-    row: Option<Row>,
+    pub(super) row: Option<Row>,
     point: Point,
     pub(super) selected: usize,
     pub(super) page: Page,

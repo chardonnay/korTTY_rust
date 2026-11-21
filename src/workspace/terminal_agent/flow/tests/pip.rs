@@ -524,6 +524,165 @@ fn click_log_label(
 }
 
 #[test]
+fn history_modules_open_the_actions_for_the_exact_recorded_step() {
+    use design::log_table::{Message as LogMessage, Row, Surface};
+
+    fn history(fixture: &Fixture, id: window::Id) -> Element<'_, Desktop> {
+        design::history_view(
+            fixture.run(id),
+            None,
+            true,
+            Some((&fixture.workspace.terminal_agents, id)),
+        )
+        .map(move |message| Desktop::TerminalAgent(id, message))
+    }
+
+    for (module, label) in [
+        (History::Timeline, "1 · First receipt"),
+        (History::PlanExecution, "1  First receipt"),
+        (History::CardStack, "1 · First receipt"),
+        (History::Conversation, "Agent · First receipt"),
+        (History::Tmux, "First receipt"),
+        (History::Transcript, "First receipt"),
+    ] {
+        let mut fixture = Fixture::new(false, false);
+        fixture.workspace.clipboard.policy.internal = true;
+        let id = fixture.open_ask_with_source_tab_visible();
+        let run = fixture.run_mut(id);
+        run.design.history = module;
+        run.goal = "Review two steps with identical commands".into();
+        run.next(Phase::Thinking, "Fixture activity");
+        let first = run.inline_command("printf fixture");
+        let result = run.inline_result(engine::Status::Exited(0), "first output", "");
+        assert_eq!(first, result);
+        run.record("First receipt".into());
+        run.bind_activity_step(result);
+        let other = run.inline_command("printf fixture");
+        assert_ne!(first, other);
+        let result = run.inline_result(engine::Status::Exited(0), "different output", "");
+        run.record("Second receipt".into());
+        run.bind_activity_step(result);
+        let size = Size::new(620.0, 440.0);
+        let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
+        let mut ui =
+            UserInterface::build(history(&fixture, id), size, Cache::default(), &mut renderer);
+        let mut messages = click_log_label(&mut ui, &mut renderer, label, mouse::Button::Right);
+        let cache = ui.into_cache();
+        assert!(
+            matches!(
+                messages.as_slice(),
+                [Desktop::TerminalAgent(run, Message::Design(design::Message::LogTable(
+                    LogMessage::OpenMenu(Surface::ActivityEntry(_), Some(Row::Step(step)), _)
+                )))] if *run == id && Some(*step) == first
+            ),
+            "{module:?} exposed the wrong menu"
+        );
+        no_task(fixture.workspace.update(messages.remove(0)));
+        let mut ui = UserInterface::build(history(&fixture, id), size, cache, &mut renderer);
+        let mut messages =
+            click_log_label(&mut ui, &mut renderer, "Copy output", mouse::Button::Left);
+        drop(ui);
+        assert!(matches!(
+            messages.as_slice(),
+            [Desktop::TerminalAgent(run, Message::DesignAction(action))]
+            if *run == id && action.label() == "Copy output"
+        ));
+        drop(fixture.workspace.update(messages.remove(0)));
+        assert_eq!(
+            fixture.workspace.clipboard.buffer.get().as_deref(),
+            Some("first output")
+        );
+    }
+}
+
+#[test]
+fn folded_picture_in_picture_title_menu_acts_on_the_displayed_run() {
+    use iced::futures::{StreamExt, executor::block_on};
+    use iced_runtime::Action::Window;
+    use iced_runtime::window::Action::Resize;
+
+    fn view(fixture: &Fixture, detached: Option<window::Id>, size: Size) -> Element<'_, Desktop> {
+        if let Some(detached) = detached {
+            fixture.workspace.view(detached)
+        } else {
+            keyboard_log_view(fixture, size)
+        }
+    }
+
+    for detached in [false, true] {
+        let mut fixture = Fixture::new(false, false);
+        fixture.workspace.clipboard.policy.internal = true;
+        let id = fixture.open_ask_with_source_tab_visible();
+        let run = fixture.run_mut(id);
+        run.design.arrangement = Arrangement::PictureInPicture;
+        run.design.history = History::Transcript;
+        run.design.status = Status::Hidden;
+        run.goal = "Inspect the fixture".into();
+        run.next(Phase::Thinking, "Fixture activity");
+        let answer = "Answer from the displayed run";
+        run.inline_decision(&engine::Action::Done, "Finished", answer);
+        run.next(Phase::Finished, "Finished");
+        no_task(fixture.send(id, Message::Pip(Pip::Fold)));
+        let (window, bounds) = if detached {
+            drop(fixture.send(id, Message::Pip(Pip::Detach)));
+            (
+                fixture.run(id).presentation.pip.detached,
+                Size::new(300.0, 36.0),
+            )
+        } else {
+            (None, Size::new(720.0, 440.0))
+        };
+        let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
+        let mut ui = UserInterface::build(
+            view(&fixture, window, bounds),
+            bounds,
+            Cache::default(),
+            &mut renderer,
+        );
+        let mut messages = click_log_label(&mut ui, &mut renderer, "⋯", mouse::Button::Left);
+        let cache = ui.into_cache();
+        assert_eq!(messages.len(), 1);
+        let opened = fixture.workspace.update(messages.remove(0));
+        let menu_bounds = if detached {
+            let mut effects = iced_runtime::task::into_stream(opened).unwrap();
+            let Some(Window(Resize(owner, size))) = block_on(effects.next()) else {
+                panic!("the detached frame should make room for the menu");
+            };
+            assert_eq!(Some(owner), window);
+            assert!(size.height > bounds.height);
+            size
+        } else {
+            no_task(opened);
+            bounds
+        };
+        assert!(!fixture.run(id).presentation.pip.shows_history());
+        let mut ui = UserInterface::build(
+            view(&fixture, window, menu_bounds),
+            menu_bounds,
+            cache,
+            &mut renderer,
+        );
+        let mut messages =
+            click_log_label(&mut ui, &mut renderer, "Copy answer", mouse::Button::Left);
+        drop(ui);
+        assert_eq!(messages.len(), 1);
+        let closed = fixture.workspace.update(messages.remove(0));
+        if detached {
+            let mut effects = iced_runtime::task::into_stream(closed).unwrap();
+            assert!(
+                matches!(block_on(effects.next()), Some(Window(Resize(owner, size)))
+                if Some(owner) == window && size == bounds)
+            );
+        }
+        assert_eq!(
+            fixture.workspace.clipboard.buffer.get().as_deref(),
+            Some(answer)
+        );
+        assert!(!fixture.run(id).presentation.pip.shows_history());
+    }
+}
+
+#[test]
 fn docked_log_answer_context_menu_copies_the_selected_run_answer() {
     use design::log_table::{Message as LogMessage, Row, Surface};
 
@@ -1295,6 +1454,7 @@ fn picture_in_picture_new_input_moves_the_detached_window_and_rejects_old_owner_
         .run_mut(second)
         .next(Phase::Directory, "Reading directory");
     no_task(fixture.send(first, Message::Pip(Pip::Show)));
+    no_task(fixture.send(first, Message::Pip(Pip::Fold)));
     drop(fixture.send(first, Message::Pip(Pip::Detach)));
     let detached = fixture.run(first).presentation.pip.detached.unwrap();
     no_task(fixture.send(second, Message::InlineDetails));
@@ -1310,6 +1470,7 @@ fn picture_in_picture_new_input_moves_the_detached_window_and_rejects_old_owner_
             .pip_run_for_window(detached),
         Some(second)
     );
+    assert!(!fixture.run(second).presentation.pip.shows_history());
     assert!(fixture.run(first).presentation.pip.detached.is_none());
     no_task(fixture.send(
         detached,
@@ -1351,6 +1512,71 @@ fn picture_in_picture_new_input_moves_the_detached_window_and_rejects_old_owner_
             .presented_runs
             .contains_key(&fixture.session)
     );
+}
+
+#[test]
+fn picture_in_picture_stays_detached_when_reopened_activity_closes() {
+    let mut fixture = Fixture::new(false, false);
+    let first = fixture.open(Mode::Run);
+    let second = fixture.open(Mode::Run);
+    for (order, (id, goal)) in [(first, "Earlier result"), (second, "Recent result")]
+        .into_iter()
+        .enumerate()
+    {
+        let run = fixture.run_mut(id);
+        run.design.arrangement = Arrangement::PictureInPicture;
+        run.started_order = order as u64 + 1;
+        run.goal = goal.into();
+        run.next(Phase::Thinking, "");
+        run.inline_decision(&engine::Action::Done, "Finished", goal);
+        run.next(Phase::Finished, "Finished");
+    }
+    let stream = fixture.workspace.sessions[&fixture.session].stream_generation;
+    drop(fixture.send(first, Message::Close));
+    assert_eq!(
+        fixture
+            .workspace
+            .finished_agent_run_choices(fixture.session, stream),
+        [first]
+    );
+    assert_eq!(followed(&fixture), second);
+    no_task(fixture.send(second, Message::Pip(Pip::Fold)));
+    drop(fixture.send(second, Message::Pip(Pip::Detach)));
+    let detached = fixture.run(second).presentation.pip.detached.unwrap();
+
+    let epoch = fixture.run(second).epoch;
+    drop(fixture.send(second, Message::SelectPresentedRun(epoch, first)));
+    let reopened = followed(&fixture);
+    assert_ne!(reopened, first);
+    assert_eq!(fixture.run(reopened).goal, "Earlier result");
+    assert_eq!(
+        fixture
+            .workspace
+            .terminal_agents
+            .pip_run_for_window(detached),
+        Some(reopened)
+    );
+    assert!(!fixture.run(reopened).presentation.pip.shows_history());
+
+    drop(fixture.send(reopened, Message::Close));
+    assert_eq!(followed(&fixture), second);
+    assert_eq!(
+        fixture
+            .workspace
+            .terminal_agents
+            .pip_run_for_window(detached),
+        Some(second)
+    );
+    assert!(!fixture.run(second).presentation.pip.shows_history());
+    assert!(fixture.workspace.agent_window_view(detached).is_some());
+    no_task(fixture.send(
+        detached,
+        Message::PipOwned(reopened, Box::new(Message::Pip(Pip::Fold))),
+    ));
+    assert!(!fixture.run(second).presentation.pip.shows_history());
+
+    drop(fixture.send(second, Message::Close));
+    assert!(fixture.workspace.agent_window_view(detached).is_none());
 }
 
 #[test]

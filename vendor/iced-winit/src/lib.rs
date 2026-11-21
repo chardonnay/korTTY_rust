@@ -1438,14 +1438,27 @@ fn run_action<'a, P, C>(
                 }
             }
             window::Action::Resize(id, size) => {
-                if let Some(window) = window_manager.get_mut(id) {
-                    let _ = window.raw.request_inner_size(
+                if let Some(window) = window_manager.get_mut(id)
+                    && let Some(applied) = window.raw.request_inner_size(
                         winit::dpi::LogicalSize {
                             width: size.width,
                             height: size.height,
                         }
                         .to_physical::<f32>(f64::from(window.state.scale_factor())),
-                    );
+                    )
+                    && window.state.physical_size() != Size::new(applied.width, applied.height)
+                {
+                    // A synchronously applied size may not emit a native resize event.
+                    let resized = winit::event::WindowEvent::Resized(applied);
+                    window.state.update(program, &window.raw, &resized);
+                    window.raw.request_redraw();
+                    if let Some(event) = conversion::window_event(
+                        resized,
+                        window.state.scale_factor(),
+                        window.state.modifiers(),
+                    ) {
+                        events.push((id, event));
+                    }
                 }
             }
             window::Action::SetMinSize(id, size) => {

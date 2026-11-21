@@ -16,6 +16,92 @@ open until a result is recorded for the tested revision and environment. Both
 Mosh modes are out of scope. The editor has a reduced native scope with structure
 navigation for classes, functions, variables, and placeholders.
 
+## November 21 Detached Terminal Agent history follows its pane
+
+The Java v2.26.0 pane shares one picture-in-picture presenter as it
+switches between runs. In Rust, the detached native window and its folded
+state now follow the selected run of the same terminal stream. Closing
+the selected Activity window or handing an Ask response to Chat lets
+the next eligible run take over. A changed source or a run without PiP
+closes the detached window. Actions from its previous owner are ignored.
+
+The history fixture reopens a finished run, keeps the folded window,
+closes the reopened Activity, and confirms that the same window returns
+to the recent run. The new-input fixture verifies the automatic handoff
+and rejects a stale click after a stream change. Native desktop checks
+of the window transitions on Windows and macOS remain open.
+
+Native Windows ARM64 passed 13 PiP and run-selection checks. The wider
+Terminal Agent selection passed 317 tests on Apple Silicon and 318 on
+Fedora ARM64. The test logs identify the merged PR #25 base and the Unix
+source overlays. [Java presenter](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignHost.java#L1556)
+· [Windows tests](target/verification/20261121-agent-pip-follow-windows.log)
+· [Apple Silicon tests](target/verification/20261121-agent-pip-follow-macos-final.log)
+· [Fedora tests](target/verification/20261121-agent-pip-follow-fedora-final.log).
+
+The PiP title now exposes the shared run actions through its ellipsis,
+including when history is folded. The menu uses the displayed run's
+identity and current action set. It closes when the presenter changes
+runs. The folded detached frame requests enough height for the popup
+and restores the folded height on dismissal or selection. The widget
+test opens the folded menu in both placements and copies the displayed
+answer.
+The wider native Terminal Agent tests passed on Windows ARM64 (316),
+Apple Silicon (318) and Fedora ARM64 (319).
+[Java PiP title bar](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignPictureInPicture.java#L90)
+· [Windows tests](target/verification/20261121-agent-pip-title-windows.log)
+· [Apple Silicon tests](target/verification/20261121-agent-pip-title-macos-retry.log)
+· [Fedora tests](target/verification/20261121-agent-pip-title-fedora-retry.log).
+
+The Fedora ARM64 debug app also passed an X11 desktop run with Openbox
+in a private Xvfb session and a loopback test profile. The folded docked
+menu copied the first Ask answer. In the detached window, opening the
+menu increased the actual client height from 36 to 196 pixels. Escape
+and clicking **Copy answer** each restored the original height. The
+window kept its X11 ID, coordinates, and 300-pixel width. The same window
+followed a second finished Ask run, switched back to a reopened first
+run, and returned to the second after the reopened Activity closed. Each
+clipboard receipt matched the visible run. The test also reattached the
+folded menu and verified that closing the last Activity removed its
+detached window.
+[Fedora native X11 log](target/verification/20261121-agent-pip-native-x11.log).
+
+The first private Mutter 50.6 run exposed a renderer resize issue. The
+compositor geometry expanded while the app continued attaching a
+300-by-36 buffer. The Iced shell now updates its viewport and publishes
+the resize when Winit returns an applied size immediately. In the
+corrected native Wayland run, the same toplevel and surface attached
+300-by-36 and 300-by-196 buffers at the appropriate stages. Escape
+and selecting Copy answer each restored the folded size. The two
+reviewed Ask requests used a private loopback model. The history window
+followed the second run, reopened the archived first run, returned after
+closing its Activity, reattached, and disappeared when the last Activity
+closed. Clipboard receipts matched the selected run. Native compilation
+checks passed on Windows ARM64 and Apple Silicon. Desktop checks on both
+platforms and across multiple monitors remain open.
+[Wayland reproduction](target/verification/20261121-agent-pip-native-wayland.log)
+· [Wayland acceptance](target/verification/20261121-agent-pip-native-wayland-fixed.log)
+· [Windows ARM64 check](target/verification/20261121-wayland-immediate-resize-windows.log)
+· [Apple Silicon check](target/verification/20261121-wayland-immediate-resize-macos.log).
+
+## November 21 Exact step actions in Terminal Agent history
+
+The history now binds each recorded command, result, and model step to
+its typed step ID. The Timeline, Plan and execution, Card stack,
+Conversation, tmux, and Transcript modules expose step actions for their
+associated entries. The same actions are available in the Minimap,
+step toasts, and the PiP step list. The history retains these
+associations when reopening a finished run with a trimmed transcript.
+
+The widget fixture records two steps with the same command text and
+checks that each of six history modules opens the actions for the
+clicked step and copies its own output. The focused native suites passed
+317 tests on Windows ARM64, 319 on Apple Silicon, and 320 on Fedora ARM64.
+[Java step menus](https://github.com/chardonnay/korTTY/blob/v2.26.0/app-docs/site/docs/en/features/ai-agent-designs.md#run-menu-and-step-menu)
+· [Windows tests](target/verification/20261121-agent-step-context-windows.log)
+· [Apple Silicon tests](target/verification/20261121-agent-step-context-macos.log)
+· [Fedora tests](target/verification/20261121-agent-step-context-fedora.log).
+
 ## November 21 Real OpenSSH sudo/PAM for the Terminal Agent
 
 Fedora ARM64 verified the accepted-plan preflight over a pinned OpenSSH
