@@ -1010,7 +1010,16 @@ impl Workspace {
                 .local_security
                 .as_ref()
                 .ok_or("The source local shell changed.")?;
-            json!({"local":local,"host":kortty_pty::local_hostname(),"user":kortty_pty::local_username(),"directory":local.working_directory})
+            let mut identity = json!({"local":local,"host":kortty_pty::local_hostname(),"user":kortty_pty::local_username(),"directory":local.working_directory});
+            if let Some(command) = &local.command {
+                let argv = serde_json::to_string(command)
+                    .map_err(|_| "Could not verify the local shell launch command.")?;
+                identity["commandHash"] = json!(
+                    crate::snippet_analysis::model::content_hash(&argv)
+                        .map_err(|_| "Could not verify the local shell launch command.")?
+                );
+            }
+            identity
         };
         Destination::capture(run.label.clone(), &identity.to_string())
             .map_err(|error| error.to_string())

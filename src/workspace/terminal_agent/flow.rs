@@ -289,11 +289,20 @@ impl Workspace {
                         run.review_initial_command()?;
                     }
                     Phase::ReviewedDirectory { probe } => {
-                        if !matches!(run.target.as_ref(), Some(RunTarget::Attached(Target::Local { directory: before, .. })) if before == &directory)
-                        {
+                        let Some(RunTarget::Attached(Target::Local {
+                            shell,
+                            directory: before,
+                        })) = &run.target
+                        else {
+                            return Err("The reviewed local shell is unavailable.".into());
+                        };
+                        if before != &directory {
                             return Err(
                                 "The shell directory changed after review. Start a new run.".into(),
                             );
+                        }
+                        if local_agent_shell(pane).as_ref() != Ok(shell) {
+                            return Err("The shell changed after review. Start a new run.".into());
                         }
                         return self.accept_target_review(id, run, probe);
                     }
@@ -1236,17 +1245,51 @@ fn bounded(text: &str) -> String {
 }
 
 pub(super) fn local_agent_shell(pane: &crate::workspace::PaneSession) -> Result<Shell, String> {
-    #[cfg(target_os = "linux")]
-    if pane.session.flatpak_host_shell() {
-        return Ok(Shell::FlatpakHost);
-    }
     let settings = pane
         .local_security
         .as_ref()
         .ok_or("The source shell changed.")?;
+    let custom = settings
+        .command
+        .as_deref()
+        .map(|command| custom_agent_shell(settings.shell, command))
+        .transpose()?;
+    #[cfg(target_os = "linux")]
+    if pane.session.flatpak_host_shell() {
+        return Ok(Shell::FlatpakHost);
+    }
+    if let Some(shell) = custom {
+        return Ok(shell);
+    }
     let program = kortty_pty::shell_program(settings.shell)
         .map_err(|_| "The selected shell is unavailable.")?;
     active_shell(program)
+}
+
+fn custom_agent_shell(preset: kortty_pty::LocalShell, command: &[String]) -> Result<Shell, String> {
+    use kortty_pty::ShellIntegrationSnippet as Snippet;
+
+    const UNSUPPORTED: &str = "The custom program has no supported agent command mode.";
+    kortty_pty::validate_shell_integration(preset, Some(command)).map_err(|_| UNSUPPORTED)?;
+    match Snippet::from_program(&command[0]) {
+        #[cfg(unix)]
+        Some(Snippet::Bash | Snippet::Zsh | Snippet::Fish) => {
+            // Run reviewed POSIX commands independently of the interactive startup argv.
+            Ok(Shell::Posix(PathBuf::from("/bin/sh")))
+        }
+        #[cfg(windows)]
+        Some(snippet @ (Snippet::PowerShell | Snippet::CommandPrompt)) => {
+            let preset = if snippet == Snippet::PowerShell {
+                kortty_pty::LocalShell::PowerShell
+            } else {
+                kortty_pty::LocalShell::CommandPrompt
+            };
+            let program = kortty_pty::shell_program(preset)
+                .map_err(|_| "The selected shell is unavailable.")?;
+            active_shell(program)
+        }
+        _ => Err(UNSUPPORTED.into()),
+    }
 }
 
 fn active_shell(path: PathBuf) -> Result<Shell, String> {
@@ -1257,6 +1300,10 @@ fn active_shell(path: PathBuf) -> Result<Shell, String> {
     #[cfg(unix)]
     if matches!(name, "sh" | "bash" | "dash" | "zsh" | "ksh" | "ash") {
         return Ok(Shell::Posix(path));
+    }
+    #[cfg(unix)]
+    if name == "fish" {
+        return Ok(Shell::Posix(PathBuf::from("/bin/sh")));
     }
     #[cfg(windows)]
     {

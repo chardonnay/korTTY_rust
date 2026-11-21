@@ -35,6 +35,7 @@ fn run_executable(
     executable: &Path,
     started: impl FnOnce(),
 ) -> io::Result<Outcome> {
+    let cwd = kortty_pty::windows_shell_directory(shell.executable(), cwd)?;
     let kind = match shell {
         Shell::PowerShell(_) => "powershell",
         Shell::CommandPrompt(_) => "cmd",

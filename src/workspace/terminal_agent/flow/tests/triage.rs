@@ -34,15 +34,10 @@ fn proposal_response() -> String {
 pub(in crate::workspace::terminal_agent) fn complete_probe(fixture: &mut Fixture) -> window::Id {
     let id = fixture.open(Mode::Run);
     let directory = LocalDirectory::capture(fixture.profile.0.canonicalize().unwrap()).unwrap();
+    let shell = local_agent_shell(&fixture.workspace.sessions[&fixture.session]).unwrap();
     let run = fixture.run_mut(id);
     run.goal = "Check the report directory".into();
-    run.target = Some(RunTarget::Attached(Target::Local {
-        #[cfg(unix)]
-        shell: Shell::Posix(PathBuf::from("/bin/sh")),
-        #[cfg(windows)]
-        shell: Shell::CommandPrompt(PathBuf::from("cmd.exe")),
-        directory,
-    }));
+    run.target = Some(RunTarget::Attached(Target::Local { shell, directory }));
     let epoch = run.next(Phase::Probe, "Checking the directory");
     let task = fixture.send(
         id,

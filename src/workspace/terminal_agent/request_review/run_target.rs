@@ -115,6 +115,7 @@ impl RunTargetReview {
             ) if pane.ssh.is_none()
                 && pane.local_security.is_some()
                 && shell == current_shell
+                && super::super::flow::local_agent_shell(pane).as_ref() == Ok(shell)
                 && directory == current_directory =>
             {
                 Ok(())

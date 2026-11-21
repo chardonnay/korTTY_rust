@@ -964,7 +964,7 @@ impl Workspace {
                 .isolation
                 .max(self.clipboard.policy.minimum_isolation)
                 != IsolationLevel::None
-                || settings.command.is_some()
+                || settings.command.is_some() && flow::local_agent_shell(pane).is_err()
             {
                 return Err(
                     "The configured local shell or isolation level does not support the agent command runner.",

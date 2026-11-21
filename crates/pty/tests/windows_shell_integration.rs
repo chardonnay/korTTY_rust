@@ -196,6 +196,7 @@ fn fixture_windows_prompt() {
         ]
     };
     if !bash {
+        fs::write(root.join("cwd proof.txt"), "kortty-fixture-directory\n").unwrap();
         command.extend(
             if powershell {
                 ["-NoProfile", "-NoLogo"]
@@ -216,7 +217,13 @@ fn fixture_windows_prompt() {
                 LocalShell::Default
             },
             command: (!git_preset).then_some(command),
-            working_directory: Some(if bash { root.join("cwd proof'") } else { root }),
+            working_directory: Some(if bash {
+                root.join("cwd proof'")
+            } else if enabled {
+                root.canonicalize().unwrap()
+            } else {
+                root
+            }),
             shell_integration: enabled,
             ..LaunchOptions::default()
         },
@@ -245,6 +252,14 @@ fn fixture_windows_prompt() {
                 bytes.contains(&b'>')
             }
         });
+        if !bash && enabled {
+            let before = occurrences(&output, B);
+            writer.write_all(b"type \"cwd proof.txt\"\r").unwrap();
+            read_until(&receive, &mut writer, &mut output, |bytes| {
+                occurrences(bytes, b"kortty-fixture-directory") != 0
+                    && occurrences(bytes, B) > before
+            });
+        }
         if bash {
             assert!(
                 occurrences(&output, b"startup-verified") > 0,
