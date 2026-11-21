@@ -91,7 +91,7 @@ pub(in crate::workspace) struct View {
     pub(in crate::workspace) phase: (&'static str, usize),
     pub(in crate::workspace) goal: &'static str,
     pub(in crate::workspace) approval: Option<&'static str>,
-    pub(in crate::workspace) status_visible: bool,
+    pub(in crate::workspace) status_opacity: Option<f32>,
     pub(in crate::workspace) reduced_motion: bool,
     pub(in crate::workspace) countdown: Option<(Instant, u8)>,
 }
@@ -304,27 +304,33 @@ impl Sample {
         let (status_kind, position) = self.status_position(layout);
         let history_position = view.dock.history_slot(layout);
         let adaptive_side = layout.arrangement == Arrangement::Adaptive && position == Slot::Right;
-        let status = if !view.status_visible
-            || status_kind == Status::Hidden
-            || adaptive_side && layout.history == History::Timeline
-        {
-            None
-        } else if adaptive_side {
-            Some(adaptive_timeline(activity, view.phase.0, controls(), None).map(forward))
-        } else {
-            Some(
-                status::render(
-                    activity,
-                    view.phase,
-                    status::Trace::sample(&self.transcript, self.started, now, view.reduced_motion),
-                    status_kind,
-                    None,
-                    false,
-                    controls,
+        let status = view.status_opacity.and_then(|opacity| {
+            if status_kind == Status::Hidden || adaptive_side && layout.history == History::Timeline
+            {
+                None
+            } else if adaptive_side {
+                Some(adaptive_timeline(activity, view.phase.0, controls(), None).map(forward))
+            } else {
+                Some(
+                    status::render(
+                        activity,
+                        view.phase,
+                        status::Trace::sample(
+                            &self.transcript,
+                            self.started,
+                            now,
+                            view.reduced_motion,
+                        ),
+                        status_kind,
+                        None,
+                        false,
+                        controls,
+                    )
+                    .map(forward),
                 )
-                .map(forward),
-            )
-        };
+            }
+            .map(|status| super::fade::view(status, opacity))
+        });
         let side_width = view.dock.side_width(placement::history_width(
             layout.history,
             bounds.width,

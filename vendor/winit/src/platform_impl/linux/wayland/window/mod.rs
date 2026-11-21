@@ -628,6 +628,27 @@ impl Window {
     #[inline]
     pub fn focus_window(&self) {}
 
+    pub(crate) fn focus_window_from(&self, source: &Self) {
+        let Some(activation) = self.xdg_activation.as_ref() else {
+            return;
+        };
+        if self.window_id == source.window_id || self.display != source.display {
+            return;
+        }
+        let Some((seat, serial)) = source.window_state.lock().unwrap().take_activation_input()
+        else {
+            return;
+        };
+        let data = XdgActivationTokenData::Activate {
+            surface: self.surface().clone(),
+            target: Arc::downgrade(&self.window_requests),
+        };
+        let token = activation.get_activation_token(&self.queue_handle, data);
+        token.set_surface(source.surface());
+        token.set_serial(serial, &seat);
+        token.commit();
+    }
+
     #[inline]
     pub fn surface(&self) -> &WlSurface {
         self.window.wl_surface()

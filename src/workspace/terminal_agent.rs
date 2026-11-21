@@ -1102,7 +1102,11 @@ impl Workspace {
         }
     }
 
-    pub(super) fn focus_agent_surface(&mut self, id: window::Id) -> Task<Desktop> {
+    pub(super) fn focus_agent_surface(
+        &mut self,
+        id: window::Id,
+        source: Option<window::Id>,
+    ) -> Task<Desktop> {
         self.focus_hosted_tool(id).unwrap_or_else(|| {
             if self
                 .terminal_agents
@@ -1112,7 +1116,11 @@ impl Workspace {
             {
                 Task::none()
             } else {
-                window::minimize(id, false).chain(window::gain_focus(id))
+                let focus = source.map_or_else(
+                    || window::gain_focus(id),
+                    |source| iced_runtime::window::gain_focus_from(id, source),
+                );
+                window::minimize(id, false).chain(focus)
             }
         })
     }
@@ -1443,14 +1451,14 @@ impl Workspace {
                 .get(&id)
                 .filter(|run| !run.swarm && !run.closing)
                 .and_then(|run| run.binding.live().ok());
-            return if source.is_some_and(|source| {
+            let owner = source.and_then(|source| {
                 self.agent_pane(source.session)
-                    .is_some_and(|(_, pane, _)| pane.stream_generation == source.stream)
-            }) {
-                self.focus_agent_surface(id)
-            } else {
-                Task::none()
-            };
+                    .filter(|(_, pane, _)| pane.stream_generation == source.stream)
+                    .map(|(owner, _, _)| owner)
+            });
+            return owner.map_or_else(Task::none, |owner| {
+                self.focus_agent_surface(id, Some(owner))
+            });
         }
         if matches!(message, Message::Copy) {
             let transcript = self

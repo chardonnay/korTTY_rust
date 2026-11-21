@@ -53,3 +53,10 @@ settled content buffers and the saved dimensions after each close. With
 client decorations, the trace should show updated equal limits including
 the titlebar before the first buffer, followed by the normal resize limits
 after placement.
+
+For Terminal Agent Review, the shell resolves the source terminal and the
+Activity window in `GainFocusFrom`. The vendored Winit Wayland backend
+uses a recent, single-use input serial and seat captured on the source
+surface for `xdg_activation_v1`. The token reply activates the existing
+target surface if its window is live. The compositor decides whether to
+grant focus. Other backends use the regular native focus operation.

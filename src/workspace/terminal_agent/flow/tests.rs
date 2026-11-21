@@ -703,8 +703,8 @@ fn agent_design_keeps_status_and_focus_bound_to_the_saved_connection_stream() {
     ));
     assert!(matches!(
         block_on(task.next()),
-        Some(iced_runtime::Action::Window(iced_runtime::window::Action::GainFocus(id)))
-            if id == floating
+        Some(iced_runtime::Action::Window(iced_runtime::window::Action::GainFocusFrom { target, source }))
+            if target == floating && source == fixture.owner
     ));
     assert!(block_on(task.next()).is_none());
     fixture.run_mut(floating).closing = true;

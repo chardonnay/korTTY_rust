@@ -4989,7 +4989,7 @@ impl Workspace {
         if let Some(id) = self.terminal_agents.running_window() {
             let cancelled = self.cancel_terminal_agent_activity(id);
             window_lifecycle::reply_to_native_quit(false);
-            return Task::batch([cancelled, self.focus_agent_surface(id)]);
+            return Task::batch([cancelled, self.focus_agent_surface(id, None)]);
         }
         if let Some(task) = self.request_highlight_quit() {
             return task;

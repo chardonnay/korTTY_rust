@@ -81,6 +81,10 @@ impl<T> EventLoopBuilderExtWayland for EventLoopBuilder<T> {
 pub trait WindowExtWayland {
     /// Returns `xdg_toplevel` of the window or [`None`] if the window is X11 window.
     fn xdg_toplevel(&self) -> Option<NonNull<c_void>>;
+
+    /// Requests focus using recent user input in `source` on Wayland.
+    /// On X11 this is equivalent to [`Window::focus_window`].
+    fn focus_window_from(&self, source: &Window);
 }
 
 impl WindowExtWayland for Window {
@@ -92,6 +96,21 @@ impl WindowExtWayland for Window {
             crate::platform_impl::Window::X(_) => None,
             #[cfg(wayland_platform)]
             crate::platform_impl::Window::Wayland(window) => window.xdg_toplevel(),
+        }
+    }
+
+    fn focus_window_from(&self, source: &Window) {
+        use crate::platform_impl::Window as PlatformWindow;
+
+        match (&self.window, &source.window) {
+            #[cfg(wayland_platform)]
+            (PlatformWindow::Wayland(target), PlatformWindow::Wayland(source)) => {
+                target.focus_window_from(source);
+            },
+            #[cfg(x11_platform)]
+            (PlatformWindow::X(target), PlatformWindow::X(_)) => target.focus_window(),
+            #[cfg(all(x11_platform, wayland_platform))]
+            _ => (),
         }
     }
 }

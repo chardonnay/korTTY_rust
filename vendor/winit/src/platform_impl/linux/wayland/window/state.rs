@@ -2,7 +2,7 @@
 
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ahash::HashSet;
 use tracing::{info, warn};
@@ -93,6 +93,8 @@ pub struct WindowState {
     // is created, since add/removed stuff could be delivered a bit out of order.
     /// Seats that has keyboard focus on that window.
     seat_focus: HashSet<ObjectId>,
+
+    activation_input: Option<(WlSeat, u32, Instant)>,
 
     /// The scale factor of the window.
     scale_factor: f64,
@@ -197,6 +199,7 @@ impl WindowState {
             frame: None,
             frame_callback_state: FrameCallbackState::None,
             seat_focus: Default::default(),
+            activation_input: None,
             has_pending_move: None,
             ime_allowed: false,
             ime_purpose: ImePurpose::Normal,
@@ -564,6 +567,15 @@ impl WindowState {
     #[inline]
     pub fn has_focus(&self) -> bool {
         !self.seat_focus.is_empty()
+    }
+
+    pub(crate) fn record_activation_input(&mut self, seat: &WlSeat, serial: u32) {
+        self.activation_input = Some((seat.clone(), serial, Instant::now()));
+    }
+
+    pub(crate) fn take_activation_input(&mut self) -> Option<(WlSeat, u32)> {
+        let (seat, serial, when) = self.activation_input.take()?;
+        (seat.is_alive() && when.elapsed() <= Duration::from_secs(2)).then_some((seat, serial))
     }
 
     /// Whether the IME is allowed.
@@ -1013,6 +1025,9 @@ impl WindowState {
     #[inline]
     pub fn remove_seat_focus(&mut self, seat: &ObjectId) {
         self.seat_focus.remove(seat);
+        if self.activation_input.as_ref().is_some_and(|(source, _, _)| source.id() == *seat) {
+            self.activation_input = None;
+        }
     }
 
     /// Returns `true` if the requested state was applied.

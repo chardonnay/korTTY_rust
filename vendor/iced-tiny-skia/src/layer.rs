@@ -36,10 +36,17 @@ fn text_visible_bounds(text: &Text) -> Option<Rectangle> {
 #[derive(Debug, Clone)]
 pub struct Layer {
     pub bounds: Rectangle,
+    pub(crate) opacity_group: Option<OpacityGroup>,
     pub quads: Vec<(Quad, Background)>,
     pub primitives: Vec<Item<Primitive>>,
     pub images: Vec<Image>,
     pub text: Vec<Item<Text>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OpacityGroup {
+    pub(crate) opacity: f32,
+    pub(crate) layers: Arc<[Layer]>,
 }
 
 impl Layer {
@@ -234,6 +241,9 @@ impl Layer {
         if previous.bounds != current.bounds {
             return vec![previous.bounds, current.bounds];
         }
+        if previous.opacity_group.is_some() || current.opacity_group.is_some() {
+            return vec![current.bounds];
+        }
 
         let mut damage = damage::list(
             &previous.quads,
@@ -346,6 +356,7 @@ impl Default for Layer {
     fn default() -> Self {
         Self {
             bounds: Rectangle::INFINITE,
+            opacity_group: None,
             quads: Vec::new(),
             primitives: Vec::new(),
             text: Vec::new(),
@@ -374,6 +385,7 @@ impl graphics::Layer for Layer {
 
     fn reset(&mut self) {
         self.bounds = Rectangle::INFINITE;
+        self.opacity_group = None;
 
         self.quads.clear();
         self.primitives.clear();
@@ -382,6 +394,9 @@ impl graphics::Layer for Layer {
     }
 
     fn start(&self) -> usize {
+        if self.opacity_group.is_some() {
+            return 0;
+        }
         if !self.quads.is_empty() {
             return 1;
         }
@@ -402,6 +417,9 @@ impl graphics::Layer for Layer {
     }
 
     fn end(&self) -> usize {
+        if self.opacity_group.is_some() {
+            return 5;
+        }
         if !self.text.is_empty() {
             return 4;
         }

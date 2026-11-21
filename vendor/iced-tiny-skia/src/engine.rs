@@ -1,10 +1,13 @@
-use crate::Primitive;
+use iced_debug as debug;
+
+use crate::{Layer, Primitive};
 use crate::clip_mask::ClipMask;
 use crate::core::renderer::Quad;
 use crate::core::{
     Background, Color, Gradient, Rectangle, Size, Transformation, Vector,
 };
 use crate::graphics::{Image, Text};
+use crate::layer::OpacityGroup;
 use crate::text;
 
 #[derive(Debug)]
@@ -26,6 +29,116 @@ impl Engine {
             #[cfg(feature = "svg")]
             vector_pipeline: crate::vector::Pipeline::new(),
         }
+    }
+
+    pub(crate) fn draw_layers(
+        &mut self,
+        layers: &[Layer],
+        transformation: Transformation,
+        pixels: &mut tiny_skia::PixmapMut<'_>,
+        clip_mask: &mut ClipMask<'_>,
+        clip_bounds: Rectangle,
+    ) {
+        for layer in layers {
+            let Some(bounds) = clip_bounds.intersection(&(layer.bounds * transformation)) else {
+                continue;
+            };
+            if let Some(group) = &layer.opacity_group {
+                self.draw_opacity_group(group, transformation, pixels, clip_mask, bounds);
+                continue;
+            }
+
+            if !layer.quads.is_empty() {
+                let span = debug::render(debug::Primitive::Quad);
+                for (quad, background) in &layer.quads {
+                    self.draw_quad(quad, background, transformation, pixels, clip_mask, bounds);
+                }
+                span.finish();
+            }
+
+            if !layer.primitives.is_empty() {
+                let span = debug::render(debug::Primitive::Triangle);
+                for group in &layer.primitives {
+                    let Some(bounds) = bounds.intersection(&(group.clip_bounds() * transformation))
+                    else {
+                        continue;
+                    };
+                    for primitive in group.as_slice() {
+                        self.draw_primitive(
+                            primitive,
+                            transformation * group.transformation(),
+                            pixels,
+                            clip_mask,
+                            bounds,
+                        );
+                    }
+                }
+                span.finish();
+            }
+
+            if !layer.images.is_empty() {
+                let span = debug::render(debug::Primitive::Image);
+                for image in &layer.images {
+                    self.draw_image(image, transformation, pixels, clip_mask, bounds);
+                }
+                span.finish();
+            }
+
+            if !layer.text.is_empty() {
+                let span = debug::render(debug::Primitive::Image);
+                for group in &layer.text {
+                    for text in group.as_slice() {
+                        self.draw_text(
+                            text,
+                            transformation * group.transformation(),
+                            pixels,
+                            clip_mask,
+                            bounds,
+                        );
+                    }
+                }
+                span.finish();
+            }
+        }
+    }
+
+    fn draw_opacity_group(
+        &mut self,
+        group: &OpacityGroup,
+        transformation: Transformation,
+        pixels: &mut tiny_skia::PixmapMut<'_>,
+        clip_mask: &mut ClipMask<'_>,
+        bounds: Rectangle,
+    ) {
+        let surface = Rectangle::with_size(Size::new(pixels.width() as f32, pixels.height() as f32));
+        let Some(bounds) = bounds.intersection(&surface) else {
+            return;
+        };
+        let x = bounds.x.floor();
+        let y = bounds.y.floor();
+        let width = ((bounds.x + bounds.width).ceil() - x) as u32;
+        let height = ((bounds.y + bounds.height).ceil() - y) as u32;
+        let (Some(mut layer), Some(mut mask)) =
+            (tiny_skia::Pixmap::new(width, height), tiny_skia::Mask::new(width, height))
+        else {
+            return;
+        };
+        let offset = Transformation::translate(-x, -y);
+        self.draw_layers(
+            &group.layers,
+            offset * transformation,
+            &mut layer.as_mut(),
+            &mut ClipMask::new(&mut mask),
+            bounds * offset,
+        );
+        pixels.draw_pixmap(
+            x as i32,
+            y as i32,
+            layer.as_ref(),
+            &tiny_skia::PixmapPaint { opacity: group.opacity, ..Default::default() },
+            tiny_skia::Transform::identity(),
+            Some(clip_mask.viewport(bounds)),
+        );
     }
 
     pub fn draw_quad(

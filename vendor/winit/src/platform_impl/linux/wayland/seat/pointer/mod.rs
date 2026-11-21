@@ -160,6 +160,7 @@ impl PointerHandler for WinitState {
 
                     let button = wayland_button_to_winit(button);
                     let state = if matches!(kind, PointerEventKind::Press { .. }) {
+                        window.record_activation_input(seat, serial);
                         ElementState::Pressed
                     } else {
                         ElementState::Released

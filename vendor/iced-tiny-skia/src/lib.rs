@@ -20,7 +20,6 @@ mod vector;
 #[cfg(feature = "geometry")]
 pub mod geometry;
 
-use iced_debug as debug;
 pub use iced_graphics as graphics;
 pub use iced_graphics::core;
 
@@ -70,6 +69,42 @@ impl Renderer {
         self.layers.as_slice()
     }
 
+    /// Composites the content as a single layer within the given bounds.
+    pub fn with_opacity(
+        &mut self,
+        bounds: Rectangle,
+        opacity: f32,
+        draw: impl FnOnce(&mut Self),
+    ) {
+        if opacity >= 1.0 {
+            draw(self);
+            return;
+        }
+        if opacity <= 0.0 {
+            return;
+        }
+
+        let (parent, transformation) = self.layers.current_mut();
+        let Some(clip) = (bounds * transformation).intersection(&parent.bounds) else {
+            return;
+        };
+        let outer = std::mem::take(&mut self.layers);
+        self.layers.reset(clip);
+        self.layers.push_transformation(transformation);
+        draw(self);
+        self.layers.flush();
+        let group = layer::OpacityGroup {
+            opacity,
+            layers: self.layers.as_slice().into(),
+        };
+        self.layers = outer;
+        self.layers.push_clip(bounds);
+        let (layer, _) = self.layers.current_mut();
+        layer.bounds = clip;
+        layer.opacity_group = Some(group);
+        self.layers.pop_clip();
+    }
+
     pub fn draw(
         &mut self,
         pixels: &mut tiny_skia::PixmapMut<'_>,
@@ -79,6 +114,7 @@ impl Renderer {
         background_color: Color,
     ) {
         let scale_factor = viewport.scale_factor();
+        let transformation = Transformation::scale(scale_factor);
         let mut clip_mask = clip_mask::ClipMask::new(clip_mask);
 
         self.layers.flush();
@@ -92,90 +128,13 @@ impl Renderer {
                 engine::into_color(background_color),
             );
 
-            for layer in self.layers.iter() {
-                let Some(layer_bounds) =
-                    damage_bounds.intersection(&(layer.bounds * scale_factor))
-                else {
-                    continue;
-                };
-
-                if !layer.quads.is_empty() {
-                    let render_span = debug::render(debug::Primitive::Quad);
-                    for (quad, background) in &layer.quads {
-                        self.engine.draw_quad(
-                            quad,
-                            background,
-                            Transformation::scale(scale_factor),
-                            pixels,
-                            &mut clip_mask,
-                            layer_bounds,
-                        );
-                    }
-                    render_span.finish();
-                }
-
-                if !layer.primitives.is_empty() {
-                    let render_span =
-                        debug::render(debug::Primitive::Triangle);
-
-                    for group in &layer.primitives {
-                        let Some(group_bounds) = (group.clip_bounds()
-                            * scale_factor)
-                            .intersection(&layer_bounds)
-                        else {
-                            continue;
-                        };
-
-                        for primitive in group.as_slice() {
-                            self.engine.draw_primitive(
-                                primitive,
-                                Transformation::scale(scale_factor)
-                                    * group.transformation(),
-                                pixels,
-                                &mut clip_mask,
-                                group_bounds,
-                            );
-                        }
-                    }
-
-                    render_span.finish();
-                }
-
-                if !layer.images.is_empty() {
-                    let render_span = debug::render(debug::Primitive::Image);
-
-                    for image in &layer.images {
-                        self.engine.draw_image(
-                            image,
-                            Transformation::scale(scale_factor),
-                            pixels,
-                            &mut clip_mask,
-                            layer_bounds,
-                        );
-                    }
-
-                    render_span.finish();
-                }
-
-                if !layer.text.is_empty() {
-                    let render_span = debug::render(debug::Primitive::Image);
-
-                    for group in &layer.text {
-                        for text in group.as_slice() {
-                            self.engine.draw_text(
-                                text,
-                                Transformation::scale(scale_factor)
-                                    * group.transformation(),
-                                pixels,
-                                &mut clip_mask,
-                                layer_bounds,
-                            );
-                        }
-                    }
-
-                    render_span.finish();
-                }
-            }
+            self.engine.draw_layers(
+                self.layers.as_slice(),
+                transformation,
+                pixels,
+                &mut clip_mask,
+                damage_bounds,
+            );
         }
 
         self.engine.trim();
