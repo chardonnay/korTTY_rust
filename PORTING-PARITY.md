@@ -102,6 +102,91 @@ clicked step and copies its own output. The focused native suites passed
 · [Apple Silicon tests](target/verification/20261121-agent-step-context-macos.log)
 · [Fedora tests](target/verification/20261121-agent-step-context-fedora.log).
 
+In a private Fedora X11 desktop, the Minimap context menu copied the
+exact output of a reviewed local command. The PiP step list context menu
+copied the approved command itself.
+[X11 step menu acceptance](target/verification/20261121-agent-step-context-x11.log)
+· [Merged checkpoint](https://github.com/chardonnay/korTTY_rust/pull/26).
+
+## November 21 Terminal Agent cursor suggestion motion
+
+The d14 cursor view reveals one character every 18 ms and pulses the
+Enter hint on a 700 ms half-cycle. The module preview uses the same
+animation. Reduced animations shows the complete suggestion immediately
+and leaves the hint still. Screen changes within the same review preserve
+its reveal progress. A new review starts from the first character.
+
+An approval key pressed during the reveal shows the complete command.
+Approval then requires a fresh press, with repeat suppression retained
+if the review disappears while the key is held. In a private Fedora X11
+desktop, a held Enter revealed the exact command and left the approval
+pending. A new Enter ran it once, with the expected stdout line in the
+Activity transcript. In a second run, Tab cancelled the run and left an
+editable command in the original Bash prompt. The draft accepted an
+edit and was cleared without executing it.
+
+Apple Silicon and Fedora ARM64 each passed 18 cursor tests and seven
+Agent Design preview tests. Windows ARM64 passed targeted Clippy with
+warnings denied.
+[Java cursor approval](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignCursorApproval.java)
+· [Apple Silicon tests](target/verification/20261121-agent-cursor-motion-macos-final.log)
+· [Windows ARM64 Clippy](target/verification/20261121-agent-cursor-motion-windows.log)
+· [Fedora X11 acceptance](target/verification/20261121-agent-cursor-motion-x11-final.log).
+
+The native Wayland check with OpenSSH exposed a rejected takeover when
+the directory report and prompt arrived in separate output batches.
+Takeover now uses the directory report associated with the current
+verified prompt. A regression test covers split output batches and
+rejects a directory report received after the prompt. The native SSH
+retest remains part of desktop acceptance.
+
+## November 21 Numeric decisions in Terminal Agent cursor approval
+
+The d14 hint follows the same run-wide approval conditions as the
+Activity window. Both use the existing ordinary-command approval and
+its saved-policy and profile checks. Either Enter or 1 approves the
+displayed command once. When broader approval is available, 2 approves
+the remaining ordinary commands and 3 dismisses the current review.
+Under per-command confirmation, 2 dismisses and 3 is consumed without
+changing the review. An event retains the action shown when the key
+was captured. Dispatch rechecks it against the current review and
+policy so a stale dismissal key cannot become an approval.
+
+The private Fedora X11 session verified a single press of 2 produced
+both expected stdout lines once. A separate run used 3 to dismiss.
+With confirmation required on every command, 3 left the review and
+the visible shell bytes unchanged, 1 ran the first command, and 2
+dismissed the second. The transcript contained only the first stdout
+line. The native widget test covers the digit row and numpad cases,
+and the workspace test changes policy between capture and dispatch.
+Fedora ARM64 and Apple Silicon each passed 27 cursor, preview, and
+run-wide approval tests. Windows ARM64 passed strict Clippy.
+[Java decision keys](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignHost.java#L857)
+· [Fedora X11 acceptance](target/verification/20261121-agent-cursor-numeric-x11.log)
+· [Apple Silicon tests](target/verification/20261121-agent-cursor-numeric-macos.log)
+· [Windows ARM64 Clippy](target/verification/20261121-agent-cursor-numeric-windows.log).
+
+## November 21 Terminal Agent cursor dismissal animation
+
+The d14 cursor suggestion and its Settings preview share a 180 ms
+dismissal fade. The pane keeps the last rendered suggestion while its
+review closes. Only the current live review can handle approval keys.
+The old visual is discarded when the pane or input changes, when a
+new review takes its place, or when reduced animations is enabled.
+
+A private Fedora X11 session captured successive foreground contrast
+levels of an outgoing suggestion at 81%, 36%, and 20% before it
+disappeared. With reduced animations enabled, the frames changed
+directly from full contrast to zero. A separate dismissal sent a
+fresh 1 during the transition. The original Bash prompt contained
+the digit and the cancelled review sent no follow-up model request.
+The targeted Fedora ARM64 and Apple Silicon suites and Windows ARM64
+strict Clippy passed.
+[Java dismissal transition](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignCursorApproval.java#L156)
+· [Fedora X11 acceptance](target/verification/20261121-agent-cursor-fade-x11-pane.log)
+· [Apple Silicon tests](target/verification/20261121-agent-cursor-fade-macos-pane.log)
+· [Windows ARM64 Clippy](target/verification/20261121-agent-cursor-fade-windows-pane.log).
+
 ## November 21 Real OpenSSH sudo/PAM for the Terminal Agent
 
 Fedora ARM64 verified the accepted-plan preflight over a pinned OpenSSH

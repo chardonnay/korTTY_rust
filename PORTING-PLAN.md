@@ -9,7 +9,7 @@ source and environment for earlier checks. Detailed logs under
 
 **Java v2.26.0 parity remains partial.** The comparison uses Java tag
 `v2.26.0` (`b235d91f2035`). The current Rust worktree is based on merged
-PR #25 (`d3dd72ea`). Agent-to-Chat continuation, the Agent profile
+PR #26 (`3d310ee1`). Agent-to-Chat continuation, the Agent profile
 role, Journal chat exports, command summaries, the snippet structure panel
 and Lua editor tools are implemented. AI Manager search reaches every page
 and a subset of individual controls. The [source comparison](PORTING-PARITY.md#november-19-java-release-source-comparison)
@@ -1163,9 +1163,38 @@ Log Table. The Minimap, step toasts and the PiP step list share the
 command, output, entry and snippet actions. A toast remains visible
 while its step menu is open. Native widget tests cover identically
 titled steps and the exact copied output across six history modules.
-Exercise the menus on native desktops with a restored run and masked
-output. [Java step menu reference](https://github.com/chardonnay/korTTY/blob/v2.26.0/app-docs/site/docs/en/features/ai-agent-designs.md#run-menu-and-step-menu)
+Fedora X11 verified that the Minimap copied the exact command output and
+that the PiP step list copied the approved command. Exercise the menus on
+native desktops with a restored run and masked output.
+[Java step menu reference](https://github.com/chardonnay/korTTY/blob/v2.26.0/app-docs/site/docs/en/features/ai-agent-designs.md#run-menu-and-step-menu)
 · [Native test results](PORTING-PARITY.md#november-21-exact-step-actions-in-terminal-agent-history)
+
+The d14 cursor suggestion and its Settings preview reveal the text
+at 18 ms per character and pulse the Enter hint. Reduced animations
+shows the complete command immediately and disables the pulse. Pressing
+Enter or 1 while the suggestion is still appearing reveals the full
+command. A fresh press can then approve that review. Holding the key
+through a review transition preserves shell input isolation. Fedora X11
+verified the held and fresh Enter presses and the Tab handoff to an
+editable Bash prompt. The d14 review now maps 1 to a single approval.
+When the Activity window offers approval for the remaining ordinary
+commands, 2 grants that approval and 3 dismisses the review. Otherwise,
+2 dismisses it. The keyboard action retains the displayed decision and
+rechecks it before dispatch. Fedora X11 verified both approval modes,
+including the exact command output and shell input isolation. The cursor
+suggestion and Settings preview fade over 180 ms when the review closes.
+Reduced animations clears the suggestion immediately. A fading suggestion
+has no keyboard actions. Fedora X11 verified both settings and input
+delivery during the fade. Verify the cursor interactions on Windows,
+macOS, and Wayland, including reduced animations and SSH takeover.
+The SSH takeover now binds the reported working directory to the current
+shell prompt, including when the directory and prompt arrive in separate
+transport reads. The native Wayland SSH retest is tracked separately from
+the completed local X11 takeover.
+[Java cursor approval](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignCursorApproval.java)
+· [Cursor verification](PORTING-PARITY.md#november-21-terminal-agent-cursor-suggestion-motion)
+· [Numeric decision verification](PORTING-PARITY.md#november-21-numeric-decisions-in-terminal-agent-cursor-approval)
+· [Dismissal animation verification](PORTING-PARITY.md#november-21-terminal-agent-cursor-dismissal-animation)
 
 Interactive Run can review a complexity assessment after the environment
 probe. The AI Manager preference and the managed override select when to

@@ -116,6 +116,7 @@ fn canvas_clock_publishes_only_a_scoped_demo_tick_and_stops_while_paused() {
         playing: true,
         owner,
         reduced_motion: false,
+        cursor_design: false,
         cursor_review: false,
         deadline: None,
         status_frame: None,
@@ -185,6 +186,7 @@ fn reduced_motion_skips_intermediate_frames_and_keeps_demo_timing() {
         playing: true,
         owner: window::Id::unique(),
         reduced_motion: true,
+        cursor_design: false,
         cursor_review: false,
         deadline: None,
         status_frame: None,
@@ -233,6 +235,62 @@ fn reduced_motion_skips_intermediate_frames_and_keeps_demo_timing() {
 
 #[derive(Default)]
 struct ReplayBounds(Option<Rectangle>);
+
+#[test]
+fn cursor_preview_fades_after_cancellation_and_reduced_motion_stops_the_frames() {
+    let mut demo = Demo::default();
+    for _ in 0..3 {
+        demo.update(Action::Next(demo.token()));
+    }
+    let mut preview = canvas::Preview {
+        model: demo.model(),
+        style: None,
+        token: demo.token(),
+        playing: true,
+        owner: window::Id::unique(),
+        reduced_motion: false,
+        cursor_design: true,
+        cursor_review: true,
+        deadline: None,
+        status_frame: None,
+    };
+    let bounds = Rectangle::with_size(Size::new(640.0, 320.0));
+    let now = Instant::now();
+    let redraw = |preview: &canvas::Preview, clock: &mut canvas::Clock, at| {
+        preview.update(
+            clock,
+            &Event::Window(window::Event::RedrawRequested(at)),
+            bounds,
+            mouse::Cursor::Unavailable,
+        )
+    };
+    let mut clock = canvas::Clock::default();
+    redraw(&preview, &mut clock, now).unwrap();
+    preview.cursor_review = false;
+    preview.playing = false;
+    let closed = now + Duration::from_millis(20);
+    let (_, request, _) = redraw(&preview, &mut clock, closed).unwrap().into_inner();
+    assert_eq!(
+        request,
+        window::RedrawRequest::At(closed + Duration::from_millis(16))
+    );
+    let tail = closed + Duration::from_millis(175);
+    let (_, request, _) = redraw(&preview, &mut clock, tail).unwrap().into_inner();
+    assert_eq!(
+        request,
+        window::RedrawRequest::At(closed + Duration::from_millis(180))
+    );
+    assert!(redraw(&preview, &mut clock, closed + Duration::from_millis(180)).is_none());
+
+    preview.playing = true;
+    preview.cursor_review = true;
+    let next = now + Duration::from_secs(1);
+    redraw(&preview, &mut clock, next).unwrap();
+    preview.playing = false;
+    preview.cursor_review = false;
+    preview.reduced_motion = true;
+    assert!(redraw(&preview, &mut clock, next + Duration::from_millis(20)).is_none());
+}
 
 impl Operation for ReplayBounds {
     fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {

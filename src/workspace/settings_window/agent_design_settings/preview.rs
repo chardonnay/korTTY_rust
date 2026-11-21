@@ -304,7 +304,8 @@ pub(super) fn view(
     let mut model = demo.model();
     let token = demo.token();
     let approval = model.prompt.is_some();
-    let cursor_review = approval && layout.approval == Approval::Cursor && layout.cursor_overlay();
+    let cursor_design = layout.approval == Approval::Cursor && layout.cursor_overlay();
+    let cursor_review = approval && cursor_design;
     if cursor_review {
         model.prompt = None;
     }
@@ -356,6 +357,7 @@ pub(super) fn view(
             playing: demo.playing && demo.active(),
             owner: id,
             reduced_motion,
+            cursor_design,
             cursor_review,
             deadline: deadline.filter(|deadline| now < *deadline),
             status_frame,

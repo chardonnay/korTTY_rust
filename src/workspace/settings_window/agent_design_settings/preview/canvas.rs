@@ -2,6 +2,7 @@ use iced::widget::canvas::{self, Action, Geometry};
 use iced::{Color, Event, Font, Pixels, Point, Rectangle, Renderer, Size, Theme, mouse};
 
 use super::*;
+use crate::terminal_view::agent_cursor::{Fade, MotionFrame, approval_hint, paint_ghost};
 use inline::{Line, Role, Segment, Style};
 
 pub(super) struct Preview {
@@ -11,6 +12,7 @@ pub(super) struct Preview {
     pub playing: bool,
     pub owner: window::Id,
     pub reduced_motion: bool,
+    pub cursor_design: bool,
     pub cursor_review: bool,
     pub deadline: Option<Instant>,
     pub status_frame: Option<Instant>,
@@ -22,6 +24,8 @@ pub(super) struct Clock {
     started: Option<Instant>,
     now: Option<Instant>,
     published: bool,
+    cursor_motion: Option<MotionFrame>,
+    cursor_fade: Option<Fade>,
 }
 
 impl canvas::Program<Desktop> for Preview {
@@ -37,12 +41,36 @@ impl canvas::Program<Desktop> for Preview {
         let Event::Window(window::Event::RedrawRequested(now)) = event else {
             return None;
         };
+        let replay = clock
+            .token
+            .is_some_and(|token| token.generation != self.token.generation);
         if clock.token != Some(self.token) || !self.playing {
             clock.token = Some(self.token);
             clock.started = self.playing.then_some(*now);
             clock.published = false;
         }
         clock.now = Some(*now);
+        if !self.cursor_design || self.reduced_motion || replay {
+            clock.cursor_motion = None;
+            clock.cursor_fade = None;
+        }
+        if self.cursor_review {
+            clock.cursor_fade = None;
+            clock.cursor_motion = Some(if self.playing && !self.reduced_motion {
+                MotionFrame::animated(
+                    now.saturating_duration_since(*clock.started.get_or_insert(*now)),
+                )
+            } else {
+                MotionFrame::default()
+            });
+        } else if clock.cursor_motion.is_some() {
+            let fade = *clock.cursor_fade.get_or_insert_with(|| Fade::new(*now));
+            if fade.opacity(*now).is_none() {
+                clock.cursor_motion = None;
+                clock.cursor_fade = None;
+            }
+        }
+        let fade_frame = clock.cursor_fade.and_then(|fade| fade.next_frame(*now));
         if self.status_frame.is_some_and(|frame| *now >= frame) {
             return Some(Action::publish(message(
                 self.owner,
@@ -50,7 +78,12 @@ impl canvas::Program<Desktop> for Preview {
             )));
         }
         if !self.playing {
-            let deadline = self.deadline.into_iter().chain(self.status_frame).min()?;
+            let deadline = self
+                .deadline
+                .into_iter()
+                .chain(self.status_frame)
+                .chain(fade_frame)
+                .min()?;
             return Some(if *now >= deadline {
                 Action::publish(message(self.owner, super::Action::StatusDeadline))
             } else {
@@ -69,13 +102,21 @@ impl canvas::Program<Desktop> for Preview {
             )));
         }
         let next_step = started + Duration::from_millis(dwell);
-        let redraw = if self.reduced_motion || self.style.is_none() {
+        let redraw = if self.reduced_motion {
+            next_step
+        } else if self.cursor_review {
+            let motion = MotionFrame::animated(now.saturating_duration_since(started));
+            next_step.min(*now + motion.interval(VACUUM))
+        } else if self.style.is_none() {
             next_step
         } else {
             next_step.min(*now + Duration::from_millis(150))
         };
         Some(Action::request_redraw_at(
-            redraw.min(self.status_frame.unwrap_or(redraw)),
+            fade_frame
+                .into_iter()
+                .chain(self.status_frame)
+                .fold(redraw, Instant::min),
         ))
     }
 
@@ -91,6 +132,18 @@ impl canvas::Program<Desktop> for Preview {
         let palette = theme.palette();
         frame.fill_rectangle(Point::ORIGIN, bounds.size(), palette.background);
         let cell = crate::terminal_view::cell_size(12, Font::MONOSPACE);
+        let cursor = if self.cursor_review {
+            Some((clock.cursor_motion.unwrap_or_default(), 1.0))
+        } else if self.cursor_design && !self.reduced_motion {
+            clock.cursor_motion.zip(
+                clock
+                    .cursor_fade
+                    .zip(clock.now)
+                    .and_then(|(fade, now)| fade.opacity(now)),
+            )
+        } else {
+            None
+        };
         let columns = ((bounds.width - 16.0) / cell.width).max(1.0) as usize;
         // This parser has no transport, actor, provider, or callback. It only formats fixture cells.
         let mut terminal = kortty_terminal::Terminal::new(columns.min(u16::MAX as usize) as u16, 4);
@@ -137,7 +190,7 @@ impl canvas::Program<Desktop> for Preview {
                 ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][phase as usize % 10]
             };
             let lines = inline::render(style, &self.model, columns, spinner);
-            let footer = if self.cursor_review { 3.0 } else { 1.0 };
+            let footer = if cursor.is_some() { 3.0 } else { 1.0 };
             let available =
                 ((bounds.height - y - cell.height * footer) / cell.height).max(0.0) as usize;
             for line in lines.iter().take(available) {
@@ -181,18 +234,24 @@ impl canvas::Program<Desktop> for Preview {
             palette.text,
             palette.primary,
         );
-        if self.cursor_review {
+        if let Some((motion, opacity)) = cursor {
             frame.with_clip(Rectangle::with_size(bounds.size()), |frame| {
-                crate::terminal_view::agent_cursor::paint_ghost(
+                paint_ghost(
                     frame,
-                    VACUUM,
+                    motion.command(VACUUM),
                     Point::new(8.0 + 15.0 * cell.width, y),
-                    palette.text,
+                    palette.text.scale_alpha(opacity),
                     Font::MONOSPACE,
                     12,
                 );
+                motion.paint_enter_glow(
+                    frame,
+                    Point::new(8.0, y + cell.height),
+                    cell,
+                    palette.primary.scale_alpha(opacity),
+                );
                 for (line, top) in [
-                    ("Enter run   Tab edit   Esc dismiss", y + cell.height),
+                    (approval_hint(true, false), y + cell.height),
                     (
                         "Agent waiting for approval · /var",
                         bounds.height - cell.height,
@@ -208,8 +267,8 @@ impl canvas::Program<Desktop> for Preview {
                         },
                         top,
                         cell,
-                        palette.text,
-                        palette.primary,
+                        palette.text.scale_alpha(opacity),
+                        palette.primary.scale_alpha(opacity),
                     );
                 }
             });
