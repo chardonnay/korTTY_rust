@@ -208,10 +208,15 @@ token count. Both stations remained visible after the source terminal
 narrowed from 112 to 54 columns. The mock provider received one reviewed
 request. Twelve focused Apple Silicon tests passed, including the shared
 design preview, usage labels, overflow and reduced motion. Windows ARM64
-passed targeted Clippy with warnings denied. Remaining native desktop
-and rail motion checks are open.
+passed targeted Clippy with warnings denied. The Fedora X11 run captured
+132 frames of the live rail during a reviewed environment probe. Its light
+reached the next station through ten distinct intermediate positions.
+A second 132-frame capture with reduced animations showed only the old
+and new positions. The X11 SSH pane also displayed `+1` for the additional
+active run. Live rail motion checks remain open on Wayland, macOS, and Windows.
 [Java Metro model](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/agentdesign/MetroStationModel.java)
 · [Fedora Wayland Metro acceptance](target/verification/20261121-agent-metro-wayland-fixed.log)
+· [Fedora X11 Metro acceptance](target/verification/20261121-agent-mixed-ssh-x11.log)
 · [Apple Silicon tests](target/verification/20261121-agent-metro-macos-fixed.log)
 · [Windows ARM64 Clippy](target/verification/20261121-agent-metro-windows-fixed.log).
 
@@ -269,8 +274,7 @@ the Snippet Analysis export test. The unchanged rerun passed. The
 concurrency regressions cover the shared cap, fresh review after a
 contended probe, cancellation, and invalidation on stream replacement.
 Fedora and Windows ARM64 passed application and test-target Clippy with
-warnings denied. Native SSH desktop review and sudo contention still
-need acceptance against a real privileged route.
+warnings denied.
 [Java run limit](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/MainWindow.java)
 · [Fedora Wayland acceptance](target/verification/20261121-agent-mixed-wayland.log)
 · [Fedora workspace suite and Clippy](target/verification/20261121-agent-mixed-fedora.log)
@@ -283,6 +287,40 @@ command. Each busy attempt kept its pending review, issued a fresh
 epoch, and left the simulated sudo endpoint untouched. A fresh approval
 could continue the existing workflow after the probe finished.
 [OpenSSH sudo contention fixture](target/verification/20261121-agent-typed-sudo-contention-fedora.log).
+
+The PR #30 test run repeated these contention checks against real sudo
+and PAM in an isolated Linux namespace. Both direct and Landlock-confined
+SSH kept busy reviews pending without attempting authentication or
+writing command receipts. After the worker was released, the stale
+approvals remained inert and the new approvals proceeded. The tests
+verified a rejected password, a successful retry, and an elevated
+command with both effective UID and file-owner UID zero inside the
+namespace.
+[Fedora system sudo/PAM contention checks](target/verification/20261121-pr-standard-design-fedora.log).
+
+The Fedora ARM64 Wayland desktop accepted the typed Run, Ask, and
+Planning aliases on one pinned OpenSSH Bash pane using the Landlock
+worker. Ask displayed the response to its independently reviewed
+request, and Planning kept the same unsent questions review. A second
+Run held the pane's worker with an ordinary command. The sudo run kept
+its command review and reported that the pane was busy. It requested no
+password and created neither receipt during contention. After the
+ordinary command completed, a fresh approval opened the private sudo
+prompt. The desktop masked the password input. Submitting it wrote
+the two receipts with effective UID and file-owner UID zero in the
+test namespace. The next decision stayed in review, and the loopback
+model received only the three explicitly approved requests.
+[Fedora Wayland mixed SSH acceptance](target/verification/20261121-agent-mixed-ssh-desktop.log).
+
+The Fedora X11 desktop repeated the same mixed-mode test under Openbox in
+a private Xvfb session. The sandboxed OpenSSH pane retained its Planning
+review while the independently approved Ask and two Run requests reached
+the loopback model. Contention displayed a busy notice and created no
+receipts. A fresh approval after the ordinary command finished opened a
+masked password prompt. Submitting the password created the two UID-zero
+receipts inside the test namespace. The following decisions stayed in
+review.
+[Fedora X11 mixed SSH acceptance](target/verification/20261121-agent-mixed-ssh-x11.log).
 
 ## November 21 Overlapping starts from terminal shortcuts
 
@@ -466,6 +504,42 @@ separate OpenSSH test with simulated sudo. Native macOS system sudo
 acceptance remains open.
 [Fedora direct and sandboxed OpenSSH](target/verification/20261121-agent-openssh-real-pam-fedora.log)
 · [Apple Silicon regression](target/verification/20261121-agent-ssh-pam-macos-regression.log).
+
+The Apple Silicon client also passed the direct and App Sandbox paths
+against the isolated Fedora OpenSSH server with real sudo/PAM. The test
+checked stale and competing approvals, a rejected password, a successful
+retry, and a separately approved command that wrote the two UID-zero
+receipts. An independent pinned SSH login read those files using the
+fixture group's read permission. The revised fixture passed both paths
+on Fedora as well.
+
+On macOS, two cold launches timed out before the worker could report its
+sandbox checks. The system log recorded App Sandbox initialization
+about five seconds after the helper load event. The macOS startup
+deadline is now ten seconds. The signed test bundle passed the real PAM
+fixture with this change, the separate one-second SSH handshake test,
+and cancellation with the peer still open. Native desktop review and
+the macOS local system sudo route still need acceptance.
+[Apple Silicon direct SSH](target/verification/20261121-macos-native-remote-pam-retry.log)
+· [Apple Silicon sandbox, handshake and cancellation](target/verification/20261121-macos-native-remote-pam-startup-fix.log)
+· [macOS cold-start trace](target/verification/20261121-macos-ssh-sandbox-cold-start.log)
+· [Fedora regression](target/verification/20261121-agent-pam-portable-fedora-retry.log).
+
+Windows ARM64 passed the same real sudo/PAM tests over direct SSH and
+through the native LPAC worker against the isolated Fedora server. Ask
+and Planning retained their own reviews while the reviewed Run retried
+authentication and executed the separately approved command. Ask then
+finished independently. Planning and the following Run decision stayed
+in review. Both transports created the two UID-zero receipts in the test
+namespace. The Windows loopback relay cancellation check also passed.
+The native Terminal Agent suite passed 241 tests with four ignored using
+the project's Windows test environment. The corresponding Fedora real
+and simulated OpenSSH regressions also passed. The Windows desktop
+review and manual password-entry checks remain open.
+[Windows native mixed SSH and relay verification](target/verification/20261121-windows-arm64-pam-tests.log)
+· [Windows Terminal Agent tests](target/verification/20261121-windows-arm64-pam-regressions-final.log)
+· [Fedora system sudo/PAM tests](target/verification/20261121-agent-pam-mixed-platform-fedora.log)
+· [Fedora simulated sudo rerun](target/verification/20261121-agent-pam-unix-regression-home.log).
 
 ## November 21 Flatpak host sudo for the Terminal Agent
 

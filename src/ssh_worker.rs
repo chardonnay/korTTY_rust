@@ -29,9 +29,43 @@ mod relay;
 #[cfg(all(test, unix))]
 mod tests;
 #[cfg(all(test, unix))]
-pub(crate) use tests::{
-    Fixture as OpenSshFixture, dial as dial_test_executable, executable as test_executable,
-};
+pub(crate) use tests::Fixture as OpenSshFixture;
+
+#[cfg(test)]
+pub(crate) fn test_executable() -> std::path::PathBuf {
+    let path = std::env::var_os("KORTTY_SSH_TEST_EXE")
+        .map(std::path::PathBuf::from)
+        .expect("set KORTTY_SSH_TEST_EXE to the built app");
+    assert!(
+        path.is_absolute() && path.is_file(),
+        "invalid app executable"
+    );
+    path
+}
+
+#[cfg(all(test, any(unix, windows)))]
+pub(crate) fn dial_test_executable(
+    request: Request,
+    sftp: bool,
+    executable: &Path,
+    trust: &TrustStore,
+) -> Result<Session, ConnectError> {
+    let size = WindowSize {
+        columns: 80,
+        rows: 24,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    Session::dial_executable(
+        request,
+        size,
+        sftp,
+        &DialCancellation::default(),
+        executable,
+        trust,
+        None,
+    )
+}
 
 pub(crate) use client::{Channel, Opener, RemoteForward, StreamAbort};
 use kortty::ssh_runtime::{ARGUMENT, closed, lock, mux, wire};
@@ -688,13 +722,20 @@ fn sandbox_ready(output: &mut WorkerOutput, _abort: &Abort) -> Result<(), Connec
         use std::sync::mpsc;
         use std::time::Duration;
 
+        // A cold macOS App Sandbox launch can spend five seconds in system
+        // initialization before the worker can report its security checks.
+        #[cfg(target_os = "macos")]
+        let startup_timeout = Duration::from_secs(10);
+        #[cfg(windows)]
+        let startup_timeout = Duration::from_secs(5);
+
         let (ready, deadline) = mpsc::channel();
         let abort = _abort.clone();
         let timer = thread::Builder::new()
             .name("kortty-ssh-sandbox-startup".into())
             .spawn(move || {
-                let expired = deadline.recv_timeout(Duration::from_secs(5))
-                    == Err(mpsc::RecvTimeoutError::Timeout);
+                let expired =
+                    deadline.recv_timeout(startup_timeout) == Err(mpsc::RecvTimeoutError::Timeout);
                 if expired {
                     abort.abort();
                 }

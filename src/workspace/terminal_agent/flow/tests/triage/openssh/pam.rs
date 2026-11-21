@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::process::Command;
 
 use kortty_ssh::{HostKey, HostKeyStatus, TrustMode};
 
@@ -30,28 +31,77 @@ fn check_real_pam(isolation: IsolationLevel, name: &str) {
         .parse::<u16>()
         .unwrap();
     assert!(root.is_absolute() && port > 1024);
-    let work = root.join("ssh-work");
+    let work = std::env::var_os("KORTTY_SSH_PAM_WORK")
+        .map_or_else(|| root.join("ssh-work"), PathBuf::from);
+    assert!(
+        work.to_str().unwrap().starts_with('/'),
+        "set an absolute remote path"
+    );
     let receipt_name = format!("effective-uid-{name}");
     let owner_name = format!("owner-uid-{name}");
-    let receipt = work.join(&receipt_name);
-    let owner = work.join(&owner_name);
     let login = LoginTarget {
         host: "127.0.0.1".into(),
         port,
         username: "fixture".into(),
     };
     let endpoint = Endpoint::new(&login.host, port).unwrap();
-    let trust = TrustStore::new(root.join(format!("pinned-{name}")), TrustMode::Strict);
+    let pins = root.join(format!("pinned-{name}"));
+    let client = root.join("client");
+    let trust = TrustStore::new(pins.clone(), TrustMode::Strict);
     let public_key = fs::read_to_string(root.join("host.pub")).unwrap();
     let host_key = HostKey::from_openssh(public_key.trim()).unwrap();
     assert_eq!(
         trust.remember(&endpoint, &host_key).unwrap(),
         HostKeyStatus::Known
     );
+    let mut directory = String::new();
+    crate::scheduler_window::script::shell_quote(&mut directory, work.to_str().unwrap());
+    let receipt_query = format!(
+        "cd {directory} || exit; for receipt in {receipt_name} {owner_name}; do \
+         if test -e \"$receipt\"; then /bin/cat -- \"$receipt\" || exit; \
+         else printf 'absent\\n'; fi; done"
+    );
+    // Read the receipts over an independent pinned login so the client and
+    // the disposable sudo/PAM server can run on different systems.
+    #[cfg(windows)]
+    let (ssh, null) = (
+        PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32/OpenSSH/ssh.exe"),
+        "NUL",
+    );
+    #[cfg(not(windows))]
+    let (ssh, null) = (PathBuf::from("/usr/bin/ssh"), "/dev/null");
+    let check_receipts = |expected: &[u8]| {
+        let known_hosts = if cfg!(windows) {
+            pins.to_str().unwrap().replace('\\', "/")
+        } else {
+            pins.to_str().unwrap().to_owned()
+        };
+        let output = Command::new(&ssh)
+            .args(["-T", "-F", null])
+            .args([
+                "-oBatchMode=yes",
+                "-oIdentitiesOnly=yes",
+                "-oIdentityAgent=none",
+                "-oStrictHostKeyChecking=yes",
+                "-oConnectTimeout=5",
+                "-oServerAliveInterval=2",
+                "-oServerAliveCountMax=2",
+            ])
+            .arg(format!("-oGlobalKnownHostsFile={null}"))
+            .arg(format!("-oUserKnownHostsFile={known_hosts}"))
+            .args(["-p", &port.to_string(), "-i"])
+            .arg(&client)
+            .args(["fixture@127.0.0.1", &receipt_query])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, expected);
+    };
+    let absent = b"absent\nabsent\n";
     let request = Request {
         target: LoginRequest {
             endpoint: login.clone(),
-            auth: LoginAuthentication::PrivateKey(root.join("client")),
+            auth: LoginAuthentication::PrivateKey(client.clone()),
             keyboard_interactive: false,
         },
         jump: None,
@@ -68,6 +118,19 @@ fn check_real_pam(isolation: IsolationLevel, name: &str) {
         .terminal_notifications
         .ai_runs = false;
     attach_reviewed_shell(&mut fixture, request, &trust, &work, isolation);
+    let ask = fixture.open(Mode::Ask);
+    no_task(fixture.send(ask, Message::Goal("Review the fixture question".into())));
+    let start = fixture.send(ask, Message::Start);
+    finish_agent_task(&mut fixture, start);
+    assert!(fixture.run(ask).phase == Phase::ModelReview);
+
+    let plan = fixture.open(Mode::Plan);
+    no_task(fixture.send(plan, Message::Goal("Review the fixture plan".into())));
+    let start = fixture.send(plan, Message::StartPlanWithoutProbe);
+    finish_agent_task(&mut fixture, start);
+    assert!(fixture.run(plan).phase == Phase::ModelReview);
+    assert_idle(&model);
+
     set_sudo_vault(
         &mut fixture,
         root.join(format!("wrong-sudo-{name}")),
@@ -136,7 +199,7 @@ fn check_real_pam(isolation: IsolationLevel, name: &str) {
     let run = fixture.run(id);
     assert!(run.phase == Phase::ModelReview, "{}", run.notice);
     assert!(run.sudo_terminal.is_some());
-    assert!(!receipt.exists() && !owner.exists());
+    check_receipts(absent);
     respond_to_model_review(
         &mut fixture,
         id,
@@ -145,7 +208,12 @@ fn check_real_pam(isolation: IsolationLevel, name: &str) {
         json!({
             "status": "run_commands", "summary": "Write fixture receipts", "userMessage": "Review one command",
             "commands": [{
-                "command": format!("/usr/bin/id -u > {receipt_name} && /usr/bin/stat -c %u -- {receipt_name} > {owner_name}"),
+                "command": format!(
+                    "/usr/bin/id -u > {receipt_name} && \
+                     /usr/bin/stat -c %u -- {receipt_name} > {owner_name} && \
+                     /usr/bin/chgrp -- fixture {receipt_name} {owner_name} && \
+                     /usr/bin/chmod 0640 -- {receipt_name} {owner_name}"
+                ),
                 "purpose": "Verify the effective user and receipt owner",
                 "risk": "requires_confirmation",
                 "elevation": "password_sudo"
@@ -155,7 +223,7 @@ fn check_real_pam(isolation: IsolationLevel, name: &str) {
     let run = fixture.run(id);
     assert!(run.phase == Phase::Approval, "{}", run.notice);
     assert!(run.reviewed_password_sudo().is_some());
-    assert!(!receipt.exists() && !owner.exists());
+    check_receipts(absent);
     let epoch = run.epoch;
     let (peer, probe) = hold_peer_probe(&mut fixture);
     no_task(fixture.send(
@@ -167,13 +235,13 @@ fn check_real_pam(isolation: IsolationLevel, name: &str) {
     assert!(run.notice.contains("Another Agent command"));
     assert_ne!(run.epoch, epoch);
     assert!(run.reviewed_password_sudo().is_some() && run.sudo_terminal.is_some());
-    assert!(!receipt.exists() && !owner.exists());
+    check_receipts(absent);
     finish_peer_probe(&mut fixture, peer, probe);
     no_task(fixture.send(
         id,
         Message::Password(password::Message::Approve(epoch, password::Source::Ticket)),
     ));
-    assert!(!receipt.exists() && !owner.exists());
+    check_receipts(absent);
     assert_idle(&model);
 
     let command = fixture.send(
@@ -186,10 +254,27 @@ fn check_real_pam(isolation: IsolationLevel, name: &str) {
     finish_agent_task(&mut fixture, command);
     let run = fixture.run(id);
     assert!(run.phase == Phase::ModelReview, "{}", run.notice);
-    assert_eq!(fs::read_to_string(receipt).unwrap(), "0\n");
-    assert_eq!(fs::read_to_string(owner).unwrap(), "0\n");
+    check_receipts(b"0\n0\n");
+    assert!(fixture.run(ask).phase == Phase::ModelReview);
+    assert!(fixture.run(plan).phase == Phase::ModelReview);
+    respond_to_model_review(
+        &mut fixture,
+        ask,
+        &model,
+        None,
+        json!({
+            "status": "done",
+            "summary": "Reviewed fixture answer",
+            "userMessage": "The independent Ask completed."
+        }),
+    );
+    assert!(fixture.run(ask).phase == Phase::Finished);
+    assert!(fixture.run(plan).phase == Phase::ModelReview);
+    assert!(fixture.run(id).phase == Phase::ModelReview);
     assert_idle(&model);
     drop(fixture.workspace.close_terminal_agent(id));
+    drop(fixture.workspace.close_terminal_agent(ask));
+    drop(fixture.workspace.close_terminal_agent(plan));
     let _ = fixture.workspace.sessions[&fixture.session]
         .session
         .stop()
