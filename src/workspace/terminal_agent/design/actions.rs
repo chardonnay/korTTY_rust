@@ -285,7 +285,11 @@ impl Workspace {
                 .chain(self.update_terminal_agent(id, Message::Focus))
             }
             (None, Item::Repeat)
-                if finished && !self.terminal_agents.owns_session(source.session) =>
+                if finished
+                    && self
+                        .terminal_agents
+                        .check_live_run_slot(source, false)
+                        .is_ok() =>
             {
                 let result = (|| {
                     let profile = run

@@ -379,15 +379,25 @@ impl State {
                         0
                     }
                 };
-                priority(left).cmp(&priority(right)).then_with(|| {
-                    let order =
-                        (left.started_order, **left_id).cmp(&(right.started_order, **right_id));
-                    if left.awaiting_input() {
-                        order.reverse()
-                    } else {
-                        order
-                    }
-                })
+                (
+                    left.active(),
+                    left.has_terminal_presentation(),
+                    priority(left),
+                )
+                    .cmp(&(
+                        right.active(),
+                        right.has_terminal_presentation(),
+                        priority(right),
+                    ))
+                    .then_with(|| {
+                        let order =
+                            (left.started_order, **left_id).cmp(&(right.started_order, **right_id));
+                        if left.awaiting_input() {
+                            order.reverse()
+                        } else {
+                            order
+                        }
+                    })
             })
             .map(|(&id, run)| (id, run))
     }
@@ -399,29 +409,21 @@ impl State {
         stream: u64,
     ) -> Option<Element<'_, Desktop>> {
         let (id, run) = self.agent_activity_for_stream(session, stream)?;
-        pane_status(
-            id,
-            run,
-            run.design.status,
-            None,
-            Instant::now(),
-            true,
-            self.has_archived_activity(run),
-        )
+        pane_status(id, run, run.design.status, None, Instant::now(), true, self)
     }
 }
 
-fn pane_status(
+fn pane_status<'a>(
     id: window::Id,
-    run: &Run,
+    run: &'a Run,
     status: Status,
     palette: Option<Palette>,
     now: Instant,
     reduced_motion: bool,
-    has_archive: bool,
-) -> Option<Element<'_, Desktop>> {
+    agents: &State,
+) -> Option<Element<'a, Desktop>> {
     (status != Status::Hidden).then(|| {
-        status::view(run, status, palette, now, reduced_motion, has_archive)
+        status::view(run, status, palette, now, reduced_motion, agents)
             .map(move |message| Desktop::TerminalAgent(id, message))
     })
 }
@@ -729,7 +731,6 @@ impl Workspace {
         let visibility = &run.presentation.status_visibility;
         let status_opacity = visibility.opacity(seconds, now, reduced_motion);
         let chooser = || agents.run_picker(id, run);
-        let has_archive = agents.has_archived_activity(run);
         let picture_in_picture = run.design.arrangement == Arrangement::PictureInPicture;
         let dock = self.window_settings.ai_agent_panel;
         let history_position = dock
@@ -838,38 +839,31 @@ impl Workspace {
                 // Both roles resolve to Java d02. Keep its single history presenter.
                 None
             } else if adaptive_side {
-                let controls = column![chooser(), controls(run, has_archive)]
+                let controls = column![chooser(), controls(run, agents.has_archived_activity(run))]
                     .spacing(4)
                     .into();
                 let panel = adaptive_timeline(run.into(), status::phase(run).0, controls, palette);
                 Some(panel.map(move |message| Desktop::TerminalAgent(id, message)))
             } else {
-                pane_status(
-                    id,
-                    run,
-                    status_kind,
-                    palette,
-                    now,
-                    reduced_motion,
-                    has_archive,
+                pane_status(id, run, status_kind, palette, now, reduced_motion, agents).map(
+                    |status| {
+                        let picker = if history_position.is_none() && !picture_in_picture {
+                            chooser().map(|picker| {
+                                picker.map(move |message| Desktop::TerminalAgent(id, message))
+                            })
+                        } else {
+                            None
+                        };
+                        if let Some(picker) = picker {
+                            palette::panel(
+                                palette,
+                                container(column![status, picker].spacing(3)).padding(2),
+                            )
+                        } else {
+                            status
+                        }
+                    },
                 )
-                .map(|status| {
-                    let picker = if history_position.is_none() && !picture_in_picture {
-                        chooser().map(|picker| {
-                            picker.map(move |message| Desktop::TerminalAgent(id, message))
-                        })
-                    } else {
-                        None
-                    };
-                    if let Some(picker) = picker {
-                        palette::panel(
-                            palette,
-                            container(column![status, picker].spacing(3)).padding(2),
-                        )
-                    } else {
-                        status
-                    }
-                })
             }
             .map(|status| fade::view(status, opacity))
         });
@@ -912,6 +906,7 @@ impl Workspace {
 mod dock_tests {
     use super::*;
     use crate::terminal_agent::Mode;
+    use crate::terminal_agent::design::Preset;
     use crate::workspace::terminal_agent::flow::tests::Fixture;
 
     #[test]
@@ -952,6 +947,7 @@ mod dock_tests {
     #[test]
     fn activity_height_remembers_only_committed_changes_and_reopens_collapsed() {
         let mut fixture = Fixture::with_endpoint(false, false, "127.0.0.1:12345");
+        fixture.workspace.window_settings.ai_agent_design = Preset::Classic;
         let id = fixture.open(Mode::Ask);
         let workspace = &mut fixture.workspace;
         let dock = DockPreferences {
@@ -1006,6 +1002,7 @@ mod dock_tests {
     #[test]
     fn dock_drag_previews_then_commits_and_rejects_stale_layout_and_stream() {
         let mut fixture = Fixture::with_endpoint(false, false, "127.0.0.1:12345");
+        fixture.workspace.window_settings.ai_agent_design = Preset::Classic;
         let run = fixture.open(Mode::Ask);
         let workspace = &mut fixture.workspace;
         let panel = DockPreferences {

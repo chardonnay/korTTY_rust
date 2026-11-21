@@ -5,9 +5,11 @@ use std::fmt;
 use iced::widget::pick_list;
 use iced::{Element, Task, window};
 
+use crate::terminal_agent::design::{Arrangement, Status};
+
 use super::super::finished_runs::FinishedRun;
 use super::super::{Desktop, LiveBinding, Message, Phase, Run, State, Workspace};
-use super::history;
+use super::{history, placement};
 
 #[derive(Clone, Eq, PartialEq)]
 pub(super) struct Choice {
@@ -49,6 +51,27 @@ fn finished_label(run: &FinishedRun) -> String {
 }
 
 impl State {
+    pub(super) fn active_metro_runs(&self, run: &Run) -> usize {
+        let Ok(source) = run.binding.live() else {
+            return 0;
+        };
+        let history_panel =
+            |run: &Run| placement::history_slot(run.design.history).map(|_| run.design.history);
+        let panel = history_panel(run);
+        self.runs
+            .values()
+            .filter(|candidate| {
+                eligible(candidate, source)
+                    && candidate.has_terminal_presentation()
+                    && candidate.active()
+                    && candidate.status_transcript().is_some()
+                    && candidate.design.arrangement != Arrangement::Adaptive
+                    && candidate.design.status == Status::Metro
+                    && history_panel(candidate) == panel
+            })
+            .count()
+    }
+
     fn finished_choices(&self, source: LiveBinding) -> impl Iterator<Item = Choice> {
         self.finished_runs
             .iter()
@@ -214,6 +237,11 @@ impl Workspace {
         {
             return Task::none();
         }
+        if run.has_terminal_presentation()
+            && !self.terminal_agents.runs[&selected].has_terminal_presentation()
+        {
+            return self.focus_agent_surface(selected, Some(owner));
+        }
         let run = self
             .terminal_agents
             .runs
@@ -234,8 +262,45 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::terminal_agent::design::History;
     use crate::terminal_agent::{Action, Decision, Mode};
+    use crate::workspace::terminal_agent::Binding;
     use crate::workspace::terminal_agent::flow::tests::Fixture;
+
+    #[test]
+    fn metro_count_uses_unfinished_runs_with_the_same_stream_and_history_panel() {
+        let mut fixture = Fixture::with_endpoint(false, false, "127.0.0.1:12345");
+        let current = fixture.open(Mode::Ask);
+        let peer = fixture.open(Mode::Ask);
+        for id in [current, peer] {
+            let run = fixture.run_mut(id);
+            run.goal = "Review logs".into();
+            run.next(Phase::Thinking, "");
+        }
+        let count = |fixture: &Fixture| {
+            let agents = &fixture.workspace.terminal_agents;
+            agents.active_metro_runs(&agents.runs[&current])
+        };
+        assert_eq!(count(&fixture), 2);
+        fixture.run_mut(peer).next(Phase::Paused, "");
+        fixture.run_mut(peer).design.history = History::Focus;
+        assert_eq!(count(&fixture), 2);
+        fixture.run_mut(peer).design.history = History::Timeline;
+        assert_eq!(count(&fixture), 1);
+        fixture.run_mut(peer).design.history = History::InlineBlocks;
+        fixture.run_mut(peer).design.status = Status::Neon;
+        assert_eq!(count(&fixture), 1);
+        fixture.run_mut(peer).design.status = Status::Metro;
+        let own_stream = fixture.run_mut(peer).binding.live().unwrap();
+        fixture.run_mut(peer).binding = Binding::Live(LiveBinding {
+            stream: own_stream.stream + 1,
+            ..own_stream
+        });
+        assert_eq!(count(&fixture), 1);
+        fixture.run_mut(peer).binding = Binding::Live(own_stream);
+        fixture.run_mut(peer).next(Phase::Finished, "");
+        assert_eq!(count(&fixture), 1);
+    }
 
     #[test]
     fn earlier_run_selection_reveals_history_and_yields_to_new_input() {

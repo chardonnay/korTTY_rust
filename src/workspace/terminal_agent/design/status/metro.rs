@@ -418,6 +418,9 @@ pub(super) fn view<'a>(
     ]
     .spacing(8)
     .align_y(Alignment::Center);
+    if trace.active_runs > 1 {
+        header = header.push(text(format!("+{}", trace.active_runs - 1)).size(11));
+    }
     if let Some(usage) = super::usage_label(activity, palette) {
         header = header.push(usage);
     }

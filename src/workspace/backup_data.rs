@@ -2318,7 +2318,7 @@ mod tests {
     #[test]
     fn java_agent_dock_preserves_native_placement_and_imports_an_unset_width() {
         use super::super::terminal_agent::design::Slot;
-        use crate::terminal_agent::design::{Arrangement, Layout};
+        use crate::terminal_agent::design::{Arrangement, Layout, Preset};
 
         let imported = portable_java_preferences(
             br#"<globalSettings>
@@ -2337,9 +2337,10 @@ mod tests {
         assert_eq!(preferences.placement, Some(AgentDockPlacement::Left));
         assert_eq!(preferences.width(), 600);
         assert_eq!(
-            preferences.history_slot(Layout::default()),
+            preferences.history_slot(Preset::Classic.layout()),
             Some(Slot::Left)
         );
+        assert_eq!(preferences.history_slot(Preset::Standard.layout()), None);
         let pip = Layout {
             arrangement: Arrangement::PictureInPicture,
             ..Layout::default()

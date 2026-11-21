@@ -37,7 +37,7 @@ impl Preset {
 
     pub(crate) fn description(self) -> &'static str {
         match self {
-            Self::Standard => "Activity window and a status strip in the source terminal.",
+            Self::Standard => "In-terminal blocks and a Metro line.",
             Self::Classic => "Activity window with its own controls and transcript.",
             Self::Floating => "Compact always-on-top activity window and a terminal status strip.",
         }

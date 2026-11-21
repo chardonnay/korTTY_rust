@@ -388,19 +388,28 @@ impl Workspace {
         {
             return None;
         }
-        let (run_id, run) = self.terminal_agents.runs.iter().find(|(_, run)| {
-            run.active()
-                && !run.closing
-                && !run.cancel.requested()
-                && run.design.history.inline_style().is_some()
-                && run.binding.live().is_ok_and(|source| {
-                    source.session == session && source.stream == pane.stream_generation
-                })
-                && run
-                    .inline
-                    .as_ref()
-                    .is_some_and(|history| view.visible(history.id, run.epoch))
-        })?;
+        // Several Ask reviews can share the prompt. Bind the keys to the
+        // rendered block nearest the prompt, even when Metro shows an older run.
+        let (_, run_id, run) = self
+            .terminal_agents
+            .runs
+            .iter()
+            .filter(|(_, run)| {
+                run.active()
+                    && !run.closing
+                    && !run.swarm
+                    && !run.cancel.requested()
+                    && run.design.history.inline_style().is_some()
+                    && run.binding.live().is_ok_and(|source| {
+                        source.session == session && source.stream == pane.stream_generation
+                    })
+            })
+            .filter_map(|(&id, run)| {
+                let history = run.inline.as_ref()?;
+                let start = view.visible_start(history.id, run.epoch)?;
+                Some((start, id, run))
+            })
+            .max_by_key(|(start, _, _)| *start)?;
         let (current_owner, _) = self.current_run_pane(run).ok()?;
         if current_owner != owner {
             return None;
@@ -437,7 +446,7 @@ impl Workspace {
                 owner,
                 session,
                 stream: pane.stream_generation,
-                run: *run_id,
+                run: run_id,
                 epoch: run.epoch,
                 screen_revision: frame.search_revision,
                 input_revision: pane.session.mcp_input_revision(),

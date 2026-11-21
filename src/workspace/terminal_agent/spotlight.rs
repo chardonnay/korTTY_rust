@@ -297,7 +297,10 @@ impl Workspace {
     fn agent_spotlight_source(&self, owner: window::Id) -> Option<(u64, LiveBinding)> {
         let (tab, source) = self.spotlight_binding(owner)?;
         (self.terminal_agents.runs.len() < MAX_RUNS
-            && !self.terminal_agents.owns_session(source.session))
+            && self
+                .terminal_agents
+                .check_live_run_slot(source, false)
+                .is_ok())
         .then_some((tab, source))
     }
 
@@ -514,6 +517,7 @@ impl Workspace {
         choice: &Choice,
         prompt: String,
     ) -> Result<(Run, bool), String> {
+        self.terminal_agents.check_live_run_slot(source, false)?;
         let profile = match choice {
             Choice::PaneDefault => None,
             Choice::Profile(profile) => Some(profile),

@@ -283,6 +283,23 @@ fn check_implementation_sudo_preflight(isolation: IsolationLevel) {
     );
     assert_idle(&model);
 
+    let (peer, probe) = hold_peer_probe(&mut fixture);
+    let before_contention = fs::read_to_string(&receipt).unwrap();
+    no_task(fixture.send(
+        id,
+        Message::Password(password::Message::AuthenticatePlan(
+            epoch,
+            password::Source::Vault,
+        )),
+    ));
+    let run = fixture.run(id);
+    assert!(run.phase == Phase::SudoPreflight);
+    assert_ne!(run.epoch, epoch);
+    assert!(run.sudo_preflight.is_some());
+    assert_eq!(run.sudo_preflight_attempts, 0);
+    assert_eq!(fs::read_to_string(&receipt).unwrap(), before_contention);
+    finish_peer_probe(&mut fixture, peer, probe);
+
     for expected_phase in [Phase::SudoPreflight, Phase::ModelReview] {
         authenticate_plan_with_vault(&mut fixture, id, &model, |_| {});
         let run = fixture.run(id);
@@ -318,10 +335,28 @@ fn check_implementation_sudo_preflight(isolation: IsolationLevel) {
         run.notice
     );
     assert!(!root.join("approved-sudo-step").exists());
+    let epoch = run.epoch;
+    let (peer, probe) = hold_peer_probe(&mut fixture);
+    no_task(fixture.send(
+        id,
+        Message::Password(password::Message::Approve(epoch, password::Source::Ticket)),
+    ));
+    let run = fixture.run(id);
+    assert!(run.phase == Phase::Approval);
+    assert_ne!(run.epoch, epoch);
+    assert!(run.reviewed_password_sudo().is_some());
+    assert!(run.sudo_terminal.is_some());
+    assert!(!root.join("approved-sudo-step").exists());
+    finish_peer_probe(&mut fixture, peer, probe);
+    no_task(fixture.send(
+        id,
+        Message::Password(password::Message::Approve(epoch, password::Source::Ticket)),
+    ));
+    assert!(!root.join("approved-sudo-step").exists());
     let command = fixture.send(
         id,
         Message::Password(password::Message::Approve(
-            run.epoch,
+            fixture.run(id).epoch,
             password::Source::Ticket,
         )),
     );
@@ -376,6 +411,27 @@ fn check_implementation_sudo_preflight(isolation: IsolationLevel) {
     drop(fixture);
     let output = server.join().unwrap();
     assert!(String::from_utf8_lossy(&output.stderr).contains("Accepted publickey for "));
+}
+
+fn hold_peer_probe(fixture: &mut Fixture) -> (window::Id, Task<Desktop>) {
+    let peer = fixture.open(Mode::Run);
+    no_task(fixture.send(peer, Message::Goal("Review another fixture probe".into())));
+    let start = fixture.send(peer, Message::Start);
+    finish_agent_task(fixture, start);
+    assert!(fixture.run(peer).phase == Phase::ProbeApproval);
+    let probe = fixture.send(peer, Message::Approve(fixture.run(peer).epoch));
+    assert!(fixture.run(peer).phase == Phase::Probe);
+    (peer, probe)
+}
+
+fn finish_peer_probe(fixture: &mut Fixture, peer: window::Id, probe: Task<Desktop>) {
+    finish_agent_task(fixture, probe);
+    assert!(
+        fixture.run(peer).probe_reviewed,
+        "{}",
+        fixture.run(peer).notice
+    );
+    drop(fixture.workspace.close_terminal_agent(peer));
 }
 
 fn set_sudo_vault(

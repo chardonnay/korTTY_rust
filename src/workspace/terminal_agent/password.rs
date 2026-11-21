@@ -11,6 +11,7 @@ use crate::terminal_logging::RedactionSecrets;
 use crate::vault_window::AgentSudoCredential;
 use crate::workspace::SshTarget;
 
+use super::execution_slot::ShellSlot;
 use super::{
     Desktop, IsolationLevel, Mode, Phase, Purpose, Run, RunTarget, SessionId, Sudo, Target, Task,
     Workspace, engine, mask, window,
@@ -405,6 +406,7 @@ impl Workspace {
         id: window::Id,
         run: &mut Run,
         source: Source,
+        slot: ShellSlot,
     ) -> Result<Task<Desktop>, String> {
         let Some(super::ReviewedCommand {
             proposal,
@@ -420,7 +422,14 @@ impl Workspace {
         if mask::prompt(&run.redactor, command.wire())? != command.wire() {
             return Err("The effective sudo command contains text that requires masking.".into());
         }
-        self.launch_sudo_operation(id, run, authentication, source, Some((command, proposal)))
+        self.launch_sudo_operation(
+            id,
+            run,
+            authentication,
+            source,
+            Some((command, proposal)),
+            slot,
+        )
     }
 
     fn launch_sudo_operation(
@@ -430,6 +439,7 @@ impl Workspace {
         authentication: AuthenticationReview,
         source: Source,
         command: Option<(engine::password::Command, super::Command)>,
+        slot: ShellSlot,
     ) -> Result<Task<Desktop>, String> {
         let AuthenticationReview { scope, credential } = authentication;
         let preflight = command.is_none();
@@ -525,6 +535,7 @@ impl Workspace {
                             }
                         })
                         .map(|(status, terminal)| Completed::new(status, terminal));
+                    drop(slot);
                     let _ = worker.try_send(Message::Finished(epoch, result));
                 })
                 .is_err()
@@ -556,12 +567,16 @@ impl Workspace {
                     && !run.cancel.requested()
                     && matches!(source, Source::Manual | Source::Vault) =>
             {
+                let Some(slot) = self.terminal_agents.shell_slots.reserve(run) else {
+                    run.return_to_busy_shell_review(Phase::SudoPreflight);
+                    return Ok(Task::none());
+                };
                 let review = run
                     .sudo_preflight
                     .take()
                     .ok_or("The sudo review expired.")?;
                 run.sudo_preflight_attempts += 1;
-                return self.launch_sudo_operation(id, run, review, source, None);
+                return self.launch_sudo_operation(id, run, review, source, None, slot);
             }
             Message::SkipPlanAuthentication(epoch)
                 if epoch == run.epoch
@@ -582,7 +597,11 @@ impl Workspace {
                     && !run.cancel.requested()
                     && run.reviewed_password_sudo().is_some() =>
             {
-                return self.launch_password_sudo(id, run, source);
+                let Some(slot) = self.terminal_agents.shell_slots.reserve(run) else {
+                    run.return_to_busy_shell_review(Phase::Approval);
+                    return Ok(Task::none());
+                };
+                return self.launch_password_sudo(id, run, source, slot);
             }
             Message::Challenge(epoch)
                 if epoch == run.epoch

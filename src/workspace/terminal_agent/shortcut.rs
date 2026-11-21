@@ -11,7 +11,7 @@ use crate::session::{SessionId, ShortcutPrompt};
 use crate::terminal_agent::shortcut::{Aliases, Input, Parsed, PendingPrefix, shortcut_character};
 use crate::workspace::multi_exec_access::KeyboardRoute;
 
-use super::{Desktop, PaneSession, Workspace};
+use super::{Desktop, LiveBinding, PaneSession, Workspace};
 
 mod completion;
 use completion::Completion;
@@ -21,10 +21,17 @@ pub(in crate::workspace) const HISTORY_POPUP_WIDTH: std::ops::RangeInclusive<u16
 pub(in crate::workspace) const HISTORY_POPUP_HEIGHT: std::ops::RangeInclusive<u16> = 120..=900;
 
 pub(in crate::workspace) struct Capture {
-    aliases: Aliases,
-    prompt: ShortcutPrompt,
+    scope: Scope,
     line: PendingPrefix,
     completion: Option<Completion>,
+}
+
+#[derive(PartialEq, Eq)]
+struct Scope {
+    owner: window::Id,
+    source: LiveBinding,
+    aliases: Aliases,
+    prompt: ShortcutPrompt,
 }
 
 impl PaneSession {
@@ -49,7 +56,11 @@ impl PaneSession {
         bounds: Size,
     ) -> Option<Element<'_, Desktop>> {
         let capture = self.agent_shortcut.as_ref()?;
-        if self.agent_shortcut_prompt()? != capture.prompt {
+        if owner != capture.scope.owner
+            || private != capture.scope.source.private
+            || self.stream_generation != capture.scope.source.stream
+            || self.agent_shortcut_prompt()? != capture.scope.prompt
+        {
             return None;
         }
         let draft = capture.line.text();
@@ -97,9 +108,6 @@ impl Workspace {
         if !self.window_settings.prompt_navigation_enabled {
             return "Enable shell command marks in Settings → Terminal, then reconnect or restart this terminal.";
         }
-        if self.terminal_agents.owns_session(session) {
-            return "An Agent run owns this terminal. Wait for it to finish or stop the run.";
-        }
         let frame = pane.session.frame();
         if frame.status != crate::session::Status::Running {
             return "Connect or restart this terminal before entering an Agent shortcut.";
@@ -121,10 +129,15 @@ impl Workspace {
         if self.tab_broadcast_active(tab) || (!tab.incognito && self.multi_exec_member(session)) {
             return "Turn off broadcast and Multi-exec for this terminal to use Agent shortcuts.";
         }
-        if self.agent_shortcut_scope(session).is_some() {
-            "Ready to recognize an Agent shortcut at this empty shell prompt."
-        } else {
-            "An empty shell prompt is not verified. Set up shell integration, then return to a fresh prompt."
+        let Some(scope) = self.agent_shortcut_scope(session) else {
+            return "An empty shell prompt is not verified. Set up shell integration, then return to a fresh prompt.";
+        };
+        match self
+            .terminal_agents
+            .check_live_run_slot(scope.source, false)
+        {
+            Ok(()) => "Ready to recognize an Agent shortcut at this empty shell prompt.",
+            Err(reason) => reason,
         }
     }
 
@@ -176,7 +189,7 @@ impl Workspace {
         }
         let decision = match key {
             Key::Named(Named::Enter) if modifiers.is_empty() => {
-                capture.line.submit(&capture.aliases)
+                capture.line.submit(&capture.scope.aliases)
             }
             Key::Named(Named::Backspace) if composing && modifiers.is_empty() => {
                 capture.line.backspace();
@@ -199,7 +212,7 @@ impl Workspace {
                 });
                 match (plain, bytes.as_deref()) {
                     (Some(plain), Some(bytes)) if !plain.is_empty() => {
-                        capture.line.push(&capture.aliases, plain, bytes)
+                        capture.line.push(&capture.scope.aliases, plain, bytes)
                     }
                     _ if composing => Input::Wait,
                     _ => capture.line.replay_before(),
@@ -227,7 +240,7 @@ impl Workspace {
             Err(stale) => return stale.composing,
         };
         capture.completion = None;
-        let decision = capture.line.paste(&capture.aliases, text);
+        let decision = capture.line.paste(&capture.scope.aliases, text);
         self.route_agent_shortcut(owner, session, capture, decision)
             .is_some()
     }
@@ -244,13 +257,10 @@ impl Workspace {
             .and_then(|pane| pane.agent_shortcut.take());
         let ready = single_pane
             .then(|| self.agent_shortcut_scope(session))
-            .flatten();
+            .flatten()
+            .filter(|scope| scope.owner == owner);
         match (pending, ready) {
-            (Some(draft), Some((aliases, prompt)))
-                if draft.prompt == prompt && draft.aliases == aliases =>
-            {
-                Ok(Some(draft))
-            }
+            (Some(draft), Some(scope)) if draft.scope == scope => Ok(Some(draft)),
             (Some(draft), _) => {
                 self.notice(
                     owner,
@@ -260,9 +270,8 @@ impl Workspace {
                     composing: draft.line.composing(),
                 })
             }
-            (None, Some((aliases, prompt))) => Ok(Some(Capture {
-                aliases,
-                prompt,
+            (None, Some(scope)) => Ok(Some(Capture {
+                scope,
                 line: PendingPrefix::default(),
                 completion: None,
             })),
@@ -270,15 +279,21 @@ impl Workspace {
         }
     }
 
-    fn agent_shortcut_scope(&self, session: SessionId) -> Option<(Aliases, ShortcutPrompt)> {
-        if !self.clipboard.policy.ai_agent_allowed() || self.terminal_agents.owns_session(session) {
+    fn agent_shortcut_scope(&self, session: SessionId) -> Option<Scope> {
+        if !self.clipboard.policy.ai_agent_allowed() {
             return None;
         }
-        let aliases = self.ai_configuration()?.agent_shortcut_aliases()?;
-        Some((
-            aliases,
-            self.sessions.get(&session)?.agent_shortcut_prompt()?,
-        ))
+        let (owner, pane, tab) = self.agent_pane(session)?;
+        Some(Scope {
+            owner,
+            source: LiveBinding {
+                session,
+                stream: pane.stream_generation,
+                private: tab.incognito,
+            },
+            aliases: self.ai_configuration()?.agent_shortcut_aliases()?,
+            prompt: pane.agent_shortcut_prompt()?,
+        })
     }
 
     fn hold_agent_shortcut(&mut self, session: SessionId, capture: Capture) {
@@ -309,7 +324,7 @@ impl Workspace {
                 if let Some(pane) = self.sessions.get_mut(&session)
                     && pane
                         .session
-                        .replay_agent_shortcut(capture.prompt, bytes.to_vec())
+                        .replay_agent_shortcut(capture.scope.prompt, bytes.to_vec())
                         .is_ok()
                 {
                     pane.clear_selection();
@@ -325,18 +340,18 @@ impl Workspace {
                 }
             }
             Input::Compose(line) => {
-                if self
-                    .sessions
-                    .get(&session)
-                    .and_then(PaneSession::agent_shortcut_prompt)
-                    != Some(capture.prompt)
-                {
+                if self.agent_shortcut_scope(session).as_ref() != Some(&capture.scope) {
                     self.notice(
                         owner,
                         "The terminal prompt changed. Enter the shortcut again.".into(),
                     );
                 } else {
-                    return Some(self.open_agent_shortcut(owner, session, &capture.aliases, &line));
+                    return Some(self.open_agent_shortcut(
+                        owner,
+                        session,
+                        &capture.scope.aliases,
+                        &line,
+                    ));
                 }
             }
         }
@@ -366,6 +381,22 @@ impl Workspace {
                     ));
                 }
             };
+            let (actual_owner, pane, tab) = self
+                .agent_pane(session)
+                .ok_or("This terminal is no longer available.")?;
+            if actual_owner != owner {
+                return Err("The source terminal changed. Enter the shortcut again.".into());
+            }
+            // Check capacity on submit so a recognized alias never falls
+            // through to the shell when the last slot becomes occupied.
+            self.terminal_agents.check_live_run_slot(
+                LiveBinding {
+                    session,
+                    stream: pane.stream_generation,
+                    private: tab.incognito,
+                },
+                false,
+            )?;
             let config = self
                 .ai_configuration()
                 .ok_or("AI is unavailable under the current settings.")?;
@@ -913,6 +944,38 @@ while ($null -ne ($line = [Console]::ReadLine())) {
                 .as_str(),
             "***",
         );
+        let source_tab = fixture.workspace.agent_pane(pane).unwrap().2.id;
+        fixture.type_text("agent-ask What is in the fixture?");
+        fixture.enter();
+        let ask = *fixture
+            .workspace
+            .terminal_agents
+            .runs
+            .iter()
+            .find(|(_, run)| run.mode == Mode::Ask)
+            .unwrap()
+            .0;
+        drop(
+            fixture
+                .workspace
+                .update_terminal_agent(ask, super::super::Message::Start),
+        );
+        assert!(fixture.workspace.terminal_agents.runs[&ask].phase == Phase::ModelReview);
+        fixture.workspace.select_tab(owner, source_tab, false);
+        fixture.type_text("agent-plan Plan the fixture inventory");
+        fixture.enter();
+        let plan = fixture
+            .workspace
+            .terminal_agents
+            .runs
+            .values()
+            .find(|run| run.mode == Mode::Plan)
+            .unwrap();
+        assert_eq!(plan.binding.session(), Some(pane));
+        assert_eq!(plan.goal, "Plan the fixture inventory");
+        assert!(plan.phase == Phase::Setup);
+        assert!(fixture.workspace.terminal_agents.runs[&ask].phase == Phase::ModelReview);
+
         fixture
             .session()
             .send(b"printf '%s\\n' 'kortty-after-shortcut'\r".to_vec())
@@ -924,7 +987,7 @@ while ($null -ne ($line = [Console]::ReadLine())) {
             .flat_map(|cells| cells.iter().map(|cell| cell.text.as_str()))
             .collect::<String>();
         assert!(!visible.contains("kortty-forwarded:Inspect the fixture"));
-        assert_eq!(fixture.workspace.terminal_agents.runs.len(), 1);
+        assert_eq!(fixture.workspace.terminal_agents.runs.len(), 3);
         fixture.session().send(b"exit\r".to_vec()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while fixture.session().frame().status == crate::session::Status::Running {
@@ -934,6 +997,104 @@ while ($null -ne ($line = [Console]::ReadLine())) {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn typed_shortcuts_share_an_active_pane_and_keep_overflow_out_of_the_shell() {
+        let mut fixture = Fixture::new();
+        let source_tab = fixture.workspace.agent_pane(fixture.pane).unwrap().2.id;
+        let initial_prompt = fixture
+            .session()
+            .agent_shortcut_prompt(&fixture.session().frame());
+        let start_ask = |fixture: &mut Fixture, index| {
+            let goal = format!("Review question {index}");
+            fixture.type_text(&format!("agent-ask {goal}"));
+            fixture.enter();
+            let id = *fixture
+                .workspace
+                .terminal_agents
+                .runs
+                .iter()
+                .find(|(_, run)| run.goal == goal)
+                .unwrap()
+                .0;
+            drop(
+                fixture
+                    .workspace
+                    .update_terminal_agent(id, super::super::Message::Start),
+            );
+            assert!(fixture.workspace.terminal_agents.runs[&id].phase == Phase::ModelReview);
+            fixture
+                .workspace
+                .select_tab(fixture.owner, source_tab, false);
+        };
+        for index in 1..=5 {
+            start_ask(&mut fixture, index);
+        }
+        assert_eq!(
+            fixture.workspace.agent_shortcut_status(fixture.pane),
+            "This terminal pane already has five active Agent runs."
+        );
+        fixture.type_text("agent-plan Plan a fixture inventory");
+        assert_eq!(
+            fixture.draft().line.text(),
+            "agent-plan Plan a fixture inventory"
+        );
+        fixture.enter();
+        assert_eq!(fixture.workspace.terminal_agents.runs.len(), 5);
+        assert_eq!(
+            fixture
+                .session()
+                .agent_shortcut_prompt(&fixture.session().frame()),
+            initial_prompt,
+        );
+        fixture.type_text("agenda ordinary text");
+        fixture.enter();
+        fixture.wait_for_prompt("line=agenda ordinary text");
+        let frame = fixture.session().frame();
+        assert!(
+            !frame
+                .screen
+                .cells
+                .iter()
+                .map(|cell| cell.text.as_str())
+                .collect::<String>()
+                .contains("line=agent-plan")
+        );
+    }
+
+    #[test]
+    fn typed_agent_draft_cannot_follow_a_replaced_stream_with_the_same_prompt() {
+        let mut fixture = Fixture::new();
+        let initial_prompt = fixture
+            .session()
+            .agent_shortcut_prompt(&fixture.session().frame());
+        fixture.type_text("agent-ask Inspect the original stream");
+        fixture
+            .workspace
+            .sessions
+            .get_mut(&fixture.pane)
+            .unwrap()
+            .stream_generation += 1;
+        fixture.enter();
+        assert!(fixture.workspace.terminal_agents.runs.is_empty());
+        assert_eq!(
+            fixture
+                .session()
+                .agent_shortcut_prompt(&fixture.session().frame()),
+            initial_prompt,
+        );
+
+        fixture.type_text("agent-ask Inspect the current stream");
+        fixture.enter();
+        let run = fixture
+            .workspace
+            .terminal_agents
+            .runs
+            .values()
+            .next()
+            .unwrap();
+        assert_eq!(run.goal, "Inspect the current stream");
     }
 
     #[test]

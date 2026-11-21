@@ -1,6 +1,6 @@
 # Remaining Java-to-Rust porting plan
 
-Source audit updated on 2026-11-20. This plan tracks the scope agreed in
+Terminal Agent source audit updated on 2026-11-21. This plan tracks the scope agreed in
 [HANDOFF.md](HANDOFF.md). The [parity record](PORTING-PARITY.md) identifies the
 source and environment for earlier checks. Detailed logs under
 `target/verification/` are local build records.
@@ -9,11 +9,14 @@ source and environment for earlier checks. Detailed logs under
 
 **Java v2.26.0 parity remains partial.** The comparison uses Java tag
 `v2.26.0` (`b235d91f2035`). The current Rust worktree is based on merged
-PR #27 (`2e6faa3a`). Agent-to-Chat continuation, the Agent profile
+PR #29 (`bf85762c`). Agent-to-Chat continuation, the Agent profile
 role, Journal chat exports, command summaries, the snippet structure panel
 and Lua editor tools are implemented. AI Manager search reaches every page
 and a subset of individual controls. The [source comparison](PORTING-PARITY.md#november-19-java-release-source-comparison)
 identifies the remaining interactions and the tested revisions.
+The [Standard design](PORTING-PARITY.md#november-21-terminal-agent-standard-design)
+and [overlapping Agent runs](PORTING-PARITY.md#november-21-overlapping-terminal-agent-runs)
+are recorded under A2.
 
 ### Reconciliation against the current working tree
 
@@ -1204,11 +1207,23 @@ the oldest retained stations collapse into a count. Clicking a station
 opens its typed detail or the current review. The live status and the
 Settings preview share the rail. Fedora Wayland verified station selection,
 request review, completion, hiding and restoring the rail, and a vertical
-split that narrowed the source terminal from 112 to 54 columns. Verify
-the remaining native desktops and the rail's station motion in the live
-renderer. Audit the Java standard combination and the active-run count
-separately.
+split that narrowed the source terminal from 112 to 54 columns. Standard
+selects d03 in-terminal blocks and the d08 Metro line with approval in
+history and a fixed arrangement. Unavailable roles in saved designs
+fall back independently to the Standard modules. The Metro header
+counts unfinished runs on the same stream that share its status and
+history panel. The same pane accepts up to five standalone Run, Ask, or
+Planning runs with individual reviews and output routing. Environment
+probes, ordinary commands and sudo operations acquire the pane's worker
+slot. A competing approval returns to review with a fresh epoch.
+Typed shortcuts also use the same five-run limit. A recognized
+submission at the limit stays local, and an edited shortcut stays bound
+to its original stream, privacy state, window and prompt. Verify mixed-mode
+desktop workflows with SSH panes, including contended sudo.
+Verify the remaining native desktops and the rail's station motion in
+the live renderer.
 [Java Metro line](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignMetroBar.java)
+· [Java Standard preset](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/agentdesign/AgentDesignPresets.java)
 · [Metro line verification](PORTING-PARITY.md#november-21-terminal-agent-metro-line)
 
 The d09 tmux history shows the masked goal, one entry per typed step with
@@ -1410,9 +1425,10 @@ native Swarm window, including a retry and an archived run.
 
 The built-in Agent exists. Its terminal shortcut is enabled separately and
 defaults to off. Recognition requires fresh OSC 133 A/B prompt markers, a live
-UTF-8 Xterm primary screen at its bottom, and no password prompt, incompatible
-full-screen application or competing run ownership. A previous-prompt marker
-alone does not prove that OSC 133 B marked the prompt end and input start.
+UTF-8 Xterm primary screen at its bottom, and no password prompt or
+incompatible full-screen application. Submission checks the stream's
+standalone run limit and Swarm ownership. A previous-prompt marker alone
+does not prove that OSC 133 B marked the prompt end and input start.
 
 Five integration snippets now ship: Bash, Zsh, Fish, PowerShell and CMD.
 Automatic integration is a separate local-shell opt-in and remains off by

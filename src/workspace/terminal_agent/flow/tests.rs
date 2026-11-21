@@ -1690,6 +1690,124 @@ fn managed_agent_and_planning_controls_keep_independent_authority() {
 }
 
 #[test]
+fn terminal_agent_allows_five_independent_runs_on_the_same_stream() {
+    let mut fixture = Fixture::new(false, false);
+    let start_ask = |fixture: &mut Fixture, index| {
+        let id = fixture.open(Mode::Ask);
+        no_task(fixture.send(id, Message::Goal(format!("Review question {index}"))));
+        let task = fixture.send(id, Message::Start);
+        finish_agent_task(fixture, task);
+        id
+    };
+    let active: Vec<_> = (1..=3)
+        .map(|index| start_ask(&mut fixture, index))
+        .collect();
+    for &id in &active {
+        assert!(fixture.run(id).phase == Phase::ModelReview);
+        assert!(fixture.run(id).model_review.is_some());
+    }
+    let run = fixture.open(Mode::Run);
+    let directory = fixture.profile.0.canonicalize().unwrap();
+    fixture.run_mut(run).manual_directory = Some(directory.to_str().unwrap().into());
+    fixture.run_mut(run).goal = "Inspect the current directory".into();
+    let task = fixture.send(run, Message::Start);
+    finish_agent_task(&mut fixture, task);
+    assert!(fixture.run(run).phase == Phase::ProbeApproval);
+
+    let planner = fixture.open(Mode::Plan);
+    fixture.run_mut(planner).goal = "Plan a fixture inventory".into();
+    let task = fixture.send(planner, Message::StartPlanWithoutProbe);
+    finish_agent_task(&mut fixture, task);
+    assert!(fixture.run(planner).phase == Phase::ModelReview);
+
+    let overflow = start_ask(&mut fixture, 6);
+    assert!(
+        fixture
+            .run(overflow)
+            .notice
+            .contains("five active Agent runs")
+    );
+
+    drop(fixture.send(active[0], Message::Cancel));
+    assert!(fixture.run(active[0]).phase == Phase::Cancelled);
+    let reopened = start_ask(&mut fixture, 7);
+    assert!(fixture.run(reopened).phase == Phase::ModelReview);
+    assert!(fixture.run(active[1]).phase == Phase::ModelReview);
+}
+
+#[test]
+fn contending_agent_probes_keep_their_review_and_need_a_fresh_approval() {
+    let mut fixture = Fixture::new(false, false);
+    let directory = fixture.profile.0.canonicalize().unwrap();
+    let reviewed = LocalDirectory::capture(directory.clone()).unwrap();
+    let start_probe = |fixture: &mut Fixture| {
+        let id = fixture.open(Mode::Run);
+        fixture.run_mut(id).manual_directory = Some(directory.to_str().unwrap().into());
+        fixture.run_mut(id).goal = "Inspect fixture".into();
+        let task = fixture.send(id, Message::Start);
+        finish_agent_task(fixture, task);
+        assert!(fixture.run(id).phase == Phase::ProbeApproval);
+        id
+    };
+    let dispatch_probe = |fixture: &mut Fixture, id, review| {
+        drop(fixture.send(id, Message::Approve(review)));
+        assert!(fixture.run(id).phase == Phase::ReviewedDirectory { probe: true });
+        fixture.send(
+            id,
+            Message::Directory(fixture.run(id).epoch, Ok(reviewed.clone())),
+        )
+    };
+    let settle_probe = |fixture: &mut Fixture, id, dispatch| {
+        assert!(fixture.run(id).phase == Phase::Probe);
+        assert!(
+            fixture
+                .workspace
+                .terminal_agents
+                .shell_slots
+                .reserve(fixture.run(id))
+                .is_none()
+        );
+        // The Windows test binary has no desktop command-worker entry point.
+        // Exercise lease release for its abandoned dispatch. Unix also runs the probe.
+        #[cfg(windows)]
+        drop(dispatch);
+        #[cfg(unix)]
+        {
+            finish_agent_task(fixture, dispatch);
+            assert!(fixture.run(id).probe_reviewed, "{}", fixture.run(id).notice);
+        }
+        assert!(
+            fixture
+                .workspace
+                .terminal_agents
+                .shell_slots
+                .reserve(fixture.run(id))
+                .is_some()
+        );
+    };
+    let first = start_probe(&mut fixture);
+    let second = start_probe(&mut fixture);
+    let first_review = fixture.run(first).epoch;
+    let dispatch = dispatch_probe(&mut fixture, first, first_review);
+
+    let second_review = fixture.run(second).epoch;
+    let busy = dispatch_probe(&mut fixture, second, second_review);
+    finish_agent_task(&mut fixture, busy);
+    assert!(fixture.run(second).phase == Phase::ProbeApproval);
+    assert!(fixture.run(second).notice.contains("Another Agent command"));
+    assert!(fixture.run(second).activity.is_empty());
+    let fresh_review = fixture.run(second).epoch;
+    assert_ne!(second_review, fresh_review);
+
+    settle_probe(&mut fixture, first, dispatch);
+    assert!(!fixture.run(second).probe_reviewed);
+    no_task(fixture.send(second, Message::Approve(second_review)));
+    assert_eq!(fixture.run(second).epoch, fresh_review);
+    let dispatch = dispatch_probe(&mut fixture, second, fresh_review);
+    settle_probe(&mut fixture, second, dispatch);
+}
+
+#[test]
 fn terminal_agent_approvals_are_epoch_bound_and_stream_replacement_cancels() {
     use iced::advanced::subscription::into_recipes;
 
@@ -1714,9 +1832,20 @@ fn terminal_agent_approvals_are_epoch_bound_and_stream_replacement_cancels() {
     no_task(fixture.send(first, Message::Approve(epoch)));
     assert!(fixture.run(first).phase == Phase::ProbeApproval);
 
+    fixture.run_mut(second).manual_directory = Some(
+        fixture
+            .profile
+            .0
+            .canonicalize()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .into(),
+    );
     no_task(fixture.send(second, Message::Goal("Second run".into())));
-    no_task(fixture.send(second, Message::Start));
-    assert!(fixture.run(second).notice.contains("already owns"));
+    let task = fixture.send(second, Message::Start);
+    finish_agent_task(&mut fixture, task);
+    assert!(fixture.run(second).phase == Phase::ProbeApproval);
     fixture
         .workspace
         .sessions
@@ -1726,6 +1855,7 @@ fn terminal_agent_approvals_are_epoch_bound_and_stream_replacement_cancels() {
     let _ = fixture.workspace.reconcile_terminal_agents();
     assert!(fixture.run(first).phase == Phase::Cancelled);
     assert!(fixture.run(first).activity.is_empty());
+    assert!(fixture.run(second).phase == Phase::Cancelled);
     assert!(into_recipes(fixture.workspace.scheduler_subscription()).is_empty());
 }
 

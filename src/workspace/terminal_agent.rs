@@ -33,6 +33,7 @@ mod binding;
 mod clarification;
 mod cursor;
 pub(super) mod design;
+mod execution_slot;
 mod final_evidence;
 mod finished_runs;
 mod flow;
@@ -713,6 +714,7 @@ impl Drop for Run {
 #[derive(Default)]
 pub(super) struct State {
     runs: HashMap<window::Id, Run>,
+    shell_slots: execution_slot::ShellSlots,
     spotlights: HashMap<window::Id, spotlight::Composer>,
     spotlight_exits: HashMap<window::Id, spotlight::Departure>,
     cursor_keys: u8,
