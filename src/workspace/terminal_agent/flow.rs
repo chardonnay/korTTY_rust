@@ -109,10 +109,12 @@ impl Workspace {
                 if value.len() <= 4096
                     && (run.phase == Phase::Setup
                         && matches!(run.mode, Mode::Run | Mode::Plan)
-                        || matches!(
-                            run.phase,
-                            Phase::DirectoryConfirmation | Phase::PlanReady
-                        )) =>
+                        || run.phase == Phase::DirectoryConfirmation
+                        || run.target.is_none()
+                            && matches!(
+                                run.phase,
+                                Phase::PlanReady | Phase::PlanImplementationReview
+                            )) =>
             {
                 if let Some(directory) = &mut run.manual_directory {
                     *directory = value;
@@ -270,6 +272,19 @@ impl Workspace {
                             }
                             Err(error) => return Err(error),
                         };
+                        if run.mode == Mode::Run
+                            && run.plan.is_some()
+                            && let Some(RunTarget::Attached(Target::Local {
+                                shell: expected_shell,
+                                directory: expected_directory,
+                            })) = &run.target
+                            && (&shell != expected_shell || &directory != expected_directory)
+                        {
+                            return Err(
+                                "The planned local shell or directory changed. Open a new plan."
+                                    .into(),
+                            );
+                        }
                         run.target = Some(RunTarget::Attached(Target::Local { shell, directory }));
                         run.review_initial_command()?;
                     }
@@ -379,6 +394,9 @@ impl Workspace {
                 {
                     return Err("The command did not complete. Review its partial result.".into());
                 }
+                if run.phase == Phase::Probe && self.offer_plan_sudo_preflight(run, result)? {
+                    return Ok(Task::none());
+                }
                 if run.commands.is_empty() {
                     if result.status != engine::Status::Exited(0) {
                         run.auto_approve_root = false;
@@ -448,13 +466,17 @@ impl Workspace {
         let live = run.binding.live()?;
         let (owner, pane) = self.current_run_pane(run)?;
         if pane.ssh.is_some() {
-            run.target = Some(RunTarget::Attached(Target::Ssh {
-                opener: pane
-                    .session
-                    .exec_opener()
-                    .ok_or("The authenticated command channel closed.")?,
-                directory: self.agent_remote_path(owner, live.session)?,
-            }));
+            if run.mode == Mode::Run && run.plan.is_some() && run.target.is_some() {
+                self.planning_probe_target(run)?;
+            } else {
+                run.target = Some(RunTarget::Attached(Target::Ssh {
+                    opener: pane
+                        .session
+                        .exec_opener()
+                        .ok_or("The authenticated command channel closed.")?,
+                    directory: self.agent_remote_path(owner, live.session)?,
+                }));
+            }
             run.review_initial_command()?;
             return Ok(Task::none());
         }
@@ -601,6 +623,9 @@ impl Workspace {
         } else {
             None
         };
+        let implementation_probe = (probe && run.uses_plan_sudo_probe())
+            .then(|| self.planning_probe_target(run))
+            .transpose()?;
         if matches!(run.purpose, Purpose::Agent(_)) {
             let _ = self.agent_transport(run)?;
         }
@@ -704,6 +729,9 @@ impl Workspace {
                                 policy.check()?;
                                 if let Some((policy, target)) = &plan_probe {
                                     policy.check()?;
+                                    target.check_worker()?;
+                                }
+                                if let Some(target) = &implementation_probe {
                                     target.check_worker()?;
                                 }
                                 if let Some(batch) = &batch {
@@ -883,8 +911,36 @@ impl Workspace {
 }
 
 impl Run {
+    pub(super) fn supports_native_local_sudo(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.mode == Mode::Run
+                && !self.swarm
+                && matches!(
+                    self.target,
+                    Some(RunTarget::Attached(Target::Local {
+                        shell: Shell::Posix(_),
+                        ..
+                    }))
+                )
+                && engine::password::local_available()
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    pub(super) fn uses_plan_sudo_probe(&self) -> bool {
+        self.mode == Mode::Run
+            && !self.swarm
+            && self.plan.is_some()
+            && (matches!(self.target, Some(RunTarget::Attached(Target::Ssh { .. })))
+                || self.supports_native_local_sudo())
+    }
+
     pub(super) fn environment_probe(&self, target: &RunTarget) -> &'static str {
-        if self.mode == Mode::Plan
+        if (self.mode == Mode::Plan || self.uses_plan_sudo_probe())
             && let RunTarget::Attached(target) = target
         {
             return engine::planning_probe::command(target);

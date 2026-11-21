@@ -1168,6 +1168,36 @@ handoff, request review and cancellation on native desktops.
 [Java Run tab](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/MainWindow.java#L12244)
 · [Java accepted-plan launch](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/MainWindow.java#L13209)
 
+Choose Implement this approach to request a report for a selected approach
+and review it for implementation. Accept plan and open Agent checks the
+original stream, profile and reviewed directory, then opens the separate
+Run with a fresh probe approval. Keep plan for later retains the report in
+Planning. Verify both actions and the report preview on native desktops.
+[Java implementation entry point](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AiAgentPlanTab.java#L561)
+
+An implementation run on SSH or in a native POSIX shell offers sudo
+authentication before its first model request when the fresh approved probe
+finds a non-root account with sudo and passwordless sudo is unavailable.
+The user can authorize manual password entry or continue to model review.
+SSH also offers a matching vault credential. The run retains its private
+authenticated terminal and continues to review each elevated command
+separately. Rejected preflight authentication permits up to three separately
+approved retries. The native local PTY starts from the opened directory
+descriptor and checks its working directory before privileged commands.
+Fedora ARM64 passed isolated SSH with simulated sudo and local system
+sudo/PAM for a synthetic account in a disposable namespace. Verify the
+desktop choices and policy changes, configured SSH sudo/PAM, native macOS
+sudo, and the Flatpak host route.
+[Java sudo preflight](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/core/TerminalAgentService.java#L1620)
+
+The Planning tab shows all clarifying questions together. Users can revise
+each suggested answer and add multiline details where allowed. Review
+answers prepares one masked model preview for the whole set. Users can edit
+their answers again from the approaches or final report. An unsuccessful
+revision keeps the previous approaches and report available. Verify scrolling,
+editing and returning to earlier results on native desktops.
+[Java clarification form](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AiAgentPlanTab.java#L269)
+
 The Planning tab accepts multiline refinement notes. Review revised
 approaches or draft the final report from a selected approach using the
 notes. Each request shows its masked content and rechecks the destination.
@@ -1196,8 +1226,10 @@ sudo capabilities where the shell supports them. Windows Command Prompt
 reports system, account and directory details. The planning tab shows a
 masked summary and includes the same snapshot in the reviews for questions,
 approaches and the final report. Users can also plan without a probe. The
-implementation run still requires its own review. Verify the live SSH
-planning path and the native desktop approval and skip flows.
+implementation run still requires its own review. The pinned OpenSSH test
+verifies the approved probe request, the reviewed model payload and rejection
+of a later send after a directory change. Verify the native desktop approval
+and skip flows.
 [Java planning probe](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AiAgentPlanTab.java#L251)
 
 Interactive Agent and Swarm member reviews include masked memory for the exact

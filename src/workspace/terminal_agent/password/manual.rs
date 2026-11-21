@@ -43,6 +43,17 @@ impl Prompt {
 }
 
 impl Workspace {
+    fn focused_sudo_surface(&self, id: window::Id) -> Option<window::Id> {
+        let hosted_owner = self.hosted_tool_owner(id);
+        let surface = hosted_owner.unwrap_or(id);
+        (self.native_focused_window == Some(surface)
+            && hosted_owner.is_none_or(|owner| {
+                self.active_hosted_tab(owner)
+                    .is_some_and(|tool| tool.instance == id)
+            }))
+        .then_some(surface)
+    }
+
     pub(super) fn open_manual_sudo_prompt(
         &self,
         id: window::Id,
@@ -54,10 +65,10 @@ impl Workspace {
             .ok_or("The sudo password request expired.")?;
         self.revalidate_password_sudo(run, pending)?;
         let (owner, _) = self.current_run_pane(run)?;
-        if pending.manual_open()
-            || self.native_focused_window != Some(id)
-            || self.owner_dialog(owner).is_some()
-        {
+        let Some(surface) = self.focused_sudo_surface(id) else {
+            return Ok(Task::none());
+        };
+        if pending.manual_open() || self.owner_dialog(owner).is_some() {
             return Ok(Task::none());
         }
         let pending = run
@@ -65,7 +76,13 @@ impl Workspace {
             .as_mut()
             .ok_or("The sudo password request expired.")?;
         let prompt = Prompt::new();
-        let task = prompt.open(id, run.epoch, &pending.scope.destination, &run.cancel);
+        let task = prompt.open(
+            surface,
+            id,
+            run.epoch,
+            &pending.scope.destination,
+            &run.cancel,
+        );
         pending.manual = Some(prompt);
         Ok(task)
     }
@@ -100,6 +117,7 @@ impl Prompt {
     #[cfg(target_os = "windows")]
     fn open(
         &self,
+        surface: window::Id,
         id: window::Id,
         epoch: u64,
         destination: &str,
@@ -111,7 +129,7 @@ impl Prompt {
         let cancel = cancel.clone();
         let destination = destination.to_owned();
         let (signal, ready) = async_channel::bounded(1);
-        let show = window::run(id, move |native| {
+        let show = window::run(surface, move |native| {
             let callback = signal.clone();
             let opened = native.window_handle().ok().is_some_and(|owner| {
                 kortty_windowing::open_password_prompt(
@@ -148,7 +166,36 @@ impl Prompt {
     }
 
     #[cfg(not(target_os = "windows"))]
-    fn open(&self, _: window::Id, _: u64, _: &str, _: &super::engine::Cancel) -> Task<Desktop> {
+    fn open(
+        &self,
+        _: window::Id,
+        _: window::Id,
+        _: u64,
+        _: &str,
+        _: &super::engine::Cancel,
+    ) -> Task<Desktop> {
         iced::widget::operation::focus(self.field.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workspace::tool_tabs::Kind;
+
+    #[test]
+    fn manual_sudo_uses_only_the_visible_hosted_agent_surface() {
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let first = window::Id::unique();
+        let second = window::Id::unique();
+        workspace.native_focused_window = Some(owner);
+        drop(workspace.host_tool(owner, Kind::TerminalAgent, first));
+        assert_eq!(workspace.focused_sudo_surface(first), Some(owner));
+        drop(workspace.host_tool(owner, Kind::TerminalAgent, second));
+        assert_eq!(workspace.focused_sudo_surface(first), None);
+        assert_eq!(workspace.focused_sudo_surface(second), Some(owner));
+        workspace.native_focused_window = Some(window::Id::unique());
+        assert_eq!(workspace.focused_sudo_surface(second), None);
     }
 }

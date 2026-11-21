@@ -1571,7 +1571,7 @@ Interactive Agent and Swarm member reviews include masked AI Memory for the sele
 
 A standalone agent on an attached SSH pane can propose a typed passwordless sudo command. The activity window shows the complete command and requires a separate approval. The remote account must allow that exact invocation as root without a password. The run stops if the elevated command fails.
 
-Password sudo is available for a standalone agent on an attached SSH connection. Review each exact command, directory, SSH account and host key. The first approved password sudo step opens a private SSH pseudoterminal for the run. If sudo requests a password, enter it once in the masked prompt or authorize one submission from a matching credential in the unlocked vault. Later approved password sudo steps use the same terminal and the server's sudo ticket. Each step contributes its exit status to the agent transcript. The terminal closes when the run finishes or is cancelled.
+Password sudo is available for a standalone agent on an attached SSH connection or in a native POSIX shell with system sudo. Review each exact command and directory. SSH reviews also show the account and host key. The first approved password sudo step opens a private pseudoterminal for the run. If sudo requests a password, enter it once in the masked prompt. SSH also offers one submission from a matching credential in the unlocked vault. Later approved password sudo steps reuse the same terminal and its sudo ticket. Each step contributes its exit status to the agent transcript. The terminal closes when the run finishes or is cancelled.
 
 The same flow works with an isolated SSH worker and in Incognito. The SSH server must allow pseudoterminals and the sudo policy must allow the ticket to be reused. If the ticket expires or sudo rejects an invocation, the run stops. A desktop notice can return to the current password request when Agent notices are enabled.
 
@@ -1583,9 +1583,15 @@ Select one filename in the terminal to include a text file in an Ask request. Qu
 
 Use **AI Manager → General → Default Agent presentation** to choose where a new interactive Run opens, including a run from an accepted plan. **Chat tab** gives the run its own tab with activity, request previews and approvals. The run stays bound to the original terminal pane. Closing the tab cancels its active operation. **Terminal window** uses the terminal and the Activity window.
 
-In the **AI Planning** tab, enter additional requirements to refine the approaches or the final report. **Review revised approaches…** opens a masked request preview. **Draft plan for this approach** includes the current notes and selected approach in a separate preview. You can revise again after reviewing the final report.
-
 Choose **Start planning** to review a fixed environment probe when the source terminal and policy allow it. The planning tab summarizes the result. Each model request shows the masked snapshot for review. Choose **Plan without environment details** to start directly with the planning questions.
+
+Review all planning questions together. Select a suggested answer for each question and add multiline details where offered. **Review answers…** prepares a masked preview before sending. Use **Edit answers…** to revise the answers from the approaches or final report.
+
+In the **AI Planning** tab, enter additional requirements to refine the approaches or the final report. **Review revised approaches…** opens a masked request preview. **Draft plan** includes the current notes and selected approach in a separate preview. You can revise again after reviewing the final report.
+
+Choose **Implement this approach…** to prepare a report for implementation. Review the model request and then the completed report. **Accept plan and open Agent** starts a separate run at its environment-probe approval. **Keep plan for later** returns to the completed plan.
+
+When the approved implementation probe finds that the native local or SSH account needs a sudo password, the run offers sudo authentication before the first model request. Choose manual password entry or **Continue to model review**. SSH also offers an eligible vault credential. If sudo rejects the authentication, you can approve up to three retries. Successful authentication prepares the run’s private terminal. Each elevated command keeps its own approval.
 
 For an interactive Run without an accepted plan, **AI Manager → General → Agent complexity check** controls whether the Agent offers approaches after the environment probe. **For complex requests** reviews an assessment and offers approaches when the model identifies a meaningful choice. **Always** offers approaches for simple requests too. **Never** goes directly to the Agent request review. The assessment has its own send confirmation. Choose a suggested approach, enter your own, or continue as requested. Any additional instructions appear in the next masked request review. When the assessment fails or the choice expires after ten minutes, the original request is available for review. Managed installations can set `triage = "auto"`, `"always"` or `"never"` under `[rule.ai-memory]`. Planning permission is required for the assessment.
 

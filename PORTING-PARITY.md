@@ -16,6 +16,90 @@ open until a result is recorded for the tested revision and environment. Both
 Mosh modes are out of scope. The editor has a reduced native scope with structure
 navigation for classes, functions, variables, and placeholders.
 
+## November 21 Local POSIX sudo for the Terminal Agent
+
+A standalone Agent can review password sudo on a native POSIX shell. An
+accepted plan offers manual authentication before its first model request
+when the fresh probe identifies a non-root account that needs a sudo password.
+The local run starts an owned PTY from the verified directory descriptor.
+Authentication prepares that terminal. A separately reviewed elevated
+command uses the same terminal and checks its physical working directory.
+
+Apple Silicon passed 239 selected tests, four optional OpenSSH regressions,
+one optional local directory-replacement regression and 14 local PTY tests.
+Fedora ARM64 passed the same Agent, OpenSSH and directory-replacement
+checks and 13 local PTY tests. The new PTY regression used a simulated sudo
+dialogue and verified that the approved input reached the authenticated
+terminal from the original directory. A separate Fedora test with system
+sudo and PAM in a disposable namespace rejected a wrong password, accepted
+the test account's password, and reused the authenticated PTY for a
+separately approved command. Five pinned OpenSSH tests passed, including
+preflight with simulated sudo through the isolated worker. Windows ARM64
+passed strict workspace Clippy. Configured SSH sudo/PAM, native desktop
+acceptance and the Flatpak host route remain under A2.
+[Apple Silicon tests](target/verification/20261121-local-sudo-macos-final.log)
+· [Fedora ARM64 tests](target/verification/20261121-local-sudo-fedora-final.log)
+· [Windows ARM64 Clippy](target/verification/20261121-local-sudo-windows-clippy-final.log)
+
+## November 21 SSH sudo preflight for an accepted plan
+
+The separate implementation run uses a fresh reviewed probe to identify a
+non-root SSH account with sudo and no passwordless access. It offers an
+explicit manual or vault password review before its first model request,
+with up to three reviewed retries and an option to continue to model review.
+Successful authentication prepares the run's private SSH terminal. The first
+elevated command still requires its own approval. A hosted Agent tab uses
+its visible parent window for manual password entry.
+
+Apple Silicon passed 238 selected tests with seven ignored and passed four
+separately enabled OpenSSH regressions. The new live SSH fixture simulated
+sudo rejection and acceptance. It verified the retry, the skip path, the
+separate command review and reuse of the authenticated terminal. Windows
+ARM64 passed strict workspace Clippy. The Fedora follow-up also covers
+simulated sudo on the isolated SSH route. Configured SSH sudo/PAM and
+interactive desktop password entry remain under A2.
+[Apple Silicon tests](target/verification/20261121-planning-sudo-macos-final.log)
+· [Windows ARM64 Clippy](target/verification/20261121-planning-sudo-windows-clippy-final.log)
+
+## November 21 Start implementation from a planning approach
+
+Implement this approach opens the report request preview for the selected
+approach. The completed report has an explicit acceptance action that opens
+a separate Agent run at the probe review. Keep plan for later returns the
+report to the Planning tab. An existing review epoch cannot accept a newly
+completed report. The handoff rechecks the original stream and profile and
+retains the previously reviewed directory when Planning captured one.
+
+Apple Silicon passed 232 selected tests with six ignored. Three separately
+enabled OpenSSH tests passed. They checked the exact probe and model payloads,
+and verified that changing the SSH directory blocks both the later model
+send and implementation of an already drafted report. The local fixture
+verified the accepted directory and rejected a late change. Strict workspace
+Clippy passed on Windows ARM64. Native desktop interaction and the conditional
+sudo preflight remain under A2.
+[Apple Silicon tests](target/verification/20261121-planning-implementation-macos-final.log)
+· [Windows ARM64 Clippy](target/verification/20261121-planning-implementation-windows-clippy-final.log)
+
+## November 21 Planning clarification form
+
+The Planning tab shows all clarification questions together. Each question
+offers its suggested answers and an optional multiline editor where allowed.
+The first suggestion is selected initially. Review answers prepares one
+masked model preview. Users can reopen the form from the approaches or
+report and return to those results. A failed revision keeps the previous
+results and the answer draft available. A successful revision uses the new
+answers for later planning stages.
+
+Apple Silicon passed 232 selected tests with five ignored. The loopback
+provider tests verified exact reviewed payloads, multiline masking, stale
+events and preservation of the previous approaches on a failed revision.
+The separately enabled pinned OpenSSH test verified the exact probe command
+and first model payload. A directory change prevented the next model send.
+Strict workspace Clippy passed on Windows ARM64. Native desktop interaction
+remains under A2.
+[Apple Silicon tests](target/verification/20261121-planning-answers-macos-final.log)
+· [Windows ARM64 Clippy](target/verification/20261121-planning-answers-windows-clippy-final.log)
+
 ## November 21 Planning environment probe
 
 The Planning tab offers an environmental probe before drafting its questions

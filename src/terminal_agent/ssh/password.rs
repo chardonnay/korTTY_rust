@@ -15,20 +15,65 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::{ssh_connection::ExecOpener, ssh_worker};
 
+#[cfg(unix)]
+use super::super::LocalDirectory;
 use super::super::runner::{COMMAND_LIMIT, Cancel, POLL, Status};
 use super::{quote, validate_remote_command};
+
+pub(crate) const AUTHENTICATION_REJECTED: &str =
+    "Sudo authentication failed. No approved command was run.";
+
+#[cfg(unix)]
+mod local;
+
+#[cfg(unix)]
+pub(crate) fn local_available() -> bool {
+    local::supported()
+}
+
+#[derive(Clone)]
+pub(crate) enum Endpoint {
+    Ssh(ExecOpener),
+    #[cfg(unix)]
+    Local(LocalDirectory),
+}
+
+impl Endpoint {
+    pub(crate) fn is_local(&self) -> bool {
+        #[cfg(unix)]
+        {
+            matches!(self, Self::Local(_))
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    pub(crate) fn matches(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Ssh(left), Self::Ssh(right)) => left.same_connection(right),
+            #[cfg(unix)]
+            (Self::Local(left), Self::Local(right)) => left == right,
+            #[cfg(unix)]
+            _ => false,
+        }
+    }
+}
 
 pub(crate) struct Command {
     wire: String,
 }
 
 impl Command {
-    pub(crate) fn new(directory: &str, command: &str) -> Result<Self, String> {
+    pub(crate) fn new(directory: &str, command: &str, local: bool) -> Result<Self, String> {
         validate_remote_command(directory, command)?;
-        let payload = format!(
-            "exec </dev/null\ncd {} || exit\n{command}",
-            quote(directory)
-        );
+        let directory = quote(directory);
+        let payload = if local {
+            format!("exec </dev/null\n[ \"$(/bin/pwd -P)\" = {directory} ] || exit 97\n{command}")
+        } else {
+            format!("exec </dev/null\ncd {directory} || exit\n{command}")
+        };
         let wire = format!(
             "exec /usr/bin/sudo -n -u root -- /bin/sh -c {}",
             quote(&payload)
@@ -45,7 +90,7 @@ impl Command {
 
     pub(crate) fn run_with_terminal(
         self,
-        opener: ExecOpener,
+        endpoint: Endpoint,
         terminal: Option<Terminal>,
         cancel: Cancel,
         authorized: impl Fn() -> bool + Clone + Send + Sync + 'static,
@@ -57,25 +102,16 @@ impl Command {
             return Ok((Status::Cancelled, None));
         }
         let mut terminal = match terminal {
-            Some(terminal) if opener.same_connection(&terminal.opener) => terminal,
-            Some(_) => return Err("The sudo terminal belongs to a different SSH connection."),
-            None => match Terminal::open(opener, permitted.clone(), answers, challenge) {
-                Ok(terminal) => terminal,
-                Err(Status::Cancelled) => return Ok((Status::Cancelled, None)),
-                Err(Status::TimedOut) => {
-                    return Err("Timed out while validating sudo in the SSH terminal.");
-                }
-                Err(Status::Exited(124)) => {
-                    return Err("The SSH server did not allocate a sudo pseudoterminal.");
-                }
-                Err(Status::Exited(125)) => {
-                    return Err("Could not disable echo on the SSH sudo pseudoterminal.");
-                }
-                Err(Status::Exited(_)) => {
-                    return Err("Sudo authentication failed. No approved command was run.");
-                }
-                Err(_) => return Err("Could not validate sudo in the SSH terminal."),
-            },
+            Some(terminal) if endpoint.matches(&terminal.endpoint) => terminal,
+            Some(_) => return Err("The sudo terminal belongs to a different target."),
+            None => {
+                let Some(terminal) =
+                    Terminal::authenticate(endpoint, permitted.clone(), answers, challenge)?
+                else {
+                    return Ok((Status::Cancelled, None));
+                };
+                terminal
+            }
         };
         let request = new_token()?;
         let status = terminal.execute(&request, &self.wire, &permitted);
@@ -85,7 +121,7 @@ impl Command {
 }
 
 pub(crate) struct Terminal {
-    opener: ExecOpener,
+    endpoint: Endpoint,
     streams: Streams,
 }
 
@@ -100,19 +136,43 @@ enum Streams {
         reader: ssh_worker::Reader,
         writer: ssh_worker::Writer,
     },
+    #[cfg(unix)]
+    Local(Box<local::Streams>),
 }
 
 impl Terminal {
+    pub(crate) fn authenticate(
+        endpoint: Endpoint,
+        permitted: impl Fn() -> bool + Clone + Send + Sync + 'static,
+        answers: async_channel::Receiver<SensitiveLine>,
+        challenge: impl FnOnce() -> bool,
+    ) -> Result<Option<Self>, &'static str> {
+        if !permitted() {
+            return Ok(None);
+        }
+        match Self::open(endpoint, permitted, answers, challenge) {
+            Ok(terminal) => Ok(Some(terminal)),
+            Err(Status::Cancelled) => Ok(None),
+            Err(Status::TimedOut) => {
+                Err("Timed out while validating sudo in the private terminal.")
+            }
+            Err(Status::Exited(124)) => Err("Could not allocate a sudo pseudoterminal."),
+            Err(Status::Exited(125)) => Err("Could not disable echo on the sudo pseudoterminal."),
+            Err(Status::Exited(_)) => Err(AUTHENTICATION_REJECTED),
+            Err(_) => Err("Could not validate sudo in the private terminal."),
+        }
+    }
+
     fn open(
-        opener: ExecOpener,
+        endpoint: Endpoint,
         permitted: impl Fn() -> bool + Clone + Send + Sync + 'static,
         answers: async_channel::Receiver<SensitiveLine>,
         challenge: impl FnOnce() -> bool,
     ) -> Result<Self, Status> {
         let mut nonce = [0; 16];
         getrandom::fill(&mut nonce).map_err(|_| Status::TransportFailed)?;
-        let streams = match &opener {
-            ExecOpener::Direct(direct) => {
+        let streams = match &endpoint {
+            Endpoint::Ssh(ExecOpener::Direct(direct)) => {
                 let opening = permitted.clone();
                 let mut lease = direct
                     .open_pty_cancellable(&sudo_pty::command(nonce), move || !opening())
@@ -135,7 +195,7 @@ impl Terminal {
                     writer,
                 }
             }
-            ExecOpener::Worker(worker) => {
+            Endpoint::Ssh(ExecOpener::Worker(worker)) => {
                 let mut channel = open_worker(worker, nonce, permitted, answers, challenge)?;
                 let reader = channel.take_reader().ok_or(Status::TransportFailed)?;
                 let writer = channel.take_writer().ok_or(Status::TransportFailed)?;
@@ -145,8 +205,12 @@ impl Terminal {
                     writer,
                 }
             }
+            #[cfg(unix)]
+            Endpoint::Local(directory) => Streams::Local(Box::new(local::open(
+                directory, nonce, permitted, answers, challenge,
+            )?)),
         };
-        Ok(Self { opener, streams })
+        Ok(Self { endpoint, streams })
     }
 
     fn execute(&mut self, token: &str, wire: &str, permitted: &impl Fn() -> bool) -> Status {
@@ -202,6 +266,8 @@ impl Streams {
                 result
             }
             Self::Worker { writer, .. } => writer.write_timeout(bytes, POLL),
+            #[cfg(unix)]
+            Self::Local(streams) => streams.write(bytes),
         }
     }
 
@@ -209,6 +275,8 @@ impl Streams {
         match self {
             Self::Direct { reader, .. } => reader.read_timeout(bytes, POLL),
             Self::Worker { reader, .. } => reader.read_timeout(bytes, POLL),
+            #[cfg(unix)]
+            Self::Local(streams) => streams.read(bytes),
         }
     }
 }
@@ -312,7 +380,7 @@ mod tests {
 
     #[test]
     fn password_sudo_reviews_only_the_noninteractive_command_and_quoted_directory() {
-        let command = Command::new("/tmp/it's here", "printf '%s' '$literal'").unwrap();
+        let command = Command::new("/tmp/it's here", "printf '%s' '$literal'", false).unwrap();
         assert!(
             command
                 .wire()
@@ -320,8 +388,8 @@ mod tests {
         );
         assert!(!command.wire().contains("-k"));
         assert!(!command.wire().contains("-S"));
-        assert!(Command::new("relative", "id").is_err());
-        assert!(Command::new("/tmp", "echo ***").is_err());
+        assert!(Command::new("relative", "id", false).is_err());
+        assert!(Command::new("/tmp", "echo ***", false).is_err());
     }
 
     #[test]

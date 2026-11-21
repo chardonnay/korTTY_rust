@@ -145,6 +145,7 @@ impl Control {
         size: Size,
         term: &str,
         options: &LaunchOptions,
+        directory: Option<File>,
     ) -> io::Result<(Self, PtyReader, PtyWriter)> {
         #[cfg(target_os = "linux")]
         let host_shell = crate::flatpak::routes_to_host(options);
@@ -264,6 +265,9 @@ impl Control {
         // system calls. std sets up the slave on fd 0 before running it.
         unsafe {
             command.pre_exec(move || {
+                if let Some(directory) = &directory {
+                    os_result(libc::fchdir(directory.as_raw_fd()))?;
+                }
                 os_result(libc::setsid())?;
                 #[cfg(target_os = "macos")]
                 let request = libc::c_ulong::from(libc::TIOCSCTTY);
@@ -441,6 +445,20 @@ pub struct PtyReader {
     signal: UnixStream,
 }
 
+impl PtyReader {
+    /// Reads only the bytes currently available from the PTY.
+    pub fn read_nonblocking(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let file = self.file.lock().unwrap_or_else(|err| err.into_inner());
+        match file.as_ref() {
+            Some(mut file) => match file.read(buffer) {
+                Err(err) if err.raw_os_error() == Some(libc::EIO) => Ok(0),
+                result => result,
+            },
+            None => Ok(0),
+        }
+    }
+}
+
 impl Read for PtyReader {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         if buffer.is_empty() {
@@ -466,6 +484,18 @@ impl Read for PtyReader {
 pub struct PtyWriter {
     file: SharedFile,
     signal: UnixStream,
+}
+
+impl PtyWriter {
+    /// Writes to the PTY without waiting for the child to consume input.
+    pub fn write_nonblocking(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let file = self.file.lock().unwrap_or_else(|err| err.into_inner());
+        let mut file = file.as_ref().ok_or_else(closed)?;
+        match file.write(buffer) {
+            Err(err) if err.raw_os_error() == Some(libc::EIO) => Err(closed()),
+            result => result,
+        }
+    }
 }
 
 impl Write for PtyWriter {

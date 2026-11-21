@@ -183,10 +183,8 @@ fn planning_requires_fixed_probe_approval_and_reuses_the_masked_snapshot() {
     finish_review(&mut workspace, questions);
     let run = &workspace.terminal_agents.runs[&id];
     assert!(run.phase == Phase::PlanQuestions);
-    let options = workspace.update_terminal_agent(
-        id,
-        RunMessage::Planning(Message::Answer(run.epoch, "Brief".into())),
-    );
+    let options = workspace
+        .update_terminal_agent(id, RunMessage::Planning(Message::SubmitAnswers(run.epoch)));
     finish_review(&mut workspace, options);
     let (epoch, messages) = reviewed_messages(&workspace, id);
     let payload: serde_json::Value = serde_json::from_str(&messages[1]).unwrap();
@@ -229,7 +227,6 @@ fn planning_requires_fixed_probe_approval_and_reuses_the_masked_snapshot() {
     let _ = workspace.sessions[&source].session.stop().recv_blocking();
 }
 
-#[cfg(unix)]
 fn reply_with_plan_json(
     socket: &mut std::io::BufReader<std::net::TcpStream>,
     answer: serde_json::Value,
@@ -239,6 +236,96 @@ fn reply_with_plan_json(
         .get_mut()
         .write_all(fixture_http_response("200 OK", "", &body).as_bytes())
         .unwrap();
+}
+
+#[test]
+fn failed_planning_answer_revision_keeps_the_previous_approaches() {
+    let _exclusive = exclusive_run();
+    let (listener, _) = listener();
+    let profile = Profile::new();
+    let root = profile.0.canonicalize().unwrap();
+    let (mut workspace, owner, source) =
+        fixture(&root, listener.local_addr().unwrap(), CONTEXT_LIMIT);
+    let id = open_plan(&mut workspace, owner, source);
+    no_task(
+        workspace.update_terminal_agent(id, RunMessage::Goal("Plan a service inventory".into())),
+    );
+    let start = workspace.update_terminal_agent(id, RunMessage::StartPlanWithoutProbe);
+    finish_review(&mut workspace, start);
+
+    let send = |workspace: &mut Workspace, answer, expected_answers| {
+        let (epoch, messages) = reviewed_messages(workspace, id);
+        let payload: serde_json::Value = serde_json::from_str(&messages[1]).unwrap();
+        assert_eq!(payload["answers"], expected_answers);
+        no_model_request(&listener);
+        let pending = send_review(workspace, id, epoch);
+        let mut socket = accept(&listener);
+        assert_eq!(request(&mut socket)["messages"][1]["content"], messages[1]);
+        reply_with_plan_json(&mut socket, answer);
+        drop(socket);
+        finish_review(workspace, pending);
+    };
+    send(
+        &mut workspace,
+        json!({"status":"questions","summary":"Scope","userMessage":"Choose scope","questions":[
+            {"id":"q1","question":"Which scope?","options":["Local","Test"],"allowCustomAnswer":false}
+        ]}),
+        json!([]),
+    );
+    let submit = |workspace: &mut Workspace| {
+        let epoch = workspace.terminal_agents.runs[&id].epoch;
+        let task = workspace
+            .update_terminal_agent(id, RunMessage::Planning(Message::SubmitAnswers(epoch)));
+        finish_review(workspace, task);
+    };
+    let approach = |title| {
+        json!({"status":"options","summary":"Options","userMessage":"Choose approach","options":[
+            {"title":title,"summary":"Inspect first","feasibility":"Records are available","risks":[],"prerequisites":[],"steps":["Inspect"],"alternatives":[]}
+        ]})
+    };
+    submit(&mut workspace);
+    send(
+        &mut workspace,
+        approach("Original approach"),
+        json!(["Local"]),
+    );
+
+    let epoch = workspace.terminal_agents.runs[&id].epoch;
+    no_task(workspace.update_terminal_agent(id, RunMessage::Planning(Message::EditAnswers(epoch))));
+    let epoch = workspace.terminal_agents.runs[&id].epoch;
+    no_task(
+        workspace
+            .update_terminal_agent(id, RunMessage::Planning(Message::SelectAnswer(epoch, 0, 1))),
+    );
+    submit(&mut workspace);
+    send(
+        &mut workspace,
+        json!({"status":"blocked","summary":"Unavailable","userMessage":"Please retry."}),
+        json!(["Test"]),
+    );
+    let run = &workspace.terminal_agents.runs[&id];
+    assert!(run.phase == Phase::PlanQuestions);
+    assert_eq!(run.notice, "Please retry.");
+    let flow = run.planning.as_ref().unwrap();
+    assert_eq!(flow.answers, ["Local"]);
+    assert_eq!(flow.options[0].title, "Original approach");
+
+    submit(&mut workspace);
+    send(
+        &mut workspace,
+        approach("Revised approach"),
+        json!(["Test"]),
+    );
+    let run = &workspace.terminal_agents.runs[&id];
+    assert!(run.phase == Phase::PlanOptions);
+    let draft =
+        workspace.update_terminal_agent(id, RunMessage::Planning(Message::Choose(run.epoch, 0)));
+    finish_review(&mut workspace, draft);
+    let (_, messages) = reviewed_messages(&workspace, id);
+    let payload: serde_json::Value = serde_json::from_str(&messages[1]).unwrap();
+    assert_eq!(payload["answers"], json!(["Test"]));
+    assert_eq!(payload["selectedApproach"]["title"], "Revised approach");
+    no_model_request(&listener);
 }
 
 fn send_review(workspace: &mut Workspace, id: window::Id, epoch: u64) -> Task<Desktop> {
@@ -517,7 +604,10 @@ fn terminal_agent_planning_walks_review_steps_and_reopens_without_execution() {
         let report = json!({"status":"final_plan","title":"Inspect service","summary":"Record findings",
             "userMessage":"Review the final plan","prerequisites":[],"steps":["Read the configuration"],"risks":[],"successCriteria":["Find the configured port"]});
         for (index, result) in [
-            json!({"status":"questions","summary":"Clarify","userMessage":"Choose environment","questions":[{"id":"q1","question":"Which environment? API_KEY=private-plan-question","options":["Local","Test"],"allowCustomAnswer":false}]}),
+            json!({"status":"questions","summary":"Clarify","userMessage":"Choose environment","questions":[
+                {"id":"q1","question":"Which environment? API_KEY=private-plan-question","options":["Local","Test"],"allowCustomAnswer":true},
+                {"id":"q2","question":"What level of detail?","options":["Brief","Detailed"],"allowCustomAnswer":false}
+            ]}),
             report.clone(), // Wrong status for Options, which can repair once.
             json!({"status":"options","summary":"Options","userMessage":"Choose approach","options":[{"title":"Review files","summary":"Inspect before changes","feasibility":"Files are available","risks":[],"prerequisites":[],"steps":["Inspect"],"alternatives":[]}]}),
             json!({"status":"blocked","summary":"Unavailable","userMessage":"The revision is unavailable."}),
@@ -551,7 +641,11 @@ fn terminal_agent_planning_walks_review_steps_and_reopens_without_execution() {
             assert_eq!(request.contains("reviewedContext"), matches!(index, 2 | 6));
             if index >= 1 {
                 assert!(request.contains("Local"));
+                assert!(request.contains("Detailed"));
+                assert!(request.contains("Second answer line"));
             }
+            assert!(!request.contains("private-answer-note"));
+            assert!(!request.contains("disallowed answer"));
             if matches!(index, 3 | 4) {
                 assert!(request.contains("Keep service read-only"));
                 assert!(request.contains("Use local metadata"));
@@ -639,19 +733,40 @@ fn terminal_agent_planning_walks_review_steps_and_reopens_without_execution() {
     let run = &workspace.terminal_agents.runs[&id];
     assert!(run.phase == Phase::PlanQuestions && run.target.is_none());
     let epoch = run.epoch;
+    let paste =
+        |notes: &str| text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(notes.into())));
+    let answer =
+        |question, action| RunMessage::Planning(Message::EditCustomAnswer(epoch, question, action));
+    no_task(
+        workspace
+            .update_terminal_agent(id, RunMessage::Planning(Message::SubmitAnswers(epoch - 1))),
+    );
+    no_task(
+        workspace
+            .update_terminal_agent(id, RunMessage::Planning(Message::SelectAnswer(epoch, 1, 1))),
+    );
+    no_task(workspace.update_terminal_agent(id, answer(1, paste("disallowed answer"))));
     no_task(workspace.update_terminal_agent(
         id,
-        RunMessage::Planning(Message::Answer(epoch - 1, "Local".into())),
+        answer(0, paste(&"x".repeat(MAX_CUSTOM_ANSWER_BYTES + 1))),
+    ));
+    no_task(workspace.update_terminal_agent(
+        id,
+        answer(0, paste("API_KEY=private-answer-note\nSecond answer line")),
     ));
     assert!(workspace.terminal_agents.runs[&id].phase == Phase::PlanQuestions);
-    let options = workspace.update_terminal_agent(
-        id,
-        RunMessage::Planning(Message::Answer(epoch, "Local".into())),
-    );
+    no_model_request(&listener);
+    let options =
+        workspace.update_terminal_agent(id, RunMessage::Planning(Message::SubmitAnswers(epoch)));
     finish_review(&mut workspace, options);
     let (approval, messages) = reviewed_messages(&workspace, id);
     assert!(messages[0].contains(LOCAL_GUIDANCE));
-    assert!(messages[1].contains("Local"));
+    let answers = json!([
+        "Local\nAdditional details\nAPI_KEY=***\nSecond answer line",
+        "Detailed"
+    ]);
+    let payload: serde_json::Value = serde_json::from_str(&messages[1]).unwrap();
+    assert_eq!(payload["answers"], answers);
     assert!(messages[1].contains("API_KEY=***"));
     assert!(!messages[1].contains("private-plan-question"));
     no_model_request(&listener);
@@ -660,10 +775,27 @@ fn terminal_agent_planning_walks_review_steps_and_reopens_without_execution() {
     finish(&mut workspace, options, owner);
     let run = &workspace.terminal_agents.runs[&id];
     assert!(run.phase == Phase::PlanOptions && run.target.is_none());
+    let options_epoch = run.epoch;
+    no_task(workspace.update_terminal_agent(
+        id,
+        RunMessage::Planning(Message::EditAnswers(options_epoch)),
+    ));
+    let run = &workspace.terminal_agents.runs[&id];
+    assert!(run.phase == Phase::PlanQuestions);
+    let answer_epoch = run.epoch;
+    no_task(workspace.update_terminal_agent(
+        id,
+        RunMessage::Planning(Message::SelectAnswer(answer_epoch, 0, 1)),
+    ));
+    no_task(workspace.update_terminal_agent(
+        id,
+        RunMessage::Planning(Message::ReturnToResults(answer_epoch)),
+    ));
+    let run = &workspace.terminal_agents.runs[&id];
+    assert!(run.phase == Phase::PlanOptions);
+    assert_ne!(run.epoch, options_epoch);
     let initial_options = run.epoch;
     let edit = |epoch, action| RunMessage::Planning(Message::EditRefinement(epoch, action));
-    let paste =
-        |notes: &str| text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(notes.into())));
     no_task(workspace.update_terminal_agent(
         id,
         edit(
@@ -687,7 +819,7 @@ fn terminal_agent_planning_walks_review_steps_and_reopens_without_execution() {
         revised["refinement"],
         "Keep service read-only.\nAPI_KEY=***\nUse local metadata."
     );
-    assert_eq!(revised["answers"], json!(["Local"]));
+    assert_eq!(revised["answers"], answers);
     assert!(revised["selectedApproach"].is_null());
     no_task(workspace.update_terminal_agent(id, edit(initial_options, paste("Unreviewed notes"))));
     assert_eq!(reviewed_messages(&workspace, id).1, messages);
@@ -736,8 +868,10 @@ fn terminal_agent_planning_walks_review_steps_and_reopens_without_execution() {
             paste("Keep the unit name unchanged.\nAPI_KEY=private-report-note"),
         ),
     ));
-    let report =
-        workspace.update_terminal_agent(id, RunMessage::Planning(Message::Choose(epoch, 0)));
+    let report = workspace.update_terminal_agent(
+        id,
+        RunMessage::Planning(Message::PrepareImplementation(epoch, 0)),
+    );
     finish_review(&mut workspace, report);
     let (approval, messages) = reviewed_messages(&workspace, id);
     assert!(messages[0].contains(LOCAL_GUIDANCE));
@@ -750,13 +884,15 @@ fn terminal_agent_planning_walks_review_steps_and_reopens_without_execution() {
         drafted["refinement"],
         "Keep the unit name unchanged.\nAPI_KEY=***"
     );
+    no_task(workspace.update_terminal_agent(id, RunMessage::Implement(approval)));
+    assert_eq!(workspace.terminal_agents.runs.len(), 1);
     no_model_request(&listener);
     reviews.send(messages).unwrap();
     let report = send_review(&mut workspace, id, approval);
     finish(&mut workspace, report, owner);
     planner.join().unwrap();
     let run = &workspace.terminal_agents.runs[&id];
-    assert!(run.phase == Phase::PlanReady && run.target.is_none());
+    assert!(run.phase == Phase::PlanImplementationReview && run.target.is_none());
     assert_eq!(run.presentation.model_usage.attempts().count(), 7);
     assert_eq!(run.presentation.model_usage.total(), Some(28));
     assert!(
@@ -765,6 +901,15 @@ fn terminal_agent_planning_walks_review_steps_and_reopens_without_execution() {
             .unwrap()
             .contains("Find the configured port")
     );
+    assert_eq!(workspace.terminal_agents.runs.len(), 1);
+    let review_epoch = run.epoch;
+    no_task(
+        workspace
+            .update_terminal_agent(id, RunMessage::Planning(Message::KeepReport(review_epoch))),
+    );
+    no_task(workspace.update_terminal_agent(id, RunMessage::Implement(review_epoch)));
+    assert!(workspace.terminal_agents.runs[&id].phase == Phase::PlanReady);
+    assert_eq!(workspace.terminal_agents.runs.len(), 1);
 
     let save = workspace.update_terminal_agent(id, RunMessage::Planning(Message::Save));
     finish(&mut workspace, save, owner);
@@ -861,12 +1006,22 @@ fn accepted_plan_uses_the_current_chat_tab_preference_and_keeps_the_exact_source
     };
     let mut flow = Flow::new(destination);
     flow.report = Some(report.clone());
+    let shell = super::super::flow::local_agent_shell(&workspace.sessions[&source]).unwrap();
+    let directory = crate::terminal_agent::LocalDirectory::capture(root.clone()).unwrap();
     let plan = workspace.terminal_agents.runs.get_mut(&planner).unwrap();
     plan.goal = "Inspect service".into();
     plan.plan = Some(report.render());
     plan.planning = Some(flow);
     plan.manual_directory = Some(root.to_str().unwrap().into());
-    let epoch = plan.next(Phase::PlanReady, "Plan ready");
+    plan.target = Some(RunTarget::Attached(crate::terminal_agent::Target::Local {
+        shell,
+        directory: directory.clone(),
+    }));
+    let epoch = plan.next(Phase::PlanImplementationReview, "Review the plan");
+    no_task(workspace.update_terminal_agent(
+        planner,
+        RunMessage::DirectoryChoice(root.join("unreviewed").to_str().unwrap().into()),
+    ));
     no_task(workspace.update_terminal_agent(planner, RunMessage::Implement(epoch - 1)));
     assert_eq!(workspace.terminal_agents.runs.len(), 1);
     let implement = workspace.update_terminal_agent(planner, RunMessage::Implement(epoch));
@@ -877,6 +1032,11 @@ fn accepted_plan_uses_the_current_chat_tab_preference_and_keeps_the_exact_source
     finish(&mut workspace, implement, owner);
     let state = &workspace.terminal_agents.runs[&run];
     assert!(state.phase == Phase::ProbeApproval);
+    assert!(matches!(
+        &state.target,
+        Some(RunTarget::Attached(crate::terminal_agent::Target::Local { directory: current, .. }))
+            if current == &directory
+    ));
     assert_eq!(state.binding.live().unwrap().session, source);
     assert_eq!(state.plan.as_deref(), Some(report.render().as_str()));
     assert_eq!(state.profile().unwrap().id, 1);
@@ -890,6 +1050,20 @@ fn accepted_plan_uses_the_current_chat_tab_preference_and_keeps_the_exact_source
     no_model_request(&listener);
     drop(workspace.close_terminal_agent(planner));
     assert!(workspace.terminal_agents.runs[&run].phase == Phase::ProbeApproval);
+
+    let changed = root.join("unreviewed");
+    std::fs::create_dir(&changed).unwrap();
+    let changed = crate::terminal_agent::LocalDirectory::capture(changed).unwrap();
+    let epoch = workspace
+        .terminal_agents
+        .runs
+        .get_mut(&run)
+        .unwrap()
+        .next(Phase::Directory, "Checking the local directory");
+    drop(workspace.update_terminal_agent(run, RunMessage::Directory(epoch, Ok(changed))));
+    let state = &workspace.terminal_agents.runs[&run];
+    assert!(state.phase == Phase::Blocked && state.notice.contains("directory changed"));
+    no_model_request(&listener);
 }
 
 #[test]

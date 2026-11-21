@@ -1,5 +1,6 @@
 use std::fs;
 use std::net::{SocketAddr, TcpListener};
+use std::path::Path;
 
 use kortty_ssh::{Authentication, Connect, Endpoint, SshSession};
 
@@ -9,6 +10,7 @@ use crate::ssh_connection::Connected;
 use crate::ssh_worker::OpenSshFixture;
 use crate::terminal_logging::Prepared;
 use crate::workspace::ssh_access::SshTarget;
+use crate::workspace::terminal_agent::planning;
 use kortty_terminal::TerminalProfile;
 
 #[test]
@@ -126,11 +128,484 @@ fn reviewed_triage_preserves_the_live_openssh_target_and_rejects_a_directory_cha
     assert!(String::from_utf8_lossy(&output.stderr).contains("Accepted publickey for "));
 }
 
+#[test]
+#[ignore = "requires OpenSSH sshd and ssh-keygen and a local account"]
+fn reviewed_planning_probe_preserves_the_live_openssh_directory() {
+    with_openssh_planning_review(|fixture, id, _, moved| {
+        let epoch = fixture.run(id).epoch;
+        move_to_other_directory(fixture, moved);
+        let stale = fixture.send(
+            id,
+            Message::ReviewModel(request_review::Message::Send(epoch)),
+        );
+        finish_agent_task(fixture, stale);
+        assert_planning_directory_blocked(fixture, id);
+    });
+}
+
+#[test]
+#[ignore = "requires OpenSSH sshd and ssh-keygen and a local account"]
+fn plan_implementation_refuses_a_live_openssh_directory_change() {
+    with_openssh_planning_review(|fixture, id, model, moved| {
+        respond_to_plan_review(
+            fixture,
+            id,
+            model,
+            Stage::Options,
+            json!({
+                "status":"options","summary":"Approach","userMessage":"Review approach","options":[{
+                    "title":"Review metadata","summary":"Inspect the directory metadata","feasibility":"Read-only",
+                    "risks":[],"prerequisites":[],"steps":["Review metadata"],"alternatives":[]
+                }]
+            }),
+        );
+        let run = fixture.run(id);
+        assert!(run.phase == Phase::PlanOptions, "{}", run.notice);
+        let prepare = fixture.send(
+            id,
+            Message::Planning(planning::Message::PrepareImplementation(run.epoch, 0)),
+        );
+        finish_agent_task(fixture, prepare);
+        respond_to_plan_review(
+            fixture,
+            id,
+            model,
+            Stage::Report,
+            json!({
+                "status":"final_plan","title":"Review metadata","summary":"Inspect directory metadata",
+                "userMessage":"Review the implementation plan","prerequisites":[],"risks":[],
+                "steps":["Inspect its metadata"],"successCriteria":["Record the directory metadata"]
+            }),
+        );
+        let run = fixture.run(id);
+        assert!(
+            run.phase == Phase::PlanImplementationReview,
+            "{}",
+            run.notice
+        );
+        assert_eq!(fixture.workspace.terminal_agents.runs.len(), 1);
+        let epoch = run.epoch;
+        move_to_other_directory(fixture, moved);
+        let stale = fixture.send(id, Message::Implement(epoch));
+        finish_agent_task(fixture, stale);
+        assert_planning_directory_blocked(fixture, id);
+        assert_eq!(fixture.workspace.terminal_agents.runs.len(), 1);
+    });
+}
+
+#[test]
+#[ignore = "requires OpenSSH sshd and ssh-keygen and a local account"]
+fn implementation_sudo_preflight_authenticates_before_the_first_model_review() {
+    check_implementation_sudo_preflight(IsolationLevel::None);
+}
+
+#[test]
+#[ignore = "requires OpenSSH and KORTTY_SSH_TEST_EXE pointing to the built app"]
+fn isolated_ssh_implementation_sudo_preflight_uses_the_authenticated_terminal() {
+    check_implementation_sudo_preflight(IsolationLevel::Sandbox);
+}
+
+fn check_implementation_sudo_preflight(isolation: IsolationLevel) {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use iced::futures::{StreamExt as _, executor::block_on};
+    use kortty_vault::{CredentialInput, CredentialKind, Secret, Vault};
+
+    let _serial = exclusive_run();
+    let (model, _) = listener();
+    let mut fixture =
+        Fixture::with_endpoint(false, false, &model.local_addr().unwrap().to_string());
+    fixture
+        .workspace
+        .window_settings
+        .terminal_notifications
+        .ai_runs = false;
+    let ssh = OpenSshFixture::new();
+    let root = ssh.directory().canonicalize().unwrap();
+    let receipt = root.join("reviewed-exec");
+    let mut password_bytes = [0; 32];
+    getrandom::fill(&mut password_bytes).unwrap();
+    let sudo_password = URL_SAFE_NO_PAD.encode(password_bytes);
+    fs::write(root.join("sudo-password"), &sudo_password).unwrap();
+    let server = start_shell_with_exec(&ssh, &root, &root, &receipt, SUDO_PREFLIGHT_FIXTURE);
+    attach_shell_with_isolation(&mut fixture, &ssh, &root, isolation);
+    let login = ssh.request(root.join("client")).target.endpoint;
+    let vault_path = root.join("fixture-vault");
+    let mut master = [0; 32];
+    getrandom::fill(&mut master).unwrap();
+    let mut vault = Vault::create(&vault_path, &master).unwrap();
+    vault
+        .save(
+            CredentialInput {
+                label: "Fixture sudo credential".into(),
+                username: login.username,
+                server_pattern: format!("{}:{}", login.host, login.port),
+                kind: CredentialKind::SudoPassword,
+                ..CredentialInput::default()
+            },
+            Secret::new(sudo_password),
+        )
+        .unwrap();
+    fixture.workspace.vault = Some(crate::vault_window::VaultWindow::with_unlocked_fixture(
+        vault_path, vault,
+    ));
+
+    let id = fixture.open(Mode::Run);
+    no_task(fixture.send(id, Message::Goal("Check directory metadata".into())));
+    fixture.run_mut(id).plan = Some("Review the directory metadata.".into());
+    let start = fixture.send(id, Message::Start);
+    finish_agent_task(&mut fixture, start);
+    let run = fixture.run(id);
+    assert!(run.phase == Phase::ProbeApproval, "{}", run.notice);
+    assert!(
+        run.reviewed_command()
+            .unwrap()
+            .1
+            .contains("field rootEscalationMode")
+    );
+    assert!(!receipt.exists());
+    let probe = fixture.send(id, Message::Approve(run.epoch));
+    finish_agent_task(&mut fixture, probe);
+
+    let run = fixture.run(id);
+    assert!(run.phase == Phase::SudoPreflight, "{}", run.notice);
+    assert_eq!(
+        run.sudo_preflight.as_ref().unwrap().credential_label(),
+        Some("Fixture sudo credential"),
+    );
+    let epoch = run.epoch;
+    no_task(fixture.send(
+        id,
+        Message::Password(password::Message::AuthenticatePlan(
+            epoch - 1,
+            password::Source::Vault,
+        )),
+    ));
+    no_task(fixture.send(
+        id,
+        Message::Password(password::Message::AuthenticatePlan(
+            epoch,
+            password::Source::Ticket,
+        )),
+    ));
+    assert!(
+        !fs::read_to_string(&receipt)
+            .unwrap()
+            .contains(" kortty-sudo ")
+    );
+    assert_idle(&model);
+
+    for expected_phase in [Phase::SudoPreflight, Phase::ModelReview] {
+        let authenticate = fixture.send(
+            id,
+            Message::Password(password::Message::AuthenticatePlan(
+                fixture.run(id).epoch,
+                password::Source::Vault,
+            )),
+        );
+        let mut stream = iced_runtime::task::into_stream(authenticate).unwrap();
+        let mut challenged = false;
+        while let Some(action) = block_on(stream.next()) {
+            if let iced_runtime::Action::Output(Desktop::TerminalAgent(owner, message)) = action {
+                assert_eq!(owner, id);
+                let challenge =
+                    matches!(&message, Message::Password(password::Message::Challenge(_)));
+                let next = fixture.send(id, message);
+                finish_agent_task(&mut fixture, next);
+                if challenge {
+                    challenged = true;
+                    assert!(fixture.run(id).phase == Phase::SudoPassword);
+                    assert_idle(&model);
+                    let password_epoch = fixture.run(id).epoch;
+                    no_task(fixture.send(
+                        id,
+                        Message::Password(password::Message::Use(password_epoch)),
+                    ));
+                }
+            }
+        }
+        assert!(challenged);
+        let run = fixture.run(id);
+        assert!(run.phase == expected_phase, "{}", run.notice);
+        if expected_phase == Phase::SudoPreflight {
+            assert!(run.notice.contains("authentication was rejected"));
+            assert!(run.sudo_terminal.is_none());
+            assert_idle(&model);
+        }
+    }
+    let run = fixture.run(id);
+    assert!(
+        run.phase == Phase::ModelReview && run.sudo_terminal.is_some(),
+        "{}",
+        run.notice
+    );
+    assert!(!root.join("approved-sudo-step").exists());
+    respond_to_model_review(
+        &mut fixture,
+        id,
+        &model,
+        None,
+        json!({
+            "status":"run_commands","summary":"Inspect","userMessage":"Review one command",
+            "commands":[{"command":"id -u","purpose":"Check the effective user",
+                "risk":"requires_confirmation","elevation":"password_sudo"}]
+        }),
+    );
+    let run = fixture.run(id);
+    assert!(
+        run.phase == Phase::Approval && run.reviewed_password_sudo().is_some(),
+        "{}",
+        run.notice
+    );
+    assert!(!root.join("approved-sudo-step").exists());
+    let command = fixture.send(
+        id,
+        Message::Password(password::Message::Approve(
+            run.epoch,
+            password::Source::Ticket,
+        )),
+    );
+    finish_agent_task(&mut fixture, command);
+    assert_eq!(
+        fs::read_to_string(root.join("approved-sudo-step")).unwrap(),
+        "approved\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&receipt)
+            .unwrap()
+            .matches(" kortty-sudo ")
+            .count(),
+        2
+    );
+    assert_idle(&model);
+    drop(fixture.workspace.close_terminal_agent(id));
+
+    let skipped = fixture.open(Mode::Run);
+    no_task(fixture.send(
+        skipped,
+        Message::Goal("Check the directory without preflight".into()),
+    ));
+    fixture.run_mut(skipped).plan = Some("Review directory metadata.".into());
+    let start = fixture.send(skipped, Message::Start);
+    finish_agent_task(&mut fixture, start);
+    assert!(fixture.run(skipped).phase == Phase::ProbeApproval);
+    let probe = fixture.send(skipped, Message::Approve(fixture.run(skipped).epoch));
+    finish_agent_task(&mut fixture, probe);
+    let run = fixture.run(skipped);
+    assert!(run.phase == Phase::SudoPreflight);
+    let skip = fixture.send(
+        skipped,
+        Message::Password(password::Message::SkipPlanAuthentication(run.epoch)),
+    );
+    finish_agent_task(&mut fixture, skip);
+    let run = fixture.run(skipped);
+    assert!(run.phase == Phase::ModelReview && run.sudo_terminal.is_none());
+    assert_eq!(
+        fs::read_to_string(&receipt)
+            .unwrap()
+            .matches(" kortty-sudo ")
+            .count(),
+        2
+    );
+    assert_idle(&model);
+    drop(fixture.workspace.close_terminal_agent(skipped));
+    let _ = fixture.workspace.sessions[&fixture.session]
+        .session
+        .stop()
+        .recv_blocking();
+    drop(fixture);
+    let output = server.join().unwrap();
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Accepted publickey for "));
+}
+
+const SUDO_PREFLIGHT_FIXTURE: &str = r#"
+case "$SSH_ORIGINAL_COMMAND" in
+    *"field rootEscalationMode"*)
+        printf '%s\n' 'osRelease=Fixture' "currentDir=$FIXTURE_ROOT" \
+            'alreadyRoot=false' 'sudoAvailable=true' 'passwordlessSudo=false'
+        exit
+        ;;
+    *" kortty-sudo "*)
+        stty raw -echo -echonl
+        armed=$(printf '%s\n' "$SSH_ORIGINAL_COMMAND" | sed -n "s/^.*'\(KORTTY_SUDO_ARMED_[0-9a-f]\{32\}\)'$/\1/p")
+        token=${armed#KORTTY_SUDO_ARMED_}
+        [ "${#token}" -eq 32 ] || exit 1
+        printf '%s\n[kortty-sudo-%s] ' "$armed" "$token"
+        IFS= read -r supplied || exit 1
+        [ "$supplied" = "$(cat "$FIXTURE_ROOT/sudo-password")" ] || exit 1
+        if ! [ -e "$FIXTURE_ROOT/rejected-once" ]; then
+            touch "$FIXTURE_ROOT/rejected-once"
+            printf '\036%s:1\n' "$token"
+            exit 1
+        fi
+        printf '\036%s:0\n' "$token"
+        if IFS=' ' read -r request encoded; then
+            [ -n "$request" ] && [ -n "$encoded" ] || exit 1
+            printf 'approved\n' > "$FIXTURE_ROOT/approved-sudo-step"
+            printf '\036%s:0\n' "$request"
+        fi
+        while IFS= read -r ignored; do :; done
+        exit
+        ;;
+esac
+exec /bin/sh -c "$SSH_ORIGINAL_COMMAND"
+"#;
+
+fn with_openssh_planning_review(test: impl FnOnce(&mut Fixture, window::Id, &TcpListener, &Path)) {
+    let _serial = exclusive_run();
+    let (model, _) = listener();
+    let mut fixture =
+        Fixture::with_endpoint(false, false, &model.local_addr().unwrap().to_string());
+    fixture
+        .workspace
+        .window_settings
+        .terminal_notifications
+        .ai_runs = false;
+    let ssh = OpenSshFixture::new();
+    let root = ssh.directory().canonicalize().unwrap();
+    let moved = root.join("moved");
+    fs::create_dir(&moved).unwrap();
+    let receipt = root.join("reviewed-exec");
+    let server = start_shell(&ssh, &root, &moved, &receipt);
+    attach_shell(&mut fixture, &ssh, &root);
+
+    let id = fixture.open(Mode::Plan);
+    no_task(fixture.send(id, Message::Goal("Plan a directory inventory".into())));
+    let start = fixture.send(id, Message::Start);
+    finish_agent_task(&mut fixture, start);
+    let run = fixture.run(id);
+    assert!(run.phase == Phase::ProbeApproval, "{}", run.notice);
+    let wire = engine::wrap_ssh_command(root.to_str().unwrap(), run.reviewed_command().unwrap().1)
+        .unwrap();
+    let epoch = run.epoch;
+    assert!(!receipt.exists());
+    assert_idle(&model);
+    let probe = fixture.send(id, Message::Approve(epoch));
+    finish_agent_task(&mut fixture, probe);
+    assert_eq!(fs::read_to_string(&receipt).unwrap(), format!("{wire}\n"));
+
+    let run = fixture.run(id);
+    assert!(run.phase == Phase::ModelReview, "{}", run.notice);
+    let review = run.model_review.as_ref().unwrap();
+    assert_eq!(review.plan_stage(), Some(Stage::Questions));
+    let input: serde_json::Value = serde_json::from_str(&review.input).unwrap();
+    let snapshot = input["probe"].clone();
+    assert_eq!(snapshot["currentDir"], root.to_str().unwrap());
+    assert!(snapshot["availableDiskKb"].is_u64());
+    assert_idle(&model);
+    respond_to_plan_review(
+        &mut fixture,
+        id,
+        &model,
+        Stage::Questions,
+        json!({"status":"questions","summary":"Choose scope","userMessage":"Review scope",
+            "questions":[{"id":"q1","question":"Which scope?","options":["Current directory","Subdirectories"],"allowCustomAnswer":false}]}),
+    );
+
+    let run = fixture.run(id);
+    assert!(run.phase == Phase::PlanQuestions, "{}", run.notice);
+    let review = fixture.send(
+        id,
+        Message::Planning(planning::Message::SubmitAnswers(run.epoch)),
+    );
+    finish_agent_task(&mut fixture, review);
+    let run = fixture.run(id);
+    assert!(run.phase == Phase::ModelReview, "{}", run.notice);
+    let input: serde_json::Value =
+        serde_json::from_str(&run.model_review.as_ref().unwrap().input).unwrap();
+    assert_eq!(input["probe"], snapshot);
+    assert_eq!(input["answers"], json!(["Current directory"]));
+
+    test(&mut fixture, id, &model, &moved);
+    assert_eq!(fs::read_to_string(&receipt).unwrap(), format!("{wire}\n"));
+    assert_idle(&model);
+    let _ = fixture.workspace.sessions[&fixture.session]
+        .session
+        .stop()
+        .recv_blocking();
+    drop(fixture);
+    let output = server.join().unwrap();
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Accepted publickey for "));
+}
+
+fn respond_to_plan_review(
+    fixture: &mut Fixture,
+    id: window::Id,
+    model: &TcpListener,
+    stage: Stage,
+    reply: serde_json::Value,
+) {
+    respond_to_model_review(fixture, id, model, Some(stage), reply);
+}
+
+fn respond_to_model_review(
+    fixture: &mut Fixture,
+    id: window::Id,
+    model: &TcpListener,
+    stage: Option<Stage>,
+    reply: serde_json::Value,
+) {
+    assert_idle(model);
+    let run = fixture.run(id);
+    assert!(run.phase == Phase::ModelReview, "{}", run.notice);
+    let review = run.model_review.as_ref().unwrap();
+    assert_eq!(review.plan_stage(), stage);
+    let reviewed_input = review.input.clone();
+    let send = fixture.send(
+        id,
+        Message::ReviewModel(request_review::Message::Send(run.epoch)),
+    );
+    let mut socket = accept(model);
+    assert_eq!(
+        request(&mut socket)["messages"][1]["content"],
+        reviewed_input
+    );
+    let body = json!({"choices":[{"message":{"content":reply.to_string()}}]});
+    socket
+        .get_mut()
+        .write_all(fixture_http_response("200 OK", "", &body.to_string()).as_bytes())
+        .unwrap();
+    drop(socket);
+    finish_agent_task(fixture, send);
+}
+
+fn move_to_other_directory(fixture: &mut Fixture, moved: &Path) {
+    fixture.workspace.sessions[&fixture.session]
+        .session
+        .send(b"move\r".to_vec())
+        .unwrap();
+    wait_for_directory(fixture, moved);
+}
+
+fn assert_planning_directory_blocked(fixture: &Fixture, id: window::Id) {
+    let run = fixture.run(id);
+    assert!(
+        run.phase == Phase::Blocked && run.notice.contains("directory changed"),
+        "{}",
+        run.notice
+    );
+}
+
 fn start_shell(
     ssh: &OpenSshFixture,
     root: &std::path::Path,
     moved: &std::path::Path,
     receipt: &std::path::Path,
+) -> thread::JoinHandle<std::process::Output> {
+    start_shell_with_exec(
+        ssh,
+        root,
+        moved,
+        receipt,
+        r#"exec /bin/sh -c "$SSH_ORIGINAL_COMMAND""#,
+    )
+}
+
+fn start_shell_with_exec(
+    ssh: &OpenSshFixture,
+    root: &Path,
+    moved: &Path,
+    receipt: &Path,
+    execute: &str,
 ) -> thread::JoinHandle<std::process::Output> {
     let script = root.join("triage-shell.sh");
     let quote = |path: &std::path::Path| {
@@ -141,7 +616,8 @@ fn start_shell(
     let script_body = format!(
         r#"if [ -n "$SSH_ORIGINAL_COMMAND" ]; then
     printf '%s\n' "$SSH_ORIGINAL_COMMAND" >> {}
-    exec /bin/sh -c "$SSH_ORIGINAL_COMMAND"
+    FIXTURE_ROOT={}
+    {execute}
 fi
 report_directory() {{
     cd -- "$1" || exit 1
@@ -155,6 +631,7 @@ done
 "#,
         quote(receipt),
         quote(root),
+        quote(root),
         quote(moved),
     );
     fs::write(&script, script_body).unwrap();
@@ -165,21 +642,45 @@ done
 }
 
 fn attach_shell(fixture: &mut Fixture, ssh: &OpenSshFixture, directory: &std::path::Path) {
+    attach_shell_with_isolation(fixture, ssh, directory, IsolationLevel::None);
+}
+
+fn attach_shell_with_isolation(
+    fixture: &mut Fixture,
+    ssh: &OpenSshFixture,
+    directory: &Path,
+    isolation: IsolationLevel,
+) {
     let key = ssh.directory().join("client");
-    let login = ssh.request(key.clone()).target.endpoint;
+    let mut request = ssh.request(key.clone());
+    let login = request.target.endpoint.clone();
     let grid = GridSize::default();
-    let connection = SshSession::connect(
-        Connect {
-            address: SocketAddr::from(([127, 0, 0, 1], login.port)),
-            endpoint: Endpoint::new(&login.host, login.port).unwrap(),
-            username: login.username.clone(),
-            authentication: Authentication::private_key(fs::read(key).unwrap()),
-            term: TerminalProfile::Xterm.term_name().into(),
-            size: crate::session::ssh_size(grid),
-        },
-        ssh.pinned_trust(),
-    )
-    .unwrap();
+    let connection = if isolation == IsolationLevel::None {
+        let direct = SshSession::connect(
+            Connect {
+                address: SocketAddr::from(([127, 0, 0, 1], login.port)),
+                endpoint: Endpoint::new(&login.host, login.port).unwrap(),
+                username: login.username.clone(),
+                authentication: Authentication::private_key(fs::read(key).unwrap()),
+                term: TerminalProfile::Xterm.term_name().into(),
+                size: crate::session::ssh_size(grid),
+            },
+            ssh.pinned_trust(),
+        )
+        .unwrap();
+        Connected::Direct(Box::new(direct))
+    } else {
+        request.isolation = isolation;
+        let worker = crate::ssh_worker::dial_test_executable(
+            request,
+            false,
+            &crate::ssh_worker::test_executable(),
+            &ssh.pinned_trust(),
+        )
+        .unwrap();
+        assert!(worker.sandbox_backend().is_some());
+        Connected::Worker(Box::new(worker))
+    };
     let capture = Prepared::new(
         Default::default(),
         Default::default(),
@@ -188,7 +689,7 @@ fn attach_shell(fixture: &mut Fixture, ssh: &OpenSshFixture, directory: &std::pa
         login.username.clone(),
     );
     let session = Session::ssh_with_logging(
-        Some(Connected::Direct(Box::new(connection))),
+        Some(connection),
         grid,
         TerminalProfile::Xterm,
         true,
@@ -199,7 +700,7 @@ fn attach_shell(fixture: &mut Fixture, ssh: &OpenSshFixture, directory: &std::pa
     .unwrap();
     let pane = fixture.workspace.store_session(session, grid, 14);
     fixture.workspace.sessions.get_mut(&pane).unwrap().ssh =
-        Some(SshTarget::from_imported_route(login, None, IsolationLevel::None).unwrap());
+        Some(SshTarget::from_imported_route(login, None, isolation).unwrap());
     fixture.workspace.add_tab(fixture.owner, pane);
     fixture.session = pane;
     wait_for_directory(fixture, directory);

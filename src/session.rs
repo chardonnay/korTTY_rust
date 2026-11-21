@@ -4119,7 +4119,8 @@ mod search_tests {
                     "-c".into(),
                     concat!(
                         r#"i=0; while [ "$i" -lt 250 ]; do printf 'row\n'; i=$((i+1)); done; "#,
-                        "printf 'history-ready\\n'; IFS= read -r gate",
+                        // Keep the marker as the final output before scrolling.
+                        "printf 'history-ready'; IFS= read -r gate",
                     )
                     .into(),
                 ]),

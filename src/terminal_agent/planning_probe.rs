@@ -148,6 +148,14 @@ impl Snapshot {
         &self.0
     }
 
+    pub(crate) fn needs_password_sudo(&self) -> bool {
+        self.has_sudo_as_non_root() && self.0["passwordlessSudo"] == false
+    }
+
+    pub(crate) fn has_sudo_as_non_root(&self) -> bool {
+        self.0["alreadyRoot"] == false && self.0["sudoAvailable"] == true
+    }
+
     pub(crate) fn summary(&self) -> String {
         let field = |key| self.0[key].as_str().unwrap_or("unknown");
         let mut summary = format!(
@@ -247,5 +255,25 @@ mod tests {
         assert_eq!(snapshot.input()["shell"], "CMD");
         assert_eq!(snapshot.input()["currentDir"], r"C:\work");
         assert!(snapshot.input().get("sudoAvailable").is_none());
+    }
+
+    #[test]
+    fn planning_sudo_preflight_requires_all_three_capability_fields() {
+        for (root, available, passwordless, expected) in [
+            ("false", "true", "false", true),
+            ("true", "true", "false", false),
+            ("false", "false", "false", false),
+            ("false", "true", "true", false),
+            ("false", "true", "", false),
+        ] {
+            let snapshot = Snapshot::parse(
+                &format!(
+                    "osRelease=Linux\ncurrentDir=/work\nalreadyRoot={root}\nsudoAvailable={available}\npasswordlessSudo={passwordless}"
+                ),
+                &|text| Ok(text.into()),
+            )
+            .unwrap();
+            assert_eq!(snapshot.needs_password_sudo(), expected);
+        }
     }
 }

@@ -34,6 +34,16 @@ impl LocalDirectory {
         &self.canonical
     }
 
+    #[cfg(unix)]
+    pub(crate) fn open_verified(&self) -> Result<std::fs::File, String> {
+        self.require_current()?;
+        let opened = Directory::open(&self.canonical, false).map_err(|_| unavailable())?;
+        if opened.identity().map_err(|_| unavailable())? != self.identity {
+            return Err("The reviewed directory changed. Start a new agent run.".into());
+        }
+        Ok(opened.into_file())
+    }
+
     pub(crate) fn require_current(&self) -> Result<(), String> {
         if Self::capture(self.configured.clone()).as_ref() == Ok(self) {
             return Ok(());

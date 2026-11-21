@@ -33,8 +33,10 @@ impl Run {
             .spacing(8)
             .padding(12);
         let plan_view = self.mode == Mode::Plan;
-        let showing_plan =
-            matches!(self.phase, Phase::PlanReady | Phase::PlanHandedOff) && self.plan.is_some();
+        let showing_plan = matches!(
+            self.phase,
+            Phase::PlanReady | Phase::PlanImplementationReview | Phase::PlanHandedOff
+        ) && self.plan.is_some();
         let reviewing_model = self.phase == Phase::ModelReview;
         let body_size = if plan_view {
             self.fonts.plan
@@ -77,7 +79,12 @@ impl Run {
         }
         let show_directory = self.phase == Phase::Setup
             && matches!(self.mode, Mode::Run | Mode::Plan)
-            || matches!(self.phase, Phase::DirectoryConfirmation | Phase::PlanReady);
+            || self.phase == Phase::DirectoryConfirmation
+            || self.target.is_none()
+                && matches!(
+                    self.phase,
+                    Phase::PlanReady | Phase::PlanImplementationReview
+                );
         if show_directory && let Some(directory) = &self.manual_directory {
             page = page.push(
                 column![
@@ -251,7 +258,7 @@ impl Run {
                     (self.reviewing_sudo() && password.is_none())
                         .then(|| text("Passwordless sudo as root over SSH").size(13)),
                     password.map(|review| column![
-                        text("Password sudo as root over attached SSH").size(13),
+                        text("Password sudo as root").size(13),
                         text(review.destination()).size(13),
                         (self.sudo_terminal.is_none())
                             .then(|| review.credential_label())
@@ -266,6 +273,43 @@ impl Run {
                     scrollable(text(command.1).font(iced::Font::MONOSPACE))
                         .height(Length::Fixed(84.0)),
                     approval,
+                ]
+                .spacing(6),
+            );
+        }
+        if self.phase == Phase::SudoPreflight
+            && let Some(review) = &self.sudo_preflight
+        {
+            use super::password::{Message as Sudo, Source};
+            let enabled = !self.paused && !self.cancel.requested();
+            page = page.push(
+                column![
+                    text("Authenticate sudo for this implementation run").size(15),
+                    text(review.destination()).size(13),
+                    review
+                        .credential_label()
+                        .map(|label| text(format!("Vault credential: {label}")).size(13)),
+                    row![
+                        review.credential_label().map(|_| {
+                            button("Authenticate with vault password").on_press_maybe(
+                                enabled.then_some(Message::Password(Sudo::AuthenticatePlan(
+                                    self.epoch,
+                                    Source::Vault,
+                                ))),
+                            )
+                        }),
+                        button("Authenticate with manual password").on_press_maybe(
+                            enabled.then_some(Message::Password(Sudo::AuthenticatePlan(
+                                self.epoch,
+                                Source::Manual,
+                            ))),
+                        ),
+                        button("Continue to model review").on_press_maybe(enabled.then_some(
+                            Message::Password(Sudo::SkipPlanAuthentication(self.epoch,))
+                        ),),
+                    ]
+                    .spacing(6)
+                    .wrap(),
                 ]
                 .spacing(6),
             );
@@ -302,7 +346,21 @@ impl Run {
         if let Some(question) = &self.question {
             page = page.push(question.view(self).map(Message::Clarification));
         }
-        if self.phase == Phase::PlanReady {
+        if self.phase == Phase::PlanImplementationReview {
+            let enabled = !self.paused && !self.cancel.requested();
+            page = page.push(
+                row![
+                    button("Accept plan and open Agent").on_press_maybe(
+                        (enabled && directory_ready).then_some(Message::Implement(self.epoch)),
+                    ),
+                    button("Keep plan for later").on_press_maybe(enabled.then_some(
+                        Message::Planning(super::planning::Message::KeepReport(self.epoch),)
+                    )),
+                ]
+                .spacing(6)
+                .wrap(),
+            );
+        } else if self.phase == Phase::PlanReady {
             page = page.push(button("Implement…").on_press_maybe(
                 (!self.paused && directory_ready).then_some(Message::Implement(self.epoch)),
             ));
@@ -333,8 +391,10 @@ impl Run {
                 )),
             );
         }
-        if self.phase != Phase::PlanReady
-            && let Some(handoff) = super::design::handoff::bar(self)
+        if !matches!(
+            self.phase,
+            Phase::PlanReady | Phase::PlanImplementationReview
+        ) && let Some(handoff) = super::design::handoff::bar(self)
         {
             page = page.push(handoff);
         }

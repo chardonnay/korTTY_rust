@@ -127,6 +127,10 @@ impl Directory {
         Ok((metadata.dev(), metadata.ino()))
     }
 
+    pub(crate) fn into_file(self) -> File {
+        self.0
+    }
+
     pub(crate) fn create_private_subdirectory(&self, name: &OsStr) -> io::Result<Self> {
         mkdirat(&self.0, name, PRIVATE_DIRECTORY)?;
         let child = self.deletion_child(name)?;
