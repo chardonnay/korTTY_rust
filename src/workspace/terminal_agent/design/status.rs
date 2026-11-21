@@ -3,9 +3,7 @@
 use std::f32::consts::TAU;
 use std::time::{Duration, Instant};
 
-use iced::widget::{
-    button, column, container, mouse_area, progress_bar, row, scrollable, text, tooltip,
-};
+use iced::widget::{button, column, container, progress_bar, row, scrollable, text, tooltip};
 use iced::{Alignment, Element, Font, Length};
 
 use crate::terminal_agent::design::Status;
@@ -14,6 +12,7 @@ use crate::terminal_agent::design::inline::{State, Step, StepState, Transcript};
 use super::super::{Message as AgentMessage, Phase};
 use super::{
     Message, Run, history,
+    log_table::{Surface, step_context},
     palette::{self, Palette},
     presentation::Notice,
     toast,
@@ -188,7 +187,7 @@ fn station(
             palette.muted.color()
         }
     });
-    tooltip(
+    let station = tooltip(
         button(
             text(if vertical {
                 format!("{marker} {}", index + 1)
@@ -219,7 +218,16 @@ fn station(
             tooltip::Position::Top
         },
     )
-    .into()
+    .into();
+    if vertical {
+        run.step_context(
+            index,
+            Surface::Minimap(run.presentation.identity(index)),
+            station,
+        )
+    } else {
+        station
+    }
 }
 
 pub(super) fn view(
@@ -424,25 +432,37 @@ pub(super) fn render<'a>(
             ]
             .spacing(5);
             let limit = if trace.waiting { 3 } else { 4 };
-            let recent: Vec<_> = run
+            let mut recent: Vec<_> = run
                 .presentation
                 .status_events
                 .recent(trace.now, trace.reduced_motion)
                 .rev()
                 .take(limit)
                 .collect();
+            if let Some(id) = run.presentation.log_table.open_step_menu(Surface::Toast)
+                && !recent
+                    .iter()
+                    .any(|(notice, _)| matches!(notice, Notice::Step(step) if *step == id))
+            {
+                recent.truncate(limit - 1);
+                recent.push((Notice::Step(id), toast::review_frame(Duration::MAX, true)));
+            }
             for (notice, frame) in recent.into_iter().rev() {
-                let title = match notice {
+                let (title, step) = match notice {
                     Notice::Step(id) => {
                         let Some(step) = trace.step(id) else { continue };
                         let title =
                             history::summary(step.command.as_deref().unwrap_or(&step.title));
-                        button(text(title).size(12))
-                            .on_press(AgentMessage::Design(Message::SelectStep(id)))
+                        (
+                            button(text(title).size(12))
+                                .on_press(AgentMessage::Design(Message::SelectStep(id))),
+                            Some(step),
+                        )
                     }
-                    Notice::Answer => {
-                        button(text(history::summary(trace.answer)).size(12)).on_press(toggle())
-                    }
+                    Notice::Answer => (
+                        button(text(history::summary(trace.answer)).size(12)).on_press(toggle()),
+                        None,
+                    ),
                 };
                 let title = title
                     .style(move |theme, status| {
@@ -469,10 +489,15 @@ pub(super) fn render<'a>(
                         style.border.color = style.border.color.scale_alpha(frame.opacity);
                         style
                     });
-                cards = cards.push(toast::view(
+                let card = toast::view(
                     column![title, timer].width(Length::Fill).max_width(320),
                     frame,
-                ));
+                );
+                cards = cards.push(if let Some((run, step)) = trace.run.zip(step) {
+                    step_context(card, run, step, Surface::Toast)
+                } else {
+                    card
+                });
             }
             if trace.waiting {
                 let review = toast::review_frame(
@@ -546,6 +571,7 @@ pub(super) fn render<'a>(
                 &trace,
                 run.presentation.selected_step,
                 124.into(),
+                Surface::StatusStepList,
             ));
         } else {
             let selected = run.presentation.selection(run.activity.len());
@@ -568,11 +594,12 @@ pub(super) fn render<'a>(
     palette::panel(palette, container(panel).padding(5))
 }
 
-pub(super) fn step_list(run: &Run) -> Element<'_, AgentMessage> {
+pub(super) fn step_list(run: &Run, surface: Surface) -> Element<'_, AgentMessage> {
     trace_drawer(
         &Trace::live(run, Instant::now(), true),
         run.presentation.selected_step,
         Length::Fill,
+        surface,
     )
 }
 
@@ -580,6 +607,7 @@ fn trace_drawer<'a>(
     trace: &Trace<'a>,
     selected_id: Option<u64>,
     height: Length,
+    surface: Surface,
 ) -> Element<'a, AgentMessage> {
     let selected = selected_id
         .and_then(|id| trace.steps.iter().find(|step| step.id == id))
@@ -588,20 +616,20 @@ fn trace_drawer<'a>(
     for step in trace.steps {
         let label = history::summary(&step.title);
         let chosen = selected.is_some_and(|selected| selected.id == step.id);
-        let select = AgentMessage::Design(Message::SelectStep(step.id));
-        rows = rows.push(
-            mouse_area(
-                button(text(label).size(12))
-                    .width(Length::Fill)
-                    .style(if chosen {
-                        button::secondary
-                    } else {
-                        button::text
-                    })
-                    .on_press(select.clone()),
-            )
-            .on_right_press(select),
-        );
+        let row = button(text(label).size(12))
+            .width(Length::Fill)
+            .style(if chosen {
+                button::secondary
+            } else {
+                button::text
+            })
+            .on_press(AgentMessage::Design(Message::SelectStep(step.id)))
+            .into();
+        rows = rows.push(if let Some(run) = trace.run {
+            step_context(row, run, step, surface)
+        } else {
+            row
+        });
         if chosen && !step.detail.is_empty() && step.detail != step.title {
             rows = rows.push(text(&step.detail).size(12));
         }

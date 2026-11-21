@@ -6,12 +6,13 @@ use iced::{Element, Length, Size, Task, window};
 use crate::session::SessionId;
 use crate::terminal_agent::design::{Arrangement, History};
 
-use super::super::{Message as AgentMessage, Run, State, Workspace};
+use super::super::{LiveBinding, Message as AgentMessage, Run, State, Workspace};
 use super::{
     Desktop, dialog_placement, history,
     palette::{self, Palette},
 };
 
+mod menu;
 mod surface;
 
 pub(crate) use surface::Corner;
@@ -24,6 +25,7 @@ pub(crate) enum Message {
     Show,
     Detach,
     Select(window::Id),
+    Menu(menu::Message),
 }
 
 #[derive(Default)]
@@ -32,10 +34,11 @@ pub(in crate::workspace::terminal_agent) struct Panel {
     corner: Corner,
     pub(super) folded: bool,
     hidden: bool,
+    menu_selection: Option<usize>,
 }
 
 impl Panel {
-    pub(super) fn shows_history(&self) -> bool {
+    pub(in crate::workspace::terminal_agent) fn shows_history(&self) -> bool {
         !self.folded && !self.hidden
     }
 }
@@ -71,9 +74,14 @@ fn size(run: &Run) -> Size {
     panel_size(run.design.history, run.presentation.pip.folded)
 }
 
-fn title(panel: &Panel, can_detach: bool) -> iced::widget::Row<'static, AgentMessage> {
+fn title(
+    panel: &Panel,
+    can_detach: bool,
+    run_menu: Option<Element<'static, AgentMessage>>,
+) -> iced::widget::Row<'static, AgentMessage> {
     row![
         container(text("⠿ Agent history").size(13)).width(Length::Fill),
+        run_menu,
         can_detach.then(|| {
             button(if panel.detached.is_some() {
                 "Attach"
@@ -115,7 +123,7 @@ fn body<'a>(
     reduced_motion: bool,
 ) -> Element<'a, AgentMessage> {
     let panel = &run.presentation.pip;
-    let mut content = column![title(panel, true)].spacing(4);
+    let mut content = column![title(panel, true, menu::view(state, run))].spacing(4);
     if !panel.folded {
         let source = run
             .binding
@@ -167,7 +175,7 @@ fn body<'a>(
                 },
                 (state, id),
             ))
-            .push(super::controls(run, state.has_archived_activity(run)));
+            .push(super::controls_with_menu(run, None));
     }
     panel_view(content, palette)
 }
@@ -260,43 +268,25 @@ impl Workspace {
             return Task::none();
         }
         if matches!(message, Message::Show) {
-            let mut closed = Vec::new();
-            for (&other_id, other) in &mut self.terminal_agents.runs {
-                if other_id != id
-                    && matches(other, session, stream)
-                    && let Some(detached) = other.presentation.pip.detached.take()
-                {
-                    closed.push(detached);
-                }
-            }
-            let panel = &mut self
-                .terminal_agents
+            self.terminal_agents
                 .runs
                 .get_mut(&id)
                 .unwrap()
                 .presentation
-                .pip;
-            panel.hidden = false;
-            let detached = panel.detached;
-            self.terminal_agents
-                .presented_runs
-                .retain(|_, (_, selected)| self.terminal_agents.runs.contains_key(selected));
+                .pip
+                .show();
             self.terminal_agents
                 .presented_runs
                 .insert(session, (stream, id));
-            let focus = detached.map_or_else(Task::none, |window| {
-                window::minimize(window, false).chain(window::gain_focus(window))
-            });
-            if closed.is_empty() {
-                return focus;
-            }
-            return Task::batch(
-                std::iter::once(focus).chain(
-                    closed
-                        .into_iter()
-                        .map(|window| self.close_placed_dialog(window)),
-                ),
-            );
+            let follow = self.reconcile_agent_pip();
+            let focus = self.terminal_agents.runs[&id]
+                .presentation
+                .pip
+                .detached
+                .map_or_else(Task::none, |window| {
+                    window::minimize(window, false).chain(window::gain_focus(window))
+                });
+            return follow.chain(focus);
         }
         if self
             .terminal_agents
@@ -304,6 +294,9 @@ impl Workspace {
             .is_none_or(|(selected, _)| selected != id)
         {
             return Task::none();
+        }
+        if let Message::Menu(message) = message {
+            return self.agent_pip_menu(id, message);
         }
         if let Message::Select(selected) = message {
             if !self
@@ -334,18 +327,21 @@ impl Workspace {
         match message {
             Message::Corner(corner) if panel.detached.is_none() => panel.corner = corner,
             Message::Fold => {
+                panel.menu_selection = None;
                 panel.folded = !panel.folded;
                 if let Some(detached) = panel.detached {
                     return window::resize(detached, size(run));
                 }
             }
             Message::Hide => {
+                panel.menu_selection = None;
                 panel.hidden = true;
                 if let Some(detached) = panel.detached.take() {
                     return self.close_placed_dialog(detached);
                 }
             }
             Message::Detach => {
+                panel.menu_selection = None;
                 if let Some(detached) = panel.detached.take() {
                     panel.corner = Corner::BottomRight;
                     return self.close_placed_dialog(detached);
@@ -382,8 +378,57 @@ impl Workspace {
         let id = self.terminal_agents.pip_run_for_window(detached)?;
         let panel = &mut self.terminal_agents.runs.get_mut(&id)?.presentation.pip;
         panel.detached = None;
+        panel.menu_selection = None;
         panel.corner = Corner::BottomRight;
         Some(self.close_placed_dialog(detached))
+    }
+
+    fn followed_agent_pip_run(&self, source: LiveBinding) -> Option<window::Id> {
+        let (id, run) = self
+            .terminal_agents
+            .agent_activity_for_stream(source.session, source.stream)?;
+        (!self.exiting
+            && run.binding.live().ok() == Some(source)
+            && run.has_terminal_presentation()
+            && run.design.arrangement == Arrangement::PictureInPicture
+            && self.current_run_pane(run).is_ok())
+        .then_some(id)
+    }
+
+    fn move_detached_agent_pip(
+        &mut self,
+        detached: window::Id,
+        folded: bool,
+        next: Option<window::Id>,
+    ) -> Task<Desktop> {
+        if let Some(run) = next
+            .and_then(|id| self.terminal_agents.runs.get_mut(&id))
+            .filter(|run| run.presentation.pip.detached.is_none())
+        {
+            let panel = &mut run.presentation.pip;
+            panel.detached = Some(detached);
+            panel.folded = folded;
+            panel.hidden = false;
+            panel.menu_selection = None;
+            window::resize(detached, size(run))
+        } else {
+            self.close_placed_dialog(detached)
+        }
+    }
+
+    pub(in crate::workspace::terminal_agent) fn follow_released_agent_pip(
+        &mut self,
+        run: &mut Run,
+    ) -> Task<Desktop> {
+        let Some(detached) = run.presentation.pip.detached.take() else {
+            return Task::none();
+        };
+        let next = run
+            .binding
+            .live()
+            .ok()
+            .and_then(|source| self.followed_agent_pip_run(source));
+        self.move_detached_agent_pip(detached, run.presentation.pip.folded, next)
     }
 
     pub(in crate::workspace::terminal_agent) fn reconcile_agent_pip(&mut self) -> Task<Desktop> {
@@ -406,55 +451,36 @@ impl Workspace {
         for session in stale {
             self.terminal_agents.presented_runs.remove(&session);
         }
-        let detached: Vec<_> = self
+        let updates: Vec<_> = self
             .terminal_agents
             .runs
             .iter()
-            .filter_map(|(&id, run)| run.presentation.pip.detached.map(|window| (id, window)))
+            .filter_map(|(&id, run)| {
+                let panel = &run.presentation.pip;
+                if panel.detached.is_none() && panel.menu_selection.is_none() {
+                    return None;
+                }
+                let next = run
+                    .binding
+                    .live()
+                    .ok()
+                    .and_then(|source| self.followed_agent_pip_run(source));
+                (next != Some(id)).then_some((id, next))
+            })
             .collect();
         let mut tasks = Vec::new();
-        for (id, window) in detached {
-            let next = self
+        for (id, next) in updates {
+            let panel = &mut self
                 .terminal_agents
                 .runs
-                .get(&id)
-                .and_then(|run| run.binding.live().ok())
-                .filter(|source| {
-                    self.agent_pane(source.session)
-                        .is_some_and(|(_, pane, _)| pane.stream_generation == source.stream)
-                })
-                .and_then(|source| {
-                    self.terminal_agents
-                        .agent_activity_for_stream(source.session, source.stream)
-                })
-                .filter(|(_, run)| {
-                    run.has_terminal_presentation()
-                        && run.design.arrangement == Arrangement::PictureInPicture
-                })
-                .map(|(id, _)| id);
-            if next == Some(id) {
-                continue;
-            }
-            if let Some(next) = next
-                && self.terminal_agents.runs[&next]
-                    .presentation
-                    .pip
-                    .detached
-                    .is_none()
-            {
-                self.terminal_agents
-                    .runs
-                    .get_mut(&id)
-                    .unwrap()
-                    .presentation
-                    .pip
-                    .detached = None;
-                let run = self.terminal_agents.runs.get_mut(&next).unwrap();
-                run.presentation.pip.detached = Some(window);
-                run.presentation.pip.hidden = false;
-                tasks.push(window::resize(window, size(run)));
-            } else if let Some(task) = self.close_agent_pip(window) {
-                tasks.push(task);
+                .get_mut(&id)
+                .unwrap()
+                .presentation
+                .pip;
+            panel.menu_selection = None;
+            if let Some(detached) = panel.detached.take() {
+                let folded = panel.folded;
+                tasks.push(self.move_detached_agent_pip(detached, folded, next));
             }
         }
         if tasks.is_empty() {
@@ -484,7 +510,11 @@ pub(super) fn sample<'a>(
     } else {
         (
             panel_view(
-                column![title(panel, false), (!panel.folded).then_some(content)].spacing(4),
+                column![
+                    title(panel, false, None),
+                    (!panel.folded).then_some(content)
+                ]
+                .spacing(4),
                 None,
             ),
             panel_size(history, panel.folded),
@@ -515,7 +545,7 @@ impl Panel {
             Message::Fold => self.folded = !self.folded,
             Message::Hide => self.hidden = true,
             Message::Show => self.show(),
-            Message::Detach | Message::Select(_) => {}
+            Message::Detach | Message::Select(_) | Message::Menu(_) => {}
         }
     }
 }

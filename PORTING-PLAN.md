@@ -8,8 +8,8 @@ source and environment for earlier checks. Detailed logs under
 ## Current result and actionable backlog
 
 **Java v2.26.0 parity remains partial.** The comparison uses Java tag
-`v2.26.0` (`b235d91f2035`) and the Rust worktree based on merged PR #17
-(`d5c53ab7`). Agent-to-Chat continuation, the Agent profile
+`v2.26.0` (`b235d91f2035`). The current Rust worktree is based on merged
+PR #25 (`d3dd72ea`). Agent-to-Chat continuation, the Agent profile
 role, Journal chat exports, command summaries, the snippet structure panel
 and Lua editor tools are implemented. AI Manager search reaches every page
 and a subset of individual controls. The [source comparison](PORTING-PARITY.md#november-19-java-release-source-comparison)
@@ -1138,6 +1138,34 @@ an English answer. Keep this difference visible when comparing transcripts.
 | A3 | Acceptance + bounded audit. Live and saved targets, named pre-run saved SSH drafts, completed interactive rounds with renaming, reviewed continuation, connection groups and working-directory metadata, history search, Markdown/text/PDF export, saved journal defaults, estimate and journal links are implemented. A batch review binds one approval to the displayed ordinary commands and target identities. R `src/workspace/terminal_agent/swarm.rs` and its `batch.rs`/`comparison.rs`/`conversation.rs`. | Verify native renaming, selection, batch review and revocation, comparison, failure isolation, workflow drafts and continuation over pinned SSH. Evaluate Java's standing batch policy and incognito target scope against native authority requirements. Saved follow-up uses reviewed saved SSH routes. |
 | A4 | Acceptance. All eight pinned Agent verbs, events, wait/start/rename and `notification.show` have native Control/CLI routes. Windows socket backpressure and native notification submission have evidence. | Native visible delivery and exact focus/target routing, stale agents, moved splits, timeouts and losses across desktops. Admission/native submission receipts alone do not prove a displayed notice or activation. |
 | A5 | Acceptance. Explicit `control-api = "allow"` starts the listener and locks the setting while retaining the personal preference. The parser normalizes feature keys and values. MCP stdio keeps its independent opt-in, retains its write tools preference while disabled, and gates writes on effective policy and consent. Masked reads, reconnect identity guards and managed MCP denial exist. | Verify managed activation, lock display and relaxation on native desktops. Complete affirmative write consent and invalidation across those desktops. P1 owns shared policy acceptance. |
+
+A detached d19 history window retains its identity and folded state
+while following runs of the same terminal stream. Closing the Activity
+of a reopened run or continuing an Ask in Chat hands the window to the
+next eligible run. A stream change invalidates that handoff. The PiP
+title menu uses the shared run actions in the folded and unfolded panel.
+The folded detached window temporarily makes room for the popup and
+restores its height on dismissal or selection. Fedora ARM64 passed a
+native X11 Openbox run and a native Wayland Mutter run with two reviewed
+Ask requests, copied responses, an archived run reopened and closed, and
+reattachment. The Wayland test verified that Iced applies an inner size
+returned synchronously by Winit and renders a buffer of the new size.
+Repeat the workflow on Windows and macOS and verify placement across
+monitors.
+[Java pane presenter](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignHost.java#L1556)
+· [Fedora native desktop acceptance](PORTING-PARITY.md#november-21-detached-terminal-agent-history-follows-its-pane)
+
+Activity entries for recorded commands, their results and model steps
+keep the typed step ID through activity eviction and finished-run
+reopening. The timeline, plan and execution, card stack, conversation,
+tmux and transcript histories offer the same step context menu as the
+Log Table. The Minimap, step toasts and the PiP step list share the
+command, output, entry and snippet actions. A toast remains visible
+while its step menu is open. Native widget tests cover identically
+titled steps and the exact copied output across six history modules.
+Exercise the menus on native desktops with a restored run and masked
+output. [Java step menu reference](https://github.com/chardonnay/korTTY/blob/v2.26.0/app-docs/site/docs/en/features/ai-agent-designs.md#run-menu-and-step-menu)
+· [Native test results](PORTING-PARITY.md#november-21-exact-step-actions-in-terminal-agent-history)
 
 Interactive Run can review a complexity assessment after the environment
 probe. The AI Manager preference and the managed override select when to

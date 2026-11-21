@@ -96,7 +96,7 @@ impl History {
         self.transcript.steps.push(step);
     }
 
-    fn event(&mut self, kind: Kind, title: String, detail: String, command: Option<String>) {
+    fn event(&mut self, kind: Kind, title: String, detail: String, command: Option<String>) -> u64 {
         let active = command.is_some();
         let id = self.next_step;
         self.next_step += 1;
@@ -121,21 +121,17 @@ impl History {
         if active {
             self.command_started = Some(Instant::now());
         }
+        id
     }
 
-    fn result(&mut self, status: engine::Status, stdout: &str, stderr: &str) {
-        let Some(started) = self.command_started.take() else {
-            return;
-        };
-        let Some(step) = self
+    fn result(&mut self, status: engine::Status, stdout: &str, stderr: &str) -> Option<u64> {
+        let started = self.command_started.take()?;
+        let step = self
             .transcript
             .steps
             .iter_mut()
             .rev()
-            .find(|step| step.kind == Kind::Action && step.state == StepState::Running)
-        else {
-            return;
-        };
+            .find(|step| step.kind == Kind::Action && step.state == StepState::Running)?;
         step.elapsed_ms = Some(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
         step.state = match status {
             engine::Status::Exited(0) => StepState::Completed,
@@ -159,6 +155,7 @@ impl History {
             step.detail.push('\n');
             step.detail.push_str(&step.output.join("\n"));
         }
+        Some(step.id)
     }
 }
 
@@ -188,17 +185,16 @@ impl Run {
         }
     }
 
-    pub(super) fn inline_command(&mut self, command: &str) {
-        if let Some(history) = &mut self.inline {
-            let title = command
-                .lines()
-                .next()
-                .unwrap_or("Approved command")
-                .chars()
-                .take(120)
-                .collect();
-            history.event(Kind::Action, title, command.into(), Some(command.into()));
-        }
+    pub(super) fn inline_command(&mut self, command: &str) -> Option<u64> {
+        let history = self.inline.as_mut()?;
+        let title = command
+            .lines()
+            .next()
+            .unwrap_or("Approved command")
+            .chars()
+            .take(120)
+            .collect();
+        Some(history.event(Kind::Action, title, command.into(), Some(command.into())))
     }
 
     pub(super) fn inline_decision(
@@ -206,25 +202,28 @@ impl Run {
         decision: &engine::Action,
         summary: &str,
         detail: &str,
-    ) {
-        if let Some(history) = &mut self.inline {
-            match decision {
-                engine::Action::Done | engine::Action::Blocked => {
-                    history.transcript.final_answer = detail.into();
-                    history.transcript.final_answer_at = Some(SystemTime::now());
-                }
-                engine::Action::Input { .. } => {
-                    history.event(Kind::Question, summary.into(), detail.into(), None);
-                }
-                _ => history.event(Kind::Message, summary.into(), detail.into(), None),
+    ) -> Option<u64> {
+        let history = self.inline.as_mut()?;
+        match decision {
+            engine::Action::Done | engine::Action::Blocked => {
+                history.transcript.final_answer = detail.into();
+                history.transcript.final_answer_at = Some(SystemTime::now());
+                None
             }
+            engine::Action::Input { .. } => {
+                Some(history.event(Kind::Question, summary.into(), detail.into(), None))
+            }
+            _ => Some(history.event(Kind::Message, summary.into(), detail.into(), None)),
         }
     }
 
-    pub(super) fn inline_result(&mut self, status: engine::Status, stdout: &str, stderr: &str) {
-        if let Some(history) = &mut self.inline {
-            history.result(status, stdout, stderr);
-        }
+    pub(super) fn inline_result(
+        &mut self,
+        status: engine::Status,
+        stdout: &str,
+        stderr: &str,
+    ) -> Option<u64> {
+        self.inline.as_mut()?.result(status, stdout, stderr)
     }
 
     pub(super) fn toggle_inline_details(&mut self) {

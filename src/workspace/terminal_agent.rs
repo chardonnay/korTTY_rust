@@ -308,6 +308,7 @@ struct Run {
     learned_sudo: Option<crate::terminal_logging::RedactionSecrets>,
     notice: String,
     activity: VecDeque<String>,
+    activity_steps: HashMap<usize, u64>,
     journal_commands: HashMap<usize, Option<Arc<AtomicBool>>>,
     swarm_conclusion: Option<String>,
     final_evidence: final_evidence::Evidence,
@@ -492,6 +493,7 @@ impl Run {
             learned_sudo: None,
             notice: String::new(),
             activity: VecDeque::new(),
+            activity_steps: HashMap::new(),
             journal_commands: HashMap::new(),
             swarm_conclusion: None,
             final_evidence: final_evidence::Evidence::default(),
@@ -609,11 +611,21 @@ impl Run {
 
     fn record(&mut self, text: String) {
         if self.activity.len() == MAX_ACTIVITY {
-            self.journal_commands.remove(&self.presentation.identity(0));
+            let oldest = self.presentation.identity(0);
+            self.journal_commands.remove(&oldest);
+            self.activity_steps.remove(&oldest);
             self.activity.pop_front();
             self.presentation.evict();
         }
         self.activity.push_back(text);
+    }
+
+    fn bind_activity_step(&mut self, step: Option<u64>) {
+        if let Some(step) = step {
+            let index = self.activity.len() - 1;
+            self.activity_steps
+                .insert(self.presentation.identity(index), step);
+        }
     }
 
     fn record_command(&mut self, preview: String, probe: bool) -> Option<Arc<AtomicBool>> {
@@ -1532,12 +1544,11 @@ impl Workspace {
             && !run.history.writing()
             && !run.activity_export.writing()
         {
-            let detached = run.presentation.pip.detached.take();
             let workflow = self.close_run_workflow(id);
             self.retain_finished_agent_run(id, &mut run);
             let closed = Task::batch([
                 self.close_agent_container(id, run.surface),
-                detached.map_or_else(Task::none, |pip| self.close_placed_dialog(pip)),
+                self.follow_released_agent_pip(&mut run),
                 workflow,
             ]);
             return if self.should_exit_after_window_close() {
@@ -1607,10 +1618,9 @@ impl Workspace {
             self.publish_agent_inline_history(&self.terminal_agents.runs[&id]);
             return Some(Task::none());
         }
-        let detached = run.presentation.pip.detached.take();
         let surface = run.surface;
         let workflow = self.close_run_workflow(id);
-        if let Some(mut run) = self.terminal_agents.runs.remove(&id) {
+        let pip = if let Some(mut run) = self.terminal_agents.runs.remove(&id) {
             let finished = run.phase.finished();
             if run.active() {
                 run.stop("Agent run cancelled.");
@@ -1619,12 +1629,11 @@ impl Workspace {
             if finished {
                 self.retain_finished_agent_run(id, &mut run);
             }
-        }
-        let closed = Task::batch([
-            self.close_agent_container(id, surface),
-            detached.map_or_else(Task::none, |pip| self.close_placed_dialog(pip)),
-            workflow,
-        ]);
+            self.follow_released_agent_pip(&mut run)
+        } else {
+            Task::none()
+        };
+        let closed = Task::batch([self.close_agent_container(id, surface), pip, workflow]);
         Some(if self.should_exit_after_window_close() {
             Task::batch([closed, self.quit()])
         } else {

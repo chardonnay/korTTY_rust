@@ -167,6 +167,13 @@ pub(super) fn history_view<'a>(
 /// Review remains in the owned activity window, where the exact destination,
 /// command, password mode and epoch are reviewed together.
 fn controls(run: &Run, has_archive: bool) -> Element<'_, AgentMessage> {
+    controls_with_menu(run, actions::run_menu(run, has_archive))
+}
+
+fn controls_with_menu<'a>(
+    run: &'a Run,
+    run_menu: Option<Element<'static, AgentMessage>>,
+) -> Element<'a, AgentMessage> {
     let active = run.active() && !run.cancel.requested();
     row![
         button(match run.phase {
@@ -187,7 +194,7 @@ fn controls(run: &Run, has_archive: bool) -> Element<'_, AgentMessage> {
                 .on_press(AgentMessage::Pause)),
         active.then(|| button("Cancel").on_press(AgentMessage::Cancel)),
         handoff::compact(run),
-        actions::run_menu(run, has_archive),
+        run_menu,
         run.status_transcript()
             .filter(|(trace, _)| !trace.steps.is_empty())
             .map(|_| {
@@ -249,7 +256,12 @@ fn history_with_steps<'a>(
     owner: (&'a State, window::Id),
 ) -> Element<'a, AgentMessage> {
     if run.presentation.step_list_open {
-        status::step_list(run)
+        let surface = if surface == log_table::Surface::Detached {
+            log_table::Surface::DetachedStepList
+        } else {
+            log_table::Surface::PaneStepList
+        };
+        status::step_list(run, surface)
     } else {
         history::view(run, palette, reduced_motion, surface, Some(owner))
     }

@@ -710,7 +710,8 @@ impl Workspace {
             Purpose::Agent(_) => command.text(),
         };
         let journal_dispatch = run.record_command(format!("$ {preview}"), probe);
-        run.inline_command(command.text());
+        let step = run.inline_command(command.text());
+        run.bind_activity_step(step);
         let epoch = run.next(
             if probe {
                 Phase::Probe
@@ -1154,11 +1155,12 @@ impl Run {
         };
         let summary = mask_response(&decision.summary)?;
         let detail = mask_response(&decision.message)?;
-        self.inline_decision(&decision.action, &summary, &detail);
+        let step = self.inline_decision(&decision.action, &summary, &detail);
         if self.swarm && matches!(decision.action, Action::Done | Action::Blocked) {
             self.swarm_conclusion = Some(detail.clone());
         }
         self.record(format!("{summary}\n{detail}"));
+        self.bind_activity_step(step);
         match &decision.action {
             Action::Commands(commands) if self.mode == Mode::Run => {
                 for command in commands {
@@ -1227,7 +1229,7 @@ impl Run {
     fn record_result(&mut self, outcome: &Outcome) -> Result<(), String> {
         let stdout = mask::prompt(&self.redactor, &outcome.stdout.text())?;
         let stderr = mask::prompt(&self.redactor, &outcome.stderr.text())?;
-        self.inline_result(outcome.status, &stdout, &stderr);
+        let step = self.inline_result(outcome.status, &stdout, &stderr);
         let status = match outcome.status {
             engine::Status::Exited(code) => format!("Exit status {code}"),
             engine::Status::Cancelled => "Command cancelled".into(),
@@ -1245,6 +1247,7 @@ impl Run {
             bounded(&stdout),
             bounded(&stderr)
         ));
+        self.bind_activity_step(step);
         if matches!(self.purpose, Purpose::Agent(_)) && !self.cancel.requested() {
             self.final_evidence
                 .record_output(self.epoch, self.phase, outcome, stdout, stderr);

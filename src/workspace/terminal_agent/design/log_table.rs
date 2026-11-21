@@ -41,6 +41,29 @@ pub(crate) enum Surface {
     Activity,
     Pane,
     Detached,
+    ActivityEntry(usize),
+    PaneEntry(usize),
+    DetachedEntry(usize),
+    Minimap(usize),
+    Toast,
+    StatusStepList,
+    PaneStepList,
+    DetachedStepList,
+}
+
+impl Surface {
+    fn is_table(self) -> bool {
+        matches!(self, Self::Activity | Self::Pane | Self::Detached)
+    }
+
+    pub(super) fn activity_entry(self, identity: usize) -> Self {
+        match self {
+            Self::Activity => Self::ActivityEntry(identity),
+            Self::Pane => Self::PaneEntry(identity),
+            Self::Detached => Self::DetachedEntry(identity),
+            surface => surface,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -223,10 +246,8 @@ pub(crate) enum Message {
 
 impl Message {
     pub(in crate::workspace) fn takes_focus(self) -> bool {
-        matches!(
-            self,
-            Self::Select(_) | Self::Open(_) | Self::Sort(_) | Self::OpenMenu(..)
-        )
+        matches!(self, Self::Select(_) | Self::Open(_) | Self::Sort(_))
+            || matches!(self, Self::OpenMenu(surface, ..) if surface.is_table())
     }
 }
 
@@ -302,6 +323,14 @@ impl Default for State {
 }
 
 impl State {
+    pub(super) fn open_step_menu(&self, surface: Surface) -> Option<u64> {
+        let menu = self.menu.filter(|menu| menu.surface == surface)?;
+        match menu.row {
+            Some(Row::Step(id)) => Some(id),
+            _ => None,
+        }
+    }
+
     fn sync_detail_editor(&mut self, transcript: &Transcript) {
         let Some(detail @ (Detail::Step(_) | Detail::Answer(_))) = self.detail(transcript, None)
         else {
@@ -434,8 +463,10 @@ impl State {
     pub(super) fn update(&mut self, message: Message) {
         match message {
             Message::OpenMenu(surface, row, point) => {
-                self.selected = row;
-                self.detail = None;
+                if surface.is_table() {
+                    self.selected = row;
+                    self.detail = None;
+                }
                 self.menu = Some(context::Menu::new(surface, row, point));
             }
             Message::SelectMenuItem(index) => {
@@ -588,6 +619,25 @@ impl State {
             Row::Answer => None,
         }
     }
+}
+
+pub(super) fn step_context<'a>(
+    trigger: Element<'a, AgentMessage>,
+    run: &super::Run,
+    step: &Step,
+    surface: Surface,
+) -> Element<'a, AgentMessage> {
+    let menu = run
+        .presentation
+        .log_table
+        .menu
+        .filter(|menu| menu.surface == surface);
+    context::anchor(trigger, menu, surface, Some(Row::Step(step.id)), |_| {
+        actions::step_actions(run, step)
+            .into_iter()
+            .map(context::Entry::from)
+            .collect()
+    })
 }
 
 impl super::Run {
@@ -1064,12 +1114,7 @@ fn table_view<'a>(
             run.live_run.is_none(),
         );
         let entry = if let Some(run) = run.live_run {
-            context::anchor(trigger, menu, surface, Some(row), |_| {
-                super::actions::step_actions(run, step)
-                    .into_iter()
-                    .map(context::Entry::from)
-                    .collect()
-            })
+            step_context(trigger, run, step, surface)
         } else {
             trigger
         };
