@@ -3,11 +3,18 @@
 use std::f32::consts::PI;
 use std::time::{Duration, Instant};
 
+use iced::advanced::{
+    Clipboard, Layout, Shell, Widget,
+    graphics::geometry::Renderer as _,
+    layout::{self, Limits, Node},
+    renderer::{self, Renderer as _},
+    widget::{Operation, Tree, tree},
+};
 use iced::font::Weight;
 use iced::widget::{button, canvas, container, row, text, tooltip};
 use iced::{
     Alignment, Border, Color, Element, Event, Font, Length, Pixels, Point, Rectangle, Renderer,
-    Size, Theme, alignment, mouse, theme, window,
+    Size, Theme, Vector, alignment, mouse, theme, window,
 };
 
 use super::{AgentMessage, Trace, history, palette};
@@ -145,33 +152,69 @@ fn paint_label(frame: &mut canvas::Frame, label: &str, x: f32, y: f32, color: Co
     });
 }
 
-impl canvas::Program<AgentMessage> for Board {
-    type State = Motion;
+impl Widget<AgentMessage, Theme, Renderer> for Board {
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<Motion>()
+    }
+
+    fn state(&self) -> tree::State {
+        tree::State::new(Motion::default())
+    }
+
+    fn size(&self) -> Size<Length> {
+        Size::new(Length::Fill, Length::Fixed(HEIGHT))
+    }
+
+    fn layout(&mut self, _: &mut Tree, _: &Renderer, limits: &Limits) -> Node {
+        layout::atomic(limits, Length::Fill, Length::Fixed(HEIGHT))
+    }
+
+    fn operate(
+        &mut self,
+        _: &mut Tree,
+        layout: Layout<'_>,
+        _: &Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        operation.text(None, layout.bounds(), &self.label.text);
+    }
 
     fn update(
-        &self,
-        motion: &mut Motion,
+        &mut self,
+        tree: &mut Tree,
         event: &Event,
-        _: Rectangle,
+        _: Layout<'_>,
         _: mouse::Cursor,
-    ) -> Option<canvas::Action<AgentMessage>> {
+        _: &Renderer,
+        _: &mut dyn Clipboard,
+        shell: &mut Shell<'_, AgentMessage>,
+        _: &Rectangle,
+    ) {
         let Event::Window(window::Event::RedrawRequested(now)) = event else {
-            return None;
+            return;
         };
+        let motion = tree.state.downcast_mut::<Motion>();
         motion.sync(self, *now);
-        motion
-            .animating(self, *now)
-            .then(|| canvas::Action::request_redraw_at(*now + TICK))
+        if motion.animating(self, *now) {
+            shell.request_redraw_at(*now + TICK);
+        }
     }
 
     fn draw(
         &self,
-        motion: &Motion,
-        renderer: &Renderer,
+        tree: &Tree,
+        renderer: &mut Renderer,
         theme: &Theme,
-        bounds: Rectangle,
+        _: &renderer::Style,
+        layout: Layout<'_>,
         _: mouse::Cursor,
-    ) -> Vec<canvas::Geometry> {
+        viewport: &Rectangle,
+    ) {
+        let bounds = layout.bounds();
+        let Some(visible) = bounds.intersection(viewport) else {
+            return;
+        };
+        let motion = tree.state.downcast_ref::<Motion>();
         let now = Instant::now();
         let elapsed = motion
             .shown_at
@@ -206,40 +249,44 @@ impl canvas::Program<AgentMessage> for Board {
         );
         let x = 70.0;
         if bounds.width > x {
-            let clip = Rectangle::new(
-                Point::new(x, 0.0),
-                Size::new(bounds.width - x, bounds.height),
-            );
-            frame.with_clip(clip, |frame| {
-                let color = |label: &Label, opacity| {
-                    (if label.review { amber } else { foreground }).scale_alpha(alpha * opacity)
-                };
-                let current = &self.label;
-                if !self.reduced_motion
-                    && let (Some(old), Some(at)) = (&motion.outgoing, motion.changed_at)
-                    && motion.current.as_ref() == Some(current)
-                {
-                    let progress = travel(now.saturating_duration_since(at));
-                    paint_label(
-                        frame,
-                        &old.text,
-                        x,
-                        HEIGHT * (0.5 - progress),
-                        color(old, 1.0 - progress),
-                    );
-                    paint_label(
-                        frame,
-                        &current.text,
-                        x,
-                        HEIGHT * (1.5 - progress),
-                        color(current, 1.0),
-                    );
-                } else {
-                    paint_label(frame, &current.text, x, HEIGHT / 2.0, color(current, 1.0));
-                }
-            });
+            let color = |label: &Label, opacity| {
+                (if label.review { amber } else { foreground }).scale_alpha(alpha * opacity)
+            };
+            let current = &self.label;
+            if !self.reduced_motion
+                && let (Some(old), Some(at)) = (&motion.outgoing, motion.changed_at)
+                && motion.current.as_ref() == Some(current)
+            {
+                let progress = travel(now.saturating_duration_since(at));
+                paint_label(
+                    &mut frame,
+                    &old.text,
+                    x,
+                    HEIGHT * (0.5 - progress),
+                    color(old, 1.0 - progress),
+                );
+                paint_label(
+                    &mut frame,
+                    &current.text,
+                    x,
+                    HEIGHT * (1.5 - progress),
+                    color(current, 1.0),
+                );
+            } else {
+                paint_label(
+                    &mut frame,
+                    &current.text,
+                    x,
+                    HEIGHT / 2.0,
+                    color(current, 1.0),
+                );
+            }
         }
-        vec![frame.into_geometry()]
+        renderer.with_layer(visible, |renderer| {
+            renderer.with_translation(Vector::new(bounds.x, bounds.y), |renderer| {
+                renderer.draw_geometry(frame.into_geometry());
+            });
+        });
     }
 }
 
@@ -273,16 +320,17 @@ pub(super) fn view<'a>(
     };
     let (done, total) = trace.progress();
     let elapsed = trace.elapsed_label();
-    let summary = activity.presentation.model_usage.total().map_or_else(
-        || format!("{done}/{total} · {elapsed}"),
-        |tokens| format!("{done}/{total} · {tokens} tokens · {elapsed}"),
-    );
     let mut ticker = row![
-        canvas(board).width(Length::Fill).height(HEIGHT),
-        text(summary).size(11).font(Font::MONOSPACE),
+        Element::new(board),
+        text(format!("{done}/{total} · {elapsed}"))
+            .size(11)
+            .font(Font::MONOSPACE),
     ]
     .spacing(6)
     .align_y(Alignment::Center);
+    if let Some(usage) = super::usage_label(activity, palette) {
+        ticker = ticker.push(usage);
+    }
     if let Some(run) = trace.run {
         if trace.waiting {
             ticker = ticker.push(
@@ -322,6 +370,16 @@ pub(super) fn view<'a>(
         if let Some(menu) = super::super::actions::run_menu(run, has_archive) {
             ticker = ticker.push(menu);
         }
+        ticker = ticker.push(
+            button(if activity.presentation.drawer {
+                "Close details"
+            } else {
+                "Details"
+            })
+            .padding(3)
+            .style(button::text)
+            .on_press(AgentMessage::Design(super::Message::ToggleDrawer)),
+        );
     }
     palette::scope(
         palette,

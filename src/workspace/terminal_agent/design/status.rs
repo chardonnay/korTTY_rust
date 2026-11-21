@@ -374,7 +374,7 @@ pub(super) fn render<'a>(
         .align_y(Alignment::Center)
         .wrap()
         .into(),
-        Status::Neon => return neon::view(run, phase, &trace, palette, has_archive),
+        Status::Neon => neon::view(run, phase, &trace, palette, has_archive),
         Status::Hud => column![
             text(format!("Agent · {phase}"))
                 .size(14)
@@ -552,11 +552,19 @@ pub(super) fn render<'a>(
         }
     };
     let drawer = run.presentation.drawer;
+    if status == Status::Neon && !drawer {
+        return header;
+    }
     let simple = matches!(status, Status::Steps | Status::Pill);
-    let action_menu = trace
-        .run
-        .and_then(|run| super::actions::run_menu(run, has_archive));
-    let mut panel = column![header, usage_label(run, palette), action_menu].spacing(5);
+    let mut panel = if status == Status::Neon {
+        column![header]
+    } else {
+        let action_menu = trace
+            .run
+            .and_then(|run| super::actions::run_menu(run, has_archive));
+        column![header, usage_label(run, palette), action_menu]
+    }
+    .spacing(5);
     if drawer && !simple {
         if matches!(status, Status::Spotlight | Status::Toasts | Status::Orbit) {
             panel = panel.push(trace_drawer(
