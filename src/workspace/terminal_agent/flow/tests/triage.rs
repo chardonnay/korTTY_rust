@@ -8,7 +8,7 @@ use crate::local_ai::test_support::{
 use crate::workspace::terminal_agent::triage::{Message as Triage, Selection};
 use engine::planning::{Stage, TriageMode};
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod openssh;
 
 fn proposal() -> serde_json::Value {

@@ -11,6 +11,7 @@ use kortty_ssh::{ConnectOptions, HostKey, HostKeyStatus, TrustMode, TrustStore};
 use kortty_terminal::TerminalProfile;
 
 use super::*;
+use super::{dial_test_executable as dial, test_executable as executable};
 use crate::session_security::IsolationLevel;
 use crate::ssh_dialog::{Authentication, LoginRequest, LoginTarget};
 
@@ -177,17 +178,6 @@ fn request(listener: &TcpListener, username: String, key: PathBuf) -> Request {
     }
 }
 
-pub(crate) fn executable() -> PathBuf {
-    let path = PathBuf::from(
-        std::env::var_os("KORTTY_SSH_TEST_EXE").expect("set KORTTY_SSH_TEST_EXE to the built app"),
-    );
-    assert!(
-        path.is_absolute() && path.is_file(),
-        "invalid app executable"
-    );
-    path
-}
-
 fn accept(listener: &TcpListener) -> TcpStream {
     let deadline = Instant::now() + TIMEOUT;
     loop {
@@ -203,23 +193,6 @@ fn accept(listener: &TcpListener) -> TcpStream {
             Err(error) => panic!("could not accept SSH worker: {error}"),
         }
     }
-}
-
-pub(crate) fn dial(
-    request: Request,
-    sftp: bool,
-    executable: &Path,
-    trust: &TrustStore,
-) -> Result<Session, ConnectError> {
-    Session::dial_executable(
-        request,
-        INITIAL,
-        sftp,
-        &DialCancellation::default(),
-        executable,
-        trust,
-        None,
-    )
 }
 
 fn server_log(server: JoinHandle<ProcessOutput>) -> String {
@@ -355,26 +328,26 @@ fn worker_startup_timeout(isolation: IsolationLevel) {
     // Test double: a real TCP peer that does not send an SSH identification.
     let peer = thread::spawn(move || {
         let mut stream = accept(&incoming);
+        let accepted = Instant::now();
         stream.set_read_timeout(Some(TIMEOUT)).unwrap();
         let mut bytes = Vec::new();
         stream.read_to_end(&mut bytes).unwrap();
-        bytes
+        (accepted.elapsed(), bytes)
     });
     let mut request = request(&listener, "fixture".into(), key);
     request.isolation = isolation;
     request.options = ConnectOptions::new(1, 3).unwrap();
     let trust = TrustStore::new(directory.0.join("known_hosts"), TrustMode::Strict);
-    let started = Instant::now();
     let result = dial(request, false, &executable(), &trust);
-    let elapsed = started.elapsed();
     assert!(
         matches!(result, Err(ConnectError::Io(error)) if error.kind() == io::ErrorKind::TimedOut)
     );
+    let (elapsed, bytes) = peer.join().unwrap();
     assert!(
         (Duration::from_millis(900)..Duration::from_secs(5)).contains(&elapsed),
         "{elapsed:?}"
     );
-    assert!(peer.join().unwrap().starts_with(b"SSH-2.0-"));
+    assert!(bytes.starts_with(b"SSH-2.0-"));
     assert!(matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
 }
 

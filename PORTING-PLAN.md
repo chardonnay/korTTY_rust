@@ -9,7 +9,7 @@ source and environment for earlier checks. Detailed logs under
 
 **Java v2.26.0 parity remains partial.** The comparison uses Java tag
 `v2.26.0` (`b235d91f2035`). The current Rust worktree is based on merged
-PR #29 (`bf85762c`). Agent-to-Chat continuation, the Agent profile
+PR #30 (`e954921b`). Agent-to-Chat continuation, the Agent profile
 role, Journal chat exports, command summaries, the snippet structure panel
 and Lua editor tools are implemented. AI Manager search reaches every page
 and a subset of individual controls. The [source comparison](PORTING-PARITY.md#november-19-java-release-source-comparison)
@@ -1136,7 +1136,7 @@ an English answer. Keep this difference visible when comparing transcripts.
 
 | ID | State and implemented coverage | Remaining work |
 | --- | --- | --- |
-| A1 | Implementation + acceptance. Built-in Run/Ask/Plan, reviewed local/SSH execution, skills/quota, bounded history, opt-in `agent` aliases, Tab completion, sudo/vault challenges and mirror holds exist. PowerShell/CMD integration and per-pane setup/status now ship in source. Native ConPTY PowerShell 5.1/CMD and Fedora SSH Agent routes passed. Permitted terminal AI initializes an in-memory SSH credential mask independently of capture, including incognito, without enabling logging. R `src/workspace/terminal_agent/shortcut.rs`, `src/workspace/ssh_access.rs`, `src/session/shell_activity.rs`, `crates/pty/src/shell_integration.rs`. | The inline root-bypass option and grant revocation passed targeted native macOS/Fedora tests; automatic read-only dispatch and inline per-run confirmation passed targeted native macOS/Fedora tests. Verify remaining supported shells, native desktops and current packages. Complete native manual password entry on macOS/X11/Wayland, history/run controls, mirror release, changed targets and revocation. Direct custom Bash, Zsh, Fish, PowerShell and CMD profiles can use the Agent with validated interactive startup flags and a reviewed native runner. Verify the custom profiles in live desktop panes. See the diagnostic contract below. |
+| A1 | Implementation + acceptance. Built-in Run/Ask/Plan, reviewed local/SSH execution, skills/quota, bounded history, opt-in `agent` aliases, Tab completion, sudo/vault challenges and mirror holds exist. PowerShell/CMD integration and per-pane setup/status now ship in source. Native ConPTY PowerShell 5.1/CMD and Fedora SSH Agent routes passed. Permitted terminal AI initializes an in-memory SSH credential mask independently of capture, including incognito, without enabling logging. R `src/workspace/terminal_agent/shortcut.rs`, `src/workspace/ssh_access.rs`, `src/session/shell_activity.rs`, `crates/pty/src/shell_integration.rs`. | The inline root-bypass option and grant revocation passed targeted native macOS/Fedora tests; automatic read-only dispatch and inline per-run confirmation passed targeted native macOS/Fedora tests. Verify remaining supported shells, native desktops and current packages. The sandboxed SSH manual password flow passed on Fedora Wayland and X11. Verify the manual flow and local system sudo on macOS, and exercise history and run controls, mirror release, changed targets, and revocation. Direct custom Bash, Zsh, Fish, PowerShell and CMD profiles can use the Agent with validated interactive startup flags and a reviewed native runner. Verify the custom profiles in live desktop panes. See the diagnostic contract below. |
 | A2 | Implementation, acceptance and bounded audit. Planning stages, design module IDs d01–d20, docking/status/approval placement, inline history, picture-in-picture, usage/repair display, seven activity export formats and Agent-to-Chat/Journal links exist. The worktree includes the in-pane Spotlight prompt with entry and submission transitions, compact step progress, animated toast entry, countdown, fade and collapse, Orbit and the Adaptive Dock countdown. A chooser switches between retained runs in the same pane from status, history and the terminal context menu. Up to five finished runs remain available after the Activity window closes, bound to the original non-private stream. Settings uses the same status presenters and saves the auto-hide and reduced-motion preferences. Java restore fills both unset preferences independently. Windows ARM64 verified the earlier Settings workflow, live d14 display and cancellation, d19 layering and detach/reattach, and d20 pane resizing. [Spotlight and status checkpoint](PORTING-PARITY.md#november-20-terminal-agent-spotlight-and-status) | Verify reopening finished runs and earlier-run selection and the contextual run and step actions. Verify Spotlight focus and profile selection, the timed displays with reduced motion and auto-hide disabled, the remaining d14 interactions, and live d19 run following. Verify inline selection and Kitty row mapping, exports, linked Journal cards, live provider usage/repair and native desktop behavior across platforms. |
 | A3 | Acceptance + bounded audit. Live and saved targets, named pre-run saved SSH drafts, completed interactive rounds with renaming, reviewed continuation, connection groups and working-directory metadata, history search, Markdown/text/PDF export, saved journal defaults, estimate and journal links are implemented. A batch review binds one approval to the displayed ordinary commands and target identities. R `src/workspace/terminal_agent/swarm.rs` and its `batch.rs`/`comparison.rs`/`conversation.rs`. | Verify native renaming, selection, batch review and revocation, comparison, failure isolation, workflow drafts and continuation over pinned SSH. Evaluate Java's standing batch policy and incognito target scope against native authority requirements. Saved follow-up uses reviewed saved SSH routes. |
 | A4 | Acceptance. All eight pinned Agent verbs, events, wait/start/rename and `notification.show` have native Control/CLI routes. Windows socket backpressure and native notification submission have evidence. | Native visible delivery and exact focus/target routing, stale agents, moved splits, timeouts and losses across desktops. Admission/native submission receipts alone do not prove a displayed notice or activation. |
@@ -1218,13 +1218,23 @@ probes, ordinary commands and sudo operations acquire the pane's worker
 slot. A competing approval returns to review with a fresh epoch.
 Typed shortcuts also use the same five-run limit. A recognized
 submission at the limit stays local, and an edited shortcut stays bound
-to its original stream, privacy state, window and prompt. Verify mixed-mode
-desktop workflows with SSH panes, including contended sudo.
-Verify the remaining native desktops and the rail's station motion in
-the live renderer.
+to its original stream, privacy state, window and prompt. On Fedora,
+both direct and Landlock-confined OpenSSH pass the real sudo/PAM
+contention tests. The Fedora Wayland and X11 desktops verified
+mixed-mode aliases on a sandboxed OpenSSH pane, separate Ask and
+Planning reviews, the busy notice on a competing sudo approval, and
+successful execution after a fresh approval and masked password entry.
+X11 also showed the extra-run badge on that pane. On local panes, the
+live Metro light crossed intermediate positions with animations enabled
+and snapped to the next station with reduced animations. On Windows
+ARM64, the native direct and LPAC test routes also verified separate
+Ask and Planning reviews while Run completed real sudo/PAM. Repeat the
+mixed-mode SSH desktop workflow on macOS and Windows. Verify rail
+motion on Wayland, macOS, and Windows.
 [Java Metro line](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignMetroBar.java)
 · [Java Standard preset](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/agentdesign/AgentDesignPresets.java)
 · [Metro line verification](PORTING-PARITY.md#november-21-terminal-agent-metro-line)
+· [Mixed SSH verification](PORTING-PARITY.md#november-21-overlapping-terminal-agent-runs)
 
 The d09 tmux history shows the masked goal, one entry per typed step with
 its command or title and result, and a terminal-style footer. A completed
@@ -1339,8 +1349,14 @@ command. The ARM64 release bundle passed installation, native Wayland
 startup and a packaged CLI check of the host terminal. A separate native
 X11 run of the installed bundle accepted a plan, rejected a wrong password,
 accepted an explicitly approved retry and ran the separately approved step
-through its private sudo terminal. Verify the remaining desktop choices
-and policy changes and native macOS sudo.
+through its private sudo terminal. Apple Silicon passed the direct and App
+Sandbox client paths against the isolated Fedora server with real sudo/PAM.
+Windows ARM64 passed the same server checks through direct SSH and the
+native LPAC worker, including cancellation while the peer stayed open.
+The macOS helper has ten seconds to confirm sandbox startup. A packaged
+test also verified the separate configured SSH handshake timeout and
+cancellation. Verify the remaining desktop choices and policy changes and
+the local macOS system sudo route.
 [OpenSSH sudo/PAM verification](PORTING-PARITY.md#november-21-real-openssh-sudopam-for-the-terminal-agent)
 [Flatpak sudo and package verification](PORTING-PARITY.md#november-21-flatpak-host-sudo-for-the-terminal-agent)
 [Java sudo preflight](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/core/TerminalAgentService.java#L1620)
