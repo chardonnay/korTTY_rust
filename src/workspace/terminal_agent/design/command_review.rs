@@ -1,27 +1,40 @@
-//! Bind d09 decisions to the exact command card in the active terminal pane.
+//! Bind history-panel decisions to the exact command and terminal input state.
 
 use iced::advanced::{
     Clipboard, Layout, Shell, Widget, layout, renderer,
     widget::{Operation, Tree, tree},
 };
+use iced::widget::{button, column, container, row, text};
 use iced::{
-    Element, Event, Length, Rectangle, Renderer, Size, Task, Theme, keyboard, mouse, window,
+    Element, Event, Font, Length, Rectangle, Renderer, Size, Task, Theme, keyboard, mouse, window,
 };
 
 use crate::terminal_agent::design::{
-    History,
+    Approval, Arrangement, History,
     inline::{Prompt, clean},
 };
 use crate::terminal_view::agent_cursor::{Binding, Decision, Key};
 
-use super::super::super::{
-    Desktop, Message, Phase, Purpose, Run, RunTarget, Target, Workspace, cursor,
-};
-use super::super::Slot;
+use super::super::{Desktop, Message, Phase, Purpose, Run, RunTarget, Target, Workspace, cursor};
+use super::{Slot, history::Activity, log_table::Surface};
+
+pub(super) fn handles(history: History) -> bool {
+    matches!(
+        history,
+        History::Timeline
+            | History::PlanExecution
+            | History::CardStack
+            | History::Tmux
+            | History::Conversation
+            | History::LogTable
+    )
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::workspace::terminal_agent) struct Review {
     binding: Binding,
+    detached: Option<window::Id>,
+    history: History,
     remaining: bool,
 }
 
@@ -42,7 +55,7 @@ impl Review {
         if !matches!(key, Key::One | Key::Two | Key::Three) {
             return None;
         }
-        Some(Message::TmuxReview(ReviewAction {
+        Some(Message::PanelReview(ReviewAction {
             review: self,
             key,
             decision: key.decision(self.remaining)?,
@@ -58,6 +71,78 @@ impl Review {
     }
 }
 
+pub(super) fn card<'a>(activity: Activity<'a>) -> Option<Element<'a, Message>> {
+    if activity.live_run.is_some() && activity.surface == Surface::Activity {
+        return None;
+    }
+    let prompt = match activity.live_run {
+        Some(run) => run.masked_command_review(),
+        None => activity.transcript?.prompt.clone(),
+    }?;
+    let Prompt::Approval {
+        message, commands, ..
+    } = prompt
+    else {
+        return None;
+    };
+    let review = activity.panel_review;
+    let controls: Element<'a, Message> = if let Some(review) = review {
+        let controls =
+            row![button("[1] Allow once").on_press_maybe(review.action(Key::One, false)),]
+                .spacing(5);
+        if review.remaining() {
+            controls
+                .push(
+                    button("[2] Allow remaining ordinary commands")
+                        .on_press_maybe(review.action(Key::Two, false)),
+                )
+                .push(button("[3] Cancel").on_press_maybe(review.action(Key::Three, false)))
+                .wrap()
+                .into()
+        } else {
+            controls
+                .push(button("[2] Cancel").on_press_maybe(review.action(Key::Two, false)))
+                .wrap()
+                .into()
+        }
+    } else if activity.live_run.is_none() {
+        row![
+            button("[1] Allow once").on_press(Message::Approve(0)),
+            button("[2] Cancel").on_press(Message::Cancel)
+        ]
+        .spacing(5)
+        .wrap()
+        .into()
+    } else {
+        button("Review in Activity…")
+            .on_press(Message::Focus)
+            .into()
+    };
+    let card: Element<'a, Message> = container(
+        column![
+            text(message).size(activity.activity_font),
+            text(commands.join("\n"))
+                .font(Font::MONOSPACE)
+                .size(activity.activity_font)
+                .wrapping(text::Wrapping::WordOrGlyph),
+            controls,
+        ]
+        .spacing(5),
+    )
+    .padding(8)
+    .width(Length::Fill)
+    .style(|theme: &Theme| {
+        let mut style = container::bordered_box(theme);
+        style.border.color = theme.extended_palette().warning.base.color;
+        style
+    })
+    .into();
+    Some(match review {
+        Some(review) => review.guard(card),
+        None => card,
+    })
+}
+
 struct ReviewCard<'a> {
     review: Review,
     content: Element<'a, Message>,
@@ -66,6 +151,17 @@ struct ReviewCard<'a> {
 struct CardState {
     review: Review,
     visible: bool,
+}
+
+fn fully_visible(layout: Layout<'_>, viewport: &Rectangle) -> bool {
+    let bounds = layout.bounds();
+    bounds.x >= viewport.x
+        && bounds.y >= viewport.y
+        && bounds.x + bounds.width <= viewport.x + viewport.width
+        && bounds.y + bounds.height <= viewport.y + viewport.height
+        && layout
+            .children()
+            .all(|child| fully_visible(child, viewport))
 }
 
 impl Widget<Message, Theme, Renderer> for ReviewCard<'_> {
@@ -179,10 +275,9 @@ impl Widget<Message, Theme, Renderer> for ReviewCard<'_> {
         }
         let bounds = layout.bounds();
         let state = tree.state.downcast_mut::<CardState>();
-        if bounds.x < viewport.x
-            || bounds.y < viewport.y
-            || bounds.x + bounds.width > viewport.x + viewport.width
-            || bounds.y + bounds.height > viewport.y + viewport.height
+        if bounds.width <= 0.0
+            || bounds.height <= 0.0
+            || !fully_visible(layout, viewport)
             || matches!(event, Event::Window(window::Event::Unfocused))
         {
             if std::mem::replace(&mut state.visible, false) {
@@ -220,12 +315,13 @@ impl Widget<Message, Theme, Renderer> for ReviewCard<'_> {
 }
 
 impl Workspace {
-    pub(in crate::workspace::terminal_agent) fn tmux_review(
+    pub(in crate::workspace::terminal_agent) fn panel_review(
         &self,
         id: window::Id,
         run: &Run,
+        detached: Option<window::Id>,
     ) -> Option<Review> {
-        if run.design.history != History::Tmux
+        if !handles(run.design.history)
             || !run.has_terminal_presentation()
             || !matches!(run.purpose, Purpose::Agent(_))
             || !matches!(run.phase, Phase::ProbeApproval | Phase::Approval)
@@ -234,20 +330,34 @@ impl Workspace {
             || run.paused
             || run.cancel.requested()
             || run.presentation.step_list_open
-            || run.presentation.tmux_hidden
+            || run.presentation.dock_hidden
+            || (run.design.history == History::CardStack
+                && !run.presentation.activity.expand_all
+                && run
+                    .presentation
+                    .card_stack_back(super::card_stack::run_entry_count(run) + 1)
+                    > 0)
         {
             return None;
         }
-        let position = self
-            .window_settings
-            .ai_agent_panel
-            .history_slot(run.design)?;
-        if position == Slot::Bottom && run.presentation.activity.collapsed {
-            return None;
+        if run.design.arrangement == Arrangement::PictureInPicture {
+            let panel = &run.presentation.pip;
+            if panel.detached != detached || !panel.shows_history() {
+                return None;
+            }
+        } else {
+            let position = self
+                .window_settings
+                .ai_agent_panel
+                .history_slot(run.design)?;
+            if detached.is_some() || position == Slot::Bottom && run.presentation.activity.collapsed
+            {
+                return None;
+            }
         }
         let source = run.binding.live().ok()?;
         let (owner, _) = self.current_run_pane(run).ok()?;
-        let pane = self.agent_cursor_pane(owner, source.session)?;
+        let pane = self.agent_control_pane(owner, source.session, detached)?;
         if pane.effect.is_some()
             || self.owner_dialog(owner).is_some()
             || self.hosted_close_prompt(owner).is_some()
@@ -270,6 +380,13 @@ impl Workspace {
             return None;
         }
         let frame = pane.session.frame();
+        if run.design.approval == Approval::Cursor
+            && self
+                .agent_cursor_review(owner, source.session, &frame)
+                .is_some()
+        {
+            return None;
+        }
         if !cursor::review_frame(&frame) {
             return None;
         }
@@ -298,11 +415,13 @@ impl Workspace {
                 screen_revision: frame.search_revision,
                 input_revision: pane.session.mcp_input_revision(),
             },
+            detached,
+            history: run.design.history,
             remaining: run.offers_remaining_approval() && self.agent_approval_options().remaining,
         })
     }
 
-    pub(in crate::workspace::terminal_agent) fn update_tmux_review(
+    pub(in crate::workspace::terminal_agent) fn update_panel_review(
         &mut self,
         id: window::Id,
         action: ReviewAction,
@@ -314,7 +433,7 @@ impl Workspace {
             .terminal_agents
             .runs
             .get(&id)
-            .and_then(|run| self.tmux_review(id, run))
+            .and_then(|run| self.panel_review(id, run, action.review.detached))
         else {
             return Task::none();
         };
@@ -335,13 +454,29 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use iced::advanced::clipboard;
-    use iced::widget::button;
     use iced::{Font, Point};
     use iced_runtime::{UserInterface, user_interface::Cache};
 
     use crate::session::SessionId;
 
     use super::*;
+
+    #[test]
+    fn history_review_requires_visible_controls_even_when_the_parent_was_shrunk() {
+        let viewport = Rectangle::new(Point::ORIGIN, Size::new(130.0, 30.0));
+        let card = layout::Node::with_children(
+            viewport.size(),
+            vec![layout::Node::new(Size::new(120.0, 24.0)).move_to(Point::new(0.0, 22.0))],
+        );
+        assert!(!fully_visible(Layout::new(&card), &viewport));
+        assert!(fully_visible(
+            Layout::new(&card),
+            &Rectangle {
+                height: 60.0,
+                ..viewport
+            }
+        ));
+    }
 
     #[test]
     fn tmux_review_press_is_cleared_when_a_different_review_replaces_it() {
@@ -355,6 +490,8 @@ mod tests {
                 screen_revision: 28,
                 input_revision: 4,
             },
+            detached: None,
+            history: History::Tmux,
             remaining: false,
         };
         let content = |review: Review| {
@@ -398,6 +535,6 @@ mod tests {
             &mut clipboard::Null,
             &mut messages,
         );
-        assert!(matches!(&messages[..], [Message::TmuxReview(action)] if action.review == review));
+        assert!(matches!(&messages[..], [Message::PanelReview(action)] if action.review == review));
     }
 }

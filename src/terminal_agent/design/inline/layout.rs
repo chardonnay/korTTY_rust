@@ -91,7 +91,7 @@ fn meta(milliseconds: u64, tokens: Option<u64>) -> String {
     text
 }
 
-fn marker(step: &Step, spinner: &str) -> Segment {
+pub(crate) fn marker(step: &Step, spinner: &str) -> Segment {
     if step.state == StepState::Failed || step.kind == Kind::Error {
         return segment("✕", Role::Error);
     }

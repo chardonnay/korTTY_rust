@@ -19,6 +19,7 @@ use super::{
 };
 
 mod motion;
+pub(super) use motion::scale_card;
 
 #[derive(Clone)]
 pub struct Message {

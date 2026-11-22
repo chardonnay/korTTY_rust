@@ -129,6 +129,7 @@ impl Sample {
     pub(in crate::workspace) fn sync(&mut self, transcript: &inline::Transcript) {
         let now = Instant::now();
         let clock = SystemTime::now();
+        let prior_prompt = self.transcript.prompt.is_some();
         let mut next = transcript.clone();
         for step in &mut next.steps {
             let previous = self
@@ -182,8 +183,10 @@ impl Sample {
             self.entries.push_back(transcript.final_answer.clone());
         }
         self.presentation.activity.expand_all = transcript.expanded;
-        if transcript.prompt.is_some() {
+        if transcript.prompt.is_some() && !prior_prompt {
             self.presentation.review(super::super::Phase::Approval);
+        } else if transcript.prompt.is_none() {
+            self.presentation.review_started = None;
         }
     }
 
@@ -203,6 +206,28 @@ impl Sample {
             return None;
         }
         match layout.history {
+            History::CardStack => super::card_stack::refresh_interval(
+                &self.transcript,
+                &self.presentation,
+                !self.transcript.state.finished(),
+                now,
+                reduced_motion,
+            ),
+            History::Timeline => super::timeline::refresh_interval(
+                &self.transcript,
+                &self.presentation,
+                now,
+                self.transcript.state == inline::State::Running,
+                reduced_motion,
+            ),
+            History::PlanExecution => super::plan_execution::refresh_interval(
+                &self.transcript,
+                &self.presentation,
+                now,
+                !self.transcript.state.finished(),
+                self.transcript.state == inline::State::Running,
+                reduced_motion,
+            ),
             History::LogTable => self.presentation.log_table.refresh_interval(
                 &self.transcript,
                 now,
@@ -213,6 +238,21 @@ impl Sample {
             History::Tmux => {
                 tmux::refresh_interval(&self.transcript, &self.presentation, now, reduced_motion)
             }
+            History::Conversation => super::conversation::entrance_interval(
+                &self.transcript,
+                Some(self.started),
+                self.presentation.review_started,
+                now,
+                reduced_motion,
+            )
+            .or_else(|| {
+                super::conversation::refresh_interval(
+                    &self.transcript,
+                    self.transcript.state == inline::State::Running
+                        && self.transcript.prompt.is_none(),
+                    reduced_motion,
+                )
+            }),
             _ => None,
         }
     }
@@ -234,7 +274,19 @@ impl Sample {
 
     pub(in crate::workspace) fn interact(&mut self, action: Action) {
         match action {
-            Action::Detail(action) => self.presentation.update(action, self.entries.len()),
+            Action::Detail(action) => {
+                let len = match action {
+                    super::Message::BrowseCards(_) | super::Message::ScrollCards { .. } => {
+                        super::card_stack::entry_count(
+                            Some(&self.transcript),
+                            self.entries.len(),
+                            !self.transcript.state.finished(),
+                        )
+                    }
+                    _ => self.entries.len(),
+                };
+                self.presentation.update(action, len);
+            }
             Action::PictureInPicture(action) => self.presentation.pip.update_sample(action),
             Action::Grid(grid) => self.grid = grid,
             Action::Approve | Action::Cancel | Action::Ignore => {}
@@ -261,13 +313,17 @@ impl Sample {
             plan_font: fonts.plan,
             presentation: &self.presentation,
             transcript: Some(&self.transcript),
+            started: Some(self.started),
             live_run: None,
             surface: super::log_table::Surface::Activity,
             owner: None,
-            tmux_review: None,
+            panel_review: None,
         };
         let controls = || -> Element<'a, AgentMessage> {
-            if let Some(command) = view.approval.filter(|_| layout.history != History::Tmux) {
+            if let Some(command) = view
+                .approval
+                .filter(|_| !super::command_review::handles(layout.history))
+            {
                 column![
                     text(command).font(iced::Font::MONOSPACE).size(12),
                     row![

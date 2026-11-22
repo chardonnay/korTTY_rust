@@ -121,6 +121,7 @@ fn body<'a>(
     run: &'a Run,
     palette: Option<Palette>,
     reduced_motion: bool,
+    panel_review: Option<super::command_review::Review>,
 ) -> Element<'a, AgentMessage> {
     let panel = &run.presentation.pip;
     let mut content = column![title(panel, true, menu::view(state, run))].spacing(4);
@@ -174,7 +175,7 @@ fn body<'a>(
                     super::log_table::Surface::Pane
                 },
                 (state, id),
-                None,
+                panel_review,
             ))
             .push(super::controls_with_menu(run, None));
     }
@@ -188,6 +189,7 @@ pub(super) fn decorate<'a>(
     terminal: Element<'a, Desktop>,
     reduced_motion: bool,
     palette: Option<Palette>,
+    panel_review: Option<super::command_review::Review>,
 ) -> Element<'a, Desktop> {
     let panel = &run.presentation.pip;
     if panel.detached.is_some() {
@@ -201,7 +203,7 @@ pub(super) fn decorate<'a>(
                 .into(),
         )
     } else {
-        body(state, id, run, palette, reduced_motion)
+        body(state, id, run, palette, reduced_motion, panel_review)
     };
     surface::view(
         terminal,
@@ -226,9 +228,10 @@ pub(in crate::workspace::terminal_agent) fn detached_view(
     run_id: window::Id,
     palette: Option<Palette>,
     reduced_motion: bool,
+    panel_review: Option<super::command_review::Review>,
 ) -> Element<'_, AgentMessage> {
     let run = &state.runs[&run_id];
-    body(state, run_id, run, palette, reduced_motion)
+    body(state, run_id, run, palette, reduced_motion, panel_review)
         .map(move |message| AgentMessage::PipOwned(run_id, Box::new(message)))
 }
 

@@ -5,7 +5,7 @@ use iced::{Element, Length, Point};
 use crate::workspace::chrome::popup;
 
 use super::super::{Action, runs};
-use super::{AgentMessage, Message, Row, Surface, event};
+use super::{Activity, AgentMessage, Message, Row, Surface, actions, event};
 
 #[derive(Clone, Copy)]
 pub(super) struct Menu {
@@ -24,44 +24,82 @@ pub(crate) enum Page {
 
 pub(super) struct Entry {
     label: String,
-    action: AgentMessage,
+    action: Option<AgentMessage>,
+}
+
+impl Entry {
+    pub(super) fn action(label: &str, action: AgentMessage) -> Self {
+        Self {
+            label: label.into(),
+            action: Some(action),
+        }
+    }
 }
 
 impl From<Action> for Entry {
     fn from(action: Action) -> Self {
         Self {
             label: action.label().into(),
-            action: AgentMessage::DesignAction(action),
+            action: action
+                .enabled()
+                .then_some(AgentMessage::DesignAction(action)),
         }
     }
 }
 
-pub(super) fn run_entries(
-    actions: &[Action],
-    earlier_runs: &[runs::Choice],
+pub(super) struct RunMenu {
+    actions: Vec<Action>,
+    earlier_runs: Vec<runs::Choice>,
     epoch: u64,
-    page: Page,
-) -> Vec<Entry> {
-    match page {
-        Page::Actions => {
-            let mut entries: Vec<_> = actions.iter().copied().map(Entry::from).collect();
-            if !earlier_runs.is_empty() {
-                entries.push(Entry {
-                    label: "Earlier runs ›".into(),
-                    action: event(Message::MenuPage(Page::EarlierRuns)),
-                });
-            }
-            entries
+}
+
+impl RunMenu {
+    pub(super) fn for_activity(activity: Activity<'_>) -> Self {
+        let run = activity.live_run;
+        Self {
+            actions: run.map_or_else(Vec::new, |run| {
+                actions::run_actions(
+                    run,
+                    activity
+                        .owner
+                        .is_some_and(|(state, _)| state.has_archived_activity(run)),
+                )
+            }),
+            earlier_runs: run
+                .zip(activity.owner)
+                .map_or_else(Vec::new, |(run, (state, id))| {
+                    state.history_choices(id, run)
+                }),
+            epoch: run.map_or(0, |run| run.epoch),
         }
-        Page::EarlierRuns => std::iter::once(Entry {
-            label: "‹ Run actions".into(),
-            action: event(Message::MenuPage(Page::Actions)),
-        })
-        .chain(earlier_runs.iter().map(|run| Entry {
-            label: run.label.clone(),
-            action: AgentMessage::SelectPresentedRun(epoch, run.id),
-        }))
-        .collect(),
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.actions.is_empty() && self.earlier_runs.is_empty()
+    }
+
+    pub(super) fn entries(&self, page: Page) -> Vec<Entry> {
+        match page {
+            Page::Actions => {
+                let mut entries: Vec<_> = self.actions.iter().copied().map(Entry::from).collect();
+                if !self.earlier_runs.is_empty() {
+                    entries.push(Entry {
+                        label: "Earlier runs ›".into(),
+                        action: Some(event(Message::MenuPage(Page::EarlierRuns))),
+                    });
+                }
+                entries
+            }
+            Page::EarlierRuns => std::iter::once(Entry {
+                label: "‹ Run actions".into(),
+                action: Some(event(Message::MenuPage(Page::Actions))),
+            })
+            .chain(self.earlier_runs.iter().map(|run| Entry {
+                label: run.label.clone(),
+                action: Some(AgentMessage::SelectPresentedRun(self.epoch, run.id)),
+            }))
+            .collect(),
+        }
     }
 }
 
@@ -102,7 +140,7 @@ pub(super) fn anchor<'a>(
             } else {
                 button::text
             })
-            .on_press(entry.action.clone())
+            .on_press_maybe(entry.action.clone())
             .into()
     });
     let contents = container(scrollable(Column::with_children(buttons).spacing(2)))
@@ -122,7 +160,7 @@ pub(super) fn anchor<'a>(
         dismiss,
         move |key, _| match key {
             Key::Named(Named::Escape) => Some(escape.clone()),
-            Key::Named(Named::Enter) => Some(selection.clone()),
+            Key::Named(Named::Enter) => selection.clone(),
             Key::Named(Named::ArrowUp) => Some(event(Message::SelectMenuItem(previous))),
             Key::Named(Named::ArrowDown) => Some(event(Message::SelectMenuItem(next))),
             Key::Named(Named::ArrowLeft) if menu.page == Page::EarlierRuns => {
@@ -131,12 +169,14 @@ pub(super) fn anchor<'a>(
             Key::Named(Named::ArrowRight)
                 if matches!(
                     selection,
-                    AgentMessage::Design(super::presentation::Message::LogTable(
-                        Message::MenuPage(Page::EarlierRuns)
+                    Some(AgentMessage::Design(
+                        super::presentation::Message::LogTable(Message::MenuPage(
+                            Page::EarlierRuns
+                        ))
                     ))
                 ) =>
             {
-                Some(selection.clone())
+                selection.clone()
             }
             _ => None,
         },

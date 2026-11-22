@@ -248,7 +248,7 @@ impl Workspace {
             .get_mut(&selected)
             .expect("checked run");
         run.presentation.status_visibility.show();
-        run.presentation.set_tmux_hidden(false);
+        run.presentation.set_dock_hidden(false);
         run.presentation.pip.show();
         self.terminal_agents
             .presented_runs

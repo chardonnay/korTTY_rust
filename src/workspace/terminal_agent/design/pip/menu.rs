@@ -44,7 +44,7 @@ pub(super) fn view(state: &State, run: &Run) -> Option<Element<'static, AgentMes
                 } else {
                     button::text
                 })
-                .on_press(event(Message::Invoke(choice))),
+                .on_press_maybe(choice.enabled().then_some(event(Message::Invoke(choice)))),
         );
     }
     let contents = container(scrollable(items))
@@ -62,7 +62,7 @@ pub(super) fn view(state: &State, run: &Run) -> Option<Element<'static, AgentMes
         move |key, _| {
             Some(event(match key {
                 Key::Named(Named::Escape) => Message::Dismiss,
-                Key::Named(Named::Enter) => Message::Invoke(choice),
+                Key::Named(Named::Enter) if choice.enabled() => Message::Invoke(choice),
                 Key::Named(Named::ArrowUp) => Message::Highlight(previous),
                 Key::Named(Named::ArrowDown) => Message::Highlight(next),
                 _ => return None,
@@ -85,7 +85,9 @@ impl Workspace {
             Message::Open if !choices.is_empty() && self.current_run_pane(run).is_ok() => Some(0),
             Message::Dismiss => None,
             Message::Highlight(index) if was_open && index < choices.len() => Some(index),
-            Message::Invoke(choice) if was_open && choices.contains(&choice) => {
+            Message::Invoke(choice)
+                if was_open && choice.enabled() && choices.contains(&choice) =>
+            {
                 invoke = Some(choice);
                 None
             }

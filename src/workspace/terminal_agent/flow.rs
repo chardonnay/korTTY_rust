@@ -29,7 +29,13 @@ impl Workspace {
             {
                 return run.navigate_agent_log(navigation);
             }
-            run.presentation.update(message, run.activity.len());
+            let len = match message {
+                design::Message::BrowseCards(_) | design::Message::ScrollCards { .. } => {
+                    design::card_stack::run_entry_count(run)
+                }
+                _ => run.activity.len(),
+            };
+            run.presentation.update(message, len);
             return Task::none();
         }
         if matches!(message, Message::InlineDetails) {

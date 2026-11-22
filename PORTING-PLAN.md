@@ -9,7 +9,7 @@ source and environment for earlier checks. Detailed logs under
 
 **Java v2.26.0 parity remains partial.** The comparison uses Java tag
 `v2.26.0` (`b235d91f2035`). The current Rust worktree is based on merged
-PR #30 (`e954921b`). Agent-to-Chat continuation, the Agent profile
+PR #31 (`b3100f44`). Agent-to-Chat continuation, the Agent profile
 role, Journal chat exports, command summaries, the snippet structure panel
 and Lua editor tools are implemented. AI Manager search reaches every page
 and a subset of individual controls. The [source comparison](PORTING-PARITY.md#november-19-java-release-source-comparison)
@@ -269,9 +269,17 @@ knowledge-source capacity, and a checked Linux server-file replacement path.
 The [tagged release notes](https://github.com/chardonnay/korTTY/releases/tag/v2.26.0)
 were checked against the working source. Agent-to-Chat continuation, the Agent
 profile role, journal chat transcripts and exports, and the native editor
-structure panel are present. The release calls for Agent-to-Chat in each
-design's run menu and for search to reveal labeled controls across AI Manager
-pages. Both interactions still have gaps in the Rust worktree.
+structure panel are present. Finished terminal Run presentations now offer
+Chat with a follow-up field beneath the pane, including Classic. When Chat
+is unavailable, the offer and the entries in the existing run menus stay
+visible and disabled. The status pill, Orbit, Minimap, and the toast badge
+now expose the shared run actions and earlier-run chooser on right-click.
+Fedora verified Spotlight, Orbit, Minimap, the toast badge, and managed
+Chat denial under X11 and native Wayland. Windows ARM64 verified
+Copy answer from Spotlight and Continue in AI Chat from the terminal
+footer. A2 tracks the rest of the Windows matrix and the macOS workflow.
+AI Manager search still needs coverage for the remaining labeled controls.
+[Terminal handoff comparison](PORTING-PARITY.md#november-21-terminal-run-chat-handoff).
 
 - **S1 — Editor tools.** Native Lua highlighting, completion, and LuaJIT
   detection are available in the snippet and file editors. Reviewed tool
@@ -1157,6 +1165,84 @@ Repeat the workflow on Windows and macOS and verify placement across
 monitors.
 [Java pane presenter](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignHost.java#L1556)
 · [Fedora native desktop acceptance](PORTING-PARITY.md#november-21-detached-terminal-agent-history-follows-its-pane)
+
+The status pill (including Spotlight and Adaptive Dock's pill), Orbit,
+Minimap rail, and the toast badge open the displayed run's actions on
+right-click. The same menu selects earlier runs on the pane's stream.
+An open menu keeps its status visible through the auto-hide deadline and
+closes when the pane grid changes. On the Minimap, a step's menu takes
+precedence over the rail menu. Fedora X11 and Wayland copied answers
+from all four status menus, selected an earlier run, opened its Chat
+from the pane footer, and verified the disabled Chat entry. Both Linux
+desktops also copied distinct answers from two live splits and reopened
+the Adaptive Dock menu after a split narrowed its pane. The X11 run
+verified that the left pane's footer opened a Chat with its own answer.
+Windows ARM64 confirmed **Copy answer** from the Spotlight pill and
+**Continue in AI Chat** from the pane footer in a native private session.
+Repeat the other status presentations, earlier-run selection, split
+and resize checks on Windows. The live macOS workflow remains open.
+[Status-menu parity and tests](PORTING-PARITY.md#november-21-run-menus-on-agent-status-displays)
+
+The terminal context menu's **Last agent run** actions resolve against
+the newest traced run on that pane, including retained history. Design
+menus keep the user's displayed run. The action checks the pane stream
+and the newest run again at invocation. Desktop acceptance still needs
+an older run selected in the design, a newer retained run, and a second
+split with its own answer.
+[Latest run selection](PORTING-PARITY.md#terminal-context-menu-selects-the-latest-agent-run).
+
+The Conversation history (d13) offers a follow-up field in the pane and
+detached history. Send or Enter opens a fresh Agent run on the same
+terminal stream through the usual setup or environment review. The
+conversation keeps the most recent five earlier questions and answers
+from that stream when their run history is available. Verify draft entry,
+stream replacement, policy changes, and the live history on native
+desktops, including a split with its own Conversation history.
+The presenter uses typed command bubbles with expandable output, exit
+codes, and a pending-response indicator that stays still with reduced
+animations. Verify live and retained output disclosures on native
+desktops. Earlier turns open their step menus directly, including
+retained steps. Verify copying and the Snippet Editor from both live and
+retained turns, inside the pane and in a detached history.
+The inline command approval bubble uses the exact reviewed command in
+the active terminal stream. It works in the pane and the attached or
+detached picture-in-picture history, with the Activity window available
+for reviews that need its controls. New bubbles animate from their
+creation time and render immediately with reduced animations. Verify
+the controls, focus changes, narrow viewports and motion live on native
+desktops.
+[Conversation follow-up](PORTING-PARITY.md#conversation-design-follow-up-runs).
+
+The side timeline (d02), Plan and Execution (d06), Card Stack (d07) and
+Log Table (d16) present the same bound command approval at the newest
+node, in the execution column, on the front card, or above the table.
+Verify pointer and numeric decisions in live panes and attached and
+detached history. Card Stack browses older cards using the wheel or
+trackpad and resumes following the newest card when the user returns to
+it. The six standard docks share Hide and Show actions while preserving
+their run. Verify scoping, resize and restored review on native desktops.
+The side timeline shows typed step nodes, pending review, and the final
+answer. A new entry follows the end of the timeline. Updates to a step
+preserve a manual scroll position. New nodes and connectors animate
+with the native reduced-animations preference. Verify the rail motion,
+scrolling, and the live review in docked and detached desktops.
+Plan and Execution shows typed steps and progress beside the most recent
+command, its exit code, elapsed time, and an output tail. Pending review
+takes precedence and the final answer takes over when the run ends.
+Verify the desktop layout and progress motion in both animation modes.
+Plan and Execution draws a newly completed step's check mark over
+320 milliseconds. Updates to an existing result retain the original
+completion time. Reduced animations show the check mark immediately.
+Verify the stroke and reduced-motion behavior on native desktops.
+Card Stack shows typed
+cards with command results and output excerpts, a browsable final-answer
+card, and transitions for the front and receding cards. Verify visible
+card controls, wheel navigation, and both animation modes on native
+desktops.
+[History-panel approval](PORTING-PARITY.md#command-review-in-the-other-agent-histories)
+· [Side timeline](PORTING-PARITY.md#side-timeline-follows-typed-activity)
+· [Plan and Execution](PORTING-PARITY.md#plan-and-execution-uses-typed-command-results)
+· [Card Stack](PORTING-PARITY.md#card-stack-shows-typed-steps-and-the-final-answer).
 
 Activity entries for recorded commands, their results and model steps
 keep the typed step ID through activity eviction and finished-run

@@ -4,7 +4,7 @@ use std::f32::consts::TAU;
 use std::time::{Duration, Instant};
 
 use iced::widget::{Row, button, column, container, progress_bar, row, scrollable, text, tooltip};
-use iced::{Alignment, Element, Length};
+use iced::{Alignment, Element, Length, window};
 
 use crate::terminal_agent::design::Status;
 use crate::terminal_agent::design::inline::{State, Step, StepState, Transcript};
@@ -12,7 +12,7 @@ use crate::terminal_agent::design::inline::{State, Step, StepState, Transcript};
 use super::super::{Message as AgentMessage, Phase};
 use super::{
     Message, Run, history,
-    log_table::{Surface, step_context},
+    log_table::{Surface, status_run_context, step_context},
     palette::{self, Palette},
     presentation::Notice,
     toast,
@@ -235,15 +235,19 @@ pub(super) fn view<'a>(
     palette: Option<Palette>,
     now: Instant,
     reduced_motion: bool,
-    agents: &super::State,
+    owner: (&'a super::State, window::Id),
 ) -> Element<'a, AgentMessage> {
+    let (agents, _) = owner;
     let has_archive = agents.has_archived_activity(run);
     let mut trace = Trace::live(run, now, reduced_motion);
     if status == Status::Metro {
         trace.active_runs = agents.active_metro_runs(run);
     }
     render(
-        run.into(),
+        history::Activity {
+            owner: Some(owner),
+            ..run.into()
+        },
         phase(run),
         trace,
         status,
@@ -272,6 +276,7 @@ pub(super) fn render<'a>(
         color: heading_color,
     };
     let toggle = || AgentMessage::Design(Message::ToggleDrawer);
+    let run_context = |trigger| status_run_context(trigger, run, status);
     let header: Element<'_, AgentMessage> = match status {
         Status::Hidden => return column![].into(),
         Status::Steps | Status::Pill => row![
@@ -293,17 +298,20 @@ pub(super) fn render<'a>(
             for index in 0..run.activity.len() {
                 rail = rail.push(station(run, index, palette));
             }
-            let rail = column![
-                scrollable(rail).height(Length::Fill),
-                button("Activity")
-                    .style(button::text)
-                    .on_press(AgentMessage::Focus),
-            ]
-            .spacing(3);
+            let rail = run_context(
+                column![
+                    scrollable(rail).height(Length::Fill),
+                    button("Activity")
+                        .style(button::text)
+                        .on_press(AgentMessage::Focus),
+                ]
+                .spacing(3)
+                .into(),
+            );
             return if palette.is_some() {
                 palette::panel(palette, container(rail))
             } else {
-                rail.into()
+                rail
             };
         }
         Status::Powerline => row![
@@ -384,16 +392,14 @@ pub(super) fn render<'a>(
         }
         Status::Toasts => {
             let (_, total) = trace.progress();
-            let mut cards = column![
-                button(
-                    text(format!("Agent · {phase} · {total} steps"))
-                        .size(12)
-                        .style(heading_style)
-                )
-                .style(button::secondary)
-                .on_press(toggle()),
-            ]
-            .spacing(5);
+            let badge = button(
+                text(format!("Agent · {phase} · {total} steps"))
+                    .size(12)
+                    .style(heading_style),
+            )
+            .style(button::secondary)
+            .on_press(toggle());
+            let mut cards = column![run_context(badge.into())].spacing(5);
             let limit = if trace.waiting { 3 } else { 4 };
             let mut recent: Vec<_> = run
                 .presentation
@@ -521,6 +527,11 @@ pub(super) fn render<'a>(
             .on_press(toggle())
             .into()
         }
+    };
+    let header = if matches!(status, Status::Pill | Status::Spotlight | Status::Orbit) {
+        run_context(header)
+    } else {
+        header
     };
     let drawer = run.presentation.drawer;
     let has_own_controls = matches!(status, Status::Metro | Status::Neon);

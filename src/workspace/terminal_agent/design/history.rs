@@ -20,14 +20,16 @@ pub(super) struct Activity<'a> {
     pub(super) plan_font: f32,
     pub(super) presentation: &'a Presentation,
     pub(super) transcript: Option<&'a crate::terminal_agent::design::inline::Transcript>,
+    pub(super) started: Option<std::time::Instant>,
     pub(super) live_run: Option<&'a Run>,
     pub(super) surface: Surface,
     pub(super) owner: Option<(&'a State, window::Id)>,
-    pub(super) tmux_review: Option<super::tmux::Review>,
+    pub(super) panel_review: Option<super::command_review::Review>,
 }
 
 impl<'a> From<&'a Run> for Activity<'a> {
     fn from(run: &'a Run) -> Self {
+        let (transcript, started) = run.status_transcript().unzip();
         Self {
             activity: &run.activity,
             goal: &run.goal,
@@ -35,16 +37,26 @@ impl<'a> From<&'a Run> for Activity<'a> {
             activity_font: run.fonts.activity,
             plan_font: run.fonts.plan,
             presentation: &run.presentation,
-            transcript: run.status_transcript().map(|(trace, _)| trace),
+            transcript,
+            started,
             live_run: Some(run),
             surface: Surface::Activity,
             owner: None,
-            tmux_review: None,
+            panel_review: None,
         }
     }
 }
 
 impl<'a> Activity<'a> {
+    pub(super) fn bound_step(
+        self,
+        index: usize,
+    ) -> Option<&'a crate::terminal_agent::design::inline::Step> {
+        let run = self.live_run?;
+        let id = run.activity_steps.get(&run.presentation.identity(index))?;
+        self.transcript?.steps.iter().find(|step| step.id == *id)
+    }
+
     pub(super) fn step_context(
         self,
         index: usize,
@@ -54,17 +66,13 @@ impl<'a> Activity<'a> {
         let Some(run) = self.live_run else {
             return content;
         };
-        let Some(step) = run
-            .activity_steps
-            .get(&run.presentation.identity(index))
-            .and_then(|id| self.transcript?.steps.iter().find(|step| step.id == *id))
-        else {
+        let Some(step) = self.bound_step(index) else {
             return content;
         };
         super::log_table::step_context(content, run, step, surface)
     }
 
-    fn entry_menu(
+    pub(super) fn entry_menu(
         self,
         index: usize,
         content: impl Into<Element<'a, AgentMessage>>,
@@ -88,11 +96,11 @@ pub(super) fn summary(value: &str) -> String {
     result
 }
 
-fn select(run: Activity<'_>, index: usize) -> AgentMessage {
+pub(super) fn select(run: Activity<'_>, index: usize) -> AgentMessage {
     AgentMessage::Design(Message::Select(run.presentation.identity(index)))
 }
 
-fn detail(run: Activity<'_>, selected: usize) -> Element<'_, AgentMessage> {
+pub(super) fn detail(run: Activity<'_>, selected: usize) -> Element<'_, AgentMessage> {
     if run.presentation.activity.expand_all && !run.activity.is_empty() {
         return run
             .activity
@@ -118,13 +126,13 @@ pub(super) fn view<'a>(
     reduced_motion: bool,
     surface: Surface,
     owner: Option<(&'a State, window::Id)>,
-    tmux_review: Option<super::tmux::Review>,
+    panel_review: Option<super::command_review::Review>,
 ) -> Element<'a, AgentMessage> {
     view_as(
         Activity {
             surface,
             owner,
-            tmux_review,
+            panel_review,
             ..run.into()
         },
         run.design.history,
@@ -188,6 +196,11 @@ fn entries(
     palette: Option<Palette>,
     reduced_motion: bool,
 ) -> Element<'_, AgentMessage> {
+    if history == History::Conversation
+        && let Some(trace) = run.transcript
+    {
+        return super::conversation::thread(run, trace, palette, reduced_motion);
+    }
     if history == History::LogTable
         && let Some(transcript) = run.transcript
         && (!transcript.steps.is_empty()
@@ -196,11 +209,25 @@ fn entries(
     {
         return super::log_table::view(run, transcript, palette, reduced_motion);
     }
+    if history == History::Timeline
+        && let Some(trace) = run.transcript
+        && (!trace.steps.is_empty() || !trace.final_answer.is_empty() || run.activity.is_empty())
+    {
+        return super::timeline::view(run, trace, reduced_motion);
+    }
     let size = run.activity_font;
     let selected = run.presentation.selection(run.activity.len());
+    let approval = match history {
+        History::Timeline => super::command_review::card(run),
+        _ => None,
+    };
     let mut entries = column![].spacing(7).width(Length::Fill);
     match history {
-        History::Transcript | History::StepCards | History::InlineBlocks | History::Focus => {
+        History::Transcript
+        | History::StepCards
+        | History::InlineBlocks
+        | History::Focus
+        | History::Conversation => {
             for (index, entry) in run.activity.iter().enumerate() {
                 entries = entries.push(
                     run.entry_menu(index, super::activity_entry(history, index, entry, size)),
@@ -231,140 +258,10 @@ fn entries(
                 );
             }
         }
-        History::PlanExecution => {
-            let mut steps = column![text("Goal").size(size + 1.0), text(run.goal).size(size)]
-                .spacing(5)
-                .width(Length::FillPortion(2));
-            if let Some(plan) = run.plan {
-                steps = steps.push(text(plan).size(run.plan_font));
-            }
-            steps = steps.push(text("Activity").size(size + 1.0));
-            for (index, entry) in run.activity.iter().enumerate() {
-                steps = steps.push(
-                    run.entry_menu(
-                        index,
-                        button(text(format!("{}  {}", index + 1, summary(entry))).size(size - 1.0))
-                            .on_press(select(run, index))
-                            .style(if index == selected {
-                                button::primary
-                            } else {
-                                button::text
-                            }),
-                    ),
-                );
-            }
-            return row![
-                scrollable(steps)
-                    .height(Length::Fill)
-                    .width(Length::FillPortion(2)),
-                scrollable(
-                    column![
-                        text("Selected activity").size(size + 1.0),
-                        detail(run, selected)
-                    ]
-                    .spacing(7)
-                )
-                .height(Length::Fill)
-                .width(Length::FillPortion(3)),
-            ]
-            .spacing(10)
-            .into();
-        }
-        History::CardStack if run.presentation.activity.expand_all => {
-            for (index, entry) in run.activity.iter().enumerate() {
-                entries = entries.push(
-                    run.entry_menu(index, super::activity_entry(history, index, entry, size)),
-                );
-            }
-        }
-        History::CardStack => {
-            for index in selected.saturating_sub(2)..selected {
-                if let Some(entry) = run.activity.get(index) {
-                    entries = entries.push(
-                        run.entry_menu(
-                            index,
-                            button(
-                                text(format!("{} · {}", index + 1, summary(entry)))
-                                    .size(size - 1.0),
-                            )
-                            .width(Length::Fill)
-                            .on_press(select(run, index))
-                            .style(button::secondary),
-                        ),
-                    );
-                }
-            }
-            entries = entries.push(
-                run.entry_menu(
-                    selected,
-                    container(
-                        column![
-                            row![
-                                button("Previous").on_press_maybe(
-                                    (selected > 0)
-                                        .then_some(AgentMessage::Design(Message::Previous))
-                                ),
-                                text(format!(
-                                    "Activity {} of {}",
-                                    if run.activity.is_empty() {
-                                        0
-                                    } else {
-                                        selected + 1
-                                    },
-                                    run.activity.len()
-                                ))
-                                .size(size),
-                                button("Next").on_press_maybe(
-                                    (selected + 1 < run.activity.len())
-                                        .then_some(AgentMessage::Design(Message::Next))
-                                ),
-                            ]
-                            .spacing(6)
-                            .wrap(),
-                            detail(run, selected),
-                        ]
-                        .spacing(8),
-                    )
-                    .padding(10)
-                    .style(container::bordered_box)
-                    .width(Length::Fill),
-                ),
-            );
-        }
+        History::PlanExecution => return super::plan_execution::view(run, reduced_motion),
+        History::CardStack => return super::card_stack::view(run, reduced_motion),
         History::Tmux => {
             return super::tmux::view(run, palette, reduced_motion);
-        }
-        History::Conversation => {
-            entries = entries.push(
-                container(
-                    container(text(run.goal).size(size))
-                        .padding(8)
-                        .style(container::rounded_box)
-                        .max_width(360),
-                )
-                .width(Length::Fill)
-                .align_right(Length::Fill),
-            );
-            for (index, entry) in run.activity.iter().enumerate() {
-                entries = entries.push(
-                    run.entry_menu(
-                        index,
-                        container(
-                            column![
-                                button(text(format!("Agent · {}", summary(entry))).size(size))
-                                    .on_press(select(run, index))
-                                    .style(button::text),
-                                (index == selected || run.presentation.activity.expand_all)
-                                    .then(|| text(entry).size(size)),
-                            ]
-                            .spacing(4),
-                        )
-                        .padding(7)
-                        .style(container::bordered_box)
-                        .width(Length::Fill),
-                    ),
-                );
-            }
         }
         History::LogTable => {
             entries = entries.push(
@@ -400,5 +297,24 @@ fn entries(
             );
         }
     }
-    scrollable(entries).height(Length::Fill).into()
+    let history_rows = scrollable(entries).height(Length::Fill);
+    if let Some(approval) = approval {
+        let approval = if history == History::Timeline {
+            row![
+                text("●").style(|theme: &iced::Theme| text::Style {
+                    color: Some(theme.extended_palette().warning.base.color),
+                }),
+                approval
+            ]
+            .spacing(5)
+            .into()
+        } else {
+            approval
+        };
+        return column![history_rows, approval]
+            .height(Length::Fill)
+            .spacing(5)
+            .into();
+    }
+    history_rows.into()
 }

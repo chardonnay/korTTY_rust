@@ -11,6 +11,7 @@ use iced::{Alignment, Color, Element, Font, Length, Padding, Point, Task, mouse}
 use jiff::{Timestamp, tz::TimeZone};
 
 use crate::horizontal_divider::{self, Grow};
+use crate::terminal_agent::design::Status;
 use crate::terminal_agent::design::inline::{
     Kind, Prompt, State as TranscriptState, Step, StepState, Transcript,
 };
@@ -44,11 +45,23 @@ pub(crate) enum Surface {
     ActivityEntry(usize),
     PaneEntry(usize),
     DetachedEntry(usize),
+    ActivityExecution,
+    PaneExecution,
+    DetachedExecution,
+    EarlierConversation(ConversationSurface, u64),
     Minimap(usize),
     Toast,
+    StatusRun(Status),
     StatusStepList,
     PaneStepList,
     DetachedStepList,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConversationSurface {
+    Activity,
+    Pane,
+    Detached,
 }
 
 impl Surface {
@@ -63,6 +76,25 @@ impl Surface {
             Self::Detached => Self::DetachedEntry(identity),
             surface => surface,
         }
+    }
+
+    pub(super) fn execution(self) -> Self {
+        match self {
+            Self::Activity => Self::ActivityExecution,
+            Self::Pane => Self::PaneExecution,
+            Self::Detached => Self::DetachedExecution,
+            surface => surface,
+        }
+    }
+
+    pub(super) fn earlier_conversation(self, turn: u64) -> Option<Self> {
+        let surface = match self {
+            Self::Activity => ConversationSurface::Activity,
+            Self::Pane => ConversationSurface::Pane,
+            Self::Detached => ConversationSurface::Detached,
+            _ => return None,
+        };
+        Some(Self::EarlierConversation(surface, turn))
     }
 }
 
@@ -323,11 +355,33 @@ impl Default for State {
 }
 
 impl State {
+    pub(super) fn has_menu(&self, surface: Surface, row: Row) -> bool {
+        self.menu
+            .is_some_and(|menu| menu.surface == surface && menu.row == Some(row))
+    }
+
     pub(super) fn open_step_menu(&self, surface: Surface) -> Option<u64> {
         let menu = self.menu.filter(|menu| menu.surface == surface)?;
         match menu.row {
             Some(Row::Step(id)) => Some(id),
             _ => None,
+        }
+    }
+
+    pub(super) fn status_run_menu_open(&self, status: Status) -> bool {
+        self.menu
+            .is_some_and(|menu| menu.surface == Surface::StatusRun(status))
+    }
+
+    pub(super) fn close_status_run_menu(&mut self) -> bool {
+        if self
+            .menu
+            .is_some_and(|menu| matches!(menu.surface, Surface::StatusRun(_)))
+        {
+            self.menu = None;
+            true
+        } else {
+            false
         }
     }
 
@@ -400,7 +454,7 @@ impl State {
         }
     }
 
-    fn seen_at(&self, row: Row) -> Option<Instant> {
+    pub(super) fn seen_at(&self, row: Row) -> Option<Instant> {
         if let Row::Approval(revision) = row {
             return self
                 .approval(Some(revision))
@@ -453,7 +507,7 @@ impl State {
         })
     }
 
-    fn spinner(&self, row: Row, now: Instant) -> &'static str {
+    pub(super) fn spinner(&self, row: Row, now: Instant) -> &'static str {
         let frame = self.seen_at(row).map_or(0, |at| {
             now.saturating_duration_since(at).as_millis() / u128::from(SPINNER_INTERVAL)
         });
@@ -638,6 +692,51 @@ pub(super) fn step_context<'a>(
             .map(context::Entry::from)
             .collect()
     })
+}
+
+pub(super) fn earlier_step_context<'a>(
+    trigger: Element<'a, AgentMessage>,
+    run: &super::Run,
+    step: &Step,
+    surface: Surface,
+    key: super::conversation::OutputKey,
+) -> Element<'a, AgentMessage> {
+    let menu = run
+        .presentation
+        .log_table
+        .menu
+        .filter(|menu| menu.surface == surface);
+    context::anchor(trigger, menu, surface, Some(Row::Step(step.id)), |_| {
+        actions::step_items(step, run.binding.private())
+            .into_iter()
+            .map(|item| {
+                context::Entry::action(
+                    item.label(),
+                    AgentMessage::Design(presentation::Message::EarlierConversationStep(
+                        key, surface, item,
+                    )),
+                )
+            })
+            .collect()
+    })
+}
+
+pub(super) fn status_run_context<'a>(
+    trigger: Element<'a, AgentMessage>,
+    activity: Activity<'a>,
+    status: Status,
+) -> Element<'a, AgentMessage> {
+    let run_menu = context::RunMenu::for_activity(activity);
+    if run_menu.is_empty() {
+        return trigger;
+    }
+    let surface = Surface::StatusRun(status);
+    let menu = activity
+        .presentation
+        .log_table
+        .menu
+        .filter(|menu| menu.surface == surface);
+    context::anchor(trigger, menu, surface, None, |page| run_menu.entries(page))
 }
 
 impl super::Run {
@@ -835,7 +934,7 @@ fn result(step: &Step, spinner: &str) -> String {
     state_label(step).into()
 }
 
-fn state_label(step: &Step) -> &'static str {
+pub(super) fn state_label(step: &Step) -> &'static str {
     match step.state {
         StepState::Running => "Running",
         StepState::Completed => "Completed",
@@ -1144,30 +1243,9 @@ fn table_view<'a>(
             true,
         ));
     }
-    let run_actions = run
-        .live_run
-        .map(|live| {
-            super::actions::run_actions(
-                live,
-                run.owner
-                    .is_some_and(|(state, _)| state.has_archived_activity(live)),
-            )
-        })
-        .unwrap_or_default();
-    let earlier_runs = run
-        .live_run
-        .zip(run.owner)
-        .map(|(run, (state, id))| state.history_choices(id, run))
-        .unwrap_or_default();
-    let has_run_menu = !run_actions.is_empty() || !earlier_runs.is_empty();
-    let run_entries = |page| {
-        context::run_entries(
-            &run_actions,
-            &earlier_runs,
-            run.live_run.map_or(0, |run| run.epoch),
-            page,
-        )
-    };
+    let run_menu = context::RunMenu::for_activity(run);
+    let has_run_menu = !run_menu.is_empty();
+    let run_entries = |page| run_menu.entries(page);
     if !transcript.final_answer.is_empty() {
         let trigger = entry(
             Row::Answer,
@@ -1231,7 +1309,7 @@ fn table_view<'a>(
         .spacing(5)
         .wrap()
     });
-    column![table, review, detail]
+    column![super::command_review::card(run), table, review, detail]
         .height(Length::Fill)
         .spacing(4)
         .into()
@@ -1413,10 +1491,11 @@ mod tests {
             plan_font: 13.0,
             presentation: &presentation,
             transcript: Some(&transcript),
+            started: None,
             live_run: None,
             surface: Surface::Activity,
             owner: None,
-            tmux_review: None,
+            panel_review: None,
         };
         let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
         let mut cache = Cache::default();
@@ -1517,10 +1596,11 @@ mod tests {
                 plan_font: 13.0,
                 presentation,
                 transcript: Some(transcript),
+                started: None,
                 live_run: None,
                 surface: Surface::Activity,
                 owner: None,
-                tmux_review: None,
+                panel_review: None,
             };
             scrollable(iced::widget::column![
                 space().height(90.0),
@@ -1708,10 +1788,11 @@ mod tests {
                 plan_font: 13.0,
                 presentation,
                 transcript: Some(transcript),
+                started: None,
                 live_run: None,
                 surface: Surface::Activity,
                 owner: None,
-                tmux_review: None,
+                panel_review: None,
             };
             UserInterface::build(
                 view(info, transcript, None, true),

@@ -21,12 +21,12 @@ pub(super) struct FinishedRun {
     pub(super) mode: Mode,
     pub(super) order: u64,
     phase: Phase,
-    surface: RunPresentation,
+    pub(super) surface: RunPresentation,
     label: String,
     goal: String,
     plan: Option<String>,
     profile: ProfileChoice,
-    design: AgentLayout,
+    pub(super) design: AgentLayout,
     fonts: font::Sizes,
     history: inline_history::History,
     activity: VecDeque<String>,
@@ -150,6 +150,26 @@ impl FinishedRun {
     pub(super) fn goal(&self) -> &str {
         &self.goal
     }
+
+    pub(super) fn answer(&self) -> &str {
+        self.history.status_transcript().final_answer.trim()
+    }
+
+    pub(super) fn transcript(&self) -> &crate::terminal_agent::design::inline::Transcript {
+        self.history.status_transcript()
+    }
+
+    pub(super) fn can_export(&self) -> bool {
+        self.export.has_snapshot()
+    }
+
+    pub(super) fn can_generate_workflow(&self) -> bool {
+        self.mode == Mode::Run && !self.final_evidence.is_empty()
+    }
+
+    pub(super) fn chat_handoff_id(&self) -> Option<&str> {
+        self.chat_handoff_id.as_deref()
+    }
 }
 
 impl Workspace {
@@ -205,28 +225,45 @@ impl Workspace {
         stream: u64,
         id: window::Id,
     ) -> Task<Desktop> {
+        let (window, opened) = match self.restore_finished_agent_run(owner, session, stream, id) {
+            Ok(restored) => restored,
+            Err(task) => return task,
+        };
+        self.terminal_agents
+            .presented_runs
+            .insert(session, (stream, window));
+        Task::batch([opened, self.reconcile_agent_pip()])
+    }
+
+    pub(super) fn restore_finished_agent_run(
+        &mut self,
+        owner: window::Id,
+        session: SessionId,
+        stream: u64,
+        id: window::Id,
+    ) -> Result<(window::Id, Task<Desktop>), Task<Desktop>> {
         let archive = &self.terminal_agents.finished_runs;
         let Some(index) = archive.0.iter().position(|entry| {
             entry.id == id && entry.source.session == session && entry.source.stream == stream
         }) else {
-            return Task::none();
+            return Err(Task::none());
         };
         let entry = &archive.0[index];
         let Ok((pane_owner, pane)) = self.current_agent_pane(entry.source, entry.mode) else {
-            return Task::none();
+            return Err(Task::none());
         };
         if pane_owner != owner || self.exiting {
-            return Task::none();
+            return Err(Task::none());
         }
         if self.terminal_agents.runs.len() >= MAX_RUNS {
-            return self.open_agent_result(
+            return Err(self.open_agent_result(
                 owner,
                 Err("Close an agent activity window before reopening history.".into()),
-            );
+            ));
         }
         let redactor = match self.agent_source_redactor(pane) {
             Ok(redactor) => redactor,
-            Err(error) => return self.open_agent_result(owner, Err(error)),
+            Err(error) => return Err(self.open_agent_result(owner, Err(error))),
         };
         let entry = self.terminal_agents.finished_runs.0.remove(index);
         let mut run = Run::from_setup(RunSetup {
@@ -262,10 +299,7 @@ impl Workspace {
         run.presentation.reveal_finished(entry.finished);
         let (window, opened) = self.open_agent_surface(owner, &run);
         self.terminal_agents.runs.insert(window, run);
-        self.terminal_agents
-            .presented_runs
-            .insert(session, (stream, window));
-        Task::batch([opened, self.reconcile_agent_pip()])
+        Ok((window, opened))
     }
 }
 

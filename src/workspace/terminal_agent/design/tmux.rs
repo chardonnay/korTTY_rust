@@ -12,10 +12,6 @@ use crate::terminal_view::agent_cursor::Key;
 
 use super::{AgentMessage, Palette, Presentation, history::Activity, log_table, status};
 
-mod review;
-pub(super) use review::Review;
-pub(crate) use review::ReviewAction;
-
 const CHAR_MS: u64 = 24;
 const CURSOR_HALF_CYCLE_MS: u64 = 530;
 const CURSOR_FRAME_MS: u64 = 32;
@@ -183,7 +179,7 @@ pub(super) fn view<'a>(
         let once = |label, action| {
             button(text(label).font(Font::MONOSPACE).size(size)).on_press_maybe(action)
         };
-        let controls: Element<'_, AgentMessage> = if let Some(review) = activity.tmux_review {
+        let controls: Element<'_, AgentMessage> = if let Some(review) = activity.panel_review {
             let mut buttons =
                 row![once("[1] Allow once", review.action(Key::One, false))].spacing(6);
             if review.remaining() {
@@ -219,7 +215,7 @@ pub(super) fn view<'a>(
         ]
         .spacing(5)
         .width(Length::Fill);
-        if let Some(review) = activity.tmux_review {
+        if let Some(review) = activity.panel_review {
             lines = lines.push(review.guard(card.into()));
         } else {
             lines = lines.push(card);
