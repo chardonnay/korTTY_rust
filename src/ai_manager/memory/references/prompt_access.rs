@@ -19,6 +19,7 @@ const MAX_PATH_COMPONENTS: usize = 64;
 pub(in crate::ai_manager::memory) struct ApprovedReference {
     pub(in crate::ai_manager::memory) text: Zeroizing<String>,
     pub(in crate::ai_manager::memory) binding: ReferenceBinding,
+    pub(in crate::ai_manager::memory) partial: bool,
 }
 
 #[derive(Clone)]
@@ -30,6 +31,10 @@ pub(in crate::ai_manager::memory) struct ReferenceBinding {
 impl ReferenceBinding {
     pub(in crate::ai_manager::memory) fn is_connection(&self) -> bool {
         self.reference.connection_id.is_some()
+    }
+
+    pub(in crate::ai_manager::memory) fn file_name(&self) -> Option<&str> {
+        Path::new(&self.reference.path).file_name()?.to_str()
     }
 }
 
@@ -114,12 +119,13 @@ fn select(
         let Ok((identity, bytes)) = read_approved(&home, entry, &mut budget, allows_path) else {
             continue;
         };
-        let Ok(text) = excerpt(&bytes, Path::new(&entry.path)) else {
+        let Ok((text, partial)) = excerpt(&bytes, Path::new(&entry.path)) else {
             continue;
         };
         if !text.trim().is_empty() {
             approved.push(ApprovedReference {
                 text,
+                partial,
                 binding: ReferenceBinding {
                     reference: entry.clone(),
                     identity,
@@ -353,7 +359,7 @@ fn extension(path: &Path, suffix: &str) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case(suffix))
 }
 
-fn excerpt(bytes: &[u8], path: &Path) -> io::Result<Zeroizing<String>> {
+fn excerpt(bytes: &[u8], path: &Path) -> io::Result<(Zeroizing<String>, bool)> {
     let source = std::str::from_utf8(bytes).map_err(|_| ineligible())?;
     let clean = format::checked_reference_text(source).map_err(|_| ineligible())?;
     let text = if extension(path, "mdc") {
@@ -361,7 +367,8 @@ fn excerpt(bytes: &[u8], path: &Path) -> io::Result<Zeroizing<String>> {
     } else {
         &clean
     };
-    let text = if text.len() > MAX_EXCERPT_BYTES {
+    let partial = text.len() > MAX_EXCERPT_BYTES;
+    let text = if partial {
         let prefix = &text[..text.floor_char_boundary(MAX_EXCERPT_BYTES)];
         prefix
             .rfind("\n\n")
@@ -372,7 +379,7 @@ fn excerpt(bytes: &[u8], path: &Path) -> io::Result<Zeroizing<String>> {
     } else {
         text
     };
-    Ok(Zeroizing::new(text.to_owned()))
+    Ok((Zeroizing::new(text.to_owned()), partial))
 }
 
 fn strip_front_matter(text: &str) -> io::Result<&str> {
@@ -689,7 +696,7 @@ mod tests {
         assert!(excerpt(b"---\nrule: no closing marker\n", path).is_err());
         let long = "é".repeat(MAX_EXCERPT_BYTES);
         assert_eq!(
-            excerpt(long.as_bytes(), path).unwrap().len(),
+            excerpt(long.as_bytes(), path).unwrap().0.len(),
             MAX_EXCERPT_BYTES
         );
         let with_tail = format!("{long}\npassword: Winter2026!\n");

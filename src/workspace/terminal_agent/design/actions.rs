@@ -425,13 +425,18 @@ impl Workspace {
                 Task::none()
             }
             (None, Item::HideStatus)
-                if matches!(
-                    run.design.status,
-                    crate::terminal_agent::design::Status::Metro
-                        | crate::terminal_agent::design::Status::Neon
-                ) =>
+                if run.uses_powerline()
+                    || matches!(
+                        run.design.status,
+                        crate::terminal_agent::design::Status::Metro
+                            | crate::terminal_agent::design::Status::Neon
+                            | crate::terminal_agent::design::Status::TopBar
+                    ) =>
             {
                 if let Some(run) = self.terminal_agents.runs.get_mut(&id) {
+                    if run.uses_powerline() {
+                        run.presentation.dismiss_powerline_drawer();
+                    }
                     run.presentation.status_visibility.hide();
                 }
                 Task::none()

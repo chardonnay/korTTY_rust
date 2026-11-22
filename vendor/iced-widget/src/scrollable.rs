@@ -1882,6 +1882,9 @@ fn notify_viewport<Message>(
 ) -> bool {
     if content_bounds.width <= bounds.width
         && content_bounds.height <= bounds.height
+        && (state.follow_bottom.is_none()
+            || on_scroll.is_none()
+            || state.last_notified.is_none())
     {
         return false;
     }

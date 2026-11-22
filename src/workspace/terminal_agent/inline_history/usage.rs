@@ -45,6 +45,7 @@ impl Run {
         if epoch != self.epoch {
             return;
         }
+        self.record_sent_context(report);
         self.record_model_attempts(epoch, &report.attempts);
         self.finish_model_decision_without_report(if report.result.is_ok() {
             StepState::Completed

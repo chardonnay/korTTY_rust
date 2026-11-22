@@ -11,10 +11,14 @@ pub(in crate::workspace) enum Slot {
     Top,
     TopDrawer,
     Bottom,
+    BottomDrawer,
     Left,
     Right,
+    RightRail,
     OverlayTop,
     OverlayBottom,
+    TerminalOverlayBottom,
+    OrbitOverlay,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -116,10 +120,13 @@ pub(in crate::workspace) fn status_slot(status: Status) -> Slot {
     match status {
         Status::Hidden | Status::Steps | Status::Pill => Slot::Top,
         Status::TopBar => Slot::TopDrawer,
-        Status::Metro | Status::Powerline | Status::Neon => Slot::Bottom,
-        Status::Minimap => Slot::Right,
+        Status::Powerline => Slot::BottomDrawer,
+        Status::Metro | Status::Neon => Slot::Bottom,
+        Status::Minimap => Slot::RightRail,
         Status::Spotlight => Slot::OverlayTop,
-        Status::Hud | Status::Toasts | Status::Orbit => Slot::OverlayBottom,
+        Status::Hud => Slot::TerminalOverlayBottom,
+        Status::Orbit => Slot::OrbitOverlay,
+        Status::Toasts => Slot::OverlayBottom,
     }
 }
 
@@ -132,12 +139,58 @@ pub(in crate::workspace) struct DockExtents {
 pub(in crate::workspace) fn compose<'a, M: 'a>(
     terminal: Element<'a, M>,
     history: Option<Element<'a, M>>,
-    status: Option<Element<'a, M>>,
+    mut status: Option<Element<'a, M>>,
     history_slot: Option<Slot>,
     status_slot: Slot,
     bounds: Size,
     extents: DockExtents,
 ) -> Element<'a, M> {
+    let terminal = if status_slot == Slot::OrbitOverlay
+        && let Some(orbit) = status.take()
+    {
+        stack![terminal, orbit]
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    } else if status_slot == Slot::TerminalOverlayBottom
+        && let Some(status) = status.take()
+    {
+        stack![
+            terminal,
+            container(opaque(status))
+                .align_right(Length::Fill)
+                .align_bottom(Length::Fill)
+                .padding(iced::Padding {
+                    top: 0.0,
+                    right: 14.0,
+                    bottom: 12.0,
+                    left: 0.0
+                }),
+        ]
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+    } else if status_slot == Slot::BottomDrawer
+        && let Some(status) = status.take()
+    {
+        let height = super::status::powerline::HEIGHT;
+        let terminal = column![terminal, space::vertical().height(height)]
+            .width(Length::Fill)
+            .height(Length::Fill);
+        let drawer = container(opaque(
+            container(status)
+                .width(Length::Fill)
+                .max_height((bounds.height * 0.7).max(height))
+                .clip(true),
+        ))
+        .align_bottom(Length::Fill);
+        stack![terminal, drawer]
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    } else {
+        terminal
+    };
     let mut center = column![container(terminal).width(Length::Fill).height(Length::Fill)]
         .width(Length::Fill)
         .height(Length::Fill);
@@ -173,7 +226,7 @@ pub(in crate::workspace) fn compose<'a, M: 'a>(
                     .width(Length::Fill)
                     .height(Length::Fill)
             }
-            Slot::Bottom => center = center.push(status),
+            Slot::Bottom | Slot::BottomDrawer => center = center.push(status),
             Slot::Left => {
                 left = Some(match left {
                     Some(history) => column![history, status].into(),
@@ -184,13 +237,44 @@ pub(in crate::workspace) fn compose<'a, M: 'a>(
                 right = right.push(status);
                 has_right = true;
             }
+            Slot::RightRail => {
+                center = column![
+                    row![
+                        center,
+                        container(status)
+                            .width(super::status::minimap::WIDTH)
+                            .height(Length::Fill),
+                    ]
+                    .height(Length::Fill)
+                ]
+                .width(Length::Fill)
+                .height(Length::Fill);
+            }
             Slot::TopDrawer => {
-                center = column![space::vertical().height(38), center]
+                let terminal = column![
+                    space::vertical().height(super::status::top_bar::HEIGHT),
+                    center
+                ]
+                .width(Length::Fill)
+                .height(Length::Fill);
+                let drawer = container(opaque(status))
                     .width(Length::Fill)
-                    .height(Length::Fill);
+                    .max_height((bounds.height * 0.7).max(super::status::top_bar::HEIGHT))
+                    .clip(true);
+                center = column![
+                    stack![terminal, drawer]
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                ]
+                .width(Length::Fill)
+                .height(Length::Fill);
+            }
+            Slot::OverlayTop
+            | Slot::OverlayBottom
+            | Slot::TerminalOverlayBottom
+            | Slot::OrbitOverlay => {
                 overlay = Some(status);
             }
-            Slot::OverlayTop | Slot::OverlayBottom => overlay = Some(status),
         }
     }
     let center: Element<'a, M> = if has_right || left.is_some() {
@@ -216,17 +300,6 @@ pub(in crate::workspace) fn compose<'a, M: 'a>(
         center.into()
     };
     if let Some(overlay) = overlay {
-        if status_slot == Slot::TopDrawer {
-            return stack![
-                center,
-                container(opaque(overlay))
-                    .width(Length::Fill)
-                    .max_height(bounds.height * 0.7)
-            ]
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into();
-        }
         let overlay = container(opaque(
             container(overlay)
                 .max_width(420)
@@ -282,11 +355,12 @@ mod tests {
         assert_eq!(history_slot(History::StepCards), None);
         assert_eq!(status_slot(Status::Steps), Slot::Top);
         assert_eq!(status_slot(Status::Metro), Slot::Bottom);
-        assert_eq!(status_slot(Status::Minimap), Slot::Right);
+        assert_eq!(status_slot(Status::Minimap), Slot::RightRail);
         assert_eq!(status_slot(Status::TopBar), Slot::TopDrawer);
+        assert_eq!(status_slot(Status::Powerline), Slot::BottomDrawer);
         assert_eq!(status_slot(Status::Spotlight), Slot::OverlayTop);
-        assert_eq!(status_slot(Status::Hud), Slot::OverlayBottom);
+        assert_eq!(status_slot(Status::Hud), Slot::TerminalOverlayBottom);
         assert_eq!(status_slot(Status::Toasts), Slot::OverlayBottom);
-        assert_eq!(status_slot(Status::Orbit), Slot::OverlayBottom);
+        assert_eq!(status_slot(Status::Orbit), Slot::OrbitOverlay);
     }
 }

@@ -15,7 +15,6 @@ use crate::terminal_view::agent_cursor::{Binding, Key as CursorKey};
 
 use super::{Desktop, Message, Phase, Run, Workspace, engine, mask};
 
-const MAX_STEPS: usize = 24;
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
 mod follow_up;
@@ -89,9 +88,6 @@ impl History {
         if step.recorded_at.is_none() {
             step.recorded_at = SystemTime::now()
                 .checked_sub(Duration::from_millis(step.elapsed_ms.unwrap_or_default()));
-        }
-        if self.transcript.steps.len() == MAX_STEPS {
-            self.transcript.steps.remove(0);
         }
         self.transcript.steps.push(step);
     }

@@ -1,22 +1,60 @@
 # Remaining Java-to-Rust porting plan
 
-Terminal Agent source audit updated on 2026-11-21. This plan tracks the scope agreed in
+Porting plan reconciled on 2026-11-22. This plan tracks the scope agreed in
 [HANDOFF.md](HANDOFF.md). The [parity record](PORTING-PARITY.md) identifies the
-source and environment for earlier checks. Detailed logs under
-`target/verification/` are local build records.
+source and environment for earlier checks. Paths under `target/verification/`
+are local to the checkout that ran the tests. Historical logs referenced
+by this plan are available in the original main checkout when absent from
+the porting worktree.
 
 ## Current result and actionable backlog
 
 **Java v2.26.0 parity remains partial.** The comparison uses Java tag
 `v2.26.0` (`b235d91f2035`). The current Rust worktree is based on merged
-PR #31 (`b3100f44`). Agent-to-Chat continuation, the Agent profile
+PR #32 (`cb622a66`). Agent-to-Chat continuation, the Agent profile
 role, Journal chat exports, command summaries, the snippet structure panel
 and Lua editor tools are implemented. AI Manager search reaches every page
-and a subset of individual controls. The [source comparison](PORTING-PARITY.md#november-19-java-release-source-comparison)
-identifies the remaining interactions and the tested revisions.
+and many individual controls, including imported GGUF and MLX models. The
+latest comparison found differences in how design edits are saved, how
+much command output a step can copy and how both settings searches rank
+results. The [November 22 comparison](PORTING-PARITY.md#november-22-design-editing-command-output-and-settings-search)
+records the Java and Rust paths for these differences. The
+[November 19 comparison](PORTING-PARITY.md#november-19-java-release-source-comparison)
+records the broader release audit and its tested revisions.
 The [Standard design](PORTING-PARITY.md#november-21-terminal-agent-standard-design)
 and [overlapping Agent runs](PORTING-PARITY.md#november-21-overlapping-terminal-agent-runs)
 are recorded under A2.
+
+### GUI dialog design parity
+
+**Open, highest UI priority. Every Rust GUI dialog with a Java counterpart
+must match the design of that dialog in Java v2.26.0.** The current Rust
+dialogs have been reported as difficult to scan. Use the tagged Java dialog
+as the reference for these corrections.
+
+- **Structure.** Match the navigation, tab and section order, field groups,
+  and the sequence of labels and controls. Keep related settings together
+  and put advanced options and contextual help where the Java dialog puts them.
+- **Visual hierarchy.** Match the typography of headings and labels, theme
+  colors, icon placement, field alignment and widths, and spacing within
+  and between groups. Match the placement and order of primary, secondary
+  and cancel actions.
+- **Resizing.** Compare the initial window size, which regions grow or scroll,
+  and where the action buttons sit. At small window sizes and higher display
+  scaling, labels and fields must remain readable and all actions reachable.
+- **Verification.** Inventory the dialogs from their normal menu entries.
+  Start with Settings, Connection Manager and its connection editor, AI
+  Manager and the Agent Design chooser. Include Scheduler, SFTP and the
+  remaining dialogs. For each, compare Java and Rust screenshots side by
+  side on the same platform, with the same state, language, theme, window
+  size and display scale. Record those conditions, correct visible
+  differences, and verify the revised
+  layout on the native desktops covered by V2. For a Rust-only dialog,
+  follow the grouping and action placement of the closest Java workflow.
+
+The [tagged Java dialog sources](https://github.com/chardonnay/korTTY/tree/v2.26.0/src/main/java/de/kortty/ui)
+and the [native acceptance matrix](#native-acceptance-and-release-gates)
+define the reference and target platforms for this work.
 
 ### Reconciliation against the current working tree
 
@@ -31,17 +69,32 @@ are recorded under A2.
 
 ### Confirmed implementation work
 
-| Area | Remaining change | How to verify |
+| Area | Remaining change | Completion check |
 | --- | --- | --- |
-| A2 · Terminal Agent | The current design and earlier-run selection paths are implemented. The Log Table shows sortable typed step metadata and a live Duration column that adopts the measured result at completion. A double-click opens the selected masked output or the finished answer. Live step and answer details allow read-only selection and policy-checked partial copying. A right-click offers step actions on retained rows and run actions on the answer or table background, including Earlier runs. Export all finished runs remains available while a different run is active. The export review fixes the selection when it opens. New rows flash for 900 ms and running rows use a 120 ms spinner. Reduced animations keeps the running marker still, omits the flash and updates elapsed time once per second. Reviewed model requests create a running row and update it with the accepted response metadata. An outstanding command review has a masked, read-only Approval row that is removed when the review ends. | The live table, detached history and Settings preview support focused keyboard navigation. Ctrl+Shift+F6 focuses the visible table in the active terminal pane. Tab reaches the detached table and scrolls the Settings preview into view. With live table focus, the Context Menu key or unassigned Shift+F10 opens the selected row's actions. Verify focus, row reveal and terminal key isolation on native desktops. Columns fit the viewport above font-scaled minimum widths. Verify resizing and numeric alignment on native desktops. Chronological tables follow new rows at the bottom and preserve the reading position when reviewing older activity. Latest activity resumes following. Fixed column headers stay visible during vertical scrolling and follow the data cells horizontally. Column dividers adjust widths within the fitted table. Verify sorting, divider dragging and scrolling on native desktops. Exercise the narrow viewport, elapsed time, sorting, selected output, approval-row lifecycle, step actions and motion preferences. Verify the decision and repair rows with a configured provider. Exercise the terminal context menu and the keyboard and pointer paths for the Log Table menus and run/step controls on native desktops. Switch runs, copy individual outputs, export one or all finished runs and open an unsaved step as a snippet. |
-| D4 · AI Manager search | The search reveals provider presets, CLI and MiniMax fields, reviewed HTTPS options, usage quota and cost, and the Web search controls exposed by the active provider and policy. The profile wizard searches its reachable steps using the same validation as Next. General search reveals the shortcut toggle, alias name, case preference and retained Java settings individually. The Profiles search reveals connection and CLI tests, model discovery and inventory refresh, imported model mapping and the active deletion review. Local Preferences search reaches the runtime update policy, preferred backend, embedding controls and each retained Java role in one scrollable page. Runtime repair searches its signed-package fields and compatible release controls. Knowledge Store search follows the selected backend, source options and embedding mode, and reveals active folder reviews, source file size edits, store removal controls, profile bindings, Agent availability and embedding consent. Local Models search reaches Hugging Face and the managed GGUF and Apple MLX workflows, including model selection, runtime controls, configuration and active reviews. Memory search reveals imported preferences, active Markdown and entry editor actions, history restore and external file review controls. Skills search reveals the library filter and sort, the direct Java-style Providers entry point, available editor fields and actions, eligible Java preference suggestions, and the fields and actions of the open provider editor. Extend coverage to other nested workflows. | Select a control by keyboard and mouse, verify its page, scroll position and highlight, and preserve editor-local Find in Skills and Memory. Native widget tests verify keyboard focus and draft retention for GGUF and MLX controls and MLX runtime download policy. Exercise search from a partially completed wizard, repair or model review and verify draft retention and cancellation on native desktops. |
+| A2 · Editing Agent designs | Let the user change one module directly on Standard or Classic. Java selects a new custom copy containing that change. Rust currently requires an explicit duplicate, then a separate Settings save. Persist committed design edits, the default design, auto-hide time and reduced-motion preference as the user changes them. | Change one role on each built-in, close the dialog and restart. Check the other roles, the built-in and the current default. Verify rename, deletion of the default, explicit default selection and both preferences across restart. Module previews stay transient and unrelated Settings edits stay pending. |
+| A2 · Copying a command step's output | The step menu currently copies the last eight lines, each clipped to 320 characters. Make **Copy output** use all masked stdout and stderr retained for the selected step within the existing capture limits. Keep the compact inline preview. | Use distinct markers on two steps, more than eight lines across stdout and stderr, and a line longer than 320 characters. Verify the clipboard value for the selected step, including redaction, in a live and a retained run. |
+| D4 · Searching Settings and AI Manager | Apply the Java matching rules in both dialogs. Normalize German spellings, accents and punctuation, require two normalized characters, rank label and page matches, suppress controls matched only by their page, deduplicate and return at most 40 results. Compare the remaining labeled controls with the tagged dialogs. | Run the tagged matcher cases against both entry points. Check stable order, exact and prefix matches, duplicate labels, one-character queries and the 40-result limit. Verify keyboard navigation to a reachable result while preserving the active draft, provider restrictions and imported-model identity. |
+
+The [source comparison](PORTING-PARITY.md#november-22-design-editing-command-output-and-settings-search)
+documents these three gaps. The [portable-data audit](#remaining-field-and-identity-audit)
+tracks unresolved Java fields and identity mappings (M1). The
+[implementation order](#implementation-order) also covers provider endpoint
+compatibility, automatic web-tool behavior and remaining editor language
+coverage. Q1 tracks the requested Teamwork Agent/Swarm extension below.
+
+### Implemented features with outstanding checks
+
+| Area | Implemented in Rust | Remaining verification |
+| --- | --- | --- |
+| A2 · Terminal Agent | The design presenters and earlier-run selection paths are implemented. The Log Table shows sortable typed step metadata and a live Duration column that adopts the measured result at completion. A double-click opens the selected masked output or the finished answer. Live step and answer details allow read-only selection and policy-checked partial copying. A right-click offers step actions on retained rows and run actions on the answer or table background, including Earlier runs. Export all finished runs remains available while a different run is active. The export review fixes the selection when it opens. New rows flash for 900 ms and running rows use a 120 ms spinner. Reduced animations keeps the running marker still, omits the flash and updates elapsed time once per second. Reviewed model requests create a running row and update it with the accepted response metadata. An outstanding command review has a masked, read-only Approval row that is removed when the review ends. | The live table, detached history and Settings preview support focused keyboard navigation. Ctrl+Shift+F6 focuses the visible table in the active terminal pane. Tab reaches the detached table and scrolls the Settings preview into view. With live table focus, the Context Menu key or unassigned Shift+F10 opens the selected row's actions. Fedora ARM64 X11 verified focus, row selection, opening details, the keyboard step menu and source terminal input isolation in a docked table. Open details receive more of the dock height, with model usage in a compact scrollable summary. Fedora ARM64 X11 verified Tab entry, row details, exact output copying and reattachment in detached history. It also verified that the Settings preview reveals the table and selected sample output with the keyboard. Verify the keyboard paths on the other native desktops. Columns fit the viewport above font-scaled minimum widths. Verify resizing and numeric alignment on native desktops. Chronological tables follow new rows at the bottom and preserve the reading position when reviewing older activity. Scrolling up exposes Latest activity without selecting a row. Fedora ARM64 X11 verified stable reading through command approvals and continued following after Latest activity. Fixed column headers stay visible during vertical scrolling and follow the data cells horizontally. Column dividers adjust widths within the fitted table. Fedora ARM64 X11 verified Step sorting in both directions, fixed headings while scrolling vertically and horizontally, divider dragging and sort retention after resizing. Verify these paths on the other native desktops. Exercise the narrow viewport, elapsed time, sorting, selected output, approval-row lifecycle, step actions and motion preferences. Verify the decision and repair rows with a configured provider. Exercise the terminal context menu and the keyboard and pointer paths for the Log Table menus and run/step controls on native desktops. Switch runs, copy individual outputs, export one or all finished runs and open an unsaved step as a snippet. |
+| D4 · AI Manager search | The search reveals provider presets, CLI and MiniMax fields, reviewed HTTPS options, usage quota and cost, and the Web search controls exposed by the active provider and policy. The profile wizard searches its reachable steps using the same validation as Next. General search reveals the shortcut toggle, alias name, case preference and retained Java settings individually. The Profiles search reveals connection and CLI tests, model discovery and inventory refresh, imported model mapping and the active deletion review. Local Preferences search reaches the runtime update policy, preferred backend, embedding controls and each retained Java role in one scrollable page. Runtime repair searches its signed-package fields and compatible release controls. The search highlights active signed-runtime cancellation and pause, the separate keep and discard actions, and the open llama.cpp runtime removal review. Selecting one of these results preserves the operation or review. Knowledge Store search follows the selected backend, source options and embedding mode, and reveals active folder reviews, source file size edits, store removal controls, profile bindings, Agent availability and embedding consent. Local Models search reaches Hugging Face and the managed GGUF and Apple MLX workflows, including model selection, runtime controls, configuration and active reviews. Imported GGUF and MLX settings can be found by name, format or registry ID. The result highlights the matching row and leaves review and adoption explicit. Memory search reveals imported preferences, active Markdown and entry editor actions, history restore and external file review controls. Skills search reveals the library filter and sort, the direct Java-style Providers entry point, available editor fields and actions, eligible Java preference suggestions, and the fields and actions of the open provider editor. | Select a control by keyboard and mouse, verify its page, scroll position and highlight, and preserve editor-local Find in Skills and Memory. Native widget tests verify keyboard focus and draft retention for GGUF and MLX controls and MLX runtime download policy. Exercise search from a partially completed wizard, repair or model review and verify draft retention and cancellation on native desktops. |
 | B4 · Hugging Face model browser | Rust loads additional pages, sorts metadata and resolves missing sizes for the RAM filter. Apple Silicon offers All formats, GGUF and MLX with independent continuations. Review MLX package fixes the commit, exact sizes and SHA-256 digests. Download and register validates the complete directory through the native MLX registry. Paused MLX downloads can be found, reviewed, resumed or discarded after restart. | Exercise continuation, sorting, RAM filtering, format changes, review, installation and recovery in the native desktop. The native transfer has passed a live pause, resume and registration test against a pinned public Hub package. [Java browser](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/LocalModelManagerPane.java#L803) · [Rust MLX Hub transfer](src/local_ai/managed_models/huggingface/mlx/download.rs) |
 | D2 · Connection folders | Drag writable SSH and serial rows to a local folder in the tree or sidebar. List and map share successive Undo. | Exercise native pointer gestures across the list, sidebar and map, reverse two saved moves and check read-only Teamwork entries. |
 | Q1 · Scheduler target picker | The job editor can filter saved SSH connections and groups by name, host or group path and apply a batch to one draft. | Exercise the picker on native desktops with an individual target, overlapping groups and a source-qualified Teamwork group. Verify search, reviewed order and cancellation. |
 | T2 · SFTP | The Local and Server panes review and clean up regular transfer parts in the displayed folder. Current-process stages are reserved during transfer and checked again before removal. | Exercise the confirmation and cancellation on native desktops. Verify protected deletion over a configured SSH route, including a replacement during review and a partial failure. |
 | D4 · Logfile Manager | Saved connections' existing log folders appear before their first logging session. Manual and logger-discovered origins are tracked independently. | Check deduplication when two connections share a folder, registration by the logger and forgetting a manually added folder. |
 | U1 · Update prompts | About offers a version-specific skip and a reminder on the next local day. Successful verified publication suppresses that version's automatic prompt. Startup and periodic prompts have separate repeat limits, and manual checks can still show the version. | Exercise the native About dialog and background notices across restart against a configured managed feed and an owner-published stable release. |
-| M1 · Portable data | Java folder colors with ambiguous or unmatched paths are available for explicit assignment in the folder color editor. Exact existing favorite profiles offer explicit review. Resolve remaining ambiguous group and profile references. Java backups retain custom OS symbol definitions for review in the symbol manager, including definitions without connection references. Imported connections retain pending assignments. | Exercise folder color and favorite review on native desktops. Exercise the symbol manager and connection picker with a missing PNG, a supplied image and a colliding local badge ID. Verify reviewed assignments after restart. |
+| M1 · Portable data | Java folder colors with ambiguous or unmatched paths are available for explicit assignment in the folder color editor. Exact existing favorite profiles offer explicit review. Java backups retain custom OS symbol definitions for review in the symbol manager, including definitions without connection references. Imported connections retain pending assignments. | Exercise folder color and favorite review on native desktops. Exercise the symbol manager and connection picker with a missing PNG, a supplied image and a colliding local badge ID. Verify reviewed assignments after restart. |
 
 ### Implemented workflows awaiting acceptance and requested extensions
 
@@ -58,7 +111,7 @@ and exercise configured provider deployments.
 
 | Work item | Implemented behavior and next verification or extension |
 | --- | --- |
-| Q1/M1 · Verify and extend Teamwork scheduling | Rust supports direct and jump-host Teamwork SSH targets and source-qualified groups with descendants for commands, scripts, snippets and SFTP actions including reviewed folder sync. The Scheduler retains the reviewed source, endpoint, effective login and host-key pin and rechecks the selection before execution. Verify native OpenSSH firing and reviewed rsync with both local authentication methods. Verify protected SFTP actions on shared routes. The requested Rust extension still needs scheduled Agent/Swarm on the live Teamwork catalog. Java's picker draws on locally configured connections. [Native Scheduler targets](src/scheduler_window/connection.rs) · [Shared route](src/connection_store/teamwork/reviewed_route.rs) |
+| Q1/M1 · Verify and extend Teamwork scheduling | Rust supports direct and jump-host Teamwork SSH targets and source-qualified groups with descendants for commands, scripts, snippets and SFTP actions including reviewed folder sync. The Scheduler retains the reviewed source, endpoint, effective login and host-key pin and rechecks the selection before execution. Verify native OpenSSH firing and reviewed rsync with both local authentication methods. Verify protected SFTP actions on shared routes. The requested Rust extension still needs scheduled Agent/Swarm on the live Teamwork catalog. Java's picker draws on locally configured connections. [Scheduler eligibility checks](src/scheduler_window.rs) · [Native Scheduler targets](src/scheduler_window/connection.rs) · [Shared route](src/connection_store/teamwork/reviewed_route.rs) |
 | T3/T4/Q1/Q2 · Verify SFTP comparison and transfer recovery | After generating an AI draft, Rust can switch among the masked originals and either original against the draft. Verify the picker in the native desktop. Rust supports a new remote name and reviewed replacement of the right server file or another selected existing file through the Linux, macOS and Windows helpers. Verify macOS and Windows replacement over native OpenSSH, including permissions, backup and conflict recovery. The Linux helper reclaims marked stages left by a terminated helper. Verify native recovery through the deployed helper. [Java comparison](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SftpFileDiffDialog.java) · [Draft preview](src/sftp_window/compare/ai.rs) · [Server save](src/sftp_window/compare/ai/server.rs) · [Helper cleanup](crates/server-archive/src/server/privileged_rsync/upload/handoff.rs) |
 | S2/S3 · Verify mixed-language snippet workflows | The snippet assistant detects embedded programs locally and distinguishes ordinary scripts from orchestration formats. Whole-script migration offers the Java target languages, a reviewed request, and a before/after diff with migration notes. Applying updates the snippet language and the extension of an existing filename. Undo restores the original source and metadata. Mixed steps in Azure Pipelines, GitHub Actions, and Jenkins can use the same review workflow with host-specific targets and byte-preserving scaffold checks. Explicit platform conversion offers the Java destination formats and checks the result against the selected format and any selected step language. Selected security fixes can start with optional migration. The editor previews the migrated source and reviews the separate fix request before sending it. Apply and Undo cover the combined proposal. Full-analysis Apply can begin with the chosen migration and pass the validated source to the finding and hardening stages. The migration checkpoint supports resuming the remaining work or reviewing the completed migration. Verify the native workflows with configured providers. [Java language unification](https://github.com/chardonnay/korTTY/blob/v2.26.0/app-docs/site/docs/en/reference/language-migration.md) · [Native detection](src/snippet_window/languages/mix.rs) · [Migration plans](src/snippet_window/ai_assist/migration.rs) |
 | S2 · Verify snippet review actions | The standalone security report sorts findings by severity and lets users select individual findings before reviewing a fix request. Fix requests bind the selected findings to the exact reviewed source. Verify the desktop flow against a configured provider. Full code analysis has a separate selection workflow. Formatting and syntax checks offer a reviewed AI fallback when a local tool is unsupported or unavailable. Verify the fallback and its request and result reviews on native desktops. [Java report](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SnippetSecurityReportDialog.java) · [Native review and fix](src/workspace/snippet_access/ai_assist.rs) · [Native tools](src/editor_window/tools.rs) |
@@ -278,7 +331,8 @@ Fedora verified Spotlight, Orbit, Minimap, the toast badge, and managed
 Chat denial under X11 and native Wayland. Windows ARM64 verified
 Copy answer from Spotlight and Continue in AI Chat from the terminal
 footer. A2 tracks the rest of the Windows matrix and the macOS workflow.
-AI Manager search still needs coverage for the remaining labeled controls.
+The design editor, step output and shared settings-search behavior have
+[specific implementation gaps](#confirmed-implementation-work).
 [Terminal handoff comparison](PORTING-PARITY.md#november-21-terminal-run-chat-handoff).
 
 - **S1 — Editor tools.** Native Lua highlighting, completion, and LuaJIT
@@ -800,14 +854,17 @@ and the local
 A real SSH conflict under the managed choice and a successful scheduled
 command under an installed automation-capture denial still need acceptance.
 
-The earlier shell and Agent Windows ARM64 static-CRT release ZIP passed private-profile
-startup/shutdown smoke: read-only Control ping, exactly one owned restored
-PowerShell pane, graceful exit and removal of the extracted package/profile.
-The verified [ARM64 package](target/dist/kortty-0.1.0-aarch64-pc-windows-msvc-20261112-shell-agent/kortty-0.1.0-aarch64-pc-windows-msvc.zip)
-and its [SHA-256 sidecar](target/dist/kortty-0.1.0-aarch64-pc-windows-msvc-20261112-shell-agent/kortty-0.1.0-aarch64-pc-windows-msvc.zip.sha256)
-are retained in a dedicated directory. The older ARM64 archive is also retained
-because automatic approval review blocked moving, replacing or deleting it
-without a further stated reason. This is a specific retention exception.
+The November 12 Windows ARM64 static-CRT ZIP passed a private-profile test
+covering Control ping, one restored PowerShell pane, graceful exit and
+cleanup. That ZIP and its checksum are retained in the original main
+checkout under `target/dist/kortty-0.1.0-aarch64-pc-windows-msvc-20261112-shell-agent/`.
+The [shell and Agent checkpoint](PORTING-PARITY.md#local-shell-integration-and-terminal-agent-recognition)
+records the retention exception for the earlier archive in that checkout.
+The porting worktree holds the November 19 package. On November 22 its
+SHA-256 matched both its sidecar and the November 19 record.
+[November 19 verification](PORTING-PARITY.md#november-19-windows-arm64-portable-release)
+· [Retained ARM64 ZIP](target/dist/kortty-0.1.0-aarch64-pc-windows-msvc/kortty-0.1.0-aarch64-pc-windows-msvc.zip)
+· [SHA-256 sidecar](target/dist/kortty-0.1.0-aarch64-pc-windows-msvc/kortty-0.1.0-aarch64-pc-windows-msvc.zip.sha256).
 The current source checkpoint awaits packaging under V7. The x64 ZIP still
 needs a current build and verification. The exact executable and
 configuration used in the user's originally reported failing session have
@@ -818,6 +875,7 @@ not been identified.
 - Native Windows, macOS, Wayland and X11 remain required. The highest product
   priority remains usable Java-equivalent windows, dialogs, menus and tool
   windows. Every implementation step includes its corresponding UI.
+  Dialog changes must meet the [Java design criteria](#gui-dialog-design-parity).
 - Preserve native Rust and OS APIs and the current Iced architecture.
   No required Java runtime, WebView or browser renderer. Both Mosh modes
   remain excluded.
@@ -851,12 +909,14 @@ not been identified.
 
 ## Implementation order
 
-Start with the [confirmed implementation work](#confirmed-implementation-work),
-including the missing Agent interactions, desktop controls and folder cleanup.
-Continue the requested shared Teamwork Agent/Swarm extension and portable
-restore mappings. Run the listed native acceptance cases for the existing
-SFTP comparisons, transfer recovery and snippet workflows.
-Existing native flows and their acceptance records are the starting point.
+Start the [dialog design comparison](#gui-dialog-design-parity) with the
+Settings and Agent Design work. Apply it as each remaining dialog is
+revised. Complete design editing and step output, then align Settings and
+AI Manager search using the [A2 and D4 completion checks](#confirmed-implementation-work).
+Continue the unresolved portable restore mappings and the requested
+shared Teamwork Agent/Swarm extension. Run native acceptance for the
+existing connection-folder gestures, Scheduler picker, SFTP partial-file
+cleanup, comparisons, transfer recovery and snippet workflows.
 The six work packages below cover compatibility decisions, platform
 acceptance and release preparation. The independent SSH review under V6
 can proceed alongside implementation.
@@ -1087,9 +1147,10 @@ checkpoints.
    Verify macOS Finder drag-out independently of the replacement work.
 4. **Close the bounded scope audits.** Record explicit decisions for remaining
    vault/key persistence, approval/automatic-web behavior, Swarm capacity,
-   local completion lists, optional AI ghost text, other reduced-editor
-   differences and optional telemetry/plugins. Derive any new
-   implementation from a named pinned Java action. Do not infer a missing
+   remaining language coverage in the existing completion lists, other
+   reduced-editor differences and optional telemetry/plugins. Verify the
+   existing opt-in inline AI suggestions with a configured provider. Derive
+   any new implementation from a named pinned Java action. Do not infer a missing
    terminal opcode, SSH algorithm or editor language from a historical summary.
 5. **Complete native workflow acceptance, D/A/B/S/J/T/P/R and V1–V5.** Cover
    configured providers, signed local runtimes, shell opt-ins, window behavior,
@@ -1112,7 +1173,7 @@ checkpoints.
 | D1 | Acceptance. Saved local-shell program/arguments/directory and launch routes preserve the integration opt-in. Supported custom Bash/Zsh/Fish startup flags and qualifying Windows executable paths use private startup wrappers. PowerShell/CMD presets are supported. Java `shellIntegrationAutoInject` is imported/exported and the legacy native flag remains readable. Supported default-shell Java project routes preserve the opt-in and validate the saved catalogue identity. Fedora ARM64 verified Flatpak Bash, Zsh and Fish host startup and required Landlock sessions inside the runtime. R `src/connection_store/local.rs`, `src/connection_window/local.rs`, `src/profile/projects/java/routes.rs`, `crates/pty/src/flatpak.rs`. | Verify native launch/edit/restart, live Java exchange, PowerShell 7 and Zsh/Fish startup on the remaining native platforms. J `core/LocalShellTtyConnector.java`, `shellintegration/ShellIntegrationInjection.java`. Preserve exact-argument native extensions. The Java portable project format covers the subset without machine-local command, directory or Teamwork identities. |
 | D2 | Implementation, acceptance and bounded audit. Saved SSH, local shell and serial settings support inherited paste line delay and strict terminal overrides, including Java connection XML. HP2392 paste uses its existing line handling. Themes, independent appearance/scrollback/PTY dimensions, keepalive, project split presentation, local image backgrounds and remote hosted tool restoration also exist. J `model/ConnectionSettings.java`, `ui/ConnectionEditDialog.java`. R `src/connection_store/terminal.rs`, `src/connection_window/terminal_overrides.rs`, `src/workspace/paste_protection.rs`. | Verify tree/sidebar drag-to-folder and successive Undo shared by the list and map. [Folder move parity](PORTING-PARITY.md#november-20-connection-manager-folder-moves) Verify native editing, launch, reconnect, paste routing, Java exchange, and the theme/project/sizing/authentication workflows. The user-deferred HP and physical serial acceptance remains in V4. Verify standalone saved SSH window geometry, private Java XML import, and portable omission. |
 | D3 | Acceptance + bounded audit. Named highlight sets, per-connection selection, bounded network matchers, rule editor/preview, interchange, notification and reviewed snippet triggers exist. R `src/terminal_highlight.rs`, `src/workspace/highlight.rs`. | Native pinned-set acceptance under changing output, palette, policy and snippet authority. Java XML and backup rules use a bounded Java syntax translator shared with Quick Select and Journal markers. A bounded matcher supports lookarounds, backreferences, atomic groups and possessive quantifiers. Audit remaining Java syntax and test visible behavior on native desktops. Do not reimplement the existing set picker or master controls. |
-| D4 | Implementation + acceptance. Native lifecycle, placement, menu routing, hosted/detached tools and Settings/AI Manager keyboard guards exist. Selected Windows ARM64 default-selection, dirty-close and tab-label behavior is verified. Quick Select opens files in native Windows PowerShell/CMD panes. macOS has a separate status item for New Window and Quit and App Nap activity scopes for recent terminal I/O, running jobs and active AI requests. | Extend AI Manager search to the remaining labeled controls. Verify saved, manual and logger-discovered log folders on native desktops. Verify the status item with zero windows and observe App Nap activity on a packaged Mac build. Complete V1/V2 across native desktops. Cover fresh-profile size, footer reachability, preferred geometry, toolbar overflow, keyboard traversal, owner modality, dirty close and search focus in both hosted and detached forms. |
+| D4 | Implementation + acceptance. Native lifecycle, placement, menu routing, hosted/detached tools and Settings/AI Manager keyboard guards exist. Selected Windows ARM64 default-selection, dirty-close and tab-label behavior is verified. Quick Select opens files in native Windows PowerShell/CMD panes. macOS has a separate status item for New Window and Quit and App Nap activity scopes for recent terminal I/O, running jobs and active AI requests. | Align both dialogs with the tagged search matcher and inventory the remaining reachable labeled controls. [Search comparison](PORTING-PARITY.md#november-22-design-editing-command-output-and-settings-search) Verify saved, manual and logger-discovered log folders on native desktops. Verify the status item with zero windows and observe App Nap activity on a packaged Mac build. Complete V1/V2 across native desktops. Cover fresh-profile size, footer reachability, preferred geometry, toolbar overflow, keyboard traversal, owner modality, dirty close and search focus in both hosted and detached forms. |
 | D5 | Acceptance. General BEL/OSC, shell, highlighting, Chat, Agent/Swarm and Scheduler notifications exist. Windows OSC 777 click routing to the original inactive split was measured. The Linux LauncherEntry backend emits on a persistent D-Bus name and the portable archive stages a matching desktop entry and icon. | Verify the Linux counter on a supporting launcher and complete native sudo/password waits, moved/closed/stale targets, suppression/coalescing and revocation. Complete macOS and Linux delivery/activation under V3. |
 
 Quick Connect and the saved local-shell editor offer detected Windows
@@ -1145,7 +1206,7 @@ an English answer. Keep this difference visible when comparing transcripts.
 | ID | State and implemented coverage | Remaining work |
 | --- | --- | --- |
 | A1 | Implementation + acceptance. Built-in Run/Ask/Plan, reviewed local/SSH execution, skills/quota, bounded history, opt-in `agent` aliases, Tab completion, sudo/vault challenges and mirror holds exist. PowerShell/CMD integration and per-pane setup/status now ship in source. Native ConPTY PowerShell 5.1/CMD and Fedora SSH Agent routes passed. Permitted terminal AI initializes an in-memory SSH credential mask independently of capture, including incognito, without enabling logging. R `src/workspace/terminal_agent/shortcut.rs`, `src/workspace/ssh_access.rs`, `src/session/shell_activity.rs`, `crates/pty/src/shell_integration.rs`. | The inline root-bypass option and grant revocation passed targeted native macOS/Fedora tests; automatic read-only dispatch and inline per-run confirmation passed targeted native macOS/Fedora tests. Verify remaining supported shells, native desktops and current packages. The sandboxed SSH manual password flow passed on Fedora Wayland and X11. Verify the manual flow and local system sudo on macOS, and exercise history and run controls, mirror release, changed targets, and revocation. Direct custom Bash, Zsh, Fish, PowerShell and CMD profiles can use the Agent with validated interactive startup flags and a reviewed native runner. Verify the custom profiles in live desktop panes. See the diagnostic contract below. |
-| A2 | Implementation, acceptance and bounded audit. Planning stages, design module IDs d01–d20, docking/status/approval placement, inline history, picture-in-picture, usage/repair display, seven activity export formats and Agent-to-Chat/Journal links exist. The worktree includes the in-pane Spotlight prompt with entry and submission transitions, compact step progress, animated toast entry, countdown, fade and collapse, Orbit and the Adaptive Dock countdown. A chooser switches between retained runs in the same pane from status, history and the terminal context menu. Up to five finished runs remain available after the Activity window closes, bound to the original non-private stream. Settings uses the same status presenters and saves the auto-hide and reduced-motion preferences. Java restore fills both unset preferences independently. Windows ARM64 verified the earlier Settings workflow, live d14 display and cancellation, d19 layering and detach/reattach, and d20 pane resizing. [Spotlight and status checkpoint](PORTING-PARITY.md#november-20-terminal-agent-spotlight-and-status) | Verify reopening finished runs and earlier-run selection and the contextual run and step actions. Verify Spotlight focus and profile selection, the timed displays with reduced motion and auto-hide disabled, the remaining d14 interactions, and live d19 run following. Verify inline selection and Kitty row mapping, exports, linked Journal cards, live provider usage/repair and native desktop behavior across platforms. |
+| A2 | Implementation, acceptance and bounded audit. Planning stages, design module IDs d01–d20, docking/status/approval placement, inline history, picture-in-picture, usage/repair display, seven activity export formats and Agent-to-Chat/Journal links exist. The worktree includes the in-pane Spotlight prompt with entry and submission transitions, compact step progress, animated toast entry, countdown, fade and collapse, Orbit and the Adaptive Dock countdown. A chooser switches between retained runs in the same pane from status, history and the terminal context menu. Up to five finished runs remain available after the Activity window closes, bound to the original non-private stream. Settings uses the same status presenters and persists auto-hide and reduced motion on Save. Java restore fills both unset preferences independently. Windows ARM64 verified the earlier Settings workflow, live d14 display and cancellation, d19 layering and detach/reattach, and d20 pane resizing. [Spotlight and status checkpoint](PORTING-PARITY.md#november-20-terminal-agent-spotlight-and-status) | Implement editing a built-in through an automatic copy, immediate persistence of committed design changes and copying all retained masked output for the selected step. [Completion checks](#confirmed-implementation-work) Verify reopening finished runs and earlier-run selection and the contextual run and step actions. Verify Spotlight focus and profile selection, the timed displays with reduced motion and auto-hide disabled, the remaining d14 interactions, and live d19 run following. Verify inline selection and Kitty row mapping, exports, linked Journal cards, live provider usage/repair and native desktop behavior across platforms. |
 | A3 | Acceptance + bounded audit. Live and saved targets, named pre-run saved SSH drafts, completed interactive rounds with renaming, reviewed continuation, connection groups and working-directory metadata, history search, Markdown/text/PDF export, saved journal defaults, estimate and journal links are implemented. A batch review binds one approval to the displayed ordinary commands and target identities. R `src/workspace/terminal_agent/swarm.rs` and its `batch.rs`/`comparison.rs`/`conversation.rs`. | Verify native renaming, selection, batch review and revocation, comparison, failure isolation, workflow drafts and continuation over pinned SSH. Evaluate Java's standing batch policy and incognito target scope against native authority requirements. Saved follow-up uses reviewed saved SSH routes. |
 | A4 | Acceptance. All eight pinned Agent verbs, events, wait/start/rename and `notification.show` have native Control/CLI routes. Windows socket backpressure and native notification submission have evidence. | Native visible delivery and exact focus/target routing, stale agents, moved splits, timeouts and losses across desktops. Admission/native submission receipts alone do not prove a displayed notice or activation. |
 | A5 | Acceptance. Explicit `control-api = "allow"` starts the listener and locks the setting while retaining the personal preference. The parser normalizes feature keys and values. MCP stdio keeps its independent opt-in, retains its write tools preference while disabled, and gates writes on effective policy and consent. Masked reads, reconnect identity guards and managed MCP denial exist. | Verify managed activation, lock display and relaxation on native desktops. Complete affirmative write consent and invalidation across those desktops. P1 owns shared policy acceptance. |
@@ -1182,6 +1243,111 @@ Windows ARM64 confirmed **Copy answer** from the Spotlight pill and
 Repeat the other status presentations, earlier-run selection, split
 and resize checks on Windows. The live macOS workflow remains open.
 [Status-menu parity and tests](PORTING-PARITY.md#november-21-run-menus-on-agent-status-displays)
+
+The d01 Powerline and Adaptive Dock's bottom mode show the current typed
+step, command count, elapsed time and available model usage in a
+24-pixel bar. A step drawer opens above the bar over the terminal rows.
+It displays the latest eight typed entries and counts the earlier
+entries. A pending review opens it automatically. Resolving the review
+closes an automatically opened drawer. A manually opened drawer stays
+available until closed or hidden. The Settings preview uses the same
+presenter and respects the reduced-motion setting. Fedora ARM64 X11
+verified automatic opening, Review focus, exact step output, stable pane
+geometry, and hiding and restoring the bar. Shared step rows show the
+typed state marker, command exit code and retained output line count,
+live elapsed time, or the model's reported token count. Fedora X11
+verified the marker and result labels in Dark and IntelliJ Light, the
+latter with reduced animations. Fedora X11 verified F8 and
+Ctrl+Shift+F7 before and after copying a step's output. The earlier
+fixture sent an unintended Alt modifier with F8. The native check
+now sends the level-zero X11 keycodes and holds only the modifiers
+specified by the binding. The clean X11 build verified the shortcut
+in standalone Powerline and Adaptive Dock's bottom mode. Adaptive
+Dock switched from Powerline at 1230 pixels to the side timeline at
+1400, stayed on the side at 1230 on the way back, and returned to
+Powerline at 1160. Complete live Wayland, Windows and macOS checks and
+the remaining narrow Adaptive Dock checks on the current build.
+[Powerline step drawer](PORTING-PARITY.md#powerline-status-and-step-drawer)
+
+The d12 Top Bar shows the current step, command count, elapsed time and
+available model usage. Its track sweeps while an active run is unpaused
+and uses warning, success and error colors for the corresponding states.
+The drawer opens over older terminal rows, shows the recorded step list and
+offers the exact step actions. The bar and drawer stay within their own
+terminal column next to a docked history. Reduced animations keeps the
+track steady and opens the drawer immediately. The Settings preview uses
+the same presenter. A compact header keeps Details early in the action row,
+places run metadata in the progress tooltip, and scrolls the action row
+when it overflows. Fedora ARM64 Wayland verified Review focus, drawer
+motion, the step and run menus in a 42-column split, and stable pane
+geometry. It also verified the review, completion and blocked track
+colors, the active sweep and the steady track with reduced animations.
+Fedora ARM64 X11 verified Review focus, all three track colors, the
+active sweep and the steady reduced-animation track, and both action
+menus in a 41-column split. Repeat the desktop workflow on Windows and
+macOS.
+[Top Bar with Drawer](PORTING-PARITY.md#top-bar-with-drawer-follows-typed-steps)
+
+The d11 Minimap uses a 14-pixel rail beside the terminal, with a colored
+segment per typed step. The hover preview opens to its left and shows the
+step's result and output excerpt, the run phase and reported usage. Its
+segment reveal, running glow and hover transition share the reduced-motion
+preference with the Settings preview. The step menu stays reachable after
+the normal hide delay while it is open. Fedora ARM64 Wayland verified the
+hover preview and both context menus beside a docked history in the Dark
+and IntelliJ Light themes. X11 verified both themes and both menus. In
+a 39-column split with reduced animations, the first visible preview was
+fully rendered, and the step menu stayed available until it closed past
+the auto-hide deadline. Fedora ARM64 X11 also verified wheel scrolling
+and exact output copying at both ends of a 21-command run. The typed
+history retains every step during the run and when reopened. Complete
+Minimap desktop acceptance on Windows and macOS.
+[Minimap rail](PORTING-PARITY.md#minimap-rail-shows-typed-step-previews)
+
+The d15 Orbit ring and its step list stay in the terminal beside a side
+history or above a bottom history. The 72-pixel ring eases changes in
+step progress over 400 ms. Its dots take 1.6 seconds to make a revolution,
+hold their position when paused, and stay still with reduced animations.
+The step list shows up to twelve recent entries above the circle and keeps
+their contextual actions. The retained run keeps its own ring and labels.
+The list opens radially from the center of the ring in 340 ms and folds
+back in 260 ms. During opening, the circle limits pointer input to the
+visible part of the list. The list is inert during folding. Reduced
+animations skips both transitions. Fedora ARM64 verified animated opening
+and closing with the side timeline and immediate transitions with the
+bottom Log Table in both X11 and native Sway Wayland. The selected step's
+exact output reached the desktop clipboard in each run. The terminal grid
+and ring position stayed fixed. On Windows ARM64 the user saw the list
+animate in a live terminal and used **Copy output** on the command step.
+Verify the exact system clipboard result and reduced-motion workflow on
+Windows, and repeat both desktop workflows on macOS. The earlier
+102-test runs on Windows ARM64 and Apple Silicon predate the expanded
+Orbit step-menu regression. Rerun that regression on the current source.
+It checks the application's internal clipboard. The Windows run stopped
+during compilation and produced no result for this test.
+[Orbit progress and placement](PORTING-PARITY.md#orbit-progress-and-terminal-placement)
+
+The d04 Frosted Glass HUD shows typed progress, model usage and the current
+step in the lower-right corner of its terminal. The blur samples the rendered
+terminal behind the card. The terminal viewport keeps its size while Details
+opens the typed list above the card. Keyboard input in the terminal dims the
+card to 35 percent until the typing idle interval elapses. The Settings
+preview shares the presenter and the reduced animation preference. The HUD
+fades in over 220 ms and grows from 94 to 100 percent over 240 ms around its
+center on the first show and after hiding. Hiding the HUD closes its step
+drawer and clears its temporary typing fade. Fedora ARM64 X11 and Wayland
+verified the live drawer alongside side history, typing fade and idle
+recovery, and copying the displayed answer. Wayland also verified a narrow
+split and that typing in its neighbor leaves the original HUD undimmed.
+A Wayland follow-up verified that the details stay closed on reopen. Frame
+samples showed intermediate states with animations enabled and a fully
+visible card in the first painted frame with reduced animations. An X11
+retest verified that the menu hides the open HUD and reopens it with
+Details closed. The Wayland contrast check sampled the Details label over
+a plain terminal and over two contrasting bands of colored output in the
+Dark and IntelliJ Light themes. Repeat the desktop workflow on Windows
+and macOS.
+[Frosted Glass HUD](PORTING-PARITY.md#frosted-glass-hud-with-typed-progress).
 
 The terminal context menu's **Last agent run** actions resolve against
 the newest traced run on that pane, including retained history. Design
@@ -1495,6 +1661,16 @@ and organization memory. Member requests, workflow scripts and comparisons
 revalidate the source revisions and newly enabled memory before dispatch.
 Verify the desktop previews and replies with the configured local, HTTPS and
 CLI providers used by each workflow.
+
+The Agent's **Sent along** link opens the masked memory entries, skills
+and external files from the last confirmed turn that included context,
+with counts and estimated tokens. The receipt belongs to the exact run
+and follows retained non-private history. A live interactive review can
+include previously approved references under the existing memory policy,
+and rechecks the included files before dispatch. Verify the disclosure
+with simultaneous runs, switched panes, reopened history and Activity
+windows on native desktops.
+[Sent context parity](PORTING-PARITY.md#context-sent-with-a-reviewed-terminal-agent-request).
 
 The native Agent prompt history adopts masked Java prompts and their original
 timestamps and uses the Java entry limit when creating a new store.
@@ -3145,7 +3321,7 @@ the recorded platform, package and audit evidence from its earlier snapshot.
 | Gate | Remaining evidence |
 | --- | --- |
 | V1 | An earlier [Windows ARM64 live transfer](PORTING-PARITY.md#windows-arm64-live-window-transfer) preserved three ConPTY processes, scrollback, split ratios and focus across a chooser cancellation and a programmatic move. Verify physical drag and cancellation, the current release candidate, native Windows x64, macOS, Wayland and X11. Include transfer under output, blocked broadcast, restore and unsaved-close cancellation. Record Xwayland separately. |
-| V2 | Fresh profile/restart, small screen, DPI changes, large→small→large monitors, owner modality/focus, modeless re-entry, hosted/detached tools, menu/toolbar keyboard use, fullscreen/transparency and macOS Dock reopen. Preserve compositor control of Wayland placement. |
+| V2 | Verify [GUI dialog design parity](#gui-dialog-design-parity) against Java v2.26.0 and record the visual result for each dialog in the parity record. Cover fresh profile/restart, small screen, DPI changes, large→small→large monitors, owner modality/focus, modeless re-entry, hosted/detached tools, menu/toolbar keyboard use, fullscreen/transparency and macOS Dock reopen. Preserve compositor control of Wayland placement. |
 | V3 | Windows ARM64 already has measured activation of the exact inactive Gemini split and original window. Complete native macOS permission/display/activation, Linux compositor-qualified delivery, and moved/closed/modal/revoked/stale targets on each backend. General and programmatic notices need their own cases. |
 | V4 | All 21 emulations exist. Complete GUI/key/reply/charset/mode/resize/reflow and supported Scheduler comparisons per profile. Restore the pinned SithTermFX checkout before fixture regeneration. Verify audible Windows/Linux bell and retain documented Wyse differences. Real TN3270/TN5250, HP application/device and physical serial break/modem/flow-control remain explicitly user-deferred. |
 | V5 | Enabled real providers and signed runtimes, every AI Manager section hosted/detached, editor source jumps after edits, seven bounded diagram families, clicks after zoom, full SVG/PNG/PDF beyond the viewport, retained analyses after restart and consent/cancellation at mutation boundaries. Include current A/B/S/J changes. |

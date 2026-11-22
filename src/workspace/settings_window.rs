@@ -2023,7 +2023,11 @@ impl Workspace {
                     Edit::NavigatePreview(token, key)
                         if dialog.agent_design.preview_log_enabled(preferences) =>
                     {
-                        return dialog.agent_design.navigate_preview(token, key);
+                        return dialog.agent_design.navigate_preview(
+                            token,
+                            key,
+                            dialog.page_scroll.clone(),
+                        );
                     }
                     edit => dialog.agent_design.update(
                         &mut preferences.ai_agent_designs,

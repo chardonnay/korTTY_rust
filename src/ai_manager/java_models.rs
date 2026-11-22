@@ -6,6 +6,7 @@ use std::io;
 use roxmltree::{Document, Node, ParsingOptions};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
+use sha2::{Digest, Sha256};
 
 use crate::clipboard_policy::ClipboardPolicy;
 use crate::local_ai::managed_models::{ModelBackend, Purpose};
@@ -61,11 +62,33 @@ pub(super) struct Hint {
     pub(super) metadata: Metadata,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SearchKey {
+    index: usize,
+    identity: [u8; 32],
+}
+
 impl Hint {
     pub(super) fn kind(&self) -> Kind {
         match self.metadata {
             Metadata::Gguf { .. } => Kind::Gguf,
             Metadata::Mlx { .. } => Kind::Mlx,
+        }
+    }
+
+    pub(super) fn label(&self) -> String {
+        format!("{} · {} · {}", self.name, self.kind().label(), self.id)
+    }
+
+    pub(super) fn search_key(&self, index: usize) -> SearchKey {
+        // Reject a queued result if a restore has replaced this row.
+        let mut identity = Sha256::new();
+        identity.update(self.kind().label().as_bytes());
+        identity.update([0]);
+        identity.update(self.id.as_bytes());
+        SearchKey {
+            index,
+            identity: identity.finalize().into(),
         }
     }
 
@@ -181,6 +204,12 @@ impl Hints {
     pub(super) fn get(&self, kind: Kind, id: &str) -> Option<&Hint> {
         self.iter()
             .find(|hint| hint.kind() == kind && hint.id == id)
+    }
+
+    pub(super) fn search_hint(&self, key: SearchKey) -> Option<&Hint> {
+        self.0
+            .get(key.index)
+            .filter(|hint| hint.search_key(key.index) == key)
     }
 
     pub(super) fn validate(&self) -> io::Result<()> {

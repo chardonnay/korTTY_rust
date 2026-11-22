@@ -340,8 +340,8 @@ impl Workspace {
                     return Err(error);
                 }
                 run.ai_cancel = None;
-                let skill_usage = run.model_review.take().and_then(Review::into_skill_usage);
                 run.record_model_response(epoch, &report);
+                let skill_usage = run.model_review.take().and_then(Review::into_skill_usage);
                 run.finish_model_repair(epoch, false);
                 let review_next = if run.phase == Phase::FinalAdvice {
                     run.accept_final_advice(self, &report.result)?;

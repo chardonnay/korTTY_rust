@@ -33,6 +33,7 @@ pub(super) struct FinishedRun {
     activity_steps: HashMap<usize, u64>,
     export: activity_export::Export,
     usage: design::Usage,
+    sent_context: Option<super::sent_context::Snapshot>,
     final_evidence: final_evidence::Evidence,
     chat_handoff_id: Option<String>,
     chat_handoff_elapsed_ms: Option<u64>,
@@ -98,6 +99,11 @@ impl Archive {
                 .collect(),
             export: run.activity_export.completed_snapshot(),
             usage: std::mem::take(&mut run.presentation.model_usage),
+            sent_context: run
+                .presentation
+                .sent_context
+                .take()
+                .and_then(|snapshot| snapshot.remask(&redactor)),
             final_evidence: run
                 .final_evidence
                 .completed_snapshot(&redactor)
@@ -291,6 +297,7 @@ impl Workspace {
         run.fonts = entry.fonts;
         run.confirm_every_command = entry.confirm_every_command;
         run.presentation.model_usage = entry.usage;
+        run.presentation.sent_context = entry.sent_context;
         run.final_evidence = entry.final_evidence;
         run.chat_handoff_id = entry.chat_handoff_id;
         run.chat_handoff_enabled = self.ai_chat_enabled();
@@ -341,6 +348,13 @@ mod tests {
         for _ in 0..super::super::MAX_ACTIVITY {
             run.record("Fixture note".into());
         }
+        for _ in 0..30 {
+            run.inline_decision(
+                &super::super::engine::Action::Commands(Vec::new()),
+                "Recorded fixture step",
+                "",
+            );
+        }
         run.record(format!("Old output: {marker}"));
         run.inline_command(&format!("printf {marker}"));
         let retained = run.inline_result(super::super::engine::Status::Exited(0), marker, "");
@@ -387,12 +401,8 @@ mod tests {
             retained.as_ref()
         );
         assert_eq!(trace.goal, "Inspect service");
-        assert!(
-            trace
-                .steps
-                .iter()
-                .any(|step| step.output.iter().any(|line| line == "service active"))
-        );
+        assert_eq!(trace.steps.len(), 32);
+        assert_eq!(trace.steps[0].output, ["service active"]);
         assert!(!format!("{trace:?}").contains(marker));
         assert!(
             restored

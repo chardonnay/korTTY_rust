@@ -69,6 +69,36 @@ impl Renderer {
         self.layers.as_slice()
     }
 
+    /// Renders the accumulated backdrop over an opaque color in a small region.
+    /// The caller supplies a scale suitable for the sampled effect.
+    pub fn snapshot_region(
+        &mut self,
+        bounds: Rectangle,
+        scale: f32,
+        background: Color,
+    ) -> Option<tiny_skia::Pixmap> {
+        let bounds = bounds * self.layers.transformation();
+        let width = (bounds.width * scale).ceil() as u32;
+        let height = (bounds.height * scale).ceil() as u32;
+        if width > 512 || height > 256 {
+            return None;
+        }
+        let mut pixels = tiny_skia::Pixmap::new(width, height)?;
+        let mut mask = tiny_skia::Mask::new(width, height)?;
+        let transform = Transformation::scale(scale)
+            * Transformation::translate(-bounds.x, -bounds.y);
+        pixels.fill(engine::into_color(Color { a: 1.0, ..background }));
+        self.layers.flush();
+        self.engine.draw_layers(
+            self.layers.as_slice(),
+            transform,
+            &mut pixels.as_mut(),
+            &mut clip_mask::ClipMask::new(&mut mask),
+            bounds * transform,
+        );
+        Some(pixels)
+    }
+
     /// Composites the content as a single layer within the given bounds.
     pub fn with_opacity(
         &mut self,
@@ -80,10 +110,40 @@ impl Renderer {
             draw(self);
             return;
         }
-        if opacity <= 0.0 {
+        if opacity > 0.0 {
+            self.with_group(bounds, opacity, None, draw);
+        }
+    }
+
+    /// Draws a group clipped by a circle in the current logical coordinates.
+    pub fn with_circle_clip(
+        &mut self,
+        bounds: Rectangle,
+        center: Point,
+        radius: f32,
+        draw: impl FnOnce(&mut Self),
+    ) {
+        if !radius.is_finite() || radius <= 0.0 {
             return;
         }
+        let ellipse = Rectangle {
+            x: center.x - radius,
+            y: center.y - radius,
+            width: radius * 2.0,
+            height: radius * 2.0,
+        };
+        if let Some(clip) = bounds.intersection(&ellipse) {
+            self.with_group(clip, 1.0, Some(ellipse), draw);
+        }
+    }
 
+    fn with_group(
+        &mut self,
+        bounds: Rectangle,
+        opacity: f32,
+        ellipse: Option<Rectangle>,
+        draw: impl FnOnce(&mut Self),
+    ) {
         let (parent, transformation) = self.layers.current_mut();
         let Some(clip) = (bounds * transformation).intersection(&parent.bounds) else {
             return;
@@ -95,6 +155,7 @@ impl Renderer {
         self.layers.flush();
         let group = layer::OpacityGroup {
             opacity,
+            ellipse: ellipse.map(|ellipse| ellipse * transformation),
             layers: self.layers.as_slice().into(),
         };
         self.layers = outer;

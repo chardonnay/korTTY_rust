@@ -2,6 +2,7 @@
 
 use std::cmp::Ordering;
 use std::fmt::Write;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use zeroize::Zeroizing;
@@ -29,6 +30,23 @@ pub(crate) struct MemoryPrompt {
     organization_digest: Option<String>,
     user: Option<UserBindings>,
     includes_connection: bool,
+    pieces: Vec<Piece>,
+    omitted: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Origin {
+    Organization,
+    Global,
+    Connection,
+    External,
+}
+
+struct Piece {
+    origin: Origin,
+    range: Range<usize>,
+    file: Option<Zeroizing<String>>,
+    partial: bool,
 }
 
 struct UserBindings {
@@ -40,6 +58,21 @@ struct UserBindings {
 impl MemoryPrompt {
     pub(crate) fn text(&self) -> &str {
         self.text.as_str()
+    }
+
+    pub(crate) fn pieces(&self) -> impl Iterator<Item = (Origin, &str, Option<&str>, bool)> {
+        self.pieces.iter().map(|piece| {
+            (
+                piece.origin,
+                &self.text[piece.range.clone()],
+                piece.file.as_ref().map(|name| name.as_str()),
+                piece.partial,
+            )
+        })
+    }
+
+    pub(crate) fn omitted(&self) -> usize {
+        self.omitted
     }
 
     pub(crate) fn includes_connection(&self) -> bool {
@@ -155,7 +188,7 @@ pub(in crate::ai_manager) fn load(
         .map(|root| UserMemory::load(root, connection_id, include_external, policy))
         .transpose()?;
     let budget = usize::from(settings.budget_with_limit(policy.max_tokens));
-    let Some(rendered) = render(
+    let Some(mut rendered) = render(
         &organization,
         user.as_ref().map_or("", |user| user.global.as_str()),
         user.as_ref()
@@ -164,11 +197,27 @@ pub(in crate::ai_manager) fn load(
             .flat_map(|user| &user.external)
             .map(|reference| reference.text.as_str()),
         budget,
-        mask,
+        &mut mask,
     )?
     else {
         return Ok(None);
     };
+    if let Some(user) = &user {
+        for (piece, excerpt) in rendered
+            .pieces
+            .iter_mut()
+            .filter(|piece| piece.origin == Origin::External)
+            .zip(&rendered.included_references)
+        {
+            let reference = &user.external[*excerpt];
+            piece.file = reference
+                .binding
+                .file_name()
+                .and_then(|name| mask(name).ok())
+                .map(Zeroizing::new);
+            piece.partial |= reference.partial;
+        }
+    }
     let user = user
         .filter(|_| rendered.includes_user_files)
         .map(|user| user.bind(&rendered.included_references))
@@ -182,6 +231,8 @@ pub(in crate::ai_manager) fn load(
         organization_digest: organization_digest(policy.organization())?,
         user,
         includes_connection,
+        pieces: rendered.pieces,
+        omitted: rendered.omitted,
     }))
 }
 
@@ -298,6 +349,8 @@ struct Rendered {
     includes_user_files: bool,
     includes_connection: bool,
     included_references: Vec<usize>,
+    pieces: Vec<Piece>,
+    omitted: usize,
 }
 
 fn render<'a>(
@@ -311,24 +364,55 @@ fn render<'a>(
     let mut remaining = budget.saturating_sub(
         format::estimate(PREFIX) + format::estimate(SUFFIX) + format::estimate(organization),
     );
-    let connection = match connection {
+    let (connection, connection_omitted) = match connection {
         Some(source) => section(source, CONNECTION, &mut remaining, &mut mask)?,
-        None => None,
+        None => (None, 0),
     };
-    let global = section(global, GLOBAL, &mut remaining, &mut mask)?;
-    let (external, included_references) = external_section(external, remaining, &mut mask)?;
+    let (global, global_omitted) = section(global, GLOBAL, &mut remaining, &mut mask)?;
+    let external = external_section(external, remaining, &mut mask)?;
     let includes_user_files =
-        global.is_some() || connection.is_some() || !included_references.is_empty();
+        global.is_some() || connection.is_some() || !external.files.is_empty();
     if organization.is_empty() && !includes_user_files {
         return Ok(None);
     }
     let includes_connection = connection.is_some();
     let mut text = Zeroizing::new(String::from(PREFIX));
-    text.push_str(organization);
-    for section in [global, connection].into_iter().flatten() {
-        text.push_str(&section);
+    let mut pieces = Vec::new();
+    for (section, heading, origin) in [
+        (Some(organization), ORGANIZATION, Origin::Organization),
+        (global.as_ref().map(|s| s.as_str()), GLOBAL, Origin::Global),
+        (
+            connection.as_ref().map(|s| s.as_str()),
+            CONNECTION,
+            Origin::Connection,
+        ),
+    ] {
+        if let Some(section) = section.and_then(|section| section.strip_prefix(heading)) {
+            text.push_str(heading);
+            for line in section.split_inclusive('\n') {
+                let start = text.len();
+                text.push_str(line);
+                pieces.push(Piece {
+                    origin,
+                    range: start..text.len(),
+                    file: None,
+                    partial: false,
+                });
+            }
+        }
     }
-    text.push_str(&external);
+    let external_offset = text.len();
+    text.push_str(&external.text);
+    let mut included_references = Vec::new();
+    for (index, span, partial) in external.files {
+        included_references.push(index);
+        pieces.push(Piece {
+            origin: Origin::External,
+            range: external_offset + span.start..external_offset + span.end,
+            file: None,
+            partial,
+        });
+    }
     text.push_str(SUFFIX);
     debug_assert!(!includes_user_files || format::estimate(&text) <= budget);
     Ok(Some(Rendered {
@@ -336,22 +420,31 @@ fn render<'a>(
         includes_user_files,
         includes_connection,
         included_references,
+        pieces,
+        omitted: global_omitted + connection_omitted + external.omitted,
     }))
+}
+
+#[derive(Default)]
+struct ExternalSection {
+    text: Zeroizing<String>,
+    files: Vec<(usize, Range<usize>, bool)>,
+    omitted: usize,
 }
 
 fn external_section<'a>(
     sources: impl IntoIterator<Item = &'a str>,
     remaining: usize,
     mask: &mut impl FnMut(&str) -> Result<String, String>,
-) -> Result<(Zeroizing<String>, Vec<usize>), String> {
-    let mut text = Zeroizing::new(String::new());
-    let mut included = Vec::new();
+) -> Result<ExternalSection, String> {
+    let mut section = ExternalSection::default();
     let mut available = remaining
         .min(MAX_EXTERNAL_TOKENS)
         .saturating_sub(format::estimate(EXTERNAL));
     for (index, source) in sources.into_iter().enumerate() {
         if available == 0 {
-            break;
+            section.omitted += 1;
+            continue;
         }
         let Ok(masked) = mask(source).map(Zeroizing::new) else {
             continue;
@@ -361,26 +454,32 @@ fn external_section<'a>(
         }
         let mut units = Vec::new();
         user_rows(&masked, 0..masked.len(), &mut units);
-        let mut used_file = false;
+        let count = units.len();
+        let mut selected = 0;
+        let mut start = section.text.len();
         for unit in units {
             if available == 0 {
                 break;
             }
             let encoded = encode(masked[unit.range].trim())?;
             if let Some(next) = available.checked_sub(format::estimate(&encoded)) {
-                if text.is_empty() {
-                    text.push_str(EXTERNAL);
+                if section.text.is_empty() {
+                    section.text.push_str(EXTERNAL);
+                    start = section.text.len();
                 }
-                text.push_str(&encoded);
-                used_file = true;
+                section.text.push_str(&encoded);
+                selected += 1;
                 available = next;
             }
         }
-        if used_file {
-            included.push(index);
+        if selected > 0 {
+            section
+                .files
+                .push((index, start..section.text.len(), selected < count));
         }
+        section.omitted += count - selected;
     }
-    Ok((text, included))
+    Ok(section)
 }
 
 fn section(
@@ -388,9 +487,9 @@ fn section(
     heading: &str,
     remaining: &mut usize,
     mask: &mut impl FnMut(&str) -> Result<String, String>,
-) -> Result<Option<Zeroizing<String>>, String> {
+) -> Result<(Option<Zeroizing<String>>, usize), String> {
     let Some(mut available) = remaining.checked_sub(format::estimate(heading)) else {
-        return Ok(None);
+        return Ok((None, rows(source).len()));
     };
     let mut units: Vec<_> = rows(source).into_iter().enumerate().collect();
     units.sort_unstable_by(
@@ -402,6 +501,7 @@ fn section(
         },
     );
 
+    let mut omitted = units.len();
     let mut selected = Vec::new();
     for (index, unit) in units {
         if available == 0 {
@@ -414,6 +514,7 @@ fn section(
             .map_or(&source[unit.range], String::as_str);
         let masked = Zeroizing::new(mask(value.trim())?);
         if masked.trim().is_empty() {
+            omitted -= 1;
             continue;
         }
         let encoded = encode(&masked)?;
@@ -423,11 +524,12 @@ fn section(
                 return Err("AI memory still contains a possible credential after masking.".into());
             }
             selected.push((managed, index, encoded));
+            omitted -= 1;
             available = next;
         }
     }
     if selected.is_empty() {
-        return Ok(None);
+        return Ok((None, omitted));
     }
     selected.sort_unstable_by_key(|(managed, index, _)| (*managed, *index));
     *remaining = available;
@@ -435,7 +537,7 @@ fn section(
     for (_, _, value) in selected {
         text.push_str(&value);
     }
-    Ok(Some(text))
+    Ok((Some(text), omitted))
 }
 
 fn encode(value: &str) -> Result<Zeroizing<String>, String> {
@@ -889,6 +991,29 @@ mod tests {
         .unwrap();
         assert_eq!(rendered.included_references, [0, 3]);
         let block = rendered.text;
+        let copied: Vec<_> = rendered
+            .pieces
+            .iter()
+            .map(|piece| {
+                (
+                    piece.origin,
+                    serde_json::from_str::<String>(&block[piece.range.clone()]).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            copied,
+            [
+                (Origin::Global, global.to_owned()),
+                (Origin::Connection, connection.to_owned()),
+                (Origin::External, large.clone()),
+                (
+                    Origin::External,
+                    excerpt.replace("fixture-redacted-value", "***")
+                ),
+            ]
+        );
+        assert_eq!(rendered.omitted, 1);
         let external = block.find(EXTERNAL).unwrap();
         assert!(block.find(global).unwrap() < block.find(connection).unwrap());
         assert!(block.find(connection).unwrap() < external);

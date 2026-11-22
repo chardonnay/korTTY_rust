@@ -38,6 +38,18 @@ mod tmux;
 mod toast;
 
 impl Run {
+    fn uses_hud(&self) -> bool {
+        self.design.status == Status::Hud && self.design.arrangement != Arrangement::Adaptive
+    }
+
+    fn uses_powerline(&self) -> bool {
+        if self.design.arrangement == Arrangement::Adaptive {
+            self.presentation.dock.get() == Dock::Bar
+        } else {
+            self.design.status == Status::Powerline
+        }
+    }
+
     fn has_history_dock(&self) -> bool {
         placement::history_slot(self.design.history).is_some()
             && self.design.arrangement != Arrangement::PictureInPicture
@@ -62,6 +74,8 @@ pub(super) use presentation::{Presentation, Usage};
 pub(in crate::workspace) use sample::{
     Action as SampleAction, Grid as SampleGrid, Sample, View as SampleView,
 };
+#[cfg(test)]
+pub(in crate::workspace::terminal_agent) use status::minimap::Target as MinimapTarget;
 
 pub(in crate::workspace) const AUTO_HIDE_SECONDS: std::ops::RangeInclusive<u8> = 0..=60;
 pub(in crate::workspace) const DEFAULT_AUTO_HIDE_SECONDS: u8 = 6;
@@ -284,7 +298,7 @@ fn history_with_steps<'a>(
         } else {
             log_table::Surface::PaneStepList
         };
-        status::step_list(run, surface)
+        status::step_list(run, surface, reduced_motion)
     } else {
         history::view(
             run,
@@ -316,7 +330,7 @@ fn adaptive_status(dock: &Cell<Dock>, columns: usize, rows: usize) -> (Status, S
     dock.set(chosen);
     match chosen {
         Dock::Side => (Status::Metro, Slot::Right),
-        Dock::Bar => (Status::Powerline, Slot::Bottom),
+        Dock::Bar => (Status::Powerline, Slot::BottomDrawer),
         Dock::Pill => (Status::Spotlight, Slot::OverlayTop),
     }
 }
@@ -344,6 +358,26 @@ fn adaptive_timeline<'a>(
 }
 
 impl State {
+    pub(in crate::workspace) fn note_hud_key(
+        &self,
+        session: SessionId,
+        stream: u64,
+        seconds: u8,
+        now: Instant,
+        reduced_motion: bool,
+    ) {
+        if let Some((_, run)) = self.agent_activity_for_stream(session, stream)
+            && run.uses_hud()
+            && run.has_terminal_presentation()
+            && run
+                .presentation
+                .status_opacity(Status::Hud, seconds, now, reduced_motion)
+                .is_some()
+        {
+            run.presentation.hud_typing.key(now);
+        }
+    }
+
     pub(in crate::workspace) fn close_status_run_menus(&mut self, session: SessionId, stream: u64) {
         for run in self.runs.values_mut().filter(|run| {
             run.binding
@@ -424,7 +458,14 @@ impl State {
         stream: u64,
     ) -> Option<Element<'_, Desktop>> {
         let (id, run) = self.agent_activity_for_stream(session, stream)?;
-        pane_status(id, run, run.design.status, None, Instant::now(), true, self)
+        pane_status(
+            id,
+            run,
+            run.design.status,
+            None,
+            (Instant::now(), true, 1.0),
+            self,
+        )
     }
 }
 
@@ -433,12 +474,11 @@ fn pane_status<'a>(
     run: &'a Run,
     status: Status,
     palette: Option<Palette>,
-    now: Instant,
-    reduced_motion: bool,
+    timing: (Instant, bool, f32),
     agents: &'a State,
 ) -> Option<Element<'a, Desktop>> {
     (status != Status::Hidden).then(|| {
-        status::view(run, status, palette, now, reduced_motion, (agents, id))
+        status::view(run, status, palette, timing, (agents, id))
             .map(move |message| Desktop::TerminalAgent(id, message))
     })
 }
@@ -491,7 +531,57 @@ impl Workspace {
             .filter_map(|run| {
                 let toasts = run.design.status == Status::Toasts
                     && run.presentation.status_events.ticking(now, reduced_motion);
-                if toasts && !reduced_motion {
+                let top_bar = run.design.status == Status::TopBar
+                    && run.design.arrangement != Arrangement::Adaptive;
+                let top_bar_interval = top_bar
+                    .then(|| {
+                        status::top_bar::refresh_interval(
+                            &run.presentation,
+                            run.active() && !run.cancel.requested(),
+                            run.paused || run.phase == Phase::Paused,
+                            now,
+                            reduced_motion,
+                        )
+                    })
+                    .flatten();
+                let minimap = run.design.status == Status::Minimap
+                    && run.design.arrangement != Arrangement::Adaptive
+                    && run.status_transcript().is_some_and(|(transcript, _)| {
+                        let active = run.active() && !run.paused && !run.cancel.requested();
+                        run.presentation
+                            .minimap
+                            .animating(transcript, active, now, reduced_motion)
+                    });
+                let hud_interval = run
+                    .uses_hud()
+                    .then(|| {
+                        status::hud::refresh_interval(
+                            &run.presentation,
+                            run.active(),
+                            run.paused || run.phase == Phase::Paused,
+                            now,
+                            reduced_motion,
+                        )
+                    })
+                    .flatten();
+                let powerline_interval = run
+                    .uses_powerline()
+                    .then(|| {
+                        status::powerline::refresh_interval(
+                            &run.presentation,
+                            run.active() && !run.cancel.requested(),
+                            run.paused || run.phase == Phase::Paused,
+                            now,
+                            reduced_motion,
+                        )
+                    })
+                    .flatten();
+                if toasts && !reduced_motion
+                    || top_bar_interval == Some(16)
+                    || minimap
+                    || hud_interval == Some(16)
+                    || powerline_interval == Some(16)
+                {
                     return Some(16);
                 }
                 StatusTiming::new(
@@ -507,7 +597,24 @@ impl Workspace {
                                     && run.presentation.dock.get() == Dock::Pill))
                         .then_some(100)
                 })
+                .or_else(|| {
+                    if run.design.arrangement == Arrangement::Adaptive
+                        || !status::drawer_uses_typed_list(run.design.status)
+                        || !run.presentation.drawer_open()
+                    {
+                        return None;
+                    }
+                    let (trace, _) = run.status_transcript()?;
+                    status::step_interval(
+                        &trace.steps,
+                        run.active() && !run.cancel.requested(),
+                        reduced_motion || run.paused || run.phase == Phase::Paused,
+                    )
+                })
                 .or_else(|| (run.active() && run.design.status == Status::Metro).then_some(1000))
+                .or(top_bar_interval)
+                .or(hud_interval)
+                .or(powerline_interval)
             })
             .chain(
                 self.terminal_agents.runs.iter().filter_map(|(&id, run)| {
@@ -541,54 +648,62 @@ impl Workspace {
             return None;
         }
         let (transcript, started) = run.status_transcript()?;
-        let interval = match run.design.history {
-            History::CardStack => card_stack::refresh_interval(
-                transcript,
-                &run.presentation,
-                run.active(),
-                now,
-                reduced_motion,
-            ),
-            History::Timeline => timeline::refresh_interval(
-                transcript,
-                &run.presentation,
-                now,
-                run.active() && !run.paused && !run.cancel.requested(),
-                reduced_motion,
-            ),
-            History::PlanExecution => plan_execution::refresh_interval(
-                transcript,
-                &run.presentation,
-                now,
+        let interval = if run.presentation.step_list_open {
+            status::step_interval(
+                &transcript.steps,
                 run.active() && !run.cancel.requested(),
-                run.active() && !run.paused && !run.cancel.requested(),
-                reduced_motion,
-            ),
-            History::LogTable => run.presentation.log_table.refresh_interval(
-                transcript,
-                now,
-                run.active(),
-                !run.paused && !run.cancel.requested(),
-                reduced_motion,
-            ),
-            History::Tmux => {
-                tmux::refresh_interval(transcript, &run.presentation, now, reduced_motion)
-            }
-            History::Conversation => conversation::entrance_interval(
-                transcript,
-                Some(started),
-                run.presentation.review_started,
-                now,
-                reduced_motion,
+                reduced_motion || run.paused || run.phase == Phase::Paused,
             )
-            .or_else(|| {
-                conversation::refresh_interval(
+        } else {
+            match run.design.history {
+                History::CardStack => card_stack::refresh_interval(
                     transcript,
-                    run.conversation_pending(),
+                    &run.presentation,
+                    run.active(),
+                    now,
+                    reduced_motion,
+                ),
+                History::Timeline => timeline::refresh_interval(
+                    transcript,
+                    &run.presentation,
+                    now,
+                    run.active() && !run.paused && !run.cancel.requested(),
+                    reduced_motion,
+                ),
+                History::PlanExecution => plan_execution::refresh_interval(
+                    transcript,
+                    &run.presentation,
+                    now,
+                    run.active() && !run.cancel.requested(),
+                    run.active() && !run.paused && !run.cancel.requested(),
+                    reduced_motion,
+                ),
+                History::LogTable => run.presentation.log_table.refresh_interval(
+                    transcript,
+                    now,
+                    run.active(),
+                    !run.paused && !run.cancel.requested(),
+                    reduced_motion,
+                ),
+                History::Tmux => {
+                    tmux::refresh_interval(transcript, &run.presentation, now, reduced_motion)
+                }
+                History::Conversation => conversation::entrance_interval(
+                    transcript,
+                    Some(started),
+                    run.presentation.review_started,
+                    now,
                     reduced_motion,
                 )
-            }),
-            _ => None,
+                .or_else(|| {
+                    conversation::refresh_interval(
+                        transcript,
+                        run.conversation_pending(),
+                        reduced_motion,
+                    )
+                }),
+                _ => None,
+            }
         }?;
         if run.runs_in_chat_tab()
             && self
@@ -604,7 +719,7 @@ impl Workspace {
         if self.placed_dialog_owner(id).is_some() {
             return Some(interval);
         }
-        if run.presentation.step_list_open || run.presentation.dock_hidden {
+        if run.presentation.dock_hidden {
             return None;
         }
         let source = run.binding.live().ok()?;
@@ -650,6 +765,15 @@ impl Workspace {
         if let Some(id) = self.agent_status_target(owner)
             && let Some(run) = self.terminal_agents.runs.get_mut(&id)
         {
+            if run.uses_hud() {
+                run.presentation.dismiss_hud();
+            }
+            if run.uses_powerline() {
+                run.presentation.dismiss_powerline_drawer();
+            }
+            if run.design.status == Status::Orbit {
+                run.presentation.dismiss_drawer();
+            }
             if run.presentation.log_table.close_status_run_menu() {
                 run.presentation.status_visibility.hide();
             } else {
@@ -783,11 +907,18 @@ impl Workspace {
         let now = Instant::now();
         let seconds = self.window_settings.agent_status_auto_hide_seconds();
         let visibility = &run.presentation.status_visibility;
-        let status_opacity = if run.presentation.log_table.status_run_menu_open(status_kind) {
-            Some(1.0)
-        } else {
-            visibility.opacity(seconds, now, reduced_motion)
-        };
+        let status_opacity =
+            run.presentation
+                .status_opacity(status_kind, seconds, now, reduced_motion);
+        if status_kind == Status::Hud && status_opacity.is_none() {
+            run.presentation.dismiss_hud();
+        }
+        if status_kind == Status::Powerline && status_opacity.is_none() {
+            run.presentation.dismiss_powerline_drawer();
+        }
+        if status_kind == Status::Orbit && status_opacity.is_none() {
+            run.presentation.dismiss_drawer();
+        }
         let chooser = || agents.run_picker(id, run);
         let picture_in_picture = run.design.arrangement == Arrangement::PictureInPicture;
         let dock = self.window_settings.ai_agent_panel;
@@ -903,27 +1034,44 @@ impl Workspace {
                 let panel = adaptive_timeline(run.into(), status::phase(run).0, controls, palette);
                 Some(panel.map(move |message| Desktop::TerminalAgent(id, message)))
             } else {
-                pane_status(id, run, status_kind, palette, now, reduced_motion, agents).map(
-                    |status| {
-                        let picker = if history_position.is_none() && !picture_in_picture {
-                            chooser().map(|picker| {
-                                picker.map(move |message| Desktop::TerminalAgent(id, message))
-                            })
-                        } else {
-                            None
-                        };
-                        if let Some(picker) = picker {
-                            palette::panel(
-                                palette,
-                                container(column![status, picker].spacing(3)).padding(2),
-                            )
-                        } else {
-                            status
-                        }
-                    },
+                pane_status(
+                    id,
+                    run,
+                    status_kind,
+                    palette,
+                    (now, reduced_motion, opacity),
+                    agents,
                 )
+                .map(|status| {
+                    let picker = if history_position.is_none()
+                        && !picture_in_picture
+                        && !matches!(
+                            status_kind,
+                            Status::Powerline | Status::TopBar | Status::Minimap | Status::Hud
+                        ) {
+                        chooser().map(|picker| {
+                            picker.map(move |message| Desktop::TerminalAgent(id, message))
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(picker) = picker {
+                        palette::panel(
+                            palette,
+                            container(column![status, picker].spacing(3)).padding(2),
+                        )
+                    } else {
+                        status
+                    }
+                })
             }
-            .map(|status| fade::view(status, opacity))
+            .map(|status| {
+                if status_kind == Status::Hud {
+                    status
+                } else {
+                    fade::view(status, opacity)
+                }
+            })
         });
         let terminal = if run.design.arrangement == Arrangement::Adaptive {
             status::adaptive_countdown(
@@ -938,7 +1086,6 @@ impl Workspace {
         } else {
             terminal
         };
-        let rail = status_kind == Status::Minimap && history_position != Some(Slot::Right);
         let terminal = compose(
             terminal,
             history,
@@ -948,7 +1095,7 @@ impl Workspace {
             bounds,
             DockExtents {
                 left: side_width,
-                right: if rail { 84.0 } else { side_width },
+                right: side_width,
                 bottom: Some(bottom_height),
             },
         );
@@ -965,10 +1112,16 @@ impl Workspace {
         } else {
             terminal
         };
-        if let Some(offer) = handoff::terminal_bar(run) {
+        let context = super::sent_context::view(run, super::sent_context::Surface::Terminal);
+        let offer = handoff::terminal_bar(run);
+        if context.is_some() || offer.is_some() {
             column![
                 container(terminal).width(Length::Fill).height(Length::Fill),
-                offer.map(move |message| Desktop::TerminalAgent(id, message)),
+                context.map(|context| container(
+                    context.map(move |message| Desktop::TerminalAgent(id, message))
+                )
+                .align_right(Length::Fill)),
+                offer.map(|offer| offer.map(move |message| Desktop::TerminalAgent(id, message))),
             ]
             .height(Length::Fill)
             .into()

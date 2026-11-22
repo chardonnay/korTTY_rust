@@ -298,6 +298,27 @@ fn labels<M>(element: Element<'_, M>) -> String {
     labels.0.join("\n")
 }
 
+fn status_labels(
+    state: &mut crate::workspace::terminal_agent::State,
+    id: window::Id,
+    status: DesignStatus,
+) -> String {
+    if status == DesignStatus::Minimap {
+        let run = state.runs.get_mut(&id).unwrap();
+        let step = run.status_transcript().unwrap().0.steps[0].id;
+        run.presentation.update(
+            design::Message::MinimapHover(design::MinimapTarget::Step(step), true),
+            0,
+        );
+    }
+    let view = state.pane_agent_status(SessionId(7), 9).unwrap();
+    if status == DesignStatus::Minimap {
+        labels(iced::widget::row![iced::widget::space::horizontal().width(360), view].into())
+    } else {
+        labels(view)
+    }
+}
+
 #[test]
 fn expand_all_shows_older_details_in_each_selectable_history() {
     let mut run = run(DesignHistory::Timeline);
@@ -345,12 +366,11 @@ fn every_native_history_and_visible_status_presents_real_attempt_metadata() {
     state.runs.insert(id, run);
     for status in DesignStatus::ALL {
         state.runs.get_mut(&id).unwrap().design.status = status;
-        let view = state.pane_agent_status(SessionId(7), 9);
         if status == DesignStatus::Hidden {
-            assert!(view.is_none());
+            assert!(state.pane_agent_status(SessionId(7), 9).is_none());
         } else {
             assert!(
-                labels(view.unwrap()).contains("40 reported tokens"),
+                status_labels(&mut state, id, status).contains("40 reported tokens"),
                 "{status}"
             );
         }
@@ -378,12 +398,11 @@ fn every_native_history_and_visible_status_presents_live_repair_before_completio
     state.runs.insert(id, run);
     for status in DesignStatus::ALL {
         state.runs.get_mut(&id).unwrap().design.status = status;
-        let view = state.pane_agent_status(SessionId(7), 9);
         if status == DesignStatus::Hidden {
-            assert!(view.is_none());
+            assert!(state.pane_agent_status(SessionId(7), 9).is_none());
         } else {
             assert!(
-                labels(view.unwrap())
+                status_labels(&mut state, id, status)
                     .to_lowercase()
                     .contains("repairing response"),
                 "{status}"

@@ -40,18 +40,7 @@ impl StatusTiming {
             return None;
         }
 
-        // The Java transition eases in and out using 20% acceleration and braking ramps.
-        let phase = age.as_secs_f32() / self.fade.as_secs_f32();
-        const RAMP: f32 = 0.2;
-        const SPEED: f32 = 1.0 / (1.0 - RAMP);
-        let ramp = |t: f32| SPEED * t * t / (2.0 * RAMP);
-        Some(if phase < RAMP {
-            1.0 - ramp(phase)
-        } else if phase > 1.0 - RAMP {
-            ramp(1.0 - phase)
-        } else {
-            1.0 - SPEED * (phase - RAMP / 2.0)
-        })
+        Some(1.0 - ease_both(age, self.fade))
     }
 
     pub(in crate::workspace) fn next_frame(self, now: Instant) -> Option<Instant> {
@@ -76,9 +65,25 @@ impl StatusTiming {
     }
 }
 
+pub(super) fn ease_both(age: Duration, duration: Duration) -> f32 {
+    // The Java transition uses 20% acceleration and braking ramps.
+    let phase = (age.as_secs_f32() / duration.as_secs_f32()).min(1.0);
+    const RAMP: f32 = 0.2;
+    const SPEED: f32 = 1.0 / (1.0 - RAMP);
+    let ramp = |t: f32| SPEED * t * t / (2.0 * RAMP);
+    if phase < RAMP {
+        ramp(phase)
+    } else if phase > 1.0 - RAMP {
+        1.0 - ramp(1.0 - phase)
+    } else {
+        SPEED * (phase - RAMP / 2.0)
+    }
+}
+
 #[derive(Default)]
 pub(super) struct StatusVisibility {
     pub(super) finished_at: Option<Instant>,
+    pub(super) hud_entrance: super::fade::Entrance,
     manual: Option<bool>,
 }
 
@@ -104,7 +109,12 @@ impl StatusVisibility {
     }
 
     pub(super) fn toggle(&mut self, seconds: u8, now: Instant, reduced_motion: bool) {
-        self.manual = Some(self.opacity(seconds, now, reduced_motion).is_none());
+        if self.opacity(seconds, now, reduced_motion).is_none() {
+            self.hud_entrance.hide();
+            self.show();
+        } else {
+            self.hide();
+        }
     }
 
     pub(super) fn show(&mut self) {
@@ -113,6 +123,7 @@ impl StatusVisibility {
 
     pub(super) fn hide(&mut self) {
         self.manual = Some(false);
+        self.hud_entrance.hide();
     }
 }
 
@@ -134,6 +145,9 @@ pub(crate) enum Message {
         review: bool,
     },
     ToggleDrawer,
+    TogglePowerlineDrawer,
+    SentContext(super::super::sent_context::Surface, bool),
+    MinimapHover(super::status::minimap::Target, bool),
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -171,13 +185,21 @@ pub(in crate::workspace::terminal_agent) struct Presentation {
     pub(in crate::workspace::terminal_agent) activity: super::activity::Panel,
     pub(in crate::workspace::terminal_agent) pip: super::pip::Panel,
     pub(in crate::workspace::terminal_agent) model_usage: Usage,
+    pub(in crate::workspace::terminal_agent) sent_context:
+        Option<super::super::sent_context::Snapshot>,
+    pub(in crate::workspace::terminal_agent) sent_context_open:
+        Option<super::super::sent_context::Surface>,
     first: usize,
     selected: Option<usize>,
     card_stack_back: usize,
-    pub(in crate::workspace::terminal_agent) drawer: bool,
+    drawer: Cell<Option<Instant>>,
+    powerline_drawer: super::status::powerline::Drawer,
     pub(super) dock: Cell<Dock>,
     pub(super) status_visibility: StatusVisibility,
     pub(super) status_events: StatusEvents,
+    pub(super) minimap: super::status::minimap::Motion,
+    pub(super) hud_typing: super::status::hud::Typing,
+    pub(super) hud_glass: super::fade::Backdrop,
     pub(super) selected_step: Option<u64>,
     pub(super) conversation_output: std::collections::HashSet<super::conversation::OutputKey>,
     pub(super) step_list_open: bool,
@@ -219,6 +241,7 @@ impl Presentation {
         now: Instant,
     ) {
         self.status_events.sync(transcript, finished, now);
+        self.minimap.sync(transcript, now);
         self.status_events.track_review(waiting, now);
         self.log_table.sync(transcript, now);
         self.plan_progress.sync(transcript, finished, now);
@@ -251,12 +274,15 @@ impl Presentation {
                 | Phase::PlanOptions
                 | Phase::TriageChoice
         ) {
-            self.drawer = true;
+            self.open_drawer();
         }
     }
 
     pub(in crate::workspace::terminal_agent) fn close_status_run_menu(&mut self) {
         self.log_table.close_status_run_menu();
+        if self.sent_context_open == Some(super::super::sent_context::Surface::Terminal) {
+            self.sent_context_open = None;
+        }
     }
 
     pub(super) fn selection(&self, len: usize) -> usize {
@@ -285,6 +311,53 @@ impl Presentation {
         }
     }
 
+    pub(in crate::workspace::terminal_agent) fn drawer_open(&self) -> bool {
+        self.drawer_opened_at().is_some()
+    }
+
+    pub(super) fn drawer_opened_at(&self) -> Option<Instant> {
+        self.drawer.get()
+    }
+
+    fn open_drawer(&self) {
+        if !self.drawer_open() {
+            self.drawer.set(Some(Instant::now()));
+        }
+    }
+
+    pub(super) fn powerline_drawer_at(&self) -> Option<Instant> {
+        self.powerline_drawer.opened_at(self.status_events.review)
+    }
+
+    pub(super) fn dismiss_powerline_drawer(&self) {
+        self.powerline_drawer.dismiss(self.status_events.review);
+    }
+
+    pub(super) fn dismiss_hud(&self) {
+        self.dismiss_drawer();
+        self.status_visibility.hud_entrance.hide();
+        self.hud_typing.reset();
+        self.hud_glass.clear();
+    }
+
+    pub(super) fn dismiss_drawer(&self) {
+        self.drawer.set(None);
+    }
+
+    pub(super) fn status_opacity(
+        &self,
+        status: crate::terminal_agent::design::Status,
+        seconds: u8,
+        now: Instant,
+        reduced_motion: bool,
+    ) -> Option<f32> {
+        if self.log_table.status_run_menu_open(status) {
+            Some(1.0)
+        } else {
+            self.status_visibility.opacity(seconds, now, reduced_motion)
+        }
+    }
+
     pub(in crate::workspace::terminal_agent) fn update(&mut self, message: Message, len: usize) {
         match message {
             Message::Select(identity)
@@ -293,11 +366,11 @@ impl Presentation {
                     .is_some_and(|index| index < len) =>
             {
                 self.selected = Some(identity);
-                self.drawer = true;
+                self.open_drawer();
             }
             Message::SelectStep(identity) => {
                 self.selected_step = Some(identity);
-                self.drawer = true;
+                self.open_drawer();
             }
             Message::ConversationOutput(key) => {
                 if !self.conversation_output.remove(&key) {
@@ -314,7 +387,24 @@ impl Presentation {
                     .saturating_add_signed(isize::from(direction))
                     .min(count.saturating_sub(1));
             }
-            Message::ToggleDrawer => self.drawer = !self.drawer,
+            Message::ToggleDrawer => {
+                self.log_table.close_step_list_menu();
+                if self.drawer_open() {
+                    self.dismiss_drawer();
+                } else {
+                    self.open_drawer();
+                }
+            }
+            Message::TogglePowerlineDrawer => self
+                .powerline_drawer
+                .toggle(self.status_events.review, Instant::now()),
+            Message::SentContext(surface, true) if self.sent_context.is_some() => {
+                self.sent_context_open = Some(surface);
+            }
+            Message::SentContext(surface, false) if self.sent_context_open == Some(surface) => {
+                self.sent_context_open = None;
+            }
+            Message::MinimapHover(target, entered) => self.minimap.hover(target, entered),
             _ => {}
         }
     }

@@ -4,7 +4,7 @@ The current remaining-feature audit and implementation sequence are in
 [PORTING-PLAN.md](PORTING-PLAN.md). This file retains the
 historical baseline and chronological verification evidence; baseline-only
 missing items must be reconciled with that plan and the later entries below.
-Links under `target/verification/` point to local build records.
+Links under `target/verification/` point to the checkout that ran the tests.
 
 This inventory records implementation and acceptance separately. It starts from
 Rust commit `f463f9ce2d14d1805d8c5fd170467490ed155427` and the scope in
@@ -15,6 +15,494 @@ check. A historical result identifies an earlier run. Current acceptance stays
 open until a result is recorded for the tested revision and environment. Both
 Mosh modes are out of scope. The editor has a reduced native scope with structure
 navigation for classes, functions, variables, and placeholders.
+
+## November 22 design editing, command output and settings search
+
+This source comparison uses Java `v2.26.0` (`b235d91f2035`) and the Rust
+working tree based on `cb622a66`, including its uncommitted changes.
+The [implementation backlog](PORTING-PLAN.md#confirmed-implementation-work)
+gives completion checks for each difference.
+
+- **Agent design editor (A2).** Selecting a different module on a Java
+  built-in creates and selects a custom copy with that one role changed.
+  The default is a separate choice. Java saves committed changes to
+  combinations, the default, auto-hide and reduced animations immediately.
+  Rust offers module previews on both presets and custom designs. The
+  editable role selectors appear on custom designs, and edits to the
+  design catalog and preferences reach storage through the outer Settings
+  save. [Java design editor](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignPluginManagerDialog.java)
+  · [Rust design editor](src/workspace/settings_window/agent_design_settings.rs)
+  · [Rust Settings draft and save](src/workspace/settings_window.rs)
+- **Command step output (A2).** Java's step menu joins the stdout and
+  stderr lines already retained for that activity. Rust's inline history
+  keeps the last eight combined lines and the first 320 characters of
+  each. The step action joins that preview. A successful clipboard test
+  with a single short line covers its own case. Long-output verification
+  needs markers outside both preview limits and must preserve masking and
+  the run's capture limits. [Java step action](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentRunActions.java)
+  · [Java output reader](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/core/AgentStepReader.java)
+  · [Rust step history](src/workspace/terminal_agent/inline_history.rs)
+  · [Rust step action](src/workspace/terminal_agent/design/actions.rs)
+- **Settings and AI Manager search (D4).** Java uses the same matcher in
+  both dialogs. It folds accents, alternate German spellings and
+  punctuation, requires every query term to match, ranks labels and pages
+  with stable ties, and removes repeated labels on the same page before
+  returning up to 40 results. A query matching only the page name can
+  reveal that page without listing all its controls. Rust Settings
+  already folds accents and requires two characters. AI Manager accepts a
+  single character. Both return substring matches in enumeration order.
+  The tagged tests include German spelling, punctuation, page-only
+  hits, stable ranking and the result limit. Imported GGUF and MLX
+  model results already resolve by name, format or registry ID.
+  [Java matcher](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SettingsSearchMatcher.java)
+  · [Java matcher tests](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/test/java/de/kortty/ui/SettingsSearchMatcherTest.java)
+  · [Rust Settings search](src/workspace/settings_window.rs)
+  · [Rust AI Manager search](src/ai_manager/search.rs)
+  · [Fedora imported-model search checks](target/verification/20261122-imported-model-search-fedora.log)
+
+## Orbit progress and terminal placement
+
+The d15 Orbit status anchors its 72-pixel circle to the terminal's lower
+right while keeping the current step label to its left. Opening the list
+keeps the circle in place and shows up to twelve recent steps above it,
+with the remaining count and existing run and step actions. The ring
+eases between progress values over 400 ms. The three dots make a
+revolution in 1.6 seconds, hold through a pause, and remain still with
+reduced animations. The same presenter is used in Settings. The list
+opens from the center of the ring over 340 ms and folds back over 260 ms.
+The circular clip follows the current radius as the user reverses the
+animation or resizes the pane. During opening, only the visible area
+receives pointer input. The list is inert during folding. Reduced
+animations shows or hides the entire list immediately. A2 tracks the
+remaining native desktop checks.
+[Java Orbit presenter](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignOrbit.java).
+
+The first Fedora ARM64 test exposed a ring shift when the list opened
+over a terminal with a bottom history. The corrected Iced layout anchors
+the ring and list independently. The test checks both side and bottom
+history, clicks the ring to open the bound step list, and verifies that
+the ring and terminal bounds stay fixed. The animation tests cover an
+interrupted fill, switching runs, pause and resume, and reduced motion.
+Fedora ARM64 passed 286 selected tests with 12 ignored. Windows ARM64
+passed strict Clippy for the application and its tests.
+[Initial Fedora test](target/verification/20261122-agent-orbit-fedora.log)
+· [Fedora retest](target/verification/20261122-agent-orbit-fedora-final.log)
+· [Windows ARM64 Clippy](target/verification/20261122-agent-orbit-clippy-windows-final.log).
+
+The radial animation test samples the native Tiny Skia renderer at
+200 percent with a translucent parent layer. It checks covered and
+uncovered pixels, clicks inside and outside the reveal, and verifies that
+the folding list delivers no list actions. A deterministic clock test
+checks reversal from the current radius and immediate reduced-motion
+changes. Fedora ARM64 passed 296 selected tests with 12 ignored, including
+the Settings preview suite. Strict application and test-target Clippy
+passed on Windows ARM64.
+[Fedora animation and preview tests](target/verification/20261122-agent-orbit-bloom-fedora.log)
+· [Windows ARM64 Clippy](target/verification/20261122-agent-orbit-bloom-clippy-windows.log).
+
+The Fedora 44 ARM64 development build passed two desktop runs in a
+private Xvfb display with Openbox. Each run reviewed the environment
+probe, approved one local fixture command, and sent two reviewed
+requests to the loopback fixture model. With the side timeline, captured
+frames showed the list opening and folding. With reduced animations and
+the bottom Log Table, the first captured frames showed the final visible
+or hidden list. Both runs used the step's right-click menu to copy its
+exact command output. The ring coordinates and terminal grid stayed
+fixed through both transitions. The private display, app processes,
+profiles, and development build were removed.
+[Fedora X11 desktop verification](target/verification/20261122-agent-orbit-live-x11.log).
+
+The same Fedora 44 ARM64 source passed both Orbit desktop cases in a
+headless Sway 1.11 session with Xwayland disabled. The app windows used
+the Wayland `xdg_shell` backend and the test seat had a virtual pointer
+and a persistent virtual keyboard. Captured frames showed intermediate
+states with the side timeline. With the bottom Log Table and reduced
+animations, the first changed frames showed the fully open or closed
+list. **Copy output** was read back through `wl-paste` in both cases.
+The ring positions and terminal grids stayed fixed at 93 by 30 and
+133 by 17 cells respectively. The test compositor, input helper, app,
+profiles, and build were removed. The remaining native desktop checks
+are tracked under A2.
+[Fedora Wayland desktop verification](target/verification/20261122-agent-orbit-live-wayland.log).
+
+The Windows ARM64 desktop executable was built natively. In an isolated
+live terminal with the side timeline, the list opened and closed with
+visible Orbit animation. A loopback model verified the result of the
+approved PowerShell command, and the Orbit list displayed its successful
+step. The user reported copying the output from that step. Exact system
+clipboard readback and reduced-motion desktop acceptance
+remain open.
+[Windows ARM64 Orbit desktop verification](target/verification/20261122-agent-orbit-live-windows-retest.log).
+
+Windows ARM64 passed all 102 selected tests for Agent designs, terminal
+interactions, and the Settings preview. The detached Conversation focus
+test uses reduced animations so its pointer targets the settled Cancel
+button while checking stale and current focus.
+[Windows ARM64 Orbit and preview tests](target/verification/20261122-agent-orbit-windows-final-tests.log).
+
+The Apple Silicon build passed all 102 selected tests for Agent designs,
+terminal interactions, and the Settings preview. The checks include the
+radial clip at 200 percent, matching input regions, reversal, the
+side and bottom history placements, and the run's context menu. The
+macOS live desktop workflow remains open.
+[Apple Silicon Orbit and preview tests](target/verification/20261122-agent-orbit-macos.log).
+
+Both 102-test runs preceded a change to the Orbit placement regression.
+The expanded test opens the selected step's menu and checks **Copy output**
+against the application's internal clipboard for the animated side timeline
+and the reduced-motion bottom table. The subsequent Windows build stopped
+during compilation, before that test ran. Rerun the expanded test and keep
+the Windows system clipboard and live macOS cases open as described above.
+[Expanded Rust regression](src/workspace/terminal_agent/flow/tests/designs.rs)
+· [Interrupted Windows build](target/verification/20261122-orbit-step-menu-windows.log).
+
+## Frosted Glass HUD with typed progress
+
+The d04 HUD overlays the lower-right corner of its terminal and shows the
+task, current step, typed progress segments and available model usage.
+Details opens a typed step list above the card, including the context menu
+for each step. Both surfaces leave terminal geometry intact with a history
+dock alongside. Run actions are available on the card, and review continues
+in the run's Activity window.
+
+The glass samples a bounded region of the rendered terminal at up to ten
+frames per second and blurs it behind the tinted card. Keyboard input from
+the HUD's own live terminal stream dims the card to 35 percent over 160 ms.
+The card restores its opacity after 1.4 seconds of idle time. Reduced
+animations makes the opacity changes immediate, uses a steady progress
+display and skips the blur. When hidden, the HUD closes its step drawer and
+clears the temporary typing fade. On show or reopen, the card fades in over
+220 ms and scales from 94 to 100 percent around its center over 240 ms. The
+transition repaints without relaying out the terminal and respects reduced
+animations. The Settings preview uses the same presenter. A2 tracks native
+desktop acceptance.
+[Java Frosted Glass HUD](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignHud.java).
+
+The renderer test checks the blur and tint over terminal pixels, the
+rounded corners and the unchanged area outside the card. Iced layout and
+pointer tests check placement beside the history dock, stable terminal
+geometry and the exact step menu. The typing test covers repeated keys,
+idle recovery and reduced motion. The entrance tests check both durations,
+centered scaling, replay after hiding, immediate presentation with reduced
+motion and intermediate pixels without a layout change. Apple Silicon and
+Fedora 44 ARM64 each passed 279 Terminal Agent tests with 12 ignored. Apple
+Silicon also passed nine terminal context tests. Strict application Clippy
+passed on Apple Silicon and Windows ARM64. Fedora ran in a local container
+with its scratch data on a native Linux filesystem.
+[Apple Silicon verification](target/verification/20261122-agent-hud-entrance-macos.log)
+· [Fedora verification](target/verification/20261122-agent-hud-entrance-fedora.log)
+· [Windows ARM64 Clippy](target/verification/20261122-agent-hud-entrance-windows.log).
+
+The native Fedora 44 ARM64 development build passed a live X11 test in a
+private Xvfb display with Openbox. A private Agent run approved the fixed
+environment probe and one model request to a loopback fixture. The HUD
+opened its typed steps above the card with a side timeline present, and
+the terminal stayed at 117 columns by 34 rows. The sampled HUD text changed
+while typing and returned to the same pixels after the idle interval.
+Right-clicking the HUD and selecting **Copy answer** put that run's exact
+response in the X11 clipboard. The application, test display, container and
+scratch data were removed.
+[Fedora X11 desktop verification](target/verification/20261122-agent-hud-desktop-x11-final.log).
+
+The same development source passed the native Wayland workflow on Fedora
+44 ARM64 in a private Sway 1.11 session with XWayland disabled. Opening
+Details alongside the side timeline kept the terminal at 123 columns by
+37 rows. A Wayland keyboard event dimmed the HUD, and the sampled text
+returned to its original pixels after the idle interval. **Copy answer**
+put the reviewed run's exact answer in the Wayland clipboard. Creating a
+neighboring split narrowed the original terminal to 42 columns by 36 rows.
+Typing in the neighbor left the original HUD unchanged, and its run menu
+still copied the same answer. Exactly one reviewed loopback model request
+was sent. The compositor, application, container and scratch data were
+removed.
+[Fedora Wayland desktop verification](target/verification/20261122-agent-hud-desktop-wayland.log).
+
+A follow-up verified that both explicit and timed hiding close the
+step drawer. The native Wayland test used the same keyboard action in
+separate animated and reduced-motion profiles. It reopened the HUD with
+Details closed, kept the terminal at 123 columns by 37 rows and copied
+the original run's answer again. Stationary-pointer frame samples showed
+intermediate states in the animated profile. The first visible frame in
+the reduced-motion profile matched its settled appearance. Apple Silicon
+passed 280 Terminal Agent tests with 12 ignored and all nine terminal
+context tests. Strict application Clippy passed on Apple Silicon and
+Windows ARM64.
+[Wayland reopen verification](target/verification/20261122-agent-hud-reopen-wayland.log)
+· [Apple Silicon tests](target/verification/20261122-agent-hud-reopen-macos.log)
+· [Windows ARM64 Clippy](target/verification/20261122-agent-hud-reopen-windows.log).
+
+Native Wayland tests sampled the Details label in the built-in Dark and
+IntelliJ Light terminal themes. Each test compared the same glyph positions
+over a plain terminal and over two contrasting bands of colored terminal
+text. The sampled luminance ratios were 16.48:1 and 4.61:1 in Dark, and
+16.67:1 and 6.54:1 in IntelliJ Light. While typing, each card moved closer
+to the underlying terminal pixels, then returned to its previous
+appearance after the idle interval. Both panes stayed at 123 columns by
+37 rows and both cards copied the exact reviewed answer.
+[Wayland Dark verification](target/verification/20261122-agent-hud-contrast-wayland.log)
+· [Wayland IntelliJ Light verification](target/verification/20261122-agent-hud-contrast-wayland-light.log).
+
+A current Fedora ARM64 X11 build ran under a private Xvfb display with
+Openbox. **View → AI Agent Panel → Show or Hide Status Bar** hid the HUD
+with its drawer open and restored it with Details closed. The terminal
+grid stayed the same. Frame samples confirmed dimming while typing and
+recovery after idle, and **Copy answer** returned the exact reviewed run
+answer through the X11 clipboard.
+[X11 design retest](target/verification/20261122-agent-designs-current-x11.log).
+
+The same source built both the desktop and Control CLI for native Windows
+ARM64 (PE machine `0xaa64`). A private Dark-theme profile opened a live
+local PowerShell pane at 130 columns by 30 rows. The native suites passed
+280 Terminal Agent tests and nine terminal context tests. Four Terminal
+Agent tests were ignored. The private desktop session expired before an
+Agent request. Live Details, typing fade and copy acceptance remain open.
+[Native Windows build](target/verification/20261122-agent-hud-desktop-windows-build.log)
+· [Windows native tests](target/verification/20261122-agent-hud-windows-native-tests.log)
+· [Windows private desktop fixture](target/verification/20261122-agent-hud-desktop-windows.log).
+
+## Powerline status and step drawer
+
+The d01 Powerline follows Java's bottom placement and segmented status.
+It names the running command or latest typed step, then shows the final
+answer when available. A specific live phase such as response repair takes
+priority over the current step label. The bar counts commands and reports
+elapsed time and usage. Its review and run actions use the existing
+session-bound controls. Details opens the latest eight typed rows above the bar. A
+pending review opens the drawer, and resolution closes it if it was
+opened automatically. The drawer grows over 260 ms and the active
+spinner changes every 100 ms with animations enabled. Reduced
+animations makes the drawer appear immediately and omits the spinner.
+The Settings preview and Adaptive Dock's bottom mode share the
+Powerline presenter.
+
+On Fedora ARM64 X11, the environment review opened the drawer and
+Review focused the existing Agent window. The drawer closed when the
+two reviewed loopback requests finished. Manually reopening it copied
+the exact selected command output and preserved the 119-column by
+31-row grid. The terminal pixels above the bounded drawer were unchanged.
+The hide button restored two terminal rows and the View menu restored the
+bar with Details closed. The fixture did not verify the configured
+keyboard shortcut after a step-menu action. All 72 Terminal Agent design
+tests passed on Fedora ARM64. Strict Clippy, including test targets,
+passed on Windows ARM64.
+[X11 desktop verification](target/verification/20261122-agent-powerline-x11.log)
+· [Windows ARM64 Clippy](target/verification/20261122-agent-powerline-windows-final.log).
+
+The shared selectable step rows now use the same state markers as inline
+history. Command rows show the captured exit code and output line count,
+running steps show elapsed seconds, and model rows show reported tokens.
+The leading mark animates while a step is running and stays steady with
+reduced animations. Narrow rows keep the result on the right while the
+step name is clipped. Row actions still resolve the original typed step.
+
+The Fedora ARM64 X11 follow-up verified the green success mark, Exit 0
+with one retained line, and the reported 20 tokens on the model row in
+Dark and IntelliJ Light. IntelliJ Light used reduced animations. Both
+runs copied the exact command output from its row and kept the terminal
+grid unchanged while opening the drawer. The View menu displayed the
+configured Ctrl+Shift+F7 binding. The initial keyboard fixtures left
+the bar visible before and after a step menu action. The hide button
+and View menu toggled the bar in both themes. All 73 design tests
+passed on Fedora ARM64. Strict Clippy passed with the Windows ARM64 test targets.
+[X11 typed row verification](target/verification/20261122-agent-step-rows-x11.log)
+· [X11 shortcut diagnostic](target/verification/20261122-agent-step-shortcut-diagnostic-x11.log)
+· [Windows ARM64 Clippy](target/verification/20261122-agent-step-rows-windows.log).
+
+The X11 input trace showed that the original fixture delivered Alt+F8
+at the Winit boundary while the profile was bound to F8. Sending the
+level-zero keycodes through XTest delivered F8 and Ctrl+Shift+F7 with
+their configured modifiers. Both bindings reached the normal
+ToggleAgentStatus action and toggled the same pane from 119 columns
+by 31 rows to 33 rows and back, before and after copying a step's
+output. A rebuild with the diagnostic instrumentation removed verified
+F8 on standalone Powerline and Ctrl+Shift+F7 in Adaptive Dock's bottom
+mode. The Adaptive run toggled from 99 columns by 31 rows to 33 rows and
+back before and after using the step menu. Widening the window from
+1230 to 1400 pixels moved the display to the side timeline. It stayed
+on the side at 1230 pixels on the way back and used Powerline at 1160.
+[X11 key routing trace](target/verification/20261122-agent-status-key-x11.log)
+· [Clean Adaptive Dock verification](target/verification/20261122-agent-adaptive-status-key-x11.log).
+
+[Java Powerline presenter](https://github.com/chardonnay/korTTY/blob/1ebbe724ee84/src/main/java/de/kortty/ui/AgentDesignPowerlineBar.java)
+· [Rust Powerline presenter](src/workspace/terminal_agent/design/status/powerline.rs).
+
+## Minimap rail shows typed step previews
+
+The d11 rail reserves fourteen pixels beside the terminal, including when
+a history pane occupies the same side. Its colored segments follow the
+run's typed steps and keep their order. Hover opens a preview to the left
+with the command or step, its result, up to four masked output lines, the
+run phase and reported tokens. Reduced animations keeps running segments
+steady and opens previews immediately. The Settings preview uses the
+same rail and motion rules.
+
+Right-clicking a segment opens the menu bound to that exact step. The
+background opens the run menu. An open Minimap menu keeps the rail visible
+through its hide deadline, and a changed grid closes the menu. Older
+records with text-only activity still open their entry actions. A2 tracks
+the interactive desktop acceptance of the redesigned rail.
+[Java Minimap](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignMinimapRail.java).
+
+The native widget tests check the rail width alongside a history pane,
+the hover preview's position and output, and copying from the selected
+step after the auto-hide deadline. Separate coverage checks model repair
+status and reported tokens inside the preview. Apple Silicon and the
+local Fedora 44 ARM64 container each passed 274 Terminal Agent tests.
+Apple Silicon also passed nine terminal context tests. Strict application
+Clippy passed on Apple Silicon and Windows ARM64.
+[Apple Silicon verification](target/verification/20261122-agent-minimap-macos-verified.log)
+· [Fedora verification](target/verification/20261122-agent-minimap-fedora.log)
+· [Windows ARM64 Clippy](target/verification/20261122-agent-minimap-windows-verified.log).
+
+A native Fedora 44 ARM64 development build passed the Minimap pointer
+workflow in a private Sway 1.11 session with XWayland disabled. The Dark
+and IntelliJ Light terminal themes both showed the fixed environment
+probe, its exit code and reported token count in a preview to the left
+of the rail. **Copy output** on the probe segment put the probe output
+in the Wayland clipboard, and **Copy answer** from the empty rail copied
+the separate model answer. The terminal stayed at 122 columns by 37 rows
+beside the side timeline, and each run sent one reviewed loopback model
+request.
+[Wayland Minimap desktop verification](target/verification/20261122-agent-minimap-desktop-wayland.log).
+
+The current Fedora ARM64 X11 build passed the Dark theme pointer test. The
+preview appeared to the left of the rail with the probe command, exit code
+and reported token count. The step menu copied the exact probe output and
+the empty rail menu copied the model answer. The terminal stayed at 117
+columns by 33 rows beside the side timeline.
+[X11 Minimap desktop verification](target/verification/20261122-agent-designs-current-x11.log).
+
+A follow-up with IntelliJ Light verified the same preview and both
+clipboard actions. In Dark, a vertical split narrowed the original
+terminal to 39 columns by 33 rows. With reduced animations, the first
+visible preview matched its settled pixels. The open step menu kept
+the rail and grid intact through a 12-second auto-hide deadline and
+still copied the probe output. After selection closed the menu, the
+rail disappeared and the original terminal reclaimed two columns. The
+sibling stayed at 77 columns by 38 rows.
+[X11 Minimap follow-up](target/verification/20261122-agent-minimap-followup-x11.log).
+
+The Java presenter retains typed rows for the lifetime of a run. The
+Rust history now retains all its typed steps for active and reopened
+runs. The first X11 long-run test exposed the previous 24-step limit
+by reaching command 07 at the top. The corrected Fedora ARM64 X11
+build ran 21 commands over eight reviewed loopback model requests.
+Resizing narrowed the terminal from 117 columns by 33 rows to 115
+columns by three rows. Wheel scrolling and step menus copied the
+exact output of commands 01, 21 and 01 in that order. Scrolling left
+the terminal grid and the sampled terminal pixels unchanged.
+The Terminal Agent suite passed 280 tests on Fedora ARM64, with 12
+fixture-dependent tests ignored. It verifies retention through reopening
+a masked history and the byte limit on the separate Chat follow-up payload.
+Strict Clippy passed on Windows ARM64.
+[X11 wheel and history verification](target/verification/20261122-agent-trace-history-x11.log)
+· [Windows ARM64 Clippy](target/verification/20261122-agent-trace-history-windows.log).
+
+## Context sent with a reviewed Terminal Agent request
+
+**Sent along** lists the latest confirmed nonempty model turn's masked
+organization, global and connection memory, approved reference excerpts,
+and included skills. It distinguishes pinned and automatic skills, marks
+partial reference excerpts and shows estimated tokens. The shared popup
+opens from the terminal footer or the run's Activity view. A draft or a
+failed pre-dispatch review does not publish a receipt. An empty turn keeps
+the previous receipt. The receipt is held with its own run and is masked
+again when retained alongside the finished history.
+
+Interactive live terminal requests can include eligible, previously
+approved reference files in the exact model review. The dispatch guard
+revalidates the selected references and the memory policy. Private runs
+still exclude personal memory and reference files. Interactive desktop
+acceptance remains under A2.
+[Java Sent along link](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignSentLink.java).
+
+Apple Silicon and Fedora ARM64 each passed 273 Terminal Agent tests and
+43 AI Memory tests. The Apple Silicon loopback fixture verifies that a
+registered Markdown reference is in both the reviewed system text and
+the actual request, that the run lists the file after the response, and
+that a change after review prevents dispatch and publication. Both suites
+verify the memory and skill receipt and rejection of a stale skill review.
+The Fedora run uses a local Fedora 44 ARM64 container with a local
+filesystem for test data. The reference part of the loopback fixture is
+specific to macOS.
+[Apple Silicon verification](target/verification/20261122-agent-sent-context-macos-verified.log)
+· [Fedora verification](target/verification/20261122-agent-sent-context-fedora.log).
+
+## Top Bar with Drawer follows typed steps
+
+The d12 bar shows the run's task, current step, command count, elapsed time
+and available model usage in one row. A highlight travels along the track
+while a run is active and unpaused. It uses the warning color for a review
+and settles to success or error when the run ends. Reduced animations
+keeps the track solid. Review focuses the owned Activity window, and the
+bar exposes the shared run actions, pause, cancel and hide controls.
+
+The 260 ms drawer reveal stays within the terminal column when a side
+history is visible. It overlays the upper terminal rows and keeps the
+terminal viewport the same size. The drawer lists the typed steps and opens
+the exact step's context menu. Reduced animations reveals it immediately.
+The same presenter renders the Settings preview. Interactive desktop
+acceptance remains under A2.
+[Java Top Bar](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignTopBar.java).
+
+The native widget test opens Details, checks that the terminal viewport
+keeps its size and right-clicks the exact recorded step. Motion tests
+exercise the highlight, stable result colors, timed reveal and reduced
+animations. Windows ARM64, Apple Silicon and Fedora ARM64 each passed
+273 Terminal Agent tests. Four Windows and twelve fixture-dependent
+cases on each Unix platform stayed ignored. Apple Silicon also passed
+all nine terminal context tests. Strict application Clippy passed on
+Windows and macOS. The Linux tests ran in a local Fedora 44 container
+with system fonts and a local filesystem for their scratch data.
+[Windows ARM64 results](target/verification/20261122-agent-top-bar-windows.log)
+· [Apple Silicon results](target/verification/20261122-agent-top-bar-macos.log)
+· [Fedora ARM64 results](target/verification/20261122-agent-top-bar-fedora.log).
+
+The native Fedora 44 ARM64 build passed the live Top Bar workflow in a
+private Sway 1.11 session with XWayland disabled and smart activation
+enabled. Review used a serial from the terminal surface and returned
+keyboard focus to the same Agent window while the probe awaited approval.
+After a single reviewed loopback request, the side timeline showed the
+answer and the Top Bar showed one command and 20 reported tokens. The
+drawer showed the typed probe and model decision. The probe row's **Copy
+output** copied its exact result to the Wayland clipboard. Opening and
+closing Details kept the terminal at 123 columns by 35 rows. Captured
+frames showed intermediate drawer heights with animation enabled in Dark
+and the settled drawer from its first visible frame with reduced
+animations in Dark and IntelliJ Light.
+[Wayland Top Bar desktop verification](target/verification/20261122-agent-top-bar-desktop-wayland.log).
+
+A follow-up reproduced a clipped Details button when a vertical split
+narrowed the original terminal from 123 to 42 columns beside its history.
+The compact header now places Details ahead of the secondary actions,
+exposes the full run metadata in the progress tooltip, and scrolls the
+action row on overflow. The repaired Wayland build opened Details at
+42 by 35 cells and copied the probe output from its row. The Top Bar's
+Run actions menu copied the exact model answer. The sibling stayed at
+80 by 42 cells, with identical sampled pixels alongside the open drawer.
+
+Three runs in the Dark terminal theme verified an amber track awaiting
+review, green on completion and red after a blocked decision. With the
+loopback response held, successive frames moved the highlight across
+the active track. The reduced-animation run used a single stable color
+throughout the sampled active frames. Fedora ARM64 passed 280 Terminal
+Agent tests, including the extended narrow-drawer regression. Twelve
+fixture-dependent tests were ignored.
+[Wayland split and track verification](target/verification/20261122-agent-top-bar-compact-wayland.log)
+· [Windows ARM64 strict application Clippy](target/verification/20261122-agent-top-bar-compact-windows.log).
+
+The current Fedora ARM64 X11 build ran with the Dark theme in private
+Xvfb and Openbox. Review focused the same Agent window, the pending track
+was amber, and the held model request showed a moving highlight before
+the completed track turned green. After splitting the terminal, both
+grids stayed stable at 41 by 31 and 77 by 38 cells while Details was open.
+The drawer and run menus copied the exact probe output and model answer.
+[X11 Top Bar desktop verification](target/verification/20261122-agent-designs-current-x11.log).
+
+A follow-up with reduced animations kept the sampled active track solid
+while the test model response was held. A blocked decision then changed
+the track to its red result color.
+[X11 reduced-motion Top Bar and blocked result](target/verification/20261122-agent-minimap-followup-x11.log).
 
 ## November 21 Terminal run Chat handoff
 
@@ -1323,6 +1811,43 @@ all 23 selected tests, and Windows ARM64 passed strict workspace Clippy.
 [Apple Silicon keyboard tests](target/verification/20261120-agent-log-entry-macos-final.log)
 · [Windows ARM64 Clippy](target/verification/20261120-agent-log-entry-windows-clippy-final.log)
 
+In the Fedora ARM64 X11 docked Log Table, Ctrl+Shift+F6 focused the
+table and End and Enter opened the pending environment review without
+dispatch. After two reviewed loopback requests, Home, End and Up moved
+the selection. Enter displayed the selected command output. The opened
+detail view now takes a larger share of the dock, and the model usage
+stays in a compact scrollable summary while the detail is open. In the
+350-pixel dock, the retained output and detail controls were visible.
+Shift+F10 opened the selected row's menu, and Down and Enter copied the
+exact output. The terminal grid and pending shell input were unchanged
+during navigation and copying. Escape released focus, and the next typed
+characters reached the original shell input. The isolated Windows ARM64
+Terminal Agent suite passed 283 tests, including the status and history
+repair regression. Four tests requiring dedicated OpenSSH or HTTPS
+fixtures were ignored.
+[X11 Log Table keyboard verification](target/verification/20261122-agent-log-table-keyboard-x11.log)
+· [Windows ARM64 Terminal Agent tests](target/verification/20261122-agent-log-table-terminal-tests-windows-final.log)
+· [Windows ARM64 Clippy](target/verification/20261122-agent-log-table-clippy-windows-final.log).
+
+In Fedora ARM64 X11, Tab entered the detached Log Table. End, Up and
+Enter selected and opened the retained command output. The step menu
+copied the exact output bytes, and the source terminal readout matched
+before and after the interaction. Attach returned the history to the
+original terminal. The test used a private local shell and two reviewed
+requests to a loopback model fixture.
+
+In the 850-by-660 X11 Settings window, Tab revealed the Log Table preview
+from below the visible page. With sample playback stopped, Home and Enter
+opened the first step and showed its `Ubuntu 24.04 · bash` text. The bottom
+Log Table gets more room while a detail is open, and keyboard opening
+scrolls the Settings page to the detail. Escape closed the selected detail.
+Fedora ARM64 passed all 17 selected Settings preview, Log Table and
+detached history tests on the corrected source. Windows ARM64 passed
+strict Clippy with the test targets.
+[Detached Log Table and Settings desktop verification](target/verification/20261122-agent-log-table-detached-x11.log)
+· [Fedora ARM64 regressions](target/verification/20261122-agent-log-table-preview-tests-fedora.log)
+· [Windows ARM64 Clippy](target/verification/20261122-agent-log-table-preview-clippy-windows-final.log).
+
 An outstanding command review adds a temporary Approval row before the final
 answer. Its details reuse the masked command and destination preview. A
 password-backed review shows the instruction to open the Activity window.
@@ -1373,6 +1898,24 @@ tests, including Settings and Coding Agents. Windows ARM64 passed
 strict workspace Clippy. Native desktop acceptance remains open under A2.
 [Apple Silicon fixed-header tests](target/verification/20261120-agent-log-header-macos.log)
 · [Windows ARM64 Clippy](target/verification/20261120-agent-log-header-windows-clippy.log)
+
+In Fedora ARM64 X11, the detached live Log Table kept the same oldest
+visible timestamp when new rows and command approvals arrived. The run
+used nine short commands in three reviewed batches and a loopback model.
+Scrolling up exposed Latest activity without selecting a row. That action
+returned to the newest rows and kept following subsequent activity. The
+table keeps its viewport when the approval card or run menu changes.
+
+Clicking Step sorted the command rows in both directions. At 418 pixels
+wide, horizontal scrolling moved the Result heading from x=314 to x=194.
+The heading stayed in place vertically while the body scrolled. Dragging
+the divider moved Result another 24 pixels and preserved the selected
+sort through a wider window resize. Fedora ARM64 passed all 17 selected
+Log Table, Settings preview and detached history regressions. Windows
+ARM64 passed strict Clippy with the test targets.
+[Native X11 Log Table grid verification](target/verification/20261122-agent-log-table-grid-x11.log)
+· [Fedora ARM64 regressions](target/verification/20261122-agent-log-table-grid-tests-fedora.log)
+· [Windows ARM64 Clippy](target/verification/20261122-agent-log-table-grid-clippy-windows-final.log).
 
 Right-clicking a retained Log Table step opens its step actions. The answer
 row and table background open the run actions when available. The menu
@@ -1866,6 +2409,43 @@ repair paths, a retained backend, and no request on reveal. Busy repair
 cancellation, Rustfmt, and strict Clippy also passed.
 [Workspace tests](target/verification/20261120-runtime-repair-search-tests.log)
 · [Strict workspace Clippy](target/verification/20261120-runtime-repair-search-clippy.log)
+
+### Signed runtime progress and confirmation search
+
+Local Models search can highlight Cancel request and Pause download in
+the fixed progress footer, including during backend repair. Pause appears
+in search while the active download supports a resumable checkpoint. An
+open download-discard review exposes Keep saved ZIP and Discard saved ZIP
+as separate results. An open llama.cpp removal review offers its own
+cancel and confirmation targets. Selecting a result keeps the active
+request or review and leaves its action to the user. Runtime progress
+results keep the scroll position, and scoped reveals defer managed model
+inventory loading.
+
+Fedora ARM64 passed 27 selected AI Manager tests. The new runtime fixtures
+verified search routing during a simulated download in the standard view
+and backend repair, plus preservation of the discard and removal reviews.
+Windows ARM64 passed strict Clippy with the test targets. Interactive
+desktop verification remains under D4.
+[Fedora AI Manager tests](target/verification/20261122-runtime-search-tests-fedora.log)
+· [Windows ARM64 Clippy](target/verification/20261122-runtime-search-clippy-windows.log).
+
+### Imported local model search
+
+AI Manager search finds imported GGUF and MLX model settings by name,
+format, and registry ID. Each result shows all three values and scrolls
+to the matching row on Local Models. The dialog ignores a queued result
+if the row's format and ID no longer identify the same model. Searching
+leaves the separate model review and save steps available through their
+existing controls.
+
+Fedora ARM64 passed 30 selected AI Manager tests. The new widget test
+finds the GGUF and MLX rows with the same name and ID, checks that the
+selected row is visible in the viewport, and rejects a stale result.
+Windows ARM64 passed strict Clippy for the application and its tests.
+Interactive desktop verification remains under D4.
+[Fedora tests](target/verification/20261122-imported-model-search-fedora.log)
+· [Windows ARM64 Clippy](target/verification/20261122-imported-model-search-clippy-windows.log).
 
 ## November 20 AI profile web settings search
 

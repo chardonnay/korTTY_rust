@@ -45,9 +45,9 @@ pub(in crate::workspace) fn at_point<'a>(
 }
 
 /// Keep the trigger in the same widget tree slot as when the point menu is visible.
-pub(in crate::workspace) fn without_menu(
-    trigger: Element<'_, WorkspaceMessage>,
-) -> Element<'_, WorkspaceMessage> {
+pub(in crate::workspace) fn without_menu<'a, Message: Clone + 'a>(
+    trigger: Element<'a, Message>,
+) -> Element<'a, Message> {
     Element::new(Anchor {
         trigger,
         open_context: None,
@@ -195,6 +195,22 @@ pub(crate) fn submenu<'a, Message: Clone + 'a>(
     })
 }
 
+/// Anchors a read-only hover preview to the left of its trigger.
+pub(in crate::workspace) fn preview_left<'a, Message: Clone + 'a>(
+    trigger: Element<'a, Message>,
+    contents: Option<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    Element::new(Anchor {
+        trigger,
+        open_context: None,
+        popup: contents.map(|contents| AnchorContent {
+            contents,
+            placement: Placement::PreviewLeft,
+            commands: None,
+        }),
+    })
+}
+
 #[derive(Clone, Copy)]
 enum Placement {
     Below,
@@ -202,6 +218,7 @@ enum Placement {
     Point(Point),
     Context(Point),
     Side,
+    PreviewLeft,
     Centered,
 }
 
@@ -399,7 +416,9 @@ impl<'view, Message: Clone + 'view> Widget<Message, Theme, Renderer> for Anchor<
                 height: 0.0,
             };
         }
-        if matches!(popup.placement, Placement::Side) && !viewport.intersects(&anchor) {
+        if matches!(popup.placement, Placement::Side | Placement::PreviewLeft)
+            && !viewport.intersects(&anchor)
+        {
             return None;
         }
         Some(overlay::Element::new(Box::new(Popup {
@@ -439,6 +458,17 @@ impl<'view, Message: Clone + 'view> Overlay<Message, Theme, Renderer>
                 .layout(self.tree, renderer, &limits);
             let x = ((viewport.width - node.size().width) / 2.0).max(0.0);
             return node.move_to(Point::new(x, inset));
+        }
+        if matches!(self.placement, Placement::PreviewLeft) {
+            let right = (self.anchor.x - 8.0).max(0.0);
+            let limits = layout::Limits::new(Size::ZERO, Size::new(right, viewport.height));
+            let node = self
+                .contents
+                .as_widget_mut()
+                .layout(self.tree, renderer, &limits);
+            let size = node.size();
+            let y = (self.anchor.y - 6.0).clamp(0.0, (viewport.height - size.height).max(0.0));
+            return node.move_to(Point::new((right - size.width).max(0.0), y));
         }
         if matches!(self.placement, Placement::Side) {
             let (right, room) = side_room(self.anchor, viewport.width);
@@ -509,6 +539,9 @@ impl<'view, Message: Clone + 'view> Overlay<Message, Theme, Renderer>
         clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
     ) {
+        if matches!(self.placement, Placement::PreviewLeft) {
+            return;
+        }
         let popover = matches!(
             self.placement,
             Placement::Popover { .. } | Placement::Context(_)
@@ -577,6 +610,9 @@ impl<'view, Message: Clone + 'view> Overlay<Message, Theme, Renderer>
         cursor: mouse::Cursor,
         renderer: &Renderer,
     ) -> mouse::Interaction {
+        if matches!(self.placement, Placement::PreviewLeft) {
+            return mouse::Interaction::None;
+        }
         let interaction = self.contents.as_widget().mouse_interaction(
             self.tree,
             layout,

@@ -188,6 +188,11 @@ fn detached_conversation_review_rejects_focus_changes_before_cancelling() {
 
     let (mut fixture, id, _) = history_review_fixture(History::Conversation);
     fixture.run_mut(id).design.arrangement = Arrangement::PictureInPicture;
+    // This test clicks layout coordinates and checks focus, independent of entrance motion.
+    fixture
+        .workspace
+        .window_settings
+        .ai_agent_design_reduced_animations = Some(true);
     fixture.workspace.clipboard.policy.ai_agent_execution = AiAgentExecution::Confirm;
     drop(fixture.send(id, Message::Pip(design::pip::Message::Detach)));
     let detached = fixture.run(id).presentation.pip.detached.unwrap();
@@ -220,7 +225,7 @@ fn detached_conversation_review_rejects_focus_changes_before_cancelling() {
         );
         super::pip::click_log_label(&mut ui, &mut renderer, "[2] Cancel", mouse::Button::Left)
             .pop()
-            .unwrap()
+            .expect("detached Cancel button should dispatch its action")
     };
 
     let stale = click_cancel(&fixture);
@@ -447,7 +452,7 @@ fn design_fixture(fixture: &Fixture, stream: u64, size: Size) -> iced::Element<'
         terminal,
         size,
         Size::new(8.0, 16.0),
-        false,
+        !fixture.workspace.window_settings.agent_animations(),
     )
 }
 
@@ -588,11 +593,309 @@ fn native_status_click_opens_only_its_own_drawer_without_authorizing_work() {
         };
         no_task(fixture.send(actual, message));
     }
-    assert!(fixture.run(id).presentation.drawer);
-    assert!(!fixture.run(other).presentation.drawer);
+    assert!(fixture.run(id).presentation.drawer_open());
+    assert!(!fixture.run(other).presentation.drawer_open());
     assert_eq!(fixture.run(id).epoch, epoch);
     assert!(fixture.run(id).phase == Phase::Thinking);
     assert!(!fixture.run(id).cancel.requested());
+}
+
+#[test]
+fn top_bar_drawer_lists_exact_steps_without_resizing_the_terminal() {
+    use super::pip::{click_log_label, log_label_position};
+    use design::log_table::{Message as LogMessage, Row, Surface};
+    use engine::usage::{Attempt, AttemptKind, AttemptOutcome};
+    use std::time::Duration;
+
+    let mut fixture = Fixture::new(false, false);
+    let id = fixture.open_ask_with_source_tab_visible();
+    let stream = fixture.workspace.sessions[&fixture.session].stream_generation;
+    let run = fixture.run_mut(id);
+    run.design.history = History::InlineBlocks;
+    run.design.status = Status::TopBar;
+    run.goal = "Check two recorded commands".into();
+    let epoch = run.next(Phase::Thinking, "Fixture activity");
+    let first = run.inline_command("printf first").unwrap();
+    run.inline_result(engine::Status::Exited(0), "first output", "");
+    run.inline_command("printf second");
+    let size = Size::new(780.0, 420.0);
+    let closed = terminal_bounds(&fixture, stream, size);
+    assert_eq!(closed.width, size.width);
+    assert!(closed.height < size.height);
+
+    let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
+    let mut ui = UserInterface::build(
+        fixture
+            .workspace
+            .terminal_agents
+            .pane_agent_status(fixture.session, stream)
+            .unwrap(),
+        size,
+        Cache::default(),
+        &mut renderer,
+    );
+    let mut messages = click_log_label(&mut ui, &mut renderer, "Details", mouse::Button::Left);
+    drop(ui);
+    assert!(
+        matches!(messages.as_slice(), [Desktop::TerminalAgent(actual, Message::Design(design::Message::ToggleDrawer))] if *actual == id)
+    );
+    no_task(fixture.workspace.update(messages.remove(0)));
+    assert_eq!(terminal_bounds(&fixture, stream, size), closed);
+    assert_eq!(fixture.run(id).epoch, epoch);
+
+    let mut ui = UserInterface::build(
+        fixture
+            .workspace
+            .terminal_agents
+            .pane_agent_status(fixture.session, stream)
+            .unwrap(),
+        size,
+        Cache::default(),
+        &mut renderer,
+    );
+    let messages = click_log_label(&mut ui, &mut renderer, "printf first", mouse::Button::Right);
+    assert!(
+        matches!(messages.as_slice(), [Desktop::TerminalAgent(actual,
+        Message::Design(design::Message::LogTable(LogMessage::OpenMenu(Surface::StatusStepList,
+            Some(Row::Step(step)), _))))] if *actual == id && *step == first)
+    );
+    drop(ui);
+    no_task(fixture.send(id, Message::Design(design::Message::ToggleDrawer)));
+    let run = fixture.run_mut(id);
+    run.design.history = History::Timeline;
+    assert!(run.presentation.model_usage.accept(
+        epoch,
+        &Attempt {
+            kind: AttemptKind::Initial,
+            outcome: AttemptOutcome::Completed,
+            elapsed: Duration::from_millis(10),
+            input_tokens: Some(12),
+            output_tokens: Some(8),
+            total_tokens: Some(20),
+        },
+    ));
+
+    let split = Size::new(720.0, 420.0);
+    let closed = terminal_bounds(&fixture, stream, split);
+    assert!(closed.width < 460.0, "{closed:?}");
+    let mut ui = UserInterface::build(
+        design_fixture(&fixture, stream, split),
+        split,
+        Cache::default(),
+        &mut renderer,
+    );
+    let details = log_label_position(&mut ui, &renderer, "Details");
+    assert!(details.x < closed.x + closed.width, "{details:?}");
+    let messages = click_log_label(&mut ui, &mut renderer, "Details", mouse::Button::Left);
+    drop(ui);
+    assert!(
+        matches!(messages.as_slice(), [Desktop::TerminalAgent(actual, Message::Design(design::Message::ToggleDrawer))] if *actual == id)
+    );
+    for message in messages {
+        no_task(fixture.workspace.update(message));
+    }
+    assert!(fixture.run(id).presentation.drawer_open());
+    assert_eq!(terminal_bounds(&fixture, stream, split), closed);
+}
+
+#[test]
+fn hud_opens_typed_steps_above_the_card_inside_a_terminal_with_a_side_dock() {
+    use super::pip::{click_log_label, log_label_position};
+    use design::log_table::{Message as LogMessage, Row, Surface};
+
+    let mut fixture = Fixture::new(false, false);
+    let id = fixture.open_ask_with_source_tab_visible();
+    let stream = fixture.workspace.sessions[&fixture.session].stream_generation;
+    let run = fixture.run_mut(id);
+    run.design.history = History::Timeline;
+    run.design.status = Status::Hud;
+    run.goal = "Inspect the fixture".into();
+    let epoch = run.next(Phase::Thinking, "Fixture activity");
+    let first = run.inline_command("printf first").unwrap();
+    run.inline_result(engine::Status::Exited(0), "first output", "");
+    run.inline_command("printf second");
+    let size = Size::new(900.0, 440.0);
+    let terminal = terminal_bounds(&fixture, stream, size);
+    assert!(terminal.width < size.width);
+    assert_eq!(terminal.height, size.height);
+
+    let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
+    let mut ui = UserInterface::build(
+        design_fixture(&fixture, stream, size),
+        size,
+        Cache::default(),
+        &mut renderer,
+    );
+    let card = log_label_position(&mut ui, &renderer, "◆ Agent");
+    assert!(terminal.contains(card));
+    let mut messages = click_log_label(&mut ui, &mut renderer, "Details", mouse::Button::Left);
+    drop(ui);
+    assert!(
+        matches!(messages.as_slice(), [Desktop::TerminalAgent(actual,
+        Message::Design(design::Message::ToggleDrawer))] if *actual == id)
+    );
+    no_task(fixture.workspace.update(messages.remove(0)));
+    assert_eq!(terminal_bounds(&fixture, stream, size), terminal);
+    assert_eq!(fixture.run(id).epoch, epoch);
+
+    let mut ui = UserInterface::build(
+        design_fixture(&fixture, stream, size),
+        size,
+        Cache::default(),
+        &mut renderer,
+    );
+    assert_eq!(log_label_position(&mut ui, &renderer, "◆ Agent"), card);
+    assert!(log_label_position(&mut ui, &renderer, "printf first").y < card.y);
+    let messages = click_log_label(&mut ui, &mut renderer, "printf first", mouse::Button::Right);
+    assert!(
+        matches!(messages.as_slice(), [Desktop::TerminalAgent(actual,
+        Message::Design(design::Message::LogTable(LogMessage::OpenMenu(Surface::StatusStepList,
+            Some(Row::Step(step)), _))))] if *actual == id && *step == first)
+    );
+}
+
+#[test]
+fn orbit_stays_inside_the_terminal_when_its_steps_open_beside_docked_history() {
+    use std::time::{Duration, Instant};
+
+    use super::pip::{click_log_label, log_label_position};
+    use design::log_table::{Message as LogMessage, Row, Surface};
+
+    let mut fixture = Fixture::new(false, false);
+    fixture.workspace.clipboard.policy.internal = true;
+    let id = fixture.open_ask_with_source_tab_visible();
+    let stream = fixture.workspace.sessions[&fixture.session].stream_generation;
+    let run = fixture.run_mut(id);
+    run.design.status = Status::Orbit;
+    run.goal = "Inspect the fixture".into();
+    let epoch = run.next(Phase::Thinking, "Fixture activity");
+    let first = run.inline_command("printf first").unwrap();
+    run.inline_result(engine::Status::Exited(0), "first output", "");
+    run.inline_command("printf second").unwrap();
+
+    let size = Size::new(900.0, 440.0);
+    let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
+    for history in [History::Timeline, History::LogTable] {
+        let reduced_motion = history == History::LogTable;
+        fixture
+            .workspace
+            .window_settings
+            .ai_agent_design_reduced_animations = Some(reduced_motion);
+        fixture.run_mut(id).design.history = history;
+        let terminal = terminal_bounds(&fixture, stream, size);
+        assert!(terminal.width < size.width || terminal.height < size.height);
+        let mut ui = UserInterface::build(
+            design_fixture(&fixture, stream, size),
+            size,
+            Cache::default(),
+            &mut renderer,
+        );
+        let ring = log_label_position(&mut ui, &renderer, "1/2");
+        assert!(terminal.contains(ring));
+        assert!(ring.y > terminal.y + terminal.height - 72.0);
+        let mut messages = click_log_label(&mut ui, &mut renderer, "1/2", mouse::Button::Left);
+        let cache = ui.into_cache();
+        assert!(
+            matches!(messages.as_slice(), [Desktop::TerminalAgent(actual,
+            Message::Design(design::Message::ToggleDrawer))] if *actual == id)
+        );
+        no_task(fixture.workspace.update(messages.remove(0)));
+        assert!(fixture.run(id).presentation.drawer_open());
+        assert_eq!(fixture.run(id).epoch, epoch);
+        assert_eq!(terminal_bounds(&fixture, stream, size), terminal);
+
+        let mut ui = UserInterface::build(
+            design_fixture(&fixture, stream, size),
+            size,
+            cache,
+            &mut renderer,
+        );
+        if !reduced_motion {
+            let now = Instant::now();
+            for at in [now, now + Duration::from_millis(340)] {
+                let _ = ui.update(
+                    &[Event::Window(window::Event::RedrawRequested(at))],
+                    mouse::Cursor::Unavailable,
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut Vec::new(),
+                );
+            }
+        }
+        assert_eq!(log_label_position(&mut ui, &renderer, "1/2"), ring);
+        let step = log_label_position(&mut ui, &renderer, "printf first");
+        assert!(
+            terminal.contains(step),
+            "expected the step in the Orbit list"
+        );
+        let mut messages =
+            click_log_label(&mut ui, &mut renderer, "printf first", mouse::Button::Right);
+        let cache = ui.into_cache();
+        assert!(matches!(
+            messages.as_slice(),
+            [Desktop::TerminalAgent(actual, Message::Design(design::Message::LogTable(
+                LogMessage::OpenMenu(Surface::StatusStepList, Some(Row::Step(step)), _)
+            )))] if *actual == id && *step == first
+        ));
+        no_task(fixture.workspace.update(messages.remove(0)));
+        let mut ui = UserInterface::build(
+            design_fixture(&fixture, stream, size),
+            size,
+            cache,
+            &mut renderer,
+        );
+        let mut messages =
+            click_log_label(&mut ui, &mut renderer, "Copy output", mouse::Button::Left);
+        drop(ui);
+        assert!(matches!(
+            messages.as_slice(),
+            [Desktop::TerminalAgent(actual, Message::DesignAction(action))]
+                if *actual == id && action.label() == "Copy output"
+        ));
+        drop(fixture.workspace.update(messages.remove(0)));
+        assert_eq!(
+            fixture.workspace.clipboard.buffer.get().as_deref(),
+            Some("first output")
+        );
+        fixture
+            .run_mut(id)
+            .presentation
+            .update(design::Message::ToggleDrawer, 0);
+    }
+}
+
+#[test]
+fn hiding_the_hud_closes_its_step_drawer_before_reopening() {
+    use std::time::{Duration, Instant};
+
+    let mut fixture = Fixture::new(false, false);
+    let id = fixture.open_ask_with_source_tab_visible();
+    let owner = fixture.owner;
+    let stream = fixture.workspace.sessions[&fixture.session].stream_generation;
+    let size = Size::new(900.0, 440.0);
+    fixture
+        .workspace
+        .window_settings
+        .ai_agent_design_auto_hide_seconds = Some(1);
+    let run = fixture.run_mut(id);
+    run.design.status = Status::Hud;
+    run.presentation.update(design::Message::ToggleDrawer, 0);
+    assert!(fixture.run(id).presentation.drawer_open());
+
+    fixture.workspace.toggle_agent_status(owner);
+    assert!(!fixture.run(id).presentation.drawer_open());
+    fixture.workspace.toggle_agent_status(owner);
+    assert!(!fixture.run(id).presentation.drawer_open());
+
+    let run = fixture.run_mut(id);
+    run.presentation.update(design::Message::ToggleDrawer, 0);
+    run.presentation
+        .finished(Instant::now() - Duration::from_secs(2));
+    let terminal = terminal_bounds(&fixture, stream, size);
+    assert!(!fixture.run(id).presentation.drawer_open());
+    fixture.workspace.toggle_agent_status(owner);
+    assert_eq!(terminal_bounds(&fixture, stream, size), terminal);
+    assert!(!fixture.run(id).presentation.drawer_open());
 }
 
 #[test]
@@ -651,7 +954,17 @@ fn status_run_menus_copy_the_displayed_run_and_stay_open_past_auto_hide() {
             Cache::default(),
             &mut renderer,
         );
-        let mut events = click_log_label(&mut ui, &mut renderer, label, mouse::Button::Right);
+        let mut events = if status == Status::Minimap {
+            let terminal = terminal_bounds(&fixture, stream, size);
+            press_design_at(
+                &mut ui,
+                &mut renderer,
+                Point::new(terminal.x + terminal.width + 1.0, terminal.y + 80.0),
+                mouse::Button::Right,
+            )
+        } else {
+            click_log_label(&mut ui, &mut renderer, label, mouse::Button::Right)
+        };
         let cache = ui.into_cache();
         assert!(matches!(
             events.as_slice(),
@@ -759,7 +1072,13 @@ fn status_run_menus_copy_the_displayed_run_and_stay_open_past_auto_hide() {
 #[test]
 fn minimap_step_context_takes_priority_over_the_rail_run_menu() {
     use design::log_table::{Message as LogMessage, Row, Surface};
+    use std::time::{Duration, Instant};
     let mut fixture = Fixture::new(false, false);
+    fixture.workspace.clipboard.policy.internal = true;
+    fixture
+        .workspace
+        .window_settings
+        .ai_agent_design_auto_hide_seconds = Some(1);
     let id = fixture.open_ask_with_source_tab_visible();
     let run = fixture.run_mut(id);
     run.design.status = Status::Minimap;
@@ -767,13 +1086,23 @@ fn minimap_step_context_takes_priority_over_the_rail_run_menu() {
     run.goal = "Inspect fixture output".into();
     run.next(Phase::Thinking, "Working");
     let step = run.inline_command("printf fixture").unwrap();
-    run.record("Fixture step".into());
-    run.bind_activity_step(Some(step));
+    run.inline_result(engine::Status::Exited(7), "fixture output", "");
     run.inline_decision(&engine::Action::Done, "Finished", "Run answer");
     run.next(Phase::Finished, "Finished");
 
     let size = Size::new(790.0, 520.0);
     let stream = fixture.workspace.sessions[&fixture.session].stream_generation;
+    let terminal = terminal_bounds(&fixture, stream, size);
+    assert_eq!(size.width - terminal.width, 14.0);
+    let index = fixture
+        .run(id)
+        .status_transcript()
+        .unwrap()
+        .0
+        .steps
+        .iter()
+        .position(|entry| entry.id == step)
+        .unwrap();
     let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
     let mut ui = UserInterface::build(
         design_fixture(&fixture, stream, size),
@@ -781,11 +1110,99 @@ fn minimap_step_context_takes_priority_over_the_rail_run_menu() {
         Cache::default(),
         &mut renderer,
     );
-    let events = super::pip::click_log_label(&mut ui, &mut renderer, "● 1", mouse::Button::Right);
-    assert!(matches!(
-        events.as_slice(),
-        [Desktop::TerminalAgent(owner, Message::Design(design::Message::LogTable(
-            LogMessage::OpenMenu(Surface::Minimap(_), Some(Row::Step(actual)), _)
-        )))] if *owner == id && *actual == step
-    ));
+    let point = Point::new(
+        terminal.x + terminal.width + 7.0,
+        terminal.y + 17.0 + index as f32 * 31.0,
+    );
+    let mut hover = Vec::new();
+    let _ = ui.update(
+        &[Event::Mouse(mouse::Event::CursorMoved { position: point })],
+        mouse::Cursor::Available(point),
+        &mut renderer,
+        &mut clipboard::Null,
+        &mut hover,
+    );
+    assert!(
+        matches!(hover.as_slice(), [Desktop::TerminalAgent(owner, Message::Design(design::Message::MinimapHover(design::MinimapTarget::Step(actual), true)))] if *owner == id && *actual == step)
+    );
+    let cache = ui.into_cache();
+    no_task(fixture.workspace.update(hover.remove(0)));
+    let mut ui = UserInterface::build(
+        design_fixture(&fixture, stream, size),
+        size,
+        cache,
+        &mut renderer,
+    );
+    let output = super::pip::log_label_position(&mut ui, &renderer, "fixture output");
+    assert!(output.x < point.x);
+    let events = press_design_at(&mut ui, &mut renderer, point, mouse::Button::Right);
+    let menus: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                Desktop::TerminalAgent(_, Message::Design(design::Message::LogTable(_)))
+            )
+        })
+        .collect();
+    assert!(
+        matches!(menus.as_slice(), [Desktop::TerminalAgent(owner, Message::Design(design::Message::LogTable(
+        LogMessage::OpenMenu(Surface::MinimapStep(key), Some(Row::Step(actual)), _)
+    )))] if *owner == id && *key == step && *actual == step)
+    );
+    drop(ui);
+
+    for event in events {
+        no_task(fixture.workspace.update(event));
+    }
+    fixture
+        .run_mut(id)
+        .presentation
+        .finished(Instant::now() - Duration::from_secs(3));
+    let mut ui = UserInterface::build(
+        design_fixture(&fixture, stream, size),
+        size,
+        Cache::default(),
+        &mut renderer,
+    );
+    let events =
+        super::pip::click_log_label(&mut ui, &mut renderer, "Copy output", mouse::Button::Left);
+    drop(ui);
+    assert!(events.iter().any(|event| matches!(event, Desktop::TerminalAgent(owner, Message::DesignAction(action)) if *owner == id && action.label() == "Copy output")));
+    for event in events {
+        drop(fixture.workspace.update(event));
+    }
+    assert_eq!(
+        fixture.workspace.clipboard.buffer.get().as_deref(),
+        Some("fixture output")
+    );
+
+    fixture.run_mut(id).presentation.finished(Instant::now());
+    fixture.run_mut(id).design.history = History::Timeline;
+    let with_rail = terminal_bounds(&fixture, stream, size);
+    fixture.run_mut(id).design.status = Status::Hidden;
+    let without_rail = terminal_bounds(&fixture, stream, size);
+    assert_eq!(without_rail.width - with_rail.width, 14.0);
+    assert_eq!(without_rail.height, with_rail.height);
+}
+
+fn press_design_at(
+    ui: &mut UserInterface<'_, Desktop, iced::Theme, Renderer>,
+    renderer: &mut Renderer,
+    point: Point,
+    button: mouse::Button,
+) -> Vec<Desktop> {
+    let mut events = Vec::new();
+    let _ = ui.update(
+        &[
+            Event::Mouse(mouse::Event::CursorMoved { position: point }),
+            Event::Mouse(mouse::Event::ButtonPressed(button)),
+            Event::Mouse(mouse::Event::ButtonReleased(button)),
+        ],
+        mouse::Cursor::Available(point),
+        renderer,
+        &mut clipboard::Null,
+        &mut events,
+    );
+    events
 }

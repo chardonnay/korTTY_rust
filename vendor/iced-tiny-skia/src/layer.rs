@@ -46,6 +46,7 @@ pub struct Layer {
 #[derive(Debug, Clone)]
 pub(crate) struct OpacityGroup {
     pub(crate) opacity: f32,
+    pub(crate) ellipse: Option<Rectangle>,
     pub(crate) layers: Arc<[Layer]>,
 }
 

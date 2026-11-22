@@ -359,6 +359,8 @@ fn tab_reveals_preview_and_navigation_opens_only_the_current_sample() {
     struct PreviewMeasure {
         page: Id,
         offset: f32,
+        visible_bottom: f32,
+        answer_bottom: Option<f32>,
         has_details: bool,
     }
 
@@ -370,17 +372,21 @@ fn tab_reveals_preview_and_navigation_opens_only_the_current_sample() {
         fn scrollable(
             &mut self,
             id: Option<&Id>,
-            _: Rectangle,
+            bounds: Rectangle,
             _: Rectangle,
             translation: Vector,
             _: &mut dyn operation::Scrollable,
         ) {
             if id == Some(&self.page) {
                 self.offset = translation.y;
+                self.visible_bottom = bounds.y + bounds.height + translation.y;
             }
         }
 
-        fn text(&mut self, _: Option<&Id>, _: Rectangle, value: &str) {
+        fn text(&mut self, _: Option<&Id>, bounds: Rectangle, value: &str) {
+            if value == ANSWER {
+                self.answer_bottom = Some(bounds.y + bounds.height);
+            }
             self.has_details |= value == "Close details";
         }
     }
@@ -402,6 +408,8 @@ fn tab_reveals_preview_and_navigation_opens_only_the_current_sample() {
     let mut measure = PreviewMeasure {
         page: dialog.page_scroll.clone(),
         offset: 0.0,
+        visible_bottom: 0.0,
+        answer_bottom: None,
         has_details: false,
     };
     let size = Size::new(880.0, 475.0);
@@ -456,6 +464,12 @@ fn tab_reveals_preview_and_navigation_opens_only_the_current_sample() {
     }
     ui.operate(&renderer, &mut measure);
     assert!(measure.has_details);
+    assert!(
+        measure
+            .answer_bottom
+            .is_some_and(|bottom| bottom <= measure.visible_bottom + 1.0),
+        "opening a detail reveals its output within the settings page"
+    );
     let escape = press(&mut ui, &mut renderer, Named::Escape);
     assert!(
         matches!(escape, Desktop::Settings(Message::AgentDesignCatalog(window, Edit::NavigatePreview(current, SampleLogKey::Close))) if window == id && current == token)
