@@ -48,7 +48,7 @@ impl Section {
             Self::Split => "Split Terminal",
             Self::Effects => "Terminal Effect",
             Self::Ai => "AI",
-            Self::AgentRun => "Agent Run",
+            Self::AgentRun => "Last agent run",
         }
     }
 
@@ -393,8 +393,9 @@ impl Workspace {
             ShowFinishedAgentRun(stream, archived) => {
                 self.reopen_finished_agent_run(owner, session, stream, archived)
             }
-            AgentRunItem(run, action) => self
-                .update_terminal_agent(run, super::terminal_agent::Message::DesignAction(action)),
+            AgentRunItem(run, action) => {
+                self.invoke_last_agent_run_action(owner, session, run, action)
+            }
             Paste => self.update(Desktop::Paste(owner)),
             ClearBuffer => self.terminal_command(session, Command::ClearBuffer),
             Find => self.update(Desktop::OpenSearch(session)),
@@ -754,7 +755,7 @@ impl Workspace {
                 entries
             }
             Section::AgentRun => self
-                .terminal_agent_design_actions(session, pane.stream_generation)
+                .last_agent_run_actions(session, pane.stream_generation)
                 .into_iter()
                 .map(|(run, action)| Item(AgentRunItem(run, action)))
                 .chain(
@@ -808,9 +809,12 @@ impl Workspace {
             Branch(Section::AgentRun) => {
                 self.terminal_context_agent_runs_available(session, pane.stream_generation)
             }
-            Item(AgentRunItem(run, action)) => self
-                .terminal_agent_design_actions(session, pane.stream_generation)
-                .contains(&(run, action)),
+            Item(AgentRunItem(run, action)) => {
+                action.enabled()
+                    && self
+                        .last_agent_run_actions(session, pane.stream_generation)
+                        .contains(&(run, action))
+            }
             Item(ShowAgentRun(current, epoch, selected)) => self
                 .alternate_agent_runs(session, pane.stream_generation)
                 .contains(&(current, epoch, selected)),
@@ -845,9 +849,7 @@ impl Workspace {
     }
 
     fn terminal_context_agent_runs_available(&self, session: SessionId, stream: u64) -> bool {
-        !self
-            .terminal_agent_design_actions(session, stream)
-            .is_empty()
+        !self.last_agent_run_actions(session, stream).is_empty()
             || !self.alternate_agent_runs(session, stream).is_empty()
             || !self.finished_agent_run_choices(session, stream).is_empty()
     }

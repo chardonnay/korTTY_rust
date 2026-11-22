@@ -95,6 +95,7 @@ fn picture_in_picture_detaches_with_separate_identity_and_close_only_reattaches(
 #[derive(Default)]
 struct LogTableLayout {
     grid: Option<(Rectangle, Vector)>,
+    vertical_scroll: Option<(Rectangle, Vector, f32)>,
     labels: Vec<(Rectangle, String)>,
     step_actions: Option<Rectangle>,
     detail_editor: Option<Rectangle>,
@@ -113,6 +114,9 @@ impl Operation for LogTableLayout {
         translation: Vector,
         _: &mut dyn operation::Scrollable,
     ) {
+        if content.height > bounds.height {
+            self.vertical_scroll = Some((bounds, translation, content.height - bounds.height));
+        }
         if content.width > bounds.width && content.height > bounds.height {
             self.grid = Some((bounds, translation));
         }
@@ -493,21 +497,29 @@ fn focused_agent_log_table_gets_keys_before_the_embedded_terminal() {
     assert_eq!(fixture.run(id).epoch, epoch);
 }
 
+pub(super) fn log_label_position(
+    ui: &mut UserInterface<'_, Desktop, iced::Theme, Renderer>,
+    renderer: &Renderer,
+    label: &str,
+) -> Point {
+    let mut layout = LogTableLayout::default();
+    ui.operate(renderer, &mut layout);
+    layout
+        .labels
+        .iter()
+        .find(|(_, text)| text == label)
+        .unwrap_or_else(|| panic!("missing log table label {label}"))
+        .0
+        .center()
+}
+
 pub(super) fn click_log_label(
     ui: &mut UserInterface<'_, Desktop, iced::Theme, Renderer>,
     renderer: &mut Renderer,
     label: &str,
     button: mouse::Button,
 ) -> Vec<Desktop> {
-    let mut layout = LogTableLayout::default();
-    ui.operate(renderer, &mut layout);
-    let position = layout
-        .labels
-        .iter()
-        .find(|(_, text)| text == label)
-        .unwrap_or_else(|| panic!("missing log table label {label}"))
-        .0
-        .center();
+    let position = log_label_position(ui, renderer, label);
     let mut messages = Vec::new();
     let _ = ui.update(
         &[
@@ -527,21 +539,11 @@ pub(super) fn click_log_label(
 fn history_modules_open_the_actions_for_the_exact_recorded_step() {
     use design::log_table::{Message as LogMessage, Row, Surface};
 
-    fn history(fixture: &Fixture, id: window::Id) -> Element<'_, Desktop> {
-        design::history_view(
-            fixture.run(id),
-            None,
-            true,
-            Some((&fixture.workspace.terminal_agents, id)),
-        )
-        .map(move |message| Desktop::TerminalAgent(id, message))
-    }
-
     for (module, label) in [
-        (History::Timeline, "1 · First receipt"),
-        (History::PlanExecution, "1  First receipt"),
-        (History::CardStack, "1 · First receipt"),
-        (History::Conversation, "Agent · First receipt"),
+        (History::Timeline, "printf fixture"),
+        (History::PlanExecution, "1  printf fixture"),
+        (History::CardStack, "1 · printf fixture"),
+        (History::Conversation, "printf fixture"),
         (History::Tmux, "printf fixture"),
         (History::Transcript, "First receipt"),
     ] {
@@ -564,8 +566,12 @@ fn history_modules_open_the_actions_for_the_exact_recorded_step() {
         run.bind_activity_step(result);
         let size = Size::new(620.0, 440.0);
         let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
-        let mut ui =
-            UserInterface::build(history(&fixture, id), size, Cache::default(), &mut renderer);
+        let mut ui = UserInterface::build(
+            history_fixture_view(&fixture, id),
+            size,
+            Cache::default(),
+            &mut renderer,
+        );
         let mut messages = click_log_label(&mut ui, &mut renderer, label, mouse::Button::Right);
         let cache = ui.into_cache();
         assert!(
@@ -578,7 +584,12 @@ fn history_modules_open_the_actions_for_the_exact_recorded_step() {
             "{module:?} exposed the wrong menu"
         );
         no_task(fixture.workspace.update(messages.remove(0)));
-        let mut ui = UserInterface::build(history(&fixture, id), size, cache, &mut renderer);
+        let mut ui = UserInterface::build(
+            history_fixture_view(&fixture, id),
+            size,
+            cache,
+            &mut renderer,
+        );
         let mut messages =
             click_log_label(&mut ui, &mut renderer, "Copy output", mouse::Button::Left);
         drop(ui);
@@ -593,6 +604,458 @@ fn history_modules_open_the_actions_for_the_exact_recorded_step() {
             Some("first output")
         );
     }
+}
+
+#[test]
+fn conversation_discloses_only_the_selected_command_output() {
+    let mut fixture = Fixture::new(false, false);
+    let id = fixture.open_ask_with_source_tab_visible();
+    let run = fixture.run_mut(id);
+    run.design.history = History::Conversation;
+    run.goal = "Check both commands".into();
+    run.next(Phase::Thinking, "Fixture activity");
+    run.inline_command("printf fixture");
+    run.inline_result(engine::Status::Exited(0), "first output", "");
+    run.inline_command("printf fixture");
+    run.inline_result(engine::Status::Exited(9), "second output", "");
+    let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
+    let size = Size::new(460.0, 420.0);
+    let mut ui = UserInterface::build(
+        history_fixture_view(&fixture, id),
+        size,
+        Cache::default(),
+        &mut renderer,
+    );
+    let mut initial = LogTableLayout::default();
+    ui.operate(&renderer, &mut initial);
+    assert!(initial.labels.iter().any(|(_, label)| label == "Exit 9"));
+    assert!(
+        !initial
+            .labels
+            .iter()
+            .any(|(_, label)| label == "first output")
+    );
+    let events = click_log_label(
+        &mut ui,
+        &mut renderer,
+        "printf fixture",
+        mouse::Button::Left,
+    );
+    let cache = ui.into_cache();
+    assert!(
+        matches!(events.as_slice(), [Desktop::TerminalAgent(run, Message::Design(design::Message::ConversationOutput(_)))] if *run == id)
+    );
+    for event in events {
+        drop(fixture.workspace.update(event));
+    }
+    let mut ui = UserInterface::build(
+        history_fixture_view(&fixture, id),
+        size,
+        cache,
+        &mut renderer,
+    );
+    let mut expanded = LogTableLayout::default();
+    ui.operate(&renderer, &mut expanded);
+    assert!(
+        expanded
+            .labels
+            .iter()
+            .any(|(_, label)| label == "first output")
+    );
+    assert!(
+        !expanded
+            .labels
+            .iter()
+            .any(|(_, label)| label == "second output")
+    );
+}
+
+#[test]
+fn conversation_menus_copy_from_live_and_archived_earlier_turns() {
+    use design::log_table::{ConversationSurface, Message as LogMessage, Row, Surface};
+
+    let mut fixture = Fixture::new(false, false);
+    fixture.workspace.clipboard.policy.internal = true;
+    for (order, output, status) in [
+        (1, "archived output", 0),
+        (2, "live output", 7),
+        (3, "current output", 3),
+    ] {
+        let id = fixture.open_ask_with_source_tab_visible();
+        let run = fixture.run_mut(id);
+        run.started_order = order;
+        run.design.history = History::Conversation;
+        run.goal = format!("Command in turn {order}");
+        run.next(Phase::Thinking, "Fixture activity");
+        run.inline_command("printf fixture");
+        run.inline_result(engine::Status::Exited(status), output, "");
+        run.next(Phase::Finished, "Finished");
+        if order == 1 {
+            drop(fixture.send(id, Message::Close));
+            assert!(!fixture.workspace.terminal_agents.runs.contains_key(&id));
+            assert!(
+                fixture
+                    .workspace
+                    .terminal_agents
+                    .finished_runs
+                    .get(id)
+                    .is_some()
+            );
+        }
+    }
+    let session = fixture.session;
+    let stream = fixture.workspace.sessions[&session].stream_generation;
+    let (id, _) = fixture
+        .workspace
+        .terminal_agents
+        .agent_activity_for_stream(session, stream)
+        .unwrap();
+    let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
+    let size = Size::new(600.0, 560.0);
+    for (order, label, output) in [
+        (1, "printf fixture", "archived output"),
+        (2, "Exit 7", "live output"),
+    ] {
+        let mut ui = UserInterface::build(
+            history_fixture_view(&fixture, id),
+            size,
+            Cache::default(),
+            &mut renderer,
+        );
+        let mut events = click_log_label(&mut ui, &mut renderer, label, mouse::Button::Right);
+        let cache = ui.into_cache();
+        assert!(
+            matches!(events.as_slice(), [Desktop::TerminalAgent(panel, Message::Design(design::Message::LogTable(
+            LogMessage::OpenMenu(Surface::EarlierConversation(ConversationSurface::Activity, source), Some(Row::Step(_)), _)
+        )))] if *panel == id && *source == order)
+        );
+        drop(fixture.workspace.update(events.remove(0)));
+        let mut ui = UserInterface::build(
+            history_fixture_view(&fixture, id),
+            size,
+            cache,
+            &mut renderer,
+        );
+        let mut menu = LogTableLayout::default();
+        ui.operate(&renderer, &mut menu);
+        for label in [
+            "Copy command",
+            "Copy output",
+            "Copy entry",
+            "Open in Snippet Editor…",
+        ] {
+            assert!(
+                menu.labels.iter().any(|(_, entry)| entry == label),
+                "missing {label}"
+            );
+        }
+        let mut events =
+            click_log_label(&mut ui, &mut renderer, "Copy output", mouse::Button::Left);
+        drop(ui);
+        assert!(
+            matches!(events.as_slice(), [Desktop::TerminalAgent(panel, Message::Design(design::Message::EarlierConversationStep(..)))] if *panel == id)
+        );
+        drop(fixture.workspace.update(events.remove(0)));
+        assert_eq!(
+            fixture.workspace.clipboard.buffer.get().as_deref(),
+            Some(output)
+        );
+        assert_eq!(
+            fixture
+                .workspace
+                .terminal_agents
+                .agent_activity_for_stream(session, stream)
+                .unwrap()
+                .0,
+            id
+        );
+    }
+}
+
+fn history_fixture_view(fixture: &Fixture, id: window::Id) -> Element<'_, Desktop> {
+    design::history_view(
+        fixture.run(id),
+        None,
+        true,
+        Some((&fixture.workspace.terminal_agents, id)),
+    )
+    .map(move |message| Desktop::TerminalAgent(id, message))
+}
+
+#[test]
+fn card_stack_shows_typed_output_and_keeps_the_answer_in_browsing_order() {
+    let mut fixture = Fixture::new(false, false);
+    let id = fixture.open_ask_with_source_tab_visible();
+    let run = fixture.run_mut(id);
+    run.design.history = History::CardStack;
+    run.goal = "Inspect the fixture".into();
+    run.next(Phase::Thinking, "Reviewing activity");
+    run.inline_command("printf earlier");
+    run.inline_result(engine::Status::Exited(0), "earlier output", "");
+    run.inline_command("printf latest");
+    run.inline_result(engine::Status::Exited(7), "discard\none", "two");
+    let size = Size::new(760.0, 550.0);
+    let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
+    let labels = |fixture: &Fixture, renderer: &mut Renderer| {
+        let mut ui = UserInterface::build(
+            history_fixture_view(fixture, id),
+            size,
+            Cache::default(),
+            renderer,
+        );
+        let mut layout = LogTableLayout::default();
+        ui.operate(renderer, &mut layout);
+        layout
+            .labels
+            .into_iter()
+            .map(|(_, label)| label)
+            .collect::<Vec<_>>()
+    };
+    let review = labels(&fixture, &mut renderer);
+    assert!(review.iter().any(|label| label == "printf latest"));
+    assert!(review.iter().any(|label| label.starts_with("Exit 7 · ")));
+    assert!(review.iter().any(|label| label == "one"));
+    assert!(review.iter().any(|label| label == "two"));
+    assert!(
+        review
+            .iter()
+            .all(|label| label != "discard" && label != "earlier output")
+    );
+
+    let run = fixture.run_mut(id);
+    run.inline_decision(&engine::Action::Done, "Final", "Verified card answer");
+    run.next(Phase::Finished, "Finished");
+    let finished = labels(&fixture, &mut renderer);
+    assert!(finished.iter().any(|label| label == "Verified card answer"));
+    assert!(finished.iter().all(|label| label != "one"));
+    let click = |fixture: &Fixture, renderer: &mut Renderer, label| {
+        let mut ui = UserInterface::build(
+            history_fixture_view(fixture, id),
+            size,
+            Cache::default(),
+            renderer,
+        );
+        click_log_label(&mut ui, renderer, label, mouse::Button::Left)
+            .pop()
+            .unwrap()
+    };
+    let previous = click(&fixture, &mut renderer, "Previous");
+    no_task(fixture.workspace.update(previous));
+    let browsed = labels(&fixture, &mut renderer);
+    assert!(browsed.iter().any(|label| label == "one"));
+    assert!(browsed.iter().all(|label| label != "Verified card answer"));
+    let next = click(&fixture, &mut renderer, "Next");
+    no_task(fixture.workspace.update(next));
+    assert!(
+        labels(&fixture, &mut renderer)
+            .iter()
+            .any(|label| label == "Verified card answer")
+    );
+}
+
+#[test]
+fn side_timeline_follows_new_steps_and_the_final_answer() {
+    let mut fixture = Fixture::new(false, false);
+    let id = fixture.open_ask_with_source_tab_visible();
+    let run = fixture.run_mut(id);
+    run.design.history = History::Timeline;
+    run.goal = "Inspect the fixture".into();
+    run.next(Phase::Thinking, "Reviewing activity");
+    for index in 0..20 {
+        run.inline_command(&format!("printf fixture-{index}"));
+        run.inline_result(engine::Status::Exited(0), "fixture output", "");
+    }
+    run.inline_command("printf current");
+
+    let size = Size::new(370.0, 230.0);
+    let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
+    let metrics = |ui: &mut UserInterface<'_, Desktop, iced::Theme, Renderer>,
+                   renderer: &Renderer| {
+        let mut layout = LogTableLayout::default();
+        ui.operate(renderer, &mut layout);
+        layout
+    };
+    let mut ui = UserInterface::build(
+        history_fixture_view(&fixture, id),
+        size,
+        Cache::default(),
+        &mut renderer,
+    );
+    let initial = metrics(&mut ui, &renderer);
+    let (viewport, translation, end) = initial.vertical_scroll.unwrap();
+    assert!((translation.y - end).abs() <= 1.0);
+    assert!(
+        initial
+            .labels
+            .iter()
+            .any(|(_, label)| label.starts_with("Running · "))
+    );
+    let mut messages = Vec::new();
+    let _ = ui.update(
+        &[Event::Mouse(mouse::Event::WheelScrolled {
+            delta: mouse::ScrollDelta::Lines { x: 0.0, y: 2.0 },
+        })],
+        mouse::Cursor::Available(viewport.center()),
+        &mut renderer,
+        &mut clipboard::Null,
+        &mut messages,
+    );
+    assert!(messages.is_empty());
+    assert!(metrics(&mut ui, &renderer).vertical_scroll.unwrap().1.y < end - 20.0);
+    let cache = ui.into_cache();
+
+    fixture
+        .run_mut(id)
+        .inline_result(engine::Status::Exited(7), "result", "");
+    let mut ui = UserInterface::build(
+        history_fixture_view(&fixture, id),
+        size,
+        cache,
+        &mut renderer,
+    );
+    let revised = metrics(&mut ui, &renderer);
+    let (_, translation, end) = revised.vertical_scroll.unwrap();
+    assert!(translation.y < end - 20.0);
+    assert!(
+        revised
+            .labels
+            .iter()
+            .any(|(_, label)| label.starts_with("Exit 7 · "))
+    );
+    let cache = ui.into_cache();
+
+    fixture.run_mut(id).inline_command("printf newest");
+    let mut ui = UserInterface::build(
+        history_fixture_view(&fixture, id),
+        size,
+        cache,
+        &mut renderer,
+    );
+    let (_, translation, end) = metrics(&mut ui, &renderer).vertical_scroll.unwrap();
+    assert!((translation.y - end).abs() <= 1.0);
+    let cache = ui.into_cache();
+
+    let run = fixture.run_mut(id);
+    run.inline_result(engine::Status::Exited(0), "latest output", "");
+    run.inline_decision(&engine::Action::Done, "Final", "Verified timeline answer");
+    run.next(Phase::Finished, "Finished");
+    let mut ui = UserInterface::build(
+        history_fixture_view(&fixture, id),
+        size,
+        cache,
+        &mut renderer,
+    );
+    let finished = metrics(&mut ui, &renderer);
+    let (viewport, translation, end) = finished.vertical_scroll.unwrap();
+    assert!((translation.y - end).abs() <= 1.0);
+    assert!(finished.labels.iter().any(|(bounds, label)| {
+        label == "Verified timeline answer"
+            && viewport.contains(Point::new(
+                bounds.center().x,
+                bounds.center().y - translation.y,
+            ))
+    }));
+}
+
+#[test]
+fn plan_execution_shows_latest_typed_command_output_and_final_answer() {
+    use design::log_table::{Message as LogMessage, Row, Surface};
+
+    let mut fixture = Fixture::new(false, false);
+    let id = fixture.open_ask_with_source_tab_visible();
+    let run = fixture.run_mut(id);
+    run.design.history = History::PlanExecution;
+    run.goal = "Inspect the fixture".into();
+    run.next(Phase::Thinking, "Reviewing activity");
+    run.inline_command("printf earlier");
+    run.inline_result(engine::Status::Exited(0), "earlier output", "");
+    let latest = run.inline_command("printf latest").unwrap();
+    let size = Size::new(800.0, 680.0);
+    let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
+    let labels = |fixture: &Fixture, renderer: &mut Renderer| {
+        let mut ui = UserInterface::build(
+            history_fixture_view(fixture, id),
+            size,
+            Cache::default(),
+            renderer,
+        );
+        let mut layout = LogTableLayout::default();
+        ui.operate(renderer, &mut layout);
+        layout
+            .labels
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>()
+    };
+    let running = labels(&fixture, &mut renderer);
+    assert!(running.iter().any(|label| label == "$ printf latest"));
+    assert!(
+        running
+            .iter()
+            .any(|label| label.starts_with("◦ Running · "))
+    );
+
+    let run = fixture.run_mut(id);
+    let result = run.inline_result(
+        engine::Status::Exited(7),
+        "discard\none\ntwo\nthree\nfour",
+        "five",
+    );
+    assert_eq!(result, Some(latest));
+    let run = fixture.run_mut(id);
+    run.inline_decision(
+        &engine::Action::Input {
+            question: "Explain the result".into(),
+            answers: Vec::new(),
+        },
+        "Later question",
+        "Explain the result",
+    );
+    let done = labels(&fixture, &mut renderer);
+    assert!(
+        done.iter()
+            .any(|label| label.starts_with("Exit 7 · ") && label.ends_with(" s"))
+    );
+    for line in ["one", "two", "three", "four", "five"] {
+        assert!(
+            done.iter().any(|label| label == line),
+            "missing output line {line}"
+        );
+    }
+    assert!(
+        done.iter()
+            .all(|label| label != "discard" && label != "earlier output")
+    );
+    let mut ui = UserInterface::build(
+        history_fixture_view(&fixture, id),
+        size,
+        Cache::default(),
+        &mut renderer,
+    );
+    let messages = click_log_label(
+        &mut ui,
+        &mut renderer,
+        "$ printf latest",
+        mouse::Button::Right,
+    );
+    drop(ui);
+    assert!(matches!(
+        &messages[..],
+        [Desktop::TerminalAgent(owner, Message::Design(design::Message::LogTable(
+            LogMessage::OpenMenu(Surface::ActivityExecution, Some(Row::Step(step)), _)
+        )))] if *owner == id && *step == latest
+    ));
+
+    let run = fixture.run_mut(id);
+    run.inline_decision(&engine::Action::Done, "Final", "Verified fixture answer");
+    run.next(Phase::Finished, "Finished");
+    let final_view = labels(&fixture, &mut renderer);
+    assert!(
+        final_view
+            .iter()
+            .any(|label| label == "◆ Verified fixture answer")
+    );
+    assert!(final_view.iter().all(|label| label != "$ printf latest"));
 }
 
 #[test]

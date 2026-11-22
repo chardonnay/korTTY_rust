@@ -44,6 +44,23 @@ fn no_provider_request(listener: &TcpListener) {
 }
 
 #[test]
+fn starting_another_terminal_run_dismisses_the_finished_offer() {
+    let _exclusive = exclusive_run();
+    let (mut fixture, id, listener) = completed(false);
+    fixture.run_mut(id).surface = RunPresentation::TerminalWindow;
+    let epoch = fixture.run(id).epoch;
+    no_task(fixture.send(id, Message::ChatFollowUp(epoch, "Previous question".into())));
+
+    let next = fixture.open(Mode::Run);
+    fixture.run_mut(next).surface = RunPresentation::TerminalWindow;
+    final_advice::prepare_local_run(&mut fixture, next, "Check another service");
+    assert!(fixture.run(next).started_order > 0);
+    assert!(fixture.run(id).chat_handoff_dismissed);
+    assert!(fixture.run(id).chat_follow_up.is_empty());
+    no_provider_request(&listener);
+}
+
+#[test]
 fn agent_handoff_creates_one_masked_chat_and_keeps_the_original_draft() {
     let _exclusive = exclusive_run();
     let (mut fixture, id, listener) = completed(false);

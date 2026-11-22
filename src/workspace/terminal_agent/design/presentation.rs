@@ -120,10 +120,19 @@ impl StatusVisibility {
 pub(crate) enum Message {
     Select(usize),
     SelectStep(u64),
+    ConversationOutput(super::conversation::OutputKey),
+    EarlierConversationStep(
+        super::conversation::OutputKey,
+        super::log_table::Surface,
+        super::actions::Item,
+    ),
     LogTable(super::log_table::Message),
     ToggleStepList,
-    Previous,
-    Next,
+    BrowseCards(usize),
+    ScrollCards {
+        direction: i8,
+        review: bool,
+    },
     ToggleDrawer,
 }
 
@@ -164,20 +173,25 @@ pub(in crate::workspace::terminal_agent) struct Presentation {
     pub(in crate::workspace::terminal_agent) model_usage: Usage,
     first: usize,
     selected: Option<usize>,
+    card_stack_back: usize,
     pub(in crate::workspace::terminal_agent) drawer: bool,
     pub(super) dock: Cell<Dock>,
     pub(super) status_visibility: StatusVisibility,
     pub(super) status_events: StatusEvents,
     pub(super) selected_step: Option<u64>,
+    pub(super) conversation_output: std::collections::HashSet<super::conversation::OutputKey>,
     pub(super) step_list_open: bool,
     pub(super) log_table: super::log_table::State,
     pub(super) tmux_started: Option<Instant>,
-    pub(in crate::workspace::terminal_agent) tmux_hidden: bool,
+    pub(super) review_started: Option<Instant>,
+    pub(super) timeline_viewport: std::cell::OnceCell<iced::widget::Id>,
+    pub(super) plan_progress: super::plan_execution::Progress,
+    pub(in crate::workspace::terminal_agent) dock_hidden: bool,
 }
 
 impl Presentation {
-    pub(super) fn set_tmux_hidden(&mut self, hidden: bool) {
-        self.tmux_hidden = hidden;
+    pub(in crate::workspace::terminal_agent) fn set_dock_hidden(&mut self, hidden: bool) {
+        self.dock_hidden = hidden;
         if hidden {
             self.dock_resize = None;
             self.activity.preview = None;
@@ -207,6 +221,7 @@ impl Presentation {
         self.status_events.sync(transcript, finished, now);
         self.status_events.track_review(waiting, now);
         self.log_table.sync(transcript, now);
+        self.plan_progress.sync(transcript, finished, now);
         self.tmux_started.get_or_insert(now);
     }
 
@@ -220,6 +235,8 @@ impl Presentation {
 
     pub(in crate::workspace::terminal_agent) fn review(&mut self, phase: super::super::Phase) {
         use super::super::Phase;
+        self.review_started =
+            matches!(phase, Phase::ProbeApproval | Phase::Approval).then(Instant::now);
         if matches!(
             phase,
             Phase::ModelReview
@@ -238,11 +255,23 @@ impl Presentation {
         }
     }
 
+    pub(in crate::workspace::terminal_agent) fn close_status_run_menu(&mut self) {
+        self.log_table.close_status_run_menu();
+    }
+
     pub(super) fn selection(&self, len: usize) -> usize {
         self.selected
             .and_then(|selected| selected.checked_sub(self.first))
             .filter(|&index| index < len)
             .unwrap_or_else(|| len.saturating_sub(1))
+    }
+
+    pub(super) fn card_stack_back(&self, len: usize) -> usize {
+        self.card_stack_back.min(len.saturating_sub(1))
+    }
+
+    pub(super) fn card_stack_browsing(&self) -> bool {
+        self.card_stack_back > 0
     }
 
     pub(in crate::workspace::terminal_agent) fn identity(&self, index: usize) -> usize {
@@ -270,15 +299,20 @@ impl Presentation {
                 self.selected_step = Some(identity);
                 self.drawer = true;
             }
+            Message::ConversationOutput(key) => {
+                if !self.conversation_output.remove(&key) {
+                    self.conversation_output.insert(key);
+                }
+            }
             Message::LogTable(message) => self.log_table.update(message),
             Message::ToggleStepList => self.step_list_open = !self.step_list_open,
-            Message::Previous if len > 0 => {
-                self.selected = Some(self.identity(self.selection(len).saturating_sub(1)));
-            }
-            Message::Next if len > 0 => {
-                let index = (self.selection(len) + 1).min(len - 1);
-                // Reaching the newest entry resumes following incoming activity.
-                self.selected = (index < len - 1).then(|| self.identity(index));
+            Message::BrowseCards(back) => self.card_stack_back = back.min(len),
+            Message::ScrollCards { direction, review } => {
+                let count = len + usize::from(review);
+                self.card_stack_back = self
+                    .card_stack_back(count)
+                    .saturating_add_signed(isize::from(direction))
+                    .min(count.saturating_sub(1));
             }
             Message::ToggleDrawer => self.drawer = !self.drawer,
             _ => {}
@@ -458,11 +492,6 @@ mod tests {
         assert_eq!(presentation.selection(3), 2);
         presentation.update(Message::Select(1), 3);
         assert_eq!(presentation.selection(3), 0);
-        presentation.update(Message::Next, 3);
-        assert_eq!(presentation.selection(3), 1);
-        presentation.update(Message::Next, 3);
-        assert_eq!(presentation.selection(4), 3);
-        presentation.update(Message::Previous, 0);
         assert_eq!(presentation.selection(0), 0);
     }
 

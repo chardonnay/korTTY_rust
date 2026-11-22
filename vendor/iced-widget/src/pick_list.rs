@@ -158,6 +158,7 @@ pub struct PickList<
     Renderer: text::Renderer,
 {
     on_select: Box<dyn Fn(T) -> Message + 'a>,
+    option_enabled: fn(&T) -> bool,
     on_open: Option<Message>,
     on_close: Option<Message>,
     options: L,
@@ -195,6 +196,7 @@ where
     ) -> Self {
         Self {
             on_select: Box::new(on_select),
+            option_enabled: |_| true,
             on_open: None,
             on_close: None,
             options,
@@ -212,6 +214,12 @@ where
             last_status: None,
             menu_height: Length::Shrink,
         }
+    }
+
+    /// Sets which options can be selected. Disabled options remain visible.
+    pub fn option_enabled(mut self, enabled: fn(&T) -> bool) -> Self {
+        self.option_enabled = enabled;
+        self
     }
 
     /// Sets the placeholder of the [`PickList`].
@@ -487,10 +495,11 @@ where
                     fn find_next<'a, T: PartialEq>(
                         selected: &'a T,
                         mut options: impl Iterator<Item = &'a T>,
+                        enabled: fn(&T) -> bool,
                     ) -> Option<&'a T> {
                         let _ = options.find(|&option| option == selected);
 
-                        options.next()
+                        options.find(|option| enabled(option))
                     }
 
                     let options = self.options.borrow();
@@ -498,15 +507,24 @@ where
 
                     let next_option = if *y < 0.0 {
                         if let Some(selected) = selected {
-                            find_next(selected, options.iter())
+                            find_next(selected, options.iter(), self.option_enabled)
                         } else {
-                            options.first()
+                            options
+                                .iter()
+                                .find(|option| (self.option_enabled)(option))
                         }
                     } else if *y > 0.0 {
                         if let Some(selected) = selected {
-                            find_next(selected, options.iter().rev())
+                            find_next(
+                                selected,
+                                options.iter().rev(),
+                                self.option_enabled,
+                            )
                         } else {
-                            options.last()
+                            options
+                                .iter()
+                                .rev()
+                                .find(|option| (self.option_enabled)(option))
                         }
                     } else {
                         None
@@ -720,6 +738,7 @@ where
                 None,
                 &self.menu_class,
             )
+            .option_enabled(self.option_enabled)
             .width(bounds.width)
             .padding(self.padding)
             .font(font)

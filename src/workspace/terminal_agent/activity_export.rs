@@ -54,7 +54,7 @@ impl fmt::Display for Scope {
 pub(super) struct Archive(VecDeque<(LiveBinding, Arc<report::Run>)>);
 
 impl Archive {
-    fn contains(&self, source: LiveBinding) -> bool {
+    pub(super) fn contains(&self, source: LiveBinding) -> bool {
         self.0.iter().any(|(old, _)| same_stream(*old, source))
     }
 
@@ -182,6 +182,10 @@ pub(super) struct Export {
 }
 
 impl Export {
+    pub(super) fn has_snapshot(&self) -> bool {
+        self.snapshot.is_some()
+    }
+
     pub(super) fn completed_snapshot(&self) -> Self {
         Self {
             snapshot: self.snapshot.clone(),
@@ -263,7 +267,7 @@ impl Run {
             && !self.binding.private()
             && self.binding.live().is_ok()
             && !self.activity_export.writing()
-            && (self.phase.finished() && self.activity_export.snapshot.is_some()
+            && (self.phase.finished() && self.activity_export.has_snapshot()
                 || scope == Scope::All && has_archive)
     }
 }

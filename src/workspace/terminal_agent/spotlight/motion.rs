@@ -78,20 +78,46 @@ pub(super) fn layer<'a, M: 'a>(
             center: center.into(),
             frame,
             interactive,
+            centered: true,
         })
     }
+}
+
+pub(in crate::workspace::terminal_agent) fn scale_card<'a, M: 'a>(
+    card: Element<'a, M>,
+    scale: f32,
+) -> Element<'a, M> {
+    if scale == 1.0 {
+        return card;
+    }
+    Element::new(Layer {
+        center: card,
+        frame: Frame {
+            opacity: 1.0,
+            scale,
+            toward_status: 0.0,
+        },
+        interactive: true,
+        centered: false,
+    })
 }
 
 struct Layer<'a, M> {
     center: Element<'a, M>,
     frame: Frame,
     interactive: bool,
+    centered: bool,
 }
 
 impl<M> Layer<'_, M> {
     fn transform(&self, layout: Layout<'_>) -> Transformation {
-        self.frame
-            .transform(layout.bounds(), layout.child(0).bounds())
+        let outer = layout.bounds();
+        let card = if self.centered {
+            layout.child(0).bounds()
+        } else {
+            outer
+        };
+        self.frame.transform(outer, card)
     }
 }
 

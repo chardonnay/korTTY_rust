@@ -126,6 +126,10 @@ pub struct Loaded {
 }
 
 impl Run {
+    pub(super) fn is_terminal_command_run(&self) -> bool {
+        self.mode == Mode::Run && !self.runs_in_chat_tab() && !self.swarm && !self.reopened_history
+    }
+
     pub(super) fn is_live_ask_answer(&self) -> bool {
         self.mode == Mode::Ask
             && self.phase == Phase::Finished
@@ -144,6 +148,18 @@ impl Run {
 }
 
 impl State {
+    pub(super) fn dismiss_finished_terminal_chat_offers(&mut self, source: LiveBinding) {
+        for run in self.runs.values_mut().filter(|run| {
+            run.is_terminal_command_run()
+                && run.binding.live().ok() == Some(source)
+                && run.can_chat_handoff()
+                && !run.chat_handoff_pending
+        }) {
+            run.chat_handoff_dismissed = true;
+            run.chat_follow_up.clear();
+        }
+    }
+
     fn retain_chat_handoff(&mut self, snapshot: Snapshot) {
         self.chat_handoffs
             .retain(|previous| previous.source.session != snapshot.source.session);
@@ -311,13 +327,14 @@ impl Workspace {
         else {
             return Task::none();
         };
+        let chat_enabled = self.ai_chat_enabled();
         let Some(run) = self.terminal_agents.runs.get_mut(&id).filter(|run| {
             run.epoch == *epoch && run.can_chat_handoff() && !run.chat_handoff_pending
         }) else {
             return Task::none();
         };
         match message {
-            Message::ChatFollowUp(_, text) if text.len() <= MAX_QUESTION_BYTES => {
+            Message::ChatFollowUp(_, text) if chat_enabled && text.len() <= MAX_QUESTION_BYTES => {
                 run.chat_follow_up = text
             }
             Message::DismissChatHandoff(_) => {

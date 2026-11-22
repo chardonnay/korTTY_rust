@@ -16,6 +16,342 @@ open until a result is recorded for the tested revision and environment. Both
 Mosh modes are out of scope. The editor has a reduced native scope with structure
 navigation for classes, functions, variables, and placeholders.
 
+## November 21 Terminal run Chat handoff
+
+A finished command run offers **Continue in AI Chat** and a follow-up
+field beneath its pane in every preset, including Classic. The heading
+uses the masked task title. A new terminal command run on the same
+stream dismisses the previous finished offer. The existing continuation
+workflow opens or focuses the same chat and retains its own review and
+redaction checks. The separate Ask and Planning continuation paths remain
+available on their own surfaces.
+
+Disabling AI or disallowing Chat keeps the offer visible and disables
+submission. The run action stays visible and disabled in the dropdown,
+PiP menu, Log Table menu, and terminal context menu. A disabled dropdown
+item consumes the click without making a selection. The Fedora X11 and
+Wayland desktops verified the pane footer and the disabled run menu entry.
+Live macOS and Windows acceptance remains under A2.
+[Java handoff behavior](https://github.com/chardonnay/korTTY/blob/v2.26.0/app-docs/site/docs/en/features/ai-agent-designs.md#continue-a-run-in-an-ai-chat).
+
+The Apple Silicon test run passed 244 Terminal Agent tests with 12
+ignored, all nine terminal context tests, and strict application Clippy.
+The widget tests exercised
+the offer below each preset, its run identity, dismissal while Chat is
+disabled, and the disabled dropdown item. The flow fixture started a new
+run and verified that the previous offer and its draft were cleared.
+[Apple Silicon verification](target/verification/20261121-agent-terminal-chat-macos-complete.log).
+
+## November 21 Run menus on Agent status displays
+
+A right-click opens the displayed run's menu on the terminal status
+pill, Spotlight pill, Orbit, Minimap rail, and toast badge. The popup
+uses the Log Table's run actions and earlier-run chooser. On the Minimap,
+the menu for a recorded step takes precedence over the rail menu. An
+open run popup keeps its status visible past the auto-hide deadline.
+A change to the pane grid dismisses the popup at its old position.
+
+The Apple Silicon widget tests copied the displayed answer from all
+five status presentations after the auto-hide deadline. They also
+clicked the disabled Chat entry, selected an earlier run from the toast
+badge, checked the Minimap's step-menu priority, and reopened the
+Adaptive Dock's pill menu after resizing its pane. The broader native
+run passed 246 Terminal Agent tests with 12 ignored, all nine terminal
+context tests, and strict application Clippy.
+[Java run menus](https://github.com/chardonnay/korTTY/blob/v2.26.0/app-docs/site/docs/en/features/ai-agent-designs.md#run-menu-and-step-menu)
+· [Apple Silicon verification](target/verification/20261121-agent-status-run-menus-macos-resize.log).
+
+The same source passed live desktop checks on Fedora ARM64 in a private
+Xvfb display with Openbox and a loopback model. The Spotlight menu copied
+the newer Cobalt answer to the X11 clipboard, switched to the earlier Amber
+run, and copied its distinct answer. The footer opened a Chat that retained
+the Amber answer. Orbit and Minimap each copied the displayed answer. The
+toast badge menu stayed usable past the configured 25-second auto-hide
+deadline. A separate profile with managed Chat denial kept the Chat entry
+visible, rejected a click on it, and still copied the answer. The test
+display, application processes, and temporary profiles were removed.
+[Fedora X11 verification](target/verification/20261121-agent-status-desktop-fedora.log).
+
+The identical source passed in a private native Mutter 50.6 Wayland
+session with X11 disabled. Spotlight opened and copied the earlier
+Amber run after showing Cobalt. Orbit, Minimap, and the toast badge
+copied their displayed answers through the Wayland clipboard. The toast
+menu remained usable past its 25-second auto-hide deadline. Managed
+Chat denial left the disabled entry visible, and the adjacent Copy
+answer action still worked. Two terminal splits displayed separate
+answers, and right-clicking each pill copied its own answer. A split
+narrowed the Adaptive Dock pane from 54 to 25 columns while its menu
+was open. The pill opened a menu at the new position and copied the
+same run's answer. The isolated compositor, application processes,
+and temporary profiles were removed.
+[Fedora Wayland verification](target/verification/20261121-agent-status-desktop-wayland-fedora.log).
+
+An X11 follow-up on the same source copied distinct answers from the
+left and right pills into the X11 clipboard. The left pane footer
+opened one saved Chat containing the left answer. A further split
+narrowed the Adaptive Dock pane from 57 to 26 columns. The test checked
+that the open menu disappeared, reopened it at the new position, and
+copied the original run's answer. Only the three explicitly reviewed
+fixture requests reached the loopback model. The private display,
+application processes, and temporary profiles were removed.
+[Fedora X11 split-pane and resize verification](target/verification/20261121-agent-status-desktop-x11-splits-fedora.log).
+
+Windows built the same source with the native ARM64 toolchain. Both the
+desktop and CLI binaries report PE machine `0xaa64`. The private profile
+opened a visible desktop window and the Control API reported a connected
+local terminal pane. The native suites passed 246 Terminal Agent tests
+and all nine terminal context tests. Four Terminal Agent tests require
+separate OpenSSH or HTTPS fixtures and stayed ignored.
+[Windows ARM64 build](target/verification/20261121-agent-status-desktop-windows-build.log)
+· [Windows ARM64 tests](target/verification/20261121-agent-status-windows-native-tests.log).
+
+The November 22 Windows ARM64 desktop check used a private profile and
+a loopback model. The user confirmed **Copy answer** from the Spotlight
+pill and **Continue in AI Chat** from the terminal footer. The fixture
+recorded the reviewed Amber request, and the saved Chat contained the
+expected answer. The rest of the Windows matrix and the macOS desktop
+workflow remain open.
+[Windows ARM64 desktop verification](target/verification/20261122-agent-status-desktop-windows-fixture.log).
+
+## Terminal context menu selects the latest agent run
+
+**AI → Last agent run** uses the newest run with a terminal design trace
+on the clicked pane and current stream. A Classic run uses its own
+activity controls. The context menu can copy the latest retained answer
+without opening its history. The design's own menu continues to act on
+the displayed run. Context actions recheck the run identity, stream,
+scope and policy before execution.
+[Java terminal context menu](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignHost.java#L898).
+
+Native Windows ARM64 and Apple Silicon each passed 248 Terminal Agent
+tests and all nine terminal context tests. The new cases cover copying
+from a newer live or retained run while an earlier run stays displayed,
+ignoring the Classic layout, and rejecting a queued action after a new
+trace or stream change.
+Four Windows ARM64 and twelve Apple Silicon Terminal Agent tests require
+separate fixtures and stayed ignored. Apple Silicon application Clippy
+passed with warnings denied.
+[Windows ARM64 tests](target/verification/20261122-last-agent-run-windows.log)
+· [Apple Silicon tests](target/verification/20261122-last-agent-run-macos.log)
+· [Apple Silicon Clippy](target/verification/20261122-last-agent-run-macos-clippy.log).
+
+## Conversation design follow-up runs
+
+Conversation (d13) enables its follow-up composer after the run finishes
+in the pane or detached history. Enter and Send use the original stream
+and the current Agent defaults. The next run goes through the normal review and
+resolves its own environment. The composer keeps a draft when the run
+cannot start and blocks repeated submission while its next run is open.
+The history shows up to five earlier questions and answers from the same
+stream, including retained runs. **Continue in AI Chat** opens the
+separate chat workflow.
+[Java Conversation presenter](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignChat.java).
+
+Windows ARM64 and Apple Silicon each passed 251 Terminal Agent tests and
+all nine terminal context tests. The new cases verify one fresh setup,
+rejection after a stream or policy change, retained answers in order,
+and capture of Enter in an empty composer. Four Windows and twelve
+Apple Silicon Terminal Agent tests require separate fixtures and stayed
+ignored. Apple Silicon application Clippy passed with warnings denied.
+[Windows ARM64 verification](target/verification/20261122-agent-conversation-windows-final.log)
+· [Apple Silicon verification](target/verification/20261122-agent-conversation-macos-final.log).
+
+## Conversation command bubbles and response indicator
+
+The Conversation panel renders the masked typed steps of the current and
+earlier turns. Command bubbles show the exit status and expand their own
+retained output. Right-clicking a step opens its context menu.
+**Expand all** opens command outputs and activity details.
+Three dots move while the Agent is working and stay still with reduced
+animations. The indicator is hidden during review, pause, and after
+completion. The Settings preview uses the same command and indicator
+widgets.
+[Java Conversation presenter](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignChat.java).
+
+Windows ARM64 and Apple Silicon each passed 254 Terminal Agent tests and
+all nine terminal context tests. The widget test expanded the first of
+two identical commands and exposed only its output. Other cases checked
+retained step identity, a replaced stream, and reduced motion. Four
+Windows and twelve Apple Silicon Terminal Agent tests require separate
+fixtures and stayed ignored. Apple Silicon application Clippy passed
+with warnings denied.
+[Windows ARM64 verification](target/verification/20261122-agent-conversation-bubbles-windows.log)
+· [Apple Silicon verification](target/verification/20261122-agent-conversation-bubbles-macos-final.log).
+
+Earlier turns use the same step menu for copying the command, output or
+entry, and for opening an unsaved Snippet Editor draft where permitted.
+The menu checks the original pane stream, the shown conversation, and
+the exact step before using the current clipboard and redaction rules.
+[Java Conversation step menu](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignChat.java#L180).
+
+Windows ARM64 and Apple Silicon each passed 256 Terminal Agent tests and
+all nine terminal context tests. The widget tests copied the correct
+outputs from identical commands in a live and an archived earlier turn.
+The stale-action test covered a closed menu, a different surface and a
+replaced stream. Four Windows and twelve Apple Silicon Terminal Agent
+tests require separate fixtures and stayed ignored. Apple Silicon
+application Clippy passed with warnings denied.
+[Windows ARM64 verification](target/verification/20261122-agent-conversation-earlier-menus-windows.log)
+· [Apple Silicon verification](target/verification/20261122-agent-conversation-earlier-menus-macos-final.log).
+
+## Conversation command review and bubble animation
+
+Conversation shows the masked command and destination in a review bubble.
+The pane and picture-in-picture history use the same review binding as
+the tmux history. Approval rechecks the run, command epoch, terminal
+stream, input revision, focus and policy. Reviews that require the
+Activity window open its full controls. New bubbles scale into place
+over 280 ms. The animation uses the original timestamp and honors
+reduced animations in the live panel and Settings preview.
+[Java Conversation approval and animation](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignChat.java#L245).
+
+Windows ARM64 and Apple Silicon each passed 259 Terminal Agent tests and
+all nine terminal context tests. Apple Silicon also passed application
+Clippy with warnings denied. The tests covered a partly hidden card, a
+held key, a policy change after the decision was queued, detached-window
+focus, and the animation timestamp. An Apple Silicon Planning probe
+test failed in the first run and passed individually and in the full
+rerun on the same source. Four Windows and twelve Apple Silicon tests
+require separate fixtures and stayed ignored.
+[Windows ARM64 verification](target/verification/20261122-agent-conversation-review-windows.log)
+· [First Apple Silicon run](target/verification/20261122-agent-conversation-review-macos.log)
+· [Apple Silicon rerun](target/verification/20261122-agent-conversation-review-macos-retry.log).
+
+## Command review in the other Agent histories
+
+The side timeline places the pending command beside the newest node.
+Plan and Execution displays it in the execution column. Card Stack
+shows it as the front card after the preceding activity, and Log Table
+places its controls in a fixed section above the scrolling table. The
+current command is bound to its run, terminal, focus and execution
+policy. Attached and detached picture-in-picture histories use the
+same checks. When a cursor suggestion owns the review, its binding
+controls the numeric keys.
+[Java history-panel behavior](https://github.com/chardonnay/korTTY/blob/v2.26.0/app-docs/site/docs/en/features/ai-agent-designs.md#history-panels).
+
+The widget checks use a stable terminal frame and cover clipped
+controls, repeated keys, a policy change after the decision was
+queued, and cancellation through the visible card. Windows ARM64 and
+Apple Silicon both passed 261 Terminal Agent tests and nine terminal
+context tests. Four Windows and twelve Apple Silicon fixture tests
+stayed ignored. App Clippy passed with warnings denied on Apple Silicon.
+Live desktop acceptance remains open for these panels.
+[Windows ARM64 verification](target/verification/20261122-agent-history-review-windows-stable-fixture.log)
+· [Apple Silicon verification](target/verification/20261122-agent-history-review-macos-stable-fixture.log).
+
+## Docked history visibility and Card Stack browsing
+
+The Run actions menu and the terminal context menu can hide or show the
+Side Timeline, Plan and Execution, Card Stack, tmux, Conversation and Log
+Table docks. **View → AI Agent Panel → Show or Hide Agent History** also
+restores a hidden dock when the design has no visible status. Hiding it
+releases its pane space, clears an in-progress resize, and disables
+approvals from the dock. Status modules and picture-in-picture retain
+their own controls.
+
+Card Stack now browses earlier cards with the wheel or trackpad over the
+stack. Previous and Next use the same selection. The newest card follows
+the run again when the user returns to it. A pending review is the newest
+card and cannot act on numeric keys while an earlier card is in front.
+[Java Card Stack](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignCardStack.java#L85).
+
+Windows ARM64 and Apple Silicon each passed 262 Terminal Agent tests
+and all nine terminal context tests. Four Windows and twelve Apple
+Silicon fixture tests stayed ignored. App Clippy passed with warnings
+denied on Apple Silicon. The widget tests measured terminal space before
+hiding each of the six docks and after restoring it. They sent batches
+of line and pixel wheel events and verified that a queued approval
+action was discarded while an older card was in front.
+[Windows ARM64 verification](target/verification/20261122-agent-docks-card-wheel-windows-batched.log)
+· [Apple Silicon verification](target/verification/20261122-agent-docks-card-wheel-macos-batched.log).
+
+## Plan and Execution uses typed command results
+
+The Plan and Execution design shows typed steps with status marks. The
+execution column follows the newest command while the agent works. It
+shows the running state or exit code, elapsed time and up to five lines
+from the masked output tail. Its context menu acts on that exact command
+even if later model or question steps arrive. A pending approval takes
+priority. A completed run displays its final answer in the same column.
+Saved activity without typed steps uses its existing text view.
+
+Progress changes animate over 360 milliseconds. Reduced animations show
+the new progress immediately and keep the running indicator still.
+Completed commands and answered questions draw a check mark over 320
+milliseconds. The presenter keeps the first completion time for each
+step. Reduced animations and reopened history show the complete mark
+immediately. The Settings preview uses the same renderer and refresh
+timing. Native desktop acceptance remains open.
+[Java Plan and Execution](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignPlanExecution.java#L271).
+
+Windows ARM64 and Apple Silicon each passed 264 Terminal Agent tests
+and the nine terminal context tests. Four Windows and twelve Apple
+Silicon fixture tests stayed ignored. App Clippy passed with warnings
+denied on Apple Silicon. The widget test verifies the newest command
+after a later question, the five-line output tail, the bound step menu
+and the transition to a final answer. A timing test covers restart from
+the interpolated progress and immediate reduced-motion updates.
+[Windows ARM64 verification](target/verification/20261122-agent-plan-execution-windows-final.log)
+· [Apple Silicon verification](target/verification/20261122-agent-plan-execution-macos-final.log).
+
+The follow-up check-mark tests cover stroke order, retention of a
+step's first completion time, animation expiry and reduced motion.
+Windows ARM64 and Apple Silicon each passed 270 Terminal Agent tests
+and all nine terminal context tests. Four Windows and twelve Apple
+Silicon fixture tests stayed ignored. App Clippy passed with warnings
+denied on Apple Silicon.
+[Windows ARM64 check-mark verification](target/verification/20261122-agent-plan-tick-windows.log)
+· [Apple Silicon check-mark verification](target/verification/20261122-agent-plan-tick-macos.log).
+
+## Side timeline follows typed activity
+
+The d02 timeline uses the run's typed steps and keeps each context menu
+bound to that step. Its nodes show the step's status, elapsed time,
+exit code or token count where available. A pending review is an amber
+node with immediately visible controls. The final answer becomes a
+separate node at the end of the rail.
+
+The scroll viewport follows newly added nodes. Updating an existing
+step preserves manual scroll position. The rail draws a connector to
+each new node, and running nodes pulse. Reduced animations make the
+nodes and connectors appear immediately and keep the nodes still.
+Live desktop acceptance remains open.
+[Java Side Timeline](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignTimeline.java#L180).
+
+Windows ARM64 and Apple Silicon each passed 266 Terminal Agent tests
+and the nine terminal context tests. Four Windows and twelve Apple
+Silicon fixture tests stayed ignored. App Clippy passed with warnings
+denied on Apple Silicon. The widget test scrolls away from the newest
+step, updates its command result, and verifies that a newly added
+step and the final answer bring the viewport back to the end. A timing
+test covers connector growth, pulsing and reduced animations.
+[Windows ARM64 verification](target/verification/20261122-agent-timeline-windows-final.log)
+· [Apple Silicon verification](target/verification/20261122-agent-timeline-macos-final.log).
+
+## Card Stack shows typed steps and the final answer
+
+The d07 Card Stack uses typed steps, a pending command review when
+available, and a final-answer card after the run. The front command card
+shows its result and the last two masked output lines. Context menus
+address the exact step. The wheel, trackpad, and Previous and Next
+controls browse the same stack, including the final answer. Older records
+with text-only activity use their existing entries.
+
+The newest card rises and fades in as up to two older cards move back
+and shrink. Reduced animations apply the final positions immediately.
+Command review controls remain visible throughout the transition. Native
+desktop acceptance remains open.
+[Java Card Stack](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignCardStack.java#L174).
+
+Windows ARM64 and Apple Silicon each passed 268 Terminal Agent tests
+and the nine terminal context tests. Four Windows and twelve Apple
+Silicon fixture tests stayed ignored. App Clippy passed with warnings
+denied on Apple Silicon. The widget tests verify the two-line output
+tail, the step-specific context menus, and browsing from the answer
+back to the command. A timing test covers the front and receding cards.
+[Windows ARM64 verification](target/verification/20261122-agent-card-stack-windows.log)
+· [Apple Silicon verification](target/verification/20261122-agent-card-stack-macos.log).
+
 ## November 21 Detached Terminal Agent history follows its pane
 
 The Java v2.26.0 pane shares one picture-in-picture presenter as it

@@ -1,7 +1,7 @@
 //! Pure, bounded d03/d17 layout. These values contain no execution authority or terminal position.
 
 mod layout;
-pub(crate) use layout::render;
+pub(crate) use layout::{marker, render};
 
 pub(crate) const MAX_LINES: usize = 128;
 pub(crate) const MAX_STEPS: usize = 32;

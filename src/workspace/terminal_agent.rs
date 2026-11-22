@@ -123,7 +123,7 @@ pub enum Message {
     Approve(u64),
     ApproveBatch(u64),
     ApproveRemaining(u64),
-    TmuxReview(design::TmuxReviewAction),
+    PanelReview(design::PanelReviewAction),
     ConfirmEveryCommand(bool),
     AutoApproveRoot(bool),
     Clarification(clarification::Message),
@@ -147,6 +147,8 @@ pub enum Message {
     RememberActivityFont(bool),
     ActivityPanel(design::ActivityChange),
     ChatFollowUp(u64, String),
+    ConversationPrompt(u64, String),
+    ContinueConversation(u64),
     ContinueInChat(u64),
     DismissChatHandoff(u64),
     ChatHandoffLoaded(Arc<handoff::Loaded>),
@@ -298,6 +300,9 @@ struct Run {
     spotlight_submission: Option<spotlight::Submission>,
     chat_handoff_id: Option<String>,
     chat_follow_up: String,
+    conversation_prompt: String,
+    conversation_parent: Option<window::Id>,
+    conversation_enabled: bool,
     chat_handoff_dismissed: bool,
     chat_handoff_pending: bool,
     chat_handoff_enabled: bool,
@@ -483,6 +488,9 @@ impl Run {
             spotlight_submission: None,
             chat_handoff_id: None,
             chat_follow_up: String::new(),
+            conversation_prompt: String::new(),
+            conversation_parent: None,
+            conversation_enabled: false,
             chat_handoff_dismissed: false,
             chat_handoff_pending: false,
             chat_handoff_enabled: false,
@@ -590,6 +598,7 @@ impl Run {
             self.finish_model_decision_without_report(state);
         }
         self.epoch += 1;
+        self.presentation.close_status_run_menu();
         if phase.finished() && !self.phase.finished() {
             self.presentation.finished(std::time::Instant::now());
         }
@@ -861,6 +870,7 @@ impl Workspace {
                 run_id,
                 palette,
                 reduced_motion,
+                self.panel_review(run_id, &state.runs[&run_id], Some(id)),
             ));
         } else if let Some(view) = state.swarm_view(
             id,
@@ -1360,8 +1370,8 @@ impl Workspace {
         id: window::Id,
         message: Message,
     ) -> Task<Desktop> {
-        if let Message::TmuxReview(action) = message {
-            return self.update_tmux_review(id, action);
+        if let Message::PanelReview(action) = message {
+            return self.update_panel_review(id, action);
         }
         if let Message::ChatHandoffLoaded(loaded) = message {
             return self.finish_agent_chat(loaded);
@@ -1439,6 +1449,20 @@ impl Workspace {
         ) {
             return self.agent_chat_action(id, message);
         }
+        if matches!(
+            message,
+            Message::ConversationPrompt(..) | Message::ContinueConversation(_)
+        ) {
+            return self.agent_conversation_action(id, message);
+        }
+        if let Message::Design(design::Message::ConversationOutput(key)) = message {
+            return self.toggle_conversation_output(id, key);
+        }
+        if let Message::Design(design::Message::EarlierConversationStep(key, surface, item)) =
+            message
+        {
+            return self.earlier_conversation_step_action(id, key, surface, item);
+        }
         let group = self.terminal_agents.swarm_for_member(id);
         if matches!(message, Message::Close) {
             return self.close_terminal_agent(id).unwrap_or_else(Task::none);
@@ -1515,13 +1539,20 @@ impl Workspace {
             self.terminal_agents.next_run_order =
                 self.terminal_agents.next_run_order.saturating_add(1);
             run.started_order = self.terminal_agents.next_run_order;
-            if !run.swarm && run.binding.live().is_ok() {
+            if !run.swarm
+                && let Ok(source) = run.binding.live()
+            {
                 run.chat_handoff_id = crate::private_files::nonce().ok();
                 run.chat_follow_up.clear();
+                run.conversation_prompt.clear();
                 run.chat_handoff_dismissed = false;
                 run.chat_handoff_pending = false;
                 run.chat_handoff_elapsed_ms = None;
                 run.chat_journal = None;
+                if run.is_terminal_command_run() {
+                    self.terminal_agents
+                        .dismiss_finished_terminal_chat_offers(source);
+                }
             }
         }
         if !run.swarm
@@ -1534,7 +1565,7 @@ impl Workspace {
                 .is_some_and(|(_, pane, _)| pane.stream_generation == source.stream)
         {
             self.terminal_agents.presented_runs.remove(&source.session);
-            run.presentation.tmux_hidden = false;
+            run.presentation.set_dock_hidden(false);
         }
         if let Some(history) = &run.inline {
             run.presentation.sync_status(

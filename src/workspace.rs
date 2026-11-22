@@ -1497,6 +1497,7 @@ impl Workspace {
             task
         };
         self.revalidate_agent_chat_handoffs();
+        self.revalidate_agent_conversations();
         self.revalidate_agent_journal_synchronizations();
         self.revalidate_bound_agent_chats();
         self.reconcile_automatic_knowledge();
@@ -2392,6 +2393,8 @@ impl Workspace {
                     pane.clear_selection();
                     pane.selected_output = None;
                     pane.session.resize(grid);
+                    self.terminal_agents
+                        .close_status_run_menus(id, pane.stream_generation);
                 }
             }
             Message::ToggleTypeAhead(id) => {

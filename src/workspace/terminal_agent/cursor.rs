@@ -59,10 +59,19 @@ impl Workspace {
         owner: window::Id,
         session: SessionId,
     ) -> Option<&PaneSession> {
+        self.agent_control_pane(owner, session, None)
+    }
+
+    pub(super) fn agent_control_pane(
+        &self,
+        owner: window::Id,
+        session: SessionId,
+        detached: Option<window::Id>,
+    ) -> Option<&PaneSession> {
         let window = self.windows.get(&owner)?;
         let tab = window.tab()?;
         let pane = self.sessions.get(&session)?;
-        (window.focused
+        (detached.map_or(window.focused, |id| self.native_focused_window == Some(id))
             && !self.exiting
             && !self.tab_drag.active()
             && self.terminal_context.is_none()

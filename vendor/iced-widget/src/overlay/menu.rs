@@ -33,6 +33,7 @@ pub struct Menu<
     options: &'a [T],
     hovered_option: &'a mut Option<usize>,
     on_selected: Box<dyn FnMut(T) -> Message + 'a>,
+    option_enabled: fn(&T) -> bool,
     on_option_hovered: Option<&'a dyn Fn(T) -> Message>,
     width: f32,
     padding: Padding,
@@ -67,6 +68,7 @@ where
             options,
             hovered_option,
             on_selected: Box::new(on_selected),
+            option_enabled: |_| true,
             on_option_hovered,
             width: 0.0,
             padding: Padding::ZERO,
@@ -76,6 +78,12 @@ where
             font: None,
             class,
         }
+    }
+
+    /// Sets which options can be selected. Disabled options remain visible.
+    pub fn option_enabled(mut self, enabled: fn(&T) -> bool) -> Self {
+        self.option_enabled = enabled;
+        self
     }
 
     /// Sets the width of the [`Menu`].
@@ -197,6 +205,7 @@ where
             options,
             hovered_option,
             on_selected,
+            option_enabled,
             on_option_hovered,
             width,
             padding,
@@ -211,6 +220,7 @@ where
             options,
             hovered_option,
             on_selected,
+            option_enabled,
             on_option_hovered,
             font,
             text_size,
@@ -337,6 +347,7 @@ where
     options: &'a [T],
     hovered_option: &'a mut Option<usize>,
     on_selected: Box<dyn FnMut(T) -> Message + 'a>,
+    option_enabled: fn(&T) -> bool,
     on_option_hovered: Option<&'a dyn Fn(T) -> Message>,
     padding: Padding,
     text_size: Option<Pixels>,
@@ -415,7 +426,9 @@ where
                     && let Some(index) = *self.hovered_option
                     && let Some(option) = self.options.get(index)
                 {
-                    shell.publish((self.on_selected)(option.clone()));
+                    if (self.option_enabled)(option) {
+                        shell.publish((self.on_selected)(option.clone()));
+                    }
                     shell.capture_event();
                 }
             }
@@ -438,7 +451,8 @@ where
                         && let Some(option) =
                             self.options.get(new_hovered_option)
                     {
-                        if let Some(on_option_hovered) = self.on_option_hovered
+                        if (self.option_enabled)(option)
+                            && let Some(on_option_hovered) = self.on_option_hovered
                         {
                             shell.publish(on_option_hovered(option.clone()));
                         }
@@ -467,7 +481,9 @@ where
                     if let Some(index) = *self.hovered_option
                         && let Some(option) = self.options.get(index)
                     {
-                        shell.publish((self.on_selected)(option.clone()));
+                        if (self.option_enabled)(option) {
+                            shell.publish((self.on_selected)(option.clone()));
+                        }
                         shell.capture_event();
                     }
                 }
@@ -496,7 +512,12 @@ where
     ) -> mouse::Interaction {
         let is_mouse_over = cursor.is_over(layout.bounds());
 
-        if is_mouse_over {
+        if is_mouse_over
+            && self
+                .hovered_option
+                .and_then(|index| self.options.get(index))
+                .is_none_or(self.option_enabled)
+        {
             mouse::Interaction::Pointer
         } else {
             mouse::Interaction::default()
@@ -530,7 +551,8 @@ where
 
         for (i, option) in visible_options.iter().enumerate() {
             let i = start + i;
-            let is_selected = *self.hovered_option == Some(i);
+            let enabled = (self.option_enabled)(option);
+            let is_selected = enabled && *self.hovered_option == Some(i);
 
             let bounds = Rectangle {
                 x: bounds.x,
@@ -567,7 +589,9 @@ where
                     wrapping: text::Wrapping::default(),
                 },
                 Point::new(bounds.x + self.padding.left, bounds.center_y()),
-                if is_selected {
+                if !enabled {
+                    style.text_color.scale_alpha(0.5)
+                } else if is_selected {
                     style.selected_text_color
                 } else {
                     style.text_color

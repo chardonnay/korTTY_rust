@@ -15,6 +15,9 @@ use super::{Desktop, Message as AgentMessage, Phase, Run, State, Workspace, dial
 
 pub(in crate::workspace) mod actions;
 mod activity;
+pub(super) mod card_stack;
+mod command_review;
+mod conversation;
 mod fade;
 pub(crate) use actions::Action;
 pub(in crate::workspace::terminal_agent) mod handoff;
@@ -25,16 +28,18 @@ pub(in crate::workspace) use log_table::{
 };
 pub(in crate::workspace) mod pip;
 mod placement;
+mod plan_execution;
 mod presentation;
 mod runs;
 mod sample;
 mod status;
+mod timeline;
 mod tmux;
 mod toast;
 
 impl Run {
-    fn has_tmux_dock(&self) -> bool {
-        self.design.history == History::Tmux
+    fn has_history_dock(&self) -> bool {
+        placement::history_slot(self.design.history).is_some()
             && self.design.arrangement != Arrangement::PictureInPicture
             && self.has_terminal_presentation()
             && !self.closing
@@ -46,6 +51,7 @@ pub(crate) use activity::Change as ActivityChange;
 pub(in crate::workspace) use activity::Height;
 pub(super) use activity::controls as activity_controls;
 use activity::fitted_activity_height;
+pub(crate) use command_review::ReviewAction as PanelReviewAction;
 pub(in crate::workspace) use placement::{
     DockExtents, DockPlacement, DockPreferences, Slot, compose, status_slot,
 };
@@ -56,7 +62,6 @@ pub(super) use presentation::{Presentation, Usage};
 pub(in crate::workspace) use sample::{
     Action as SampleAction, Grid as SampleGrid, Sample, View as SampleView,
 };
-pub(crate) use tmux::ReviewAction as TmuxReviewAction;
 
 pub(in crate::workspace) const AUTO_HIDE_SECONDS: std::ops::RangeInclusive<u8> = 0..=60;
 pub(in crate::workspace) const DEFAULT_AUTO_HIDE_SECONDS: u8 = 6;
@@ -232,7 +237,7 @@ fn history_panel<'a>(
     palette: Option<Palette>,
     reduced_motion: bool,
     owner: (&'a State, window::Id),
-    tmux_review: Option<tmux::Review>,
+    panel_review: Option<command_review::Review>,
 ) -> Element<'a, AgentMessage> {
     let (phase, _) = status::phase(run);
     let activity = history_with_steps(
@@ -241,7 +246,7 @@ fn history_panel<'a>(
         reduced_motion,
         log_table::Surface::Pane,
         owner,
-        tmux_review,
+        panel_review,
     );
     let controls = controls(run, owner.0.has_archived_activity(run));
     let body = history_body(activity, controls, run.design.approval);
@@ -271,7 +276,7 @@ fn history_with_steps<'a>(
     reduced_motion: bool,
     surface: log_table::Surface,
     owner: (&'a State, window::Id),
-    tmux_review: Option<tmux::Review>,
+    panel_review: Option<command_review::Review>,
 ) -> Element<'a, AgentMessage> {
     if run.presentation.step_list_open {
         let surface = if surface == log_table::Surface::Detached {
@@ -287,7 +292,7 @@ fn history_with_steps<'a>(
             reduced_motion,
             surface,
             Some(owner),
-            tmux_review,
+            panel_review,
         )
     }
 }
@@ -339,6 +344,16 @@ fn adaptive_timeline<'a>(
 }
 
 impl State {
+    pub(in crate::workspace) fn close_status_run_menus(&mut self, session: SessionId, stream: u64) {
+        for run in self.runs.values_mut().filter(|run| {
+            run.binding
+                .live()
+                .is_ok_and(|source| source.session == session && source.stream == stream)
+        }) {
+            run.presentation.close_status_run_menu();
+        }
+    }
+
     pub(super) fn agent_activity_for_stream(
         &self,
         session: SessionId,
@@ -420,10 +435,10 @@ fn pane_status<'a>(
     palette: Option<Palette>,
     now: Instant,
     reduced_motion: bool,
-    agents: &State,
+    agents: &'a State,
 ) -> Option<Element<'a, Desktop>> {
     (status != Status::Hidden).then(|| {
-        status::view(run, status, palette, now, reduced_motion, agents)
+        status::view(run, status, palette, now, reduced_motion, (agents, id))
             .map(move |message| Desktop::TerminalAgent(id, message))
     })
 }
@@ -525,8 +540,30 @@ impl Workspace {
         {
             return None;
         }
-        let (transcript, _) = run.status_transcript()?;
+        let (transcript, started) = run.status_transcript()?;
         let interval = match run.design.history {
+            History::CardStack => card_stack::refresh_interval(
+                transcript,
+                &run.presentation,
+                run.active(),
+                now,
+                reduced_motion,
+            ),
+            History::Timeline => timeline::refresh_interval(
+                transcript,
+                &run.presentation,
+                now,
+                run.active() && !run.paused && !run.cancel.requested(),
+                reduced_motion,
+            ),
+            History::PlanExecution => plan_execution::refresh_interval(
+                transcript,
+                &run.presentation,
+                now,
+                run.active() && !run.cancel.requested(),
+                run.active() && !run.paused && !run.cancel.requested(),
+                reduced_motion,
+            ),
             History::LogTable => run.presentation.log_table.refresh_interval(
                 transcript,
                 now,
@@ -537,6 +574,20 @@ impl Workspace {
             History::Tmux => {
                 tmux::refresh_interval(transcript, &run.presentation, now, reduced_motion)
             }
+            History::Conversation => conversation::entrance_interval(
+                transcript,
+                Some(started),
+                run.presentation.review_started,
+                now,
+                reduced_motion,
+            )
+            .or_else(|| {
+                conversation::refresh_interval(
+                    transcript,
+                    run.conversation_pending(),
+                    reduced_motion,
+                )
+            }),
             _ => None,
         }?;
         if run.runs_in_chat_tab()
@@ -553,8 +604,7 @@ impl Workspace {
         if self.placed_dialog_owner(id).is_some() {
             return Some(interval);
         }
-        if run.presentation.step_list_open || (run.has_tmux_dock() && run.presentation.tmux_hidden)
-        {
+        if run.presentation.step_list_open || run.presentation.dock_hidden {
             return None;
         }
         let source = run.binding.live().ok()?;
@@ -600,33 +650,37 @@ impl Workspace {
         if let Some(id) = self.agent_status_target(owner)
             && let Some(run) = self.terminal_agents.runs.get_mut(&id)
         {
-            run.presentation.status_visibility.toggle(
-                self.window_settings.agent_status_auto_hide_seconds(),
-                Instant::now(),
-                !self.window_settings.agent_animations(),
-            );
+            if run.presentation.log_table.close_status_run_menu() {
+                run.presentation.status_visibility.hide();
+            } else {
+                run.presentation.status_visibility.toggle(
+                    self.window_settings.agent_status_auto_hide_seconds(),
+                    Instant::now(),
+                    !self.window_settings.agent_animations(),
+                );
+            }
         }
     }
 
-    fn agent_tmux_target(&self, owner: window::Id) -> Option<window::Id> {
+    fn agent_history_target(&self, owner: window::Id) -> Option<window::Id> {
         let session = self.windows.get(&owner)?.tab()?.focused_session()?;
         let stream = self.sessions.get(&session)?.stream_generation;
         let (id, run) = self
             .terminal_agents
             .agent_activity_for_stream(session, stream)?;
-        (run.has_tmux_dock() && self.current_run_pane(run).is_ok()).then_some(id)
+        (run.has_history_dock() && self.current_run_pane(run).is_ok()).then_some(id)
     }
 
-    pub(in crate::workspace) fn agent_tmux_available(&self, owner: window::Id) -> bool {
-        self.agent_tmux_target(owner).is_some()
+    pub(in crate::workspace) fn agent_history_available(&self, owner: window::Id) -> bool {
+        self.agent_history_target(owner).is_some()
     }
 
-    pub(in crate::workspace) fn toggle_agent_tmux(&mut self, owner: window::Id) {
-        if let Some(id) = self.agent_tmux_target(owner)
+    pub(in crate::workspace) fn toggle_agent_history(&mut self, owner: window::Id) {
+        if let Some(id) = self.agent_history_target(owner)
             && let Some(run) = self.terminal_agents.runs.get_mut(&id)
         {
             run.presentation
-                .set_tmux_hidden(!run.presentation.tmux_hidden);
+                .set_dock_hidden(!run.presentation.dock_hidden);
         }
     }
 
@@ -649,7 +703,7 @@ impl Workspace {
         let current = self.terminal_agents.runs.get(&id).and_then(|run| {
             if run.swarm
                 || run.closing
-                || (run.has_tmux_dock() && run.presentation.tmux_hidden)
+                || run.presentation.dock_hidden
                 || run.design.arrangement != Arrangement::Normal
                 || dock.history_slot(run.design) != Some(resize.side)
                 || !matches!(resize.side, Slot::Left | Slot::Right | Slot::Bottom)
@@ -729,14 +783,18 @@ impl Workspace {
         let now = Instant::now();
         let seconds = self.window_settings.agent_status_auto_hide_seconds();
         let visibility = &run.presentation.status_visibility;
-        let status_opacity = visibility.opacity(seconds, now, reduced_motion);
+        let status_opacity = if run.presentation.log_table.status_run_menu_open(status_kind) {
+            Some(1.0)
+        } else {
+            visibility.opacity(seconds, now, reduced_motion)
+        };
         let chooser = || agents.run_picker(id, run);
         let picture_in_picture = run.design.arrangement == Arrangement::PictureInPicture;
         let dock = self.window_settings.ai_agent_panel;
         let history_position = dock
             .history_slot(run.design)
-            .filter(|_| !run.has_tmux_dock() || !run.presentation.tmux_hidden);
-        let tmux_review = self.tmux_review(id, run);
+            .filter(|_| !run.presentation.dock_hidden);
+        let panel_review = self.panel_review(id, run, None);
         let activity = &run.presentation.activity;
         let bottom_height = fitted_activity_height(
             bounds.height,
@@ -788,7 +846,7 @@ impl Workspace {
                             palette,
                             reduced_motion,
                             (agents, id),
-                            tmux_review,
+                            panel_review,
                         )
                         .map(move |message| Desktop::TerminalAgent(id, message)),
                     );
@@ -801,7 +859,7 @@ impl Workspace {
                 palette,
                 reduced_motion,
                 (agents, id),
-                tmux_review,
+                panel_review,
             )
             .map(move |message| Desktop::TerminalAgent(id, message));
             if run.design.arrangement != Arrangement::Normal
@@ -894,8 +952,26 @@ impl Workspace {
                 bottom: Some(bottom_height),
             },
         );
-        if picture_in_picture {
-            pip::decorate(agents, id, run, terminal, reduced_motion, palette)
+        let terminal = if picture_in_picture {
+            pip::decorate(
+                agents,
+                id,
+                run,
+                terminal,
+                reduced_motion,
+                palette,
+                panel_review,
+            )
+        } else {
+            terminal
+        };
+        if let Some(offer) = handoff::terminal_bar(run) {
+            column![
+                container(terminal).width(Length::Fill).height(Length::Fill),
+                offer.map(move |message| Desktop::TerminalAgent(id, message)),
+            ]
+            .height(Length::Fill)
+            .into()
         } else {
             terminal
         }
