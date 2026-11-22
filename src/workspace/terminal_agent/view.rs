@@ -77,6 +77,11 @@ impl Run {
         if self.binding.private() {
             page = page.push(text("Private run. Activity is kept in memory.").size(13));
         }
+        if let Some(context) =
+            super::sent_context::view(self, super::sent_context::Surface::Activity)
+        {
+            page = page.push(context);
+        }
         let show_directory = self.phase == Phase::Setup
             && matches!(self.mode, Mode::Run | Mode::Plan)
             || self.phase == Phase::DirectoryConfirmation

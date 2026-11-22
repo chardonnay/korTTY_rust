@@ -331,7 +331,13 @@ pub(super) fn view<'a>(
     if let Some(usage) = super::usage_label(activity, palette) {
         ticker = ticker.push(usage);
     }
-    if let Some(controls) = super::bar_controls(trace, has_archive, activity.presentation.drawer) {
+    if let Some(controls) = super::bar_controls(
+        trace,
+        has_archive,
+        activity.presentation.drawer_open(),
+        false,
+        super::Message::ToggleDrawer,
+    ) {
         ticker = ticker.push(controls);
     }
     palette::scope(

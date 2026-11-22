@@ -1,13 +1,12 @@
 //! Status modules expose existing run actions without creating approvals.
 
-use std::f32::consts::TAU;
 use std::time::{Duration, Instant};
 
 use iced::widget::{Row, button, column, container, progress_bar, row, scrollable, text, tooltip};
-use iced::{Alignment, Element, Length, window};
+use iced::{Alignment, Element, Font, Length, window};
 
 use crate::terminal_agent::design::Status;
-use crate::terminal_agent::design::inline::{State, Step, StepState, Transcript};
+use crate::terminal_agent::design::inline::{self, Kind, Role, State, Step, StepState, Transcript};
 
 use super::super::{Message as AgentMessage, Phase};
 use super::{
@@ -18,12 +17,21 @@ use super::{
     toast,
 };
 
+pub(super) mod hud;
 mod meter;
 mod metro;
+pub(super) mod minimap;
 mod neon;
+mod orbit;
+pub(super) mod powerline;
+pub(super) mod top_bar;
+use meter::Tone;
 pub(super) use meter::adaptive_countdown;
-use meter::{Ring, Tone};
 
+const STEP_SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const STEP_FRAME_MS: u64 = 100;
+
+#[derive(Clone, Copy)]
 pub(super) struct Trace<'a> {
     run: Option<&'a Run>,
     started_at: Option<Instant>,
@@ -37,6 +45,7 @@ pub(super) struct Trace<'a> {
     paused: bool,
     tone: Tone,
     reduced_motion: bool,
+    opacity: f32,
     now: Instant,
 }
 
@@ -73,6 +82,7 @@ impl<'a> Trace<'a> {
                 _ => Tone::Active,
             },
             reduced_motion,
+            opacity: 1.0,
             now,
         }
     }
@@ -100,8 +110,14 @@ impl<'a> Trace<'a> {
                 _ => Tone::Active,
             },
             reduced_motion,
+            opacity: 1.0,
             now,
         }
+    }
+
+    pub(super) fn opacified(mut self, opacity: f32) -> Self {
+        self.opacity = opacity;
+        self
     }
 
     fn step(&self, id: u64) -> Option<&Step> {
@@ -142,6 +158,28 @@ impl<'a> Trace<'a> {
         let seconds = self.elapsed.as_secs();
         format!("{}:{:02}", seconds / 60, seconds % 60)
     }
+
+    fn spinner(&self) -> Option<&'static str> {
+        (self.active && !self.paused && !self.reduced_motion).then(|| {
+            let frame = self.animation_age.as_millis() / u128::from(STEP_FRAME_MS);
+            STEP_SPINNER[(frame % STEP_SPINNER.len() as u128) as usize]
+        })
+    }
+}
+
+pub(super) fn step_interval(steps: &[Step], active: bool, still: bool) -> Option<u64> {
+    (active
+        && steps.iter().any(|step| {
+            step.state == StepState::Running && matches!(step.kind, Kind::Action | Kind::Thinking)
+        }))
+    .then_some(if still { 1000 } else { STEP_FRAME_MS })
+}
+
+pub(super) fn drawer_uses_typed_list(status: Status) -> bool {
+    matches!(
+        status,
+        Status::Metro | Status::Spotlight | Status::Toasts | Status::Orbit
+    )
 }
 
 pub(super) fn phase(run: &Run) -> (&'static str, usize) {
@@ -184,62 +222,16 @@ pub(super) fn phase(run: &Run) -> (&'static str, usize) {
     }
 }
 
-fn station(
-    run: history::Activity<'_>,
-    index: usize,
-    palette: Option<Palette>,
-) -> Element<'_, AgentMessage> {
-    let selected = run.presentation.selection(run.activity.len()) == index;
-    let marker = if selected { "●" } else { "○" };
-    let color = palette.map(|palette| {
-        if selected {
-            palette.accent.color()
-        } else {
-            palette.muted.color()
-        }
-    });
-    let station = tooltip(
-        button(
-            text(format!("{marker} {}", index + 1))
-                .size(13)
-                .style(move |_| text::Style { color }),
-        )
-        .style(button::text)
-        .on_press(AgentMessage::Design(Message::Select(
-            run.presentation.identity(index),
-        ))),
-        container(
-            text(
-                run.activity
-                    .get(index)
-                    .map_or("No activity yet.", String::as_str),
-            )
-            .size(12),
-        )
-        .padding(7)
-        .max_width(420)
-        .style(container::bordered_box),
-        tooltip::Position::Left,
-    )
-    .into();
-    run.step_context(
-        index,
-        Surface::Minimap(run.presentation.identity(index)),
-        station,
-    )
-}
-
 pub(super) fn view<'a>(
     run: &'a Run,
     status: Status,
     palette: Option<Palette>,
-    now: Instant,
-    reduced_motion: bool,
+    (now, reduced_motion, opacity): (Instant, bool, f32),
     owner: (&'a super::State, window::Id),
 ) -> Element<'a, AgentMessage> {
     let (agents, _) = owner;
     let has_archive = agents.has_archived_activity(run);
-    let mut trace = Trace::live(run, now, reduced_motion);
+    let mut trace = Trace::live(run, now, reduced_motion).opacified(opacity);
     if status == Status::Metro {
         trace.active_runs = agents.active_metro_runs(run);
     }
@@ -253,7 +245,7 @@ pub(super) fn view<'a>(
         status,
         palette,
         has_archive,
-        || super::controls(run, has_archive),
+        move || super::controls(run, has_archive),
     )
 }
 
@@ -264,7 +256,7 @@ pub(super) fn render<'a>(
     status: Status,
     palette: Option<Palette>,
     has_archive: bool,
-    controls: impl Fn() -> Element<'a, AgentMessage>,
+    controls: impl Fn() -> Element<'a, AgentMessage> + 'a,
 ) -> Element<'a, AgentMessage> {
     let accent = palette.map(|palette| palette.accent.color());
     let heading_color = if matches!(trace.tone, Tone::Stopped) {
@@ -290,87 +282,13 @@ pub(super) fn render<'a>(
         .wrap()
         .into(),
         Status::Metro => metro::view(run, phase, &trace, palette, has_archive),
-        Status::Minimap => {
-            let mut rail = column![text(phase).size(11).style(heading_style)].spacing(2);
-            if let Some(usage) = usage_label(run, palette) {
-                rail = rail.push(usage);
-            }
-            for index in 0..run.activity.len() {
-                rail = rail.push(station(run, index, palette));
-            }
-            let rail = run_context(
-                column![
-                    scrollable(rail).height(Length::Fill),
-                    button("Activity")
-                        .style(button::text)
-                        .on_press(AgentMessage::Focus),
-                ]
-                .spacing(3)
-                .into(),
-            );
-            return if palette.is_some() {
-                palette::panel(palette, container(rail))
-            } else {
-                rail
-            };
+        Status::Minimap => return minimap::view(run, trace, phase, palette),
+        Status::Powerline => {
+            return powerline::view(run, phase, trace, palette, has_archive, controls);
         }
-        Status::Powerline => row![
-            container(text(" AGENT ").size(12))
-                .padding(4)
-                .style(container::rounded_box),
-            text("❯").size(15),
-            text(phase).size(12).style(heading_style),
-            text("❯").size(15),
-            text(format!("{} activities", run.activity.len())).size(12),
-            button(if run.presentation.drawer {
-                "Close details"
-            } else {
-                "Details"
-            })
-            .style(button::text)
-            .on_press(toggle()),
-        ]
-        .spacing(5)
-        .align_y(Alignment::Center)
-        .wrap()
-        .into(),
-        Status::TopBar => row![
-            text(format!("Agent · {phase}"))
-                .size(13)
-                .style(heading_style),
-            button(if run.presentation.drawer {
-                "Close drawer"
-            } else {
-                "Open drawer"
-            })
-            .style(button::text)
-            .on_press(toggle()),
-            button("Activity window")
-                .style(button::text)
-                .on_press(AgentMessage::Focus),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center)
-        .wrap()
-        .into(),
+        Status::TopBar => return top_bar::view(run, phase, trace, palette, has_archive, controls),
         Status::Neon => neon::view(run, phase, &trace, palette, has_archive),
-        Status::Hud => column![
-            text(format!("Agent · {phase}"))
-                .size(14)
-                .style(heading_style),
-            text(history::summary(run.goal)).size(12),
-            text(
-                run.activity
-                    .back()
-                    .map_or_else(String::new, |entry| history::summary(entry))
-            )
-            .size(12),
-            button("Show activity")
-                .style(button::text)
-                .on_press(toggle()),
-        ]
-        .spacing(5)
-        .into(),
+        Status::Hud => return hud::view(run, phase, &trace, palette, has_archive, controls),
         Status::Spotlight => {
             let (finished, total) = trace.progress();
             button(
@@ -483,57 +401,14 @@ pub(super) fn render<'a>(
             }
             cards.into()
         }
-        Status::Orbit => {
-            let (finished, total) = trace.progress();
-            let fraction = if matches!(trace.tone, Tone::Finished | Tone::Stopped) {
-                1.0
-            } else if total == 0 {
-                0.0
-            } else {
-                finished as f32 / total as f32
-            };
-            let orbit = (trace.active && !trace.waiting).then(|| {
-                if trace.reduced_motion || trace.paused {
-                    0.0
-                } else {
-                    trace.animation_age.as_secs_f32() % 1.6 / 1.6 * TAU
-                }
-            });
-            let glyph = meter::graphic(
-                72.0,
-                Ring {
-                    fraction,
-                    orbit,
-                    tone: trace.tone,
-                },
-                column![
-                    text(format!("{finished}/{total}")).size(13),
-                    text(trace.elapsed_label()).size(11),
-                ]
-                .align_x(Alignment::Center)
-                .into(),
-            );
-            button(
-                row![
-                    glyph,
-                    text(trace.current_label(phase))
-                        .size(12)
-                        .style(heading_style)
-                ]
-                .spacing(5)
-                .align_y(Alignment::Center),
-            )
-            .style(button::secondary)
-            .on_press(toggle())
-            .into()
-        }
+        Status::Orbit => return orbit::view(run, phase, trace, palette, has_archive, controls),
     };
-    let header = if matches!(status, Status::Pill | Status::Spotlight | Status::Orbit) {
+    let header = if matches!(status, Status::Pill | Status::Spotlight) {
         run_context(header)
     } else {
         header
     };
-    let drawer = run.presentation.drawer;
+    let drawer = run.presentation.drawer_open();
     let has_own_controls = matches!(status, Status::Metro | Status::Neon);
     if has_own_controls && !drawer {
         return header;
@@ -549,10 +424,7 @@ pub(super) fn render<'a>(
     }
     .spacing(5);
     if drawer && !simple {
-        if matches!(
-            status,
-            Status::Metro | Status::Spotlight | Status::Toasts | Status::Orbit
-        ) {
+        if drawer_uses_typed_list(status) {
             panel = panel.push(trace_drawer(
                 &trace,
                 run.presentation.selected_step,
@@ -580,13 +452,38 @@ pub(super) fn render<'a>(
     palette::panel(palette, container(panel).padding(5))
 }
 
-pub(super) fn step_list(run: &Run, surface: Surface) -> Element<'_, AgentMessage> {
+pub(super) fn step_list(
+    run: &Run,
+    surface: Surface,
+    reduced_motion: bool,
+) -> Element<'_, AgentMessage> {
     trace_drawer(
-        &Trace::live(run, Instant::now(), true),
+        &Trace::live(run, Instant::now(), reduced_motion),
         run.presentation.selected_step,
         Length::Fill,
         surface,
     )
+}
+
+fn step_metadata(step: &Step, now: Instant) -> Option<String> {
+    if step.state == StepState::Running && matches!(step.kind, Kind::Action | Kind::Thinking) {
+        return Some(step.elapsed_at(now).map_or_else(
+            || "Running".into(),
+            |elapsed| format!("Running {} s", elapsed / 1000),
+        ));
+    }
+    match step.kind {
+        Kind::Action => Some(step.exit_code.map_or_else(
+            || super::log_table::state_label(step).into(),
+            |code| match step.output.len() {
+                0 => format!("Exit {code}"),
+                1 => format!("Exit {code} · 1 line"),
+                lines => format!("Exit {code} · {lines} lines"),
+            },
+        )),
+        Kind::Thinking => step.tokens.map(|tokens| format!("{tokens} tokens")),
+        _ => None,
+    }
 }
 
 fn trace_drawer<'a>(
@@ -600,9 +497,49 @@ fn trace_drawer<'a>(
         .or_else(|| trace.steps.last());
     let mut rows = column![].spacing(3);
     for step in trace.steps {
-        let label = history::summary(&step.title);
+        let symbol = inline::marker(
+            step,
+            trace.spinner().unwrap_or(if step.kind == Kind::Thinking {
+                "◇"
+            } else {
+                "›"
+            }),
+        );
+        let marker_style =
+            |role| move |theme: &iced::Theme| super::plan_execution::marker_style(theme, role);
+        let title = step.command.as_deref().unwrap_or(&step.title);
+        let label = text(history::summary(title))
+            .font(if step.command.is_some() {
+                Font::MONOSPACE
+            } else {
+                Font::DEFAULT
+            })
+            .size(12)
+            .wrapping(text::Wrapping::None);
+        let mut contents = row![
+            text(symbol.text)
+                .size(12)
+                .width(14)
+                .style(marker_style(symbol.role)),
+            container(label).width(Length::Fill).clip(true),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center)
+        .clip(true);
+        if let Some(metadata) = step_metadata(step, trace.now) {
+            contents = contents.push(
+                container(
+                    text(metadata)
+                        .size(11)
+                        .wrapping(text::Wrapping::None)
+                        .style(marker_style(Role::Muted)),
+                )
+                .max_width(148)
+                .clip(true),
+            );
+        }
         let chosen = selected.is_some_and(|selected| selected.id == step.id);
-        let row = button(text(label).size(12))
+        let row = button(contents)
             .width(Length::Fill)
             .style(if chosen {
                 button::secondary
@@ -652,8 +589,16 @@ fn bar_controls<'a>(
     trace: &Trace<'a>,
     has_archive: bool,
     drawer: bool,
+    compact: bool,
+    toggle: Message,
 ) -> Option<Row<'a, AgentMessage>> {
     let run = trace.run?;
+    let details = || {
+        button(if drawer { "Close details" } else { "Details" })
+            .padding(3)
+            .style(button::text)
+            .on_press(AgentMessage::Design(toggle))
+    };
     let mut controls = row![].spacing(6).align_y(Alignment::Center);
     if trace.waiting {
         controls = controls.push(
@@ -662,6 +607,9 @@ fn bar_controls<'a>(
                 .padding(3)
                 .on_press(AgentMessage::Focus),
         );
+    }
+    if compact {
+        controls = controls.push(details());
     }
     for (label, title, message) in [
         (
@@ -680,6 +628,9 @@ fn bar_controls<'a>(
             Some(super::actions::hide_status(run)),
         ),
     ] {
+        if compact && message.is_none() {
+            continue;
+        }
         controls = controls.push(tooltip(
             button(label)
                 .style(button::text)
@@ -692,14 +643,10 @@ fn bar_controls<'a>(
     if let Some(menu) = super::actions::run_menu(run, has_archive) {
         controls = controls.push(menu);
     }
-    Some(
-        controls.push(
-            button(if drawer { "Close details" } else { "Details" })
-                .padding(3)
-                .style(button::text)
-                .on_press(AgentMessage::Design(Message::ToggleDrawer)),
-        ),
-    )
+    if !compact {
+        controls = controls.push(details());
+    }
+    Some(controls)
 }
 
 #[cfg(test)]
@@ -737,5 +684,46 @@ mod tests {
         let trace = Trace::sample(&transcript, now, now, true);
         assert_eq!(trace.progress(), (2, 2));
         assert_eq!(trace.current_label("Failed"), "Failed");
+    }
+
+    #[test]
+    fn step_rows_use_measured_results_elapsed_time_and_reported_tokens() {
+        let now = Instant::now();
+        let mut step = Step {
+            kind: Kind::Action,
+            started_at: Some(now),
+            state: StepState::Running,
+            ..Step::default()
+        };
+        let later = now + Duration::from_millis(3_250);
+        assert_eq!(step_metadata(&step, later).as_deref(), Some("Running 3 s"));
+        assert_eq!(
+            step_interval(std::slice::from_ref(&step), true, false),
+            Some(100)
+        );
+        assert_eq!(
+            step_interval(std::slice::from_ref(&step), true, true),
+            Some(1000)
+        );
+        step.state = StepState::Failed;
+        step.exit_code = Some(7);
+        step.output = vec!["One".into(), "Two".into()];
+        assert_eq!(
+            step_metadata(&step, later).as_deref(),
+            Some("Exit 7 · 2 lines")
+        );
+        assert_eq!(
+            step_interval(std::slice::from_ref(&step), true, false),
+            None
+        );
+        step.kind = Kind::Thinking;
+        step.exit_code = None;
+        step.state = StepState::Completed;
+        assert_eq!(step_metadata(&step, later), None);
+        step.tokens = Some(0);
+        assert_eq!(step_metadata(&step, later).as_deref(), Some("0 tokens"));
+        step.kind = Kind::Question;
+        step.state = StepState::Running;
+        assert_eq!(step_metadata(&step, later), None);
     }
 }

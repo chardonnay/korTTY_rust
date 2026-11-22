@@ -131,6 +131,22 @@ impl Engine {
             &mut ClipMask::new(&mut mask),
             bounds * offset,
         );
+        if let Some(ellipse) = group.ellipse {
+            let local = ellipse * (offset * transformation);
+            let Some(path) = tiny_skia::Rect::from_xywh(local.x, local.y, local.width, local.height)
+                .and_then(tiny_skia::PathBuilder::from_oval)
+            else {
+                return;
+            };
+            mask.clear();
+            mask.fill_path(
+                &path,
+                tiny_skia::FillRule::Winding,
+                true,
+                tiny_skia::Transform::identity(),
+            );
+            layer.apply_mask(&mask);
+        }
         pixels.draw_pixmap(
             x as i32,
             y as i32,

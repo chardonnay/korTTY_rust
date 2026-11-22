@@ -256,7 +256,7 @@ pub(crate) use memory::learning::{
     MAX_RULE_CHARACTERS, RuleProposal, SavedRule, normalized_length as rule_normalized_length,
     preview as review_memory_rule,
 };
-pub(crate) use memory::prompt::MemoryPrompt;
+pub(crate) use memory::prompt::{MemoryPrompt, Origin as MemoryOrigin};
 #[cfg(test)]
 pub(crate) use profiles::Message as ProfileMessageForTest;
 pub(crate) use skills::statistics::Surface as SkillUsageSurface;
@@ -3727,6 +3727,10 @@ impl Dialog {
         let wizard = self.profile_wizard_open();
         let editable = self.editable() && self.profile_form_lock().is_none();
         search::results(&self.search, self.profiles.searchable_profile())
+            .chain(search::imported_model_results(
+                &self.search,
+                &self.saved.java_model_hints,
+            ))
             .filter(move |_| !wizard)
             .chain(search::matching(
                 &self.search,
@@ -3748,6 +3752,9 @@ impl Dialog {
             );
         }
         match target {
+            search::Target::Setting(search::Setting::ImportedJavaModel(key)) => {
+                self.saved.java_model_hints.search_hint(key).is_some()
+            }
             search::Target::Setting(search::Setting::ImportedGeneral(setting)) => {
                 use search::ImportedGeneral;
                 match setting {
@@ -3845,9 +3852,9 @@ impl Dialog {
             self.revealed.setting = Some(setting);
             if matches!(
                 setting,
-                search::Setting::Control(
-                    search::Control::CloseRuntimeRepair | search::Control::InstallRuntime
-                )
+                search::Setting::Control(control)
+                    if control.runtime_progress()
+                        || matches!(control, search::Control::CloseRuntimeRepair | search::Control::InstallRuntime)
             ) {
                 return Task::none();
             }
@@ -3874,6 +3881,7 @@ impl Dialog {
                 | search::Setting::SkillProvider(_)
                 | search::Setting::ProfileAction(_)
                 | search::Setting::ImportedGeneral(_)
+                | search::Setting::ImportedJavaModel(_)
                 | search::Setting::Embedding
                 | search::Setting::LocalPreference(_),
             ) => true,
@@ -3881,7 +3889,9 @@ impl Dialog {
                 setting.needs_active_review()
             }
             search::Target::Setting(search::Setting::Control(control)) => {
-                control.contextual_memory() || control.contextual_skill()
+                control.contextual_memory()
+                    || control.contextual_skill()
+                    || control.contextual_runtime()
             }
             _ => false,
         };
@@ -3909,13 +3919,13 @@ impl Dialog {
         {
             self.local.reveal_knowledge_store(&self.local_state);
         }
-        let scroll = if self.revealed.setting.is_some() {
-            self.revealed.apply()
-        } else {
-            iced::widget::operation::snap_to(
+        let scroll = match self.revealed.setting {
+            Some(search::Setting::Control(control)) if control.runtime_progress() => Task::none(),
+            Some(_) => self.revealed.apply(),
+            None => iced::widget::operation::snap_to(
                 self.revealed.viewport.clone(),
                 iced::widget::operation::RelativeOffset::START,
-            )
+            ),
         };
         if let Some(search::Setting::Managed(setting)) = self.revealed.setting {
             let load = self.local.reveal_managed_setting(setting, self.editable());
@@ -3933,6 +3943,7 @@ impl Dialog {
                 search::Setting::Profile(search::ProfileSetting::Web(_))
                     | search::Setting::ProfileAction(_)
                     | search::Setting::ImportedGeneral(_)
+                    | search::Setting::ImportedJavaModel(_)
                     | search::Setting::LocalPreference(
                         search::LocalPreference::RuntimeUpdatePolicy
                             | search::LocalPreference::RuntimeBackend
@@ -3945,7 +3956,8 @@ impl Dialog {
         ) {
             return scroll;
         }
-        if matches!(self.revealed.setting, Some(search::Setting::Control(control)) if control.contextual_memory())
+        if matches!(self.revealed.setting, Some(search::Setting::Control(control))
+            if control.contextual_memory() || control.contextual_runtime())
         {
             return scroll;
         }
@@ -3985,7 +3997,6 @@ impl Dialog {
                             | search::Control::CheckRuntimeOnline
                             | search::Control::RuntimeOnlineChoice
                             | search::Control::DownloadRuntimeOnline
-                            | search::Control::DiscardRuntimeDownload
                     ))
                 ) =>
             {
@@ -5004,7 +5015,16 @@ impl Dialog {
         let mut results = column![text("Matching AI settings").size(17)].spacing(8);
         for (index, target) in matches {
             let selected = index == self.search_selection;
-            let result = button(text(target.label()).wrapping(text::Wrapping::WordOrGlyph))
+            let label = match target {
+                search::Target::Setting(search::Setting::ImportedJavaModel(key)) => self
+                    .saved
+                    .java_model_hints
+                    .search_hint(key)
+                    .map(|hint| format!("{} · {}", Page::LocalModels.title(), hint.label()))
+                    .unwrap_or_else(|| target.label()),
+                _ => target.label(),
+            };
+            let result = button(text(label).wrapping(text::Wrapping::WordOrGlyph))
                 .style(if selected {
                     button::primary
                 } else {

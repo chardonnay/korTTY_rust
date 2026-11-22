@@ -1533,7 +1533,19 @@ fn narrow_detached_log_table_scrolls_to_the_exact_step_and_keeps_actions_in_view
             &mut clipboard::Null,
             &mut messages,
         );
-        assert!(messages.is_empty());
+        let [Desktop::TerminalAgent(window, Message::PipOwned(owned, message))] =
+            messages.as_slice()
+        else {
+            panic!("scrolling should update the detached table's reading state");
+        };
+        assert_eq!((*window, *owned), (detached, id));
+        assert!(matches!(
+            message.as_ref(),
+            Message::Design(design::Message::LogTable(LogMessage::ReadingHistory(
+                Surface::Detached,
+                true
+            )))
+        ));
         let mut layout = LogTableLayout::default();
         ui.operate(&renderer, &mut layout);
         let (grid, offset) = layout.grid.unwrap();
@@ -1564,7 +1576,10 @@ fn narrow_detached_log_table_scrolls_to_the_exact_step_and_keeps_actions_in_view
             ui.into_cache(),
         )
     };
-    let [Desktop::TerminalAgent(window, Message::PipOwned(owned, message))] = messages.as_slice()
+    let [
+        _,
+        Desktop::TerminalAgent(window, Message::PipOwned(owned, message)),
+    ] = messages.as_slice()
     else {
         panic!("the row click should be routed through the detached run");
     };

@@ -4,8 +4,8 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::{Duration, Instant, SystemTime};
 
 use iced::widget::{
-    Id, button, canvas, column, container, mouse_area, responsive, row, scrollable, space, stack,
-    text, text_editor,
+    Id, button, canvas, column, container, keyed, mouse_area, responsive, row, scrollable, space,
+    stack, text, text_editor,
 };
 use iced::{Alignment, Color, Element, Font, Length, Padding, Point, Task, mouse};
 use jiff::{Timestamp, tz::TimeZone};
@@ -15,6 +15,7 @@ use crate::terminal_agent::design::Status;
 use crate::terminal_agent::design::inline::{
     Kind, Prompt, State as TranscriptState, Step, StepState, Transcript,
 };
+use crate::workspace::chrome::popup;
 
 use super::super::Message as AgentMessage;
 use super::{Palette, actions, history::Activity, presentation};
@@ -50,6 +51,7 @@ pub(crate) enum Surface {
     DetachedExecution,
     EarlierConversation(ConversationSurface, u64),
     Minimap(usize),
+    MinimapStep(u64),
     Toast,
     StatusRun(Status),
     StatusStepList,
@@ -66,7 +68,16 @@ pub(crate) enum ConversationSurface {
 
 impl Surface {
     fn is_table(self) -> bool {
-        matches!(self, Self::Activity | Self::Pane | Self::Detached)
+        self.table_index().is_some()
+    }
+
+    fn table_index(self) -> Option<usize> {
+        match self {
+            Self::Activity => Some(0),
+            Self::Pane => Some(1),
+            Self::Detached => Some(2),
+            _ => None,
+        }
     }
 
     pub(super) fn activity_entry(self, identity: usize) -> Self {
@@ -266,6 +277,7 @@ pub(crate) enum Message {
     Open(Row),
     Close,
     Latest,
+    ReadingHistory(Surface, bool),
     Sort(Column),
     ResizeColumns(Widths),
     OpenMenu(Surface, Option<Row>, Point),
@@ -305,6 +317,7 @@ pub(super) struct State {
     first_seen: Vec<(Row, Instant)>,
     approval: Option<Approval>,
     follow_revision: u64,
+    reading_history: [bool; 3],
     manual_widths: Option<Widths>,
     menu: Option<context::Menu>,
 }
@@ -348,6 +361,7 @@ impl Default for State {
             first_seen: Vec::new(),
             approval: None,
             follow_revision: 0,
+            reading_history: [false; 3],
             manual_widths: None,
             menu: None,
         }
@@ -369,19 +383,43 @@ impl State {
     }
 
     pub(super) fn status_run_menu_open(&self, status: Status) -> bool {
-        self.menu
-            .is_some_and(|menu| menu.surface == Surface::StatusRun(status))
+        if status == Status::Minimap {
+            self.minimap_menu_open()
+        } else {
+            self.menu
+                .is_some_and(|menu| menu.surface == Surface::StatusRun(status))
+        }
+    }
+
+    pub(super) fn minimap_menu_open(&self) -> bool {
+        self.menu.is_some_and(|menu| {
+            matches!(
+                menu.surface,
+                Surface::Minimap(_) | Surface::MinimapStep(_) | Surface::StatusRun(Status::Minimap)
+            )
+        })
     }
 
     pub(super) fn close_status_run_menu(&mut self) -> bool {
-        if self
-            .menu
-            .is_some_and(|menu| matches!(menu.surface, Surface::StatusRun(_)))
-        {
+        if self.menu.is_some_and(|menu| {
+            matches!(
+                menu.surface,
+                Surface::StatusRun(_) | Surface::Minimap(_) | Surface::MinimapStep(_)
+            )
+        }) {
             self.menu = None;
             true
         } else {
             false
+        }
+    }
+
+    pub(super) fn close_step_list_menu(&mut self) {
+        if self
+            .menu
+            .is_some_and(|menu| menu.surface == Surface::StatusStepList)
+        {
+            self.menu = None;
         }
     }
 
@@ -552,7 +590,13 @@ impl State {
                 self.selected = None;
                 self.detail = None;
                 self.sort = None;
+                self.reading_history = [false; 3];
                 self.follow_revision = self.follow_revision.saturating_add(1);
+            }
+            Message::ReadingHistory(surface, reading) => {
+                if let Some(index) = surface.table_index() {
+                    self.reading_history[index] = reading;
+                }
             }
             Message::Sort(column) => {
                 let ascending = !matches!(self.sort, Some((current, true)) if current == column);
@@ -625,6 +669,10 @@ impl State {
 
     fn row_id(&self, row: Row) -> Id {
         Id::from(format!("{:?}/log/{row:?}", self.viewport))
+    }
+
+    pub(super) fn detail_id(&self) -> Id {
+        Id::from(format!("{:?}/log/detail", self.viewport))
     }
 
     fn rows<'a>(&self, transcript: &'a Transcript, now: Instant) -> Vec<&'a Step> {
@@ -1081,6 +1129,7 @@ fn details<'a>(run: Activity<'a>, detail: Detail<'a>) -> Element<'a, AgentMessag
         ]
         .spacing(4),
     )
+    .id(table.detail_id())
     .width(Length::Fill)
     .padding(6)
     .style(container::bordered_box)
@@ -1100,6 +1149,13 @@ pub(super) fn has_approval(run: Activity<'_>) -> bool {
     run.presentation
         .log_table
         .approval(approval_revision(run))
+        .is_some()
+}
+
+pub(super) fn has_detail(run: Activity<'_>, transcript: &Transcript) -> bool {
+    run.presentation
+        .log_table
+        .detail(transcript, approval_revision(run))
         .is_some()
 }
 
@@ -1273,6 +1329,7 @@ fn table_view<'a>(
     let follow = state.selected.is_none()
         && state.sort.is_none()
         && (state.follow_revision != 0 || run.live_run.is_none_or(|run| !run.reopened_history));
+    let detail = state.detail(transcript, approval_revision);
     let table = scrollable(
         container(rows).padding(Padding::ZERO.right(SCROLLBAR_WIDTH).bottom(SCROLLBAR_WIDTH)),
     )
@@ -1285,31 +1342,47 @@ fn table_view<'a>(
     })
     .fixed_header(stack![headings, grips])
     .follow_bottom(follow, state.follow_revision)
+    .on_scroll(move |viewport| {
+        event(Message::ReadingHistory(
+            surface,
+            viewport.absolute_offset_reversed().y > 1.0,
+        ))
+    })
     .translate_cursor_moves(true)
     .width(Length::Fill)
-    .height(Length::FillPortion(2));
+    .height(Length::FillPortion(if detail.is_some() { 1 } else { 2 }));
     let table = if has_run_menu {
         context::anchor(table.into(), menu, surface, None, run_entries)
     } else {
-        table.into()
+        popup::without_menu(table.into())
     };
-    let detail = state
-        .detail(transcript, approval_revision)
-        .map(|detail| scrollable(details(run, detail)).height(Length::FillPortion(1)));
+    let detail =
+        detail.map(|detail| scrollable(details(run, detail)).height(Length::FillPortion(2)));
     let open = state.selected.filter(|row| match row {
         Row::Step(id) => transcript.steps.iter().any(|step| step.id == *id),
         Row::Approval(revision) => approval.is_some_and(|approval| approval.revision == *revision),
         Row::Answer => !transcript.final_answer.is_empty(),
     });
-    let review = (detail.is_none() && (open.is_some() || state.sort.is_some())).then(|| {
-        row![
-            open.map(|row| button("Open details").on_press(event(Message::Open(row)))),
-            latest(),
-        ]
-        .spacing(5)
-        .wrap()
-    });
-    column![super::command_review::card(run), table, review, detail]
+    let reading = surface
+        .table_index()
+        .is_some_and(|index| state.reading_history[index]);
+    let review =
+        (detail.is_none() && (reading || open.is_some() || state.sort.is_some())).then(|| {
+            row![
+                open.map(|row| button("Open details").on_press(event(Message::Open(row)))),
+                latest(),
+            ]
+            .spacing(5)
+            .wrap()
+        });
+    // The approval goes before the table, while the controls and details go after it.
+    // Keep the same table child when either part changes.
+    let grid = column![table, review, detail]
+        .height(Length::Fill)
+        .spacing(4);
+    keyed::Column::new()
+        .push_maybe("approval", super::command_review::card(run))
+        .push("table", grid)
         .height(Length::Fill)
         .spacing(4)
         .into()
@@ -1754,6 +1827,7 @@ mod tests {
         struct Position {
             viewport: Id,
             sample: Option<(f32, Vector)>,
+            latest_visible: bool,
         }
         impl Operation for Position {
             fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
@@ -1770,6 +1844,10 @@ mod tests {
                 if id == Some(&self.viewport) {
                     self.sample = Some((content.height - bounds.height, offset));
                 }
+            }
+
+            fn text(&mut self, _: Option<&Id>, _: Rectangle, content: &str) {
+                self.latest_visible |= content == "Latest activity";
             }
         }
 
@@ -1820,6 +1898,7 @@ mod tests {
             let mut position = Position {
                 viewport: viewport.clone(),
                 sample: None,
+                latest_visible: false,
             };
             ui.operate(renderer, &mut position);
             position.sample.expect("the log table has a viewport")
@@ -1863,11 +1942,56 @@ mod tests {
                 },
             ),
         );
+        let mut messages = Vec::new();
+        ui.update(
+            &[Event::Window(iced::window::Event::RedrawRequested(
+                Instant::now(),
+            ))],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        let action = messages.into_iter().find_map(|message| match message {
+            AgentMessage::Design(presentation::Message::LogTable(
+                action @ Message::ReadingHistory(Surface::Activity, true),
+            )) => Some(action),
+            _ => None,
+        });
         let cache = ui.into_cache();
+        presentation
+            .log_table
+            .update(action.expect("scrolling reports that older history is visible"));
+        presentation
+            .log_table
+            .update(Message::ReadingHistory(Surface::Detached, false));
         push(&mut transcript, 16);
         let mut ui = build(&presentation, &transcript, &activity, cache, &mut renderer);
         let (before_details, offset) = read(&mut ui, &renderer);
         assert_eq!(offset, Vector::new(65.0, 35.0));
+        let mut position = Position {
+            viewport: viewport.clone(),
+            sample: None,
+            latest_visible: false,
+        };
+        ui.operate(&renderer, &mut position);
+        assert!(position.latest_visible);
+        assert!(presentation.log_table.selected.is_none());
+        assert!(presentation.log_table.sort.is_none());
+
+        let cache = ui.into_cache();
+        transcript.prompt = Some(Prompt::Approval {
+            message: "Review the next command".into(),
+            commands: vec!["printf fixture".into()],
+            allow_always: false,
+            keyboard: true,
+        });
+        let mut ui = build(&presentation, &transcript, &activity, cache, &mut renderer);
+        assert_eq!(read(&mut ui, &renderer).1, Vector::new(65.0, 35.0));
+        let cache = ui.into_cache();
+        transcript.prompt = None;
+        let mut ui = build(&presentation, &transcript, &activity, cache, &mut renderer);
+        assert_eq!(read(&mut ui, &renderer).1, Vector::new(65.0, 35.0));
         ui.operate(
             &renderer,
             &mut operation::scrollable::scroll_to(
@@ -1894,6 +2018,9 @@ mod tests {
         let (latest, offset) = read(&mut ui, &renderer);
         assert_eq!(offset.x, 65.0);
         assert!((offset.y - latest).abs() < 0.51);
+        position.latest_visible = false;
+        ui.operate(&renderer, &mut position);
+        assert!(!position.latest_visible);
     }
 
     #[test]

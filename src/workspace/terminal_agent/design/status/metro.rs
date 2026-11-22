@@ -424,7 +424,13 @@ pub(super) fn view<'a>(
     if let Some(usage) = super::usage_label(activity, palette) {
         header = header.push(usage);
     }
-    if let Some(controls) = super::bar_controls(trace, has_archive, activity.presentation.drawer) {
+    if let Some(controls) = super::bar_controls(
+        trace,
+        has_archive,
+        activity.presentation.drawer_open(),
+        false,
+        Message::ToggleDrawer,
+    ) {
         header = header.push(controls.wrap());
     }
     palette::panel(

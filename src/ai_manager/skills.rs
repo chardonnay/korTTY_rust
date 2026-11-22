@@ -351,10 +351,11 @@ enum AutomaticSelection<'a> {
     Ranked(Vec<relevance::ScoredSkill<'a>>),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct IncludedSkill {
     id: u64,
     pinned: bool,
+    range: std::ops::Range<usize>,
 }
 
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -373,8 +374,20 @@ impl fmt::Debug for SkillGuidance {
 
 impl SkillGuidance {
     pub(crate) fn append(&mut self, additional: Self) {
+        let offset = self.text.len();
         self.text.push_str(&additional.text);
-        self.included.extend(additional.included);
+        self.included
+            .extend(additional.included.into_iter().map(|mut piece| {
+                piece.range.start += offset;
+                piece.range.end += offset;
+                piece
+            }));
+    }
+
+    pub(crate) fn pieces(&self) -> impl Iterator<Item = (u64, bool, &str)> {
+        self.included
+            .iter()
+            .map(|skill| (skill.id, skill.pinned, &self.text[skill.range.clone()]))
     }
 }
 
@@ -741,8 +754,13 @@ fn prompt<'a>(skills: impl Iterator<Item = (u64, &'a Skill, bool)>) -> SkillGuid
             )
         };
         if output.text.len() + addition.len() <= MAX_PROMPT_BYTES {
+            let start = output.text.len();
             output.text.push_str(&addition);
-            output.included.push(IncludedSkill { id, pinned });
+            output.included.push(IncludedSkill {
+                id,
+                pinned,
+                range: start..output.text.len(),
+            });
         }
     }
     output

@@ -129,7 +129,7 @@ pub(super) fn anchor<'a>(
     };
     let entries = entries(menu.page);
     if entries.is_empty() {
-        return trigger;
+        return popup::without_menu(trigger);
     }
     let current = menu.selected.min(entries.len() - 1);
     let buttons = entries.iter().enumerate().map(|(index, entry)| {

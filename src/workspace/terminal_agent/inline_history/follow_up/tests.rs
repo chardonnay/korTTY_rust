@@ -3,7 +3,7 @@ use crate::terminal_agent::usage::{Attempt, AttemptKind, AttemptOutcome};
 use crate::terminal_logging::{RedactionSecrets, Secrets};
 use crate::workspace::terminal_agent::{ProfileChoice, Purpose, RunSetup, binding, engine};
 
-use super::super::{MAX_STEPS, SessionId};
+use super::super::SessionId;
 use super::*;
 
 const SECRET: &str = "private-run-fixture-value";
@@ -155,8 +155,9 @@ fn newly_learned_password_is_remasked_before_clipping_the_stored_trace() {
 #[test]
 fn newest_complete_entries_fit_the_utf8_budget_in_chronological_order() {
     let mut run = run(false);
+    let recorded = 28;
     let long = "🧭".repeat(MAX_DETAIL_BYTES);
-    for index in 0..MAX_STEPS + 4 {
+    for index in 0..recorded {
         run.inline_decision(
             &engine::Action::Commands(Vec::new()),
             &format!("{index:02} {long}"),
@@ -165,10 +166,13 @@ fn newest_complete_entries_fit_the_utf8_budget_in_chronological_order() {
     }
     run.next(Phase::Blocked, "Check the terminal and try again.");
     run.notice = "Close another chat tab and try the handoff again.".into();
+    let (history, _) = run.status_transcript().unwrap();
+    assert_eq!(history.steps.len(), recorded);
+    assert!(history.steps[0].title.starts_with("00 "));
     let trace = run.follow_up_trace().unwrap();
     assert_eq!(trace.answer, "Check the terminal and try again.");
-    assert!(trace.steps.len() > 1 && trace.steps.len() < MAX_STEPS);
-    let first = MAX_STEPS + 4 - trace.steps.len();
+    assert!(trace.steps.len() > 1 && trace.steps.len() < recorded);
+    let first = recorded - trace.steps.len();
     for (index, step) in trace.steps.iter().enumerate() {
         assert!(step.title.starts_with(&format!("{:02} ", first + index)));
         assert!(step.title.ends_with('…') && step.detail.ends_with('…'));

@@ -865,19 +865,33 @@ impl Dialog {
             && self.runtime_removal.is_none();
         let repair = self.backend_repair.as_ref();
         match control {
+            CancelRuntimeRequest => self.runtime_request_active(),
+            PauseRuntimeDownload => self.runtime_request_active() && self.online.can_pause(),
             CloseRuntimeRepair => repair.is_some(),
             _ if repair.is_some_and(|repair| repair.installed) => false,
             SignedIndex | IndexSignature | RuntimePackage | InstallRuntime => true,
+            RemoveRuntime => repair.is_none() && self.runtime_removal.is_none(),
+            ConfirmRuntimeRemoval | CancelRuntimeRemoval => {
+                repair.is_none() && self.runtime_removal.is_some()
+            }
             CheckRuntimeOnline
             | RuntimeOnlineChoice
             | DownloadRuntimeOnline
-            | DiscardRuntimeDownload => self.online.has_search_control(
+            | DiscardRuntimeDownload
+            | KeepRuntimeDownload => self.online.has_search_control(
                 control,
                 online_enabled,
                 repair.map(|repair| repair.required),
             ),
             _ => repair.is_none(),
         }
+    }
+
+    fn runtime_request_active(&self) -> bool {
+        matches!(
+            self.request,
+            Some(Request::Runtime { .. } | Request::RuntimeRemovalReview { .. })
+        )
     }
 
     pub(super) fn runtime_removal_review_open(&self) -> bool {
@@ -2568,10 +2582,18 @@ impl Dialog {
         ai_enabled: bool,
         reveal: &Reveal,
     ) -> Element<'a, Message> {
-        use super::search::LocalPreference;
+        use super::search::{Control, LocalPreference, Setting};
 
         let can_edit = editable && self.request.is_none();
         let can_request = can_edit && ai_enabled;
+        let models_page = matches!(page, Page::Models(..));
+        let mark_progress = |control, content: Element<'a, Message>| {
+            if models_page && self.runtime_request_active() {
+                reveal.action(Setting::Control(control), content)
+            } else {
+                content
+            }
+        };
         let progress = row![
             self.status.as_ref().map(|status| {
                 container(scrollable(
@@ -2580,15 +2602,16 @@ impl Dialog {
                 .width(Length::Fill)
                 .max_height(48)
             }),
-            self.request
-                .as_ref()
-                .map(|_| button("Cancel request").on_press(Message::Cancel)),
-            (self.online.pause.is_some()
-                && self
-                    .online
-                    .progress
-                    .is_some_and(|progress| progress.resumable))
-            .then(|| button("Pause download").on_press(Message::PauseRuntimeDownload)),
+            self.request.as_ref().map(|_| mark_progress(
+                Control::CancelRuntimeRequest,
+                button("Cancel request").on_press(Message::Cancel).into()
+            )),
+            self.online.can_pause().then(|| mark_progress(
+                Control::PauseRuntimeDownload,
+                button("Pause download")
+                    .on_press(Message::PauseRuntimeDownload)
+                    .into(),
+            )),
             self.online.progress.map(|progress| text(format!(
                 "{} / {} MiB",
                 progress.received / (1024 * 1024),
@@ -2598,9 +2621,7 @@ impl Dialog {
         ]
         .spacing(8)
         .align_y(Alignment::Center);
-        if matches!(page, Page::Models(..))
-            && let Some(repair) = &self.backend_repair
-        {
+        if models_page && let Some(repair) = &self.backend_repair {
             return column![
                 self.backend_repair_view(repair, can_edit, can_request, reveal),
                 progress
@@ -2609,7 +2630,7 @@ impl Dialog {
             .into();
         }
         let preferences_page = matches!(page, Page::Preferences);
-        let inventory_status: Option<Element<'_, Message>> = if matches!(page, Page::Models(..)) {
+        let inventory_status: Option<Element<'_, Message>> = if models_page {
             None
         } else if self.policy_embedding_load.is_some() {
             Some(text("Loading embedding models…").size(13).into())
@@ -2739,12 +2760,12 @@ impl Dialog {
                 text("This removes the installed runtime packages. Your GGUF models, AI profiles and runtime trust settings stay available.")
                     .wrapping(text::Wrapping::WordOrGlyph),
                 row![
-                    button("Cancel")
+                    action(CancelRuntimeRemoval, button("Cancel")
                         .style(button::secondary)
-                        .on_press_maybe(can_edit.then_some(Message::CancelRuntimeRemoval)),
-                    button("Remove runtime")
+                        .on_press_maybe(can_edit.then_some(Message::CancelRuntimeRemoval))),
+                    action(ConfirmRuntimeRemoval, button("Remove runtime")
                         .style(button::danger)
-                        .on_press_maybe(can_edit.then_some(Message::ConfirmRuntimeRemoval)),
+                        .on_press_maybe(can_edit.then_some(Message::ConfirmRuntimeRemoval))),
                 ]
                 .spacing(8),
             ]
@@ -2757,7 +2778,7 @@ impl Dialog {
                 self.runtime_downloads_allowed,
                 reveal,
             ),
-            self.java_models_view(hints, can_request),
+            self.java_models_view(hints, can_request, reveal),
             self.hf.view(
                 can_request && self.runtime_removal.is_none(),
                 self.model_downloads_allowed,
@@ -2774,6 +2795,7 @@ impl Dialog {
         &'a self,
         hints: &'a Hints,
         can_request: bool,
+        reveal: &Reveal,
     ) -> Option<Element<'a, Message>> {
         if hints.is_empty() {
             return None;
@@ -2786,7 +2808,7 @@ impl Dialog {
         ]
         .spacing(8);
         let can_request = can_request && !self.runtime_removal_review_open();
-        for hint in hints.iter() {
+        for (index, hint) in hints.iter().enumerate() {
             let target = match hint.metadata {
                 Metadata::Gguf { purpose, .. } => self
                     .managed
@@ -2795,25 +2817,24 @@ impl Dialog {
                 Metadata::Mlx { .. } => self.mlx.java_target(),
             };
             view = view.push(
-                column![
-                    text(format!(
-                        "{} · {} · {}",
-                        hint.name,
-                        hint.kind().label(),
-                        hint.id
-                    ))
-                    .wrapping(text::Wrapping::WordOrGlyph),
-                    text(hint.details())
-                        .size(13)
-                        .wrapping(text::Wrapping::WordOrGlyph),
-                    target.map(|target| button(
-                        text(format!("Review for {target}…")).wrapping(text::Wrapping::WordOrGlyph)
-                    )
-                    .on_press_maybe(
-                        can_request.then(|| Message::ReviewJavaModel(hint.kind(), hint.id.clone()))
-                    )),
-                ]
-                .spacing(4),
+                reveal.wrap(
+                    super::search::Setting::ImportedJavaModel(hint.search_key(index)),
+                    column![
+                        text(hint.label()).wrapping(text::Wrapping::WordOrGlyph),
+                        text(hint.details())
+                            .size(13)
+                            .wrapping(text::Wrapping::WordOrGlyph),
+                        target.map(|target| button(
+                            text(format!("Review for {target}…"))
+                                .wrapping(text::Wrapping::WordOrGlyph)
+                        )
+                        .on_press_maybe(
+                            can_request
+                                .then(|| Message::ReviewJavaModel(hint.kind(), hint.id.clone()))
+                        )),
+                    ]
+                    .spacing(4),
+                ),
             );
         }
         Some(view.into())
@@ -4383,6 +4404,135 @@ mod tests {
             assert!(!manager.local.runtime_removal_review_open());
             assert!(manager.child_close_message().is_none());
             assert_eq!(manager.local.status.as_deref(), Some("Cancelled."));
+        }
+    }
+
+    #[test]
+    fn runtime_search_reveals_progress_without_stopping_the_request() {
+        use crate::ai_manager::search::{Control, Setting, Target};
+        use crate::ai_manager::{
+            Dialog as Manager, Message as ManagerMessage, Page as ManagerPage,
+        };
+        use std::sync::atomic::Ordering;
+
+        let profile = crate::snippets::tests::Profile::new();
+        for repair in [false, true] {
+            let mut manager = Manager::new(
+                Arc::new(Configuration::default()),
+                profile.0.clone(),
+                Vec::new(),
+                true,
+                None,
+            );
+            let cancelled = if repair {
+                manager.page = ManagerPage::LocalModels;
+                manager.local.open_backend_repair_for_test()
+            } else {
+                let (cancel, requested) = runtime_package::Cancel::test_token();
+                manager.local.request = Some(Request::Runtime {
+                    cancel,
+                    requires_ai: true,
+                });
+                requested
+            };
+            let (pause, paused) = runtime_package::online::Pause::test_token();
+            manager.local.online.pause = Some(pause);
+            manager.local.online.progress = Some(runtime_package::online::Progress {
+                received: 4096,
+                total: 8192,
+                resumable: false,
+            });
+            let _ = manager.update(ManagerMessage::Search("pause runtime download".into()));
+            assert!(manager.search_results().next().is_none());
+
+            manager.local.online.progress.as_mut().unwrap().resumable = true;
+            let generation = manager.local.generation;
+            for (query, control) in [
+                ("pause runtime download", Control::PauseRuntimeDownload),
+                ("cancel runtime request", Control::CancelRuntimeRequest),
+            ] {
+                let setting = Setting::Control(control);
+                let _ = manager.update(ManagerMessage::Search(query.into()));
+                assert_eq!(
+                    manager.search_results().collect::<Vec<_>>(),
+                    [Target::Setting(setting)]
+                );
+                let reveal = manager.update(ManagerMessage::SearchChoose);
+                assert!(iced_runtime::task::into_stream(reveal).is_none());
+                assert_eq!(manager.page, ManagerPage::LocalModels);
+                assert_eq!(manager.revealed.setting, Some(setting));
+                assert_eq!(manager.local.backend_repair_open(), repair);
+                assert_eq!(manager.local.generation, generation);
+                assert_eq!(manager.local.online.progress.unwrap().received, 4096);
+                assert!(manager.local.busy());
+                assert!(!paused.load(Ordering::Acquire));
+                assert!(!cancelled.load(Ordering::Acquire));
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_search_reveals_only_the_current_confirmation() {
+        use crate::ai_manager::search::{Control, Setting, Target};
+        use crate::ai_manager::{Dialog as Manager, Message as ManagerMessage};
+        use crate::private_files::Directory;
+
+        let profile = crate::snippets::tests::Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        Directory::open(&root, false)
+            .unwrap()
+            .private_child("llama-runtime", true)
+            .unwrap()
+            .publish_copy("activation.json", b"fixture activation")
+            .unwrap();
+        let mut manager = Manager::new(
+            Arc::new(Configuration::default()),
+            root.clone(),
+            Vec::new(),
+            true,
+            None,
+        );
+        for (query, control) in [
+            ("keep saved zip", Control::KeepRuntimeDownload),
+            ("cancel runtime removal", Control::CancelRuntimeRemoval),
+        ] {
+            let _ = manager.update(ManagerMessage::Search(query.into()));
+            assert!(
+                !manager
+                    .search_results()
+                    .any(|target| { target == Target::Setting(Setting::Control(control)) })
+            );
+        }
+
+        manager.local.online.discard_confirmed = true;
+        for (query, control) in [
+            ("keep saved zip", Control::KeepRuntimeDownload),
+            ("discard saved zip", Control::DiscardRuntimeDownload),
+        ] {
+            let setting = Setting::Control(control);
+            let _ = manager.update(ManagerMessage::Search(query.into()));
+            let _ = manager.update(ManagerMessage::SearchChoose);
+            assert_eq!(manager.revealed.setting, Some(setting));
+            assert!(manager.local.online.discard_confirmed);
+            assert!(!manager.local.busy());
+        }
+
+        manager.local.runtime_removal = runtime_package::inspect_removal(&root).unwrap();
+        for (query, control) in [
+            ("remove runtime", Control::ConfirmRuntimeRemoval),
+            ("cancel runtime removal", Control::CancelRuntimeRemoval),
+        ] {
+            let setting = Setting::Control(control);
+            let _ = manager.update(ManagerMessage::Search(query.into()));
+            assert_eq!(
+                manager.search_results().next(),
+                Some(Target::Setting(setting))
+            );
+            let _ = manager.update(ManagerMessage::SearchChoose);
+            assert_eq!(manager.revealed.setting, Some(setting));
+            assert!(manager.local.runtime_removal_review_open());
+            assert!(!manager.local.busy());
+            assert!(root.join("llama-runtime").join("activation.json").is_file());
         }
     }
 

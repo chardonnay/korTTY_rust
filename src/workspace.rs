@@ -794,6 +794,7 @@ enum InputSource {
         predict: bool,
         shifted_enter: bool,
         physical_pane: Option<SessionId>,
+        dim_agent_hud: bool,
     },
 }
 
@@ -5511,6 +5512,7 @@ impl Workspace {
                                 predict,
                                 shifted_enter,
                                 physical_pane: Some(physical),
+                                ..
                             } if physical == *target
                                 && (!predict
                                     || (shifted_enter
@@ -5551,6 +5553,20 @@ impl Workspace {
                         Ok(()) => {
                             pane.clear_selection();
                             pane.session.follow_output();
+                            if matches!(source, InputSource::Keyboard {
+                                physical_pane: Some(physical),
+                                dim_agent_hud: true,
+                                ..
+                            } if physical == *target)
+                            {
+                                self.terminal_agents.note_hud_key(
+                                    *target,
+                                    pane.stream_generation,
+                                    self.window_settings.agent_status_auto_hide_seconds(),
+                                    std::time::Instant::now(),
+                                    !self.window_settings.agent_animations(),
+                                );
+                            }
                         }
                         Err(error) => failures.push(error),
                     }
@@ -6054,6 +6070,7 @@ impl Workspace {
                 predict: route.predict,
                 shifted_enter: enter && modifiers.shift(),
                 physical_pane: Some(route.source),
+                dim_agent_hud: !modifiers.command(),
             };
             self.send_to(id, &route.panes, source, |target, frame| {
                 if !route.accepts(target, frame) {
@@ -8359,6 +8376,7 @@ mod tests {
                     predict: false,
                     shifted_enter: false,
                     physical_pane: None,
+                    dim_agent_hud: false,
                 },
                 |_, _| Some(PaneInput::Local(command.as_bytes().to_vec())),
             );

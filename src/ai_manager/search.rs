@@ -3,7 +3,7 @@
 use iced::widget::{Id, container};
 use iced::{Element, Length, Task};
 
-use super::{Page, local::Role, profiles};
+use super::{Page, java_models, local::Role, profiles};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Target {
@@ -54,6 +54,7 @@ pub(crate) enum Setting {
     Hub(HubSetting),
     Managed(ManagedSetting),
     Mlx(MlxSetting),
+    ImportedJavaModel(java_models::SearchKey),
     SkillProvider(SkillProviderSetting),
     Control(Control),
 }
@@ -80,7 +81,9 @@ impl Setting {
             }
             Self::Role(_) | Self::Embedding | Self::LocalPreference(_) => Page::LocalPreferences,
             Self::Knowledge(_) => Page::Knowledge,
-            Self::Hub(_) | Self::Managed(_) | Self::Mlx(_) => Page::LocalModels,
+            Self::Hub(_) | Self::Managed(_) | Self::Mlx(_) | Self::ImportedJavaModel(_) => {
+                Page::LocalModels
+            }
             Self::SkillProvider(_) => Page::Skills,
             Self::Control(control) => control.page(),
         }
@@ -113,6 +116,7 @@ impl Setting {
             Self::Hub(setting) => setting.title(),
             Self::Managed(setting) => setting.title(),
             Self::Mlx(setting) => setting.title(),
+            Self::ImportedJavaModel(_) => "Imported Java Model Settings",
             Self::SkillProvider(setting) => setting.title(),
             Self::Control(control) => control.title(),
         }
@@ -168,6 +172,9 @@ impl Setting {
             Self::Mlx(MlxSetting::Idle) => "idle timeout unload",
             Self::Mlx(MlxSetting::NeverUnload) => "keep running",
             Self::Mlx(_) => "Apple Silicon",
+            Self::ImportedJavaModel(_) => "imported Java model settings",
+            Self::Control(Control::DiscardRuntimeDownload) => "ZIP",
+            Self::Control(Control::KeepRuntimeDownload) => "runtime download",
             Self::SkillProvider(_) | Self::Control(_) => "",
         }
     }
@@ -706,9 +713,14 @@ pub(crate) enum Control {
     CheckRuntimeOnline,
     RuntimeOnlineChoice,
     DownloadRuntimeOnline,
+    PauseRuntimeDownload,
+    CancelRuntimeRequest,
     DiscardRuntimeDownload,
+    KeepRuntimeDownload,
     CloseRuntimeRepair,
     RemoveRuntime,
+    ConfirmRuntimeRemoval,
+    CancelRuntimeRemoval,
     MemoryEnabled,
     Learning,
     Budget,
@@ -765,7 +777,7 @@ pub(crate) enum Control {
 }
 
 impl Control {
-    const ALL: [Self; 71] = [
+    const ALL: [Self; 76] = [
         Self::LocalSetup,
         Self::LocalEndpoint,
         Self::RefreshModels,
@@ -778,9 +790,14 @@ impl Control {
         Self::CheckRuntimeOnline,
         Self::RuntimeOnlineChoice,
         Self::DownloadRuntimeOnline,
+        Self::PauseRuntimeDownload,
+        Self::CancelRuntimeRequest,
         Self::DiscardRuntimeDownload,
+        Self::KeepRuntimeDownload,
         Self::CloseRuntimeRepair,
         Self::RemoveRuntime,
+        Self::ConfirmRuntimeRemoval,
+        Self::CancelRuntimeRemoval,
         Self::MemoryEnabled,
         Self::Learning,
         Self::Budget,
@@ -853,9 +870,14 @@ impl Control {
             | Self::CheckRuntimeOnline
             | Self::RuntimeOnlineChoice
             | Self::DownloadRuntimeOnline
+            | Self::PauseRuntimeDownload
+            | Self::CancelRuntimeRequest
             | Self::DiscardRuntimeDownload
+            | Self::KeepRuntimeDownload
             | Self::CloseRuntimeRepair
-            | Self::RemoveRuntime => Page::LocalModels,
+            | Self::RemoveRuntime
+            | Self::ConfirmRuntimeRemoval
+            | Self::CancelRuntimeRemoval => Page::LocalModels,
             Self::MemoryEnabled
             | Self::Learning
             | Self::Budget
@@ -910,6 +932,25 @@ impl Control {
             | Self::ToggleBundledSkill
             | Self::SkillImported(_) => Page::Skills,
         }
+    }
+
+    pub(super) fn runtime_progress(self) -> bool {
+        matches!(
+            self,
+            Self::PauseRuntimeDownload | Self::CancelRuntimeRequest
+        )
+    }
+
+    pub(super) fn contextual_runtime(self) -> bool {
+        self.runtime_progress()
+            || matches!(
+                self,
+                Self::DiscardRuntimeDownload
+                    | Self::KeepRuntimeDownload
+                    | Self::RemoveRuntime
+                    | Self::ConfirmRuntimeRemoval
+                    | Self::CancelRuntimeRemoval
+            )
     }
 
     pub(super) fn contextual_memory(self) -> bool {
@@ -980,9 +1021,14 @@ impl Control {
             Self::CheckRuntimeOnline => "Check signed runtime updates",
             Self::RuntimeOnlineChoice => "Choose a verified runtime package",
             Self::DownloadRuntimeOnline => "Download or resume selected runtime",
+            Self::PauseRuntimeDownload => "Pause runtime download",
+            Self::CancelRuntimeRequest => "Cancel runtime request",
             Self::DiscardRuntimeDownload => "Discard saved runtime download",
+            Self::KeepRuntimeDownload => "Keep saved ZIP",
             Self::CloseRuntimeRepair => "Cancel repair or return to model",
             Self::RemoveRuntime => "Remove installed runtime",
+            Self::ConfirmRuntimeRemoval => "Remove runtime after review",
+            Self::CancelRuntimeRemoval => "Cancel runtime removal",
             Self::MemoryEnabled => "Enable AI memory",
             Self::Learning => "Learning",
             Self::Budget => "Token budget",
@@ -1579,8 +1625,24 @@ pub(super) fn matching(
             Target::Setting(setting) => setting.keywords(),
         };
         let haystack = format!("{} {terms}", target.label()).to_lowercase();
-        !query.is_empty() && query.split_whitespace().all(|word| haystack.contains(word))
+        includes_words(&query, &haystack)
     })
+}
+
+pub(super) fn imported_model_results<'a>(
+    query: &str,
+    hints: &'a java_models::Hints,
+) -> impl Iterator<Item = Target> + 'a {
+    let query = query.trim().to_lowercase();
+    hints.iter().enumerate().filter_map(move |(index, hint)| {
+        let haystack = format!("local models imported Java model settings {}", hint.label());
+        includes_words(&query, &haystack.to_lowercase())
+            .then(|| Target::Setting(Setting::ImportedJavaModel(hint.search_key(index))))
+    })
+}
+
+fn includes_words(query: &str, haystack: &str) -> bool {
+    !query.is_empty() && query.split_whitespace().all(|word| haystack.contains(word))
 }
 
 pub(super) struct Reveal {
@@ -1803,6 +1865,80 @@ mod tests {
             assert!(dialog.general == draft);
             assert!(dialog.request.is_none());
         }
+    }
+
+    #[test]
+    fn local_models_search_reveals_the_exact_imported_row_without_adopting_it() {
+        use java_models::Kind;
+
+        let mut hints = java_models::import(
+            Kind::Gguf,
+            br#"<llamaModels><model><id>archive-chat</id><displayName>Archive Model</displayName></model></llamaModels>"#,
+        )
+        .unwrap()
+        .hints;
+        let mlx = java_models::import(
+            Kind::Mlx,
+            br#"{"schemaVersion":1,"models":[{"id":"archive-chat","displayName":"Archive Model"}]}"#,
+        )
+        .unwrap()
+        .hints;
+        hints.merge(mlx);
+        let mut dialog = Dialog::new(
+            Arc::new(Configuration {
+                java_model_hints: hints,
+                ..Configuration::default()
+            }),
+            PathBuf::new(),
+            Vec::new(),
+            true,
+            None,
+        );
+        let _ = dialog.update(Message::Search("ARCHIVE Model".into()));
+        assert_eq!(dialog.search_results().count(), 2);
+
+        for kind in [Kind::Gguf, Kind::Mlx] {
+            let _ = dialog.update(Message::Search(format!("{} archive-chat", kind.label())));
+            let targets = dialog.search_results().collect::<Vec<_>>();
+            let [Target::Setting(Setting::ImportedJavaModel(key))] = targets.as_slice() else {
+                panic!("expected one imported model result, got {targets:?}");
+            };
+            let hint = dialog.saved.java_model_hints.search_hint(*key).unwrap();
+            assert_eq!(hint.kind(), kind);
+            assert_eq!(hint.id, "archive-chat");
+
+            let reveal = dialog.update(Message::SearchChoose);
+            assert_eq!(dialog.page, Page::LocalModels);
+            assert_eq!(
+                dialog.revealed.setting,
+                Some(Setting::ImportedJavaModel(*key))
+            );
+            let position = applied_position(&dialog, reveal);
+            let visible_y = position
+                .row_y
+                .expect("the matched model row is highlighted")
+                - position.offset;
+            assert!(visible_y >= position.viewport.y - 1.0);
+            assert!(visible_y < position.viewport.y + position.viewport.height);
+            assert!(dialog.request.is_none());
+        }
+
+        let _ = dialog.update(Message::Search("gguf archive-chat".into()));
+        let stale = dialog.search_results().next().unwrap();
+        let replacement = java_models::import(
+            Kind::Mlx,
+            br#"{"schemaVersion":1,"models":[{"id":"archive-chat","displayName":"Archive Model"}]}"#,
+        )
+        .unwrap()
+        .hints;
+        dialog.saved = Arc::new(Configuration {
+            java_model_hints: replacement,
+            ..Configuration::default()
+        });
+        dialog.page = Page::General;
+        let _ = dialog.update(Message::Reveal(stale));
+        assert_eq!(dialog.page, Page::General);
+        assert_eq!(dialog.search, "gguf archive-chat");
     }
 
     #[test]

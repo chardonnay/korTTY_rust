@@ -161,6 +161,15 @@ fn with_usage(
 ) -> Element<'_, AgentMessage> {
     let font_size = run.activity_font;
     let muted = palette.map(|palette| palette.muted.color());
+    let usage_limit = if history == History::LogTable
+        && run
+            .transcript
+            .is_some_and(|trace| super::log_table::has_detail(run, trace))
+    {
+        (font_size * 1.5).min(104.0)
+    } else {
+        104.0
+    };
     responsive(move |size| {
         let mut usage = column![
             text(run.presentation.model_usage.label().unwrap_or_default())
@@ -179,7 +188,7 @@ fn with_usage(
         column![
             scrollable(usage)
                 .width(Length::Fill)
-                .height(Length::Fixed((size.height * 0.28).min(104.0)))
+                .height(Length::Fixed((size.height * 0.28).min(usage_limit)))
                 .spacing(6),
             entries(run, history, palette, reduced_motion),
         ]

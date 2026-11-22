@@ -78,6 +78,7 @@ pub(super) struct Review {
     relevance: String,
     guidance: SkillGuidance,
     skill_usage: Option<SkillUsageReceipt>,
+    pub(super) sent_context: Option<sent_context::Snapshot>,
     base_input: Zeroizing<String>,
     pub(super) system: String,
     pub(super) input: String,
@@ -144,13 +145,20 @@ impl MemoryAuthority {
             credential.clone(),
             workspace.vault.as_ref(),
         );
-        let memory = Memory::masked(
-            config,
-            &workspace.clipboard.policy.ai_memory,
-            connection,
-            !run.binding.private(),
-            |value| mask.apply(value),
-        )?;
+        let policy = &workspace.clipboard.policy.ai_memory;
+        let include_personal = !run.binding.private();
+        let redact = |value: &str| mask.apply(value);
+        let memory = if run.binding.live().is_ok() && !run.swarm {
+            Memory::masked_for_interactive_review(
+                config,
+                policy,
+                connection,
+                include_personal,
+                redact,
+            )?
+        } else {
+            Memory::masked(config, policy, connection, include_personal, redact)?
+        };
         Ok(Self {
             memory,
             mask,
@@ -752,6 +760,20 @@ impl Review {
         } else {
             None
         };
+        self.sent_context = sent_context::Snapshot::capture(
+            self.authority.memory.memory.prompt(),
+            &guidance,
+            &system,
+            transport.tokenizer(),
+            |value| {
+                let value = mask::prompt(&run.redactor, value)?;
+                if let Some(outbound) = &self.authority.outbound {
+                    outbound.mask_text(&value, vault)
+                } else {
+                    Ok(value)
+                }
+            },
+        );
         self.input = input;
         self.system = system;
         self.cli = cli;
@@ -949,6 +971,7 @@ impl Workspace {
             relevance,
             guidance: SkillGuidance::default(),
             skill_usage: None,
+            sent_context: None,
             base_input: Zeroizing::new(input),
             system: String::new(),
             input: String::new(),

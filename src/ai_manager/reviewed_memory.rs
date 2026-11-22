@@ -24,6 +24,7 @@ pub(crate) struct Memory {
     root: Option<PathBuf>,
     connection: Option<u64>,
     include_personal: bool,
+    include_external: bool,
     prompt: Option<Arc<MemoryPrompt>>,
     binding: Option<Binding>,
 }
@@ -57,9 +58,38 @@ impl Memory {
         include_personal: bool,
         mask: impl FnMut(&str) -> Result<String, String>,
     ) -> Result<Self, String> {
+        Self::masked_with_options(config, policy, connection, include_personal, false, mask)
+    }
+
+    pub(crate) fn masked_for_interactive_review(
+        config: &Configuration,
+        policy: &AiMemoryPolicy,
+        connection: Option<u64>,
+        include_personal: bool,
+        mask: impl FnMut(&str) -> Result<String, String>,
+    ) -> Result<Self, String> {
+        Self::masked_with_options(
+            config,
+            policy,
+            connection,
+            include_personal,
+            include_personal,
+            mask,
+        )
+    }
+
+    fn masked_with_options(
+        config: &Configuration,
+        policy: &AiMemoryPolicy,
+        connection: Option<u64>,
+        include_personal: bool,
+        include_external: bool,
+        mask: impl FnMut(&str) -> Result<String, String>,
+    ) -> Result<Self, String> {
         let root = config.saved_root();
         let personal_root = root.filter(|_| include_personal);
-        let prompt = config.load_memory(personal_root, policy, connection, false, mask)?;
+        let prompt =
+            config.load_memory(personal_root, policy, connection, include_external, mask)?;
         let binding = prompt
             .as_ref()
             .map(|prompt| prompt.reviewed_revision(connection).map(Binding))
@@ -68,13 +98,18 @@ impl Memory {
             root: root.map(ToOwned::to_owned),
             connection,
             include_personal,
+            include_external,
             prompt: prompt.map(Arc::new),
             binding,
         })
     }
 
     pub(crate) fn text(&self) -> Option<&str> {
-        self.prompt.as_deref().map(MemoryPrompt::text)
+        self.prompt().map(MemoryPrompt::text)
+    }
+
+    pub(crate) fn prompt(&self) -> Option<&MemoryPrompt> {
+        self.prompt.as_deref()
     }
 
     pub(crate) fn system<'a>(&self, system: &'a str, suffix: Option<&str>) -> Cow<'a, str> {
@@ -119,7 +154,17 @@ impl Memory {
         if config.saved_root() != self.root.as_deref() {
             return Err(CHANGED.into());
         }
-        let current = Self::masked(config, policy, self.connection, self.include_personal, mask)?;
+        if let Some(prompt) = self.prompt().filter(|prompt| prompt.includes_external()) {
+            prompt.require_current(policy)?;
+        }
+        let current = Self::masked_with_options(
+            config,
+            policy,
+            self.connection,
+            self.include_personal,
+            self.include_external,
+            mask,
+        )?;
         if current.binding != self.binding {
             return Err(CHANGED.into());
         }

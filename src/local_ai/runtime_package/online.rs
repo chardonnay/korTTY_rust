@@ -149,6 +149,13 @@ impl Pause {
         self.0.store(true, Ordering::Release);
         self.1.clone().shutdown();
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_token() -> (Self, Arc<AtomicBool>) {
+        let requested = Arc::new(AtomicBool::new(false));
+        let agent = Agent::new_with_config(super::super::connection_config(Duration::from_secs(1)));
+        (Self(Arc::clone(&requested), agent), requested)
+    }
 }
 
 pub(crate) enum InstallOutcome {

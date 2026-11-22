@@ -15,7 +15,6 @@ pub(in crate::workspace::terminal_agent::design) enum Tone {
 
 pub(super) struct Ring {
     pub(super) fraction: f32,
-    pub(super) orbit: Option<f32>,
     pub(super) tone: Tone,
 }
 
@@ -37,6 +36,20 @@ impl<Message> canvas::Program<Message> for Ring {
         if radius <= 0.0 {
             return Vec::new();
         }
+        self.paint(&mut frame, center, radius, 2.5, theme);
+        vec![frame.into_geometry()]
+    }
+}
+
+impl Ring {
+    pub(super) fn paint(
+        &self,
+        frame: &mut canvas::Frame,
+        center: Point,
+        radius: f32,
+        width: f32,
+        theme: &Theme,
+    ) {
         let colors = theme.palette();
         let color = match self.tone {
             Tone::Active => colors.primary,
@@ -44,7 +57,7 @@ impl<Message> canvas::Program<Message> for Ring {
             Tone::Stopped => colors.danger,
         };
         let stroke = canvas::Stroke::default()
-            .with_width(2.5)
+            .with_width(width)
             .with_line_cap(canvas::LineCap::Round);
         let track = canvas::Path::circle(center, radius);
         frame.stroke(&track, stroke.with_color(colors.text.scale_alpha(0.24)));
@@ -63,24 +76,14 @@ impl<Message> canvas::Program<Message> for Ring {
             };
             frame.stroke(&progress, stroke.with_color(color));
         }
-        if let Some(angle) = self.orbit {
-            for (offset, opacity) in [(0.0, 1.0), (0.29, 0.63), (0.58, 0.38)] {
-                let (sin, cos) = (angle - offset).sin_cos();
-                let point = Point::new(
-                    center.x + (radius + 4.0) * cos,
-                    center.y + (radius + 4.0) * sin,
-                );
-                frame.fill(
-                    &canvas::Path::circle(point, 1.6),
-                    color.scale_alpha(opacity),
-                );
-            }
-        }
-        vec![frame.into_geometry()]
     }
 }
 
-pub(super) fn graphic<'a, M: 'a>(size: f32, ring: Ring, label: Element<'a, M>) -> Element<'a, M> {
+pub(super) fn graphic<'a, M: 'a>(
+    size: f32,
+    ring: impl canvas::Program<M> + 'a,
+    label: Element<'a, M>,
+) -> Element<'a, M> {
     stack![
         canvas(ring).width(size).height(size),
         container(label).center(Length::Fill),
@@ -107,7 +110,6 @@ pub(in crate::workspace::terminal_agent::design) fn adaptive_countdown<'a, M: 'a
         28.0,
         Ring {
             fraction,
-            orbit: None,
             tone: Tone::Active,
         },
         label,

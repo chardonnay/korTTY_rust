@@ -47,6 +47,7 @@ mod password;
 mod planning;
 mod policy;
 mod request_review;
+mod sent_context;
 pub(super) mod shortcut;
 pub(super) mod spotlight;
 pub(in crate::workspace) mod swarm;

@@ -115,8 +115,9 @@ impl Editor {
         &mut self,
         token: preview::Token,
         key: SampleLogKey,
+        page: Id,
     ) -> Task<Desktop> {
-        self.demo.navigate_log(token, key)
+        self.demo.navigate_log(token, key, page)
     }
 
     fn selected<'a>(&'a self, catalog: &'a Catalog, preset: Preset) -> &'a str {

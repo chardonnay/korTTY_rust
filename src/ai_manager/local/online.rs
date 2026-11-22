@@ -22,6 +22,10 @@ pub(super) struct State {
 }
 
 impl State {
+    pub(super) fn can_pause(&self) -> bool {
+        self.pause.is_some() && self.progress.is_some_and(|progress| progress.resumable)
+    }
+
     fn selection(&self, required: Option<PackageBackend>) -> Option<&Choice> {
         self.selected
             .as_ref()
@@ -47,6 +51,7 @@ impl State {
                     || enabled && self.choices(required).next().is_some()
             }
             Control::DownloadRuntimeOnline => self.selection(required).is_some(),
+            Control::KeepRuntimeDownload => self.discard_confirmed,
             Control::CheckRuntimeOnline | Control::DiscardRuntimeDownload => true,
             _ => false,
         }
@@ -95,14 +100,14 @@ impl State {
                 }),
                 action(Control::DownloadRuntimeOnline, button("Download or resume selected runtime").on_press_maybe(enabled.then_some(Message::InstallRuntimeOnline))),
             ].spacing(6)),
-            reveal.wrap(Setting::Control(Control::DiscardRuntimeDownload), if self.discard_confirmed {
+            if self.discard_confirmed {
                 row![
-                    button("Discard saved ZIP").on_press_maybe(can_discard.then_some(Message::DiscardRuntimeDownload)),
-                    button("Keep saved ZIP").on_press(Message::ReviewRuntimeDownloadDiscard(false)),
+                    action(Control::DiscardRuntimeDownload, button("Discard saved ZIP").on_press_maybe(can_discard.then_some(Message::DiscardRuntimeDownload))),
+                    action(Control::KeepRuntimeDownload, button("Keep saved ZIP").on_press(Message::ReviewRuntimeDownloadDiscard(false))),
                 ].spacing(8)
             } else {
-                row![button("Discard saved runtime download…").on_press_maybe(can_discard.then_some(Message::ReviewRuntimeDownloadDiscard(true)))].spacing(8)
-            }),
+                row![action(Control::DiscardRuntimeDownload, button("Discard saved runtime download…").on_press_maybe(can_discard.then_some(Message::ReviewRuntimeDownloadDiscard(true))))].spacing(8)
+            },
         ].spacing(8).into()
     }
 }

@@ -247,6 +247,19 @@ impl Workspace {
             .runs
             .get_mut(&selected)
             .expect("checked run");
+        if run.uses_hud()
+            && run
+                .presentation
+                .status_opacity(
+                    Status::Hud,
+                    self.window_settings.agent_status_auto_hide_seconds(),
+                    std::time::Instant::now(),
+                    !self.window_settings.agent_animations(),
+                )
+                .is_none()
+        {
+            run.presentation.dismiss_hud();
+        }
         run.presentation.status_visibility.show();
         run.presentation.set_dock_hidden(false);
         run.presentation.pip.show();

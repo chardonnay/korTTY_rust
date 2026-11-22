@@ -352,6 +352,7 @@ fn interactive_ask_classifies_reviewed_skills_and_sends_the_approved_messages() 
         let root = scratch.0.canonicalize().unwrap().join("ask-profile");
         let child = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", TEST_NAME, "--nocapture"])
+            .env("HOME", &root)
             .env(PROFILE_ROOT, root)
             .output()
             .unwrap();
@@ -368,6 +369,28 @@ fn interactive_ask_classifies_reviewed_skills_and_sends_the_approved_messages() 
     assert_eq!(crate::profile::root().unwrap(), root);
     let (model, _) = listener();
     let mut fixture = with_skills(&root, &model);
+    let memory = crate::private_files::Directory::open(&root.join("memory"), true).unwrap();
+    memory
+        .publish_copy("MEMORY.md", b"Use the saved maintenance window.\n")
+        .unwrap();
+    #[cfg(target_os = "macos")]
+    let reference_dir = {
+        use sha2::Digest;
+
+        let directory = crate::private_files::Directory::open(&root, false).unwrap();
+        let source = b"Read the approved reference before continuing.\n";
+        directory.publish_copy("Approved.md", source).unwrap();
+        let registry = json!({"version": 1, "entries": [{
+            "id": "terminal-review-fixture", "path": root.join("Approved.md"), "root": root,
+            "tool": "OTHER", "connectionId": null, "active": true,
+            "approvedSha256": format!("{:x}", sha2::Sha256::digest(source)),
+            "approvedAt": "2026-11-22T00:00:00Z", "status": "ok", "reason": ""
+        }]});
+        memory
+            .publish_copy("external.json", registry.to_string().as_bytes())
+            .unwrap();
+        directory
+    };
     let skill_statistics = root.join("stats/skill-usage.json");
     let usage = local_ai::UsageAccount::new(
         root,
@@ -387,6 +410,16 @@ fn interactive_ask_classifies_reviewed_skills_and_sends_the_approved_messages() 
     let local_epoch = run.epoch;
     let review = run.model_review.as_ref().unwrap();
     assert!(review.system.contains(LOCAL_GUIDANCE) && review.system.contains(PINNED_GUIDANCE));
+    assert!(review.system.contains("Use the saved maintenance window."));
+    #[cfg(target_os = "macos")]
+    {
+        assert!(
+            review
+                .system
+                .contains("Read the approved reference before continuing.")
+        );
+    }
+    assert!(run.presentation.sent_context.is_none());
     assert!(
         review
             .quota
@@ -443,6 +476,7 @@ fn interactive_ask_classifies_reviewed_skills_and_sends_the_approved_messages() 
 
     let run = fixture.run(id);
     assert!(run.phase == Phase::ModelReview);
+    assert!(run.presentation.sent_context.is_none());
     let approval = run.epoch;
     assert_ne!(approval, classifier_epoch);
     let review = run.model_review.as_ref().unwrap();
@@ -478,6 +512,21 @@ fn interactive_ask_classifies_reviewed_skills_and_sends_the_approved_messages() 
     drop(socket);
     finish_agent_task(&mut fixture, pending);
     assert!(fixture.run(id).phase == Phase::Finished);
+    let sent = fixture.run(id).presentation.sent_context.as_ref().unwrap();
+    assert!(sent.summary().contains("1 memory entry · 2 skills"));
+    #[cfg(target_os = "macos")]
+    assert!(sent.summary().contains("2 skills · 1 file"));
+    no_task(fixture.send(
+        id,
+        Message::Design(design::Message::SentContext(
+            sent_context::Surface::Terminal,
+            true,
+        )),
+    ));
+    assert_eq!(
+        fixture.run(id).presentation.sent_context_open,
+        Some(sent_context::Surface::Terminal)
+    );
     let snapshot = usage.snapshot().unwrap();
     assert_eq!(
         (
@@ -507,6 +556,25 @@ fn interactive_ask_classifies_reviewed_skills_and_sends_the_approved_messages() 
     assert!(!recorded.contains(PINNED_GUIDANCE));
     no_request(&model);
 
+    #[cfg(target_os = "macos")]
+    {
+        let changed = fixture.open(Mode::Ask);
+        no_task(fixture.send(changed, Message::Goal(GOAL.into())));
+        dispatch(&mut fixture, changed, Message::Start);
+        let epoch = fixture.run(changed).epoch;
+        reference_dir
+            .replace_file("Approved.md", b"Different content.\n")
+            .unwrap();
+        dispatch(
+            &mut fixture,
+            changed,
+            Message::ReviewModel(Ask::Send(epoch)),
+        );
+        assert!(fixture.run(changed).phase == Phase::Blocked);
+        assert!(fixture.run(changed).presentation.sent_context.is_none());
+        no_request(&model);
+    }
+
     let stale = fixture.open(Mode::Ask);
     no_task(fixture.send(stale, Message::Goal(GOAL.into())));
     dispatch(&mut fixture, stale, Message::Start);
@@ -527,6 +595,7 @@ fn interactive_ask_classifies_reviewed_skills_and_sends_the_approved_messages() 
         Message::ReviewModel(Ask::Send(stale_epoch)),
     );
     assert!(fixture.run(stale).phase == Phase::Blocked);
+    assert!(fixture.run(stale).presentation.sent_context.is_none());
     assert!(
         fixture
             .run(stale)

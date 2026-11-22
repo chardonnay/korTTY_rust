@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use iced::widget::{Canvas, button, column, container, pick_list, responsive, row, text};
+use iced::widget::{Canvas, Id, button, column, container, pick_list, responsive, row, text};
 use iced::{Element, Length, Task, window};
 
 use crate::terminal_agent::design::{Approval, Arrangement, Layout, Status, inline};
@@ -66,9 +66,14 @@ impl Default for Demo {
 }
 
 impl Demo {
-    pub(super) fn navigate_log(&mut self, token: Token, key: SampleLogKey) -> Task<Desktop> {
+    pub(super) fn navigate_log(
+        &mut self,
+        token: Token,
+        key: SampleLogKey,
+        page: Id,
+    ) -> Task<Desktop> {
         if token == self.token() {
-            self.sample.navigate_log(key)
+            self.sample.navigate_log(key, page)
         } else {
             Task::none()
         }
@@ -337,6 +342,10 @@ pub(super) fn view(
     let status_frame = status_interval
         .into_iter()
         .chain(history_interval)
+        .chain(
+            demo.sample
+                .status_refresh_interval(layout, demo.playing, now, reduced_motion),
+        )
         .min()
         .map(|ms| now + Duration::from_millis(ms))
         .into_iter()

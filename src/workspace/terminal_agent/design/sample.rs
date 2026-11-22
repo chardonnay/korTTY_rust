@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::time::{Instant, SystemTime};
 
-use iced::widget::{button, column, container, row, text};
+use iced::widget::{Id, button, column, container, row, text};
 use iced::{Element, Length, Size, Task, window};
 
 use crate::terminal_agent::design::{Arrangement, History, Layout, Status, inline};
@@ -112,11 +112,22 @@ impl Sample {
         )
     }
 
-    pub(in crate::workspace) fn navigate_log(&mut self, key: SampleLogKey) -> Task<Desktop> {
+    pub(in crate::workspace) fn navigate_log(
+        &mut self,
+        key: SampleLogKey,
+        page: Id,
+    ) -> Task<Desktop> {
         let at = self.presentation.finish_time().unwrap_or_else(Instant::now);
-        self.presentation
-            .log_table
-            .navigate(&self.transcript, at, key, Some(0))
+        let table = &mut self.presentation.log_table;
+        let navigation = table.navigate(&self.transcript, at, key, Some(0));
+        if key == SampleLogKey::Open {
+            navigation.chain(crate::workspace::coding_agents::roster_scroll::reveal_row(
+                page,
+                table.detail_id(),
+            ))
+        } else {
+            navigation
+        }
     }
 
     pub(in crate::workspace) fn reset(&mut self) {
@@ -192,6 +203,49 @@ impl Sample {
 
     pub(in crate::workspace) fn has_live_toasts(&self, now: Instant, reduced_motion: bool) -> bool {
         self.presentation.status_events.ticking(now, reduced_motion)
+    }
+
+    pub(in crate::workspace) fn status_refresh_interval(
+        &self,
+        layout: Layout,
+        playing: bool,
+        now: Instant,
+        reduced_motion: bool,
+    ) -> Option<u64> {
+        match self.status_position(layout).0 {
+            Status::Hud => status::hud::refresh_interval(
+                &self.presentation,
+                playing && !self.transcript.state.finished(),
+                self.transcript.state == inline::State::Paused,
+                now,
+                reduced_motion,
+            ),
+            Status::TopBar => status::top_bar::refresh_interval(
+                &self.presentation,
+                playing && !self.transcript.state.finished(),
+                self.transcript.state == inline::State::Paused,
+                now,
+                reduced_motion,
+            ),
+            Status::Powerline => status::powerline::refresh_interval(
+                &self.presentation,
+                playing && !self.transcript.state.finished(),
+                self.transcript.state == inline::State::Paused,
+                now,
+                reduced_motion,
+            ),
+            Status::Minimap => self
+                .presentation
+                .minimap
+                .animating(
+                    &self.transcript,
+                    playing && self.transcript.state == inline::State::Running,
+                    now,
+                    reduced_motion,
+                )
+                .then_some(16),
+            _ => None,
+        }
     }
 
     pub(in crate::workspace) fn history_refresh_interval(
@@ -319,11 +373,11 @@ impl Sample {
             owner: None,
             panel_review: None,
         };
-        let controls = || -> Element<'a, AgentMessage> {
-            if let Some(command) = view
-                .approval
-                .filter(|_| !super::command_review::handles(layout.history))
-            {
+        let approval = view
+            .approval
+            .filter(|_| !super::command_review::handles(layout.history));
+        let controls = move || -> Element<'a, AgentMessage> {
+            if let Some(command) = approval {
                 column![
                     text(command).font(iced::Font::MONOSPACE).size(12),
                     row![
@@ -358,6 +412,17 @@ impl Sample {
             .into()
         };
         let (status_kind, position) = self.status_position(layout);
+        if status_kind == Status::Powerline && view.status_opacity.is_none() {
+            self.presentation.dismiss_powerline_drawer();
+        }
+        if status_kind == Status::Orbit && view.status_opacity.is_none() {
+            self.presentation.dismiss_drawer();
+        }
+        if status_kind == Status::Hud && view.status_opacity.is_none() {
+            self.presentation.dismiss_hud();
+        } else if status_kind != Status::Hud {
+            self.presentation.status_visibility.hud_entrance.hide();
+        }
         let history_position = view.dock.history_slot(layout);
         let adaptive_side = layout.arrangement == Arrangement::Adaptive && position == Slot::Right;
         let status = view.status_opacity.and_then(|opacity| {
@@ -376,7 +441,8 @@ impl Sample {
                             self.started,
                             now,
                             view.reduced_motion,
-                        ),
+                        )
+                        .opacified(opacity),
                         status_kind,
                         None,
                         false,
@@ -385,7 +451,13 @@ impl Sample {
                     .map(forward),
                 )
             }
-            .map(|status| super::fade::view(status, opacity))
+            .map(|status| {
+                if status_kind == Status::Hud {
+                    status
+                } else {
+                    super::fade::view(status, opacity)
+                }
+            })
         });
         let side_width = view.dock.side_width(placement::history_width(
             layout.history,
@@ -406,12 +478,11 @@ impl Sample {
             bounds,
             DockExtents {
                 left: side_width,
-                right: if status_kind == Status::Minimap && history_position != Some(Slot::Right) {
-                    84.0
-                } else {
-                    side_width
-                },
-                bottom: None,
+                right: side_width,
+                bottom: (history_position == Some(Slot::Bottom)
+                    && layout.history == History::LogTable
+                    && log_table::has_detail(activity, &self.transcript))
+                .then_some(bounds.height * 0.65),
             },
         );
         let terminal = if status_kind == Status::Spotlight
