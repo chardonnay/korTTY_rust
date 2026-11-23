@@ -1790,7 +1790,12 @@ fn folder_dialog<'a>(dialog: &'a FolderDialog, store: &'a Store) -> Element<'a, 
         } => {
             return folder_color_dialog(path, draft, imported.as_ref(), store);
         }
-        FolderDialog::Isolation { path, draft, .. } => {
+        FolderDialog::Isolation {
+            path,
+            draft,
+            imported,
+            ..
+        } => {
             let inherited = path
                 .rsplit_once('/')
                 .and_then(|(parent, _)| store.inherited_group_isolation(parent));
@@ -1803,6 +1808,21 @@ fn folder_dialog<'a>(dialog: &'a FolderDialog, store: &'a Store) -> Element<'a, 
                 text(path),
                 pick_list(IsolationChoice::ALL, Some(*draft), Message::GroupIsolation),
                 text(format!("Inherited from {source}.")),
+                (!store.java_group_isolation().is_empty()).then(|| column![
+                    text("Isolation from a Java backup").size(14),
+                    pick_list(
+                        store
+                            .java_group_isolation()
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                        imported.clone(),
+                        Message::PickJavaGroupIsolation
+                    )
+                    .placeholder("Choose an imported folder setting"),
+                    text("Save applies the selected level to this folder.").size(13),
+                ]
+                .spacing(5)),
                 row![
                     button("Cancel")
                         .style(button::secondary)

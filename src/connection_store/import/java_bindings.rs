@@ -495,7 +495,10 @@ fn stage_import(
         || imports.java_groups.has_shared()
         || candidate
             .library
-            .java_presentation_changed(&local.document.library))
+            .java_presentation_changed(&local.document.library)
+        || candidate
+            .library
+            .java_isolation_changed(&local.document.library))
     .then(|| options::encode(&candidate))
     .transpose()?;
     Ok(JavaConnectionImport {

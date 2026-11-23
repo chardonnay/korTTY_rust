@@ -361,11 +361,24 @@ pub(super) fn merge_java_backup(
             .iter()
             .chain(&source.library.reviewed_java_group_colors),
     );
+    install_java_isolation(
+        &store.document.library,
+        &mut candidate.library,
+        &source.library.group_isolation,
+        source
+            .library
+            .java_group_isolation
+            .iter()
+            .chain(&source.library.reviewed_java_group_isolation),
+    );
     if outcome.imported == 0
         && !ai_hints_changed
         && !candidate
             .library
             .java_presentation_changed(&store.document.library)
+        && !candidate
+            .library
+            .java_isolation_changed(&store.document.library)
     {
         return Ok(None);
     }
@@ -573,6 +586,12 @@ pub(super) fn stage_with_java_library(
         &settings.group_colors,
         &settings.group_color_hints,
     );
+    install_java_isolation(
+        &store.document.library,
+        &mut candidate.library,
+        &settings.group_isolation,
+        &settings.group_isolation_hints,
+    );
     Ok((candidate, outcome))
 }
 
@@ -597,6 +616,22 @@ fn install_java_colors<'a>(
         } else {
             candidate.java_group_colors.insert(hint.clone());
         }
+    }
+}
+
+fn install_java_isolation<'a>(
+    original: &library::Library,
+    candidate: &mut library::Library,
+    levels: &BTreeMap<String, crate::session_security::IsolationLevel>,
+    hints: impl IntoIterator<Item = &'a library::JavaGroupIsolation>,
+) {
+    for (path, level) in levels {
+        if !original.groups.contains(path) && candidate.groups.contains(path) {
+            candidate.group_isolation.insert(path.clone(), *level);
+        }
+    }
+    for hint in hints {
+        candidate.stage_java_group_isolation(hint);
     }
 }
 

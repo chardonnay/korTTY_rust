@@ -292,6 +292,12 @@ pub(super) fn convert(
                         import.teamwork_proposals
                     ));
                 }
+                if import.security_proposals != 0 {
+                    report.entries.push(format!(
+                        "Inactive Java security preferences for review in Global Settings ({})",
+                        import.security_proposals
+                    ));
+                }
                 if import.swarm_journal_proposal {
                     report.entries.push(
                         "Inactive Java Swarm journal settings for review in the Swarm window."
@@ -854,16 +860,24 @@ pub(super) fn convert(
         }
     }
     let (_, colors) = report.connection_library.counts();
-    if colors != 0 {
+    let isolation = report.connection_library.group_isolation_count();
+    if colors != 0 || isolation != 0 {
         if !snapshot.contains_key(CONNECTIONS) {
             let (bytes, _) = ConnectionPreview::default()
                 .with_java_library(report.connection_library.clone())
                 .portable_java_backup()?;
             snapshot.insert(CONNECTIONS.into(), Zeroizing::new(bytes));
         }
-        report.entries.push(format!(
-            "Java folder colors for new folders or explicit review in Connection Manager ({colors})"
-        ));
+        if colors != 0 {
+            report.entries.push(format!(
+                "Java folder colors for new folders or explicit review in Connection Manager ({colors})"
+            ));
+        }
+        if isolation != 0 {
+            report.entries.push(format!(
+                "Java folder isolation for exact new folders or explicit review in Connection Manager ({isolation})"
+            ));
+        }
     }
 
     let scheduler = content("job-scheduler.xml").and_then(|bytes| {

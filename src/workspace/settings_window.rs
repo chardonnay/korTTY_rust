@@ -3935,6 +3935,7 @@ impl Workspace {
                 })
                 .into()
             };
+        let imported = dialog.draft.preferences.java_security;
         column![
             text("Master password").size(18),
             text("Your master password unlocks the local credential vault.").size(13),
@@ -3983,6 +3984,15 @@ impl Workspace {
                         Desktop::Settings(Message::TemporarySshKey(id, enabled))
                     })),
             ),
+            imported.temporary_ssh_keys.map(|enabled| {
+                row![
+                    text(if enabled { "Java backup · Enabled" } else { "Java backup · Disabled" }).size(13),
+                    dialog_design::secondary_action("Use Java setting").on_press_maybe(
+                        (policy.problem.is_none() && enabled != dialog.draft.preferences.temporary_ssh_key_enabled)
+                            .then_some(Desktop::Settings(Message::TemporarySshKey(id, enabled)))
+                    ),
+                ].spacing(8).align_y(Alignment::Center)
+            }),
             rule::horizontal(1),
             text("Session isolation").size(18),
             text("Choose the default for new local and SSH sessions. Saved SSH connections can specify their own level.").size(13),
@@ -3994,6 +4004,16 @@ impl Workspace {
                     isolation_control,
                 ].spacing(8).align_y(Alignment::Center),
             ),
+            imported.default_isolation.map(|level| {
+                row![
+                    text(format!("Java backup · {level}")).size(13),
+                    dialog_design::secondary_action("Use Java setting").on_press_maybe(
+                        (policy.problem.is_none() && level >= minimum
+                            && dialog.draft.preferences.default_session_isolation != Some(level))
+                            .then_some(Desktop::Settings(Message::DefaultIsolation(id, level)))
+                    ),
+                ].spacing(8).align_y(Alignment::Center)
+            }),
             (minimum != IsolationLevel::None).then(|| text(format!("Managed minimum · {minimum}")).size(13)),
             highlighted(dialog, Setting::SandboxAvailability, text(dialog.sandbox_availability.clone().unwrap_or_else(|| "Checking sandbox availability…".into())).size(13)),
             (isolation == IsolationLevel::Sandbox).then(|| text("Set an absolute sandbox workspace for local shells in Session security.").size(13)),
@@ -5469,6 +5489,73 @@ mod tests {
                 .sandbox_availability
                 .is_none()
         );
+    }
+
+    #[test]
+    fn java_security_preferences_remain_inactive_until_settings_are_saved() {
+        let local = br#"{"default_session_isolation":"sandbox","temporary_ssh_key_enabled":true}"#;
+        let imported = super::super::backup_data::portable_java_preferences(
+            b"<globalSettings><connectionIsolationDefault>none</connectionIsolationDefault><temporarySshKeyEnabled>false</temporarySshKeyEnabled></globalSettings>",
+            None,
+        ).unwrap();
+        assert_eq!(imported.security_proposals, 2);
+        let merged = super::super::backup_data::merge_java_window_settings(
+            Some(local),
+            &imported.contents.unwrap(),
+            &Default::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let mut workspace = Workspace::default();
+        workspace.window_settings = WindowSettings::decode(&merged).unwrap();
+        let proposed = workspace.window_settings.java_security;
+        assert_eq!(proposed.default_isolation, Some(IsolationLevel::None));
+        assert_eq!(proposed.temporary_ssh_keys, Some(false));
+
+        workspace.clipboard.policy.minimum_isolation = IsolationLevel::Process;
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.open_settings(owner, Some(Section::Security));
+        let id = workspace.settings.for_owner(owner).unwrap();
+        let _ = workspace.update_settings(Message::DefaultIsolation(
+            id,
+            proposed.default_isolation.unwrap(),
+        ));
+        let _ = workspace.update_settings(Message::TemporarySshKey(
+            id,
+            proposed.temporary_ssh_keys.unwrap(),
+        ));
+        assert!(workspace.window_settings.temporary_ssh_key_enabled);
+        assert_eq!(
+            workspace
+                .settings
+                .0
+                .as_ref()
+                .unwrap()
+                .draft
+                .preferences
+                .default_session_isolation,
+            Some(IsolationLevel::Sandbox)
+        );
+        let _ = workspace.update_settings(Message::Cancel(id));
+        assert!(workspace.window_settings.temporary_ssh_key_enabled);
+
+        workspace.clipboard.policy.minimum_isolation = IsolationLevel::None;
+        let _ = workspace.open_settings(owner, Some(Section::Security));
+        let id = workspace.settings.for_owner(owner).unwrap();
+        let _ = workspace.update_settings(Message::DefaultIsolation(
+            id,
+            proposed.default_isolation.unwrap(),
+        ));
+        let _ = workspace.update_settings(Message::TemporarySshKey(
+            id,
+            proposed.temporary_ssh_keys.unwrap(),
+        ));
+        let _ = workspace.save_settings_to(id, |_| Ok(()));
+        assert_eq!(
+            workspace.window_settings.default_session_isolation,
+            Some(IsolationLevel::None)
+        );
+        assert!(!workspace.window_settings.temporary_ssh_key_enabled);
     }
 
     #[test]

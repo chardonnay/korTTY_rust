@@ -2931,6 +2931,7 @@ fn java_os_badge_restore_requires_a_local_image_choice_even_when_the_id_exists()
 fn java_connection_library_restore_remaps_only_unambiguous_insertions() {
     use crate::connection_store::{Store, TabColor, import::Preview as ConnectionPreview};
     use crate::connection_window::{ConnectionWindow, Message, Scope};
+    use crate::session_security::IsolationLevel;
     use iced::futures::{StreamExt, executor::block_on};
     use iced_runtime::{Action, task};
     use zip::{AesMode, ZipWriter, write::SimpleFileOptions};
@@ -2955,6 +2956,8 @@ fn java_connection_library_restore_remaps_only_unambiguous_insertions() {
         <connection id="new-shell"><name>Java shell</name><protocol>LOCAL_SHELL</protocol></connection>
     </connections>"#;
     const SETTINGS: &[u8] = br##"<globalSettings>
+        <connectionIsolationDefault>sandbox</connectionIsolationDefault>
+        <temporarySshKeyEnabled>true</temporarySshKeyEnabled>
         <favoriteConnections>
             <connection>new-ssh</connection><connection>already-here</connection><connection>teamwork</connection>
             <connection>duplicate-id</connection><connection>shadow-a</connection><connection>new-serial</connection><connection>new-shell</connection>
@@ -2968,6 +2971,13 @@ fn java_connection_library_restore_remaps_only_unambiguous_insertions() {
             <group path=" Work / Conflict " color="#2a4"/>
             <group path="Orphan" color="#abc"/>
         </connectionGroupColors>
+        <connectionGroupIsolation>
+            <group path="Work" level="sandbox"/>
+            <group path=" Work / Imported " level="sandbox"/>
+            <group path="Work/Conflict" level="none"/>
+            <group path=" Work / Conflict " level="process"/>
+            <group path="Orphan" level="none"/>
+        </connectionGroupIsolation>
     </globalSettings>"##;
     let source = Scratch::new();
     let archive_path = source.0.join("java-library.zip");
@@ -2990,6 +3000,12 @@ fn java_connection_library_restore_remaps_only_unambiguous_insertions() {
         .portable_java_backup()
         .unwrap();
     directory.publish_copy(CONNECTIONS, &initial).unwrap();
+    directory
+        .publish_copy(
+            "window-settings.json",
+            br#"{"default_session_isolation":"process","temporary_ssh_key_enabled":false}"#,
+        )
+        .unwrap();
     let connection_path = local.0.join(CONNECTIONS);
     let mut store = Store::open(connection_path.clone()).unwrap();
     let native_id = store.connections()[0].id;
@@ -3000,6 +3016,9 @@ fn java_connection_library_restore_remaps_only_unambiguous_insertions() {
     );
     store
         .set_group_color("Work", TabColor::parse("#900"))
+        .unwrap();
+    store
+        .set_group_isolation("Work", None, Some(IsolationLevel::Process))
         .unwrap();
     drop(store);
 
@@ -3065,6 +3084,32 @@ fn java_connection_library_restore_remaps_only_unambiguous_insertions() {
     assert_eq!(store.group_color("Work/Imported"), TabColor::parse("#3af"));
     assert_eq!(store.group_color("Work/Conflict"), None);
     assert!(!store.has_group("Orphan"));
+    let settings: serde_json::Value =
+        serde_json::from_slice(&fs::read(local.0.join("window-settings.json")).unwrap()).unwrap();
+    assert_eq!(settings["default_session_isolation"], "process");
+    assert_eq!(settings["temporary_ssh_key_enabled"], false);
+    assert_eq!(settings["java_security"]["default_isolation"], "sandbox");
+    assert_eq!(settings["java_security"]["temporary_ssh_keys"], true);
+    assert_eq!(store.group_isolation("Work"), Some(IsolationLevel::Process));
+    assert_eq!(
+        store.group_isolation("Work/Imported"),
+        Some(IsolationLevel::Sandbox)
+    );
+    assert_eq!(store.group_isolation("Work/Conflict"), None);
+    assert_eq!(
+        store
+            .java_group_isolation()
+            .iter()
+            .filter(|hint| hint.source == "Work/Conflict")
+            .count(),
+        2
+    );
+    let isolation_hint = store
+        .java_group_isolation()
+        .iter()
+        .find(|hint| hint.source == "Orphan")
+        .unwrap()
+        .clone();
     let hints = store.java_group_colors();
     assert_eq!(hints.len(), 4);
     assert_eq!(
@@ -3090,6 +3135,13 @@ fn java_connection_library_restore_remaps_only_unambiguous_insertions() {
     store
         .set_group_color("Work/Imported", TabColor::parse("#098"))
         .unwrap();
+    store
+        .set_group_isolation(
+            "Work/Imported",
+            Some(IsolationLevel::Sandbox),
+            Some(IsolationLevel::Process),
+        )
+        .unwrap();
     drop(store);
 
     let mut editor = ConnectionWindow::open(connection_path.clone()).unwrap();
@@ -3109,6 +3161,24 @@ fn java_connection_library_restore_remaps_only_unambiguous_insertions() {
     let Some(Action::Output(completed @ Message::Completed(Ok(_)))) = block_on(operation.next())
     else {
         panic!("expected a reviewed group color assignment");
+    };
+    let _ = editor.update(completed);
+    let _ = editor.update(Message::SelectGroup("Work".into()));
+    let _ = editor.update(Message::EditGroupIsolation);
+    let _ = editor.update(Message::PickJavaGroupIsolation(isolation_hint.clone()));
+    let _ = editor.update(Message::CancelGroup);
+    assert_eq!(
+        Store::open(connection_path.clone())
+            .unwrap()
+            .group_isolation("Work"),
+        Some(IsolationLevel::Process)
+    );
+    let _ = editor.update(Message::EditGroupIsolation);
+    let _ = editor.update(Message::PickJavaGroupIsolation(isolation_hint.clone()));
+    let mut operation = task::into_stream(editor.update(Message::CommitGroup)).unwrap();
+    let Some(Action::Output(completed @ Message::Completed(Ok(_)))) = block_on(operation.next())
+    else {
+        panic!("expected a reviewed Java folder isolation assignment");
     };
     let _ = editor.update(completed);
     let _ = editor.update(Message::Select(existing));
@@ -3144,10 +3214,22 @@ fn java_connection_library_restore_remaps_only_unambiguous_insertions() {
     assert_eq!(store.group_color("Work/Imported"), TabColor::parse("#098"));
     assert_eq!(store.group_color("Work"), Some(orphan.color));
     assert!(!store.java_group_colors().contains(&orphan));
+    assert_eq!(store.group_isolation("Work"), Some(IsolationLevel::None));
+    assert_eq!(
+        store.group_isolation("Work/Imported"),
+        Some(IsolationLevel::Process)
+    );
+    assert!(!store.java_group_isolation().contains(&isolation_hint));
+    assert!(
+        !store
+            .java_group_isolation()
+            .iter()
+            .any(|hint| hint.source == "Work/Imported")
+    );
 }
 
 #[test]
-fn java_group_colors_restore_from_settings_alone_without_creating_folders() {
+fn java_folder_preferences_restore_from_settings_alone_without_creating_folders() {
     use crate::connection_store::Store;
     use zip::{AesMode, ZipWriter, write::SimpleFileOptions};
 
@@ -3166,6 +3248,7 @@ fn java_group_colors_restore_from_settings_alone_without_creating_folders() {
         .write_all(
             br##"<globalSettings>
         <connectionGroupColors><group path="Old/Empty" color="#abc"/></connectionGroupColors>
+        <connectionGroupIsolation><group path="Old/Empty" level="process"/></connectionGroupIsolation>
     </globalSettings>"##,
         )
         .unwrap();
@@ -3180,6 +3263,10 @@ fn java_group_colors_restore_from_settings_alone_without_creating_folders() {
     assert!(!store.has_group("Old/Empty"));
     assert_eq!(
         store.java_group_colors().iter().next().unwrap().source,
+        "Old/Empty"
+    );
+    assert_eq!(
+        store.java_group_isolation().iter().next().unwrap().source,
         "Old/Empty"
     );
 }

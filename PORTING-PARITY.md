@@ -136,7 +136,9 @@ fresh paste after expiry. Turning off the option discards Quick Connect
 form and retry keys. Teamwork continues to use its separately configured
 temporary-key method. The native Save connection control applies to the
 other authentication methods. The Java connection editor's encrypted
-temporary-key persistence and the Java preference migration remain open.
+temporary-key persistence remains open. The
+[backup security checkpoint](#november-23-java-backup-security-settings)
+records the later adoption of the global preference.
 
 The native Windows ARM64 development build passed. The Settings desktop
 opened the Security page from its search result and displayed the saved
@@ -245,8 +247,9 @@ with `dialog-preview`. [Windows native tests](target/verification/20261123-isola
 · [Windows application check](target/verification/20261123-isolation-inheritance-windows-verified-check.log)
 
 The [local shell update](#november-23-local-shell-profile-isolation) adds
-saved local-shell overrides. Java global and folder backup settings, native
-desktop comparison and live SSH acceptance remain open.
+saved local-shell overrides. The [backup security update](#november-23-java-backup-security-settings)
+adds migration of the Java global and folder preferences. Native desktop
+comparison and live SSH acceptance remain open.
 [Connection Manager editor](src/connection_window/form.rs)
 · [Folder and connection storage](src/connection_store.rs)
 · [Isolation resolver](src/session_security.rs)
@@ -273,8 +276,8 @@ sandboxed shell preserves its recorded isolation and workspace.
 The Java-compatible and Rust-specific local connection XML forms retain
 their isolation choice and folder. Tagged Java XML without an explicit
 level inherits. Native exports record the distinction when a profile
-follows Global Settings directly. Reviewed adoption of the global and
-folder preferences from a Java backup remains open.
+follows Global Settings directly. The [backup security checkpoint](#november-23-java-backup-security-settings)
+covers the separate global and folder preferences.
 [Local profile storage](src/connection_store/local.rs)
 · [Local editor](src/connection_window/local.rs)
 · [Launch and restore settings](src/workspace/session_security.rs)
@@ -292,6 +295,51 @@ profile backup tests and native local-shell launches through the Manager and
 Quick Connect. The final application all-target check passed with
 `dialog-preview`. [Windows tests](target/verification/20261123-local-profile-isolation-windows-tests.log)
 · [Windows application check](target/verification/20261123-local-profile-isolation-windows-verified-check.log)
+
+## November 23 Java backup security settings
+
+The tagged Java settings store the global isolation level and temporary SSH
+key opt-in as `connectionIsolationDefault` and `temporarySshKeyEnabled`.
+Rust stages these as separate Security page proposals. An omitted field
+leaves no proposal. Explicit None and false remain selectable values.
+Use Java setting changes the current draft, and Save applies the change.
+Cancel preserves the current native values. Managed policy can block an
+isolation proposal below its minimum. Adopting the temporary-key option
+changes availability in Quick Connect and imports no key material.
+
+Java stores folder choices as `connectionGroupIsolation` entries with a
+path and level. An unambiguous level is applied when the restore creates
+that exact folder. Choices for existing, missing or ambiguous folders
+remain available for review in the Connection Manager. The dialog shows
+the Java path and level before Save. Restore keeps existing native choices,
+and replay preserves subsequent edits and prior reviews.
+[Tagged Java settings](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/model/GlobalSettings.java)
+· [Rust security preferences](src/workspace/backup_data.rs)
+· [Folder mapping](src/connection_store/import/options.rs)
+· [Settings review](src/workspace/settings_window.rs)
+· [Folder review](src/connection_window/view.rs)
+
+The native Apple Silicon build passed three focused tests. They cover the
+full connection-library restore and replay, a settings-only backup with
+no new folders, and the global Security draft, managed floor, Cancel and
+Save. [Apple Silicon tests](target/verification/20261123-java-security-restore-apple-silicon.log)
+
+The native Windows ARM64 application all-target check passed with
+`dialog-preview`. The native test build passed 373 selected cases with one
+ignored. The selections cover profile backup, Connection Manager storage
+and editing, global Settings and workspace backup preferences.
+[Windows application check](target/verification/20261123-java-security-restore-windows-check.log)
+· [Windows native tests](target/verification/20261123-java-security-restore-windows-tests.log)
+
+Compare the restored Security and Connection Manager review controls on
+native desktops. Check live inherited SSH and local sandbox launches and
+the interactive SSH and SFTP temporary-key routes with disposable keys.
+Startup auto-unlock and encrypted temporary keys in the saved-connection
+editor remain open. The tagged Settings dialog updates its remembered
+unlock credential after a master password change and clears it when the
+user disables auto-unlock. Include those transitions and the managed
+startup requirement in native acceptance.
+[Tagged Java Settings dialog](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SettingsDialog.java)
 
 ## November 23 Plan and execution layout
 

@@ -20,7 +20,7 @@ mod color;
 pub(crate) mod custom_os_badges;
 pub(crate) mod import;
 mod library;
-pub(crate) use library::JavaGroupColor;
+pub(crate) use library::{JavaGroupColor, JavaGroupIsolation};
 mod local;
 mod os_badge;
 mod terminal;
@@ -870,12 +870,43 @@ impl Store {
         original: Option<IsolationLevel>,
         level: Option<IsolationLevel>,
     ) -> io::Result<()> {
+        self.save_group_isolation(path, original, level, None)
+    }
+
+    pub(crate) fn java_group_isolation(&self) -> &BTreeSet<JavaGroupIsolation> {
+        &self.document.library.java_group_isolation
+    }
+
+    pub(crate) fn adopt_java_group_isolation(
+        &mut self,
+        path: &str,
+        original: Option<IsolationLevel>,
+        hint: JavaGroupIsolation,
+    ) -> io::Result<()> {
+        self.save_group_isolation(path, original, Some(hint.level), Some(hint))
+    }
+
+    fn save_group_isolation(
+        &mut self,
+        path: &str,
+        original: Option<IsolationLevel>,
+        level: Option<IsolationLevel>,
+        hint: Option<JavaGroupIsolation>,
+    ) -> io::Result<()> {
         let mut candidate = self.document.clone();
         candidate.library.require_group(Some(path))?;
         if self.group_isolation(path) != original {
             return Err(invalid(
                 "Folder isolation changed. Open the folder settings again.",
             ));
+        }
+        if let Some(hint) = hint {
+            if !candidate.library.java_group_isolation.remove(&hint) {
+                return Err(invalid(
+                    "The imported Java folder isolation choice is no longer available.",
+                ));
+            }
+            candidate.library.reviewed_java_group_isolation.insert(hint);
         }
         if let Some(level) = level {
             candidate

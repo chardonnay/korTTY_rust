@@ -9,7 +9,8 @@ use iced::{Point, Task};
 use crate::connection_store::custom_os_badges::Catalog;
 use crate::connection_store::teamwork;
 use crate::connection_store::{
-    Connection, JavaGroupColor, LocalProfile, Search, SerialProfile, Store, TabColor,
+    Connection, JavaGroupColor, JavaGroupIsolation, LocalProfile, Search, SerialProfile, Store,
+    TabColor,
 };
 use crate::serial_dialog;
 use crate::session_security::{IsolationChoice, IsolationLevel};
@@ -70,6 +71,7 @@ pub enum Message {
     GroupColorEnabled(bool),
     GroupColorInput(String),
     PickJavaGroupColor(JavaGroupColor),
+    PickJavaGroupIsolation(JavaGroupIsolation),
     GroupName(String),
     CommitGroup,
     CancelGroup,
@@ -230,6 +232,7 @@ enum FolderDialog {
         path: String,
         original: Option<IsolationLevel>,
         draft: IsolationChoice,
+        imported: Option<JavaGroupIsolation>,
     },
 }
 
@@ -844,8 +847,11 @@ impl ConnectionWindow {
                 FolderDialog::Rename { path, name } => path.rsplit('/').next() != Some(name),
                 FolderDialog::Delete { .. } => false,
                 FolderDialog::Isolation {
-                    original, draft, ..
-                } => *original != draft.0,
+                    original,
+                    draft,
+                    imported,
+                    ..
+                } => imported.is_some() || *original != draft.0,
                 FolderDialog::Color {
                     original,
                     draft,
@@ -1095,6 +1101,7 @@ impl ConnectionWindow {
                         | Message::GroupColorInput(_)
                         | Message::GroupIsolation(_)
                         | Message::PickJavaGroupColor(_)
+                        | Message::PickJavaGroupIsolation(_)
                         | Message::CommitGroup
                         | Message::CancelGroup
                         | Message::Completed(_)
@@ -1534,13 +1541,29 @@ impl ConnectionWindow {
                         path: path.to_owned(),
                         original,
                         draft: IsolationChoice(original),
+                        imported: None,
                     });
                     self.notice = None;
                 }
             }
             Message::GroupIsolation(choice) => {
-                if let Some(FolderDialog::Isolation { draft, .. }) = &mut self.folder {
+                if let Some(FolderDialog::Isolation {
+                    draft, imported, ..
+                }) = &mut self.folder
+                {
                     *draft = choice;
+                    *imported = None;
+                    self.notice = None;
+                }
+            }
+            Message::PickJavaGroupIsolation(hint) => {
+                if let Some(FolderDialog::Isolation {
+                    draft, imported, ..
+                }) = &mut self.folder
+                    && self.store.java_group_isolation().contains(&hint)
+                {
+                    *draft = IsolationChoice(Some(hint.level));
+                    *imported = Some(hint);
                     self.notice = None;
                 }
             }
@@ -1781,8 +1804,13 @@ impl ConnectionWindow {
                     path,
                     original,
                     draft,
+                    imported,
                 } => {
-                    store.set_group_isolation(&path, original, draft.0)?;
+                    if let Some(hint) = imported {
+                        store.adopt_java_group_isolation(&path, original, hint)?;
+                    } else {
+                        store.set_group_isolation(&path, original, draft.0)?;
+                    }
                     (Scope::Group(path), "Folder isolation saved.", None)
                 }
             };
