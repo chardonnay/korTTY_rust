@@ -541,7 +541,7 @@ fn history_modules_open_the_actions_for_the_exact_recorded_step() {
 
     for (module, label) in [
         (History::Timeline, "printf fixture"),
-        (History::PlanExecution, "1  printf fixture"),
+        (History::PlanExecution, "printf fixture"),
         (History::CardStack, "1 · printf fixture"),
         (History::Conversation, "printf fixture"),
         (History::Tmux, "printf fixture"),
@@ -884,12 +884,12 @@ fn side_timeline_follows_new_steps_and_the_final_answer() {
     let initial = metrics(&mut ui, &renderer);
     let (viewport, translation, end) = initial.vertical_scroll.unwrap();
     assert!((translation.y - end).abs() <= 1.0);
-    assert!(
-        initial
-            .labels
-            .iter()
-            .any(|(_, label)| label.starts_with("Running · "))
-    );
+    assert!(initial.labels.iter().any(|(_, label)| {
+        label
+            .strip_prefix("Running ")
+            .and_then(|elapsed| elapsed.strip_suffix(" s"))
+            .is_some_and(|seconds| seconds.parse::<u64>().is_ok())
+    }));
     let mut messages = Vec::new();
     let _ = ui.update(
         &[Event::Mouse(mouse::Event::WheelScrolled {
@@ -920,7 +920,7 @@ fn side_timeline_follows_new_steps_and_the_final_answer() {
         revised
             .labels
             .iter()
-            .any(|(_, label)| label.starts_with("Exit 7 · "))
+            .any(|(_, label)| label == "Exit 7 · 1 line")
     );
     let cache = ui.into_cache();
 
@@ -987,6 +987,46 @@ fn plan_execution_shows_latest_typed_command_output_and_final_answer() {
             .map(|(_, text)| text)
             .collect::<Vec<_>>()
     };
+    let mut ui = UserInterface::build(
+        history_fixture_view(&fixture, id),
+        size,
+        Cache::default(),
+        &mut renderer,
+    );
+    let before = log_label_position(&mut ui, &renderer, "$ printf latest");
+    let start = Point::new(size.width * 0.42, before.y);
+    let end = Point::new(size.width * 0.60, before.y);
+    let mut messages = Vec::new();
+    for (event, position) in [
+        (mouse::Event::ButtonPressed(mouse::Button::Left), start),
+        (mouse::Event::CursorMoved { position: end }, end),
+        (mouse::Event::ButtonReleased(mouse::Button::Left), end),
+    ] {
+        let _ = ui.update(
+            &[Event::Mouse(event)],
+            mouse::Cursor::Available(position),
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+    }
+    let cache = ui.into_cache();
+    assert!(matches!(
+        messages.as_slice(),
+        [Desktop::TerminalAgent(owner, Message::Design(design::Message::ResizePlan(_)))]
+            if *owner == id
+    ));
+    let _ = fixture.workspace.update(messages.remove(0));
+    let mut ui = UserInterface::build(
+        history_fixture_view(&fixture, id),
+        size,
+        cache,
+        &mut renderer,
+    );
+    let after = log_label_position(&mut ui, &renderer, "$ printf latest");
+    assert!((after.x - before.x - (end.x - start.x)).abs() <= 2.0);
+    drop(ui);
+
     let running = labels(&fixture, &mut renderer);
     assert!(running.iter().any(|label| label == "$ printf latest"));
     assert!(

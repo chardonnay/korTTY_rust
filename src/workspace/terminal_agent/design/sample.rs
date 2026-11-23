@@ -367,8 +367,7 @@ impl Sample {
         let activity = history::Activity {
             activity: &self.entries,
             goal: view.goal,
-            plan: (layout.history == History::PlanExecution)
-                .then_some("Inspect disk usage, review a cleanup, and summarize the result."),
+            plan: None,
             activity_font: fonts.activity,
             plan_font: fonts.plan,
             presentation: &self.presentation,
@@ -422,19 +421,26 @@ impl Sample {
             }
         };
         let history_panel = || -> Element<'a, AgentMessage> {
-            let palette = (layout.history == History::Timeline
+            let plan = layout.history == History::PlanExecution;
+            let timeline = layout.history == History::Timeline
+                && layout.arrangement != Arrangement::PictureInPicture;
+            let palette = ((timeline || plan)
                 && layout.arrangement != Arrangement::PictureInPicture)
                 .then(palette::Palette::default_status);
-            let header = if palette.is_some() {
-                status::timeline_header(
+            let header = if timeline {
+                Some(status::timeline_header(
                     activity,
                     status::Trace::sample(&self.transcript, self.started, now, view.reduced_motion),
                     palette,
-                )
+                ))
+            } else if plan {
+                None
             } else {
-                text(format!("{} · {}", layout.history, view.phase.0))
-                    .size(13)
-                    .into()
+                Some(
+                    text(format!("{} · {}", layout.history, view.phase.0))
+                        .size(13)
+                        .into(),
+                )
             };
             let panel = container(
                 column![
@@ -447,7 +453,7 @@ impl Sample {
                 ]
                 .spacing(if palette.is_some() { 4 } else { 5 }),
             )
-            .padding(if palette.is_some() {
+            .padding(if timeline {
                 super::timeline::PANEL_PADDING
             } else {
                 iced::Padding::from(7)
@@ -532,15 +538,22 @@ impl Sample {
             history_position.map(|_| history_panel().map(forward)),
             status,
             history_position,
-            position,
+            placement::status_relative_to_history(position, layout.history, history_position),
             bounds,
             DockExtents {
                 left: side_width,
                 right: side_width,
-                bottom: (history_position == Some(Slot::Bottom)
-                    && layout.history == History::LogTable
-                    && log_table::has_detail(activity, &self.transcript))
-                .then_some(bounds.height * 0.65),
+                bottom: match (history_position, layout.history) {
+                    (Some(Slot::Bottom), History::PlanExecution) => {
+                        Some(placement::plan_sample_height(bounds.height))
+                    }
+                    (Some(Slot::Bottom), History::LogTable)
+                        if log_table::has_detail(activity, &self.transcript) =>
+                    {
+                        Some(bounds.height * 0.65)
+                    }
+                    _ => None,
+                },
             },
         );
         let terminal = if status_kind == Status::Spotlight

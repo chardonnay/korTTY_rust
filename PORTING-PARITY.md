@@ -25,17 +25,20 @@ Windows ARM64 desktop checks.
 - **Agent designs.** Activating another module on Standard or Classic already
   creates a custom design. The standalone editor saves the change. A fresh Rust
   process restored the custom default, delay and reduced animations. Java
-  names an automatic copy after its preset, for example `Standard 2`, and opens
-  a name dialog for New, Duplicate and Rename. Rust generates `Custom design N`
-  and renames inline. [Java editor](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignPluginManagerDialog.java)
+  appends ` 2` to the preset's full display name and opens a name dialog
+  for New, Duplicate and Rename. New opens with `My combination` selected.
+  Duplicate selects the proposed name based on the current design. Rust
+  generates `Custom design N` and renames inline. [Java editor](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignPluginManagerDialog.java)
   · [Rust editor](src/workspace/settings_window/agent_design_settings.rs)
   · [Rust catalog](src/terminal_agent/design/custom.rs)
 - **Plan and execution.** At 1,202 by 694 pixels, Java placed Metro above the
   bottom history and Rust placed it below. Java gives the prompt and run
   controls one header above the Plan checklist and execution column. Its
-  divider starts at 42% and can be dragged. The shared Rust layout puts Metro
-  below the composed pane, and the Rust presenter uses Goal and Activity
-  headings and fixed column proportions. [Java panel](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignPlanExecution.java)
+  divider starts at 42% and can be dragged. At this checkpoint the shared
+  Rust layout put Metro below the composed pane and used Goal and Activity
+  headings and fixed column proportions. The later
+  [layout update](#november-23-plan-and-execution-layout) addresses these
+  differences. [Java panel](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignPlanExecution.java)
   · [Rust placement](src/workspace/terminal_agent/design/placement.rs)
   · [Rust panel](src/workspace/terminal_agent/design/plan_execution.rs)
 - **Local models.** Both GGUF and MLX have owned Configure windows. The
@@ -44,8 +47,9 @@ Windows ARM64 desktop checks.
   prompts for copy or reference after the file picker and offers a matching
   runtime when a saved GGUF model requires a different backend. Rust
   embeds import review and offers runtime repair separately. Java stores the
-  Hub publication date for MLX, while Rust's MLX inventory row supplies no
-  date. MLX Configure and the mixed inventory still need Apple Silicon
+  Hub publication date for MLX. At this checkpoint Rust's MLX inventory row
+  supplied no date. The later [MLX update](#november-23-mlx-publication-date-on-apple-silicon)
+  adds that metadata. MLX Configure and the mixed inventory need Apple Silicon
   desktop acceptance. [Java model manager](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/LocalModelManagerPane.java)
   · [Rust window routing](src/workspace/ai_access.rs)
   · [Rust GGUF actions](src/ai_manager/local/managed.rs)
@@ -74,6 +78,55 @@ the [release matrix](PORTING-PLAN.md#native-acceptance-and-release-gates).
 The checkout's `target/verification/` directory holds the desktop record
 `20261123-model-config-windows-arm64-desktop.md` and its test log
 `20261123-model-config-windows-arm64-tests.log`.
+
+## November 23 Plan and execution layout
+
+The shared terminal and preview layout places Metro before the bottom
+Plan and execution panel while retaining the full-width Metro bar beneath
+a side timeline. The panel has a prompt and run header, a checklist and
+an execution column. The default bottom panel is 152 logical pixels high.
+The divider starts at 42% and supports dragging between independently
+scrollable columns.
+
+Private automatic launches compared Java v2.26.0 x64 under emulation
+and native Rust on the same Windows ARM64 host. The standard dialogs
+both captured at 1,202 by 694 pixels. Rust showed the prompt header and
+Plan checklist beneath Metro. Dragging the divider after highlighting it
+reflowed the answer in the narrower execution column. The compact Rust
+dialog captured at 942 by 512 pixels. Scrolling exposed the whole panel
+with Close still visible. Side timeline retained the full-width bar.
+The divider highlight, panel colors and text spacing still differ from
+Java. The native Rust executable had PE machine `0xAA64` and SHA-256
+`535503DA10D56BD83E10E0078CE68B9C8CF0ACC00AAB57BDBC9DE66C7619353E`.
+
+Apple Silicon passed four targeted plan tests. The drag fixture verifies
+that a native resize event changes the split and that the presenter still
+shows the latest typed command output and final answer. Windows ARM64
+passed 151 focused cases, including that drag fixture, the shared Metro
+positions and bound history-panel approvals. The wider Windows selection
+also found a prior Timeline assertion for the old running label. The test
+now checks the displayed elapsed time and output line count. The final
+source passed Windows ARM64 `cargo check --tests` and nine focused tests
+on Apple Silicon, including the corrected Timeline case. A run in the
+live desktop terminal with a reviewed command remains open.
+[Apple Silicon regression record](target/verification/20261123-mlx-publication-and-plan-macos.log)
+· [Apple Silicon final retest](target/verification/20261123-mlx-publication-and-plan-macos-final.log)
+· [Windows ARM64 regression record](target/verification/20261123-plan-execution-windows-retest.log)
+
+## November 23 MLX publication date on Apple Silicon
+
+Hugging Face MLX review now captures the repository publication time and
+retains it in the download checkpoint. Registration stores the optional
+date with the verified model. The installed inventory uses the same date
+format and sort as GGUF. Old model manifests and paused downloads without
+the field remain readable.
+
+Native macOS ARM64 passed 33 MLX tests, with five ignored. The local Hub
+fixture verified a downloaded model's publication timestamp after the
+registry reloaded it. A separate mixed-inventory test passed and sorted
+the dated MLX model, older GGUF model and undated model in that order.
+The dated and undated rows still need a desktop comparison after restart.
+[Native test record](target/verification/20261123-mlx-publication-and-plan-macos.log)
 
 ## November 22 AI Manager and Agent Design on Windows ARM64
 

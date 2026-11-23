@@ -267,7 +267,7 @@ fn entries(
                 );
             }
         }
-        History::PlanExecution => return super::plan_execution::view(run, reduced_motion),
+        History::PlanExecution => return super::plan_execution::view(run, palette, reduced_motion),
         History::CardStack => return super::card_stack::view(run, reduced_motion),
         History::Tmux => {
             return super::tmux::view(run, palette, reduced_motion);

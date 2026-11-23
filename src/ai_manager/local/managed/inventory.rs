@@ -79,19 +79,17 @@ impl Row {
     }
 
     pub(in crate::ai_manager::local) fn mlx(
-        id: &str,
-        name: &str,
-        idle_minutes: u16,
+        model: &crate::local_ai::mlx_models::Model,
         state: String,
     ) -> Self {
         Self {
-            id: ModelId::Mlx(id.to_owned()),
-            name: name.to_owned(),
-            file: id.to_owned(),
+            id: ModelId::Mlx(model.id.clone()),
+            name: model.name.clone(),
+            file: model.id.clone(),
             purpose: purpose_label(Purpose::Chat).into(),
             backend: "Metal".into(),
-            idle_minutes: u32::from(idle_minutes),
-            published_at: None,
+            idle_minutes: u32::from(model.idle_minutes),
+            published_at: model.published_at.clone(),
             state: state.to_uppercase(),
             default: false,
         }
@@ -545,18 +543,17 @@ mod tests {
         let llama = ModelId::Gguf(common_id.into());
         let mlx = ModelId::Mlx(common_id.into());
         let other = ModelId::Gguf(other_id.into());
+        let mut older = model(other_id, "Charlie", Purpose::Embedding);
+        older.published_at = Some("2024-10-01T12:00:00Z".into());
         dialog.managed.set_models(
-            vec![
-                model(common_id, "Alpha", Purpose::Chat),
-                model(other_id, "Charlie", Purpose::Embedding),
-            ],
+            vec![model(common_id, "Alpha", Purpose::Chat), older],
             None,
             None,
             &root,
         );
         let fixture = serde_json::from_value(serde_json::json!({
             "id": common_id, "name": "Bravo", "bytes": 0,
-            "idle_minutes": 15, "assets": {},
+            "idle_minutes": 15, "published_at": "2025-02-01T12:00:00Z", "assets": {},
         }))
         .unwrap();
         dialog.mlx.add_hub_model(fixture, &root);
@@ -586,5 +583,17 @@ mod tests {
         assert_eq!(dialog.mlx.selected_models().count(), 1);
         assert!(dialog.managed.selected.is_none());
         assert!(!dialog.installed_selected(&other));
+
+        let now = "2025-02-11T12:00:00Z".parse().unwrap();
+        dialog.managed.sort_by(Column::Age);
+        let rows = dialog.installed_rows(now);
+        assert_eq!(rows[0].id, mlx);
+        assert_eq!(
+            publication_days(rows[0].published_at.as_deref(), now),
+            Some(10)
+        );
+        assert_eq!(rows[1].id, other);
+        assert_eq!(rows[2].id, llama);
+        assert!(rows[2].published_at.is_none());
     }
 }

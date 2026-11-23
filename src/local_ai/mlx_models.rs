@@ -45,6 +45,8 @@ pub(crate) struct Model {
     pub(crate) name: String,
     pub(crate) bytes: u64,
     pub(crate) idle_minutes: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) published_at: Option<String>,
     assets: BTreeMap<String, u64>,
 }
 
@@ -97,6 +99,7 @@ impl Review {
             name: name.to_owned(),
             bytes: size_of_assets(&assets)?,
             idle_minutes: DEFAULT_IDLE_MINUTES,
+            published_at: None,
             assets,
         };
         let stamps = stamps(&files)?;
@@ -137,9 +140,16 @@ impl Review {
         self.model.assets.keys().map(String::as_str)
     }
 
-    pub(super) fn name_for_hub(&mut self, name: &str) -> io::Result<()> {
+    pub(super) fn set_hub_metadata(
+        &mut self,
+        name: &str,
+        published_at: Option<&str>,
+    ) -> io::Result<()> {
         require_name(name)?;
         self.model.name = name.into();
+        self.model.published_at = published_at
+            .and_then(|date| date.parse::<jiff::Timestamp>().ok())
+            .map(|date| date.to_string());
         Ok(())
     }
 
@@ -521,6 +531,7 @@ pub(super) fn open_policy_model(
         name: definition.name.clone(),
         bytes: size_of_assets(&assets)?,
         idle_minutes: DEFAULT_IDLE_MINUTES,
+        published_at: None,
         assets,
     };
     let stamps = stamps(&files)?;

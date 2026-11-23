@@ -408,7 +408,7 @@ fn register(
             "The native MLX review differs from the Hugging Face package.",
         ));
     }
-    native.name_for_hub(review.repository.id())?;
+    native.set_hub_metadata(review.repository.id(), review.published_at.as_deref())?;
     mlx_models::Registry::new(profile).import_authorized(&native, stop.cancelled, || {
         if stop.pausing() {
             return Err(io::Error::new(

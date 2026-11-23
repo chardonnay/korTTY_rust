@@ -169,43 +169,77 @@ impl<'a> Trace<'a> {
     }
 }
 
-pub(super) fn timeline_header<'a>(
-    activity: history::Activity<'a>,
-    trace: Trace<'a>,
-    palette: Option<Palette>,
-) -> Element<'a, AgentMessage> {
-    let colors = palette.unwrap_or_else(Palette::default_status);
+fn history_icon(
+    colors: Palette,
+    glyph: &'static str,
+    label: &'static str,
+    action: Option<AgentMessage>,
+) -> Element<'static, AgentMessage> {
     let accent = colors.accent.color();
     let muted = colors.muted.color();
     let ink = colors.text.color();
-    let icon = move |glyph, label, action| {
-        tooltip(
-            button(text(glyph).size(11).center())
-                .height(21)
-                .padding([1, 5])
-                .style(move |_, state| {
-                    let hovered =
-                        matches!(state, button::Status::Hovered | button::Status::Pressed);
-                    button::Style {
-                        background: hovered.then(|| accent.scale_alpha(0.18).into()),
-                        text_color: if hovered { ink } else { muted },
-                        border: iced::Border {
-                            radius: 4.0.into(),
-                            ..iced::Border::default()
-                        },
-                        ..button::Style::default()
-                    }
-                })
-                .on_press_maybe(action),
-            text(label).size(12),
-            tooltip::Position::Bottom,
-        )
-    };
+    tooltip(
+        button(text(glyph).size(11).center())
+            .height(21)
+            .padding([1, 5])
+            .style(move |_, state| {
+                let hovered = matches!(state, button::Status::Hovered | button::Status::Pressed);
+                button::Style {
+                    background: hovered.then(|| accent.scale_alpha(0.18).into()),
+                    text_color: if hovered { ink } else { muted },
+                    border: iced::Border {
+                        radius: 4.0.into(),
+                        ..iced::Border::default()
+                    },
+                    ..button::Style::default()
+                }
+            })
+            .on_press_maybe(action),
+        text(label).size(12),
+        tooltip::Position::Bottom,
+    )
+    .into()
+}
+
+fn history_header_actions<'a>(
+    activity: history::Activity<'a>,
+    trace: &Trace<'a>,
+    colors: Palette,
+    hide_label: &'static str,
+) -> Element<'a, AgentMessage> {
     let hide = trace.run.map_or(
         AgentMessage::Design(Message::HideTimelineSample),
         super::actions::hide_history,
     );
-    let usage = usage_label(activity, Some(colors)).or_else(|| {
+    row![
+        history_icon(
+            colors,
+            if trace.paused { "▶" } else { "Ⅱ" },
+            if trace.paused { "Resume" } else { "Pause" },
+            (trace.active && !trace.waiting).then_some(AgentMessage::Pause),
+        ),
+        history_icon(
+            colors,
+            "■",
+            "Cancel run",
+            trace.active.then_some(AgentMessage::Cancel),
+        ),
+        log_table::history_icon_menu(activity, hide.clone(), hide_label, |action| {
+            history_icon(colors, "⋯", "Run actions", Some(action))
+        }),
+        history_icon(colors, "✕", hide_label, Some(hide)),
+    ]
+    .spacing(4)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+fn history_header_usage(
+    activity: history::Activity<'_>,
+    colors: Palette,
+) -> Option<Element<'_, AgentMessage>> {
+    let muted = colors.muted.color();
+    usage_label(activity, Some(colors)).or_else(|| {
         activity
             .transcript
             .and_then(|transcript| transcript.tokens)
@@ -216,7 +250,50 @@ pub(super) fn timeline_header<'a>(
                     .style(move |_| text::Style { color: Some(muted) })
                     .into()
             })
-    });
+    })
+}
+
+pub(super) fn plan_header<'a>(
+    activity: history::Activity<'a>,
+    trace: Trace<'a>,
+    palette: Option<Palette>,
+) -> Element<'a, AgentMessage> {
+    let colors = palette.unwrap_or_else(Palette::default_status);
+    let ink = colors.text.color();
+    let muted = colors.muted.color();
+    row![
+        container(
+            text(history::summary(activity.goal))
+                .size(12)
+                .font(Font {
+                    weight: iced::font::Weight::Bold,
+                    ..Font::DEFAULT
+                })
+                .wrapping(text::Wrapping::None)
+                .style(move |_| text::Style { color: Some(ink) })
+        )
+        .width(Length::Fill)
+        .clip(true),
+        history_header_usage(activity, colors),
+        text(trace.elapsed_label())
+            .size(11)
+            .style(move |_| text::Style { color: Some(muted) }),
+        history_header_actions(activity, &trace, colors, "Hide history"),
+    ]
+    .align_y(Alignment::Center)
+    .spacing(5)
+    .padding([2, 5])
+    .into()
+}
+
+pub(super) fn timeline_header<'a>(
+    activity: history::Activity<'a>,
+    trace: Trace<'a>,
+    palette: Option<Palette>,
+) -> Element<'a, AgentMessage> {
+    let colors = palette.unwrap_or_else(Palette::default_status);
+    let ink = colors.text.color();
+    let muted = colors.muted.color();
     column![
         row![
             container(
@@ -231,25 +308,12 @@ pub(super) fn timeline_header<'a>(
             )
             .width(Length::Fill)
             .clip(true),
-            icon(
-                if trace.paused { "▶" } else { "Ⅱ" },
-                if trace.paused { "Resume" } else { "Pause" },
-                (trace.active && !trace.waiting).then_some(AgentMessage::Pause)
-            ),
-            icon(
-                "■",
-                "Cancel run",
-                trace.active.then_some(AgentMessage::Cancel)
-            ),
-            log_table::timeline_icon_menu(activity, hide.clone(), |action| {
-                icon("⋯", "Run actions", Some(action)).into()
-            }),
-            icon("✕", "Hide timeline", Some(hide)),
+            history_header_actions(activity, &trace, colors, "Hide timeline"),
         ]
         .align_y(Alignment::Center)
         .spacing(4),
         row![
-            usage,
+            history_header_usage(activity, colors),
             text(trace.elapsed_label())
                 .size(11)
                 .style(move |_| text::Style { color: Some(muted) })
