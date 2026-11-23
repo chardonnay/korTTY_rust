@@ -119,7 +119,9 @@ impl Options {
         if self.credential.is_some() || self.key.is_some() {
             let method = match &connection.login.auth {
                 Auth::Prompt | Auth::VaultPassword(_) => AuthMethod::Password,
-                Auth::KeyFile { .. } | Auth::StoredKey(_) => AuthMethod::PublicKey,
+                Auth::KeyFile { .. } | Auth::StoredKey(_) | Auth::TemporaryKey { .. } => {
+                    AuthMethod::PublicKey
+                }
                 Auth::KeyboardInteractive => AuthMethod::KeyboardInteractive,
                 Auth::Configured { method, .. } => *method,
             };

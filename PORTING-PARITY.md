@@ -135,8 +135,9 @@ A failed connection can reopen with its current in-memory key and accept a
 fresh paste after expiry. Turning off the option discards Quick Connect
 form and retry keys. Teamwork continues to use its separately configured
 temporary-key method. The native Save connection control applies to the
-other authentication methods. The Java connection editor's encrypted
-temporary-key persistence remains open. The
+other authentication methods. The
+[saved temporary-key checkpoint](#november-23-native-saved-temporary-ssh-keys)
+covers the separate editor workflow. The
 [backup security checkpoint](#november-23-java-backup-security-settings)
 records the later adoption of the global preference.
 
@@ -362,13 +363,60 @@ authentication asks for a fresh key when the saved key is expired or
 still held by the locked vault. Session snapshots omit the temporary
 material. Rust Quick Connect
 already holds temporary keys for the lifetime of an interactive SSH or
-SFTP attempt, including a retry. Saving encrypted temporary keys in the
-Rust connection editor is still open. The native acceptance checklist
-includes expiry, removal, restart, and preservation on locked edits.
+SFTP attempt, including a retry. The later
+[saved temporary-key update](#november-23-native-saved-temporary-ssh-keys)
+adds encrypted credential custody to the Rust editor.
 [Java connection editor](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ConnectionEditDialog.java)
 · [Java XML repository](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/persistence/XMLConnectionRepository.java)
 · [Java authentication resolver](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ConnectionAuthResolver.java)
 · [Rust Quick Connect](src/workspace/quick_connect.rs)
+
+## November 23 Native saved temporary SSH keys
+
+The Security opt-in exposes **Temporary SSH key** in the saved SSH
+connection editor. With the vault unlocked, the editor accepts a pasted
+private key, a lifetime from 1 to 1,440 minutes, and optional automatic
+selection in the login form. Saving validates the private key with the
+native SSH parser, creates a vault entry bound to the exact login account
+and endpoint, and writes its reference into the connection profile.
+A replacement starts a new lifetime. Removing or replacing a reference
+cleans up the unused credential after saving the profile.
+
+An unrelated edit preserves the existing reference while the vault is
+locked. A duplicate starts with no saved key. The live SSH and SFTP login
+forms resolve the reference against the current profile and the unlocked
+vault, including on reconnect. Automatic selection lasts only until
+expiry. An expired key requires a new key, and a credential cannot be used
+for another username, host, or port. The key and lifetime are authenticated
+inside the vault.
+[Vault credential](crates/vault/src/temporary_ssh_key.rs)
+· [Editor save](src/connection_window/temporary_ssh_key.rs)
+· [Login form](src/ssh_dialog.rs)
+· [Route and credential checks](src/workspace/ssh_access.rs)
+
+Apple Silicon passed ten application tests, including changes to the
+login account, explicit key selection, preserving a saved reference on
+an unrelated edit, and dropping it on duplication. The separate editor
+fixture generated two disposable OpenSSH keys and verified saving,
+reopening, replacing, and removing the vault reference. The first Windows
+vault run exposed unbracketed IPv6 endpoint formatting. The native vault
+fixture checks IPv6 binding, restart, and rejection of a different host,
+port, or username. Windows ARM64 passed all 15 vault tests, strict vault
+Clippy and the all-target application check with the dialog preview
+feature. A separate Apple Silicon fixture used the saved-key path against
+a pinned loopback OpenSSH server. It rejected the locked vault, opened
+the terminal, and downloaded the exact SFTP fixture bytes after unlocking.
+[Apple Silicon application, editor and OpenSSH tests](target/verification/20261123-saved-temporary-ssh-macos-final.log)
+· [Windows vault suite](target/verification/20261123-saved-temporary-ssh-windows-vault-final.log)
+· [Windows application check](target/verification/20261123-saved-temporary-ssh-windows-check-final.log)
+
+Remaining work includes reviewed adoption of encrypted Java keys, native
+desktop coverage of the editor and reconnect flow, and acceptance for
+isolated workers or unattended and restored routes that require separate
+authority. The Java decoder already
+has a tested temporary-key case. Connect that path to restore review and
+exact route mapping.
+[Java credential decoder](src/profile_backup/java_secrets.rs)
 
 ## November 23 Native vault startup unlock
 
@@ -465,8 +513,8 @@ passed with `dialog-preview`.
 
 Remaining acceptance includes a fresh saved-profile desktop launch,
 the other desktop SSH and Teamwork checks, backend-unavailable editor
-feedback and the macOS and Linux desktop comparisons. Encrypted saved
-temporary keys remain in the implementation backlog.
+feedback and the macOS and Linux desktop comparisons. Encrypted Java
+temporary-key migration remains in the implementation backlog.
 
 ## November 23 Saved and Teamwork SSH reconnect
 

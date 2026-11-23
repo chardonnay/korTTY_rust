@@ -39,6 +39,8 @@ pub(crate) struct ViewChoices<'a> {
     pub(crate) passwords: &'a [CredentialChoice],
     pub(crate) passphrases: &'a [CredentialChoice],
     pub(crate) keys: &'a [KeyChoice],
+    pub(crate) temporary_keys: bool,
+    pub(crate) vault_unlocked: bool,
     pub(crate) ai_profiles: &'a [(Option<u64>, ProfileRef, String)],
     pub(crate) java_ai_profiles: &'a [(crate::ai_manager::JavaProfileSource, ProfileRef, String)],
     pub(crate) ai_skills: &'a [(u64, String)],
@@ -1574,6 +1576,7 @@ impl ConnectionWindow {
             Auth::KeyboardInteractive => "Keyboard-interactive",
             Auth::VaultPassword(_) => "Vault password",
             Auth::KeyFile { .. } => "SSH private key",
+            Auth::TemporaryKey { .. } => "Temporary SSH key",
             Auth::StoredKey(id) => keys
                 .iter()
                 .find(|key| key.id == *id)
@@ -2134,6 +2137,8 @@ fn teamwork_auth_picker_displays_missing_references_without_offering_them() {
         name: "Team key".into(),
     }];
     let choices = ViewChoices {
+        temporary_keys: false,
+        vault_unlocked: false,
         passwords: &passwords,
         passphrases: &[],
         keys: &keys,

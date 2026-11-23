@@ -861,6 +861,7 @@ impl Workspace {
         };
         pending.form_key() == key
             && (pending.teamwork.is_some()
+                || (pending.saved.is_some() && self.quick_temporary_key_enabled())
                 || (key.is_none()
                     && self.quick_temporary_key_enabled()
                     && pending
@@ -2319,6 +2320,17 @@ impl Workspace {
                     &login.endpoint,
                 )?),
             ),
+            Input::VaultTemporaryKey { id, automatic } => {
+                if !self.quick_temporary_key_enabled() {
+                    return Err("Enable temporary SSH keys in Security settings.");
+                }
+                Input::TemporaryKey(
+                    self.vault
+                        .as_ref()
+                        .ok_or(crate::vault_window::VAULT_LOCKED)?
+                        .temporary_ssh_key(id, &login.endpoint, *automatic)?,
+                )
+            }
             _ => return Ok(()),
         };
         Ok(())
@@ -3271,7 +3283,10 @@ fn route_login(
                 None => Authentication::private_key(key),
             })
         }
-        Input::VaultPassword(_) | Input::VaultKey(..) | Input::StoredKey { .. } => {
+        Input::VaultPassword(_)
+        | Input::VaultKey(..)
+        | Input::VaultTemporaryKey { .. }
+        | Input::StoredKey { .. } => {
             return Err(io::Error::other("SSH credential was not resolved"));
         }
     };
@@ -3303,6 +3318,10 @@ fn saved_credentials_match(
             }
             Input::VaultKey(path, id) => {
                 matches!(expected, Some(Auth::KeyFile { path: key, passphrase: Some(reference) }) if path == key && id == reference)
+            }
+            Input::VaultTemporaryKey { id, .. } => {
+                matches!(saved, Some(saved) if &saved.endpoint == &login.endpoint
+                    && matches!(expected, Some(Auth::TemporaryKey { credential: Some(key), .. }) if key == id))
             }
             Input::StoredKey { id, explicit } => {
                 *explicit || expected.and_then(Auth::registered_key) == Some(*id)

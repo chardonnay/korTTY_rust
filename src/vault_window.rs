@@ -115,6 +115,7 @@ pub enum Kind {
     HuggingFaceToken,
     QdrantApiKey,
     SkillProviderCredential,
+    TemporarySshKey,
     SudoPassword,
     SudoGroupPassword,
     JobWebhookUrl,
@@ -130,6 +131,7 @@ impl Kind {
             Self::HuggingFaceToken => CredentialKind::HuggingFaceToken,
             Self::QdrantApiKey => CredentialKind::QdrantApiKey,
             Self::SkillProviderCredential => CredentialKind::SkillProviderCredential,
+            Self::TemporarySshKey => CredentialKind::TemporarySshKey,
             Self::SudoPassword => CredentialKind::SudoPassword,
             Self::SudoGroupPassword => CredentialKind::SudoGroupPassword,
             Self::JobWebhookUrl => CredentialKind::JobWebhookUrl,
@@ -145,6 +147,7 @@ impl Kind {
             CredentialKind::HuggingFaceToken => Self::HuggingFaceToken,
             CredentialKind::QdrantApiKey => Self::QdrantApiKey,
             CredentialKind::SkillProviderCredential => Self::SkillProviderCredential,
+            CredentialKind::TemporarySshKey => Self::TemporarySshKey,
             CredentialKind::SudoPassword => Self::SudoPassword,
             CredentialKind::SudoGroupPassword => Self::SudoGroupPassword,
             CredentialKind::JobWebhookUrl => Self::JobWebhookUrl,
@@ -156,7 +159,10 @@ impl Kind {
         self.native().is_ssh()
             || matches!(
                 self,
-                Self::SudoPassword | Self::SudoGroupPassword | Self::PasswordCommand
+                Self::SudoPassword
+                    | Self::SudoGroupPassword
+                    | Self::PasswordCommand
+                    | Self::TemporarySshKey
             )
     }
 
@@ -174,6 +180,7 @@ impl fmt::Display for Kind {
             Self::HuggingFaceToken => "Hugging Face access token",
             Self::QdrantApiKey => "Qdrant API key",
             Self::SkillProviderCredential => "External skill provider credential",
+            Self::TemporarySshKey => "Temporary SSH private key",
             Self::SudoPassword => "Scheduler sudo password",
             Self::SudoGroupPassword => "Scheduler group sudo password",
             Self::JobWebhookUrl => "Scheduler webhook URL",
@@ -869,6 +876,26 @@ impl VaultWindow {
         self.busy = false;
     }
 
+    pub(crate) fn temporary_ssh_key(
+        &self,
+        id: &str,
+        endpoint: &LoginTarget,
+        automatic: bool,
+    ) -> Result<crate::ssh_dialog::TemporaryKey, &'static str> {
+        let vault = self.vault.as_ref().ok_or(VAULT_LOCKED)?;
+        let key = vault
+            .temporary_ssh_key(
+                id,
+                (&endpoint.host, endpoint.port, &endpoint.username),
+            )
+            .ok_or("The saved temporary key expired, was removed, or belongs to another SSH target. Paste a new key.")?;
+        if automatic && !key.options.automatic {
+            return Err("Select the saved temporary SSH key before connecting.");
+        }
+        crate::ssh_dialog::TemporaryKey::from_vault(key)
+            .map_err(|_| "Could not load the saved temporary SSH key.")
+    }
+
     pub(crate) fn environment_usage(&self, id: &str) -> Option<usize> {
         Some(
             self.vault
@@ -1129,7 +1156,10 @@ impl VaultWindow {
             }
             Message::EditSelected if self.draft.is_none() && self.operation.is_none() => {
                 self.revoke_webhook_test();
-                self.draft = self.selected_entry().map(EntryDraft::from_entry);
+                self.draft = self
+                    .selected_entry()
+                    .filter(|entry| entry.kind != CredentialKind::TemporarySshKey)
+                    .map(EntryDraft::from_entry);
             }
             Message::Field(field) => {
                 if let Some(draft) = &mut self.draft {
@@ -1349,15 +1379,19 @@ impl VaultWindow {
         }
         if let Some(vault) = &self.vault {
             let editing = self.operation.is_some() || self.draft.is_some();
-            let selected = self.selected_entry().is_some() && !editing;
+            let entry = self.selected_entry().filter(|_| !editing);
             contents = contents.push(
                 row![
                     button("New credential")
                         .on_press_maybe((!editing).then_some(Message::NewEntry)),
-                    button("Edit").on_press_maybe(selected.then_some(Message::EditSelected)),
+                    button("Edit").on_press_maybe(
+                        entry
+                            .is_some_and(|entry| entry.kind != CredentialKind::TemporarySshKey)
+                            .then_some(Message::EditSelected)
+                    ),
                     button("Delete")
                         .style(button::danger)
-                        .on_press_maybe(selected.then_some(Message::DeleteEntry)),
+                        .on_press_maybe(entry.is_some().then_some(Message::DeleteEntry)),
                     button("Change master password")
                         .on_press_maybe((!editing).then_some(Message::ChangeMaster)),
                     button("Encrypted backup")
@@ -1616,7 +1650,9 @@ impl VaultWindow {
             let kind = Kind::from_native(entry.kind);
             let scope_label = match kind {
                 Kind::SudoGroupPassword => "Connection group",
-                Kind::SudoPassword | Kind::PasswordCommand => "SSH endpoint",
+                Kind::SudoPassword | Kind::PasswordCommand | Kind::TemporarySshKey => {
+                    "SSH endpoint"
+                }
                 _ => "Host pattern",
             };
             let scope = if entry.server_pattern.is_empty() {
@@ -1862,6 +1898,7 @@ impl EntryDraft {
                     }
                     Kind::Password | Kind::KeyPassphrase => !self.secret.is_empty(),
                     Kind::PasswordCommand => !self.password_program.is_empty(),
+                    Kind::TemporarySshKey => false,
                 })
     }
 

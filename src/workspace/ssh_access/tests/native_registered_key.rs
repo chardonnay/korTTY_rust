@@ -273,3 +273,130 @@ fn wait_for_frame(
         thread::sleep(Duration::from_millis(10));
     }
 }
+
+#[test]
+#[ignore = "requires a private OpenSSH fixture"]
+fn openssh_saved_temporary_key_authenticates_terminal_and_sftp() {
+    use std::io::Read;
+
+    let peer = OpenSshFixture::new();
+    let root = peer.directory().canonicalize().unwrap();
+    let client = root.join("client");
+    let endpoint = peer.request(client.clone()).target.endpoint;
+    let vault_path = root.join("temporary-vault.bin");
+    let mut vault = Vault::create(&vault_path, b"temporary SSH wire fixture master").unwrap();
+    let credential = vault
+        .save_temporary_ssh_key(
+            "OpenSSH temporary fixture".into(),
+            (&endpoint.host, endpoint.port, &endpoint.username),
+            kortty_vault::TemporarySshKeyOptions {
+                minutes: 10,
+                automatic: true,
+            },
+            Secret::new(fs::read_to_string(client).unwrap()),
+        )
+        .unwrap();
+    let saved = Connection {
+        id: 1,
+        name: "Temporary key fixture".into(),
+        tag: String::new(),
+        login: SavedLogin {
+            endpoint,
+            auth: Auth::TemporaryKey {
+                credential: Some(credential),
+                minutes: 10,
+                automatic: true,
+            },
+            keyboard_interactive: false,
+        },
+        jump: None,
+        emulation: TerminalProfile::Xterm.term_name().into(),
+        tunnels: Vec::new(),
+        incognito: false,
+        isolation: IsolationLevel::None,
+        inherit_isolation: false,
+        startup: Default::default(),
+        logging: Default::default(),
+        terminal_effect: None,
+        command_timestamps: None,
+        tab_color: None,
+        paste_warning: None,
+        window_geometry: None,
+        terminal: Default::default(),
+    };
+    let mut desktop = Workspace::default();
+    desktop.window_settings.temporary_ssh_key_enabled = true;
+    let request = || {
+        SshDialog::from_saved(TerminalProfile::Xterm, &saved)
+            .take_request()
+            .unwrap()
+    };
+    assert!(saved_credentials_match(&request(), Some(&saved), None));
+    assert!(matches!(
+        desktop.resolve_ssh_logins(&mut request(), Some(&saved)),
+        Err("Unlock the vault before connecting.")
+    ));
+    desktop.vault = Some(VaultWindow::with_unlocked_fixture(vault_path, vault));
+
+    let (events, messages) = async_channel::bounded(1);
+    let prompt = challenge::Forwarder {
+        events,
+        window: window::Id::unique(),
+        dial: 1,
+        cancellation: Default::default(),
+        rounds: Arc::default(),
+        secrets: None,
+    };
+    let trust = peer.pinned_trust();
+    let remote_file = root.join("temporary-sftp.bin");
+    let contents = b"\0temporary-key SFTP fixture\xff";
+    fs::write(&remote_file, contents).unwrap();
+    for sftp in [false, true] {
+        let command = if sftp {
+            "ForceCommand internal-sftp\n".into()
+        } else {
+            format!(
+                "SetEnv \"HOME={0}\" \"ZDOTDIR={0}\" ENV=/dev/null BASH_ENV=/dev/null\nForceCommand /usr/bin/printf temporary-key-terminal\n",
+                root.display()
+            )
+        };
+        let server = peer.serve_with_extra("host", &command);
+        let mut request = request();
+        desktop
+            .resolve_ssh_logins(&mut request, Some(&saved))
+            .unwrap();
+        let mut connected = dial_direct(
+            request,
+            sftp,
+            &prompt,
+            trust.clone(),
+            ssh_size(initial_grid(TerminalProfile::Xterm)),
+        )
+        .unwrap();
+        if sftp {
+            let mut sftp = Sftp::new(
+                connected.take_reader().unwrap(),
+                connected.take_writer().unwrap(),
+            )
+            .unwrap();
+            let mut downloaded = Vec::new();
+            sftp.download(remote_file.to_str().unwrap().as_bytes(), &mut downloaded)
+                .unwrap();
+            assert_eq!(downloaded, contents);
+            connected.close().unwrap();
+        } else {
+            let mut output = Vec::new();
+            connected
+                .take_reader()
+                .unwrap()
+                .read_to_end(&mut output)
+                .unwrap();
+            assert!(String::from_utf8_lossy(&output).contains("temporary-key-terminal"));
+            connected.close().unwrap();
+        }
+        assert!(
+            String::from_utf8_lossy(&server.join().unwrap().stderr).contains("Accepted publickey")
+        );
+    }
+    assert!(messages.is_empty());
+}

@@ -25,6 +25,7 @@ pub(crate) mod network_map;
 mod os_badge;
 pub(crate) mod overview;
 mod selection;
+mod temporary_ssh_key;
 mod terminal_overrides;
 pub(crate) use terminal_overrides::{ai_profile_choices, theme_choices};
 #[cfg(test)]
@@ -35,6 +36,7 @@ use color::ColorDraft;
 use form::Draft;
 pub use form::Edit;
 use selection::{RowKey, Selection};
+pub use temporary_ssh_key::TemporarySaveReply;
 pub(crate) use view::{HighlightChoices, ViewChoices};
 
 const TEAMWORK_USERNAME_DRAFT_BYTES: usize = 259;
@@ -104,6 +106,8 @@ pub enum Message {
     EditSelected,
     Duplicate,
     Edit(Edit),
+    PasteTemporaryKey,
+    TemporaryKeyPasted(u64, bool, crate::ssh_dialog::Password),
     Save,
     CancelEdit,
     Delete,
@@ -116,6 +120,7 @@ pub enum Message {
     ExportConnections,
     ExportOverview,
     Completed(Result<Box<Persisted>, String>),
+    TemporarySaveCompleted(TemporarySaveReply),
     Connect(bool),
     ConnectInNewWindow,
     OpenVault,
@@ -1334,6 +1339,9 @@ impl ConnectionWindow {
                 let Some(draft) = &self.draft else {
                     return Task::none();
                 };
+                if self.temporary_save_needs_vault() {
+                    return Task::none();
+                }
                 let Ok(connection) = draft.connection() else {
                     return Task::none();
                 };

@@ -4037,7 +4037,7 @@ impl Workspace {
             ),
             rule::horizontal(1),
             text("Temporary SSH keys").size(18),
-            text("Paste a private key in Quick Connect for SSH or SFTP. The key is kept in memory for its selected lifetime.").size(13),
+            text("Use temporary private keys in Quick Connect and saved SSH profiles. Quick Connect keeps the key in memory for its selected lifetime.").size(13),
             highlighted(
                 dialog,
                 Setting::TemporarySshKey,

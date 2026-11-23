@@ -62,7 +62,9 @@ Enable **Require master password at startup** and choose **Save** to unlock or c
 
 For an existing vault, choose **Configure automatic unlock…**, unlock the vault if needed, and confirm **Enable automatic unlock**. kortty stores an unlock key in the device's protected credential store. The personal or managed startup password requirement takes precedence. If the store is unavailable, enter the master password. Choose **Disable automatic unlock** to remove the device credential. The choice applies to this profile on this device.
 
-Enable **Enable temporary SSH key option** and choose **Save** to use the temporary-key method for SSH or SFTP in Quick Connect. Enter the host and username, set the key lifetime, and use **Paste private key**. The key is held in memory for the attempt and its retries until it expires. For a saved connection with reusable key authentication, use a registered SSH key.
+Enable **Enable temporary SSH key option** and choose **Save** to use a temporary key for SSH or SFTP. Quick Connect keeps the key in memory for the attempt and its retries until it expires.
+
+For a saved SSH profile, unlock the Credential Vault and select **Temporary SSH key** in the Connection editor. Enter the host, port and username, paste the private key, and choose a lifetime from 1 to 1,440 minutes. **Select the saved key automatically until it expires** makes the valid key the default in the login form. Choose **Save** to store the private key in the encrypted vault. Replacing the key starts a new lifetime. **Remove key** removes the profile's reference.
 
 Use **Default isolation** for new local shells and new SSH or SFTP logins. Saved personal SSH connections keep their own setting. Teamwork connections can raise the default, and the managed minimum always applies. The Security page reports the local shell and SSH sandbox backends separately. To start a local sandbox, set an absolute workspace in **Session security**. Existing local-only settings apply until a default is selected in Global Settings.
 

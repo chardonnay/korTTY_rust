@@ -1291,6 +1291,8 @@ fn connection_manager_pointer_drags_accept_local_folders_and_refuse_teamwork_sou
     let row_index = |key: &RowKey| keys.iter().position(|row| row == key).unwrap();
     let themes = crate::terminal_theme::Themes::default();
     let mut view = manager.view(ViewChoices {
+        temporary_keys: false,
+        vault_unlocked: false,
         journal_max_parts: None,
         serial_allowed: true,
         passwords: &[],
@@ -1403,6 +1405,8 @@ fn native_workbench_keeps_reference_side_widths_at_default_and_minimum_size() {
     let renderer = Renderer::new(Font::DEFAULT, 16.0.into());
     for width in [1240.0, 940.0] {
         let mut view = window.view(ViewChoices {
+            temporary_keys: false,
+            vault_unlocked: false,
             journal_max_parts: None,
             serial_allowed: true,
             passwords: &[],
@@ -1455,6 +1459,8 @@ fn long_scope_titles_keep_list_and_map_visible_at_minimum_width() {
     let renderer = Renderer::new(Font::DEFAULT, 16.0.into());
     let switch_widths = |window: &ConnectionWindow| {
         let mut view = window.view(ViewChoices {
+            temporary_keys: false,
+            vault_unlocked: false,
             journal_max_parts: None,
             serial_allowed: true,
             passwords: &[],

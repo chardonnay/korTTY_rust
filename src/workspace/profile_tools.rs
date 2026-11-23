@@ -510,6 +510,8 @@ impl Workspace {
                 passwords: &passwords,
                 passphrases: &passphrases,
                 keys: &self.ssh_key_choices,
+                temporary_keys: self.quick_temporary_key_enabled(),
+                vault_unlocked: self.vault.as_ref().is_some_and(VaultWindow::is_unlocked),
                 ai_profiles: &ai_profiles,
                 java_ai_profiles: &java_ai_profiles,
                 incognito_allowed: self.clipboard.policy.incognito_allowed,
@@ -810,6 +812,19 @@ impl Workspace {
         editing: bool,
     ) -> Task<Message> {
         use connection_window::{Edit, Message as Profile};
+        let message = match message {
+            Profile::TemporarySaveCompleted(reply) => {
+                let Some((vault, result)) = reply.take() else {
+                    return Task::none();
+                };
+                if let Some(window) = self.vault.as_mut() {
+                    window.restore_after_ssh_keys(vault);
+                    self.vault_change_revision = Arc::new(());
+                }
+                Profile::Completed(result)
+            }
+            other => other,
+        };
         let Some(manager) = self
             .connection_managers
             .get(&id)
@@ -822,7 +837,9 @@ impl Workspace {
             && let Some((dialog, _)) = self.connection_manager_modal(id)
             && !matches!(
                 message,
-                Profile::Completed(_) | Profile::Serial(crate::serial_dialog::Message::Ports(..))
+                Profile::Completed(_)
+                    | Profile::TemporaryKeyPasted(..)
+                    | Profile::Serial(crate::serial_dialog::Message::Ports(..))
             )
         {
             return window::gain_focus(dialog);
@@ -842,6 +859,71 @@ impl Workspace {
             return Task::none();
         }
         let task = match message {
+            Profile::PasteTemporaryKey
+                if editing
+                    && self.quick_temporary_key_enabled()
+                    && self.vault.as_ref().is_some_and(VaultWindow::is_unlocked) =>
+            {
+                let request = self.allocate();
+                let internal = self.clipboard.policy.internal;
+                if self
+                    .connection_managers
+                    .get_mut(&id)
+                    .is_some_and(|manager| manager.window.begin_temporary_key_paste(request))
+                {
+                    self.read_clipboard().map(move |value| {
+                        Message::Connections(
+                            id,
+                            Profile::TemporaryKeyPasted(
+                                request,
+                                internal,
+                                crate::ssh_dialog::Password::new(value.unwrap_or_default()),
+                            ),
+                        )
+                    })
+                } else {
+                    Task::none()
+                }
+            }
+            Profile::TemporaryKeyPasted(request, internal, key) => {
+                if internal == self.clipboard.policy.internal
+                    && self.quick_temporary_key_enabled()
+                    && self.vault.as_ref().is_some_and(VaultWindow::is_unlocked)
+                    && let Some(manager) = self.connection_managers.get_mut(&id)
+                {
+                    manager.window.finish_temporary_key_paste(request, key);
+                }
+                Task::none()
+            }
+            Profile::Save if manager.window.temporary_save_needs_vault() => {
+                if manager.window.has_pending_temporary_key() && !self.quick_temporary_key_enabled()
+                {
+                    self.connection_managers
+                        .get_mut(&id)
+                        .expect("current manager")
+                        .window
+                        .set_notice("Enable temporary SSH keys in Security settings.".into());
+                    return Task::none();
+                }
+                let Some(vault) = self.vault.as_mut().and_then(VaultWindow::take_for_ssh_keys)
+                else {
+                    self.connection_managers
+                        .get_mut(&id)
+                        .expect("current manager")
+                        .window
+                        .set_notice(
+                            "Unlock the vault before changing the saved temporary SSH key.".into(),
+                        );
+                    return Task::none();
+                };
+                self.vault_change_revision = Arc::new(());
+                self.connection_managers
+                    .get_mut(&id)
+                    .expect("current manager")
+                    .window
+                    .save_connection_with_temporary_key(vault)
+                    .map(move |message| Message::Connections(id, message))
+            }
             Profile::SaveTeamworkAuth if !editing => self.save_teamwork_auth(id),
             Profile::RestoreTeamwork if !editing => self.open_teamwork_restore(id),
             Profile::RefreshTeamwork if !editing && manager.window.can_restore_teamwork() => {

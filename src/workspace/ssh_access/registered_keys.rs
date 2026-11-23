@@ -1,3 +1,5 @@
+use std::sync::{Arc, Weak};
+
 use iced::{Task, window};
 use kortty_terminal::TerminalProfile;
 
@@ -12,19 +14,25 @@ use super::{SavedSshProfile, SshTarget, Workspace, WorkspaceMessage};
 pub(in crate::workspace) struct KeySnapshots {
     records: Vec<KeyRecord>,
     saved: Option<Connection>,
+    temporary_vault: Option<Weak<()>>,
 }
 
 impl KeySnapshots {
     pub(in crate::workspace) fn is_current(&self) -> bool {
-        self.saved.as_ref().is_none_or(|saved| {
-            SavedSshProfile::from_profile(saved.id)
-                .is_ok_and(|current| current.is_some_and(|current| current.connection == *saved))
-        }) && (self.records.is_empty()
-            || Catalog::open_profile().is_ok_and(|catalog| {
-                self.records
-                    .iter()
-                    .all(|key| catalog.get(key.id) == Some(key))
-            }))
+        self.temporary_vault
+            .as_ref()
+            .is_none_or(|revision| revision.upgrade().is_some())
+            && self.saved.as_ref().is_none_or(|saved| {
+                SavedSshProfile::from_profile(saved.id).is_ok_and(|current| {
+                    current.is_some_and(|current| current.connection == *saved)
+                })
+            })
+            && (self.records.is_empty()
+                || Catalog::open_profile().is_ok_and(|catalog| {
+                    self.records
+                        .iter()
+                        .all(|key| catalog.get(key.id) == Some(key))
+                }))
     }
 }
 
@@ -79,6 +87,10 @@ impl Workspace {
                     keys.saved = saved.cloned();
                 }
             } else {
+                if matches!(login.auth, Authentication::VaultTemporaryKey { .. }) {
+                    keys.saved = saved.cloned();
+                    keys.temporary_vault = Some(Arc::downgrade(&self.vault_change_revision));
+                }
                 self.resolve_ssh_login(login)?;
             }
         }

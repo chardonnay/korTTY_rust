@@ -34,8 +34,9 @@ Windows ARM64 restart restored both manual and automatic source outcomes.
 Global Settings groups password rotation, the password requirement and
 optional device-local vault auto-unlock under Security. A password
 requirement takes precedence, and unavailable or stale device credentials
-return to the typed password prompt. Its temporary-key switch enables the interactive Quick
-Connect SSH and SFTP paths. Security also provides the global session
+return to the typed password prompt. The temporary-key switch enables
+both Quick Connect and encrypted temporary credentials in the saved SSH
+editor. Security also provides the global session
 isolation default and shows the native local-shell and SSH sandbox
 prerequisites. New local shells, ad hoc SSH and SFTP, and Teamwork SSH use
 the default subject to their applicable managed limits.
@@ -78,7 +79,7 @@ records the broader comparison with the tagged Java release.
 
 | Area | Remaining change | Completion check |
 | --- | --- | --- |
-| D2/M1 · Saved-connection temporary keys | Define and implement encrypted custody for the saved SSH editor's temporary authentication. Cover the Java expiry and permanent options, vault-locked editing and explicit adoption of compatible imported credentials. | Verify protected storage, save and reload, expiry and replacement, removal and preservation during unrelated locked edits. Verify that import and restore require review. [Java credential comparison](PORTING-PARITY.md#november-23-java-credential-workflow-review) |
+| D2/M1 · Java temporary-key migration | Adopt compatible encrypted Java temporary keys through explicit review and bind them to the matching native connection and account. Audit other Java consumers that may act without the native login form. | Verify import and restore with a disposable encrypted key, missing or locked credentials, incompatible scope, duplicate profiles and preservation of the selected lifetime. Verify unattended execution separately. [Java credential comparison](PORTING-PARITY.md#november-23-java-credential-workflow-review) |
 | D4 · Searchable controls | Compare the remaining Java Settings and AI Manager pages, subpages and labeled controls with the Rust search inventory. Add reachable missing destinations alongside the dialog comparisons. | Verify that controls on a page that has never been opened are discoverable, and that navigation reveals the exact control with the current page state and policy. |
 
 The [November 23 review](PORTING-PARITY.md#november-23-dialog-parity-review)
@@ -133,8 +134,8 @@ page offers the imported global isolation and Quick Connect temporary-key
 choices for explicit adoption. Windows ARM64 verified the managed display,
 below-minimum rejection and folder review presentation. Exercise the Save
 and restart flow for reviewed choices and repeat it on the other native
-desktops. The saved-connection temporary-key workflow is in the
-[implementation backlog](#confirmed-implementation-work). Privacy exposes Java
+desktops. Continue the [saved temporary-key desktop checks](PORTING-PARITY.md#november-23-native-saved-temporary-ssh-keys).
+Privacy exposes Java
 telemetry consent. Record the native app's behavior and the handling of imported
 consent before designing the corresponding surface. Language selects the
 application language. Translation manages application translation profiles,
@@ -385,6 +386,7 @@ feature is opt-in and its startup command is available in debug builds.
 | D4/P1 · Vault startup | An explicit profile opt-in stores the current derived vault key in the protected device credential store. Startup authenticates the vault, falls back to the password prompt on failure, and checks both managed and personal password requirements. Password rotation refreshes the saved key and disabling removes it. | Exercise the Security flow and an actual restart on each native desktop. Include a signed macOS app with an available Keychain, Linux Secret Service and Flatpak Secret portal, and a managed startup policy set after opting in. [Startup unlock checkpoint](PORTING-PARITY.md#november-23-native-vault-startup-unlock) |
 | D2/P1 · Session isolation and reconnect | Effective isolation appears in the folder and connection editors. Windows ARM64 verified saved local-shell recovery with inherited and managed Sandbox choices. The native Apple Silicon fixture verified saved SSH and Teamwork reconnect over pinned direct OpenSSH. | Exercise a fresh local launch, unavailable sandbox feedback, desktop reconnect and a live jump-host reconnect. Repeat the applicable desktop checks on macOS and Linux. [Windows desktop checks](PORTING-PARITY.md#november-23-windows-isolation-dialogs-and-launches) · [OpenSSH reconnect checks](PORTING-PARITY.md#november-23-saved-and-teamwork-ssh-reconnect) |
 | D2/D4 · Quick Connect temporary keys | The saved Security opt-in enables in-memory temporary authentication for interactive SSH and SFTP, with destination validation, expiry and retry. | Use a disposable key for a live SSH and SFTP login, retry after expiry, and disable the option while a form or retry holds a key. [Quick Connect checkpoint](PORTING-PARITY.md#november-23-quick-connect-temporary-ssh-keys) |
+| D2 · Saved temporary keys | Connection Manager stores the key, expiry, and exact account and destination in the encrypted vault. The login form uses an unexpired saved key with optional automatic selection or accepts a replacement for that attempt. A pinned Apple Silicon OpenSSH fixture passed a terminal connection and SFTP download. | Exercise the desktop editor, locked unrelated saves, reconnection on expiry and after replacement, the isolated SSH worker, and related restore flows. [Saved temporary-key checkpoint](PORTING-PARITY.md#november-23-native-saved-temporary-ssh-keys) |
 | B4 · GGUF Configure styling | The measured path width, compact two-column form, joined numeric controls and fixed actions follow the tagged Java layout. [Configure checkpoint](PORTING-PARITY.md#november-23-gguf-configure-sizing) | Compare the same layout with the platform theme on the remaining native desktops. |
 | D4 · Search matching | Settings and AI Manager use the shared Java matching and ranking rules for visible page and control names, aliases, duplicate suppression and the 40-result limit. Available controls are filtered before ranking. Imported model IDs remain selectable when their normalized names collide. | Compare result labels, ranking and keyboard and pointer navigation against the tagged dialogs on native desktops. [Search matching checkpoint](PORTING-PARITY.md#november-23-settings-search-matching) |
 | A2 · Copying a command step's output | **Copy output** uses all masked stdout and stderr retained for the selected step within the existing capture limits. The compact preview still shows the last eight lines. Retained runs use the same action and clipboard policy. | Verify both streams, a line longer than 320 characters and redaction in the native clipboard for live and retained runs. [Step-copy checkpoint](PORTING-PARITY.md#november-23-complete-masked-step-copy) |
@@ -499,7 +501,7 @@ The following work requires native acceptance or a scope decision.
   obtain independent external SSH review, build and verify one fixed source
   snapshot per target, and measure startup, idle memory and p95 input latency.
   An existing test count or notarization does not cover subsequent source edits.
-- **Product decisions** cover the custody and import rules for persisted
+- **Product decisions** cover the import and unattended use rules for saved
   temporary keys, automatic web requests using later command output, and round-wide
   approval of future commands across Swarm targets. An explicit grant for one
   run or one target already exists. Larger or dynamic Swarms, incognito scope,
@@ -921,7 +923,8 @@ The broader release audit also confirmed these workflow differences:
   Java credential migration or unattended support before implementing it.
   Optional startup unlock is implemented and awaits the remaining native
   checks. The [implementation backlog](#confirmed-implementation-work)
-  tracks the saved temporary-key editor.
+  tracks Java temporary-key import and unattended use. The native
+  saved-connection editor and login forms have their own acceptance checks.
 - **D5/A4 — Coding-agent indicators.** Native badges exist on macOS and
   Windows. Linux emits a persistent LauncherEntry D-Bus counter with an
   installed desktop entry. The native bus and count lifecycle have a
@@ -1222,11 +1225,11 @@ not been identified.
 
 ## Implementation order
 
-Implement the saved-connection temporary-key workflow from the
+Implement reviewed Java temporary-key adoption from the
 [credential backlog](#confirmed-implementation-work). Continue native
 desktop acceptance for [vault auto-unlock](PORTING-PARITY.md#november-23-native-vault-startup-unlock)
-and exercise the existing Quick Connect SSH and SFTP workflow with
-disposable keys.
+and exercise the [saved key](PORTING-PARITY.md#november-23-native-saved-temporary-ssh-keys)
+and Quick Connect workflows with disposable keys.
 
 Continue the [native session isolation checks](PORTING-PARITY.md#november-23-windows-isolation-dialogs-and-launches)
 with the macOS and Linux Security page and folder, SSH and local-shell

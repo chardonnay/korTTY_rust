@@ -70,6 +70,7 @@ pub enum Authentication {
     PrivateKey(PathBuf),
     KeyWithPassphrase(PathBuf, Password),
     TemporaryKey(TemporaryKey),
+    VaultTemporaryKey { id: String, automatic: bool },
     VaultPassword(String),
     VaultKey(PathBuf, String),
     StoredKey { id: u64, explicit: bool },
@@ -84,7 +85,9 @@ impl fmt::Debug for Authentication {
             Self::PrivateKey(_) => "PrivateKey([redacted])",
             Self::KeyWithPassphrase(..) => "KeyWithPassphrase([redacted])",
             Self::TemporaryKey(_) => "TemporaryKey([redacted])",
-            Self::VaultPassword(_) | Self::VaultKey(..) => "Vault reference",
+            Self::VaultPassword(_) | Self::VaultKey(..) | Self::VaultTemporaryKey { .. } => {
+                "Vault reference"
+            }
             Self::StoredKey { .. } | Self::ResolvedKey(..) => "Registered SSH key",
         })
     }
@@ -155,6 +158,7 @@ pub enum LoginMessage {
     StoredKey(KeyChoice),
     VaultPassword(String),
     TemporaryLifetime(String),
+    UseSavedTemporaryKey,
 }
 
 impl fmt::Debug for LoginMessage {
@@ -172,6 +176,7 @@ impl fmt::Debug for LoginMessage {
             Self::StoredKey(_) => "StoredKey",
             Self::VaultPassword(_) => "VaultPassword([redacted])",
             Self::TemporaryLifetime(_) => "TemporaryLifetime",
+            Self::UseSavedTemporaryKey => "UseSavedTemporaryKey",
         })
     }
 }
@@ -402,6 +407,9 @@ struct LoginForm {
     explicit_key: bool,
     explicit_vault: bool,
     temporary_key: Option<temporary_key::Form>,
+    saved_temporary_key: Option<String>,
+    automatic_temporary_key: bool,
+    use_saved_temporary_key: bool,
 }
 
 impl SshDialog {
@@ -868,6 +876,9 @@ impl LoginForm {
             explicit_key: false,
             explicit_vault: false,
             temporary_key: None,
+            saved_temporary_key: None,
+            automatic_temporary_key: false,
+            use_saved_temporary_key: false,
         }
     }
 
@@ -897,6 +908,17 @@ impl LoginForm {
                 form.stored_passphrase = passphrase.clone();
             }
             Auth::StoredKey(id) => form.select_registered_key(*id, false),
+            Auth::TemporaryKey {
+                credential,
+                minutes,
+                automatic,
+            } => {
+                form.method = Method::TemporaryKey;
+                form.temporary_key = Some(temporary_key::Form::with_minutes(*minutes));
+                form.saved_temporary_key.clone_from(credential);
+                form.automatic_temporary_key = *automatic;
+                form.use_saved_temporary_key = *automatic && credential.is_some();
+            }
             Auth::Configured {
                 method,
                 credential,
@@ -992,6 +1014,15 @@ impl LoginForm {
                     form.set_minutes(minutes);
                 }
             }
+            LoginMessage::UseSavedTemporaryKey
+                if self.method == Method::TemporaryKey && self.saved_temporary_key.is_some() =>
+            {
+                if let Some(form) = &mut self.temporary_key {
+                    form.clear();
+                }
+                self.automatic_temporary_key = false;
+                self.use_saved_temporary_key = true;
+            }
             _ => {}
         }
     }
@@ -1007,12 +1038,20 @@ impl LoginForm {
                 id: self.stored_key.unwrap_or_default(),
                 explicit: self.explicit_key,
             },
-            Method::TemporaryKey => Authentication::TemporaryKey(
-                self.temporary_key
-                    .as_mut()
-                    .and_then(temporary_key::Form::take)
-                    .expect("temporary key was validated"),
-            ),
+            Method::TemporaryKey => self
+                .temporary_key
+                .as_mut()
+                .and_then(temporary_key::Form::take)
+                .map_or_else(
+                    || Authentication::VaultTemporaryKey {
+                        id: self
+                            .saved_temporary_key
+                            .clone()
+                            .expect("validated saved key"),
+                        automatic: self.automatic_temporary_key,
+                    },
+                    Authentication::TemporaryKey,
+                ),
             Method::PrivateKey => {
                 let path = PathBuf::from(&self.key_file);
                 if !self.passphrase.0.is_empty() {
@@ -1170,7 +1209,25 @@ impl LoginForm {
                         ]
                         .spacing(8)
                         .align_y(Alignment::Center),
-                        text(form.status()).size(13),
+                        self.saved_temporary_key.as_ref().map(|_| {
+                            button(if self.use_saved_temporary_key {
+                                "Saved key selected"
+                            } else {
+                                "Use saved key"
+                            })
+                            .on_press(wrap(LoginMessage::UseSavedTemporaryKey))
+                        }),
+                        text(
+                            if self.saved_temporary_key.is_some()
+                                && self.use_saved_temporary_key
+                                && form.key().is_none()
+                            {
+                                "Uses the expiring key from the unlocked vault."
+                            } else {
+                                form.status()
+                            }
+                        )
+                        .size(13),
                     ]
                     .spacing(4),
                 )
@@ -1231,6 +1288,9 @@ impl LoginForm {
         self.stored_password = None;
         self.stored_passphrase = None;
         self.stored_key = None;
+        self.saved_temporary_key = None;
+        self.use_saved_temporary_key = false;
+        self.automatic_temporary_key = false;
         self.explicit_key = false;
         self.explicit_vault = false;
         if self.method == Method::VaultPassword {
@@ -1248,6 +1308,7 @@ impl LoginForm {
     fn uses_vault(&self) -> bool {
         matches!(self.method, Method::VaultPassword | Method::StoredKey)
             || (self.method == Method::PrivateKey && self.stored_passphrase.is_some())
+            || (self.method == Method::TemporaryKey && self.use_saved_temporary_key)
     }
 
     fn address(&self) -> Result<ServerAddress, ValidationError> {
@@ -1299,7 +1360,8 @@ impl LoginForm {
                     .temporary_key
                     .as_ref()
                     .and_then(temporary_key::Form::key)
-                    .is_none() =>
+                    .is_none()
+                    && !(self.use_saved_temporary_key && self.saved_temporary_key.is_some()) =>
             {
                 return Err(ValidationError::TemporaryKey);
             }
@@ -1505,6 +1567,38 @@ fn labeled<'a, M: 'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_temporary_keys_recheck_the_account_and_can_require_selection() {
+        let endpoint = LoginTarget {
+            host: "host.example".into(),
+            port: 22,
+            username: "reviewer".into(),
+        };
+        let credential = "b".repeat(32);
+        let saved = SavedLogin {
+            endpoint,
+            auth: Auth::TemporaryKey {
+                credential: Some(credential.clone()),
+                minutes: 60,
+                automatic: false,
+            },
+            keyboard_interactive: false,
+        };
+        let mut form = LoginForm::for_saved(&saved);
+        assert_eq!(form.validate(), Err(ValidationError::TemporaryKey));
+        form.update(LoginMessage::UseSavedTemporaryKey);
+        let endpoint = form.validate().unwrap();
+        let request = form.take_login(endpoint);
+        assert!(matches!(
+            request.auth,
+            Authentication::VaultTemporaryKey { id, automatic: false } if id == credential
+        ));
+
+        form.update(LoginMessage::Username("another".into()));
+        form.update(LoginMessage::UseSavedTemporaryKey);
+        assert_eq!(form.validate(), Err(ValidationError::TemporaryKey));
+    }
 
     #[test]
     fn saved_ssh_keepalive_edit_validates_and_can_return_to_inheritance() {

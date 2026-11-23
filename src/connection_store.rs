@@ -286,6 +286,13 @@ pub enum Auth {
         passphrase: Option<String>,
     },
     StoredKey(u64),
+    TemporaryKey {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        credential: Option<String>,
+        minutes: u16,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        automatic: bool,
+    },
     Configured {
         method: AuthMethod,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -319,7 +326,9 @@ impl Auth {
         match self {
             Self::Prompt | Self::VaultPassword(_) => AuthMethod::Password,
             Self::KeyboardInteractive => AuthMethod::KeyboardInteractive,
-            Self::KeyFile { .. } | Self::StoredKey(_) => AuthMethod::PublicKey,
+            Self::KeyFile { .. } | Self::StoredKey(_) | Self::TemporaryKey { .. } => {
+                AuthMethod::PublicKey
+            }
             Self::Configured { method, .. } => *method,
         }
     }
@@ -349,6 +358,7 @@ impl Auth {
                 ..
             } => ActiveAuth::KeyboardInteractive,
             Self::Configured { .. } => ActiveAuth::Prompt,
+            Self::TemporaryKey { .. } => ActiveAuth::Prompt,
         }
     }
 
@@ -377,6 +387,13 @@ impl Auth {
 
     pub(crate) fn has_vault_reference(&self) -> bool {
         self.credential_reference().is_some()
+            || matches!(
+                self,
+                Self::TemporaryKey {
+                    credential: Some(_),
+                    ..
+                }
+            )
             || matches!(
                 self,
                 Self::KeyFile {
@@ -520,6 +537,20 @@ impl SavedLogin {
             Auth::VaultPassword(id) => validate_credential_id(id)?,
             Auth::StoredKey(0) => return Err(invalid("invalid registered SSH key ID")),
             Auth::StoredKey(_) => {}
+            Auth::TemporaryKey {
+                credential,
+                minutes,
+                ..
+            } => {
+                if !(1..=1440).contains(minutes) || self.endpoint.username.is_empty() {
+                    return Err(invalid(
+                        "temporary SSH keys require an account and a lifetime from 1 to 1440 minutes",
+                    ));
+                }
+                if let Some(id) = credential {
+                    validate_credential_id(id)?;
+                }
+            }
             Auth::KeyFile { path, passphrase } => {
                 if !path.is_absolute()
                     || !path

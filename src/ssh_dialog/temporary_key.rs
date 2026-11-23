@@ -20,6 +20,17 @@ struct Material {
 }
 
 impl TemporaryKey {
+    pub(crate) fn from_vault(key: kortty_vault::TemporarySshKey<'_>) -> io::Result<Self> {
+        let deadline = Instant::now()
+            .checked_add(key.remaining)
+            .ok_or_else(|| io::Error::other("Invalid temporary SSH key lifetime."))?;
+        Self::hold(
+            Zeroizing::new(key.private_key.as_bytes().to_vec()),
+            key.options.minutes,
+            deadline,
+        )
+    }
+
     fn new(pasted: Password, minutes: u16) -> io::Result<Self> {
         let text = pasted.as_str().trim();
         if pasted.as_str().len() >= MAX_BYTES
