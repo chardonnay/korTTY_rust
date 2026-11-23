@@ -880,6 +880,20 @@ impl Dialog {
     ) -> bool {
         use super::search::KnowledgeSetting::*;
 
+        match setting {
+            Name | Create => return true,
+            Inventory(_) => {
+                return self.knowledge_settings_title().is_none()
+                    && !self.knowledge_source_picker_open()
+                    && !self.knowledge_file_review_open()
+                    && !self.knowledge_source_updates_open()
+                    && !self.knowledge_source_advanced_open()
+                    && !self.knowledge_source_sync_open()
+                    && self.source_removal.is_none();
+            }
+            _ => {}
+        }
+
         if setting.needs_active_review() {
             let Some(store) = self.selected.and_then(|index| state.stores.get(index)) else {
                 return false;
@@ -4333,7 +4347,7 @@ impl Dialog {
         reveal: &Reveal,
         viewport_height: f32,
     ) -> Element<'a, Message> {
-        use super::search::{KnowledgeSetting, Setting};
+        use super::search::{InventoryAction, KnowledgeSetting, Setting};
         use KnowledgeSetting::*;
         let store_name = Setting::Knowledge(Name);
         let importing_store = self.java_store_origin.is_some();
@@ -4383,20 +4397,31 @@ impl Dialog {
                 dialog_design::secondary_action("Cancel Java store review")
                     .on_press(Message::CancelJavaKnowledgeStore)
             }),
-            dialog_design::secondary_action("Configure").on_press_maybe(can_configure.then_some(
-                Message::KnowledgeSettings(knowledge_settings::Action::Open { create: false })
-            )),
+            reveal.inventory_action(
+                InventoryAction::ConfigureStore,
+                dialog_design::secondary_action("Configure").on_press_maybe(
+                    can_configure.then_some(Message::KnowledgeSettings(
+                        knowledge_settings::Action::Open { create: false }
+                    ))
+                ),
+            ),
             reveal.action(
                 Setting::Knowledge(ReviewStoreRemoval),
                 dialog_design::secondary_action("Remove store…").on_press_maybe(
                     (can_configure && !self.confirm_remove).then_some(Message::ConfirmRemove(true))
                 )
             ),
-            dialog_design::secondary_action("Test search").on_press_maybe(
-                can_configure.then_some(Message::RevealKnowledgeSetting(TestQuery))
+            reveal.inventory_action(
+                InventoryAction::OpenTestSearch,
+                dialog_design::secondary_action("Test search").on_press_maybe(
+                    can_configure.then_some(Message::RevealKnowledgeSetting(TestQuery))
+                )
             ),
-            dialog_design::secondary_action("Refresh")
-                .on_press_maybe(can_configure.then_some(Message::RefreshKnowledgeInventory)),
+            reveal.inventory_action(
+                InventoryAction::Refresh,
+                dialog_design::secondary_action("Refresh")
+                    .on_press_maybe(can_configure.then_some(Message::RefreshKnowledgeInventory)),
+            ),
         ]
         .spacing(8)
         .align_y(Alignment::Center)
@@ -4453,13 +4478,19 @@ impl Dialog {
         .wrap();
         let enter_path = self.manual_source;
         let mut source_actions = row![
-            dialog_design::secondary_action("Add files…").on_press_maybe(
-                (can_configure && backend_valid)
-                    .then_some(Message::PickNativeKnowledgeSources(SourceKind::File)),
+            reveal.inventory_action(
+                InventoryAction::AddFiles,
+                dialog_design::secondary_action("Add files…").on_press_maybe(
+                    (can_configure && backend_valid)
+                        .then_some(Message::PickNativeKnowledgeSources(SourceKind::File)),
+                )
             ),
-            dialog_design::secondary_action("Add folder…").on_press_maybe(
-                (can_configure && backend_valid)
-                    .then_some(Message::PickNativeKnowledgeSources(SourceKind::Folder)),
+            reveal.inventory_action(
+                InventoryAction::AddFolder,
+                dialog_design::secondary_action("Add folder…").on_press_maybe(
+                    (can_configure && backend_valid)
+                        .then_some(Message::PickNativeKnowledgeSources(SourceKind::Folder)),
+                )
             ),
             reveal.action(
                 Setting::Knowledge(Update),
@@ -4473,18 +4504,21 @@ impl Dialog {
                     }
                 ))
             ),
-            dialog_design::secondary_action("Cancel").on_press_maybe(
-                (self.source_request()
-                    && self
-                        .source_work
-                        .as_ref()
-                        .is_some_and(|work| work.phase != SourcePhase::Cancelling))
-                .then_some(Message::Cancel),
+            reveal.inventory_action(
+                InventoryAction::CancelIndexing,
+                dialog_design::secondary_action("Cancel").on_press_maybe(
+                    (self.source_request()
+                        && self
+                            .source_work
+                            .as_ref()
+                            .is_some_and(|work| work.phase != SourcePhase::Cancelling))
+                    .then_some(Message::Cancel),
+                )
             ),
         ]
         .spacing(8)
         .align_y(Alignment::Center);
-        source_actions = source_actions.extend(self.source_actions(selected, can_review));
+        source_actions = source_actions.extend(self.source_actions(selected, can_review, reveal));
         let mut maintenance = row![
             button(if enter_path {
                 "Hide path field"
@@ -5384,6 +5418,65 @@ mod tests {
             "review automatic Qdrant capacity".into(),
         ));
         assert_eq!(manager.search_results().next(), None);
+    }
+
+    #[test]
+    fn knowledge_inventory_search_keeps_the_source_selection_and_leaves_actions_to_the_user() {
+        use crate::ai_manager::search::{InventoryAction, KnowledgeSetting, Setting, Target};
+        use crate::ai_manager::{
+            Configuration, Dialog as Manager, Message as ManagerMessage, Page as ManagerPage,
+        };
+
+        let profile = crate::snippets::tests::Profile::new();
+        let file = profile.0.canonicalize().unwrap().join("notes.txt");
+        std::fs::write(&file, "Search fixture").unwrap();
+        let mut store = Store::new("Fixture").unwrap();
+        store.add_source(file.clone()).unwrap();
+        let saved = Configuration {
+            local: State {
+                stores: vec![store],
+                ..State::default()
+            },
+            ..Configuration::default()
+        };
+        let mut dialog = Manager::new(Arc::new(saved), profile.0.clone(), Vec::new(), true, None);
+        let refresh = Target::Setting(Setting::Knowledge(KnowledgeSetting::Inventory(
+            InventoryAction::Refresh,
+        )));
+        let _ = dialog.open_page(refresh);
+        assert_eq!(dialog.page, ManagerPage::Knowledge);
+        assert!(!dialog.local.busy());
+        let _ = dialog.update(ManagerMessage::Local(Message::SelectStore(0)));
+        let _ = dialog.update(ManagerMessage::Local(Message::SelectKnowledgeSource(
+            0,
+            SourceKind::File,
+            file,
+        )));
+        let selection = dialog.local.selected_sources.clone();
+        assert_eq!(selection.len(), 1);
+        let before = serde_json::to_value(&dialog.local_state).unwrap();
+        for (query, action) in [
+            ("refresh knowledge inventory", InventoryAction::Refresh),
+            ("sync mode", InventoryAction::SyncMode),
+            ("remove sources", InventoryAction::RemoveSources),
+        ] {
+            let target = Setting::Knowledge(KnowledgeSetting::Inventory(action));
+            let _ = dialog.update(ManagerMessage::Search(query.into()));
+            let _ = dialog.update(ManagerMessage::SearchChoose);
+            assert_eq!(dialog.revealed.setting, Some(target));
+            assert_eq!(dialog.local.selected_sources, selection);
+            assert!(!dialog.knowledge_source_sync_open());
+            assert!(!dialog.knowledge_source_removal_open());
+            assert!(dialog.knowledge_settings_title().is_none());
+            assert!(!dialog.local.knowledge_source_picker_open());
+            assert_eq!(serde_json::to_value(&dialog.local_state).unwrap(), before);
+        }
+
+        let _ = dialog.update(ManagerMessage::Local(Message::OpenSourceSync(0)));
+        assert!(dialog.knowledge_source_sync_open());
+        assert!(!dialog.search_target_available(refresh));
+        let _ = dialog.open_page(refresh);
+        assert!(dialog.knowledge_source_sync_open());
     }
 
     #[test]

@@ -3994,15 +3994,9 @@ impl Dialog {
                     self.editable() && self.profile_form_lock().is_none(),
                 )
             }
-            search::Target::Setting(search::Setting::Knowledge(setting))
-                if setting.needs_store() =>
-            {
-                self.local.can_reveal_knowledge_setting(
-                    &self.local_state,
-                    self.profiles.catalog(),
-                    setting,
-                )
-            }
+            search::Target::Setting(search::Setting::Knowledge(setting)) => self
+                .local
+                .can_reveal_knowledge_setting(&self.local_state, self.profiles.catalog(), setting),
             search::Target::Setting(search::Setting::Hub(setting)) => self
                 .local
                 .can_reveal_hub_setting(setting, self.editable() && self.general.features_enabled),
@@ -4099,6 +4093,7 @@ impl Dialog {
             ) => true,
             search::Target::Setting(search::Setting::Knowledge(setting)) => {
                 setting.needs_active_review()
+                    || matches!(setting, search::KnowledgeSetting::Inventory(_))
             }
             search::Target::Setting(search::Setting::Control(control)) => {
                 control.contextual_memory()
@@ -4179,6 +4174,14 @@ impl Dialog {
                 iced::widget::operation::RelativeOffset::START,
             ),
         };
+        if matches!(
+            self.revealed.setting,
+            Some(search::Setting::Knowledge(
+                search::KnowledgeSetting::Inventory(_)
+            ))
+        ) {
+            return scroll;
+        }
         if let Some(search::Setting::Managed(setting)) = self.revealed.setting {
             let load = self.local.reveal_managed_setting(setting, self.editable());
             return Task::batch([scroll, load.map(Message::Local)]);

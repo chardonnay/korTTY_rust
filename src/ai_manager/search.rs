@@ -165,6 +165,7 @@ impl Setting {
             Self::Knowledge(KnowledgeSetting::TestQuery | KnowledgeSetting::TestSearch) => {
                 "retrieval"
             }
+            Self::Knowledge(KnowledgeSetting::Inventory(action)) => action.keywords(),
             Self::Knowledge(_) => "",
             Self::Hub(HubSetting::Access) => {
                 "Hugging Face HuggingFace token vault credential anonymous"
@@ -1109,6 +1110,7 @@ impl Control {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum KnowledgeSetting {
+    Inventory(InventoryAction),
     Name,
     Create,
     Update,
@@ -1203,6 +1205,7 @@ impl KnowledgeSetting {
 
     fn title(self) -> &'static str {
         match self {
+            Self::Inventory(action) => action.title(),
             Self::Name => "New store name",
             Self::Create => "Create store",
             Self::Update => "Update index",
@@ -1252,7 +1255,7 @@ impl KnowledgeSetting {
     }
 
     pub(super) fn needs_store(self) -> bool {
-        !matches!(self, Self::Name | Self::Create)
+        !matches!(self, Self::Name | Self::Create | Self::Inventory(_))
     }
 
     pub(super) fn store_settings(self) -> bool {
@@ -1298,6 +1301,65 @@ impl KnowledgeSetting {
                 | Self::ConfirmStoreRemoval
                 | Self::CancelStoreRemoval
         )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InventoryAction {
+    ConfigureStore,
+    OpenTestSearch,
+    Refresh,
+    AddFiles,
+    AddFolder,
+    CancelIndexing,
+    SyncMode,
+    AdvancedSource,
+    ToggleSource,
+    RemoveSources,
+}
+
+impl InventoryAction {
+    const ALL: [Self; 10] = [
+        Self::ConfigureStore,
+        Self::OpenTestSearch,
+        Self::Refresh,
+        Self::AddFiles,
+        Self::AddFolder,
+        Self::CancelIndexing,
+        Self::SyncMode,
+        Self::AdvancedSource,
+        Self::ToggleSource,
+        Self::RemoveSources,
+    ];
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::ConfigureStore => "Configure knowledge store",
+            Self::OpenTestSearch => "Test search",
+            Self::Refresh => "Refresh knowledge inventory",
+            Self::AddFiles => "Add files…",
+            Self::AddFolder => "Add folder…",
+            Self::CancelIndexing => "Cancel indexing",
+            Self::SyncMode => "Sync mode…",
+            Self::AdvancedSource => "Advanced source settings",
+            Self::ToggleSource => "Enable / disable sources",
+            Self::RemoveSources => "Remove sources…",
+        }
+    }
+
+    fn keywords(self) -> &'static str {
+        match self {
+            Self::ConfigureStore => "settings edit",
+            Self::OpenTestSearch => "retrieval",
+            Self::Refresh => "reload source statuses",
+            Self::AddFiles => "add source files picker",
+            Self::AddFolder => "add source directory picker",
+            Self::CancelIndexing => "cancel source update scanning",
+            Self::SyncMode => "change source synchronization manual automatic",
+            Self::AdvancedSource => "advanced folder file options",
+            Self::ToggleSource => "toggle active enabled disabled",
+            Self::RemoveSources => "delete selected source",
+        }
     }
 }
 
@@ -1636,7 +1698,16 @@ pub(super) fn targets(profile: Option<&profiles::Profile>) -> impl Iterator<Item
             )
             .map(Setting::LocalPreference),
     )
-    .chain(KnowledgeSetting::ALL.into_iter().map(Setting::Knowledge))
+    .chain(
+        KnowledgeSetting::ALL
+            .into_iter()
+            .chain(
+                InventoryAction::ALL
+                    .into_iter()
+                    .map(KnowledgeSetting::Inventory),
+            )
+            .map(Setting::Knowledge),
+    )
     .chain(HubSetting::ALL.into_iter().map(Setting::Hub))
     .chain(ManagedSetting::ALL.into_iter().map(Setting::Managed))
     .chain(MlxSetting::ALL.into_iter().map(Setting::Mlx))
@@ -1719,6 +1790,17 @@ impl Default for Reveal {
 }
 
 impl Reveal {
+    pub(super) fn inventory_action<'a, Message: 'a>(
+        &self,
+        action: InventoryAction,
+        content: impl Into<Element<'a, Message>>,
+    ) -> Element<'a, Message> {
+        self.action(
+            Setting::Knowledge(KnowledgeSetting::Inventory(action)),
+            content,
+        )
+    }
+
     pub(super) fn knowledge_input<'a, Message: Clone + 'a>(
         &self,
         setting: KnowledgeSetting,
@@ -2288,6 +2370,58 @@ mod tests {
         let y = target - position.offset;
         assert!(y >= position.viewport.y && y < position.viewport.y + position.viewport.height);
         assert_eq!(serde_json::to_value(&dialog.local_state).unwrap(), before);
+    }
+
+    #[test]
+    fn knowledge_inventory_search_reveals_each_toolbar_control_on_first_visit() {
+        use iced_runtime::{UserInterface, user_interface::Cache};
+
+        for action in InventoryAction::ALL {
+            let mut dialog = Dialog::new(
+                Arc::new(Configuration::default()),
+                PathBuf::new(),
+                Vec::new(),
+                false,
+                None,
+            );
+            assert_eq!(dialog.page, Page::General);
+            let setting = Setting::Knowledge(KnowledgeSetting::Inventory(action));
+            let _ = dialog.update(Message::Search(action.title().into()));
+            assert_eq!(
+                dialog.search_results().next(),
+                Some(Target::Setting(setting))
+            );
+            let task = dialog.update(Message::SearchChoose);
+            assert_eq!(dialog.page, Page::Knowledge);
+            assert_eq!(dialog.revealed.setting, Some(setting));
+            assert!(!dialog.local_state.has_knowledge_stores());
+
+            let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+            let mut interface = UserInterface::build(
+                dialog.view(Vec::new(), Vec::new()),
+                Size::new(640.0, 300.0),
+                Cache::default(),
+                &mut renderer,
+            );
+            let mut position = Position {
+                viewport_id: dialog.revealed.viewport.clone(),
+                row_id: dialog.revealed.row.clone(),
+                viewport: Rectangle::default(),
+                row_y: None,
+                offset: 0.0,
+            };
+            crate::settings_search::test_input::apply(&mut interface, &renderer, task);
+            interface.operate(&renderer, &mut position);
+            let y = position
+                .row_y
+                .unwrap_or_else(|| panic!("{} has no reveal row", action.title()))
+                - position.offset;
+            assert!(
+                y >= position.viewport.y && y < position.viewport.y + position.viewport.height,
+                "{} is outside the Knowledge Stores viewport",
+                action.title()
+            );
+        }
     }
 
     #[test]

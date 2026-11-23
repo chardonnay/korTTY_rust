@@ -89,7 +89,7 @@ records the broader comparison with the tagged Java release.
 
 | Area | Remaining change | Completion check |
 | --- | --- | --- |
-| D4 · Searchable controls | Compare the remaining Java Settings and AI Manager pages, subpages and labeled controls with the Rust search inventory. Start with the Knowledge Stores inventory actions **Refresh** and **Sync mode**, which both versions display. | Verify that controls on a page that has never been opened are discoverable, and that navigation reveals the exact control with the current page state and policy. |
+| D4 · Searchable controls | Compare the remaining Java Settings and AI Manager pages, subpages and labeled controls with the Rust search inventory. The [Knowledge Stores toolbar](PORTING-PARITY.md#november-24-knowledge-stores-toolbar-search) now has search targets for its previously unindexed actions. Continue with the Local Models runtime toolbar, including the separate signed package entry and its form controls. | Verify that controls on a page that has never been opened are discoverable, and that navigation reveals the exact control with the current page state and policy. |
 
 The [November 23 review](PORTING-PARITY.md#november-23-dialog-parity-review)
 records the dialog differences. The [November 22 comparison](PORTING-PARITY.md#november-22-design-editing-command-output-and-settings-search)

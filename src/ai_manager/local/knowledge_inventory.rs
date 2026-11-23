@@ -20,7 +20,7 @@ use super::{
 };
 use crate::ai_manager::file_chooser::display_path;
 use crate::ai_manager::profiles::picker::DismissOnEscape as _;
-use crate::ai_manager::search::Reveal;
+use crate::ai_manager::search::{InventoryAction, Reveal};
 use crate::workspace::dialog_design;
 
 pub(super) fn body_heights(viewport_height: f32) -> (f32, f32) {
@@ -688,6 +688,7 @@ impl Dialog {
         &'a self,
         selected: Option<(usize, &'a Store)>,
         editable: bool,
+        reveal: &Reveal,
     ) -> [Element<'a, Message>; 4] {
         let properties = selected.filter(|_| editable && self.selected_sources.len() == 1);
         let actions = properties.and_then(|(index, store)| {
@@ -723,18 +724,22 @@ impl Dialog {
             })
             .map(|(index, _)| Message::ReviewSourceRemoval(index));
         [
-            dialog_design::secondary_action("Sync mode…")
-                .on_press_maybe(mode)
-                .into(),
-            dialog_design::secondary_action("Advanced…")
-                .on_press_maybe(advanced)
-                .into(),
-            dialog_design::secondary_action("Enable / disable")
-                .on_press_maybe(toggle)
-                .into(),
-            dialog_design::secondary_action("Remove…")
-                .on_press_maybe(remove)
-                .into(),
+            reveal.inventory_action(
+                InventoryAction::SyncMode,
+                dialog_design::secondary_action("Sync mode…").on_press_maybe(mode),
+            ),
+            reveal.inventory_action(
+                InventoryAction::AdvancedSource,
+                dialog_design::secondary_action("Advanced…").on_press_maybe(advanced),
+            ),
+            reveal.inventory_action(
+                InventoryAction::ToggleSource,
+                dialog_design::secondary_action("Enable / disable").on_press_maybe(toggle),
+            ),
+            reveal.inventory_action(
+                InventoryAction::RemoveSources,
+                dialog_design::secondary_action("Remove…").on_press_maybe(remove),
+            ),
         ]
     }
 

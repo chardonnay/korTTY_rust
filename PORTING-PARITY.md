@@ -870,6 +870,31 @@ Models page first. Enter opened the page and cleared the search.
 · [Tagged Java matcher](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SettingsSearchMatcher.java)
 · [Apple Silicon focused tests](target/verification/20261123-settings-ranking-macos-final.log)
 
+## November 24 Knowledge Stores toolbar search
+
+The tagged Java search indexes visible toolbar labels, including disabled
+buttons. Rust now includes the previously unindexed Knowledge Stores
+inventory actions. The store toolbar adds Configure, Test search and
+Refresh. The source toolbar adds Add files, Add folder, Cancel indexing,
+Sync mode, Advanced, Enable / disable and Remove sources.
+
+A result opens the Knowledge Stores page and scrolls to the highlighted
+button. Its normal availability and policy still apply. Revealing a
+button preserves the store and source selection and leaves the inventory
+and indexes untouched. When an owned Knowledge Stores review or editor is
+open, its parent toolbar results are unavailable. The remaining desktop
+coverage includes comparison of the search results and keyboard focus.
+[Tagged Java toolbar](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/RagKnowledgeStorePane.java)
+· [Rust search targets](src/ai_manager/search.rs)
+
+Apple Silicon passed strict application Clippy and eight focused tests.
+The tests located all ten new toolbar targets at 640 by 300 logical
+pixels on first visit, kept an existing source selection, and refused a
+stale parent result while the Sync mode dialog was open. Windows ARM64
+passed strict application Clippy for all targets.
+[Apple Silicon search tests](target/verification/20261124-knowledge-inventory-search-macos-acceptance.log)
+· [Windows Clippy](target/verification/20261124-knowledge-inventory-search-windows-clippy-final.log)
+
 ## November 23 GGUF Configure sizing
 
 Java sizes the Configure grid to its path label. Rust now measures the
