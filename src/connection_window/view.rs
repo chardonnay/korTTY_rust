@@ -414,8 +414,17 @@ impl ConnectionWindow {
             let draft = self.draft.as_ref()?;
             draft.view(&choices, &self.custom_badges, self.editor_group_picker())
         };
-        let form =
-            scrollable(container(contents).padding(16).width(Length::Fill)).height(Length::Fill);
+        let form: Element<'_, Message> =
+            if self.draft.is_some() && !self.confirming_close && !self.busy {
+                container(contents)
+                    .padding([8, 12])
+                    .height(Length::Fill)
+                    .into()
+            } else {
+                scrollable(container(contents).padding(16).width(Length::Fill))
+                    .height(Length::Fill)
+                    .into()
+            };
         let mut body = column![form].height(Length::Fill);
         if !self.confirming_close && !self.busy {
             let valid = if let Some(draft) = &self.local_draft {
@@ -430,6 +439,8 @@ impl ConnectionWindow {
             body = body.push(rule::horizontal(1)).push(
                 row![
                     space::horizontal(),
+                    button("Save")
+                        .on_press_maybe((!self.draft_conflict && valid).then_some(Message::Save)),
                     button(if self.draft.as_ref().is_some_and(|draft| draft.changed) {
                         "Discard draft"
                     } else {
@@ -437,8 +448,6 @@ impl ConnectionWindow {
                     })
                     .style(button::secondary)
                     .on_press(Message::CancelEdit),
-                    button("Save")
-                        .on_press_maybe((!self.draft_conflict && valid).then_some(Message::Save)),
                 ]
                 .spacing(8)
                 .padding([8, 16]),
@@ -478,10 +487,15 @@ impl ConnectionWindow {
                 .size(13)
                 .width(Length::Fill)
                 .wrapping(text::Wrapping::WordOrGlyph),
-            button("Close")
+            button(container(text("Connect").size(13)).center_x(Length::Fill))
+                .width(82)
+                .padding([7, 5])
+                .on_press_maybe(selected.then_some(Message::Connect(false))),
+            button(container(text("Close").size(13)).center_x(Length::Fill))
+                .width(76)
+                .padding([7, 5])
                 .style(button::secondary)
                 .on_press(Message::Close),
-            button("Connect").on_press_maybe(selected.then_some(Message::Connect(false))),
         ]
         .spacing(10)
         .align_y(Alignment::Center)
@@ -492,15 +506,17 @@ impl ConnectionWindow {
                     container(self.sidebar(&zone))
                         .width(SIDEBAR_WIDTH)
                         .height(Length::Fill)
-                        .style(sidebar_background),
+                        .style(crate::workspace::dialog_design::sidebar),
                     rule::vertical(4),
                     container(self.results(&zone))
                         .width(Length::Fill)
-                        .height(Length::Fill),
+                        .height(Length::Fill)
+                        .style(crate::workspace::dialog_design::page),
                     rule::vertical(4),
-                    scrollable(self.inspector(&choices))
+                    container(scrollable(self.inspector(&choices)).height(Length::Fill))
                         .width(INSPECTOR_WIDTH)
-                        .height(Length::Fill),
+                        .height(Length::Fill)
+                        .style(crate::workspace::dialog_design::page),
                 ]
                 .height(Length::Fill)
                 .into()
@@ -515,6 +531,7 @@ impl ConnectionWindow {
             rule::horizontal(1),
             footer,
         ]
+        .padding([0, 12])
         .height(Length::Fill)
         .into()
     }
@@ -612,7 +629,7 @@ impl ConnectionWindow {
         container(body)
             .padding([7, 10])
             .width(Length::Fill)
-            .style(sidebar_background)
+            .style(crate::workspace::dialog_design::sidebar)
             .into()
     }
 
@@ -629,9 +646,12 @@ impl ConnectionWindow {
             (true, false) => "Hide Teamwork connection",
             (false, _) => "Delete connection",
         };
-        let search = text_input("Search profiles… (* as wildcard)", &self.query)
-            .on_input_maybe(browsing.then_some(Message::Search))
-            .width(Length::Fill);
+        let search = text_input(
+            "Search by name, host, IP address or tag… (* as wildcard)",
+            &self.query,
+        )
+        .on_input_maybe(browsing.then_some(Message::Search))
+        .width(Length::Fill);
         row![
             tool_group(
                 "Connection",
@@ -640,16 +660,6 @@ impl ConnectionWindow {
                         Icon::AddServer,
                         "New connection",
                         local.then_some(Message::New)
-                    ),
-                    tool(
-                        Icon::Serial,
-                        "New serial connection",
-                        (local && serial_allowed).then_some(Message::NewSerial)
-                    ),
-                    tool(
-                        Icon::Tab,
-                        "New local shell profile",
-                        local.then_some(Message::NewLocal)
                     ),
                     tool(
                         Icon::Edit,
@@ -665,6 +675,16 @@ impl ConnectionWindow {
                         Icon::Delete,
                         delete_label,
                         (hide_shared || delete_local).then_some(Message::Delete)
+                    ),
+                    tool(
+                        Icon::Serial,
+                        "New serial connection",
+                        (local && serial_allowed).then_some(Message::NewSerial)
+                    ),
+                    tool(
+                        Icon::Tab,
+                        "New local shell profile",
+                        local.then_some(Message::NewLocal)
                     ),
                 ]
             ),
@@ -683,6 +703,12 @@ impl ConnectionWindow {
                         group.then_some(Message::RenameGroup)
                     ),
                     tool(
+                        Icon::Undo,
+                        "Undo folder move",
+                        self.can_undo_folder_move()
+                            .then_some(Message::UndoFolderMove)
+                    ),
+                    tool(
                         Icon::Colors,
                         "Tab Color…",
                         group.then_some(Message::EditGroupColor)
@@ -696,7 +722,7 @@ impl ConnectionWindow {
             ),
             container(rule::vertical(1)).height(44),
             tool_group(
-                "Exchange",
+                "Import & export",
                 [
                     tool(
                         Icon::ImportConnections,
@@ -931,10 +957,6 @@ impl ConnectionWindow {
         .vertical_spacing(2);
         let header = row![
             container(summary).width(Length::Fill),
-            button("Undo move").on_press_maybe(
-                self.can_undo_folder_move()
-                    .then_some(Message::UndoFolderMove)
-            ),
             row![
                 button("List")
                     .style(selectable(!self.network_map.visible))
@@ -1909,10 +1931,6 @@ fn server_tile<'a>(
     } else {
         tile
     }
-}
-
-fn sidebar_background(theme: &Theme) -> container::Style {
-    container::background(theme.extended_palette().background.weakest.color)
 }
 
 fn server_policy_note(host: &str, port: u16) -> String {

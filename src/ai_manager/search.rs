@@ -222,16 +222,18 @@ pub(crate) enum LocalPreference {
     EmbeddingSource,
     EmbeddingSetup,
     RefreshEmbeddingModels,
+    HubAccess,
     ImportedRole(super::java_roles::Role),
 }
 
 impl LocalPreference {
-    const CONTROLS: [Self; 5] = [
+    const CONTROLS: [Self; 6] = [
         Self::RuntimeUpdatePolicy,
         Self::RuntimeBackend,
         Self::EmbeddingSource,
         Self::EmbeddingSetup,
         Self::RefreshEmbeddingModels,
+        Self::HubAccess,
     ];
 
     pub(super) fn title(self) -> &'static str {
@@ -242,6 +244,7 @@ impl LocalPreference {
             Self::EmbeddingSource => "Default embedding source",
             Self::EmbeddingSetup => "Set up an embedding model",
             Self::RefreshEmbeddingModels => "Refresh embedding models",
+            Self::HubAccess => "Hugging Face access preference",
             Self::ImportedRole(role) => match role {
                 JavaRole::Default => "Imported Java default profile",
                 JavaRole::Text => "Imported Java text profile",
@@ -260,6 +263,7 @@ impl LocalPreference {
             Self::EmbeddingSource => "default embedding model vector managed local endpoint",
             Self::EmbeddingSetup => "guided embedding model vector",
             Self::RefreshEmbeddingModels => "reload managed policy embedding inventory",
+            Self::HubAccess => "hub credential vault token gated anonymous",
             Self::ImportedRole(_) => "adopt use imported profile role backup restore",
         }
     }
@@ -419,7 +423,7 @@ impl ManagedSetting {
             Self::Reference => "Register external GGUF",
             Self::Refresh => "Refresh managed GGUF models",
             Self::Select => "Select a managed GGUF model",
-            Self::SetDefault => "Set managed GGUF model as default",
+            Self::SetDefault => "Set installed local model as default",
             Self::ClearDefault => "Clear default managed GGUF model",
             Self::RepairBackend => "Install matching GGUF runtime",
             Self::Reattach => "Reattach local GGUF",
@@ -1104,6 +1108,7 @@ pub(crate) enum KnowledgeSetting {
     Update,
     Rebuild,
     VectorStorage,
+    LocalDimensions,
     QdrantEndpoint,
     QdrantCollection,
     QdrantDimensions,
@@ -1144,12 +1149,13 @@ pub(crate) enum KnowledgeSetting {
 }
 
 impl KnowledgeSetting {
-    const ALL: [Self; 42] = [
+    const ALL: [Self; 43] = [
         Self::Name,
         Self::Create,
         Self::Update,
         Self::Rebuild,
         Self::VectorStorage,
+        Self::LocalDimensions,
         Self::QdrantEndpoint,
         Self::QdrantCollection,
         Self::QdrantDimensions,
@@ -1196,6 +1202,7 @@ impl KnowledgeSetting {
             Self::Update => "Update index",
             Self::Rebuild => "Rebuild index",
             Self::VectorStorage => "Vector storage backend",
+            Self::LocalDimensions => "Local embedding dimensions",
             Self::QdrantEndpoint => "Qdrant endpoint",
             Self::QdrantCollection => "Qdrant collection",
             Self::QdrantDimensions => "Qdrant embedding dimensions",
@@ -1240,6 +1247,35 @@ impl KnowledgeSetting {
 
     pub(super) fn needs_store(self) -> bool {
         !matches!(self, Self::Name | Self::Create)
+    }
+
+    pub(super) fn store_settings(self) -> bool {
+        self.advanced_store_settings()
+            || matches!(
+                self,
+                Self::Name
+                    | Self::EmbeddingSource
+                    | Self::EmbeddingEndpoint
+                    | Self::EmbeddingModel
+                    | Self::TerminalChatProfile
+                    | Self::CodeAnalysisProfile
+                    | Self::AgentKnowledge
+            )
+    }
+
+    pub(super) fn advanced_store_settings(self) -> bool {
+        matches!(
+            self,
+            Self::VectorStorage
+                | Self::LocalDimensions
+                | Self::QdrantEndpoint
+                | Self::QdrantCollection
+                | Self::QdrantDimensions
+                | Self::QdrantAuthentication
+                | Self::QdrantCredentialVariable
+                | Self::EmbeddingEndpoint
+                | Self::EmbeddingModel
+        )
     }
 
     pub(super) fn needs_active_review(self) -> bool {
@@ -1406,23 +1442,21 @@ impl ProfileSetting {
             | Self::CliReview
             | Self::MiniMaxModule
             | Self::MiniMaxConfig
-            | Self::MiniMaxRegion
-            | Self::Web(_) => profiles::Section::Connection,
+            | Self::MiniMaxRegion => profiles::Section::Connection,
             Self::ModelMode
             | Self::Model
             | Self::AvailableModels
             | Self::ManagedModel
             | Self::Reasoning
             | Self::Vision
-            | Self::PromptPreset => profiles::Section::Model,
+            | Self::PromptPreset
+            | Self::Web(_) => profiles::Section::Model,
             Self::SelectionLimit
             | Self::Timeout
             | Self::OutputLimit
-            | Self::Tokenizer
             | Self::ReviewedAgentHttps
-            | Self::ReviewedPlanningHttps
-            | Self::Usage(_)
-            | Self::RecordedUsage => profiles::Section::Limits,
+            | Self::ReviewedPlanningHttps => profiles::Section::Limits,
+            Self::Tokenizer | Self::Usage(_) | Self::RecordedUsage => profiles::Section::Budget,
         }
     }
 
@@ -1734,7 +1768,7 @@ mod tests {
     use iced::{Font, Rectangle, Renderer, Size, Vector};
 
     use super::*;
-    use crate::ai_manager::{Configuration, Dialog, Message};
+    use crate::ai_manager::{Configuration, Dialog, LocalSection, Message};
 
     struct Position {
         viewport_id: Id,
@@ -1976,24 +2010,37 @@ mod tests {
                 LocalPreference::ImportedRole(java_roles::Role::Coding),
             )))
         );
-        for (query, setting) in [
-            ("preferred runtime backend", LocalPreference::RuntimeBackend),
+        for (query, setting, section) in [
+            (
+                "preferred runtime backend",
+                LocalPreference::RuntimeBackend,
+                LocalSection::Runtime,
+            ),
             (
                 "imported Java agent profile",
                 LocalPreference::ImportedRole(java_roles::Role::Agent),
+                LocalSection::Roles,
             ),
             (
                 "managed runtime update policy",
                 LocalPreference::RuntimeUpdatePolicy,
+                LocalSection::Runtime,
             ),
             (
                 "imported Java text profile",
                 LocalPreference::ImportedRole(java_roles::Role::Text),
+                LocalSection::Roles,
+            ),
+            (
+                "Hugging Face access preference",
+                LocalPreference::HubAccess,
+                LocalSection::HuggingFace,
             ),
         ] {
             let _ = dialog.update(Message::Search(query.into()));
             let reveal = dialog.update(Message::SearchChoose);
             assert_eq!(dialog.page, Page::LocalPreferences);
+            assert_eq!(dialog.local_section, section);
             assert_eq!(
                 dialog.revealed.setting,
                 Some(Setting::LocalPreference(setting))
@@ -2005,12 +2052,6 @@ mod tests {
                 visible_y >= position.viewport.y - 1.0
                     && visible_y < position.viewport.y + position.viewport.height
             );
-            if matches!(
-                setting,
-                LocalPreference::RuntimeBackend | LocalPreference::RuntimeUpdatePolicy
-            ) {
-                assert!(position.offset > 0.0);
-            }
             assert_eq!(dialog.local_state, local);
             assert_eq!(dialog.profiles.catalog(), &profiles);
         }

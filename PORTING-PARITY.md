@@ -16,6 +16,614 @@ open until a result is recorded for the tested revision and environment. Both
 Mosh modes are out of scope. The editor has a reduced native scope with structure
 navigation for classes, functions, variables, and placeholders.
 
+## November 22 AI Manager and Agent Design on Windows ARM64
+
+The published Java v2.26.0 Windows package was observed under x64
+emulation alongside the native Windows ARM64 Rust application. The
+released Java dialogs were opened with a private JavaFX fixture. Rust
+opened both dialogs through the development preview. The English
+Normal-design captures measured 982 by 672 pixels for AI Manager and
+1202 by 694 pixels for Agent Design on both sides.
+
+In AI Manager, the search kept the General page visible beneath its
+results. Selecting the global request timeout by keyboard opened Defaults,
+highlighted the matching row and focused its field. Java's Features &
+safety page has additional confirmation and runtime message controls.
+Its General Internet access page places provider options together.
+Continue the comparison of form alignment, profile states and the
+remaining primary pages.
+
+In the standalone Rust Agent Design editor, the module table and sample
+were visible side by side. Activating Side timeline on Standard created
+`custom-1` with history `d02`, preserving the other roles and the default
+selection. Selecting reduced animations changed the sample immediately.
+Both changes appeared in the isolated preferences file before closing.
+The same copy workflow worked for Classic. After tightening the layout,
+another native run opened the collapsed sample controls and increased
+the auto-hide time from six to seven seconds. The AI Manager profile
+draft displayed separate Connection, Model & capabilities, Limits &
+timeouts and Budget & usage tabs. Budget & usage showed quota, cost
+and recorded-usage controls. All of these previews used the automatic
+start with private profiles.
+
+Local AI now has the Profile roles, Local runtime and Hugging Face
+subtabs. Search switches to the subtab that owns a setting and reveals
+its field. The Hugging Face subtab shares the Hub's session selection of
+anonymous access or an existing Vault token. Java's dialog can also
+replace or clear a stored token directly.
+
+Local Models now opens with a runtime summary and an installed GGUF
+table. The setup assistant, default selection and refresh are next to
+the model inventory. Signed runtime package controls, Hub workflows
+and local-service discovery remain on the same page.
+
+The native Windows ARM64 preview showed both inventories in the same
+order as the released Java dialog. All three Local AI subtabs opened
+from the private profile. A keyboard search for `preferred runtime
+backend` selected Local runtime and highlighted the corresponding row.
+The setup assistant opened from the new toolbar and Cancel returned to
+the model inventory. The isolated Windows ARM64 suite covering AI
+Manager, settings search, Agent Design and runtime package code passed
+491 tests with 12 ignored before the final styling pass.
+[Local AI regression results](target/verification/ai-local-dialog-windows-arm64-tests.log)
+
+The Agent Design module columns have separators and the sample has a
+border. Clicking Side timeline previewed that module. Activating it
+created a copy of Standard. The native dialog renamed the copy and
+set it as the default. The private settings file held the new name,
+default ID `custom-1`, history `d02` and the other roles from Standard.
+The final native preview showed the full description on hover with a
+background distinct from the following row.
+[Final native preview build](target/verification/ai-dialog-windows-arm64-tooltip-build.log)
+
+The primary AI Manager pages were also opened in both apps with private
+profiles. These visual differences remain.
+
+| Page | Visible Java structure still to port |
+| --- | --- |
+| Local Models | Match the package toolbar, the installed-model action order and import flow, and the table with a populated registry. Rust shows a single selection of GGUF models and keeps its signed-package review fields and MLX controls in separate groups. Java has an age column and can select multiple models. |
+| Knowledge Stores | The stacked tables grow with the window. The source actions share a wrapping row. File and folder actions use native pickers. Individual files open an owned preflight with path, format, size, status and the reason for skipped files. Folder selection opens the scan review. Create and Configure open an owned settings dialog. Create continues to initial source selection and stages the store only after the scanned files or folder are approved. Update now opens a shared owned preview for selected enabled files and folders. Approval stages folder manifests and retains the reviewed individual-file digests for the separately authorized index operation. The native removal confirmation lists the selected paths and applies the change to the store draft. Column styling, initial store selection, and per-source indexing history remain open. |
+| Skills | The settings, Local/External switch, filter and library are to the left of the editor. The statistics setting, provider editor and nested Markdown actions still differ. |
+| Memory | The settings grid, scope, budget, Entries/Markdown switch and file actions use the Java order. The editable budget control, budget bar colors and individual file-management views still differ. |
+| Local AI | Align the captions, field widths, and hint placement. Java edits the stored Hub credential inline. Rust selects a Vault credential for the current session. |
+
+The Windows ARM64 library comparison opened the published Java pages
+and the corresponding native Rust pages under the Normal design.
+The Rust search focused the source path field in a newly created private
+store. Adding a synthetic file updated the source table and selecting
+its row revealed the sync, size-limit, enable and removal controls.
+The Providers action opened from External skills. Closing it returned
+to the same library. Memory switched from an empty Entries view to
+its Markdown editor. In the corrected native build both inventory
+action rows fit the default viewport. The Memory selector, Reload
+button and token count were fully visible at the default width.
+[Windows ARM64 library comparison build](target/verification/ai-library-dialogs-windows-arm64-corrected-build.log)
+
+The final native run passed 469 selected tests with 10 ignored. This
+includes the compact skill editor layout test, the search path between
+local and external skills, and retention of the selected source when
+another row is removed.
+[Windows ARM64 library regression results](target/verification/ai-library-dialogs-windows-arm64-retest.log)
+
+The populated Knowledge Stores comparison opened the published Java tab
+and its Windows file picker. The Rust build placed both source actions
+under the inventory. Its file picker listed the two supported fixture
+files and filtered out the unsupported file. Reviewing and confirming
+the pair added two draft sources. The folder picker started the existing
+scan and scrolled to its result, where the reviewed folder could be
+approved. The inventory showed two files and one folder. Escape returned
+from the picker to the inventory. The final build kept long paths on one
+line and displayed the full path in a tooltip with an opaque background.
+Windows ARM64 passed 472 selected tests
+with 10 ignored, including rejection of a stale approval after a store
+switch and rejection of an entire file batch when one path overlaps.
+[Windows ARM64 knowledge picker tests](target/verification/20261122-knowledge-chooser-windows-arm64-tests.log)
+· [Final native build](target/verification/20261122-knowledge-chooser-windows-arm64-final-build.log)
+
+The separate knowledge-store settings dialog was compared with the Java
+v2.26.0 Configure dialog using a private Java registry fixture. The Rust
+Windows ARM64 window uses the same order for the name, embedding model,
+roles and Advanced section, and opens in its compact form when Advanced
+is collapsed. Opening the backend search result expands Advanced and
+reveals vector storage. Opening Qdrant showed the endpoint, collection,
+dimensions and credential controls. Escape abandoned a name and backend
+edit together. The window close button returned to AI Manager. Saving a
+rename preserved the store identifier and its source across restart.
+The populated store showed the embedding and storage restrictions. A
+separate Create window added a new store to the AI Manager draft.
+Java offers a managed-model picker and editable dimensions for local
+stores. Rust also exposes an external local model and configures vector
+dimensions for Qdrant. Rust applies the store changes through AI Manager's
+Save action.
+[Windows ARM64 store settings build](target/verification/20261122-knowledge-settings-windows-arm64-final-build.log)
+
+Windows ARM64 passed 404 selected AI Manager, settings search, workspace
+routing and dialog placement tests with 10 ignored. The tests also cover
+draft cancellation, source-preserving rename, rejection of stale drafts,
+the lock on populated-store settings, and keyboard focus in the Qdrant
+endpoint search result.
+[Windows ARM64 store settings tests](target/verification/20261122-knowledge-settings-windows-arm64-final-tests.log)
+
+The Java v2.26.0 first-source dialog was opened on Windows from the tagged
+release's Knowledge Stores pane. It presents a file-or-folder dropdown
+with the folder option selected by default. The Rust Create dialog now
+continues to that choice and reuses the file selection and recursive folder
+review in AI Manager. The store remains outside the draft inventory until
+the first sources are approved. Cancelling the choice, picker, scan, or
+review abandons creation. A completed scan cannot apply after cancellation.
+In the native Windows ARM64 desktop run, cancelling at the dropdown left
+the inventory empty. Approving two selected files and approving one folder
+in separate runs produced exactly two saved stores in the private profile.
+The folder review showed two ready files and skipped one unsupported file.
+The Rust choice uses the store editor's width and a separate indexing
+consent step. Java opens its operating-system picker from the compact choice.
+[Windows ARM64 initial-source build](target/verification/20261122-knowledge-initial-sources-windows-arm64-final-build.log)
+
+The Windows ARM64 regression run passed 405 tests with 10 ignored,
+including source approval, folder scan cancellation, and store identity.
+[Windows ARM64 initial-source tests](target/verification/20261122-knowledge-initial-sources-windows-arm64-tests-retest.log)
+
+Knowledge source selection now opens the operating system's file and
+folder dialogs. A Windows ARM64 desktop run compared both dialogs against
+the corresponding Java v2.26.0 actions. Both used the Windows file dialog
+layout and localized system controls. The Rust run selected two supported
+files in one operation and showed them in its review before staging the
+new store. Adding a folder to that store showed one supported file and one
+skipped file before approval. The saved profile contained both individual
+sources and the approved folder snapshot. Cancelling the native dialog
+during a separate creation attempt discarded the new store draft.
+[Windows ARM64 native picker build](target/verification/20261122-knowledge-native-picker-windows-arm64-build.log)
+
+The focused Windows ARM64 test run passed 405 tests with 10 ignored.
+The source-selection regression rejects unsupported paths and ignores a
+late native picker result when the user has already opened a new picker.
+[Windows ARM64 native picker tests](target/verification/20261122-knowledge-native-picker-windows-arm64-tests.log)
+
+The Windows ARM64 desktop comparison opened the Java v2.26.0 and Rust
+file preflights with two usable files and one binary file. Both dialogs
+showed the path, format, size, status and skip reason in an owned window.
+The Rust preview showed the exact byte counts and required a separate
+indexing consent. Changing a source after the first scan blocked the
+entire approval. With the reviewed bytes restored, only the two valid
+files were saved. A manually entered file opened the same preview, and
+cancelling it left the two saved sources in place.
+[Windows ARM64 file preflight build](target/verification/20261122-knowledge-file-review-windows-arm64-final-build.log)
+
+The file preflight also passed a native Windows ARM64 size-limit check.
+A 52,428,801-byte text fixture was skipped at the 50 MiB default. Setting
+51 MiB in the preview and rescanning made the fixture eligible. Approval
+and Save persisted both the source and its 53,477,376-byte reviewed limit.
+[Windows ARM64 size-limit build](target/verification/20261122-knowledge-file-review-windows-arm64-limit-build.log)
+
+The focused Windows ARM64 suite passed 406 tests with 10 ignored. It
+covers mixed usable and skipped files, rechecking changed contents,
+reviewing a larger size limit, and applying the new preview flow before
+the Qdrant and vault persistence checks.
+[Windows ARM64 file preflight tests](target/verification/20261122-knowledge-file-review-limit-windows-arm64-tests.log)
+
+The Java v2.26.0 Create knowledge store dialog places an editable dimension
+spinner after the storage type inside Advanced. On the Windows ARM64 host,
+the Java release running under x64 emulation recognized 3,072 dimensions
+from the private GGUF fixture. Java shows inactive Qdrant controls for a
+local store. The corresponding Rust form places the editable dimensions
+field after Vector storage and shows Qdrant controls when Qdrant is selected.
+Rust leaves the value automatic when no usable hint is available and
+accepts 1 to 65,536 for local stores. Existing automatic stores keep their
+snapshot identity. Fixed dimensions are part of the local snapshot identity
+and are checked against returned vectors. A new snapshot header represents
+dimensions above 16,384. Older snapshots are still readable and the Qdrant
+dimension ceiling is unchanged.
+The focused Windows ARM64 run passed 409 tests with 10 ignored. It covers
+registered GGUF metadata, a mismatched provider response, unchanged
+automatic-store identity, and a 65,536-dimensional snapshot round trip.
+[Windows ARM64 dimension tests](target/verification/20261122-knowledge-dimensions-windows-arm64-tests.log)
+
+The native Windows ARM64 dialog loaded 3,072 from the same GGUF metadata
+as Java. The existing empty store kept its automatic setting. The editor
+rejected 65,537, then the AI Manager saved 65,536 in the private profile.
+The same build opened Agent Design directly with the module table, live
+sample, auto-hide delay, and reduced-animation control. The Rust dimension
+label still wraps at the default width.
+[Windows ARM64 desktop verification](target/verification/20261123-knowledge-dimensions-windows-arm64-desktop.md)
+
+The revised Knowledge Store Advanced panel fits the dimension label on
+one line, uses a compact editable spinner, and displays the disabled
+Qdrant endpoint, collection, and key fields in local mode. The direct
+Windows comparison stepped both dialogs from 3,072 to 3,073 and back.
+Rust also stopped at 65,536 locally and at 16,384 for Qdrant, and selecting
+Qdrant enabled its destination and credential controls. The same native
+binary started Agent Design directly and saved a seven-second delay
+after using its shared spinner. Java showed the same one-second step.
+[Windows ARM64 spinner comparison](target/verification/20261123-knowledge-spinner-windows-arm64-desktop.md)
+The focused Windows ARM64 regression run passed 419 tests with 10 ignored,
+including Qdrant search focus, source locks, and the isolated Agent preview.
+[Windows ARM64 spinner regression results](target/verification/20261123-knowledge-spinner-windows-arm64-tests.log)
+
+The next Agent Design comparison aligned the Standard combination caption
+and the table headings. Rust measures the description against its column
+width and reserves space for the scrollbar so the ellipsis stays visible.
+The full tooltip and the linked Side timeline preview worked in the
+standard and compact Rust windows. Selecting the row kept the Standard
+combination active. Both Java and Rust opened the timeline beside the
+sample terminal. The Rust build also opened AI Manager and Knowledge Stores
+through the private startup. This comparison preceded the alignment of the
+Metro header and track.
+[Windows ARM64 table comparison](target/verification/20261123-agent-table-windows-arm64-desktop.md)
+The focused suite passed 420 tests with 10 ignored. It includes the
+measured-width UTF-8 truncation case and the isolated preview replay test.
+[Windows ARM64 table regression results](target/verification/20261123-agent-table-windows-arm64-tests.log)
+
+The next Windows ARM64 comparison verified the Standard preview's new
+52-pixel logical Metro bar with a title, stations, metadata, and actions
+on one row. The simulated approval uses a separate compact strip. The
+steps remain collapsed until opened from the menu or a station. Hide
+dismisses the bar and steps, and Replay restores the bar. The compact
+preview also kept the rail and action icons on one row. Other visual
+differences include the sample text and Java's Allow Always choice.
+[Windows ARM64 Metro layout comparison](target/verification/20261123-metro-layout-windows-arm64-desktop.md)
+The focused Windows suite passed 423 tests with 10 ignored. A separate
+terminal-design run passed 27 tests, including bound status clicks,
+Top Bar drawer geometry, and menu actions after auto-hide.
+[Windows ARM64 tests](target/verification/20261123-metro-layout-windows-arm64-tests.log)
+· [Terminal design tests](target/verification/20261123-metro-layout-windows-arm64-terminal-regressions.log)
+
+The Windows ARM64 source selection comparison used four private text files
+in each application. Java's source pane held a noncontiguous selection
+and opened its count-based removal confirmation. Rust highlighted the
+source row, switched Update index to Update selected, and showed the
+selected path in the inline removal review. Cancel kept the selection.
+The Rust review was below the initial viewport and could be reached by
+scrolling. The selected-update path retains vectors for unselected files
+and preserves prior Qdrant coverage for the same destination. Rust's
+existing completeness and freshness checks still govern retrieval.
+[Desktop comparison](target/verification/20261123-knowledge-selection-windows-arm64-desktop.md)
+The focused native suite passed 452 tests with 10 ignored. It exercised
+modifier-based selection, removal review and cancellation, and a scoped
+index update followed by a full update that reused the selected vector.
+[Windows ARM64 tests](target/verification/20261123-knowledge-selection-windows-arm64-tests.log)
+
+The next comparison moved source removal into an owned confirmation that
+opens from the source action without scrolling the AI Manager page. The
+modal shows the selected paths and uses the Java confirmation's primary
+action followed by Cancel. Cancel and Escape return to the selected source.
+The corrected viewport shows a long path across two lines at the initial
+window size.
+The native suite passed 452 tests with 10 ignored. The selection test also
+checks cancellation through the close route and refuses a stale removal
+message after the review has been cleared.
+[Desktop comparison](target/verification/20261123-knowledge-removal-windows-arm64-desktop.md)
+· [Windows ARM64 tests](target/verification/20261123-knowledge-removal-windows-arm64-tests.log)
+
+The Windows ARM64 inventory comparison confirmed that the full Java
+AI Manager displayed three source rows at its default outer size.
+The Rust source inventory displayed all four private fixture rows at
+that size. At maximum size both Rust inventories grew evenly, and the
+selection survived maximizing and restoring the window. At the Rust
+minimum size, the page scroll reached the four source rows, and the
+common source action row wrapped into a second line.
+[Desktop comparison](target/verification/20261123-knowledge-table-layout-windows-arm64-desktop.md)
+The native focused suite passed 452 tests with 10 ignored, including
+search-driven focus of an input below the resized inventory and range
+selection and removal review.
+[Windows ARM64 tests](target/verification/20261123-knowledge-table-layout-windows-arm64-tests.log)
+
+The next Windows ARM64 comparison scanned two synthetic folders in one
+owned window. Java used Update now, and Rust used Review folder updates.
+The previews both showed two text files and two skipped files with the
+same five columns. Rust revealed the complete path in a tooltip. Cancel
+kept both previous manifests. The next Rust review staged and saved the
+two accepted text files, one per folder. The four source files remained
+on disk, and the indexing action stayed disabled without consent.
+[Desktop comparison](target/verification/20261123-knowledge-folders-windows-arm64-desktop.md)
+The focused native suite passed 453 tests with 10 ignored. The batch
+regression checked cancellation, a changed selection, and a valid
+approval that left the unselected folder's manifest intact.
+[Windows ARM64 tests](target/verification/20261123-knowledge-folders-windows-arm64-tests.log)
+
+The next desktop comparison opened a single Update now preview for a
+standalone text file and a folder. Each version showed two usable text
+files and one unsupported file. Rust kept indexing as a separate consent
+step after the preview. The Agent Design comparison also opened Side
+timeline by selecting its row in both apps, leaving the Standard
+combination selected. Java's timeline displays a run header and extends
+the Metro rail under both the terminal and side panel. Rust's timeline
+shows a compact status heading, and the Metro rail ends at the terminal.
+[Desktop comparison](target/verification/20261123-knowledge-source-updates-windows-arm64-desktop.md)
+The focused native suite passed 453 tests with 10 ignored. The reviewed
+index test covers the consent gate, a file changed after the preview,
+a changed selection, and the reuse of compatible vectors. The batch
+test includes individual files and folders in one review.
+[Windows ARM64 tests](target/verification/20261123-knowledge-source-updates-windows-arm64-tests.log)
+
+The subsequent Side timeline comparison confirmed the Rust title, usage,
+elapsed time, prompt and four header actions. The Metro rail now spans
+the frame below both the preview terminal and the timeline. Hide removed
+only the timeline, and Replay restored it. The timeline menu opened on
+its own header. Java and Rust still use different step colors and sample
+data. The same native Rust build opened AI Manager from its preview route.
+[Desktop comparison](target/verification/20261123-agent-timeline-windows-arm64-desktop.md)
+The focused Windows ARM64 suite passed 549 tests with 10 ignored.
+It measures the full-width Metro bar below a docked timeline and checks
+that opening the Top Bar drawer leaves the terminal bounds unchanged.
+[Windows ARM64 tests](target/verification/20261123-agent-timeline-windows-arm64-tests.log)
+
+The next Windows ARM64 comparison used equivalent private indexed
+sources in Java and Rust. Both source tables showed 1 / 1 files and
+chunks for the individual file, 2 / 2 for the folder, one skipped
+folder entry and the same local indexing time. Rust now uses the
+Java headings and column dividers. Selection of an empty test store
+cleared the previous result rows. The Agent Design comparison confirmed
+violet analysis, blue command nodes, the matching example prompt and
+answer, and the finished 1.3k-token and 0:08 metadata. The remaining
+differences include activity details, command wrapping and the layout
+of some source actions.
+[Desktop comparison](target/verification/20261123-dialog-tables-windows-arm64-desktop.md)
+The focused native ARM64 suite passed 550 tests with 10 ignored.
+The source result regression checks legacy snapshots, timestamp
+round-trips, inconsistent summary records and Qdrant receipt coverage.
+[Windows ARM64 tests](target/verification/20261123-dialog-tables-windows-arm64-tests.log)
+
+The subsequent Windows ARM64 comparison placed Cancel beside Update
+now. Java showed a configured folder that pointed at a file as skipped.
+Rust showed the same invalid folder and a valid text file together in
+its review, with one skipped and one ready row. Approval retained the
+folder row with one problem. The separate indexing consent remained
+off. The native Agent Design preview matched the Java exit codes and
+available output line counts. Hyphen wrap positions still differ.
+[Desktop comparison](target/verification/20261123-source-review-windows-arm64-desktop.md)
+The final focused Windows ARM64 suite passed 552 tests with 10 ignored.
+Regressions cover cancelled scans, selected-source indexing failures,
+and an unavailable folder that is excluded from indexing while its
+existing manifest remains in the store.
+[Windows ARM64 tests](target/verification/20261123-source-review-windows-arm64-tests.log)
+
+The next Windows ARM64 comparison used a store with 5,000 saved files.
+Its batch review applied an early folder's addition and a later folder's
+removal together and saved 5,000 files. The disabled folder retained all
+4,997 entries. The Java reference identified the same three usable files
+and which files were unchanged. The Rust preview also listed the removed
+file. The timeline sample placed a compact command review beside its amber
+node under the existing Rust approval rules.
+[Desktop comparison](target/verification/20261123-source-capacity-windows-arm64-desktop.md)
+The focused suite passed 553 tests with 10 ignored. It covers reclaiming
+capacity from a later folder, retaining a failed folder's reservation, and
+the timeline review's bound keyboard and pointer actions.
+[Windows ARM64 tests](target/verification/20261123-source-capacity-windows-arm64-tests.log)
+
+The next Windows ARM64 run started both dialogs directly with private
+profiles. The Java Knowledge Stores table displayed preloaded status values
+for a matching inventory. The Rust application automatically indexed one
+synthetic file through a loopback embedding fixture, showed the updated
+timestamp, and independently marked a missing file Unavailable and an
+unreviewed folder Review required. Its manual source stayed Pending. The
+Rust agent preview and the Java reference grouped `1.3k tokens · 0:08` on
+the Metro bar. Their terminal-block summaries and station labels still differ.
+[Desktop comparison](target/verification/20261123-automatic-sources-windows-arm64-desktop.md)
+
+The subsequent Windows ARM64 comparison covered the ordered source toolbar,
+neutral selection, Refresh and the separate Sync mode window. Cancellation
+kept the previous file mode. Confirming a folder mode opened the reviewed
+file list, and Save persisted the two changed modes and the reviewed folder
+file in the private profile. In both Agent Design dialogs, selecting Side
+timeline highlighted the whole row and replayed the sample without changing
+the combination's active history module. The advanced source editor and
+module keyboard behavior still differ.
+[Desktop comparison](target/verification/20261123-inventory-actions-windows-arm64-desktop.md)
+
+The next Windows ARM64 run opened the file and folder Advanced editors
+as owned windows. The Rust file editor saved an exact byte limit, and the
+folder editor saved both lines of a glob field after the local file review.
+Java displays a MiB spinner and additional filters for individual files.
+The Rust module inventory received Tab focus, revealed the first and last
+rows with Home and End, and used Space to activate the previewed module in
+a custom copy. A subsequent Tab moved the focus to the auto-hide field.
+[Desktop comparison](target/verification/20261123-advanced-dialog-windows-arm64-desktop.md)
+
+The source size comparison added adjacent MiB step controls to the owned
+Rust editors. It verified a 51 MiB file limit in the saved profile and
+retained a separate 4,096-byte folder limit. The Agent Design disclosure
+groups sample controls and dock preferences beside the main Replay action.
+Both previews restart when the Reduce animations checkbox changes.
+[Desktop comparison](target/verification/20261123-source-stepper-windows-arm64-desktop.md)
+
+The Local Models comparison used one chat model and one embedding model.
+Rust now presents runtime and model inventories with the same column
+order and puts the actions directly below them. Both inventories
+displayed a 42-day-old model and an undated model. Rust copies GGUF
+models into its managed registry, so the file cell identifies the local
+weight entry. The package review and import still retain the Rust
+signature fields. Java offers a direct native import chooser and
+multi-selection of model rows.
+
+The Agent Design comparison showed the sample prompt, disk-usage row
+and outline caret in both versions. Rust now formats those lines with
+its terminal's ANSI parser. Standard history still differs in its run
+metadata and answer wrapping. The accompanying Windows ARM64 test run
+passed 593 tests with 13 ignored.
+[Windows ARM64 comparison](target/verification/20261123-model-inventory-windows-arm64-desktop.md)
+
+The following Windows ARM64 comparison verified native GGUF multi-file
+selection, private copy and external registration, and reversible Name
+sorting. In the Standard Agent Design preview, the action-step count,
+compact token total and answer line breaks matched the Java sample.
+The models table still uses single-row actions, and the import review
+appears inside the Rust manager. The preview still differs in spacing
+and some control placement. The focused native suite passed 603 tests
+with 13 ignored.
+[Windows ARM64 desktop checks](target/verification/20261123-model-picker-windows-arm64-desktop.md)
+
+The next native comparison exercised the GGUF model selection with
+Shift+Down and Ctrl+A. Sorting kept selected IDs. Rust reviewed all
+selected registrations before removal and left the unselected
+registrations in the registry. Start reached both selected rows and
+reported the missing runtime. Stop returned both Failed rows to Stopped.
+The shared table keyboard handling also switched the Agent Design
+preview to Side timeline while preserving the active Standard module.
+The focused Windows ARM64 suite passed 605 tests with 13 ignored.
+[Windows ARM64 selection checks](target/verification/20261123-model-selection-windows-arm64-desktop.md)
+
+The runtime comparison exercised the separate installation confirmation
+and version chooser from the Local Models page. The Java x64 release on
+Windows ARM64 offered three runtime versions. The native Rust executable
+verified the channel and reported that it had no compatible package.
+Escape retained both selected models. The offline action closed the
+confirmation and focused the signed-index field in the manager. The
+Agent Design comparison opened both versions directly and confirmed
+the combination picker, module table, preview, Replay, delay, and
+animation controls. The Rust preview includes additional controls and
+differs in spacing.
+[Windows ARM64 runtime dialog checks](target/verification/20261123-runtime-review-windows-arm64-desktop.md)
+
+The Windows ARM64 installed model comparison verified the shared table's
+GGUF path with three rows. Java and Rust displayed the same columns,
+purpose labels, idle values and stopped states. Rust retained selection
+and sorting on refresh and opened the settings for the selected model.
+Java uses a separate settings window and Rust embeds those settings.
+The Agent Design dialog also opened directly and previewed Side timeline
+while retaining the Standard combination. Live MLX and mixed-registry
+desktop actions remain to be verified on Apple Silicon.
+[Windows ARM64 installed model comparison](target/verification/20261123-mixed-model-windows-arm64-desktop.md)
+
+The group-action comparison confirmed the separate removal window for
+two selected models. Java showed the count and its external-file note.
+Rust also listed the model names and copy types. Escape retained both
+selections. Confirming the second Rust review removed the selected
+private GGUF copies and retained the third registration on disk.
+The startup review still opened when llama.cpp was unavailable. Both
+Agent Design previews showed Side timeline beside the sample terminal
+and Metro beneath it.
+[Windows ARM64 group-action comparison](target/verification/20261123-model-batch-windows-arm64-desktop.md)
+
+The default-model comparison showed the two context actions and star
+marker in Java and Rust. Both restored the selected default when the
+manager was reopened with its saved test profile. Rust opened an
+existing GGUF preference, changed it through the row menu, and persisted
+an explicit clear from that menu with Enter. The Rust menu is wider
+with a lighter active highlight. The Agent Design preview still opened
+directly and showed Side timeline beside the sample terminal.
+[Windows ARM64 local model default](target/verification/20261123-model-default-windows-arm64-desktop.md)
+
+The native GGUF Configure window follows Java's field order and numeric
+controls. In Rust, Escape discarded a name edit. The next dialog stored
+4,608 context tokens and 11 idle minutes, then closed and refreshed the
+model row. The Rust window is narrower and wraps the model path. The
+Plan and execution preview showed a two-column panel in both apps.
+Java placed Metro above the plan and execution panel. Rust placed it
+below. The heading and the plan column also differ.
+[Windows ARM64 configuration and Agent Design comparison](target/verification/20261123-model-config-windows-arm64-desktop.md)
+
+A second private Agent Design run set Side timeline as the custom
+default, increased the auto-hide time to seven seconds, and enabled
+reduced animations. A new application process automatically opened
+Agent Design using the same private profile. The selection, module
+preview, delay and animation setting all matched the saved values.
+
+The Windows ARM64 Profiles preview showed the persistent empty editor
+and its four section tabs. Its Test connection and Delete actions stayed
+disabled without a selection. The regression test also verifies that an
+empty editor can save a pending catalog removal. The active primary tab
+has the blue underline from the Java layout. Searching for the tokenizer
+in a draft profile opened Budget & usage and highlighted the field.
+The name, endpoint and credential fields kept their positions when Add
+switched the empty editor to a draft. The native Connection section retains
+its environment-variable and endpoint-trust settings.
+[Windows ARM64 Profiles build](target/verification/ai-profiles-windows-arm64-aligned-build.log)
+
+The compact Agent Design preview opened at 942 by 512 captured pixels.
+Side timeline rendered to the right of the module list. Scrolling the
+outer pane brought the auto-hide and reduced-animation controls into
+view, and the spinner changed the delay from six to seven seconds. The
+Java reference captured at 928 by 505 pixels clipped its lower controls
+at that size. The native preview keeps Close visible while scrolling.
+
+Both standard-size dialogs showed the Minimap rail along the right side
+of the terminal sample and the Top bar above the terminal. The first
+comparison identified differences in the Top Bar's background and action
+controls. The shared Rust presenter now uses the Java-height bar, dark
+default preview colors, and icon actions for pause, cancel, steps, run
+menu and hide. Live runs retain the terminal theme and the Review action.
+The selected module stays active when Replay starts a fresh sample.
+
+The side-by-side Windows check opened the Top Bar in the published Java
+v2.26.0 package and the native Rust build. Both bars showed the task,
+progress, metadata and icon actions above the sample. Both drawers
+covered the terminal's upper rows. In Rust, Reduced animations opened
+the drawer immediately. The run menu closed the drawer. Hide removed
+the bar and drawer, and Replay restored the same module with a fresh
+sample. Pause, Resume and Cancel changed the sample state as expected.
+At 942 by 512 pixels the step toggle stayed visible and opened the
+drawer within the narrower sample.
+The two implementations use different title truncation and step-row
+spacing. The same Rust build opened AI Manager and displayed the four
+Profiles tabs in its empty editor.
+[Windows ARM64 build](target/verification/20261122-agent-top-bar-design-windows-arm64-replay-build.log)
+
+The Windows ARM64 regression run passed 565 selected tests with 10
+ignored. It covered replay of the selected module, scoped preview events,
+and opening the drawer in a narrow split without changing terminal bounds.
+[Windows ARM64 regression results](target/verification/20261122-agent-top-bar-windows-arm64-replay-regression.log)
+
+The earlier Windows ARM64 Profiles regression run passed 471 selected tests with
+10 ignored. It covers the empty profile's save rules and confirms that
+cancelling custom-design removal preserves the default. Confirming
+removal restores the built-in default.
+[Windows ARM64 profile and agent design regression results](target/verification/ai-profiles-windows-arm64-aligned-tests.log)
+
+The General and Profiles dialogs have remaining differences in field
+content and actions, including global request settings and provider
+credentials. The Agent dialog has differences in vertical spacing,
+the sample support controls and the inline rename flow. Compare the
+remaining module presentations before closing the visual parity item.
+[Latest native visual build](target/verification/ai-dialog-parity-windows-arm64-surface-build.log)
+
+The Windows ARM64 regression suite passed 468 selected tests with
+10 ignored. It covers search routing to General and profile sections,
+the usage read on the Budget tab, compact dialog geometry and keyboard
+navigation in the Agent sample. Escape dismisses a sample detail before
+it closes the design window.
+[Native regression results](target/verification/ai-dialog-parity-windows-arm64-focus-retest.log)
+
+## November 22 Java dialog design on Windows ARM64
+
+The Java reference used the published v2.26.0 Windows x86-64 package
+under Windows ARM64 emulation. A private JavaFX fixture opened the released
+dialog classes directly. Rust used a native ARM64 development build.
+Both Settings windows were captured at 1122 by 1112 pixels on the same
+desktop in English with the Normal design.
+
+The Font comparison covered the window header, 640-pixel search field,
+navigation, tabs, controls and Save/Cancel row. In Rust, pressing the
+Window tab kept the already visible tab strip in position. Searching for
+“font size” and pressing Enter highlighted the Font row and focused its
+editable size. The increase control changed 14 to 15 and repainted the
+sample. Cancel closed the dialog. A separate Normal-theme preview opened
+Settings automatically from its private profile.
+
+The two toolkits still differ in control rendering, including the size
+stepper and tab overflow. The check covered Font and Window. Remaining
+pages, other display scales and platforms are tracked in the
+[dialog design backlog](PORTING-PLAN.md#gui-dialog-design-parity).
+[Java Windows package](https://github.com/chardonnay/korTTY/releases/tag/v2.26.0)
+
+The Java and Rust Connection Managers were captured at 1242 by 792 pixels
+with empty private connection libraries. The grouped toolbar, folder Undo,
+search placement, three panes and footer order were visible in Rust. The
+Rust fixture changed from List to Map and opened New connection from the
+toolbar. The SSH editor selected SSH Tunnels, stepped to Jump Server with
+the forward button, then returned to the Manager through Cancel without
+triggering a dirty-draft prompt. The editors were observed at different
+window sizes. Java's Journal and AI tabs, detailed field layout, toolbar
+spacing and the separate Teamwork sidebar group remain in the visual
+backlog. [Native ARM64 build](target/verification/dialog-parity-windows-arm64-build-verified.log)
+
+The development preview also opened AI Manager and the Agent Design page
+directly. A bounded run confirmed automatic exit and removal of its
+private profile. The native Windows ARM64 regression run passed all 137
+selected Settings, connection and settings-search tests. The Manager
+layout test checks the Java-style 12-pixel outer margins while retaining
+the reference sidebar and inspector widths at both supported window sizes.
+[Native ARM64 regression run](target/verification/dialog-parity-windows-arm64-retest.log)
+
 ## November 22 design editing, command output and settings search
 
 This source comparison uses Java `v2.26.0` (`b235d91f2035`) and the Rust
@@ -445,7 +1053,7 @@ The same presenter renders the Settings preview. Interactive desktop
 acceptance remains under A2.
 [Java Top Bar](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignTopBar.java).
 
-The native widget test opens Details, checks that the terminal viewport
+The native widget test opens the step drawer, checks that the terminal viewport
 keeps its size and right-clicks the exact recorded step. Motion tests
 exercise the highlight, stable result colors, timed reveal and reduced
 animations. Windows ARM64, Apple Silicon and Fedora ARM64 each passed

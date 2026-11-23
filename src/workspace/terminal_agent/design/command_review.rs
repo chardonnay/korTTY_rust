@@ -11,12 +11,12 @@ use iced::{
 
 use crate::terminal_agent::design::{
     Approval, Arrangement, History,
-    inline::{Prompt, clean},
+    inline::{Prompt, Role, clean},
 };
 use crate::terminal_view::agent_cursor::{Binding, Decision, Key};
 
 use super::super::{Desktop, Message, Phase, Purpose, Run, RunTarget, Target, Workspace, cursor};
-use super::{Slot, history::Activity, log_table::Surface};
+use super::{Palette, Slot, history::Activity, log_table::Surface};
 
 pub(super) fn handles(history: History) -> bool {
     matches!(
@@ -72,6 +72,20 @@ impl Review {
 }
 
 pub(super) fn card<'a>(activity: Activity<'a>) -> Option<Element<'a, Message>> {
+    review_card(activity, None)
+}
+
+pub(super) fn timeline_card<'a>(
+    activity: Activity<'a>,
+    palette: Palette,
+) -> Option<Element<'a, Message>> {
+    review_card(activity, Some(palette))
+}
+
+fn review_card<'a>(
+    activity: Activity<'a>,
+    timeline: Option<Palette>,
+) -> Option<Element<'a, Message>> {
     if activity.live_run.is_some() && activity.surface == Surface::Activity {
         return None;
     }
@@ -86,57 +100,99 @@ pub(super) fn card<'a>(activity: Activity<'a>) -> Option<Element<'a, Message>> {
         return None;
     };
     let review = activity.panel_review;
+    let compact = timeline.is_some();
+    let size = if compact {
+        (activity.activity_font - 1.5).max(10.0)
+    } else {
+        activity.activity_font
+    };
+    let decision = |label, action, primary| {
+        if compact {
+            button(text(label).size(size))
+                .padding([2, 7])
+                .style(if primary {
+                    button::primary
+                } else {
+                    button::secondary
+                })
+                .on_press_maybe(action)
+        } else {
+            button(label).on_press_maybe(action)
+        }
+    };
+    let (once, remaining, cancel_two, cancel_three) = if compact {
+        (
+            "1 Allow once",
+            "2 Allow remaining ordinary commands",
+            "2 Cancel",
+            "3 Cancel",
+        )
+    } else {
+        (
+            "[1] Allow once",
+            "[2] Allow remaining ordinary commands",
+            "[2] Cancel",
+            "[3] Cancel",
+        )
+    };
     let controls: Element<'a, Message> = if let Some(review) = review {
-        let controls =
-            row![button("[1] Allow once").on_press_maybe(review.action(Key::One, false)),]
-                .spacing(5);
+        let controls = row![decision(once, review.action(Key::One, false), true)].spacing(4);
         if review.remaining() {
             controls
-                .push(
-                    button("[2] Allow remaining ordinary commands")
-                        .on_press_maybe(review.action(Key::Two, false)),
-                )
-                .push(button("[3] Cancel").on_press_maybe(review.action(Key::Three, false)))
+                .push(decision(remaining, review.action(Key::Two, false), false))
+                .push(decision(
+                    cancel_three,
+                    review.action(Key::Three, false),
+                    false,
+                ))
                 .wrap()
                 .into()
         } else {
             controls
-                .push(button("[2] Cancel").on_press_maybe(review.action(Key::Two, false)))
+                .push(decision(cancel_two, review.action(Key::Two, false), false))
                 .wrap()
                 .into()
         }
     } else if activity.live_run.is_none() {
         row![
-            button("[1] Allow once").on_press(Message::Approve(0)),
-            button("[2] Cancel").on_press(Message::Cancel)
+            decision(once, Some(Message::Approve(0)), true),
+            decision(cancel_two, Some(Message::Cancel), false)
         ]
         .spacing(5)
         .wrap()
         .into()
     } else {
-        button("Review in Activity…")
-            .on_press(Message::Focus)
+        decision("Review in Activity…", Some(Message::Focus), false).into()
+    };
+    let title = text(message).size(size);
+    let title = if let Some(palette) = timeline {
+        title.color(palette.role(Role::Warn))
+    } else {
+        title
+    };
+    let body = column![
+        title,
+        text(commands.join(if compact { " ; " } else { "\n" }))
+            .font(Font::MONOSPACE)
+            .size(size)
+            .wrapping(text::Wrapping::WordOrGlyph),
+        controls,
+    ]
+    .spacing(if compact { 3 } else { 5 })
+    .width(Length::Fill);
+    let card = if compact {
+        body.into()
+    } else {
+        container(body)
+            .padding(8)
+            .width(Length::Fill)
+            .style(|theme: &Theme| {
+                let mut style = container::bordered_box(theme);
+                style.border.color = theme.extended_palette().warning.base.color;
+                style
+            })
             .into()
     };
-    let card: Element<'a, Message> = container(
-        column![
-            text(message).size(activity.activity_font),
-            text(commands.join("\n"))
-                .font(Font::MONOSPACE)
-                .size(activity.activity_font)
-                .wrapping(text::Wrapping::WordOrGlyph),
-            controls,
-        ]
-        .spacing(5),
-    )
-    .padding(8)
-    .width(Length::Fill)
-    .style(|theme: &Theme| {
-        let mut style = container::bordered_box(theme);
-        style.border.color = theme.extended_palette().warning.base.color;
-        style
-    })
-    .into();
     Some(match review {
         Some(review) => review.guard(card),
         None => card,

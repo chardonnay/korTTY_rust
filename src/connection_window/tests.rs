@@ -1395,7 +1395,9 @@ fn native_workbench_keeps_reference_side_widths_at_default_and_minimum_size() {
             .children()
             .map(|pane| pane.bounds().width)
             .collect();
-        assert_eq!(widths, [210.0, 4.0, width - 588.0, 4.0, 370.0]);
+        assert_eq!(workbench.bounds().x, 12.0);
+        assert_eq!(workbench.bounds().width, width - 24.0);
+        assert_eq!(widths, [210.0, 4.0, width - 612.0, 4.0, 370.0]);
     }
 }
 

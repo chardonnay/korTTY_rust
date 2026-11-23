@@ -1,6 +1,6 @@
 # Remaining Java-to-Rust porting plan
 
-Porting plan reconciled on 2026-11-22. This plan tracks the scope agreed in
+Porting plan reconciled on 2026-11-23. This plan tracks the scope agreed in
 [HANDOFF.md](HANDOFF.md). The [parity record](PORTING-PARITY.md) identifies the
 source and environment for earlier checks. Paths under `target/verification/`
 are local to the checkout that ran the tests. Historical logs referenced
@@ -56,6 +56,222 @@ The [tagged Java dialog sources](https://github.com/chardonnay/korTTY/tree/v2.26
 and the [native acceptance matrix](#native-acceptance-and-release-gates)
 define the reference and target platforms for this work.
 
+The shared Settings frame and Font page now follow the Normal Java design.
+The Window page groups tool-window hosting with window preferences. A
+Windows ARM64 comparison covered both pages, search result focus, the
+font-size preview and cancellation. A direct-start recheck confirmed the
+Font field order and the current navigation difference: Rust has 17 tabs
+in a scrolling strip, and Java has 21 sections and an overflow menu.
+Resources, Security, Privacy, Language
+and Translation still need a comparison of their Java controls and Rust
+entry points. The tab overflow affordance, control styling and deeper
+Settings pages still need visual work. [Desktop comparison](PORTING-PARITY.md#november-22-java-dialog-design-on-windows-arm64)
+
+The Connection Manager adopts the Java toolbar order, places Undo in the
+Folder group and groups Connect and Close at the right. The SSH editor
+organizes its existing form into Connection, Terminal Settings, SSH Tunnels,
+Jump Server, Terminal Logging and Window Geometry. The Java Journal and AI
+tabs, remaining form alignment and narrower-window checks remain open. The
+Windows desktop check covered the three-pane Manager, its Map view,
+opening the editor and navigating between editor tabs.
+
+The AI Manager now uses the Java window size, a search overlay, underlined
+primary tabs and General subpages. The profile form retains its four
+sections without a selection, and the empty and editable forms share
+field alignment. Budget & usage contains the tokenizer, quota, warning
+thresholds, reset and prices. Local AI separates
+profile roles, runtime settings and Hugging Face access. Local Models
+starts with runtime and GGUF inventories. Knowledge Stores stacks
+store and source inventories and places file and folder selection below
+the source table. The shared picker can review multiple files together.
+Folder selection opens the existing scan review. Create and Configure
+open a separate owned store settings window with model and role fields
+and collapsible advanced storage settings. Create continues to a compact
+initial-source dialog. Approving the file or folder review stages the new
+store and its sources together. AI Manager Save applies the draft and
+indexing requires separate consent. Knowledge source actions use native
+file and folder pickers. Individual files are scanned locally before an
+owned preview shows the usable files and the reasons for skipped entries.
+Approving the preview checks the reviewed contents again before staging
+the usable sources. Oversized files can be rescanned with a reviewed
+per-file limit before they are added. The Advanced form exposes local
+embedding dimensions from 1 to 65,536. New stores suggest the selected
+registered GGUF model's declared size, and a blank field retains automatic
+detection. The local index checks the selected size before publishing vectors
+and retains compatibility with existing snapshots. Verify the native pickers
+and previews on macOS and Linux. The Windows comparison confirmed the
+single-line dimension label, arrow controls, and inactive Qdrant fields
+in Java's order. Both applications step the same GGUF dimension up and
+down. The Rust spinner enforces the limit of the selected backend. The
+advanced spacing and active Qdrant credential rows still differ. Rust
+now supports range and toggle selection in the source inventory. Update
+reads the selected enabled sources, or all enabled sources with an empty
+selection, and preserves existing compatible vectors for other sources.
+Removal opens a separate confirmation owned by AI Manager and lists the
+exact selected paths before changing the store draft. Save applies the
+draft change. Both inventories grow with the AI Manager window. At
+standard height the source inventory has room for four rows. The shared
+source action row wraps at smaller widths, and the page scrolls to keep
+the tables and controls reachable at the minimum size. The source actions
+now stay in the Java order, and secondary index actions sit below them.
+Refresh reloads the selected store's index inventory. Sync mode opens
+an owned choice dialog. Changing a folder's mode requires reviewing its
+file list, and AI Manager Save applies the staged changes. Both tables
+use neutral selected rows in the Normal theme. Advanced opens an owned
+file or folder editor. Folder include and exclude globs each have a
+multiline field. Review checks the file list before updating the draft.
+The owned editors use an editable MiB value and adjacent increment and
+decrement buttons. A B suffix accepts or displays exact byte limits
+already present in saved profiles. Align the remaining table column
+widths. Java also shows filters in its individual-file form. Its
+scanner and watcher apply those filters during folder traversal.
+Update scans the selected enabled files and folders together, or all enabled sources
+when no source is selected. The owned preview shows path, format, size,
+status, and reason. Approval stages the folder manifests and holds the
+reviewed individual-file digests for the approved selection. Index
+reviewed sources remains a separate action with embedding consent.
+It verifies the reviewed contents before sending them to the provider.
+The source table shows Files / chunks, Skipped / failed and Last indexed.
+File and folder totals reflect the matching index snapshot. New snapshots
+carry per-file timestamps, and partial refreshes retain the times of
+unchanged sources. Earlier snapshots retain their counts and show no
+timestamp. Folder review problems persist with the approved manifest.
+Manual updates show scanning, indexing and cancellation in the requested
+source rows. Cancel sits beside Update now and keeps the operation pending
+until its worker returns. An unreadable folder appears as a skipped row in
+the mixed review. Ready sources can still be approved, and the unavailable
+folder retains its saved manifest and vectors. An indexing failure tied to
+a particular file marks its source row and keeps the previous committed index.
+Automatic sync now reports scanning, indexing, unavailable sources,
+required review and source-specific indexing failures in the same inventory.
+The latest result stays visible while the application is running. Persist
+failure history across application restarts.
+At the source limit, a mixed folder review now counts all successful
+decreases before admitting growth in inventory order. Skipped folders
+continue to count with their saved manifests. Folder preview rows
+distinguish unchanged files from files to be indexed, in the Status column.
+Align the remaining control styling and source actions.
+[Windows ARM64 source table comparison](target/verification/20261123-dialog-tables-windows-arm64-desktop.md)
+[Windows ARM64 mixed source comparison](target/verification/20261123-knowledge-source-updates-windows-arm64-desktop.md)
+[Windows ARM64 folder update comparison](target/verification/20261123-knowledge-folders-windows-arm64-desktop.md)
+[Windows ARM64 inventory layout comparison](target/verification/20261123-knowledge-table-layout-windows-arm64-desktop.md)
+[Windows ARM64 source selection comparison](target/verification/20261123-knowledge-selection-windows-arm64-desktop.md)
+[Windows ARM64 automatic source status comparison](target/verification/20261123-automatic-sources-windows-arm64-desktop.md)
+[Windows ARM64 source control comparison](target/verification/20261123-inventory-actions-windows-arm64-desktop.md)
+[Windows ARM64 advanced source comparison](target/verification/20261123-advanced-dialog-windows-arm64-desktop.md)
+[Windows ARM64 source size comparison](target/verification/20261123-source-stepper-windows-arm64-desktop.md)
+[Desktop verification](target/verification/20261123-knowledge-spinner-windows-arm64-desktop.md)
+Skills places preferences and the Local/External switch next to the
+editor. Memory groups entry and Markdown actions beneath the selected
+view. Local Models places the runtime inventory above the installed
+models and groups the actions immediately below each table. Its model
+columns follow the Java order. New Hugging Face GGUF downloads retain
+the repository publication timestamp, and existing registrations
+without publication metadata show an em dash. The signed-package import
+discloses its verification fields. Import GGUF opens a native multiple-file
+picker and then shows the selected paths, model purpose, and private-copy
+or external-reference options. A manual path entry remains available.
+The installed model table combines GGUF and MLX registrations on Apple
+Silicon. Other hosts display GGUF. The headers sort by the selected column
+in either direction. Ctrl or Command toggles rows, Shift extends the range
+in the displayed order, and the focused table accepts the arrow keys and
+Select All. Refresh reads both supported registries. Configure follows the
+current row. Start, Stop, and Remove act on the selected models across
+both runtimes. Start can warm two models concurrently. Its estimate
+includes selected and resident GGUF and MLX weights and opens a separate
+confirmation at the 80 percent threshold. Remove opens a separate
+confirmation listing the reviewed registrations and validates each
+registration again under its registry lock before unpublishing it.
+Install runtime and Other versions open separate dialogs. Starting selected
+GGUF models without a compatible runtime offers the signed installation
+first. Cancel preserves the selection. After the reviewed online package
+activates, the manager checks the selected registrations again before
+starting them. The version chooser filters the signed channel for the
+current host and backend, and lets users return a pinned install to
+stable updates. The toolbar and row context menu set or clear a single
+default for GGUF or MLX. The manager restores its star and preselects it
+when there is no live selection. Existing GGUF preferences keep their
+format. MLX preferences record the model family explicitly.
+Continue with storing the upstream publication date for downloaded MLX
+models. Verify the mixed inventory, the MLX default, and live model starts on
+Apple Silicon. Native Windows ARM64 installation,
+version selection with rows, and the subsequent model start need a
+compatible signed runtime.
+Configure opens an owned window for GGUF and MLX. Both show the model
+location and use numeric steppers for the editable unload time. GGUF also
+shows backend, purpose, context size, CPU threads, and GPU layers in the
+Java order. Escape dismisses the draft. Save checks the current
+registration before writing it. The runtime repair action remains
+available after saving a backend mismatch. Java offers its matching
+runtime immediately after such a save. Enter path opens the manual
+import fields in the manager. Move the import review into a separate
+dialog to match Java.
+[Windows ARM64 model inventory comparison](target/verification/20261123-model-inventory-windows-arm64-desktop.md)
+[Windows ARM64 native model picker and sorting](target/verification/20261123-model-picker-windows-arm64-desktop.md)
+[Windows ARM64 model selection and group actions](target/verification/20261123-model-selection-windows-arm64-desktop.md)
+[Windows ARM64 runtime dialogs](target/verification/20261123-runtime-review-windows-arm64-desktop.md)
+[Windows ARM64 installed model table](target/verification/20261123-mixed-model-windows-arm64-desktop.md)
+[Windows ARM64 model group actions](target/verification/20261123-model-batch-windows-arm64-desktop.md)
+[Windows ARM64 local model default](target/verification/20261123-model-default-windows-arm64-desktop.md)
+[Windows ARM64 model configuration](target/verification/20261123-model-config-windows-arm64-desktop.md#ai-manager)
+Agent Design now opens
+as a standalone dialog with a module table and adjacent sample. Changing
+a built-in creates a custom copy. The standalone dialog saves its own
+preferences as they change, including auto-hide and reduced animations.
+Replay and changes to Reduce animations restart the selected module
+preview. The disclosure next to Replay opens the sample controls and
+dock preferences. The General Settings entry
+retains its draft behavior. The Windows comparison confirmed the auto-hide
+stepper, the Standard choice caption, bold table headings, and measured
+ellipses with full description tooltips in the standard and compact views.
+The shared Metro presenter now places the title and prompt on the left,
+the station track in the center, and run metadata and actions on the right
+in a 52-pixel logical bar. Windows confirmed the standard and compact
+previews, the compact sample approval strip, and the steps menu. The
+module selection highlight spans the full table row, including the Active
+column. The table participates in Tab focus. Up, Down, Home and End preview
+and reveal the selected row. Space activates a module using the existing
+custom-copy behavior. Compare the remaining sample content, approval
+actions, keyboard details and additional preview and dock actions. Side
+timeline uses Java's default 240-pixel panel width. The shared presenter
+shows the run title, usage, elapsed time, prompt, and actions. Metro
+spans the terminal and side dock in the shared composition. Windows
+confirmed the row-driven timeline preview, independent hide, and
+restoration through Replay. The timeline uses the Java role colors,
+transparent header actions, and the Java preview prompt, answer and
+reported token count. It also shows exit codes with available output line
+counts and wraps long commands within the dock. Side timeline now uses
+the reference panel insets and more compact text, a muted scrollbar,
+and inline command review controls. The existing bound approval and
+number-key checks still apply. Metro groups compact token usage and
+elapsed time into one label, also used by Side timeline. Continue
+comparing the remaining module details, preview controls and dock actions.
+For Plan and execution, place Metro above the bottom history panel and
+match the panel header and plan column labels to Java.
+The sample prompt, disk-usage output and outline caret now render from
+ANSI terminal cells. Blocks in the terminal show the action-step count and
+compact token usage. The summary wraps at words within the terminal cell
+width. Continue comparing the presentation of each module around the shared
+sample.
+[Windows ARM64 Side timeline comparison](target/verification/20261123-agent-timeline-windows-arm64-desktop.md)
+[Windows ARM64 Metro comparison](target/verification/20261123-metro-layout-windows-arm64-desktop.md)
+[Windows ARM64 module selection comparison](target/verification/20261123-inventory-actions-windows-arm64-desktop.md#agent-design)
+[Windows ARM64 module keyboard verification](target/verification/20261123-advanced-dialog-windows-arm64-desktop.md#agent-design-keyboard)
+[Windows ARM64 preview control comparison](target/verification/20261123-source-stepper-windows-arm64-desktop.md#agent-design)
+[Windows ARM64 Plan and execution comparison](target/verification/20261123-model-config-windows-arm64-desktop.md#agent-design)
+[AI dialog comparison](PORTING-PARITY.md#november-22-ai-manager-and-agent-design-on-windows-arm64)
+
+For standalone Windows previews, build the development application with
+`cargo rustc --locked -p kortty --bin kortty --features dialog-preview -- -C linker=rust-lld`.
+Run `scripts/preview-windows-dialog.ps1` with `-Dialog settings`,
+`connections`, `ai-manager`, `agent-design` or `agent-design-compact`.
+The compact variant opens Agent Design at its 940 by 480 minimum client size.
+Each run creates a private
+Normal-theme profile and opens the requested dialog through the application's
+usual startup and window routes. Use these entry points for Windows desktop
+comparison without operator interaction in the terminal window. The preview
+feature is opt-in and its startup command is available in debug builds.
+
 ### Reconciliation against the current working tree
 
 | Implemented in the working tree | Evidence and remaining acceptance |
@@ -71,7 +287,7 @@ define the reference and target platforms for this work.
 
 | Area | Remaining change | Completion check |
 | --- | --- | --- |
-| A2 · Editing Agent designs | Let the user change one module directly on Standard or Classic. Java selects a new custom copy containing that change. Rust currently requires an explicit duplicate, then a separate Settings save. Persist committed design edits, the default design, auto-hide time and reduced-motion preference as the user changes them. | Change one role on each built-in, close the dialog and restart. Check the other roles, the built-in and the current default. Verify rename, deletion of the default, explicit default selection and both preferences across restart. Module previews stay transient and unrelated Settings edits stay pending. |
+| A2 · Editing Agent designs | Direct module changes create a copy of a built-in and the standalone editor saves its preferences. Finish matching the Java table, compact controls and preview actions. Review the copy name and naming prompts. | Change one role on each built-in, close the dialog and restart. Check the other roles, the built-in and the current default. Verify rename, deletion of the default, explicit default selection and both preferences across restart. Module previews stay transient and unrelated Settings edits stay pending. |
 | A2 · Copying a command step's output | The step menu currently copies the last eight lines, each clipped to 320 characters. Make **Copy output** use all masked stdout and stderr retained for the selected step within the existing capture limits. Keep the compact inline preview. | Use distinct markers on two steps, more than eight lines across stdout and stderr, and a line longer than 320 characters. Verify the clipboard value for the selected step, including redaction, in a live and a retained run. |
 | D4 · Searching Settings and AI Manager | Apply the Java matching rules in both dialogs. Normalize German spellings, accents and punctuation, require two normalized characters, rank label and page matches, suppress controls matched only by their page, deduplicate and return at most 40 results. Compare the remaining labeled controls with the tagged dialogs. | Run the tagged matcher cases against both entry points. Check stable order, exact and prefix matches, duplicate labels, one-character queries and the 40-result limit. Verify keyboard navigation to a reachable result while preserving the active draft, provider restrictions and imported-model identity. |
 
@@ -87,7 +303,7 @@ coverage. Q1 tracks the requested Teamwork Agent/Swarm extension below.
 | Area | Implemented in Rust | Remaining verification |
 | --- | --- | --- |
 | A2 · Terminal Agent | The design presenters and earlier-run selection paths are implemented. The Log Table shows sortable typed step metadata and a live Duration column that adopts the measured result at completion. A double-click opens the selected masked output or the finished answer. Live step and answer details allow read-only selection and policy-checked partial copying. A right-click offers step actions on retained rows and run actions on the answer or table background, including Earlier runs. Export all finished runs remains available while a different run is active. The export review fixes the selection when it opens. New rows flash for 900 ms and running rows use a 120 ms spinner. Reduced animations keeps the running marker still, omits the flash and updates elapsed time once per second. Reviewed model requests create a running row and update it with the accepted response metadata. An outstanding command review has a masked, read-only Approval row that is removed when the review ends. | The live table, detached history and Settings preview support focused keyboard navigation. Ctrl+Shift+F6 focuses the visible table in the active terminal pane. Tab reaches the detached table and scrolls the Settings preview into view. With live table focus, the Context Menu key or unassigned Shift+F10 opens the selected row's actions. Fedora ARM64 X11 verified focus, row selection, opening details, the keyboard step menu and source terminal input isolation in a docked table. Open details receive more of the dock height, with model usage in a compact scrollable summary. Fedora ARM64 X11 verified Tab entry, row details, exact output copying and reattachment in detached history. It also verified that the Settings preview reveals the table and selected sample output with the keyboard. Verify the keyboard paths on the other native desktops. Columns fit the viewport above font-scaled minimum widths. Verify resizing and numeric alignment on native desktops. Chronological tables follow new rows at the bottom and preserve the reading position when reviewing older activity. Scrolling up exposes Latest activity without selecting a row. Fedora ARM64 X11 verified stable reading through command approvals and continued following after Latest activity. Fixed column headers stay visible during vertical scrolling and follow the data cells horizontally. Column dividers adjust widths within the fitted table. Fedora ARM64 X11 verified Step sorting in both directions, fixed headings while scrolling vertically and horizontally, divider dragging and sort retention after resizing. Verify these paths on the other native desktops. Exercise the narrow viewport, elapsed time, sorting, selected output, approval-row lifecycle, step actions and motion preferences. Verify the decision and repair rows with a configured provider. Exercise the terminal context menu and the keyboard and pointer paths for the Log Table menus and run/step controls on native desktops. Switch runs, copy individual outputs, export one or all finished runs and open an unsaved step as a snippet. |
-| D4 · AI Manager search | The search reveals provider presets, CLI and MiniMax fields, reviewed HTTPS options, usage quota and cost, and the Web search controls exposed by the active provider and policy. The profile wizard searches its reachable steps using the same validation as Next. General search reveals the shortcut toggle, alias name, case preference and retained Java settings individually. The Profiles search reveals connection and CLI tests, model discovery and inventory refresh, imported model mapping and the active deletion review. Local Preferences search reaches the runtime update policy, preferred backend, embedding controls and each retained Java role in one scrollable page. Runtime repair searches its signed-package fields and compatible release controls. The search highlights active signed-runtime cancellation and pause, the separate keep and discard actions, and the open llama.cpp runtime removal review. Selecting one of these results preserves the operation or review. Knowledge Store search follows the selected backend, source options and embedding mode, and reveals active folder reviews, source file size edits, store removal controls, profile bindings, Agent availability and embedding consent. Local Models search reaches Hugging Face and the managed GGUF and Apple MLX workflows, including model selection, runtime controls, configuration and active reviews. Imported GGUF and MLX settings can be found by name, format or registry ID. The result highlights the matching row and leaves review and adoption explicit. Memory search reveals imported preferences, active Markdown and entry editor actions, history restore and external file review controls. Skills search reveals the library filter and sort, the direct Java-style Providers entry point, available editor fields and actions, eligible Java preference suggestions, and the fields and actions of the open provider editor. | Select a control by keyboard and mouse, verify its page, scroll position and highlight, and preserve editor-local Find in Skills and Memory. Native widget tests verify keyboard focus and draft retention for GGUF and MLX controls and MLX runtime download policy. Exercise search from a partially completed wizard, repair or model review and verify draft retention and cancellation on native desktops. |
+| D4 · AI Manager search | The search reveals provider presets, CLI and MiniMax fields, reviewed HTTPS options, usage quota and cost, and the Web search controls exposed by the active provider and policy. The profile wizard searches its reachable steps using the same validation as Next. General search reveals the shortcut toggle, alias name, case preference and retained Java settings individually. The Profiles search reveals connection and CLI tests, model discovery and inventory refresh, imported model mapping and the active deletion review. Local AI search opens the relevant Profile roles, Local runtime or Hugging Face subtab and reveals the matching control. Runtime repair searches its signed-package fields and compatible release controls. The search highlights active signed-runtime cancellation and pause, the separate keep and discard actions, and the open llama.cpp runtime removal review. Selecting one of these results preserves the operation or review. Knowledge Store search follows the selected backend, source options and embedding mode, and reveals active folder reviews, source file size edits, store removal controls, profile bindings, Agent availability and embedding consent. Local Models search reaches Hugging Face and the managed GGUF and Apple MLX workflows, including model selection, runtime controls, configuration and active reviews. Imported GGUF and MLX settings can be found by name, format or registry ID. The result highlights the matching row and leaves review and adoption explicit. Memory search reveals imported preferences, active Markdown and entry editor actions, history restore and external file review controls. Skills search reveals the library filter and sort, the direct Java-style Providers entry point, available editor fields and actions, eligible Java preference suggestions, and the fields and actions of the open provider editor. | Select a control by keyboard and mouse, verify its page, scroll position and highlight, and preserve editor-local Find in Skills and Memory. Native widget tests verify keyboard focus and draft retention for GGUF and MLX controls and MLX runtime download policy. Exercise search from a partially completed wizard, repair or model review and verify draft retention and cancellation on native desktops. |
 | B4 · Hugging Face model browser | Rust loads additional pages, sorts metadata and resolves missing sizes for the RAM filter. Apple Silicon offers All formats, GGUF and MLX with independent continuations. Review MLX package fixes the commit, exact sizes and SHA-256 digests. Download and register validates the complete directory through the native MLX registry. Paused MLX downloads can be found, reviewed, resumed or discarded after restart. | Exercise continuation, sorting, RAM filtering, format changes, review, installation and recovery in the native desktop. The native transfer has passed a live pause, resume and registration test against a pinned public Hub package. [Java browser](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/LocalModelManagerPane.java#L803) · [Rust MLX Hub transfer](src/local_ai/managed_models/huggingface/mlx/download.rs) |
 | D2 · Connection folders | Drag writable SSH and serial rows to a local folder in the tree or sidebar. List and map share successive Undo. | Exercise native pointer gestures across the list, sidebar and map, reverse two saved moves and check read-only Teamwork entries. |
 | Q1 · Scheduler target picker | The job editor can filter saved SSH connections and groups by name, host or group path and apply a batch to one draft. | Exercise the picker on native desktops with an individual target, overlapping groups and a source-qualified Teamwork group. Verify search, reviewed order and cancellation. |
@@ -1276,7 +1492,8 @@ The drawer opens over older terminal rows, shows the recorded step list and
 offers the exact step actions. The bar and drawer stay within their own
 terminal column next to a docked history. Reduced animations keeps the
 track steady and opens the drawer immediately. The Settings preview uses
-the same presenter. A compact header keeps Details early in the action row,
+the same 30-pixel presenter and icon actions for pause, cancel, steps,
+run menu and hide. A compact header keeps the step toggle early in the action row,
 places run metadata in the progress tooltip, and scrolls the action row
 when it overflows. Fedora ARM64 Wayland verified Review focus, drawer
 motion, the step and run menus in a 42-column split, and stable pane

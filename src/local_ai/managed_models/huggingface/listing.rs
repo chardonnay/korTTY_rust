@@ -88,12 +88,7 @@ impl ListingWire {
                     .filter_map(|tag| tag.strip_prefix("license:"))
                     .find_map(license_label)
             });
-        let created = self
-            .created
-            .as_ref()
-            .and_then(Value::as_str)
-            .filter(|value| value.len() <= 35)
-            .and_then(|value| value.parse().ok());
+        let created = super::publication_timestamp(self.created.as_ref());
         let (quantizations, bytes) = match format {
             Format::Gguf => weight_summary(self.siblings.as_ref(), gguf),
             Format::Mlx => (

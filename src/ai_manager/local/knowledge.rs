@@ -20,6 +20,7 @@ use crate::private_files::{Directory, FileStamp, nonce};
 
 use super::ProfileRef;
 
+pub(super) mod file_review;
 pub(super) mod folder;
 mod hnsw;
 pub(super) mod qdrant;
@@ -37,13 +38,13 @@ pub(super) use source_mask::SourceMask;
 mod scale;
 
 pub(super) const MAX_STORES: usize = 32;
-const MAX_SOURCES: usize = 5_000;
+pub(super) const MAX_SOURCES: usize = 5_000;
 const LEGACY_MAX_SOURCES: usize = 32;
 const CHUNK_BYTES: usize = 4096;
 const MAX_CHUNKS: usize = 8_192;
 const MAX_LOCAL_INDEX_PASSAGES: usize = 5_000_000;
 const MAX_QDRANT_INDEX_PASSAGES: usize = 16_384;
-const MAX_DIMENSIONS: usize = 16_384;
+pub(super) const MAX_DIMENSIONS: usize = 65_536;
 const BATCH_SIZE: usize = 16;
 const SEARCH_HITS: usize = 5;
 const EXACT_SEARCH_LIMIT: usize = 256;
@@ -57,6 +58,8 @@ pub(super) struct Store {
     pub(super) java_origin: Option<java_knowledge::Origin>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) embedding: Option<Embedding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) local_dimensions: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) qdrant: Option<qdrant::Settings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -91,10 +94,99 @@ pub(super) struct Store {
     pub(super) automatic_qdrant_expanded: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum SourceKind {
     File,
     Folder,
+}
+
+pub(super) type SourceKey = (SourceKind, PathBuf);
+
+#[derive(Clone)]
+pub(crate) struct SourceIssue {
+    pub(super) source: SourceKey,
+    pub(super) message: String,
+}
+
+impl fmt::Debug for SourceIssue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SourceIssue([redacted])")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct SourceResult {
+    pub(super) files: usize,
+    pub(super) chunks: usize,
+    pub(super) indexed_at: i64,
+}
+
+pub(super) fn group_source_results(
+    store: &Store,
+    mut results: impl Iterator<Item = SourceResult>,
+) -> BTreeMap<SourceKey, SourceResult> {
+    let mut grouped = BTreeMap::new();
+    for path in &store.sources {
+        grouped.insert(
+            (SourceKind::File, path.clone()),
+            results.next().unwrap_or_default(),
+        );
+    }
+    for folder in &store.folders {
+        let result = results.by_ref().take(folder.len()).fold(
+            SourceResult::default(),
+            |mut folder, file| {
+                folder.files += file.files;
+                folder.chunks += file.chunks;
+                folder.indexed_at = folder.indexed_at.max(file.indexed_at);
+                folder
+            },
+        );
+        grouped.insert((SourceKind::Folder, folder.root.clone()), result);
+    }
+    grouped
+}
+
+pub(crate) struct SourceUpdates {
+    pub(super) store: usize,
+    pub(super) selection: BTreeSet<SourceKey>,
+    pub(super) files: Vec<file_review::Row>,
+    pub(super) folders: Vec<folder::Review>,
+    pub(super) issues: Vec<SourceIssue>,
+    original: Store,
+}
+
+impl fmt::Debug for SourceUpdates {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SourceUpdates")
+            .field("files", &self.files.len())
+            .field("folders", &self.folders.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl SourceUpdates {
+    pub(super) fn has_indexable_files(&self) -> bool {
+        self.folders.iter().any(|review| review.folder.len() > 0)
+            || self
+                .files
+                .iter()
+                .any(|row| matches!(row.status, file_review::Status::Ready { .. }))
+    }
+
+    pub(super) fn can_approve(&self) -> bool {
+        !self.folders.is_empty() || self.has_indexable_files()
+    }
+}
+
+impl std::fmt::Display for SourceKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::File => "Add files",
+            Self::Folder => "Add folder",
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -131,6 +223,7 @@ impl Store {
             id: Some(nonce()?),
             java_origin: None,
             embedding: None,
+            local_dimensions: None,
             qdrant: None,
             coding_profile: None,
             text_profile: None,
@@ -155,6 +248,18 @@ impl Store {
         self.id.as_deref()
     }
 
+    pub(super) fn validate_local_dimensions(&self) -> Result<(), String> {
+        if self
+            .local_dimensions
+            .is_some_and(|value| !(1..=MAX_DIMENSIONS).contains(&value))
+        {
+            return Err(format!(
+                "Enter 1 to {MAX_DIMENSIONS} embedding dimensions or leave the field blank for automatic detection."
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn add_source(&mut self, path: PathBuf) -> Result<(), String> {
         source_name(&path).map_err(|error| error.to_string())?;
         if self.source_count() >= MAX_SOURCES {
@@ -171,16 +276,66 @@ impl Store {
         {
             return Err("This source is already in the store".into());
         }
-        self.file_size_limits.insert(
-            path.clone(),
-            FileSizeLimit::reviewed_for_text(source::NEW_SOURCE_DEFAULT, !pdf::is_pdf(&path)),
-        );
+        self.file_size_limits
+            .insert(path.clone(), new_source_file_limit(&path));
         self.sources.push(path);
         Ok(())
     }
 
     pub(super) fn source_count(&self) -> usize {
         self.sources.len() + self.folders.iter().map(folder::Folder::len).sum::<usize>()
+    }
+
+    pub(super) fn source_keys(&self) -> impl Iterator<Item = SourceKey> + '_ {
+        self.sources
+            .iter()
+            .map(|path| (SourceKind::File, path.clone()))
+            .chain(
+                self.folders
+                    .iter()
+                    .map(|folder| (SourceKind::Folder, folder.root.clone())),
+            )
+    }
+
+    pub(super) fn check_source_file_overlaps(&self, paths: &[PathBuf]) -> Result<(), String> {
+        let mut explicit: HashSet<_> = self
+            .sources
+            .iter()
+            .map(|path| folder::path_key(path))
+            .collect();
+        for path in paths {
+            if !explicit.insert(folder::path_key(path))
+                || self
+                    .folders
+                    .iter()
+                    .any(|folder| folder::within(path, &folder.root))
+            {
+                return Err(format!(
+                    "This source overlaps an existing source: {}",
+                    path.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn review_source_files(
+        &self,
+        paths: &[PathBuf],
+        file_limit: Option<u64>,
+    ) -> Result<Self, String> {
+        self.check_source_file_overlaps(paths)?;
+        let mut updated = self.clone();
+        for path in paths {
+            if !folder::supported(path) {
+                return Err(format!("Unsupported source file: {}", path.display()));
+            }
+            updated.add_source(path.clone())?;
+            if file_limit.is_some() {
+                updated.set_file_size_limit(path.clone(), file_limit)?;
+            }
+        }
+        Ok(updated)
     }
 
     pub(super) fn source_enabled(&self, kind: SourceKind, path: &Path) -> bool {
@@ -364,26 +519,143 @@ impl Store {
     }
 
     pub(super) fn approve_folder(&mut self, review: &folder::Review) -> Result<(), String> {
+        let mut candidate = self.clone();
+        candidate.apply_folder_review(review)?;
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    fn folders_for_update<'a>(
+        &'a self,
+        selection: &'a BTreeSet<SourceKey>,
+    ) -> impl Iterator<Item = &'a folder::Folder> {
+        self.folders.iter().filter(|folder| {
+            !self.disabled_folders.contains(&folder.root)
+                && (selection.is_empty()
+                    || selection.contains(&(SourceKind::Folder, folder.root.clone())))
+        })
+    }
+
+    fn files_for_update<'a>(
+        &'a self,
+        selection: &'a BTreeSet<SourceKey>,
+    ) -> impl Iterator<Item = &'a PathBuf> {
+        self.sources.iter().filter(|path| {
+            !self.disabled_files.contains(*path)
+                && (selection.is_empty()
+                    || selection.contains(&(SourceKind::File, (*path).clone())))
+        })
+    }
+
+    pub(super) fn has_sources_for_update(&self, selection: &BTreeSet<SourceKey>) -> bool {
+        self.files_for_update(selection).next().is_some()
+            || self.folders_for_update(selection).next().is_some()
+    }
+
+    pub(super) fn review_source_updates(
+        &self,
+        store: usize,
+        selection: &BTreeSet<SourceKey>,
+    ) -> Result<
+        (
+            async_channel::Receiver<Result<Arc<SourceUpdates>, String>>,
+            folder::Cancel,
+        ),
+        String,
+    > {
+        self.validate()?;
+        if !self.has_sources_for_update(selection) {
+            return Err("Choose an enabled file or folder to review.".into());
+        }
+        let original = self.clone();
+        let selection = selection.clone();
+        folder::start_review(move |cancelled| {
+            let files = file_review::scan(
+                original
+                    .files_for_update(&selection)
+                    .map(|path| (path.clone(), original.file_limit(path))),
+                cancelled,
+            )?;
+            let targets: Vec<_> = original.folders_for_update(&selection).collect();
+            let unoccupied = MAX_SOURCES - original.source_count();
+            // Each scan may use space reclaimed from the selected manifests. Allocate
+            // that space only after all the successful decreases are known.
+            let scan_limit = unoccupied + targets.iter().map(|folder| folder.len()).sum::<usize>();
+            let mut candidates = Vec::new();
+            let mut issues = Vec::new();
+            for source in targets {
+                let result =
+                    folder::review_update(source, scan_limit, &original.sources, cancelled);
+                if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err("The source review was cancelled.".into());
+                }
+                match result {
+                    Ok(review) => candidates.push((source.len(), review)),
+                    Err(message) => issues.push(SourceIssue {
+                        source: (SourceKind::Folder, source.root.clone()),
+                        message,
+                    }),
+                }
+            }
+            let mut available = unoccupied
+                + candidates
+                    .iter()
+                    .map(|(previous, review)| previous.saturating_sub(review.folder.len()))
+                    .sum::<usize>();
+            let mut reviews = Vec::new();
+            for (previous, review) in candidates {
+                let growth = review.folder.len().saturating_sub(previous);
+                if growth <= available {
+                    available -= growth;
+                    reviews.push(review);
+                } else {
+                    issues.push(SourceIssue {
+                        source: (SourceKind::Folder, review.folder.root),
+                        message: "The updated folder would exceed the store file limit. Existing files in skipped folders still count toward the limit.".into(),
+                    });
+                }
+            }
+            Ok(Arc::new(SourceUpdates {
+                store,
+                selection,
+                files,
+                folders: reviews,
+                issues,
+                original,
+            }))
+        })
+    }
+
+    pub(super) fn approve_source_updates(&mut self, updates: &SourceUpdates) -> Result<(), String> {
+        if *self != updates.original {
+            return Err("The knowledge store changed. Review the selected sources again.".into());
+        }
+        let mut candidate = self.clone();
+        for review in &updates.folders {
+            candidate.apply_folder_review(review)?;
+        }
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    fn apply_folder_review(&mut self, review: &folder::Review) -> Result<(), String> {
         let position = self.folder_index(&review.folder.root)?;
         if review.existing != position.is_some() || (position.is_none() && review.folder.len() == 0)
         {
             return Err("The selected folder or store changed. Review the folder again.".into());
         }
-        let mut candidate = self.clone();
         match position {
             Some(position) => {
-                let old = &candidate.folders[position].root;
-                if candidate.disabled_folders.remove(old) {
-                    candidate
-                        .disabled_folders
-                        .insert(review.folder.root.clone());
+                let old = &self.folders[position].root;
+                if self.disabled_folders.remove(old) {
+                    self.disabled_folders.insert(review.folder.root.clone());
                 }
-                candidate.folders[position] = review.folder.clone();
+                self.folders[position] = review.folder.clone();
             }
-            None => candidate.folders.push(review.folder.clone()),
+            None => self.folders.push(review.folder.clone()),
         }
-        candidate.validate()?;
-        *self = candidate;
         Ok(())
     }
 
@@ -409,6 +681,7 @@ impl Store {
     }
 
     pub(super) fn validate(&self) -> Result<(), String> {
+        self.validate_local_dimensions()?;
         for settings in [&self.qdrant, &self.automatic_qdrant].into_iter().flatten() {
             settings.validate()?;
         }
@@ -513,6 +786,7 @@ pub(super) struct Scope {
     approved: Vec<Option<[u8; 32]>>,
     size_limits: Vec<Option<FileSizeLimit>>,
     enabled: Vec<bool>,
+    local_dimensions: Option<usize>,
     pub(super) qdrant: Option<qdrant::Settings>,
     pub(super) profile: Profile,
 }
@@ -524,6 +798,22 @@ enum StoreKey {
 }
 
 impl Scope {
+    pub(super) fn source_rows<'a>(
+        &'a self,
+        store: &'a Store,
+    ) -> impl Iterator<Item = (usize, SourceKey)> + 'a {
+        store
+            .sources
+            .iter()
+            .map(|file| (SourceKind::File, file.clone()))
+            .chain(store.folders.iter().flat_map(|folder| {
+                std::iter::repeat_n((SourceKind::Folder, folder.root.clone()), folder.len())
+            }))
+            .zip(&self.enabled)
+            .enumerate()
+            .filter_map(|(position, (key, enabled))| enabled.then_some((position, key)))
+    }
+
     pub(super) fn new(store: &Store, endpoint: &str, model: &str) -> Result<Self, String> {
         store.validate()?;
         let profile = Profile::new(endpoint, model)?;
@@ -576,10 +866,20 @@ impl Scope {
     ) -> Result<Self, String> {
         let encoded = encoded.map_err(|error| error.to_string())?;
         let base_digest = sha256(&encoded).map_err(|error| error.to_string())?;
+        let local_dimensions = if store.qdrant.is_none() {
+            store.local_dimensions
+        } else {
+            None
+        };
         let digest = if let Some(settings) = &store.qdrant {
             let remote = serde_json::to_vec(&("qdrant-v1", base_digest, settings))
                 .map_err(|error| error.to_string())?;
             sha256(&remote).map_err(|error| error.to_string())?
+        } else if let Some(dimensions) = local_dimensions {
+            let local =
+                serde_json::to_vec(&("local-vector-dimensions-v1", base_digest, dimensions))
+                    .map_err(|error| error.to_string())?;
+            sha256(&local).map_err(|error| error.to_string())?
         } else {
             base_digest
         };
@@ -612,6 +912,7 @@ impl Scope {
             approved,
             size_limits,
             enabled,
+            local_dimensions,
             qdrant: store.qdrant.clone(),
             profile,
         })
@@ -639,7 +940,7 @@ impl Scope {
     ) -> Result<(), String> {
         if self.approved[position].is_some_and(|approved| approved != digest) {
             return Err(format!(
-                "A reviewed folder file changed ({}). Review the folder again.",
+                "A reviewed file changed ({}). Review the source again.",
                 path.display()
             ));
         }
@@ -658,6 +959,14 @@ impl Scope {
         self.store == previous.store
             && self.profile == previous.profile
             && self.qdrant == previous.qdrant
+            && self.local_dimensions == previous.local_dimensions
+    }
+
+    fn expected_dimensions(&self) -> Option<usize> {
+        self.qdrant
+            .as_ref()
+            .map(|settings| settings.dimensions)
+            .or(self.local_dimensions)
     }
 
     pub(super) fn enabled_sources(&self) -> SourceMask {
@@ -668,6 +977,64 @@ impl Scope {
             }
         }
         sources
+    }
+
+    pub(super) fn for_source_rows(&self, store: &Store, selected: &BTreeSet<SourceKey>) -> Self {
+        let included: HashSet<_> = store
+            .sources
+            .iter()
+            .filter(|path| selected.contains(&(SourceKind::File, (*path).clone())))
+            .map(|path| folder::path_key(path))
+            .chain(
+                store
+                    .folders
+                    .iter()
+                    .filter(|folder| selected.contains(&(SourceKind::Folder, folder.root.clone())))
+                    .flat_map(|folder| folder.sources())
+                    .map(|(path, _)| folder::path_key(&path)),
+            )
+            .collect();
+        let mut scoped = self.clone();
+        for (enabled, path) in scoped.enabled.iter_mut().zip(&scoped.sources) {
+            *enabled &= included.contains(&folder::path_key(path));
+        }
+        scoped
+    }
+
+    pub(super) fn include_previous_reviews(&mut self, previous: &Self) {
+        debug_assert!(self.same_snapshot(previous));
+        for (enabled, prior) in self.enabled.iter_mut().zip(&previous.enabled) {
+            *enabled |= *prior;
+        }
+    }
+
+    pub(super) fn apply_source_reviews(&mut self, updates: &SourceUpdates) {
+        let files: HashMap<_, _> = updates
+            .files
+            .iter()
+            .map(|row| (&row.path, &row.status))
+            .collect();
+        let skipped: HashSet<_> = updates.issues.iter().map(|issue| &issue.source.1).collect();
+        let rejected_files: HashSet<_> = updates
+            .original
+            .folders
+            .iter()
+            .filter(|folder| skipped.contains(&folder.root))
+            .flat_map(folder::Folder::sources)
+            .map(|(file, _)| folder::path_key(&file))
+            .collect();
+        for (position, path) in self.sources.iter().enumerate() {
+            match files.get(path) {
+                Some(file_review::Status::Ready { digest, .. }) => {
+                    self.approved[position] = Some(*digest);
+                }
+                Some(file_review::Status::Skipped(_)) => self.enabled[position] = false,
+                None => {}
+            }
+            if !rejected_files.is_empty() && rejected_files.contains(&folder::path_key(path)) {
+                self.enabled[position] = false;
+            }
+        }
     }
 }
 
@@ -743,6 +1110,7 @@ pub(crate) struct Index {
     graph: Option<hnsw::Graph>,
     pub(super) qdrant_receipt: Option<QdrantReceipt>,
     source_ranges: Vec<Range<usize>>,
+    indexed_at: Vec<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -756,6 +1124,12 @@ pub(crate) struct UpdateSummary {
 struct IndexLimits {
     passages: usize,
     bytes: u64,
+}
+
+struct IndexOptions {
+    rebuild: bool,
+    automatic_qdrant: Option<bool>,
+    limits: IndexLimits,
 }
 
 impl IndexLimits {
@@ -783,6 +1157,25 @@ impl fmt::Debug for Index {
 }
 
 impl Index {
+    pub(super) fn source_results<'a>(
+        &'a self,
+        coverage: Option<&'a SourceMask>,
+    ) -> impl Iterator<Item = SourceResult> + 'a {
+        self.source_ranges
+            .iter()
+            .enumerate()
+            .map(move |(position, range)| {
+                if coverage.is_some_and(|covered| !covered.contains(position)) {
+                    return SourceResult::default();
+                }
+                SourceResult {
+                    files: usize::from(!range.is_empty()),
+                    chunks: range.len(),
+                    indexed_at: self.indexed_at.get(position).copied().unwrap_or_default(),
+                }
+            })
+    }
+
     #[cfg(test)]
     fn from_parts(
         scope: [u8; 32],
@@ -856,6 +1249,7 @@ impl Index {
             graph,
             qdrant_receipt: None,
             source_ranges,
+            indexed_at: Vec::new(),
         })
     }
 
@@ -1058,6 +1452,7 @@ impl Index {
         Self::update(client, scope, None, false, || Ok(())).map(|(index, _)| index)
     }
 
+    #[cfg(test)]
     pub(super) fn update(
         client: &Client,
         scope: &Scope,
@@ -1065,14 +1460,28 @@ impl Index {
         rebuild: bool,
         authorize: impl Fn() -> Result<(), String>,
     ) -> Result<(Self, UpdateSummary), String> {
+        Self::update_observed(client, scope, previous, rebuild, authorize, &mut None)
+    }
+
+    pub(super) fn update_observed(
+        client: &Client,
+        scope: &Scope,
+        previous: Option<(&Scope, &Self)>,
+        rebuild: bool,
+        authorize: impl Fn() -> Result<(), String>,
+        failed_source: &mut Option<usize>,
+    ) -> Result<(Self, UpdateSummary), String> {
         Self::refresh(
             client,
             scope,
             previous,
-            rebuild,
-            None,
-            IndexLimits::for_scope(scope, None),
+            IndexOptions {
+                rebuild,
+                automatic_qdrant: None,
+                limits: IndexLimits::for_scope(scope, None),
+            },
             authorize,
+            failed_source,
         )
     }
 
@@ -1082,15 +1491,19 @@ impl Index {
         previous: Option<(&Scope, &Self)>,
         expanded_qdrant: bool,
         authorize: impl Fn() -> Result<(), String>,
+        failed_source: &mut Option<usize>,
     ) -> Result<(Self, UpdateSummary), String> {
         Self::refresh(
             client,
             scope,
             previous,
-            false,
-            Some(expanded_qdrant),
-            IndexLimits::for_scope(scope, Some(expanded_qdrant)),
+            IndexOptions {
+                rebuild: false,
+                automatic_qdrant: Some(expanded_qdrant),
+                limits: IndexLimits::for_scope(scope, Some(expanded_qdrant)),
+            },
             authorize,
+            failed_source,
         )
     }
 
@@ -1098,11 +1511,15 @@ impl Index {
         client: &Client,
         scope: &Scope,
         previous: Option<(&Scope, &Self)>,
-        rebuild: bool,
-        automatic_qdrant: Option<bool>,
-        limits: IndexLimits,
+        options: IndexOptions,
         authorize: impl Fn() -> Result<(), String>,
+        failed_source: &mut Option<usize>,
     ) -> Result<(Self, UpdateSummary), String> {
+        let IndexOptions {
+            rebuild,
+            automatic_qdrant,
+            limits,
+        } = options;
         authorize()?;
         let previous =
             previous.filter(|(base, index)| scope.can_reuse(base) && base.same_as(index));
@@ -1131,17 +1548,16 @@ impl Index {
         let stage_allowed = scope.qdrant.is_none();
         let mut reused = Vec::new();
         let mut disabled = Vec::new();
-        let header = if scope.qdrant.is_some() {
-            snapshot::V4_BASE_BYTES
-        } else {
-            snapshot::V8_BASE_BYTES
-        } + 33 * scope.sources.len()
+        let header = snapshot::V9_BASE_BYTES
+            + (33 + snapshot::SOURCE_RESULT_BYTES) * scope.sources.len()
             + scope
                 .qdrant
                 .as_ref()
                 .map_or(0, |_| snapshot::qdrant_receipt_bytes(scope.sources.len()));
         let mut payload = header;
         let mut sources = Vec::with_capacity(scope.sources.len());
+        let mut indexed_at = vec![0; scope.sources.len()];
+        let mut updated = Vec::new();
         let legacy_qdrant = scope.qdrant.is_some() && automatic_qdrant == Some(false);
         let max_passages = limits.passages;
         let max_snapshot_bytes = limits.bytes;
@@ -1150,6 +1566,9 @@ impl Index {
             let previous_source = previous_positions.as_ref().and_then(|(positions, index)| {
                 Some((*positions.get(&folder::path_key(path))?, *index))
             });
+            if let Some((old, index)) = previous_source {
+                indexed_at[source] = index.indexed_at.get(old).copied().unwrap_or_default();
+            }
             if !scope.enabled[source] {
                 sources.push(previous_source.and_then(|(old, index)| index.sources[old]));
                 if let Some((old, index)) = previous_source {
@@ -1187,9 +1606,23 @@ impl Index {
                 },
             );
             check_active(client)?;
-            let summary_source = summary_source.map_err(|error| source_unavailable(path, error))?;
+            let summary_source = summary_source.map_err(|error| {
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound
+                        | io::ErrorKind::PermissionDenied
+                        | io::ErrorKind::InvalidData
+                ) {
+                    *failed_source = Some(source);
+                }
+                source_unavailable(path, error)
+            })?;
             let digest = summary_source.digest;
-            scope.require_approved(source, path, digest)?;
+            scope
+                .require_approved(source, path, digest)
+                .inspect_err(|_| {
+                    *failed_source = Some(source);
+                })?;
             sources.push(Some(digest));
             let staged = &entries[start..];
             if let Some((old, index)) = previous_source
@@ -1206,6 +1639,7 @@ impl Index {
                 }
             } else {
                 summary.indexed += 1;
+                updated.push(source);
             }
         }
         let old_dimensions = previous.map_or(0, |(_, index)| index.dimensions);
@@ -1242,7 +1676,7 @@ impl Index {
                 check_active(client)
             })?;
         }
-        let collection_dimensions = scope.qdrant.as_ref().map(|settings| settings.dimensions);
+        let expected_dimensions = scope.expected_dimensions();
         let dimensions = if entries.is_empty() {
             if automatic_qdrant.is_none() {
                 return Err("The source files contain no text".into());
@@ -1258,11 +1692,15 @@ impl Index {
                 &mut entries,
                 stage.as_mut(),
                 texts.as_mut(),
-                (reused_dimensions, collection_dimensions),
+                (reused_dimensions, expected_dimensions),
                 &authorize,
                 |dimensions, projected| {
-                    if collection_dimensions.is_some_and(|expected| expected != dimensions) {
-                        return Err("The embedding dimension does not match the saved Qdrant collection settings.".into());
+                    if let Some(expected) =
+                        expected_dimensions.filter(|expected| *expected != dimensions)
+                    {
+                        return Err(format!(
+                            "The model returned {dimensions} embedding dimensions, but the store expects {expected}."
+                        ));
                     }
                     let retained = if keep_disabled(dimensions) {
                         require_passage_count(enabled_count + disabled_count, max_passages)?;
@@ -1283,9 +1721,12 @@ impl Index {
             if !rebuild {
                 return Err("The embedding dimensions changed. Choose Rebuild index to replace all vectors.".into());
             }
-            for (digest, enabled) in sources.iter_mut().zip(&scope.enabled) {
+            for ((digest, indexed_at), enabled) in
+                sources.iter_mut().zip(&mut indexed_at).zip(&scope.enabled)
+            {
                 if !enabled {
                     *digest = None;
+                    *indexed_at = 0;
                 }
             }
         } else if disabled_count != 0 {
@@ -1367,7 +1808,7 @@ impl Index {
             bytes + graph.as_ref().map_or(0, hnsw::Graph::encoded_bytes),
             max_snapshot_bytes,
         )?;
-        let index = Self::from_snapshot_parts(
+        let mut index = Self::from_snapshot_parts(
             scope.digest,
             sources,
             entries,
@@ -1377,7 +1818,12 @@ impl Index {
         )
         .map_err(|error| error.to_string())?;
         authorize()?;
-        index.check_sources(scope, || check_active(client))?;
+        index.check_sources_observed(scope, || check_active(client), failed_source)?;
+        let now = jiff::Timestamp::now().as_second();
+        for source in updated {
+            indexed_at[source] = now;
+        }
+        index.indexed_at = indexed_at;
         Ok((index, summary))
     }
 
@@ -1389,6 +1835,7 @@ impl Index {
         self.entries.capacity() * size_of::<Entry>()
             + self.sources.capacity() * size_of::<Option<[u8; 32]>>()
             + self.source_ranges.capacity() * size_of::<Range<usize>>()
+            + self.indexed_at.capacity() * size_of::<i64>()
             + self
                 .entries
                 .iter()
@@ -1602,18 +2049,27 @@ impl Index {
         scope: &Scope,
         check_active: impl Fn() -> Result<(), String>,
     ) -> Result<(), String> {
+        self.check_sources_observed(scope, check_active, &mut None)
+    }
+
+    fn check_sources_observed(
+        &self,
+        scope: &Scope,
+        check_active: impl Fn() -> Result<(), String>,
+        failed_source: &mut Option<usize>,
+    ) -> Result<(), String> {
         if let Some(snapshot) = self
             .snapshot_vectors
             .as_ref()
             .filter(|snapshot| snapshot.has_texts())
         {
             return snapshot.with_texts(|reader| {
-                self.check_sources_with(scope, check_active, |position, text| {
+                self.check_sources_with(scope, check_active, failed_source, |position, text| {
                     Ok(reader.read(position)? == text)
                 })
             });
         }
-        self.check_sources_with(scope, check_active, |position, text| {
+        self.check_sources_with(scope, check_active, failed_source, |position, text| {
             Ok(self.entries[position].0.text == text)
         })
     }
@@ -1622,6 +2078,7 @@ impl Index {
         &self,
         scope: &Scope,
         check_active: impl Fn() -> Result<(), String>,
+        failed_source: &mut Option<usize>,
         mut matches_text: impl FnMut(usize, &str) -> io::Result<bool>,
     ) -> Result<(), String> {
         if !scope.same_as(self) || scope.sources.len() != self.sources.len() {
@@ -1635,6 +2092,7 @@ impl Index {
                 continue;
             }
             let Some(expected) = expected else {
+                *failed_source = Some(position);
                 return Err(
                     "An enabled knowledge source is missing from the index. Choose Update index."
                         .into(),
@@ -1657,15 +2115,24 @@ impl Index {
                 },
             );
             check_active()?;
-            let document = document.map_err(|error| source_unavailable(path, error))?;
-            scope.require_approved(position, path, document.digest)?;
+            let document = document.map_err(|error| {
+                *failed_source = Some(position);
+                source_unavailable(path, error)
+            })?;
+            scope
+                .require_approved(position, path, document.digest)
+                .inspect_err(|_| {
+                    *failed_source = Some(position);
+                })?;
             if document.digest != *expected {
+                *failed_source = Some(position);
                 return Err(format!(
                     "A knowledge source changed ({}). Update the index first.",
                     path.display()
                 ));
             }
             if !passages_match || stored.next().is_some() {
+                *failed_source = Some(position);
                 return Err(
                     "The saved passages do not match the source. Update the index first.".into(),
                 );
@@ -1760,9 +2227,9 @@ fn embed_missing(
             text_bytes + entry_count * dimensions * size_of::<f32>(),
         )
     };
-    let mut dimensions = reused_dimensions;
-    let reusing = dimensions.is_some();
-    if let Some(dimensions) = dimensions.or(dimensions_hint) {
+    let mut dimensions = reused_dimensions.or(dimensions_hint);
+    let reusing = reused_dimensions.is_some();
+    if let Some(dimensions) = dimensions {
         check_budget(dimensions)?;
     }
     let mut pending = entries.iter_mut().enumerate();
@@ -1775,7 +2242,9 @@ fn embed_missing(
                         .as_ref()
                         .is_some_and(|stage| stage.contains(*position))
             })
-            .take(BATCH_SIZE)
+            .take(dimensions.map_or(BATCH_SIZE, |known| {
+                (BATCH_SIZE * snapshot::LEGACY_MAX_DIMENSIONS / known).min(BATCH_SIZE)
+            }))
             .collect();
         if batch.is_empty() {
             break;
@@ -1812,6 +2281,12 @@ fn embed_missing(
             let expected = *dimensions.get_or_insert(vector.len());
             if reusing && expected != vector.len() {
                 return Err("The embedding dimensions changed. Choose Rebuild index to replace all vectors.".into());
+            }
+            if dimensions_hint.is_some() && expected != vector.len() {
+                return Err(format!(
+                    "The model returned {} embedding dimensions, but the store expects {expected}.",
+                    vector.len()
+                ));
             }
             normalize(&mut vector, expected)?;
             if let Some(stage) = &mut stage {
@@ -1853,6 +2328,10 @@ fn sha256(bytes: &[u8]) -> io::Result<[u8; 32]> {
         .map_err(io::Error::other)?
         .try_into()
         .map_err(|_| io::Error::other("Invalid SHA-256 digest"))
+}
+
+fn new_source_file_limit(path: &Path) -> FileSizeLimit {
+    FileSizeLimit::reviewed_for_text(source::NEW_SOURCE_DEFAULT, !pdf::is_pdf(path))
 }
 
 fn source_name(path: &Path) -> io::Result<&str> {
@@ -2301,7 +2780,20 @@ mod tests {
         store.add_source(extra).unwrap();
         let scope = Scope::new(&store, &endpoint, "fixture:embedding").unwrap();
         let client = Client::new(scope.profile.clone());
-        let refresh = || Index::refresh(&client, &scope, None, false, None, limits, || Ok(()));
+        let refresh = || {
+            Index::refresh(
+                &client,
+                &scope,
+                None,
+                IndexOptions {
+                    rebuild: false,
+                    automatic_qdrant: None,
+                    limits,
+                },
+                || Ok(()),
+                &mut None,
+            )
+        };
         let error = refresh().unwrap_err();
         assert!(
             error.contains(&format!("supports up to {} text passages", limits.passages)),
@@ -2322,6 +2814,41 @@ mod tests {
     }
 
     #[test]
+    fn local_fixed_dimensions_reject_a_mismatched_model_without_reusing_auto_vectors() {
+        let _exclusive = test_support::exclusive_run();
+        let fixture = crate::snippets::tests::Profile::new();
+        let path = fixture.0.join("source.txt");
+        fs::write(&path, "Vector shape fixture").unwrap();
+        let (listener, _) = test_support::listener();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let mut store = Store::new("Fixed shape fixture").unwrap();
+        store.add_source(path).unwrap();
+        let auto = Scope::new(&store, &endpoint, "fixture").unwrap();
+        let saved = serde_json::to_value(&store).unwrap();
+        assert!(saved.get("local_dimensions").is_none());
+        let mut store: Store = serde_json::from_value(saved).unwrap();
+        assert!(auto.same_snapshot(&Scope::new(&store, &endpoint, "fixture").unwrap()));
+        store.local_dimensions = Some(3);
+        let fixed = Scope::new(&store, &endpoint, "fixture").unwrap();
+        assert!(!fixed.same_snapshot(&auto));
+        assert!(!fixed.can_reuse(&auto));
+
+        let worker = std::thread::spawn(move || {
+            let mut socket = test_support::accept(&listener);
+            test_support::wire_request(&mut socket, "POST /api/embed HTTP/1.1");
+            let response =
+                test_support::fixture_http_response("200 OK", "", r#"{"embeddings":[[1,0]]}"#);
+            socket.get_mut().write_all(response.as_bytes()).unwrap();
+        });
+        let error = Index::build(&Client::new(fixed.profile.clone()), &fixed).unwrap_err();
+        worker.join().unwrap();
+        assert!(
+            error.contains("returned 2 embedding dimensions, but the store expects 3"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn qdrant_dimensions_refuse_an_oversized_snapshot_before_embedding() {
         let fixture = crate::snippets::tests::Profile::new();
         let (embedding, _) = test_support::listener();
@@ -2331,7 +2858,7 @@ mod tests {
         store.qdrant = Some(qdrant::Settings {
             endpoint: format!("http://{}", qdrant.local_addr().unwrap()),
             collection: "fixture".into(),
-            dimensions: MAX_DIMENSIONS,
+            dimensions: qdrant::MAX_DIMENSIONS,
             ..qdrant::Settings::default()
         });
         let path = fixture.0.join("source.txt");
@@ -2371,7 +2898,7 @@ mod tests {
         for event in [
             Message::SelectStore(0),
             Message::ConfigureFileSize(0, path.clone()),
-            Message::FileSize("0".into()),
+            Message::FileSize("0 B".into()),
             Message::ApplyFileSize(0, path.clone()),
         ] {
             let _ = dialog.update(event, &mut draft, &saved, false);
@@ -2382,7 +2909,7 @@ mod tests {
             source::SyncMode::Automatic
         );
         for event in [
-            Message::FileSize("4".into()),
+            Message::FileSize("4 B".into()),
             Message::ApplyFileSize(0, path.clone()),
         ] {
             let _ = dialog.update(event, &mut draft, &saved, false);
@@ -2613,6 +3140,104 @@ mod tests {
     }
 
     #[test]
+    fn knowledge_folder_batch_rejects_stale_selection_and_applies_only_reviewed_roots() {
+        use iced::futures::{StreamExt as _, executor::block_on};
+
+        let profile = crate::snippets::tests::Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        let paths = ["alpha", "beta", "gamma"].map(|name| root.join(name));
+        let mut store = Store::new("Collections").unwrap();
+        for path in &paths {
+            fs::create_dir(path).unwrap();
+            fs::write(path.join("original.txt"), "Original excerpt").unwrap();
+            let (reply, _cancel) = store.folder_review(path.clone()).unwrap();
+            store
+                .approve_folder(&reply.recv_blocking().unwrap().unwrap())
+                .unwrap();
+            fs::write(path.join("added.txt"), "New excerpt").unwrap();
+        }
+        let loose = root.join("loose.txt");
+        fs::write(&loose, "Individual excerpt").unwrap();
+        store.add_source(loose.clone()).unwrap();
+        let skipped = root.join("skipped.txt");
+        fs::write(&skipped, [0, 0, 0]).unwrap();
+        store.add_source(skipped.clone()).unwrap();
+        let saved = State {
+            stores: vec![store],
+            ..State::default()
+        };
+        let mut draft = saved.clone();
+        let mut dialog = Dialog::new(root);
+        let _ = dialog.update(Message::SelectStore(0), &mut draft, &saved, true);
+        let selection = BTreeSet::from([
+            (SourceKind::Folder, paths[0].clone()),
+            (SourceKind::Folder, paths[2].clone()),
+            (SourceKind::File, loose.clone()),
+            (SourceKind::File, skipped.clone()),
+        ]);
+        dialog.selected_sources = selection;
+        let finish = |dialog: &mut Dialog, draft: &mut State| {
+            let task = dialog.update(Message::ReviewSourceUpdates(0), draft, &saved, true);
+            let mut stream =
+                iced_runtime::task::into_stream(task).expect("folder review scheduled");
+            let Some(iced_runtime::Action::Output(reply)) = block_on(stream.next()) else {
+                panic!("folder review must return a result");
+            };
+            let _ = dialog.update(reply, draft, &saved, true);
+        };
+
+        finish(&mut dialog, &mut draft);
+        let review = dialog.source_updates.as_ref().unwrap();
+        let reviews = &review.folders;
+        assert_eq!(reviews.len(), 2);
+        assert_eq!(reviews[0].folder.root, paths[0]);
+        assert_eq!(reviews[1].folder.root, paths[2]);
+        assert_eq!(review.files.len(), 2);
+        assert_eq!(review.files[0].path, loose);
+        assert!(matches!(
+            review.files[0].status,
+            file_review::Status::Ready { .. }
+        ));
+        assert_eq!(review.files[1].path, skipped);
+        assert!(matches!(
+            review.files[1].status,
+            file_review::Status::Skipped(_)
+        ));
+        assert_eq!(draft, saved);
+        let _ = dialog.update(Message::CancelSourceUpdates, &mut draft, &saved, true);
+        let _ = dialog.update(Message::ApproveSourceUpdates, &mut draft, &saved, true);
+        assert_eq!(draft, saved);
+
+        finish(&mut dialog, &mut draft);
+        let changed = (SourceKind::Folder, paths[1].clone());
+        dialog.selected_sources.insert(changed.clone());
+        let _ = dialog.update(Message::ApproveSourceUpdates, &mut draft, &saved, true);
+        assert_eq!(draft, saved);
+        assert!(
+            dialog
+                .status
+                .as_deref()
+                .unwrap()
+                .contains("selection changed")
+        );
+        dialog.selected_sources.remove(&changed);
+
+        finish(&mut dialog, &mut draft);
+        let _ = dialog.update(Message::ApproveSourceUpdates, &mut draft, &saved, true);
+        assert!(dialog.source_updates.is_none());
+        assert_eq!(
+            draft.stores[0]
+                .folders
+                .iter()
+                .map(folder::Folder::len)
+                .collect::<Vec<_>>(),
+            [2, 1, 2]
+        );
+        assert_eq!(draft.stores[0].folders[1], saved.stores[0].folders[1]);
+        assert!(paths.iter().all(|path| path.join("added.txt").exists()));
+    }
+
+    #[test]
     fn knowledge_folder_review_pins_contents_and_resolves_missing_sources() {
         let profile = crate::snippets::tests::Profile::new();
         let root = profile.0.join("manual");
@@ -2662,7 +3287,7 @@ mod tests {
         assert_eq!(scope.sources.len(), 2);
         assert!(!scope.sources.contains(&root.join("appendix.txt")));
         let result = Index::build(&Client::new(scope.profile.clone()), &scope).unwrap_err();
-        assert!(result.contains("reviewed folder file changed"));
+        assert!(result.contains("reviewed file changed"));
         assert_eq!(
             listener.accept().unwrap_err().kind(),
             io::ErrorKind::WouldBlock
@@ -2839,6 +3464,221 @@ mod tests {
     }
 
     #[test]
+    fn source_review_reuses_later_decreases_without_reclaiming_unavailable_folders() {
+        let profile = crate::snippets::tests::Profile::new();
+        let early = profile.0.join("early");
+        let late = profile.0.join("late");
+        fs::create_dir(&early).unwrap();
+        fs::create_dir(&late).unwrap();
+        fs::write(early.join("first.txt"), "Original early source").unwrap();
+        fs::write(late.join("keep.txt"), "Retained late source").unwrap();
+        fs::write(late.join("remove.txt"), "Removed late source").unwrap();
+        let mut store = Store::new("Full store").unwrap();
+        for path in [&early, &late] {
+            let (reply, _cancel) = store.folder_review(path.clone()).unwrap();
+            store
+                .approve_folder(&reply.recv_blocking().unwrap().unwrap())
+                .unwrap();
+        }
+        store.sources = (0..MAX_SOURCES - 3)
+            .map(|index| profile.0.join(format!("unselected-{index}.txt")))
+            .collect();
+        assert_eq!(store.source_count(), MAX_SOURCES);
+        fs::write(early.join("second.txt"), "Additional early source").unwrap();
+        fs::rename(late.join("remove.txt"), profile.0.join("removed.txt")).unwrap();
+        let selection = BTreeSet::from([
+            (SourceKind::Folder, early.clone()),
+            (SourceKind::Folder, late.clone()),
+        ]);
+
+        let (reply, _cancel) = store.review_source_updates(0, &selection).unwrap();
+        let review = reply.recv_blocking().unwrap().unwrap();
+        assert!(review.issues.is_empty());
+        assert_eq!(
+            review
+                .folders
+                .iter()
+                .map(|review| review.folder.len())
+                .collect::<Vec<_>>(),
+            [2, 1]
+        );
+        let mut updated = store.clone();
+        updated.approve_source_updates(&review).unwrap();
+        assert_eq!(updated.source_count(), MAX_SOURCES);
+
+        fs::rename(&late, profile.0.join("original-late")).unwrap();
+        fs::write(&late, "This path is no longer a folder").unwrap();
+        let (reply, _cancel) = store.review_source_updates(0, &selection).unwrap();
+        let review = reply.recv_blocking().unwrap().unwrap();
+        assert!(!review.can_approve());
+        assert!(review.issues.iter().any(|issue| {
+            issue.source.1 == early && issue.message.contains("store file limit")
+        }));
+        assert!(review.issues.iter().any(|issue| issue.source.1 == late));
+        assert_eq!(store.source_count(), MAX_SOURCES);
+    }
+
+    #[test]
+    fn source_review_skips_an_unavailable_folder_without_replacing_its_manifest() {
+        let profile = crate::snippets::tests::Profile::new();
+        let directory = profile.0.join("docs");
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("old.txt"), "Retained snapshot source").unwrap();
+        let file = profile.0.join("manual.txt");
+        fs::write(&file, "Reviewed manual source").unwrap();
+        let mut store = Store::new("Mixed review fixture").unwrap();
+        store.add_source(file.clone()).unwrap();
+        let (review, _cancel) = store.folder_review(directory.clone()).unwrap();
+        store
+            .approve_folder(&review.recv_blocking().unwrap().unwrap())
+            .unwrap();
+        let original = store.clone();
+
+        fs::rename(&directory, profile.0.join("old-directory")).unwrap();
+        fs::write(&directory, "This path is no longer a folder").unwrap();
+        let (review, _cancel) = store.review_source_updates(0, &BTreeSet::new()).unwrap();
+        let review = review.recv_blocking().unwrap().unwrap();
+        assert_eq!(review.files.len(), 1);
+        assert!(matches!(
+            review.files[0].status,
+            file_review::Status::Ready { .. }
+        ));
+        assert_eq!(review.issues.len(), 1);
+        assert_eq!(review.issues[0].source, (SourceKind::Folder, directory));
+        assert!(review.can_approve());
+        store.approve_source_updates(&review).unwrap();
+        assert_eq!(store, original);
+
+        let mut scope = Scope::new(&store, "127.0.0.1:1234", "fixture").unwrap();
+        scope.apply_source_reviews(&review);
+        assert_eq!(
+            scope.source_rows(&store).collect::<Vec<_>>(),
+            [(0, (SourceKind::File, file))]
+        );
+    }
+
+    #[test]
+    fn knowledge_selected_updates_publish_only_reviewed_reads_and_keep_other_vectors() {
+        use super::super::{Dialog, Message, State};
+        use crate::ai_manager::Configuration;
+        use iced::futures::{StreamExt as _, executor::block_on};
+
+        let _exclusive = test_support::exclusive_run();
+        let profile = crate::snippets::tests::Profile::new();
+        let files = ["a.txt", "b.txt", "c.txt"].map(|name| profile.0.join(name));
+        let mut store = Store::new("Selection").unwrap();
+        for (path, content) in files
+            .iter()
+            .zip(["Alpha fixture", "Beta fixture", "Gamma fixture"])
+        {
+            fs::write(path, content).unwrap();
+            store.add_source(path.clone()).unwrap();
+        }
+        let (listener, _) = test_support::listener();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let server = std::thread::spawn(move || {
+            for expected in [
+                json!(["Beta fixture"]),
+                json!(["Alpha fixture", "Gamma fixture"]),
+            ] {
+                let mut socket = test_support::accept(&listener);
+                let request = test_support::wire_request(&mut socket, "POST /api/embed HTTP/1.1");
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&request).unwrap()["input"],
+                    expected
+                );
+                let vectors = vec![[1, 0]; expected.as_array().unwrap().len()];
+                let response = test_support::fixture_http_response(
+                    "200 OK",
+                    "",
+                    &json!({"embeddings": vectors}).to_string(),
+                );
+                socket.get_mut().write_all(response.as_bytes()).unwrap();
+            }
+        });
+        let saved = State {
+            endpoint,
+            embedding: "embed".into(),
+            stores: vec![store],
+            ..State::default()
+        };
+        Configuration {
+            local: saved.clone(),
+            ..Configuration::default()
+        }
+        .save_against(&profile.0, &Configuration::default())
+        .unwrap();
+        let mut draft = saved.clone();
+        let mut dialog = Dialog::new(profile.0.clone());
+        let _ = dialog.update(Message::SelectStore(0), &mut draft, &saved, true);
+        let press = Message::SelectKnowledgeSource(0, SourceKind::File, files[1].clone());
+        let _ = dialog.update(press.clone(), &mut draft, &saved, true);
+        let scope = saved.scope(&saved.stores[0], &profile.0).unwrap();
+        let finish = |dialog: &mut Dialog, draft: &mut State, message| {
+            let indexing = matches!(message, Message::IndexReviewed);
+            let task = dialog.update(message, draft, &saved, true);
+            if indexing {
+                let work = dialog.source_work.as_ref().unwrap();
+                assert_eq!(
+                    work.status(&(SourceKind::File, files[1].clone())),
+                    Some("Indexing…")
+                );
+            }
+            let mut stream = iced_runtime::task::into_stream(task).expect("scheduled update");
+            let Some(iced_runtime::Action::Output(reply)) = block_on(stream.next()) else {
+                panic!("update did not reply");
+            };
+            let _ = dialog.update(reply, draft, &saved, true);
+        };
+        let approve = |dialog: &mut Dialog, draft: &mut State| {
+            finish(dialog, draft, Message::ReviewSourceUpdates(0));
+            let _ = dialog.update(Message::ApproveSourceUpdates, draft, &saved, true);
+            let without_consent = dialog.update(Message::IndexReviewed, draft, &saved, true);
+            assert!(iced_runtime::task::into_stream(without_consent).is_none());
+            let _ = dialog.update(Message::Consent(true), draft, &saved, true);
+        };
+        let update = |dialog: &mut Dialog, draft: &mut State| {
+            finish(dialog, draft, Message::IndexReviewed);
+            dialog.cache.load(&scope).unwrap()
+        };
+        approve(&mut dialog, &mut draft);
+        fs::write(&files[1], "Changed after the preview").unwrap();
+        finish(&mut dialog, &mut draft, Message::IndexReviewed);
+        assert!(
+            dialog
+                .status
+                .as_deref()
+                .unwrap()
+                .contains("reviewed file changed")
+        );
+        let work = dialog.source_work.as_ref().unwrap();
+        assert_eq!(
+            work.status(&(SourceKind::File, files[1].clone())),
+            Some("Error")
+        );
+        assert_eq!(work.status(&(SourceKind::File, files[0].clone())), None);
+        assert!(dialog.cache.load(&scope).is_err());
+        fs::write(&files[1], "Beta fixture").unwrap();
+        let first = update(&mut dialog, &mut draft);
+        assert!(dialog.source_work.is_none());
+        assert_eq!(first.len(), 1);
+        assert!(first.sources[0].is_none() && first.sources[2].is_none());
+        #[cfg(target_os = "macos")]
+        dialog.set_selection_modifiers(iced::keyboard::Modifiers::LOGO);
+        #[cfg(not(target_os = "macos"))]
+        dialog.set_selection_modifiers(iced::keyboard::Modifiers::CTRL);
+        let _ = dialog.update(press, &mut draft, &saved, true);
+        let stale_selection = dialog.update(Message::IndexReviewed, &mut draft, &saved, true);
+        assert!(iced_runtime::task::into_stream(stale_selection).is_none());
+        approve(&mut dialog, &mut draft);
+        let full = update(&mut dialog, &mut draft);
+        assert_eq!(full.len(), 3);
+        assert_eq!(full.sources[1], first.sources[1]);
+        full.check_sources(&scope, || Ok(())).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
     fn knowledge_index_survives_reopen_and_refuses_stale_sources() {
         let profile = crate::snippets::tests::Profile::new();
         let path = profile.0.join("manual.txt");
@@ -2873,6 +3713,7 @@ mod tests {
         dialog.drafts.push(super::super::DraftIndex {
             index: Arc::clone(&index),
             vault_revision: None,
+            review: None,
         });
 
         let settings = serde_json::to_vec(&state).unwrap();
@@ -3131,6 +3972,8 @@ mod tests {
             }
         );
         assert!(updated.sources.iter().all(Option::is_some));
+        assert_eq!(updated.indexed_at[0], cached.indexed_at[0]);
+        assert!(updated.indexed_at[1] > 0);
         server.join().unwrap();
     }
 
@@ -3238,9 +4081,9 @@ mod tests {
             &mut dialog,
             &mut draft,
             &saved,
-            Message::ReviewFolderUpdate(0),
+            Message::ReviewSourceUpdates(0),
         );
-        let _ = dialog.update(Message::ApproveFolder, &mut draft, &saved, true);
+        let _ = dialog.update(Message::ApproveSourceUpdates, &mut draft, &saved, true);
         let without_consent =
             dialog.update(Message::Index { rebuild: false }, &mut draft, &saved, true);
         assert!(iced_runtime::task::into_stream(without_consent).is_none());

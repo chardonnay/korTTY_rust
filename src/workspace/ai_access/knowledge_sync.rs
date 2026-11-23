@@ -14,6 +14,7 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 #[derive(Clone, Debug)]
 pub(crate) enum Event {
     Tick,
+    Sources(u64, Arc<knowledge_sync::SourceReport>),
     Finished(u64, knowledge_sync::Report),
 }
 
@@ -22,13 +23,25 @@ pub(super) struct State {
     next: usize,
     ticket: u64,
     running: Option<Running>,
-    pub(super) statuses: BTreeMap<String, String>,
+    statuses: BTreeMap<String, knowledge_sync::Status>,
 }
 
 struct Running {
     baseline: Arc<Configuration>,
     store: String,
+    sources: Arc<knowledge_sync::SourceReport>,
     cancel: Option<knowledge_sync::Cancel>,
+}
+
+impl State {
+    pub(super) fn update_dialog(&self, dialog: &mut crate::ai_manager::Dialog) {
+        let active = self
+            .running
+            .as_ref()
+            .filter(|running| running.cancel.is_some())
+            .map(|running| (running.store.clone(), Arc::clone(&running.sources)));
+        dialog.set_automatic_knowledge_status(self.statuses.clone(), active);
+    }
 }
 
 impl Workspace {
@@ -56,20 +69,31 @@ impl Workspace {
     pub(in crate::workspace) fn reconcile_automatic_knowledge(&mut self) {
         let allowed = self.automatic_knowledge_allowed();
         if let Some(running) = &mut self.ai_manager.knowledge_sync.running
+            && running.cancel.is_some()
             && (!allowed || self.ai_manager.config != running.baseline)
         {
             // The slot remains occupied until this canceled worker has actually returned.
             running.cancel = None;
+            self.refresh_knowledge_sync_view();
         }
     }
 
     pub(super) fn update_knowledge_sync(&mut self, event: Event) -> Task<Desktop> {
         match event {
             Event::Tick => self.poll_automatic_knowledge(),
-            Event::Finished(ticket, report) => {
-                self.finish_automatic_knowledge(ticket, report);
+            Event::Sources(ticket, sources) => {
+                let sync = &mut self.ai_manager.knowledge_sync;
+                if ticket == sync.ticket
+                    && let Some(running) = &mut sync.running
+                    && running.cancel.is_some()
+                    && self.ai_manager.config == running.baseline
+                {
+                    running.sources = sources;
+                    self.refresh_knowledge_sync_view();
+                }
                 Task::none()
             }
+            Event::Finished(ticket, report) => self.finish_automatic_knowledge(ticket, report),
         }
     }
 
@@ -89,7 +113,13 @@ impl Workspace {
         let pending = match attempt.pending {
             Ok(pending) => pending,
             Err(error) => {
-                self.knowledge_sync_status(store, knowledge_sync::Report::failed(error).status);
+                self.knowledge_sync_status(
+                    store,
+                    knowledge_sync::Status {
+                        summary: knowledge_sync::Report::failed(error).status,
+                        sources: None,
+                    },
+                );
                 return Task::none();
             }
         };
@@ -98,31 +128,43 @@ impl Workspace {
         sync.running = Some(Running {
             baseline,
             store,
+            sources: attempt.checking,
             cancel: Some(pending.cancel),
         });
-        Task::perform(
-            async move {
-                pending
-                    .reply
-                    .recv()
-                    .await
-                    .unwrap_or_else(|_| Err("The automatic knowledge worker stopped.".into()))
-                    .unwrap_or_else(knowledge_sync::Report::failed)
-            },
-            move |report| message(Event::Finished(ticket, report)),
-        )
+        self.refresh_knowledge_sync_view();
+        Task::batch([
+            Task::run(pending.progress, move |report| {
+                message(Event::Sources(ticket, report))
+            }),
+            Task::perform(
+                async move {
+                    pending
+                        .reply
+                        .recv()
+                        .await
+                        .unwrap_or_else(|_| Err("The automatic knowledge worker stopped.".into()))
+                        .unwrap_or_else(knowledge_sync::Report::failed)
+                },
+                move |report| message(Event::Finished(ticket, report)),
+            ),
+        ])
     }
 
-    fn finish_automatic_knowledge(&mut self, ticket: u64, report: knowledge_sync::Report) {
+    fn finish_automatic_knowledge(
+        &mut self,
+        ticket: u64,
+        report: knowledge_sync::Report,
+    ) -> Task<Desktop> {
         let sync = &mut self.ai_manager.knowledge_sync;
         if ticket != sync.ticket {
-            return;
+            return Task::none();
         }
         let Some(running) = sync.running.take() else {
-            return;
+            return Task::none();
         };
         if self.ai_manager.config != running.baseline {
-            return;
+            self.refresh_knowledge_sync_view();
+            return Task::none();
         }
         if let Some(saved) = report.saved {
             if let Some((_, dialog)) = &mut self.ai_manager.surface {
@@ -132,23 +174,42 @@ impl Workspace {
             self.invalidate_snippet_apply_requests();
         }
         if running.cancel.is_some() || report.changed {
-            self.knowledge_sync_status(running.store, report.status);
+            self.knowledge_sync_status(
+                running.store,
+                knowledge_sync::Status {
+                    summary: report.status,
+                    sources: report.sources,
+                },
+            );
+        } else {
+            self.refresh_knowledge_sync_view();
         }
         if report.changed {
             self.invalidate_snippet_knowledge();
             let config = self.ai_chat_configuration();
             self.invalidate_terminal_ai_reviews(config.as_ref());
+            if let Some((id, dialog)) = &mut self.ai_manager.surface {
+                let id = *id;
+                return dialog
+                    .load_knowledge_source_results()
+                    .map(move |event| super::wrap(id, event));
+            }
         }
+        Task::none()
     }
 
-    fn knowledge_sync_status(&mut self, store: String, status: String) {
+    fn knowledge_sync_status(&mut self, store: String, status: knowledge_sync::Status) {
         let statuses = &mut self.ai_manager.knowledge_sync.statuses;
         if statuses.len() >= 32 && !statuses.contains_key(&store) {
             statuses.clear();
         }
         statuses.insert(store, status);
+        self.refresh_knowledge_sync_view();
+    }
+
+    fn refresh_knowledge_sync_view(&mut self) {
         if let Some((_, dialog)) = &mut self.ai_manager.surface {
-            dialog.set_automatic_knowledge_status(statuses.clone());
+            self.ai_manager.knowledge_sync.update_dialog(dialog);
         }
     }
 }

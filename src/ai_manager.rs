@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use iced::widget::{
-    Id, button, checkbox, column, container, pick_list, row, scrollable, text, text_input,
+    Id, button, checkbox, column, container, pick_list, row, scrollable, space, stack, text,
+    text_input,
 };
 use iced::{Alignment, Element, Length, Task};
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,7 @@ use crate::connection_window::CredentialChoice;
 use crate::session_journal::summary_plan::EvidenceLimits;
 use crate::terminal_agent::shortcut;
 use crate::vault_window::VaultWindow;
+use crate::workspace::dialog_design;
 use crate::{
     clipboard_policy::{
         AI_PROFILE_CREATION_DISABLED, AI_PROFILE_EDIT_DISABLED, AiMemoryPolicy, ClipboardPolicy,
@@ -27,8 +29,10 @@ pub(crate) mod backup;
 mod chat_terminal_actions;
 mod code_text_language;
 mod document_find;
+mod file_chooser;
 pub(crate) mod java_knowledge;
 pub(crate) mod java_models;
+pub(crate) use local::ModelConfigurationKind;
 mod java_roles;
 mod lm_studio;
 pub(crate) mod lm_studio_auto;
@@ -2487,8 +2491,8 @@ impl Page {
             Self::LocalModels => "Local Models",
             Self::Knowledge => "Knowledge Stores",
             Self::Skills => "AI Skills",
-            Self::Memory => "AI Memory",
-            Self::LocalPreferences => "Local Preferences",
+            Self::Memory => "Memory",
+            Self::LocalPreferences => "Local AI",
         }
     }
 
@@ -2504,24 +2508,89 @@ impl Page {
             Self::Knowledge => "embedding documents files search retrieval index",
             Self::Skills => "prompt instructions rules learned learning markdown import export",
             Self::Memory => "global connection history learned archive restore",
-            Self::LocalPreferences => "default profiles text coding agent journal",
+            Self::LocalPreferences => "preferences default profiles text coding agent journal",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum GeneralSection {
+    #[default]
+    Features,
+    Agent,
+    Defaults,
+    Internet,
+}
+
+impl GeneralSection {
+    const ALL: [Self; 4] = [Self::Features, Self::Agent, Self::Defaults, Self::Internet];
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Features => "Features & safety",
+            Self::Agent => "Terminal agent",
+            Self::Defaults => "Defaults",
+            Self::Internet => "Internet access",
         }
     }
 
-    fn step(self, next: bool) -> Option<Self> {
-        let position = Self::ALL.iter().position(|&page| page == self)?;
-        let target = if next {
-            position + 1
-        } else {
-            position.checked_sub(1)?
-        };
-        Self::ALL.get(target).copied()
+    fn for_setting(setting: search::Setting) -> Self {
+        use search::{ImportedGeneral, Setting};
+        match setting {
+            Setting::GlobalTimeout
+            | Setting::CodeTextLanguage
+            | Setting::JournalSemanticSearch
+            | Setting::ImportedGeneral(ImportedGeneral::JournalSearch) => Self::Defaults,
+            Setting::AgentShortcut
+            | Setting::AgentShortcutName
+            | Setting::AgentShortcutCase
+            | Setting::AgentTriage
+            | Setting::AgentRunPresentation
+            | Setting::AgentExecution
+            | Setting::AgentConfirmation
+            | Setting::ShowAgentSetup
+            | Setting::ImportedGeneral(_) => Self::Agent,
+            _ => Self::Features,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum LocalSection {
+    #[default]
+    Roles,
+    Runtime,
+    HuggingFace,
+}
+
+impl LocalSection {
+    const ALL: [Self; 3] = [Self::Roles, Self::Runtime, Self::HuggingFace];
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Roles => "Profile roles",
+            Self::Runtime => "Local runtime",
+            Self::HuggingFace => "Hugging Face",
+        }
+    }
+
+    fn for_setting(setting: search::Setting) -> Self {
+        use search::{LocalPreference, Setting};
+        match setting {
+            Setting::Role(_) | Setting::LocalPreference(LocalPreference::ImportedRole(_)) => {
+                Self::Roles
+            }
+            Setting::LocalPreference(LocalPreference::HubAccess) => Self::HuggingFace,
+            _ => Self::Runtime,
+        }
     }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) enum Message {
     Page(Page),
+    GeneralSection(GeneralSection),
+    LocalSection(LocalSection),
     Search(String),
     SearchStep(isize),
     SearchChoose,
@@ -2565,7 +2634,7 @@ pub(crate) enum Message {
     ProfileDefaultSaved(Result<Arc<Configuration>, String>),
     PolicyProfilesRefreshed(Arc<Configuration>),
     RefreshPolicyAutoModels,
-    ManagedDefaultSaved(Result<Option<String>, String>),
+    ManagedDefaultSaved(Result<Option<local::ModelId>, String>),
     Escape,
     Close,
     CloseAnswer(bool),
@@ -2703,6 +2772,8 @@ pub(crate) struct Dialog {
     setup: Option<setup::Wizard>,
     setup_commit: Option<u64>,
     page: Page,
+    general_section: GeneralSection,
+    local_section: LocalSection,
     search: String,
     search_id: Id,
     search_selection: usize,
@@ -2720,6 +2791,10 @@ pub(crate) struct Dialog {
 }
 
 impl Dialog {
+    pub(crate) fn set_selection_modifiers(&mut self, modifiers: iced::keyboard::Modifiers) {
+        self.local.set_selection_modifiers(modifiers);
+    }
+
     pub(crate) fn new(
         saved: Arc<Configuration>,
         profile: PathBuf,
@@ -2761,6 +2836,8 @@ impl Dialog {
             setup_commit: None,
             saved,
             page: Page::default(),
+            general_section: GeneralSection::default(),
+            local_section: LocalSection::default(),
             search: String::new(),
             search_id: Id::unique(),
             search_selection: 0,
@@ -2861,9 +2938,10 @@ impl Dialog {
 
     pub(crate) fn set_automatic_knowledge_status(
         &mut self,
-        statuses: std::collections::BTreeMap<String, String>,
+        statuses: std::collections::BTreeMap<String, knowledge_sync::Status>,
+        active: Option<(String, Arc<knowledge_sync::SourceReport>)>,
     ) {
-        self.local.set_automatic_status(statuses);
+        self.local.set_automatic_status(statuses, active);
     }
 
     pub(crate) fn set_runtime_update_status(&mut self, status: Option<String>) {
@@ -2916,11 +2994,20 @@ impl Dialog {
             Page::Skills if self.skills.file_prompt_open() => {
                 Some(Message::Skills(skills::Message::Cancel))
             }
+            Page::Knowledge if self.local.knowledge_source_picker_open() => {
+                Some(Message::Local(local::Message::CloseKnowledgeSourcePicker))
+            }
             Page::LocalModels if self.local.backend_repair_open() => {
                 Some(Message::Local(local::Message::CloseBackendRepair))
             }
             Page::LocalModels if self.local.runtime_removal_review_open() => {
                 Some(Message::Local(local::Message::CancelRuntimeRemoval))
+            }
+            Page::LocalModels if self.local.runtime_review_title().is_some() => {
+                Some(Message::Local(local::Message::CloseRuntimeReview))
+            }
+            Page::LocalModels if self.editable() => {
+                self.local.models_escape_message().map(Message::Local)
             }
             _ => None,
         }
@@ -2936,6 +3023,8 @@ impl Dialog {
         if self.setup.is_some()
             || self.profile_wizard_open()
             || self.local.backend_repair_open()
+            || self.local.runtime_review_title().is_some()
+            || (self.page == Page::Knowledge && self.local.knowledge_source_picker_open())
             || (self.page == Page::LocalModels && self.local.runtime_removal_review_open())
         {
             self.child_escape_message()
@@ -2993,7 +3082,7 @@ impl Dialog {
         self.editable()
             && self.page == Page::LocalModels
             && self.search.trim().is_empty()
-            && self.local.has_managed_model_selection()
+            && self.local.has_managed_models_to_refresh()
     }
 
     fn editable(&self) -> bool {
@@ -3173,6 +3262,26 @@ impl Dialog {
         }
         match message {
             Message::Page(page) => return self.open_page(search::Target::Page(page)),
+            Message::GeneralSection(section) if self.page == Page::General => {
+                self.general_section = section;
+                self.revealed.setting = None;
+                self.search.clear();
+                self.search_selection = 0;
+                return iced::widget::operation::snap_to(
+                    self.revealed.viewport.clone(),
+                    iced::widget::operation::RelativeOffset::START,
+                );
+            }
+            Message::LocalSection(section) if self.page == Page::LocalPreferences => {
+                self.local_section = section;
+                self.revealed.setting = None;
+                self.search.clear();
+                self.search_selection = 0;
+                return iced::widget::operation::snap_to(
+                    self.revealed.viewport.clone(),
+                    iced::widget::operation::RelativeOffset::START,
+                );
+            }
             Message::ManagedModelStatusTick if self.shows_managed_model_status() => {
                 self.local.refresh_managed_model_status();
             }
@@ -3354,7 +3463,12 @@ impl Dialog {
             }
             Message::Profiles(profiles::Message::Save) if !profile_editable => {}
             Message::Profiles(profiles::Message::Save) | Message::Save
-                if editable && !self.busy() && !self.local.busy() && self.request.is_none() =>
+                if editable
+                    && !self.busy()
+                    && !self.local.busy()
+                    && !self.local.knowledge_source_picker_open()
+                    && self.local.knowledge_settings_title().is_none()
+                    && self.request.is_none() =>
             {
                 return self.save(vault);
             }
@@ -3526,6 +3640,48 @@ impl Dialog {
                         .stage_java_knowledge_source(&self.local_state, hint, &source);
                 }
             }
+            Message::Local(local::Message::OpenModelSetup) => {
+                return self.update_guided_setup(setup::Message::Open(None), vault);
+            }
+            Message::Local(local::Message::RevealKnowledgeSetting(setting))
+                if editable && self.page == Page::Knowledge =>
+            {
+                return self
+                    .open_page(search::Target::Setting(search::Setting::Knowledge(setting)));
+            }
+            Message::Local(local::Message::RevealManagedSetting(setting))
+                if editable && self.page == Page::LocalModels =>
+            {
+                return self.open_page(search::Target::Setting(search::Setting::Managed(setting)));
+            }
+            Message::Local(local::Message::RevealMlxConfiguration)
+                if editable && self.page == Page::LocalModels =>
+            {
+                return self.open_page(search::Target::Setting(search::Setting::Mlx(
+                    search::MlxSetting::Name,
+                )));
+            }
+            Message::Local(local::Message::RevealRuntimeImport)
+                if editable && self.page == Page::LocalModels =>
+            {
+                return self.open_page(search::Target::Setting(search::Setting::Control(
+                    search::Control::SignedIndex,
+                )));
+            }
+            Message::Local(local::Message::ManagedFilesPicked(ticket, paths)) => {
+                let can_import = editable
+                    && self.general.features_enabled
+                    && self.page == Page::LocalModels
+                    && self.search.trim().is_empty();
+                if self
+                    .local
+                    .finish_managed_file_picker(&ticket, paths, can_import)
+                {
+                    return self.open_page(search::Target::Setting(search::Setting::Managed(
+                        search::ManagedSetting::Source,
+                    )));
+                }
+            }
             Message::Local(event)
                 if editable
                     || matches!(
@@ -3534,18 +3690,31 @@ impl Dialog {
                             | local::Message::ManagedBackendLoaded(..)
                             | local::Message::PolicyEmbeddingsLoaded(..)
                             | local::Message::HubSizeResolved(..)
+                            | local::Message::SourceResults(..)
                     )
                     || (self.close_token.is_none()
                         && matches!(
                             event,
                             local::Message::CloseBackendRepair
+                                | local::Message::CloseRuntimeReview
                                 | local::Message::CancelRuntimeRemoval
+                                | local::Message::CancelSourceSync
+                                | local::Message::CancelFileSize
+                                | local::Message::CancelFolderAdvanced
+                                | local::Message::CloseKnowledgeSourcePicker
+                                | local::Message::KnowledgeSettings(
+                                    local::knowledge_settings::Action::Cancel
+                                )
                         )) =>
             {
                 if let local::Message::HuggingFace(action) = event {
                     if editable
                         && (matches!(action, local::huggingface::Action::Progress(..))
-                            || self.page == Page::LocalModels && self.search.trim().is_empty())
+                            || self.search.trim().is_empty()
+                                && (self.page == Page::LocalModels
+                                    || self.page == Page::LocalPreferences
+                                        && self.local_section == LocalSection::HuggingFace
+                                        && matches!(action, local::huggingface::Action::Token(_))))
                     {
                         return self
                             .local
@@ -3560,6 +3729,7 @@ impl Dialog {
                     && let Some(change) =
                         self.local.managed_default_change(&event, &self.local_state)
                 {
+                    self.local.close_default_menu();
                     self.saving = true;
                     self.notice = "Saving the default managed model…".into();
                     let profile = self.profile_dir.clone();
@@ -3568,6 +3738,7 @@ impl Dialog {
                         Message::ManagedDefaultSaved,
                     );
                 }
+                let source_picker = self.local.knowledge_source_picker_open();
                 let task = self
                     .local
                     .update_with_vault(
@@ -3578,7 +3749,9 @@ impl Dialog {
                         vault,
                     )
                     .map(Message::Local);
-                if backend_repair != self.local.backend_repair_open() {
+                if backend_repair != self.local.backend_repair_open()
+                    || source_picker != self.local.knowledge_source_picker_open()
+                {
                     self.search.clear();
                     self.search_selection = 0;
                     self.revealed.setting = None;
@@ -3688,6 +3861,7 @@ impl Dialog {
                     return Task::batch([
                         self.load_profile_usage(),
                         self.refresh_lm_studio_metadata(),
+                        self.load_knowledge_source_results(),
                     ]);
                 }
             }
@@ -3780,6 +3954,9 @@ impl Dialog {
                     LocalPreference::RefreshEmbeddingModels => {
                         self.local.can_refresh_embedding_inventory(self.editable())
                     }
+                    LocalPreference::HubAccess => self
+                        .local
+                        .can_reveal_hub_setting(search::HubSetting::Access, self.editable()),
                     LocalPreference::RuntimeUpdatePolicy
                     | LocalPreference::RuntimeBackend
                     | LocalPreference::EmbeddingSource => true,
@@ -3840,6 +4017,21 @@ impl Dialog {
     }
 
     fn open_page(&mut self, target: search::Target) -> Task<Message> {
+        if self.local.knowledge_source_advanced_open()
+            && let search::Target::Setting(
+                setting @ search::Setting::Knowledge(
+                    search::KnowledgeSetting::FileSize
+                    | search::KnowledgeSetting::ApplyFileSize
+                    | search::KnowledgeSetting::CancelFileSize,
+                ),
+            ) = target
+            && self.search_target_available(target)
+        {
+            self.search.clear();
+            self.search_selection = 0;
+            self.revealed.setting = Some(setting);
+            return self.revealed.apply();
+        }
         if self.local.backend_repair_open() {
             let search::Target::Setting(setting) = target else {
                 return Task::none();
@@ -3898,6 +4090,9 @@ impl Dialog {
         if state_dependent && !self.search_target_available(target) {
             return Task::none();
         }
+        self.local.close_knowledge_source_picker();
+        self.local.close_knowledge_settings();
+        self.local.close_default_menu();
         self.page = target.page();
         self.search.clear();
         self.search_selection = 0;
@@ -3907,6 +4102,16 @@ impl Dialog {
             }
             _ => None,
         };
+        if self.page == Page::General
+            && let Some(setting) = self.revealed.setting
+        {
+            self.general_section = GeneralSection::for_setting(setting);
+        }
+        if self.page == Page::LocalPreferences
+            && let Some(setting) = self.revealed.setting
+        {
+            self.local_section = LocalSection::for_setting(setting);
+        }
         if let Some(search::Setting::Profile(setting)) = self.revealed.setting {
             self.profiles
                 .update(profiles::Message::Section(setting.section()), false);
@@ -3914,10 +4119,37 @@ impl Dialog {
         if let Some(search::Setting::ProfileAction(action)) = self.revealed.setting {
             self.profiles.reveal_profile_action(action);
         }
+        if let Some(search::Setting::Control(control)) = self.revealed.setting
+            && control.page() == Page::Skills
+        {
+            self.skills.reveal_library_action(control);
+        }
         if let Some(search::Setting::Knowledge(setting)) = self.revealed.setting
             && setting.needs_store()
         {
             self.local.reveal_knowledge_store(&self.local_state);
+            if matches!(
+                setting,
+                search::KnowledgeSetting::SourcePath
+                    | search::KnowledgeSetting::AddFile
+                    | search::KnowledgeSetting::ReviewFolder
+            ) {
+                self.local.reveal_knowledge_path();
+            }
+        }
+        if let Some(search::Setting::Knowledge(setting)) = self.revealed.setting
+            && setting.store_settings()
+            && self.editable()
+        {
+            self.local.open_knowledge_settings(
+                &self.local_state,
+                setting == search::KnowledgeSetting::Name,
+                setting.advanced_store_settings(),
+            );
+            return Task::batch([
+                self.revealed.apply(),
+                self.local.suggest_local_dimensions().map(Message::Local),
+            ]);
         }
         let scroll = match self.revealed.setting {
             Some(search::Setting::Control(control)) if control.runtime_progress() => Task::none(),
@@ -3930,6 +4162,19 @@ impl Dialog {
         if let Some(search::Setting::Managed(setting)) = self.revealed.setting {
             let load = self.local.reveal_managed_setting(setting, self.editable());
             return Task::batch([scroll, load.map(Message::Local)]);
+        }
+        if self.page == Page::LocalModels
+            && matches!(
+                self.revealed.setting,
+                Some(search::Setting::Control(
+                    search::Control::SignedIndex
+                        | search::Control::IndexSignature
+                        | search::Control::RuntimePackage
+                        | search::Control::InstallRuntime
+                ))
+            )
+        {
+            self.local.reveal_offline_runtime();
         }
         if let Some(search::Setting::Mlx(setting)) = self.revealed.setting {
             return Task::batch([
@@ -3950,6 +4195,7 @@ impl Dialog {
                             | search::LocalPreference::ImportedRole(_)
                             | search::LocalPreference::EmbeddingSetup
                             | search::LocalPreference::RefreshEmbeddingModels
+                            | search::LocalPreference::HubAccess
                     )
                     | search::Setting::Hub(_)
             )
@@ -4014,7 +4260,19 @@ impl Dialog {
             load,
             self.load_profile_usage(),
             self.refresh_lm_studio_metadata(),
+            self.load_knowledge_source_results(),
         ])
+    }
+
+    pub(crate) fn load_knowledge_source_results(&mut self) -> Task<Message> {
+        if self.page == Page::Knowledge {
+            self.local.reveal_knowledge_store(&self.local_state);
+            self.local
+                .load_source_results(&self.local_state)
+                .map(Message::Local)
+        } else {
+            Task::none()
+        }
     }
 
     fn set_default_profile(&mut self, id: ProfileId) -> Task<Message> {
@@ -4574,13 +4832,152 @@ impl Dialog {
         hub_tokens: Vec<CredentialChoice>,
         qdrant_keys: Vec<CredentialChoice>,
     ) -> Element<'_, Message> {
-        self.view_with_skill_credentials(hub_tokens, qdrant_keys, &[])
+        self.knowledge_settings_view(qdrant_keys)
+            .unwrap_or_else(|| self.view_with_skill_credentials(hub_tokens, &[]))
+    }
+
+    pub(crate) fn knowledge_settings_title(&self) -> Option<&'static str> {
+        self.local.knowledge_settings_title()
+    }
+
+    pub(crate) fn knowledge_settings_height(&self) -> Option<f32> {
+        self.local.knowledge_settings_height()
+    }
+
+    pub(crate) fn knowledge_file_review_open(&self) -> bool {
+        self.local.knowledge_file_review_open()
+    }
+
+    pub(crate) fn knowledge_source_updates_open(&self) -> bool {
+        self.local.knowledge_source_updates_open()
+    }
+
+    pub(crate) fn knowledge_source_removal_open(&self) -> bool {
+        self.local.source_removal_height().is_some()
+    }
+
+    pub(crate) fn knowledge_source_sync_open(&self) -> bool {
+        self.local.knowledge_source_sync_open()
+    }
+
+    pub(crate) fn knowledge_source_advanced_open(&self) -> bool {
+        self.local.knowledge_source_advanced_open()
+    }
+
+    pub(crate) fn native_file_picker(
+        &self,
+        message: &Message,
+        owner: iced::window::Id,
+    ) -> Option<Task<Message>> {
+        if let Message::Local(local::Message::OpenManagedFilePicker(ticket)) = message {
+            if !self.local.pending_managed_file_picker(ticket) {
+                return Some(Task::none());
+            }
+            let ticket = Arc::clone(ticket);
+            return Some(
+                iced::window::run(owner, local::pick_native_managed_files).then(move |picker| {
+                    let ticket = Arc::clone(&ticket);
+                    Task::perform(picker, move |paths| {
+                        Message::Local(local::Message::ManagedFilesPicked(ticket, paths))
+                    })
+                }),
+            );
+        }
+        let Message::Local(local::Message::OpenNativeKnowledgeSourcePicker(ticket)) = message
+        else {
+            return None;
+        };
+        let ticket = *ticket;
+        let Some(kind) = self.local.pending_native_knowledge_kind(ticket) else {
+            return Some(Task::none());
+        };
+        Some(
+            iced::window::run(owner, move |window| {
+                local::pick_native_knowledge_sources(window, kind)
+            })
+            .then(move |picker| {
+                Task::perform(picker, move |paths| {
+                    Message::Local(local::Message::NativeKnowledgeSourcesPicked(ticket, paths))
+                })
+            }),
+        )
+    }
+
+    pub(crate) fn cancel_knowledge_settings(&mut self) {
+        self.local.close_knowledge_settings();
+    }
+
+    pub(crate) fn runtime_review_title(&self) -> Option<&'static str> {
+        self.local.runtime_review_title()
+    }
+
+    pub(crate) fn runtime_review_height(&self) -> Option<f32> {
+        self.local.runtime_review_height()
+    }
+
+    pub(crate) fn runtime_versions_open(&self) -> bool {
+        self.local.runtime_versions_open()
+    }
+
+    pub(crate) fn close_runtime_review(&mut self) {
+        self.local.close_runtime_review();
+    }
+
+    pub(crate) fn runtime_review_view(&self) -> Option<Element<'_, Message>> {
+        self.local
+            .runtime_review_view(self.editable() && self.general.features_enabled)
+            .map(|view| view.map(Message::Local))
+    }
+
+    pub(crate) fn model_review_title(&self) -> Option<&'static str> {
+        self.local.model_review_title()
+    }
+
+    pub(crate) fn model_configuration_kind(&self) -> Option<ModelConfigurationKind> {
+        self.local.model_configuration_kind()
+    }
+
+    pub(crate) fn model_configuration_view(&self) -> Option<Element<'_, Message>> {
+        self.local
+            .model_configuration_view(
+                self.editable() && self.general.features_enabled,
+                &self.revealed,
+            )
+            .map(|view| view.map(Message::Local))
+    }
+
+    pub(crate) fn cancel_model_configuration(&mut self) {
+        self.local.cancel_model_configuration();
+    }
+
+    pub(crate) fn model_review_view(&self) -> Option<Element<'_, Message>> {
+        self.local
+            .model_review_view(self.editable() && self.general.features_enabled)
+            .map(|view| view.map(Message::Local))
+    }
+
+    pub(crate) fn cancel_model_review(&mut self) {
+        self.local.cancel_model_review();
+    }
+
+    pub(crate) fn knowledge_settings_view(
+        &self,
+        qdrant_keys: Vec<CredentialChoice>,
+    ) -> Option<Element<'_, Message>> {
+        self.local
+            .knowledge_settings_view(
+                &self.local_state,
+                self.profiles.catalog(),
+                qdrant_keys,
+                self.editable(),
+                &self.revealed,
+            )
+            .map(|view| view.map(Message::Local))
     }
 
     pub(crate) fn view_with_skill_credentials(
         &self,
         hub_tokens: Vec<CredentialChoice>,
-        qdrant_keys: Vec<CredentialChoice>,
         skill_credentials: &[CredentialChoice],
     ) -> Element<'_, Message> {
         if let Some(wizard) = &self.setup {
@@ -4590,162 +4987,141 @@ impl Dialog {
                 .height(Length::Fill)
                 .into();
         }
-        let child_form_open = self.profile_wizard_open() || self.local.backend_repair_open();
-        let controls = row![
-            button("‹").on_press_maybe(self.page.step(false).map(Message::Page)),
-            text(self.page.title()),
-            button("›").on_press_maybe(self.page.step(true).map(Message::Page)),
-        ]
-        .spacing(6)
-        .align_y(Alignment::Center);
-        let header = row![
-            crate::settings_search::input(
-                text_input(
-                    if self.profile_wizard_open() {
-                        "Search profile setup…"
-                    } else if self.local.backend_repair_open() {
-                        "Search runtime repair…"
-                    } else {
-                        "Search AI settings…"
-                    },
-                    &self.search
+        let source_picker_open =
+            self.page == Page::Knowledge && self.local.knowledge_source_picker_open();
+        let child_form_open =
+            self.profile_wizard_open() || self.local.backend_repair_open() || source_picker_open;
+        let search_field = crate::settings_search::input(
+            text_input(
+                if self.profile_wizard_open() {
+                    "Search profile setup…"
+                } else if self.local.backend_repair_open() {
+                    "Search runtime repair…"
+                } else {
+                    "Search the AI Manager… (e.g. agent profile, time limit, internet access)"
+                },
+                &self.search,
+            )
+            .size(13)
+            .padding(6)
+            .id(self.search_id.clone())
+            .on_input(Message::Search)
+            .on_submit(Message::SearchChoose),
+            Message::SearchStep(-1),
+            Message::SearchStep(1),
+            (!self.search.is_empty()).then_some(Message::SearchEscape),
+            None,
+        );
+        let mut search = stack![search_field];
+        if !self.search.is_empty() {
+            search = search.push(
+                container(
+                    button(text("×").size(13))
+                        .padding([2, 6])
+                        .style(button::text)
+                        .on_press(Message::SearchEscape),
                 )
-                .id(self.search_id.clone())
-                .on_input(Message::Search)
-                .on_submit(Message::SearchChoose),
-                Message::SearchStep(-1),
-                Message::SearchStep(1),
-                (!self.search.is_empty()).then_some(Message::SearchEscape),
-                None,
-            ),
-            (!child_form_open).then_some(controls),
-            (!child_form_open)
-                .then(|| button("Manual").style(button::text).on_press(Message::Help)),
-        ]
-        .spacing(10)
-        .align_y(Alignment::Center);
-        let tabs = scrollable(
-            row(Page::ALL.into_iter().map(|page| {
-                button(page.title())
-                    .style(if page == self.page {
-                        button::primary
-                    } else {
-                        button::secondary
-                    })
-                    .on_press(Message::Page(page))
-                    .into()
-            }))
-            .spacing(3),
-        )
+                .padding([0, 4])
+                .width(Length::Fill)
+                .center_y(Length::Fill)
+                .align_x(Alignment::End),
+            );
+        }
+        let search = container(container(search).max_width(640)).center_x(Length::Fill);
+        let tabs = scrollable(row(Page::ALL.into_iter().map(|page| {
+            dialog_design::primary_tab(page.title(), page == self.page, Message::Page(page))
+        })))
         .direction(scrollable::Direction::Horizontal(
-            scrollable::Scrollbar::new().spacing(4),
+            scrollable::Scrollbar::new()
+                .width(4)
+                .scroller_width(4)
+                .spacing(0),
         ))
         .width(Length::Fill);
-        let content: Element<'_, Message> = if self.search.trim().is_empty() {
-            match self.page {
-                Page::General => self.general_view(),
-                Page::Profiles => self
-                    .profiles
+        let content: Element<'_, Message> = match self.page {
+            Page::General => self.general_view(),
+            Page::Profiles => self
+                .profiles
+                .view(
+                    self.editable(),
+                    self.can_open_profile_wizard(),
+                    self.profile_policy.create,
+                    self.profiles.catalog() != &self.saved.profiles,
+                    self.profile_form_lock(),
+                    &self.revealed,
+                )
+                .map(Message::Profiles),
+            Page::Skills if self.editable() => self
+                .skills
+                .view(
+                    &self.skill_store,
+                    self.can_shorten_skill(),
+                    &self.revealed,
+                    skill_credentials,
+                )
+                .map(Message::Skills),
+            Page::Memory => self
+                .memory
+                .view(
+                    self.editable()
+                        && self.general.features_enabled
+                        && self.saved.enabled()
+                        && self.saved.profiles.default_profile().is_some(),
+                    &self.revealed,
+                )
+                .map(Message::Memory),
+            Page::Skills => text("AI skill editing is unavailable.").into(),
+            Page::LocalModels | Page::Knowledge | Page::LocalPreferences => {
+                let page = match self.page {
+                    Page::LocalModels => local::Page::Models {
+                        tokens: hub_tokens,
+                        hints: &self.saved.java_model_hints,
+                        setup_available: self.can_open_guided_setup(None),
+                    },
+                    Page::Knowledge => local::Page::Knowledge(
+                        &self.saved.java_knowledge_hints,
+                        &self.saved.java_model_hints,
+                    ),
+                    _ => local::Page::Preferences(self.local_section, hub_tokens),
+                };
+                let mut content = self
+                    .local
                     .view(
+                        page,
+                        &self.local_state,
+                        self.profiles.catalog(),
                         self.editable(),
-                        self.can_open_profile_wizard(),
-                        self.profile_policy.create,
-                        self.profile_form_lock(),
+                        self.general.features_enabled,
                         &self.revealed,
                     )
-                    .map(Message::Profiles),
-                Page::Skills if self.editable() => self
-                    .skills
-                    .view(
-                        &self.skill_store,
-                        self.can_shorten_skill(),
-                        &self.revealed,
-                        skill_credentials,
-                    )
-                    .map(Message::Skills),
-                Page::Memory => self
-                    .memory
-                    .view(
-                        self.editable()
-                            && self.general.features_enabled
-                            && self.saved.enabled()
-                            && self.saved.profiles.default_profile().is_some(),
-                        &self.revealed,
-                    )
-                    .map(Message::Memory),
-                Page::Skills => text("AI skill editing is unavailable.").into(),
-                Page::LocalModels | Page::Knowledge | Page::LocalPreferences => {
-                    let page = match self.page {
-                        Page::LocalModels => {
-                            local::Page::Models(hub_tokens, &self.saved.java_model_hints)
-                        }
-                        Page::Knowledge => local::Page::Knowledge(
-                            qdrant_keys,
-                            &self.saved.java_knowledge_hints,
-                            &self.saved.java_model_hints,
-                        ),
-                        _ => local::Page::Preferences,
-                    };
-                    let mut content = self
-                        .local
-                        .view(
-                            page,
-                            &self.local_state,
-                            self.profiles.catalog(),
-                            self.editable(),
-                            self.general.features_enabled,
-                            &self.revealed,
-                        )
-                        .map(Message::Local);
-                    if self.page == Page::LocalPreferences
-                        && let Some(roles) = self.java_roles_view()
-                    {
-                        content = column![roles, content].spacing(10).into();
-                    }
-                    let setup_role = match self.page {
-                        Page::LocalModels => Some(None),
-                        Page::LocalPreferences if self.local_state.needs_guided_embedding() => {
-                            Some(Some(setup::Role::Embedding))
-                        }
-                        _ => None,
-                    };
-                    if let Some(role) = setup_role {
-                        let catalog = (self.page == Page::LocalModels).then(|| {
-                            self.saved.model_catalog.as_ref().map_or_else(
-                                || "Model and prompt catalog · Bundled".into(),
-                                |catalog| {
-                                    format!("Model and prompt catalog · {}", catalog.version())
-                                },
-                            )
-                        });
-                        let setup = button(if role.is_some() {
-                            "Set up an embedding model…"
-                        } else {
-                            "Set up local AI…"
-                        })
-                        .on_press_maybe(
-                            self.can_open_guided_setup(role)
-                                .then_some(Message::Setup(setup::Message::Open(role))),
-                        );
-                        let setting = if role.is_none() {
-                            search::Setting::Control(search::Control::LocalSetup)
-                        } else {
-                            search::Setting::LocalPreference(
-                                search::LocalPreference::EmbeddingSetup,
-                            )
-                        };
-                        let setup = self.revealed.action(setting, setup);
-                        column![setup, catalog.map(|label| text(label).size(13)), content]
-                            .spacing(8)
-                            .height(Length::Fill)
-                            .into()
-                    } else {
-                        content
-                    }
+                    .map(Message::Local);
+                if self.page == Page::LocalPreferences
+                    && self.local_section == LocalSection::Roles
+                    && let Some(roles) = self.java_roles_view()
+                {
+                    content = column![content, roles].spacing(10).into();
+                }
+                if self.page == Page::LocalPreferences
+                    && self.local_section == LocalSection::Runtime
+                    && self.local_state.needs_guided_embedding()
+                {
+                    let role = Some(setup::Role::Embedding);
+                    let setup = button("Set up an embedding model…").on_press_maybe(
+                        self.can_open_guided_setup(role)
+                            .then_some(Message::Setup(setup::Message::Open(role))),
+                    );
+                    let setup = self.revealed.action(
+                        search::Setting::LocalPreference(search::LocalPreference::EmbeddingSetup),
+                        setup,
+                    );
+                    column![content, setup]
+                        .spacing(8)
+                        .height(Length::Fill)
+                        .into()
+                } else {
+                    content
                 }
             }
-        } else {
-            self.search_view()
         };
         let notice = container(
             scrollable(
@@ -4759,37 +5135,44 @@ impl Dialog {
         .width(Length::Fill)
         .max_height(MAX_NOTICE_HEIGHT);
         let footer = row![
+            (!child_form_open).then(|| button(text("Manual").size(13))
+                .style(button::text)
+                .on_press(Message::Help)),
             notice,
             self.request
                 .as_ref()
                 .map(|_| button("Cancel request").on_press(Message::CancelRequest)),
-            (!child_form_open && self.page != Page::Profiles).then(|| button(if self.saving {
-                "Saving…"
-            } else {
-                "Save"
-            })
+            (!child_form_open).then(|| button(
+                container(text("Close").size(13)).center_x(Length::Fill)
+            )
+            .width(76)
+            .padding([7, 5])
+            .style(dialog_design::secondary_button)
             .on_press_maybe(
-                (self.editable()
-                    && !self.busy()
-                    && !self.local.busy()
-                    && self.request.is_none()
-                    && self.dirty())
-                .then_some(Message::Save)
-            )),
-            (!child_form_open).then(|| button("Close").style(button::secondary).on_press_maybe(
                 (!self.busy()).then(|| { self.child_close_message().unwrap_or(Message::Close) })
             )),
         ]
         .spacing(8)
         .align_y(Alignment::Center);
-        let content: Element<'_, Message> = if !self.search.trim().is_empty() {
-            scrollable(content)
-                .id(self.search_scroll.clone())
-                .height(Length::Fill)
-                .into()
-        } else if matches!(self.page, Page::General | Page::LocalPreferences)
-            || self.page == Page::Memory && !self.memory.reviewing_document()
-        {
+        let content: Element<'_, Message> = if self.page == Page::LocalPreferences {
+            let tabs = row(LocalSection::ALL.into_iter().map(|section| {
+                let selected = self.local_section == section;
+                button(text(section.title()).size(13))
+                    .padding([7, 14])
+                    .style(move |theme, status| dialog_design::tab(theme, status, selected))
+                    .on_press(Message::LocalSection(section))
+                    .into()
+            }));
+            column![
+                tabs,
+                iced::widget::rule::horizontal(1),
+                scrollable(container(content).padding([12, 10]))
+                    .id(self.revealed.viewport.clone())
+                    .height(Length::Fill),
+            ]
+            .height(Length::Fill)
+            .into()
+        } else if self.page == Page::Memory && !self.memory.reviewing_document() {
             scrollable(content)
                 .id(self.revealed.viewport.clone())
                 .height(Length::Fill)
@@ -4797,10 +5180,65 @@ impl Dialog {
         } else {
             container(content).height(Length::Fill).into()
         };
-        let body = column![header, (!child_form_open).then_some(tabs), content, footer]
-            .spacing(10)
-            .padding([10, 14])
-            .height(Length::Fill);
+        let content = column![
+            content,
+            (!child_form_open && self.page != Page::Profiles).then(|| row![
+                space::horizontal(),
+                button(
+                    container(text(if self.saving { "Saving…" } else { "Save" }).size(13))
+                        .center_x(Length::Fill)
+                )
+                .style(dialog_design::secondary_button)
+                .width(78)
+                .padding([7, 5])
+                .on_press_maybe(
+                    (self.editable()
+                        && !self.busy()
+                        && !self.local.busy()
+                        && self.request.is_none()
+                        && self.dirty())
+                    .then_some(Message::Save)
+                ),
+            ]
+            .padding(6)),
+        ]
+        .height(Length::Fill);
+        let pages = column![
+            (!child_form_open).then_some(tabs),
+            container(content)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(dialog_design::page),
+        ]
+        .height(Length::Fill);
+        let mut pages = stack![pages].height(Length::Fill).width(Length::Fill);
+        if !self.search.trim().is_empty() {
+            let results = container(
+                scrollable(self.search_view())
+                    .id(self.search_scroll.clone())
+                    .height(Length::Shrink),
+            )
+            .padding(4)
+            .width(Length::Fill)
+            .max_width(640)
+            .max_height(380)
+            .style(container::bordered_box);
+            pages = pages.push(container(iced::widget::opaque(results)).center_x(Length::Fill));
+        }
+        let title =
+            container(text("Manage AI profiles, models, knowledge stores and skills").size(14))
+                .padding([0, 12])
+                .center_y(44)
+                .width(Length::Fill)
+                .style(dialog_design::header);
+        let body = column![
+            title,
+            column![(!source_picker_open).then_some(search), pages, footer]
+                .spacing(8)
+                .padding(12)
+                .height(Length::Fill),
+        ]
+        .height(Length::Fill);
         if self.close_token.is_some() {
             iced::widget::stack![
                 body,
@@ -4832,7 +5270,9 @@ impl Dialog {
     fn general_view(&self) -> Element<'_, Message> {
         use search::ImportedGeneral;
         use search::Setting::{Features, GlobalTimeout};
-        let mut features = checkbox(self.general.features_enabled).label(Features.title());
+        let mut features = checkbox(self.general.features_enabled)
+            .label(Features.title())
+            .text_size(13);
         let mut timeout = text_input("0–1440", &self.timeout).width(80);
         if self.editable() {
             features = features.on_toggle(Message::Features);
@@ -4856,6 +5296,8 @@ impl Dialog {
                 Some(self.general.chat_terminal_actions),
                 Message::ChatTerminalActions,
             )
+            .width(188)
+            .text_size(13)
             .dismiss_on_escape()
         } else {
             text(self.general.chat_terminal_actions.to_string()).into()
@@ -4902,38 +5344,32 @@ impl Dialog {
             case = case.on_toggle(Message::AgentShortcutCaseInsensitive);
             show_setup = show_setup.on_toggle(Message::ShowAgentSetup);
         }
-        column![
-            text("Features").size(19),
-            self.revealed.wrap(Features, features),
-            text("AI features use configured profiles. Local diagram generation remains available."),
-            text("Limits").size(19),
-            self.revealed.wrap(
-                GlobalTimeout,
-                row![text(GlobalTimeout.title()), self.revealed.input(GlobalTimeout, self.editable(), timeout)]
-                    .spacing(12).align_y(Alignment::Center),
-            ),
-            text("Use 0 to turn off the profile request timeout. Workflow, connection and CLI limits still apply.").size(13),
-            text("AI chat").size(19),
+        let tab_row = row(GeneralSection::ALL.into_iter().map(|section| {
+            let selected = self.general_section == section;
+            button(text(section.title()).size(13))
+                .padding([7, 14])
+                .style(move |theme, status| dialog_design::tab(theme, status, selected))
+                .on_press(Message::GeneralSection(section))
+                .into()
+        }));
+        let page: Element<'_, Message> = match self.general_section {
+            GeneralSection::Features => column![
+                row![
+                    space::horizontal().width(212),
+                    column![
+                        self.revealed.wrap(Features, features),
+                        text("AI features use configured profiles. Local diagram generation remains available.").size(12),
+                    ].spacing(8),
+                ],
+                iced::widget::rule::horizontal(1),
             self.revealed.wrap(
                 terminal_actions_setting,
-                row![text(terminal_actions_setting.title()), terminal_actions]
-                    .spacing(12)
+                row![text("AI chat code blocks in the terminal:").size(13).width(212), terminal_actions]
                     .align_y(Alignment::Center)
                     .wrap(),
             ),
-            text("Journal search").size(19),
-            self.revealed.wrap(search::Setting::JournalSemanticSearch, checkbox(self.general.journal_semantic_search)
-                .label("Use local semantic ranking when preparing cross-journal questions")
-                .on_toggle_maybe(self.editable().then_some(Message::JournalSemanticSearch))),
-            text("Preparing a cross-journal question sends its masked text and new or changed search cards to the configured local embedding model. Lexical ranking is used if no model is available. Answer requests still require review.").size(13),
-            self.saved.java_journal_semantic_search.map(|enabled| self.revealed.wrap(
-                search::Setting::ImportedGeneral(ImportedGeneral::JournalSearch),
-                row![
-                    text(format!("Imported from Java: semantic search {}", if enabled { "on" } else { "off" })).size(13),
-                    button("Use imported search preference").on_press_maybe(self.editable().then_some(Message::AdoptJavaJournalSemanticSearch)),
-                ].spacing(8).wrap(),
-            )),
-            text("Terminal AI Agent").size(19),
+            ].spacing(10).into(),
+            GeneralSection::Agent => column![
             self.revealed.wrap(
                 run_presentation_setting,
                 row![text(run_presentation_setting.title()), run_presentation_control]
@@ -4994,7 +5430,14 @@ impl Dialog {
                     text("When unchecked, a submitted Run or Ask alias with a task can skip setup when the required details are available. Run still opens the environment probe review.").size(13),
                 ].spacing(6),
             ),
-            text("Snippet text").size(19),
+            ].spacing(10).into(),
+            GeneralSection::Defaults => column![
+            self.revealed.wrap(
+                GlobalTimeout,
+                row![text(GlobalTimeout.title()), self.revealed.input(GlobalTimeout, self.editable(), timeout)]
+                    .spacing(12).align_y(Alignment::Center),
+            ),
+            text("Use 0 to turn off the profile request timeout. Workflow, connection and CLI limits still apply.").size(13),
             self.revealed.wrap(
                 language_setting,
                 row![text(language_setting.title()), code_text_language]
@@ -5002,9 +5445,33 @@ impl Dialog {
                     .align_y(Alignment::Center)
                     .wrap(),
             ),
-            text("Providers").size(19),
-            text("Choose a local service, a managed GGUF model, or a trusted HTTPS provider in Profiles. Terminal Chat shows the selected destination and masked messages before sending.").size(13),
-        ].spacing(12).into()
+            self.revealed.wrap(search::Setting::JournalSemanticSearch, checkbox(self.general.journal_semantic_search)
+                .label("Use local semantic ranking when preparing cross-journal questions")
+                .on_toggle_maybe(self.editable().then_some(Message::JournalSemanticSearch))),
+            text("Preparing a cross-journal question sends its masked text and new or changed search cards to the configured local embedding model. Lexical ranking is used if no model is available. Answer requests still require review.").size(13),
+            self.saved.java_journal_semantic_search.map(|enabled| self.revealed.wrap(
+                search::Setting::ImportedGeneral(ImportedGeneral::JournalSearch),
+                row![
+                    text(format!("Imported from Java: semantic search {}", if enabled { "on" } else { "off" })).size(13),
+                    button("Use imported search preference").on_press_maybe(self.editable().then_some(Message::AdoptJavaJournalSemanticSearch)),
+                ].spacing(8).wrap(),
+            )),
+            ].spacing(10).into(),
+            GeneralSection::Internet => column![
+                text("Internet access is configured per profile. Open the model section of a supported profile to review its web search options.").size(13),
+                button("Open Profiles").style(button::secondary).on_press(Message::Page(Page::Profiles)),
+            ].spacing(10).into(),
+        };
+        column![
+            container(tab_row)
+                .width(Length::Fill)
+                .style(dialog_design::sidebar),
+            scrollable(container(page).padding([12, 14]).width(Length::Fill))
+                .id(self.revealed.viewport.clone())
+                .height(Length::Fill),
+        ]
+        .height(Length::Fill)
+        .into()
     }
 
     fn search_view(&self) -> Element<'_, Message> {
@@ -5012,7 +5479,7 @@ impl Dialog {
         if matches.peek().is_none() {
             return text("No matching settings.").into();
         }
-        let mut results = column![text("Matching AI settings").size(17)].spacing(8);
+        let mut results = column![].spacing(2);
         for (index, target) in matches {
             let selected = index == self.search_selection;
             let label = match target {
@@ -5020,18 +5487,31 @@ impl Dialog {
                     .saved
                     .java_model_hints
                     .search_hint(key)
-                    .map(|hint| format!("{} · {}", Page::LocalModels.title(), hint.label()))
+                    .map(|hint| hint.label())
                     .unwrap_or_else(|| target.label()),
+                search::Target::Setting(setting) => setting.title().into(),
                 _ => target.label(),
             };
-            let result = button(text(label).wrapping(text::Wrapping::WordOrGlyph))
-                .style(if selected {
-                    button::primary
-                } else {
-                    button::secondary
-                })
-                .width(Length::Fill)
-                .on_press(Message::Reveal(target));
+            let result = button(
+                row![
+                    text(label)
+                        .size(13)
+                        .width(Length::Fill)
+                        .wrapping(text::Wrapping::WordOrGlyph),
+                    matches!(target, search::Target::Setting(_))
+                        .then(|| text(target.page().title()).size(12))
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+            )
+            .style(if selected {
+                button::primary
+            } else {
+                button::secondary
+            })
+            .padding([6, 10])
+            .width(Length::Fill)
+            .on_press(Message::Reveal(target));
             let row = container(result);
             results = results.push(if selected {
                 row.id(self.search_row.clone())
@@ -5049,6 +5529,27 @@ mod tests {
     use iced::{Font, Pixels, Renderer, Size};
 
     use super::*;
+
+    #[test]
+    fn search_opens_the_general_section_that_owns_the_result() {
+        let mut dialog = Dialog::new(
+            Arc::new(Configuration::default()),
+            PathBuf::new(),
+            Vec::new(),
+            true,
+            None,
+        );
+        for (setting, expected) in [
+            (search::Setting::GlobalTimeout, GeneralSection::Defaults),
+            (search::Setting::AgentTriage, GeneralSection::Agent),
+            (search::Setting::Features, GeneralSection::Features),
+        ] {
+            let _ = dialog.update(Message::Reveal(search::Target::Setting(setting)));
+            assert_eq!(dialog.page, Page::General);
+            assert_eq!(dialog.general_section, expected);
+            assert_eq!(dialog.revealed.setting, Some(setting));
+        }
+    }
 
     #[test]
     fn signed_catalog_changes_auto_provider_revisions_without_changing_saved_preferences() {
@@ -5291,7 +5792,10 @@ mod tests {
             let mut tree = Tree::new(view.as_widget());
             let limits = layout::Limits::new(Size::ZERO, Size::new(width, 480.0));
             let node = view.as_widget_mut().layout(&mut tree, &renderer, &limits);
-            let tabs = Layout::new(&node).children().nth(1).unwrap();
+            let body = Layout::new(&node).children().nth(1).unwrap();
+            let stack = body.children().nth(1).unwrap();
+            let page = stack.children().next().unwrap();
+            let tabs = page.children().next().unwrap();
             let buttons = tabs.children().next().unwrap();
             (tabs.bounds(), buttons.bounds())
         };
@@ -5303,7 +5807,7 @@ mod tests {
         // The intrinsic width of the labels varies with the platform fonts.
         let (narrow, narrow_buttons) = tab_bounds(wide_buttons.width * 0.75);
         assert!(narrow_buttons.width > narrow.width);
-        assert!(narrow.height - narrow_buttons.height >= 10.0);
+        assert_eq!(narrow.height - narrow_buttons.height, 4.0);
     }
 
     #[test]
@@ -6206,7 +6710,7 @@ mod tests {
         }
 
         let (_scratch, mut dialog) = default_profile_dialog();
-        let first = dialog.update(Message::Profiles(ProfileMessage::Section(Section::Limits)));
+        let first = dialog.update(Message::Profiles(ProfileMessage::Section(Section::Budget)));
         assert!(
             iced_runtime::task::into_stream(
                 dialog.update(Message::Profiles(ProfileMessage::Select(2)))
@@ -6422,23 +6926,25 @@ mod tests {
         let mut view = dialog.view(Vec::new(), Vec::new());
         let mut tree = Tree::new(view.as_widget());
         let renderer = Renderer::new(Font::DEFAULT, Pixels(14.0));
-        let size = Size::new(600.0, 190.0);
+        let size = Size::new(600.0, 216.0);
         let node = view.as_widget_mut().layout(
             &mut tree,
             &renderer,
             &layout::Limits::new(Size::ZERO, size),
         );
-        let mut children = Layout::new(&node).children();
-        let content = children.nth(2).unwrap().bounds();
+        let body = Layout::new(&node).children().nth(1).unwrap();
+        let mut children = body.children();
+        let content = children.nth(1).unwrap().bounds();
         let footer = children.next().unwrap();
         let mut footer_items = footer.children();
+        let manual = footer_items.next().unwrap().bounds();
         let notice = footer_items.next().unwrap().children().next().unwrap();
         let notice_text = notice.children().next().unwrap().bounds();
         assert!(notice_text.height > notice.bounds().height);
         assert!(notice.bounds().height <= MAX_NOTICE_HEIGHT);
         assert!(content.height > 24.0, "page bounds: {content:?}");
-        let actions: Vec<_> = footer_items
-            .map(|item| item.bounds())
+        let actions: Vec<_> = std::iter::once(manual)
+            .chain(footer_items.map(|item| item.bounds()))
             .filter(|bounds| bounds.width > 0.0)
             .collect();
         assert_eq!(actions.len(), 2);

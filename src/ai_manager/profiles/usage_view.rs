@@ -4,10 +4,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use iced::widget::{button, column, progress_bar, row, text, text_input};
-use iced::{Element, Length};
+use iced::{Alignment, Element, Length};
 
 use crate::ai_manager::search::{ProfileSetting, Reveal, Setting};
 use crate::local_ai::{UsageBudget, UsageSnapshot, UsageWarning};
+use crate::workspace::dialog_design;
 
 use super::{Message, Profile, ProfileId, ProfileRef};
 
@@ -109,45 +110,93 @@ impl Editor {
 
     pub(super) fn view<'a>(
         &'a self,
-        profile: &'a Profile,
+        profile: Option<&'a Profile>,
         editable: bool,
         reveal: &Reveal,
     ) -> Element<'a, Message> {
-        let budget = &profile.usage_budget;
-        let input = |field: Field, value: String| {
-            let value = self
-                .invalid
-                .get(&(profile.id, field))
+        let defaults = UsageBudget::default();
+        let budget = profile.map_or(&defaults, |profile| &profile.usage_budget);
+        let input = |field: Field, value: String, width: u32| -> Element<'a, Message> {
+            let value = profile
+                .and_then(|profile| self.invalid.get(&(profile.id, field)))
                 .map_or(value.as_str(), String::as_str);
             let setting = Setting::Profile(ProfileSetting::Usage(field));
             let field_input = text_input("", value)
-                .on_input_maybe(editable.then_some(move |value| Message::EditUsage(field, value)))
-                .width(168);
-            reveal.action(
-                setting,
-                column![
-                    text(field.label()).size(13),
-                    reveal.input(setting, editable, field_input),
-                ]
-                .spacing(4),
-            )
+                .size(13)
+                .width(width)
+                .style(dialog_design::form_input)
+                .on_input_maybe(
+                    (profile.is_some() && editable)
+                        .then_some(move |value| Message::EditUsage(field, value)),
+                );
+            if profile.is_some() {
+                reveal.action(setting, reveal.input(setting, editable, field_input))
+            } else {
+                field_input.into()
+            }
         };
+        let label = |caption| text(caption).size(13).width(116);
+        let note = profile.map(|_| text("Quota warnings use provider-reported tokens and pending output reservations. Providers can report incomplete usage. Prices calculate an estimate from reported tokens.")
+            .size(13)
+            .wrapping(text::Wrapping::WordOrGlyph));
         column![
-            text("Token quota and cost").size(16),
             row![
-                input(Field::Limit, budget.token_limit.map_or_else(String::new, |value| value.to_string())),
-                input(Field::Days, budget.reset_days.to_string()),
-                input(Field::Yellow, budget.yellow_percent.to_string()),
-                input(Field::Red, budget.red_percent.to_string()),
-            ].spacing(8).wrap(),
+                label("Token quota"),
+                input(
+                    Field::Limit,
+                    budget
+                        .token_limit
+                        .map_or_else(String::new, |value| value.to_string()),
+                    130
+                ),
+                text("Blank for unlimited").size(12),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .wrap(),
             row![
-                input(Field::InputPrice, price_text(budget.input_micros_per_million)),
-                input(Field::OutputPrice, price_text(budget.output_micros_per_million)),
-                input(Field::Currency, budget.currency.clone()),
-            ].spacing(8).wrap(),
-            text("Quota warnings use provider-reported tokens and pending output reservations. Providers can report incomplete usage. Prices calculate an estimate from reported tokens.").size(13),
-            self.recorded(profile, editable, reveal),
-        ].spacing(8).into()
+                label("Warning thresholds"),
+                text("Yellow %").size(13),
+                input(Field::Yellow, budget.yellow_percent.to_string(), 75),
+                text("Red %").size(13),
+                input(Field::Red, budget.red_percent.to_string(), 75),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .wrap(),
+            row![
+                label("Reset"),
+                input(Field::Days, budget.reset_days.to_string(), 96),
+                text("days").size(13),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .wrap(),
+            row![
+                label("Price per 1M tokens"),
+                text("Input").size(13),
+                input(
+                    Field::InputPrice,
+                    price_text(budget.input_micros_per_million),
+                    88
+                ),
+                text("Output").size(13),
+                input(
+                    Field::OutputPrice,
+                    price_text(budget.output_micros_per_million),
+                    88
+                ),
+                text("Currency").size(13),
+                input(Field::Currency, budget.currency.clone(), 62),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .wrap(),
+            note,
+            profile.map(|profile| self.recorded(profile, editable, reveal)),
+        ]
+        .spacing(10)
+        .into()
     }
 
     pub(super) fn recorded<'a>(

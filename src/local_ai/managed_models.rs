@@ -31,7 +31,7 @@ const REGISTRY_LOCK: &str = ".registry.lock";
 const LEASE: &str = ".use.lock";
 pub(crate) const BACKUP_MANIFEST: &str = "model-v1.json";
 const MANIFEST: &str = BACKUP_MANIFEST;
-const WEIGHTS: &str = "model.gguf";
+pub(crate) const WEIGHTS: &str = "model.gguf";
 const VISION_ASSETS: &str = "vision-assets";
 pub(crate) const MAX_MODELS: usize = 256;
 pub(crate) const MAX_MANIFEST: u64 = 64 * 1024;
@@ -136,6 +136,8 @@ pub(crate) struct Model {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) published_at: Option<String>,
     #[serde(default, skip_serializing_if = "ModelBackend::is_auto")]
     pub(crate) backend: ModelBackend,
     pub(crate) context_tokens: u32,
@@ -159,6 +161,21 @@ pub(crate) struct Model {
 }
 
 impl Model {
+    pub(crate) fn registered_weights_path(&self, profile: &Path) -> PathBuf {
+        if let Some(reference) = &self.external {
+            return reference.path().to_owned();
+        }
+        let mut directory = profile.join(REGISTRY).join(&self.id);
+        if self.projector_bytes.is_some() && directory.join(VISION_ASSETS).is_dir() {
+            directory.push(VISION_ASSETS);
+        }
+        if self.shard_bytes.is_empty() {
+            directory.join(WEIGHTS)
+        } else {
+            directory.join(split::private_name(0, self.shard_bytes.len()))
+        }
+    }
+
     fn new(name: String, bytes: u64, context: u32, purpose: Purpose) -> io::Result<Self> {
         let context_tokens = match purpose {
             Purpose::Chat => context,
@@ -168,6 +185,7 @@ impl Model {
             id: nonce()?,
             name,
             bytes,
+            published_at: None,
             backend: ModelBackend::Auto,
             context_tokens,
             cpu_threads: 0,
@@ -820,6 +838,25 @@ impl Registry {
         })
     }
 
+    pub(crate) fn embedding_dimensions(&self, id: &str) -> io::Result<Option<usize>> {
+        let opened = self.open(id)?;
+        if opened.model.purpose != Purpose::Embedding {
+            return Ok(None);
+        }
+        let file = match &opened.storage {
+            OpenedStorage::Private { weights, .. } => weights.first().map(|weight| &weight.file),
+            OpenedStorage::External { files, .. } => files.first().map(external::Lease::file),
+            #[cfg(target_os = "linux")]
+            OpenedStorage::ImmutablePolicy(_) => None,
+        };
+        let Some(file) = file else { return Ok(None) };
+        let dimensions =
+            gguf::embedding_dimensions(&mut file.try_clone()?, file.metadata()?.len())?;
+        opened.revalidate()?;
+        Ok(dimensions)
+    }
+
+    #[cfg(test)]
     pub(crate) fn configure(&self, model: Model) -> io::Result<Model> {
         self.configure_checked(model, |_| Ok(()))
     }
@@ -838,6 +875,7 @@ impl Registry {
         let _lease = lock(&directory, LEASE, false)?;
         let stored = read_model(&directory, &model.id)?;
         model.bytes = stored.bytes;
+        model.published_at.clone_from(&stored.published_at);
         model.shard_bytes.clone_from(&stored.shard_bytes);
         model.external.clone_from(&stored.external);
         model.projector_bytes = stored.projector_bytes;
@@ -848,12 +886,28 @@ impl Registry {
         Ok(model)
     }
 
+    #[cfg(test)]
     pub(crate) fn remove(&self, id: &str) -> io::Result<()> {
+        self.remove_checked(id, None)
+    }
+
+    pub(crate) fn remove_reviewed(&self, expected: &Model) -> io::Result<()> {
+        self.remove_checked(&expected.id, Some(expected))
+    }
+
+    fn remove_checked(&self, id: &str, expected: Option<&Model>) -> io::Result<()> {
         check_id(id)?;
         let root = self.root(false)?;
         let _lock = lock(&root, REGISTRY_LOCK, false)?;
         let directory = root.private_child(id, false)?;
         let lease = lock(&directory, LEASE, false)?;
+        if let Some(expected) = expected
+            && read_model(&directory, id)? != *expected
+        {
+            return Err(invalid(
+                "The model registration changed. Refresh and review the removal again",
+            ));
+        }
         let staging = prepare_staging(&root)?;
         // The registry lock prevents another opener while the model is being unpublished.
         drop(lease);
@@ -922,6 +976,18 @@ pub(crate) fn portable_registration(bytes: &[u8], id: &str) -> io::Result<Vec<u8
     // The receiving profile must review an external model before it can use it.
     model.external = None;
     serde_json::to_vec(&model).map_err(io::Error::other)
+}
+
+/// All shards of a split model share the same first source. The registry still
+/// validates the complete sibling set when importing it.
+pub(crate) fn import_source(path: &Path) -> PathBuf {
+    path.file_name()
+        .and_then(OsStr::to_str)
+        .and_then(|name| split::Names::parse(name).ok())
+        .map_or_else(
+            || path.to_owned(),
+            |names| path.with_file_name(names.name(0)),
+        )
 }
 
 fn import_name(path: &Path) -> io::Result<String> {

@@ -7,6 +7,14 @@ const WORD_BITS: usize = u32::BITS as usize;
 pub(in crate::ai_manager::local) struct SourceMask(Vec<u32>);
 
 impl SourceMask {
+    pub(in crate::ai_manager::local) fn union(mut self, previous: &Self) -> Self {
+        self.0.resize(self.0.len().max(previous.0.len()), 0);
+        for (word, previous) in self.0.iter_mut().zip(&previous.0) {
+            *word |= previous;
+        }
+        self
+    }
+
     pub(super) fn insert(&mut self, source: usize) {
         let word = source / WORD_BITS;
         if word >= self.0.len() {

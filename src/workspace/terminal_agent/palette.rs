@@ -5,6 +5,7 @@ use std::cell::RefCell;
 use iced::widget::{Container, container, themer};
 use iced::{Color, Element, Theme, theme};
 
+use crate::terminal_agent::design::inline::Role;
 use crate::terminal_theme::panel_colors::{luminance, mix};
 use crate::terminal_theme::{Rgb, Scheme};
 
@@ -15,14 +16,23 @@ use super::Phase;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct Palette {
     background: Rgb,
-    border: Rgb,
-    text: Rgb,
+    pub(super) border: Rgb,
+    pub(super) text: Rgb,
     pub(super) muted: Rgb,
     pub(super) accent: Rgb,
     pub(super) error: Rgb,
 }
 
 impl Palette {
+    pub(super) fn default_status() -> Self {
+        // Java's default Agent Activity colors when no terminal theme is assigned.
+        Self::new(
+            Scheme::default(),
+            [0x0d1218, 0x1d344e, 0xe6edf5, 0x8696ab, 0x4f9cf0, 0xe36a4d]
+                .map(|value| Some(Rgb::from_hex(value))),
+        )
+    }
+
     pub(super) fn new(scheme: Scheme, colors: [Option<Rgb>; 6]) -> Self {
         let [background, border, text, muted, accent, error] =
             resolved_panel_colors(scheme, colors);
@@ -34,6 +44,21 @@ impl Palette {
             accent,
             error,
         }
+    }
+
+    pub(super) fn role(self, role: Role) -> Color {
+        let dark = luminance(self.background) < 0.5;
+        match role {
+            Role::Border => mix(self.border, self.accent, 0.4),
+            Role::Accent | Role::Key => self.accent,
+            Role::Title | Role::Text => self.text,
+            Role::Muted => self.muted,
+            Role::Ok => Rgb::from_hex(if dark { 0x3fb68b } else { 0x1f8a5f }),
+            Role::Warn => Rgb::from_hex(if dark { 0xe5a84b } else { 0xb7791f }),
+            Role::Error => self.error,
+            Role::Think => Rgb::from_hex(if dark { 0xa48cff } else { 0x6b46c1 }),
+        }
+        .color()
     }
 
     fn theme(self) -> Theme {

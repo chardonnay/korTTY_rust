@@ -9,6 +9,17 @@ use super::{CHUNK_BYTES, ConfiguredFileTooLarge, Location, SourceSummary, chunk_
 
 const READ_BYTES: usize = 32 * 1024;
 
+#[derive(Debug)]
+pub(super) struct BinaryText;
+
+impl std::fmt::Display for BinaryText {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Source contains binary control characters")
+    }
+}
+
+impl std::error::Error for BinaryText {}
+
 pub(super) fn scan(
     file: &File,
     limit: u64,
@@ -49,10 +60,7 @@ pub(super) fn scan(
             Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
         };
         if !valid_text(text) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Source contains binary control characters",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, BinaryText));
         }
         let mut remaining = text;
         while remaining.len() > CHUNK_BYTES || (count == 0 && !remaining.is_empty()) {

@@ -5,6 +5,28 @@ fn plain(lines: &[Line]) -> String {
 }
 
 #[test]
+fn inline_answer_wraps_at_words_and_summarizes_action_steps() {
+    let mut model = Transcript {
+        final_answer: "One two three four five six seven eight nine ten\n\n界界 tail".into(),
+        state: State::Finished,
+        tokens: Some(1_284),
+        ..Transcript::default()
+    };
+    for id in [1, 2] {
+        model.upsert(Step {
+            id,
+            kind: Kind::Action,
+            ..Step::default()
+        });
+    }
+    let wide = plain(&render(Style::Inline, &model, 100, "*"));
+    assert!(wide.contains("2 steps · 0:00 · 1.3k tokens"));
+    let text = plain(&render(Style::Inline, &model, 38, "*"));
+    assert!(text.contains("│ One two three four five six\n│ seven eight nine ten"));
+    assert!(text.contains("│ \n│ 界界 tail"));
+}
+
+#[test]
 fn typed_activity_revisions_replace_steps_without_inventing_commands_or_tokens() {
     let mut model = Transcript {
         goal: "Inspect the directory".into(),

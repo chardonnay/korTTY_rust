@@ -145,6 +145,8 @@ pub(crate) enum Message {
         review: bool,
     },
     ToggleDrawer,
+    HideStatus,
+    HideTimelineSample,
     TogglePowerlineDrawer,
     SentContext(super::super::sent_context::Surface, bool),
     MinimapHover(super::status::minimap::Target, bool),
@@ -388,12 +390,22 @@ impl Presentation {
                     .min(count.saturating_sub(1));
             }
             Message::ToggleDrawer => {
+                self.log_table.close_status_run_menu();
                 self.log_table.close_step_list_menu();
                 if self.drawer_open() {
                     self.dismiss_drawer();
                 } else {
                     self.open_drawer();
                 }
+            }
+            Message::HideStatus => {
+                self.close_status_run_menu();
+                self.dismiss_drawer();
+                self.status_visibility.hide();
+            }
+            Message::HideTimelineSample => {
+                self.close_status_run_menu();
+                self.set_dock_hidden(true);
             }
             Message::TogglePowerlineDrawer => self
                 .powerline_drawer

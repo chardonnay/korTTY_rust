@@ -11,6 +11,7 @@ pub(in crate::workspace) enum Slot {
     Top,
     TopDrawer,
     Bottom,
+    PaneBottom,
     BottomDrawer,
     Left,
     Right,
@@ -121,7 +122,8 @@ pub(in crate::workspace) fn status_slot(status: Status) -> Slot {
         Status::Hidden | Status::Steps | Status::Pill => Slot::Top,
         Status::TopBar => Slot::TopDrawer,
         Status::Powerline => Slot::BottomDrawer,
-        Status::Metro | Status::Neon => Slot::Bottom,
+        Status::Metro => Slot::PaneBottom,
+        Status::Neon => Slot::Bottom,
         Status::Minimap => Slot::RightRail,
         Status::Spotlight => Slot::OverlayTop,
         Status::Hud => Slot::TerminalOverlayBottom,
@@ -219,6 +221,7 @@ pub(in crate::workspace) fn compose<'a, M: 'a>(
         }
     }
     let mut overlay = None;
+    let mut pane_bottom = None;
     if let Some(status) = status {
         match status_slot {
             Slot::Top => {
@@ -227,6 +230,7 @@ pub(in crate::workspace) fn compose<'a, M: 'a>(
                     .height(Length::Fill)
             }
             Slot::Bottom | Slot::BottomDrawer => center = center.push(status),
+            Slot::PaneBottom => pane_bottom = Some(status),
             Slot::Left => {
                 left = Some(match left {
                     Some(history) => column![history, status].into(),
@@ -299,6 +303,14 @@ pub(in crate::workspace) fn compose<'a, M: 'a>(
     } else {
         center.into()
     };
+    let center = if let Some(status) = pane_bottom {
+        column![center, status]
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    } else {
+        center
+    };
     if let Some(overlay) = overlay {
         let overlay = container(opaque(
             container(overlay)
@@ -328,10 +340,10 @@ pub(super) fn fitted_side_width(available: f32, requested: f32, both_sides: bool
 }
 
 pub(super) fn history_width(history: History, available: f32, default: f32) -> f32 {
-    if history == History::Tmux {
-        (available * 0.4).clamp(280.0, 640.0)
-    } else {
-        default
+    match history {
+        History::Timeline => 240.0,
+        History::Tmux => (available * 0.4).clamp(280.0, 640.0),
+        _ => default,
     }
 }
 
@@ -354,7 +366,7 @@ mod tests {
         assert_eq!(history_slot(History::Transcript), None);
         assert_eq!(history_slot(History::StepCards), None);
         assert_eq!(status_slot(Status::Steps), Slot::Top);
-        assert_eq!(status_slot(Status::Metro), Slot::Bottom);
+        assert_eq!(status_slot(Status::Metro), Slot::PaneBottom);
         assert_eq!(status_slot(Status::Minimap), Slot::RightRail);
         assert_eq!(status_slot(Status::TopBar), Slot::TopDrawer);
         assert_eq!(status_slot(Status::Powerline), Slot::BottomDrawer);
@@ -362,5 +374,69 @@ mod tests {
         assert_eq!(status_slot(Status::Hud), Slot::TerminalOverlayBottom);
         assert_eq!(status_slot(Status::Toasts), Slot::OverlayBottom);
         assert_eq!(status_slot(Status::Orbit), Slot::OrbitOverlay);
+    }
+
+    #[test]
+    fn metro_reserves_the_full_pane_width_below_a_side_history() {
+        use iced::advanced::widget::{Id, Operation};
+        use iced::{Font, Rectangle, Renderer};
+        use iced_runtime::{UserInterface, user_interface::Cache};
+
+        struct Bounds {
+            rail: Option<Rectangle>,
+            side: Option<Rectangle>,
+        }
+
+        impl Operation for Bounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+
+            fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
+                if id == Some(&Id::new("test-metro")) {
+                    self.rail = Some(bounds);
+                } else if id == Some(&Id::new("test-timeline")) {
+                    self.side = Some(bounds);
+                }
+            }
+        }
+
+        let size = Size::new(600.0, 360.0);
+        let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
+        let pane: Element<'_, ()> = compose(
+            space::vertical().height(Length::Fill).into(),
+            Some(
+                container(space::vertical())
+                    .id("test-timeline")
+                    .height(Length::Fill)
+                    .into(),
+            ),
+            Some(
+                container(space::vertical())
+                    .id("test-metro")
+                    .width(Length::Fill)
+                    .height(52)
+                    .into(),
+            ),
+            history_slot(History::Timeline),
+            status_slot(Status::Metro),
+            size,
+            DockExtents {
+                left: 240.0,
+                right: 240.0,
+                bottom: None,
+            },
+        );
+        let mut ui = UserInterface::build(pane, size, Cache::default(), &mut renderer);
+        let mut bounds = Bounds {
+            rail: None,
+            side: None,
+        };
+        ui.operate(&renderer, &mut bounds);
+        let rail = bounds.rail.unwrap();
+        let side = bounds.side.unwrap();
+        assert_eq!(rail.width, size.width);
+        assert_eq!(rail.y + rail.height, size.height);
+        assert_eq!(side.y + side.height, rail.y);
     }
 }

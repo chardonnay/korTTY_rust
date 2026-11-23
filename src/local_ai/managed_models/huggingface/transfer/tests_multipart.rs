@@ -26,6 +26,7 @@ fn multipart_resume_rehashes_prior_shards_before_registering_the_complete_model(
         file: artifact(1, &first),
         additional: vec![artifact(2, &second)],
         purpose: Purpose::Chat,
+        published_at: None,
     };
     plan.validate().unwrap();
     let (server, _) = listener();

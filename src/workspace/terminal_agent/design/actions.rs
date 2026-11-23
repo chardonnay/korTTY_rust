@@ -210,6 +210,15 @@ pub(super) fn hide_status(run: &Run) -> Message {
     })
 }
 
+pub(super) fn hide_history(run: &Run) -> Message {
+    Message::DesignAction(Action {
+        epoch: run.epoch,
+        step: None,
+        item: Item::HideHistory,
+        enabled: true,
+    })
+}
+
 enum LastRun<'a> {
     Live(window::Id, &'a Run),
     Retained(&'a FinishedRun),
@@ -437,7 +446,11 @@ impl Workspace {
                     if run.uses_powerline() {
                         run.presentation.dismiss_powerline_drawer();
                     }
-                    run.presentation.status_visibility.hide();
+                    if run.design.status == crate::terminal_agent::design::Status::TopBar {
+                        run.presentation.update(super::Message::HideStatus, 0);
+                    } else {
+                        run.presentation.status_visibility.hide();
+                    }
                 }
                 Task::none()
             }

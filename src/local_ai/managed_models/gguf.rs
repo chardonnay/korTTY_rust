@@ -28,6 +28,25 @@ pub(super) fn projector(file: &mut File, bytes: u64, cancelled: &AtomicBool) -> 
     inspect(file, bytes, Kind::Projector, cancelled).map(|_| ())
 }
 
+pub(super) fn embedding_dimensions(file: &mut File, bytes: u64) -> io::Result<Option<usize>> {
+    let cancelled = AtomicBool::new(false);
+    let mut reader = Metadata::new(file, bytes, &cancelled);
+    let (_, entries) = reader.header()?;
+    for _ in 0..entries {
+        let key = reader.key()?;
+        let kind = reader.u32()?;
+        if key.ends_with(".embedding_length") && integer(kind) {
+            let dimensions = reader.integer(kind)?;
+            if (1..=65_536).contains(&dimensions) {
+                return Ok(Some(dimensions as usize));
+            }
+            return Err(invalid("Invalid GGUF embedding dimension"));
+        }
+        reader.skip_value(kind, 0)?;
+    }
+    Ok(None)
+}
+
 pub(super) struct Inspection {
     pub(super) context: u32,
     pub(super) tensors: u64,
@@ -62,24 +81,9 @@ fn inspect(
     };
     let projector = matches!(kind, Kind::Projector);
     let scan_bytes = bytes.min(MAX_METADATA_BYTES);
-    let mut reader = Metadata {
-        input: BufReader::new(file),
-        remaining: scan_bytes,
-        array_items: MAX_ARRAY_ITEMS,
-        cancelled,
-    };
-    if reader.read::<4>()? != *b"GGUF" {
-        return Err(invalid("File is not a GGUF model"));
-    }
-    if !matches!(reader.u32()?, 2..=3) {
-        return Err(invalid("Unsupported GGUF version"));
-    }
-    let tensors = reader.u64()?;
-    let entries = reader.u64()?;
-    if tensors > MAX_TENSORS
-        || (tensors == 0 && !split.is_some_and(|(index, _)| index == 0))
-        || entries > MAX_METADATA_ENTRIES
-    {
+    let mut reader = Metadata::new(file, bytes, cancelled);
+    let (tensors, entries) = reader.header()?;
+    if tensors == 0 && !split.is_some_and(|(index, _)| index == 0) {
         return Err(invalid("Invalid GGUF tensor or metadata count"));
     }
     let mut context = None;
@@ -200,7 +204,31 @@ struct Metadata<'a> {
     cancelled: &'a AtomicBool,
 }
 
-impl Metadata<'_> {
+impl<'a> Metadata<'a> {
+    fn new(file: &'a mut File, bytes: u64, cancelled: &'a AtomicBool) -> Self {
+        Self {
+            input: BufReader::new(file),
+            remaining: bytes.min(MAX_METADATA_BYTES),
+            array_items: MAX_ARRAY_ITEMS,
+            cancelled,
+        }
+    }
+
+    fn header(&mut self) -> io::Result<(u64, u64)> {
+        if self.read::<4>()? != *b"GGUF" {
+            return Err(invalid("File is not a GGUF model"));
+        }
+        if !matches!(self.u32()?, 2..=3) {
+            return Err(invalid("Unsupported GGUF version"));
+        }
+        let tensors = self.u64()?;
+        let entries = self.u64()?;
+        if tensors > MAX_TENSORS || entries > MAX_METADATA_ENTRIES {
+            return Err(invalid("Invalid GGUF tensor or metadata count"));
+        }
+        Ok((tensors, entries))
+    }
+
     fn consume(&mut self, size: u64) -> io::Result<()> {
         check_cancelled(self.cancelled)?;
         self.remaining = self

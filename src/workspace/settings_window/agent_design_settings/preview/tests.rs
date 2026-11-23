@@ -31,6 +31,11 @@ fn previewing_one_module_leaves_the_saved_roles_and_default_intact() {
     );
     assert_eq!(catalog.layout(preset.id()).unwrap(), saved);
     assert_eq!(catalog.default_id(preset), Preset::Standard.id());
+    let shown = editor.preview_layout(&catalog, preset);
+    let token = editor.demo.token();
+    editor.update(&mut catalog, &mut preset, Edit::Demo(Action::Replay));
+    assert_eq!(editor.preview_layout(&catalog, preset), shown);
+    assert_ne!(editor.demo.token(), token);
     editor.update(&mut catalog, &mut preset, Edit::Preview(None));
     assert_eq!(editor.preview_layout(&catalog, preset), saved);
 }
@@ -83,6 +88,14 @@ fn demo_events_are_bound_to_the_current_replay_and_step() {
     demo.update(Action::Tick(old));
     assert_eq!(demo.stage, 0);
     let token = demo.token();
+    demo.update(Action::Interact(old, SampleAction::Pause));
+    assert!(demo.playing);
+    demo.update(Action::Interact(token, SampleAction::Pause));
+    assert_eq!(demo.model().state, State::Paused);
+    demo.update(Action::Tick(token));
+    assert_eq!(demo.stage, 0);
+    demo.update(Action::Interact(token, SampleAction::Pause));
+    assert!(demo.playing);
     demo.update(Action::Next(token));
     demo.update(Action::Next(token));
     assert_eq!(demo.stage, 1);
@@ -90,6 +103,8 @@ fn demo_events_are_bound_to_the_current_replay_and_step() {
         demo.update(Action::Next(demo.token()));
     }
     assert!(matches!(demo.model().prompt, Some(Prompt::Approval { .. })));
+    demo.update(Action::Interact(demo.token(), SampleAction::Pause));
+    assert!(demo.playing);
     demo.update(Action::Approve(demo.token()));
     assert_eq!(demo.stage, 4);
     demo.update(Action::Cancel(demo.token()));
@@ -316,6 +331,7 @@ fn native_replay_button_emits_only_an_isolated_settings_demo_event() {
             super::super::DockPreferences::default(),
             6,
             false,
+            false,
             owner,
         ),
         Size::new(760.0, 700.0),
@@ -358,8 +374,9 @@ fn tab_reveals_preview_and_navigation_opens_only_the_current_sample() {
 
     struct PreviewMeasure {
         page: Id,
-        offset: f32,
+        visible_top: f32,
         visible_bottom: f32,
+        focus: Option<Rectangle>,
         answer_bottom: Option<f32>,
         has_details: bool,
     }
@@ -378,8 +395,19 @@ fn tab_reveals_preview_and_navigation_opens_only_the_current_sample() {
             _: &mut dyn operation::Scrollable,
         ) {
             if id == Some(&self.page) {
-                self.offset = translation.y;
+                self.visible_top = bounds.y + translation.y;
                 self.visible_bottom = bounds.y + bounds.height + translation.y;
+            }
+        }
+
+        fn focusable(
+            &mut self,
+            _: Option<&Id>,
+            bounds: Rectangle,
+            state: &mut dyn operation::Focusable,
+        ) {
+            if state.is_focused() {
+                self.focus = Some(bounds);
             }
         }
 
@@ -407,8 +435,9 @@ fn tab_reveals_preview_and_navigation_opens_only_the_current_sample() {
     let token = demo.token();
     let mut measure = PreviewMeasure {
         page: dialog.page_scroll.clone(),
-        offset: 0.0,
+        visible_top: 0.0,
         visible_bottom: 0.0,
+        focus: None,
         answer_bottom: None,
         has_details: false,
     };
@@ -440,8 +469,11 @@ fn tab_reveals_preview_and_navigation_opens_only_the_current_sample() {
     test_input::apply(&mut ui, &renderer, task);
     ui.operate(&renderer, &mut measure);
     assert!(
-        measure.offset > 0.0,
-        "focus reveals the preview in the Settings page"
+        measure
+            .focus
+            .is_some_and(|bounds| bounds.y >= measure.visible_top - 1.0
+                && bounds.y + bounds.height <= measure.visible_bottom + 1.0),
+        "the focused preview control stays visible in the Settings viewport"
     );
 
     for (key, expected) in [

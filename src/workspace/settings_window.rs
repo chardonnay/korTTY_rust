@@ -6,7 +6,7 @@ use iced::widget::{
     self, button, checkbox, column, container, opaque, pick_list, row, rule, scrollable, slider,
     space, stack, text, text_input, tooltip,
 };
-use iced::{Alignment, Element, Length, Size, Task, window};
+use iced::{Alignment, Color, Element, Length, Padding, Size, Task, window};
 use kortty_ssh::KeepAlive;
 use kortty_terminal::TextEncoding;
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
@@ -20,7 +20,9 @@ use crate::profile_backup::preferences::Preferences as BackupPreferences;
 use crate::sftp_window::ConflictDefault;
 #[cfg(test)]
 use crate::terminal_agent::design::Preset as AgentDesign;
-use crate::terminal_theme::{BoldTextMode, MONOSPACED, Scheme, installed_families, installed_font};
+#[cfg(test)]
+use crate::terminal_theme::Scheme;
+use crate::terminal_theme::{BoldTextMode, MONOSPACED, installed_families, installed_font};
 use crate::workspace::dialog_placement::{Kind as DialogKind, escape::on_escape};
 use kortty_terminal::ScrollbackConfig;
 
@@ -28,7 +30,7 @@ use super::{
     Message as Desktop, Workspace,
     appearance::Design,
     chrome::TOOLBAR_ICON_SIZE,
-    highlight,
+    dialog_design, highlight,
     key_bindings::{Edit, Editor as KeyboardEditor},
     paste_protection::{MAX_PASTE_KIB, WarningMode},
     session_restore,
@@ -41,7 +43,7 @@ use super::{
 
 const TITLE: &str = "Settings";
 const MAX_SEARCH_BYTES: usize = 192;
-const SEARCH_MAX_WIDTH: f32 = 660.0;
+const SEARCH_MAX_WIDTH: f32 = 640.0;
 const SEARCH_RESULTS_MAX_HEIGHT: f32 = 380.0;
 const SEARCH_ROW_HEIGHT: f32 = 32.0;
 
@@ -95,13 +97,13 @@ impl Section {
         Self::Backup,
         Self::Logging,
         Self::Export,
+        Self::Updates,
         Self::Window,
         Self::Keyboard,
+        Self::Sftp,
         Self::Editor,
         Self::SnippetEditor,
         Self::AgentDesign,
-        Self::Updates,
-        Self::Sftp,
     ];
 
     pub(super) fn label(self) -> &'static str {
@@ -127,25 +129,10 @@ impl Section {
     }
 
     fn index(self) -> usize {
-        match self {
-            Self::Font => 0,
-            Self::Colors => 1,
-            Self::Themes => 2,
-            Self::Appearance => 3,
-            Self::Terminal => 4,
-            Self::Messaging => 5,
-            Self::Video => 6,
-            Self::Backup => 7,
-            Self::Logging => 8,
-            Self::Export => 9,
-            Self::Window => 10,
-            Self::Keyboard => 11,
-            Self::Editor => 12,
-            Self::SnippetEditor => 13,
-            Self::AgentDesign => 14,
-            Self::Updates => 15,
-            Self::Sftp => 16,
-        }
+        Self::ALL
+            .iter()
+            .position(|section| *section == self)
+            .expect("all settings sections have a tab")
     }
 
     pub(super) fn guide_chapter(self) -> String {
@@ -1096,6 +1083,7 @@ impl Draft {
 struct Dialog {
     id: window::Id,
     owner: window::Id,
+    standalone_agent_design: bool,
     initial: Draft,
     draft: Draft,
     installed_sftp_conflict_policy: SftpConflictPolicy,
@@ -1106,6 +1094,7 @@ struct Dialog {
     search_input: widget::Id,
     search_scroll: widget::Id,
     tab_scroll: widget::Id,
+    selected_tab: widget::Id,
     page_scroll: widget::Id,
     revealed_row: widget::Id,
     revealed_input: widget::Id,
@@ -1211,13 +1200,7 @@ impl Dialog {
     }
 
     fn reveal_tab(&self) -> Task<Desktop> {
-        widget::operation::snap_to(
-            self.tab_scroll.clone(),
-            widget::operation::RelativeOffset {
-                x: Some(self.section.index() as f32 / (Section::ALL.len() - 1) as f32),
-                y: None,
-            },
-        )
+        crate::settings_search::reveal_tab(self.tab_scroll.clone(), self.selected_tab.clone())
     }
 
     fn reveal_page_start(&self) -> Task<Desktop> {
@@ -1292,7 +1275,13 @@ impl Settings {
         self.0
             .as_ref()
             .filter(|dialog| dialog.id == id)
-            .map(|_| TITLE)
+            .map(|dialog| {
+                if dialog.standalone_agent_design {
+                    "AI Agent Design"
+                } else {
+                    TITLE
+                }
+            })
     }
 
     pub(super) fn owner_closed(&mut self, owner: window::Id) -> Option<window::Id> {
@@ -1992,6 +1981,7 @@ impl Workspace {
             }
             Message::AgentDesignCatalog(_, edit) if dialog.section == Section::AgentDesign => {
                 use agent_design_settings::Edit;
+                let standalone = dialog.standalone_agent_design;
                 let preferences = &mut dialog.draft.preferences;
                 match edit {
                     Edit::DockPlacement(placement) => {
@@ -2007,18 +1997,35 @@ impl Workspace {
                         if super::terminal_agent::design::AUTO_HIDE_SECONDS.contains(&seconds) =>
                     {
                         preferences.ai_agent_design_auto_hide_seconds = Some(seconds);
+                        dialog.agent_design.delay_input = None;
+                    }
+                    Edit::AutoHideInput(mut input) => {
+                        input.truncate(input.floor_char_boundary(3));
+                        if let Some(seconds) = input.parse::<u8>().ok().filter(|seconds| {
+                            super::terminal_agent::design::AUTO_HIDE_SECONDS.contains(seconds)
+                        }) {
+                            preferences.ai_agent_design_auto_hide_seconds = Some(seconds);
+                        }
+                        dialog.agent_design.delay_input = Some(input);
                     }
                     Edit::ReducedAnimations(reduced) => {
                         preferences.ai_agent_design_reduced_animations = Some(reduced);
+                        dialog.agent_design.replay(preferences);
                     }
-                    Edit::FocusPreview(backwards)
-                        if dialog.agent_design.preview_log_enabled(preferences) =>
-                    {
+                    Edit::FocusPreview(backwards) => {
                         return agent_design_settings::focus_preview(
                             id,
                             dialog.page_scroll.clone(),
                             backwards,
                         );
+                    }
+                    Edit::NavigateModule(module) => {
+                        dialog.agent_design.update(
+                            &mut preferences.ai_agent_designs,
+                            &mut preferences.ai_agent_design,
+                            Edit::NavigateModule(module),
+                        );
+                        return agent_design_settings::reveal_module(id, module);
                     }
                     Edit::NavigatePreview(token, key)
                         if dialog.agent_design.preview_log_enabled(preferences) =>
@@ -2034,6 +2041,35 @@ impl Workspace {
                         &mut preferences.ai_agent_design,
                         edit,
                     ),
+                }
+                if standalone
+                    && (preferences.ai_agent_design != self.window_settings.ai_agent_design
+                        || preferences.ai_agent_designs != self.window_settings.ai_agent_designs
+                        || preferences.ai_agent_panel != self.window_settings.ai_agent_panel
+                        || preferences.ai_agent_design_auto_hide_seconds
+                            != self.window_settings.ai_agent_design_auto_hide_seconds
+                        || preferences.ai_agent_design_reduced_animations
+                            != self.window_settings.ai_agent_design_reduced_animations)
+                {
+                    let mut next = self.window_settings.clone();
+                    next.ai_agent_design = preferences.ai_agent_design;
+                    next.ai_agent_designs = preferences.ai_agent_designs.clone();
+                    next.ai_agent_panel = preferences.ai_agent_panel;
+                    next.ai_agent_design_auto_hide_seconds =
+                        preferences.ai_agent_design_auto_hide_seconds;
+                    next.ai_agent_design_reduced_animations =
+                        preferences.ai_agent_design_reduced_animations;
+                    match profile::window_settings_path().and_then(|path| next.save(&path)) {
+                        Ok(()) => {
+                            self.window_settings = next;
+                            dialog.initial.preferences = preferences.clone();
+                            dialog.problem = None;
+                        }
+                        Err(error) => {
+                            dialog.problem =
+                                Some(format!("Could not save agent design settings ({error})."))
+                        }
+                    }
                 }
             }
             Message::ApplicationUpdates(_, enabled)
@@ -2138,11 +2174,13 @@ impl Workspace {
         }
         if let Some(dialog) = &mut self.settings.0 {
             let id = dialog.id;
-            let reveal = section.map_or_else(Task::none, |section| {
-                dialog.select_section(section);
-                dialog.search.clear();
-                dialog.reveal_page_start()
-            });
+            let reveal = section
+                .filter(|_| !dialog.standalone_agent_design)
+                .map_or_else(Task::none, |section| {
+                    dialog.select_section(section);
+                    dialog.search.clear();
+                    dialog.reveal_page_start()
+                });
             return self.update_settings(Message::Focus(id)).chain(reveal);
         }
         let draft = Draft {
@@ -2151,6 +2189,16 @@ impl Workspace {
             backup: self.backup_preferences.clone(),
         };
         let highlighting = self.highlight.preferences();
+        let standalone_agent_design = section == Some(Section::AgentDesign);
+        let agent_design_minimum = Size::new(940.0, 480.0);
+        let agent_design_size = Size::new(1200.0, 662.0);
+        #[cfg(all(debug_assertions, feature = "dialog-preview"))]
+        let agent_design_size =
+            if std::env::var("KORTTY_DIALOG_PREVIEW").as_deref() == Ok("agent-design-compact") {
+                agent_design_minimum
+            } else {
+                agent_design_size
+            };
         let quick_select = quick_select_settings::Editor::new(&draft.preferences.quick_select);
         if let Some(window) = self.windows.get_mut(&owner) {
             window.cancel_paste();
@@ -2159,8 +2207,16 @@ impl Workspace {
             owner,
             DialogKind::GlobalSettings,
             window::Settings {
-                size: Size::new(1120.0, 960.0),
-                min_size: Some(Size::new(620.0, 450.0)),
+                size: if standalone_agent_design {
+                    agent_design_size
+                } else {
+                    Size::new(1120.0, 1080.0)
+                },
+                min_size: Some(if standalone_agent_design {
+                    agent_design_minimum
+                } else {
+                    Size::new(620.0, 450.0)
+                }),
                 position: window::Position::Centered,
                 exit_on_close_request: false,
                 ..window::Settings::default()
@@ -2170,6 +2226,7 @@ impl Workspace {
         self.settings.0 = Some(Dialog {
             id,
             owner,
+            standalone_agent_design,
             initial: draft.clone(),
             draft,
             installed_sftp_conflict_policy: SftpConflictPolicy::load(),
@@ -2180,6 +2237,7 @@ impl Workspace {
             search_input: widget::Id::unique(),
             search_scroll: widget::Id::unique(),
             tab_scroll: widget::Id::unique(),
+            selected_tab: widget::Id::unique(),
             page_scroll: widget::Id::unique(),
             revealed_row: widget::Id::unique(),
             revealed_input: widget::Id::unique(),
@@ -2861,6 +2919,36 @@ impl Workspace {
 
     pub(super) fn settings_view(&self, id: window::Id) -> Option<Element<'_, Desktop>> {
         let dialog = self.settings.0.as_ref().filter(|dialog| dialog.id == id)?;
+        if dialog.standalone_agent_design {
+            let preferences = &dialog.draft.preferences;
+            let content = column![
+                scrollable(dialog.agent_design.view(preferences, id, None))
+                    .id(dialog.page_scroll.clone())
+                    .translate_cursor_moves(true)
+                    .height(Length::Fill),
+                dialog
+                    .problem
+                    .as_deref()
+                    .map(|problem| text(problem).size(13).style(text::danger)),
+                row![
+                    space::horizontal(),
+                    button(container(text("Close").size(13)).center_x(Length::Fill))
+                        .width(76)
+                        .style(dialog_design::secondary_button)
+                        .on_press(Desktop::Settings(Message::Cancel(id))),
+                ],
+            ]
+            .spacing(8)
+            .padding(12)
+            .height(Length::Fill)
+            .into();
+            let content = on_escape(content, Desktop::Settings(Message::Escape(id)));
+            return Some(
+                dialog
+                    .agent_design
+                    .preview_keyboard(content, preferences, id),
+            );
+        }
         if dialog.saving() {
             return Some(
                 container(text(if dialog.saving_logging {
@@ -2884,29 +2972,49 @@ impl Workspace {
             .get(&dialog.owner)
             .and_then(|window| self.transparency_controls(window));
         let mut matches = dialog.search_results(transparency.is_some()).peekable();
-        let input = row![
-            search_input::view(
-                text_input("Search settings…", &dialog.search)
-                    .id(dialog.search_input.clone())
-                    .on_input(move |query| msg(Message::Search(id, query)))
-                    .on_submit(msg(Message::SearchChoose(id))),
-                id,
-            ),
-            button("×")
-                .style(button::secondary)
-                .on_press_maybe((!dialog.search.is_empty()).then(|| msg(Message::SearchClear(id)))),
-        ]
-        .spacing(6);
+        let mut input = stack![search_input::view(
+            text_input(
+                "Search settings… (e.g. font size, proxy, backup)",
+                &dialog.search
+            )
+            .size(13)
+            .padding(Padding {
+                top: 6.0,
+                right: 28.0,
+                bottom: 6.0,
+                left: 8.0
+            })
+            .id(dialog.search_input.clone())
+            .on_input(move |query| msg(Message::Search(id, query)))
+            .on_submit(msg(Message::SearchChoose(id))),
+            id,
+        )];
+        if !dialog.search.is_empty() {
+            input = input.push(
+                container(
+                    button("×")
+                        .padding([2, 6])
+                        .style(button::text)
+                        .on_press(msg(Message::SearchClear(id))),
+                )
+                .padding([0, 4])
+                .align_x(Alignment::End)
+                .center_y(Length::Fill)
+                .width(Length::Fill),
+            );
+        }
         let search = container(container(input).max_width(SEARCH_MAX_WIDTH)).center_x(Length::Fill);
         let results = matches.peek().is_some().then(|| {
             let items = column(matches.enumerate().map(|(index, setting)| {
                 button(
-                    text(format!(
-                        "{} · {}",
-                        setting.label(),
-                        setting.section().label()
-                    ))
-                    .wrapping(text::Wrapping::None),
+                    row![
+                        text(setting.label())
+                            .wrapping(text::Wrapping::None)
+                            .width(Length::Fill),
+                        text(setting.section().label()).size(13),
+                    ]
+                    .align_y(Alignment::Center)
+                    .spacing(10),
                 )
                 .style(if dialog.search_selection == index {
                     button::primary
@@ -2935,24 +3043,30 @@ impl Workspace {
 
         let index = dialog.section.index();
         let navigation = row![
-            button("◀").style(button::secondary).on_press_maybe(
-                index
-                    .checked_sub(1)
-                    .map(|previous| msg(Message::Section(id, Section::ALL[previous])))
-            ),
+            button(text("◂").size(13))
+                .padding([4, 10])
+                .style(button::secondary)
+                .on_press_maybe(
+                    index
+                        .checked_sub(1)
+                        .map(|previous| msg(Message::Section(id, Section::ALL[previous])))
+                ),
             text(format!(
                 "{} ({}/{})",
                 dialog.section.label(),
                 index + 1,
                 Section::ALL.len()
             ))
-            .size(14),
-            button("▶").style(button::secondary).on_press_maybe(
-                Section::ALL
-                    .get(index + 1)
-                    .copied()
-                    .map(|next| msg(Message::Section(id, next)))
-            ),
+            .size(13),
+            button(text("▸").size(13))
+                .padding([4, 10])
+                .style(button::secondary)
+                .on_press_maybe(
+                    Section::ALL
+                        .get(index + 1)
+                        .copied()
+                        .map(|next| msg(Message::Section(id, next)))
+                ),
         ]
         .spacing(8)
         .align_y(Alignment::Center);
@@ -2969,27 +3083,29 @@ impl Workspace {
         ]
         .align_y(Alignment::Center);
         let conflicts = dialog.draft.preferences.key_bindings.conflicts().len();
-        let tabs = Section::ALL
-            .into_iter()
-            .fold(row![].spacing(4), |row, section| {
-                row.push(
-                    button(if section == Section::Keyboard && conflicts != 0 {
-                        row![text(section.label()), text(conflicts).style(text::danger)].spacing(5)
-                    } else {
-                        row![text(section.label())]
-                    })
-                    .style(if dialog.section == section {
-                        button::secondary
-                    } else {
-                        button::text
-                    })
-                    .on_press(msg(Message::Section(id, section))),
-                )
-            });
+        let tabs = Section::ALL.into_iter().fold(row![], |row, section| {
+            let label = text(section.label()).size(13);
+            let selected = dialog.section == section;
+            let tab = container(
+                button(if section == Section::Keyboard && conflicts != 0 {
+                    row![label, text(conflicts).size(13).style(text::danger)].spacing(5)
+                } else {
+                    row![label]
+                })
+                .padding([8, 15])
+                .style(move |theme, status| dialog_design::tab(theme, status, selected))
+                .on_press(msg(Message::Section(id, section))),
+            );
+            row.push(if selected {
+                tab.id(dialog.selected_tab.clone())
+            } else {
+                tab
+            })
+        });
         let tabs = scrollable(tabs)
             .id(dialog.tab_scroll.clone())
             .direction(scrollable::Direction::Horizontal(
-                scrollable::Scrollbar::new().spacing(4),
+                scrollable::Scrollbar::new().width(4).scroller_width(4),
             ))
             .width(Length::Fill);
         let page = match dialog.section {
@@ -3110,43 +3226,51 @@ impl Workspace {
             .spacing(10)
             .align_y(Alignment::Center)
             .push(
-                button("Cancel")
-                    .style(button::secondary)
-                    .on_press(msg(Message::Cancel(id))),
+                button(container(text("Save").size(13)).center_x(Length::Fill))
+                    .width(76)
+                    .padding([7, 5])
+                    .on_press_maybe(
+                        ((!dialog.backup.browsing()
+                            || self.clipboard.policy.backup.directory.is_some())
+                            && !dialog.logging.browsing_unmanaged(
+                                self.clipboard.policy.app_logging.directory().is_some(),
+                                self.clipboard
+                                    .policy
+                                    .terminal_logging
+                                    .journal_directory()
+                                    .is_some(),
+                            ))
+                        .then(|| msg(Message::Save(id))),
+                    ),
             )
             .push(
-                button("Save").on_press_maybe(
-                    ((!dialog.backup.browsing()
-                        || self.clipboard.policy.backup.directory.is_some())
-                        && !dialog.logging.browsing_unmanaged(
-                            self.clipboard.policy.app_logging.directory().is_some(),
-                            self.clipboard
-                                .policy
-                                .terminal_logging
-                                .journal_directory()
-                                .is_some(),
-                        ))
-                    .then(|| msg(Message::Save(id))),
-                ),
+                button(container(text("Cancel").size(13)).center_x(Length::Fill))
+                    .width(76)
+                    .padding([7, 5])
+                    .style(button::secondary)
+                    .on_press(msg(Message::Cancel(id))),
             );
         let footer = column![
             dialog.problem.as_deref().map(|error| text(error).size(14)),
             footer
         ]
-        .spacing(6);
+        .spacing(8);
         let page = column![
             navigation,
-            column![rule::horizontal(1), tabs].spacing(4),
-            container(
-                scrollable(container(page).width(Length::Fill).padding(20))
-                    .id(dialog.page_scroll.clone())
-                    .translate_cursor_moves(dialog.section == Section::AgentDesign)
-            )
-            .height(Length::Fill)
-            .width(Length::Fill)
-            .style(container::bordered_box),
+            column![
+                tabs,
+                rule::horizontal(1),
+                container(
+                    scrollable(container(page).width(Length::Fill).padding(20))
+                        .id(dialog.page_scroll.clone())
+                        .translate_cursor_moves(dialog.section == Section::AgentDesign)
+                        .height(Length::Fill)
+                        .width(Length::Fill)
+                )
+                .style(dialog_design::page),
+            ],
         ]
-        .spacing(10)
+        .spacing(8)
         .height(Length::Fill);
         // The suggestions occupy a layer over the section, leaving the footer in place.
         let mut body = stack![page].height(Length::Fill).width(Length::Fill);
@@ -3155,12 +3279,13 @@ impl Workspace {
         }
 
         let content = column![
-            container(text("Global Terminal Settings").size(19))
+            container(text("Global Terminal Settings").size(14))
                 .width(Length::Fill)
-                .padding([12, 14])
-                .style(container::secondary),
+                .center_y(44)
+                .padding([0, 12])
+                .style(dialog_design::header),
             column![search, body, footer]
-                .spacing(10)
+                .spacing(8)
                 .padding(12)
                 .height(Length::Fill),
         ]
@@ -3622,8 +3747,6 @@ impl Workspace {
                     .on_toggle(move |enabled| Desktop::Settings(Message::Startup(id, startup_settings::Edit::RememberDashboard(enabled)))),
             ),
             text("Open the dashboard if it was visible when the last window closed.").size(13),
-            rule::horizontal(1),
-            text("Tabs").size(16),
             highlighted(
                 dialog,
                 Setting::ToolWindowTabs,
@@ -3635,6 +3758,8 @@ impl Workspace {
             ),
             text("Takes effect the next time you open a supported tool. The tab opens in the window whose menu you used.")
                 .size(13),
+            rule::horizontal(1),
+            text("Tabs").size(16),
             highlighted(
                 dialog,
                 Setting::ConnectionColorBorder,
@@ -4002,22 +4127,32 @@ fn font_settings_page(dialog: &Dialog) -> Element<'_, Desktop> {
     let font = installed_font(family);
     let size = preferences.terminal_font;
     let formatted_size = size.to_string();
-    let sample = Scheme::default();
+    let adjust_size = |label, message| {
+        button(
+            text(label)
+                .size(10)
+                .line_height(iced::widget::text::LineHeight::Absolute(13.0.into())),
+        )
+        .width(24)
+        .padding([0, 4])
+        .style(button::secondary)
+        .on_press_maybe(message)
+    };
     column![
-        text("Font Settings").size(18),
         highlighted(
             dialog,
             Setting::FontFamily,
             row![
-                text(Setting::FontFamily.label()).width(150),
+                text("Font Family:").size(13).width(70),
                 pick_list(
                     installed_families(),
                     Some(family.to_owned()),
                     move |value| { Desktop::Settings(Message::FontFamily(id, value)) }
                 )
-                .width(235),
+                .width(200)
+                .text_size(13),
             ]
-            .spacing(8)
+            .spacing(10)
             .align_y(Alignment::Center),
         ),
         font.is_none()
@@ -4026,28 +4161,37 @@ fn font_settings_page(dialog: &Dialog) -> Element<'_, Desktop> {
             dialog,
             Setting::FontSize,
             row![
-                text(Setting::FontSize.label()).width(150),
-                dialog.reveal_input(
-                    Setting::FontSize,
-                    true,
-                    text_input(
-                        "8–72",
-                        dialog.font_size_input.as_deref().unwrap_or(&formatted_size)
-                    )
-                    .width(50)
-                    .on_input(move |value| Desktop::Settings(Message::FontSizeInput(id, value))),
-                ),
-                button("−").style(button::secondary).on_press_maybe(
-                    (size > profile::MIN_TERMINAL_FONT)
-                        .then(|| Desktop::Settings(Message::FontSize(id, size - 1))),
-                ),
-                button("+").style(button::secondary).on_press_maybe(
-                    (size < profile::MAX_TERMINAL_FONT)
-                        .then(|| Desktop::Settings(Message::FontSize(id, size + 1))),
-                ),
-                text("pt"),
+                text("Font Size:").size(13).width(70),
+                row![
+                    dialog.reveal_input(
+                        Setting::FontSize,
+                        true,
+                        text_input(
+                            "8–72",
+                            dialog.font_size_input.as_deref().unwrap_or(&formatted_size)
+                        )
+                        .width(56)
+                        .size(13)
+                        .on_input(move |value| Desktop::Settings(Message::FontSizeInput(
+                            id, value
+                        ))),
+                    ),
+                    column![
+                        adjust_size(
+                            "▴",
+                            (size < profile::MAX_TERMINAL_FONT)
+                                .then(|| Desktop::Settings(Message::FontSize(id, size + 1)))
+                        ),
+                        adjust_size(
+                            "▾",
+                            (size > profile::MIN_TERMINAL_FONT)
+                                .then(|| Desktop::Settings(Message::FontSize(id, size - 1)))
+                        ),
+                    ],
+                ]
+                .align_y(Alignment::Center),
             ]
-            .spacing(8)
+            .spacing(10)
             .align_y(Alignment::Center),
         ),
         dialog
@@ -4056,24 +4200,26 @@ fn font_settings_page(dialog: &Dialog) -> Element<'_, Desktop> {
             .map(|_| text("Enter a font size between 8 and 72.")
                 .size(13)
                 .style(text::danger)),
-        text("Saving updates the size of panes that follow the global setting.").size(13),
+        row![
+            text("Preview:").size(13).width(70),
+            container(
+                text("AaBbCcDdEe 0123456789")
+                    .font(font.unwrap_or(iced::Font::MONOSPACE))
+                    .size(f32::from(size))
+                    .color(Color::WHITE)
+            )
+            .padding(10)
+            .style(|_| container::Style::default().background(Color::from_rgb8(30, 30, 30))),
+        ]
+        .padding(4)
+        .spacing(10)
+        .align_y(Alignment::Center),
         preferences
             .themes
             .apply_font
             .then(|| text("The selected theme can override font family and size.").size(13)),
-        rule::horizontal(1),
-        text("Preview").size(16),
-        container(
-            text("AaBbCcDdEe 0123456789")
-                .font(font.unwrap_or(iced::Font::MONOSPACE))
-                .size(f32::from(size))
-                .color(sample.foreground.color())
-        )
-        .width(Length::Fill)
-        .padding(12)
-        .style(move |_| container::Style::default().background(sample.background.color())),
     ]
-    .spacing(12)
+    .spacing(4)
     .into()
 }
 
@@ -5798,14 +5944,25 @@ mod tests {
     }
 
     #[test]
-    fn agent_design_menu_reaches_the_saved_global_preference() {
+    fn agent_design_menu_opens_the_standalone_editor() {
         let mut workspace = Workspace::default();
         let (owner, _) = workspace.open_window(false);
         let _ = workspace.invoke_chrome(owner, super::super::chrome::Action::AgentDesign);
         let dialog = workspace.settings.0.as_ref().unwrap();
         assert_eq!(dialog.section, Section::AgentDesign);
+        assert!(dialog.standalone_agent_design);
+        assert_eq!(workspace.settings.title(dialog.id), Some("AI Agent Design"));
         let id = dialog.id;
         assert!(workspace.settings_view(id).is_some());
+    }
+
+    #[test]
+    fn agent_design_in_settings_reaches_the_saved_global_preference() {
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.open_settings(owner, None);
+        let id = workspace.settings.0.as_ref().unwrap().id;
+        let _ = workspace.update_settings(Message::Section(id, Section::AgentDesign));
         let _ = workspace.update_settings(Message::AgentDesignCatalog(
             id,
             agent_design_settings::Edit::Default("classic".into()),
@@ -5835,8 +5992,9 @@ mod tests {
 
         let mut workspace = Workspace::default();
         let (owner, _) = workspace.open_window(false);
-        let _ = workspace.invoke_chrome(owner, super::super::chrome::Action::AgentDesign);
+        let _ = workspace.open_settings(owner, None);
         let id = workspace.settings.0.as_ref().unwrap().id;
+        let _ = workspace.update_settings(Message::Section(id, Section::AgentDesign));
         let _ = workspace.update_settings(Message::AgentDesignCatalog(
             id,
             Edit::Duplicate("floating".into()),
@@ -5898,8 +6056,9 @@ mod tests {
 
         let mut workspace = Workspace::default();
         let (owner, _) = workspace.open_window(false);
-        let _ = workspace.invoke_chrome(owner, super::super::chrome::Action::AgentDesign);
+        let _ = workspace.open_settings(owner, None);
         let id = workspace.settings.0.as_ref().unwrap().id;
+        let _ = workspace.update_settings(Message::Section(id, Section::AgentDesign));
         for edit in [
             Edit::AutoHide(0),
             Edit::ReducedAnimations(true),

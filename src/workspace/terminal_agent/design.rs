@@ -201,12 +201,13 @@ pub(super) fn history_view<'a>(
 /// Review remains in the owned activity window, where the exact destination,
 /// command, password mode and epoch are reviewed together.
 fn controls(run: &Run, has_archive: bool) -> Element<'_, AgentMessage> {
-    controls_with_menu(run, actions::run_menu(run, has_archive))
+    controls_with_menu(run, actions::run_menu(run, has_archive), true)
 }
 
 fn controls_with_menu<'a>(
     run: &'a Run,
     run_menu: Option<Element<'static, AgentMessage>>,
+    include_run_buttons: bool,
 ) -> Element<'a, AgentMessage> {
     let active = run.active() && !run.cancel.requested();
     row![
@@ -223,10 +224,13 @@ fn controls_with_menu<'a>(
             _ => "Activity window",
         })
         .on_press(AgentMessage::Focus),
-        active
-            .then(|| button(if run.paused { "Resume" } else { "Pause" })
-                .on_press(AgentMessage::Pause)),
-        active.then(|| button("Cancel").on_press(AgentMessage::Cancel)),
+        (active && include_run_buttons).then(|| button(if run.paused {
+            "Resume"
+        } else {
+            "Pause"
+        })
+        .on_press(AgentMessage::Pause)),
+        (active && include_run_buttons).then(|| button("Cancel").on_press(AgentMessage::Cancel)),
         handoff::compact(run),
         run_menu,
         run.status_transcript()
@@ -254,6 +258,8 @@ fn history_panel<'a>(
     panel_review: Option<command_review::Review>,
 ) -> Element<'a, AgentMessage> {
     let (phase, _) = status::phase(run);
+    let timeline = run.design.history == History::Timeline;
+    let palette = palette.or_else(|| timeline.then(Palette::default_status));
     let activity = history_with_steps(
         run,
         palette,
@@ -262,23 +268,47 @@ fn history_panel<'a>(
         owner,
         panel_review,
     );
-    let controls = controls(run, owner.0.has_archived_activity(run));
+    let controls = if timeline {
+        controls_with_menu(run, None, false)
+    } else {
+        controls(run, owner.0.has_archived_activity(run))
+    };
     let body = history_body(activity, controls, run.design.approval);
     let muted = palette.map(|palette| palette.muted.color());
     palette::panel(
         palette,
         container(
             column![
-                text(format!("{} · {phase}", run.design.history)).size(13),
-                text(&run.label)
-                    .size(12)
-                    .style(move |_| text::Style { color: muted }),
+                if timeline {
+                    status::timeline_header(
+                        history::Activity {
+                            owner: Some(owner),
+                            surface: log_table::Surface::Pane,
+                            ..run.into()
+                        },
+                        status::Trace::live(run, Instant::now(), reduced_motion),
+                        palette,
+                    )
+                } else {
+                    column![
+                        text(format!("{} · {phase}", run.design.history)).size(13),
+                        text(&run.label)
+                            .size(12)
+                            .style(move |_| text::Style { color: muted }),
+                    ]
+                    .spacing(5)
+                    .into()
+                },
                 chooser,
                 body,
             ]
-            .spacing(5),
+            .spacing(if timeline { 4 } else { 5 }),
         )
-        .padding(7)
+        .padding(if timeline {
+            timeline::PANEL_PADDING
+        } else {
+            iced::Padding::from(7)
+        })
         .width(Length::Fill)
         .height(Length::Fill),
     )

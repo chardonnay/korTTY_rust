@@ -5,6 +5,8 @@ use super::*;
 use crate::terminal_view::agent_cursor::{Fade, MotionFrame, approval_hint, paint_ghost};
 use inline::{Line, Role, Segment, Style};
 
+const PROMPT: &[u8] = b"\x1b[1;32madmin@web-01\x1b[0m:\x1b[1;34m~\x1b[0m$ ";
+
 pub(super) struct Preview {
     pub model: Transcript,
     pub style: Option<Style>,
@@ -138,38 +140,17 @@ impl canvas::Program<Desktop> for Preview {
         } else {
             None
         };
-        let columns = ((bounds.width - 16.0) / cell.width).max(1.0) as usize;
+        let columns = ((bounds.width - 16.0) / cell.width).clamp(16.0, u16::MAX as f32) as usize;
         // This parser has no transport, actor, provider, or callback. It only formats fixture cells.
-        let mut terminal = kortty_terminal::Terminal::new(columns.min(u16::MAX as usize) as u16, 4);
-        terminal.advance(b"admin@web-01:~$ df -h /var\r\nFilesystem   Size Used Avail Use% Mounted on\r\n/dev/sda3     40G  37G  3.1G   93% /var\r\n");
+        let mut terminal = kortty_terminal::Terminal::new(columns as u16, 12);
+        terminal.advance(PROMPT);
+        terminal.advance(b"df -h /var\r\nFilesystem      Size  Used Avail Use% Mounted on\r\n/dev/sda3        40G   37G  3.1G  \x1b[31m93%\x1b[0m /var\r\n");
+        terminal.advance(PROMPT);
         let snapshot = terminal.snapshot();
         let mut y = 6.0;
-        for row in 0..3 {
+        for row in 0..snapshot.cursor.row {
             if let Some(cells) = snapshot.row(row) {
-                let text: String = cells
-                    .iter()
-                    .filter(|cell| cell.width != 0)
-                    .map(|cell| {
-                        if cell.text.is_empty() {
-                            " "
-                        } else {
-                            &cell.text
-                        }
-                    })
-                    .collect();
-                paint(
-                    &mut frame,
-                    &Line {
-                        segments: vec![Segment {
-                            text,
-                            role: Role::Muted,
-                        }],
-                    },
-                    y,
-                    cell,
-                    palette.text,
-                    palette.primary,
-                );
+                paint_terminal_row(&mut frame, cells, y, cell, palette.text);
                 y += cell.height;
             }
         }
@@ -215,25 +196,16 @@ impl canvas::Program<Desktop> for Preview {
                 );
             }
         }
-        paint(
-            &mut frame,
-            &Line {
-                segments: vec![Segment {
-                    text: "admin@web-01:~$ ".into(),
-                    role: Role::Accent,
-                }],
-            },
-            y,
-            cell,
-            palette.text,
-            palette.primary,
-        );
+        if let Some(cells) = snapshot.row(snapshot.cursor.row) {
+            paint_terminal_row(&mut frame, cells, y, cell, palette.text);
+        }
+        let prompt_end = Point::new(8.0 + f32::from(snapshot.cursor.column) * cell.width, y);
         if let Some((motion, opacity)) = cursor {
             frame.with_clip(Rectangle::with_size(bounds.size()), |frame| {
                 paint_ghost(
                     frame,
                     motion.command(VACUUM),
-                    Point::new(8.0 + 15.0 * cell.width, y),
+                    prompt_end,
                     palette.text.scale_alpha(opacity),
                     Font::MONOSPACE,
                     12,
@@ -266,8 +238,64 @@ impl canvas::Program<Desktop> for Preview {
                     );
                 }
             });
+        } else {
+            frame.stroke(
+                &canvas::Path::rectangle(prompt_end, Size::new(cell.width, cell.height - 2.0)),
+                canvas::Stroke::default().with_color(palette.text.scale_alpha(0.8)),
+            );
         }
         vec![frame.into_geometry()]
+    }
+}
+
+fn paint_terminal_row(
+    frame: &mut canvas::Frame,
+    cells: &[kortty_terminal::Cell],
+    y: f32,
+    cell: Size,
+    foreground: Color,
+) {
+    use kortty_terminal::Color as Ansi;
+
+    let mut x = 8.0;
+    for run in cells.chunk_by(|left, right| left.style == right.style) {
+        let style = run[0].style;
+        let color = match style.foreground {
+            Ansi::Default => foreground,
+            Ansi::Indexed(index) => crate::terminal_view::ansi_color(if style.bold && index < 8 {
+                index + 8
+            } else {
+                index
+            }),
+            Ansi::Rgb(red, green, blue) => Color::from_rgb8(red, green, blue),
+        };
+        let mut content = String::new();
+        for glyph in run.iter().filter(|glyph| glyph.width != 0) {
+            content.push_str(if glyph.text.is_empty() {
+                " "
+            } else {
+                &glyph.text
+            });
+        }
+        let width: u16 = run.iter().map(|glyph| u16::from(glyph.width)).sum();
+        if !content.trim_end().is_empty() {
+            frame.fill_text(canvas::Text {
+                content,
+                position: Point::new(x, y),
+                color,
+                size: Pixels(12.0),
+                font: Font {
+                    weight: if style.bold {
+                        iced::font::Weight::Bold
+                    } else {
+                        iced::font::Weight::Normal
+                    },
+                    ..Font::MONOSPACE
+                },
+                ..canvas::Text::default()
+            });
+        }
+        x += f32::from(width) * cell.width;
     }
 }
 

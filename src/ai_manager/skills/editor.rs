@@ -11,21 +11,22 @@ use iced::widget::{
 use iced::{Alignment, Element, Font, Length, Task};
 
 use crate::ai_manager::document_find;
+use crate::ai_manager::file_chooser::{self as chooser, MAX_MARKDOWN_FILES as MAX_IMPORT_FILES};
 use crate::ai_manager::profiles::picker::DismissOnEscape as _;
 use crate::local_ai;
+use crate::workspace::dialog_design;
 
 use super::{MAX_SKILL_BYTES, Skill, Store, Target, markdown, shorten};
 use crate::ai_manager::search::{Control, Reveal, Setting};
 
-mod chooser;
 mod external;
 mod statistics_view;
 
-const MAX_IMPORT_FILES: usize = 32;
 const MAX_PATH_BYTES: usize = 4096;
 
 #[derive(Clone)]
 pub(crate) enum Message {
+    Library(LibraryView),
     Search(String),
     ShowHidden(bool),
     Sort(Sort),
@@ -120,11 +121,29 @@ enum Confirmation {
     DisableAutoDetection,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum LibraryView {
+    #[default]
+    Local,
+    External,
+}
+
+impl LibraryView {
+    fn for_skill(skill: &Skill) -> Self {
+        if skill.external.is_some() {
+            Self::External
+        } else {
+            Self::Local
+        }
+    }
+}
+
 #[derive(Default)]
 pub(in crate::ai_manager) struct Editor {
     search: String,
     show_hidden: bool,
     sort: Sort,
+    library: LibraryView,
     skill_creation_override: Option<bool>,
     form: Option<Form>,
     confirmation: Option<Confirmation>,
@@ -281,6 +300,25 @@ impl Editor {
             .is_some_and(|panel| panel.has_provider_search_setting(setting, store))
     }
 
+    pub(in crate::ai_manager) fn reveal_library_action(&mut self, control: Control) {
+        use Control::*;
+        self.library = match control {
+            ImportExternal | ExternalUpdates | SkillProviders => LibraryView::External,
+            AddSkill | ImportSkill => LibraryView::Local,
+            control if control.skill_form() || control == DeleteSkill => self
+                .form
+                .as_ref()
+                .map_or(self.library, |form| LibraryView::for_skill(&form.skill)),
+            _ => self.library,
+        };
+    }
+
+    fn visible_form(&self) -> Option<&Form> {
+        self.form
+            .as_ref()
+            .filter(|form| LibraryView::for_skill(&form.skill) == self.library)
+    }
+
     fn can_adopt_preference(&self, preference: super::Preference) -> bool {
         !self.busy()
             && match preference {
@@ -296,7 +334,7 @@ impl Editor {
             && self.confirmation.is_none()
             && self.external.is_none()
             && self.statistics.is_none()
-            && self.form.as_ref().is_some_and(|form| form.find.is_open())
+            && self.visible_form().is_some_and(|form| form.find.is_open())
     }
 
     pub(in crate::ai_manager) fn can_reload_after_rule(&self) -> bool {
@@ -310,7 +348,9 @@ impl Editor {
     pub(in crate::ai_manager) fn reload_after_rule(&mut self, store: &Store) {
         debug_assert!(self.can_reload_after_rule());
         if let Some(id) = self.form.as_ref().map(|form| form.id) {
+            let library = self.library;
             self.select(store, id);
+            self.library = library;
         }
     }
 
@@ -487,6 +527,9 @@ impl Editor {
             return Task::none();
         }
         match message {
+            Message::Library(library) if self.file.is_none() && self.confirmation.is_none() => {
+                self.library = library;
+            }
             Message::Search(value) => self.search = bounded(value, 256),
             Message::Find(message) => {
                 if let Some(form) = &mut self.form {
@@ -602,6 +645,9 @@ impl Editor {
 
     fn select(&mut self, store: &Store, id: u64) {
         self.form = store.skills.get(&id).map(|skill| Form::new(id, skill));
+        if let Some(form) = &self.form {
+            self.library = LibraryView::for_skill(&form.skill);
+        }
         self.notice = None;
     }
 
@@ -775,7 +821,7 @@ impl Editor {
                 }
                 let mut path = match &self.chooser {
                     Some(chooser) => {
-                        let Some(path) = chooser.export_folder() else {
+                        let Some(path) = chooser.chosen_folder() else {
                             return Task::none();
                         };
                         path.to_path_buf()
@@ -926,7 +972,7 @@ impl Editor {
                 (
                     self.export_skills.len(),
                     "Export to this folder",
-                    chooser.export_folder().is_some(),
+                    chooser.chosen_folder().is_some(),
                     "Enter folder path…",
                 )
             };
@@ -954,17 +1000,19 @@ impl Editor {
         }
         let action = |control, button| reveal.action(Setting::Control(control), button);
         let option = |control, checkbox| reveal.action(Setting::Control(control), checkbox);
-        let header = row![
+        let preferences = column![
             option(
                 Control::SkillsEnabled,
                 checkbox(store.enabled)
                     .label("Enable AI skills")
+                    .text_size(13)
                     .on_toggle(Message::EnableLibrary)
             ),
             option(
                 Control::SkillAutoSelect,
                 checkbox(store.auto_detect)
                     .label("Automatically select relevant skills")
+                    .text_size(13)
                     .on_toggle(Message::AutoDetect)
             ),
             option(
@@ -974,6 +1022,7 @@ impl Editor {
                         .unwrap_or(store.learned_rules_enabled)
                 )
                 .label("Allow saving learned rules in skills")
+                .text_size(13)
                 .on_toggle_maybe(
                     self.skill_creation_override
                         .is_none()
@@ -981,31 +1030,18 @@ impl Editor {
                 )
             ),
             option(
-                Control::ShowHiddenSkills,
-                checkbox(self.show_hidden)
-                    .label("Show hidden")
-                    .on_toggle(Message::ShowHidden)
-            ),
-            option(
                 Control::SkillUsage,
                 checkbox(store.statistics_enabled(self.statistics_policy))
                     .label("Record local skill statistics")
+                    .text_size(13)
                     .on_toggle_maybe(
                         self.statistics_policy
                             .is_none()
                             .then_some(Message::UsageStatistics)
                     )
             ),
-            action(
-                Control::SkillStatistics,
-                button("Skill statistics…").on_press_maybe(
-                    (self.statistics_root.is_some() && !self.pending_edit() && !self.busy())
-                        .then_some(Message::Statistics(statistics_view::Message::Open))
-                )
-            ),
         ]
-        .spacing(14)
-        .wrap();
+        .spacing(6);
         let mut imported = column![].spacing(4);
         if !self.imported_preferences.is_empty() {
             imported = imported.push(
@@ -1037,10 +1073,20 @@ impl Editor {
             }
         }
         let query = self.search.trim().to_lowercase();
+        let external_count = store
+            .skills
+            .values()
+            .filter(|skill| skill.external.is_some())
+            .count();
+        let local_count = store.skills.len() - external_count;
         let mut visible: Vec<_> = store
             .skills
             .iter()
-            .filter(|(_, skill)| (self.show_hidden || !skill.hidden) && skill.matches(&query))
+            .filter(|(_, skill)| {
+                LibraryView::for_skill(skill) == self.library
+                    && (self.show_hidden || !skill.hidden)
+                    && skill.matches(&query)
+            })
             .collect();
         visible.sort_by_cached_key(|(_, skill)| {
             (
@@ -1075,84 +1121,140 @@ impl Editor {
             );
         }
         let library_search = Setting::Control(Control::SkillLibraryQuery);
-        let library = column![
-            reveal.wrap(
-                library_search,
-                reveal.input(
-                    library_search,
-                    true,
-                    text_input("Search skills…", &self.search).on_input(Message::Search)
-                )
+        let switch = row([
+            (LibraryView::Local, format!("Local ({local_count})")),
+            (
+                LibraryView::External,
+                format!("External ({external_count})"),
             ),
-            row![
-                text(format!(
-                    "{} of {} skills",
-                    visible.len(),
-                    store.skills.len()
-                ))
-                .size(13)
-                .width(Length::Fill),
-                reveal.action(
-                    Setting::Control(Control::SkillLibrarySort),
-                    pick_list([Sort::Name, Sort::Status], Some(self.sort), Message::Sort)
-                        .dismiss_on_escape()
+        ]
+        .into_iter()
+        .map(|(library, label)| {
+            let selected = self.library == library;
+            button(container(text(label).size(13)).center_x(Length::Fill))
+                .width(Length::FillPortion(1))
+                .padding([6, 8])
+                .style(move |theme, status| dialog_design::segment(theme, status, selected))
+                .on_press_maybe(
+                    (self.file.is_none()
+                        && !self.busy()
+                        && self.confirmation.is_none()
+                        && self.proposal.is_none())
+                    .then_some(Message::Library(library)),
                 )
-            ]
-            .spacing(6)
-            .align_y(Alignment::Center),
-            scrollable(items).height(Length::Fill),
+                .into()
+        }))
+        .spacing(1);
+        let sort = reveal.action(
+            Setting::Control(Control::SkillLibrarySort),
+            pick_list([Sort::Name, Sort::Status], Some(self.sort), Message::Sort)
+                .text_size(13)
+                .dismiss_on_escape(),
+        );
+        let delete = action(
+            Control::DeleteSkill,
+            dialog_design::secondary_action("Delete…").on_press_maybe(
+                self.visible_form()
+                    .filter(|form| form.skill.builtin.is_none())
+                    .map(|_| Message::Delete),
+            ),
+        );
+        let export = action(
+            Control::ExportSkill,
+            dialog_design::secondary_action("Export…")
+                .on_press_maybe((!store.skills.is_empty()).then_some(Message::Export)),
+        );
+        let actions = if self.library == LibraryView::Local {
             row![
-                action(Control::AddSkill, button("Add").on_press(Message::Add)),
                 action(
-                    Control::DeleteSkill,
-                    button("Delete…").on_press_maybe(
-                        self.form
-                            .as_ref()
-                            .filter(|form| form.skill.builtin.is_none())
-                            .map(|_| Message::Delete)
-                    )
-                )
-            ]
-            .spacing(6)
-            .wrap(),
-            row![
+                    Control::AddSkill,
+                    dialog_design::secondary_action("Add").on_press(Message::Add)
+                ),
+                delete,
                 action(
                     Control::ImportSkill,
-                    button("Import Markdown…").on_press(Message::Import)
+                    dialog_design::secondary_action("Import Markdown…").on_press(Message::Import)
                 ),
-                action(
-                    Control::ExportSkill,
-                    button("Export Markdown…")
-                        .on_press_maybe((!store.skills.is_empty()).then_some(Message::Export))
-                )
+                export,
             ]
-            .spacing(6)
-            .wrap(),
+        } else {
             row![
                 action(
                     Control::ImportExternal,
-                    button("Import external skills…")
+                    dialog_design::secondary_action("Import external…")
                         .on_press(Message::External(external::Message::OpenImport))
                 ),
+                delete,
                 action(
                     Control::ExternalUpdates,
-                    button("Check external updates…").on_press_maybe(
+                    dialog_design::secondary_action("Check updates…").on_press_maybe(
                         external::Panel::can_check(store)
                             .then_some(Message::External(external::Message::OpenUpdates))
                     )
                 ),
                 action(
                     Control::SkillProviders,
-                    button("Providers…").on_press_maybe(
+                    dialog_design::secondary_action("Providers…").on_press_maybe(
                         (!self.busy())
                             .then_some(Message::External(external::Message::OpenProviders))
                     )
                 ),
+                export,
+            ]
+        };
+        let placeholder = if query.is_empty() && self.library == LibraryView::External {
+            "No external skills. Import one from a provider."
+        } else {
+            "No matching skills"
+        };
+        let items: Element<'_, Message> = if visible.is_empty() {
+            container(text(placeholder).size(13))
+                .center(Length::Fill)
+                .padding(8)
+                .into()
+        } else {
+            scrollable(items).height(Length::Fill).into()
+        };
+        let library = column![
+            preferences,
+            switch,
+            row![
+                sort,
+                option(
+                    Control::ShowHiddenSkills,
+                    checkbox(self.show_hidden)
+                        .label("Show hidden")
+                        .text_size(13)
+                        .on_toggle(Message::ShowHidden)
+                ),
+                action(
+                    Control::SkillStatistics,
+                    dialog_design::secondary_action("Statistics…").on_press_maybe(
+                        (self.statistics_root.is_some() && !self.pending_edit() && !self.busy())
+                            .then_some(Message::Statistics(statistics_view::Message::Open))
+                    )
+                ),
             ]
             .spacing(6)
+            .align_y(Alignment::Center)
             .wrap(),
+            reveal.wrap(
+                library_search,
+                reveal.input(
+                    library_search,
+                    true,
+                    text_input("Search skills…", &self.search)
+                        .size(13)
+                        .on_input(Message::Search)
+                )
+            ),
+            container(items)
+                .height(Length::Fill)
+                .style(dialog_design::sidebar),
+            text(format!("{} skills shown", visible.len())).size(12),
+            actions.spacing(6).wrap(),
         ]
-        .width(235)
+        .width(340)
         .spacing(8);
         let body: Element<'_, Message> = if self.shortening.is_some() {
             column![
@@ -1167,12 +1269,36 @@ impl Editor {
             confirmation_view(confirmation)
         } else if self.importing() {
             self.import_paths_view()
-        } else if let Some(form) = &self.form {
+        } else if let Some(form) = self.visible_form() {
             Self::form_view(form, shorten_available, reveal)
         } else {
-            container(text("Select a skill to view or edit it."))
-                .padding(12)
-                .into()
+            column![
+                field("Skill name", text_input("", "").size(13).width(360)),
+                field("Description", text_input("", "").size(13).width(360)),
+                field(
+                    "Tags",
+                    text_input("Comma-separated tags", "").size(13).width(360)
+                ),
+                field(
+                    "Target",
+                    row![
+                        text("Both").size(13).style(text::secondary),
+                        checkbox(false).label("Active").text_size(13)
+                    ]
+                    .spacing(12)
+                ),
+                text("Skill Markdown").size(13),
+                container(
+                    text("Select a skill to edit its Markdown.")
+                        .size(13)
+                        .style(text::secondary)
+                )
+                .center(Length::Fill)
+                .style(dialog_design::sidebar),
+            ]
+            .spacing(8)
+            .height(Length::Fill)
+            .into()
         };
         let layout = row![
             library,
@@ -1181,7 +1307,6 @@ impl Editor {
         .spacing(14)
         .height(Length::Fill);
         column![
-            header,
             (!self.imported_preferences.is_empty()).then_some(imported),
             self.skill_creation_override.map(|_| text(
                 "Learning rules into skills is managed by policy."
@@ -1346,7 +1471,7 @@ impl Editor {
             external::source_view(skill),
             input(
                 Control::SkillName,
-                "Name",
+                "Skill name",
                 text_input("Skill name", &skill.name).on_input(Message::EditName)
             ),
             input(
@@ -1578,7 +1703,11 @@ mod tests {
             "external skill providers",
             Control::SkillProviders,
         );
+        assert_eq!(manager.skills.library, LibraryView::External);
         assert!(!manager.skills.file_prompt_open());
+        assert!(manager.skills.form.as_ref().unwrap().find.is_open());
+        let _ = reveal(&mut manager, "skill target", Control::SkillTarget);
+        assert_eq!(manager.skills.library, LibraryView::Local);
         let task = reveal(
             &mut manager,
             "search skills library",
@@ -1925,7 +2054,7 @@ mod tests {
         let listing = output(editor.update(&mut store, Message::BrowseExport, None));
         let _ = editor.update(&mut store, listing, None);
         assert_eq!(
-            editor.chooser.as_ref().unwrap().export_folder(),
+            editor.chooser.as_ref().unwrap().chosen_folder(),
             Some(folder.as_path())
         );
         let result = output(editor.update(&mut store, Message::RunFile, None));

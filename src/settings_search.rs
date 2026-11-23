@@ -72,22 +72,41 @@ pub(crate) fn scroll_to_row<Message>(
     page: iced::widget::Id,
     row: iced::widget::Id,
 ) -> Task<Message> {
-    iced_runtime::task::effect(iced_runtime::Action::widget(ScrollToRow {
+    scroll_to_target(page, row, ScrollDirection::Vertical)
+}
+
+pub(crate) fn reveal_tab<Message>(strip: iced::widget::Id, tab: iced::widget::Id) -> Task<Message> {
+    scroll_to_target(strip, tab, ScrollDirection::Horizontal)
+}
+
+enum ScrollDirection {
+    Vertical,
+    Horizontal,
+}
+
+fn scroll_to_target<Message>(
+    page: iced::widget::Id,
+    row: iced::widget::Id,
+    direction: ScrollDirection,
+) -> Task<Message> {
+    iced_runtime::task::effect(iced_runtime::Action::widget(ScrollToTarget {
         page,
         row,
+        direction,
         viewport: None,
         target: None,
     }))
 }
 
-struct ScrollToRow {
+struct ScrollToTarget {
     page: iced::widget::Id,
     row: iced::widget::Id,
-    viewport: Option<Rectangle>,
+    direction: ScrollDirection,
+    viewport: Option<(Rectangle, Vector)>,
     target: Option<Rectangle>,
 }
 
-impl Operation for ScrollToRow {
+impl Operation for ScrollToTarget {
     fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
         operate(self);
     }
@@ -103,25 +122,42 @@ impl Operation for ScrollToRow {
         id: Option<&iced::widget::Id>,
         bounds: Rectangle,
         _: Rectangle,
-        _: Vector,
+        translation: Vector,
         _: &mut dyn operation::Scrollable,
     ) {
         if id == Some(&self.page) {
-            self.viewport = Some(bounds);
+            self.viewport = Some((bounds, translation));
         }
     }
 
     fn finish(&self) -> operation::Outcome<()> {
-        let Some((viewport, target)) = self.viewport.zip(self.target) else {
+        let Some(((viewport, translation), target)) = self.viewport.zip(self.target) else {
             return operation::Outcome::None;
         };
-        let y = (target.y - viewport.y - viewport.height / 3.0).max(0.0);
+        let offset = match self.direction {
+            ScrollDirection::Vertical => operation::scrollable::AbsoluteOffset {
+                x: None,
+                y: Some((target.y - viewport.y - viewport.height / 3.0).max(0.0)),
+            },
+            ScrollDirection::Horizontal => {
+                let start = target.x - viewport.x;
+                let end = start + target.width;
+                let x = if start < translation.x {
+                    start
+                } else if end > translation.x + viewport.width {
+                    end - viewport.width
+                } else {
+                    return operation::Outcome::None;
+                };
+                operation::scrollable::AbsoluteOffset {
+                    x: Some(x.max(0.0)),
+                    y: None,
+                }
+            }
+        };
         operation::Outcome::Chain(Box::new(operation::scrollable::scroll_to(
             self.page.clone(),
-            operation::scrollable::AbsoluteOffset {
-                x: None,
-                y: Some(y),
-            },
+            offset,
         )))
     }
 }

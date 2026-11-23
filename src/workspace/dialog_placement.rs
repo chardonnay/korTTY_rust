@@ -25,6 +25,16 @@ const SAVE_DELAY: Duration = Duration::from_millis(500);
 pub(in crate::workspace) enum Kind {
     About,
     AiManager,
+    KnowledgeStoreSettings,
+    LocalRuntimeInstall,
+    LocalRuntimeVersions,
+    LocalModelReview,
+    GgufModelConfiguration,
+    MlxModelConfiguration,
+    KnowledgeSourceReview,
+    KnowledgeSourceRemoval,
+    KnowledgeSourceSync,
+    KnowledgeSourceAdvanced,
     SavedChats,
     AsciiArt,
     GlobalSettings,
@@ -96,6 +106,16 @@ impl Kind {
         match self {
             Self::About => "about",
             Self::AiManager => "ai-manager",
+            Self::KnowledgeStoreSettings => "knowledge-store-settings",
+            Self::LocalRuntimeInstall => "local-runtime-install",
+            Self::LocalRuntimeVersions => "local-runtime-versions",
+            Self::LocalModelReview => "local-model-review",
+            Self::GgufModelConfiguration => "gguf-model-configuration",
+            Self::MlxModelConfiguration => "mlx-model-configuration",
+            Self::KnowledgeSourceReview => "knowledge-source-review",
+            Self::KnowledgeSourceRemoval => "knowledge-source-removal",
+            Self::KnowledgeSourceSync => "knowledge-source-sync",
+            Self::KnowledgeSourceAdvanced => "knowledge-source-advanced",
             Self::SavedChats => "saved-chats",
             Self::AsciiArt => "ascii-art",
             Self::GlobalSettings => "global-settings",
@@ -797,7 +817,16 @@ impl Workspace {
             })
         });
         if let Some(saved) = saved {
-            settings.size = Size::new(saved.width, saved.height);
+            settings.size.width = saved.width;
+            // These heights follow the Advanced section or number of reviewed sources.
+            if !matches!(
+                kind,
+                Kind::KnowledgeStoreSettings
+                    | Kind::KnowledgeSourceRemoval
+                    | Kind::KnowledgeSourceAdvanced
+            ) {
+                settings.size.height = saved.height;
+            }
         }
         let position = saved.and_then(|saved| saved.position);
         let preferred = WindowPlacement {

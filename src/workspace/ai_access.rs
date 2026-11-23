@@ -6,7 +6,7 @@ use std::time::Duration;
 use iced::keyboard::{Key, Modifiers, key::Named};
 use iced::{Element, Size, Subscription, Task, window};
 
-use crate::ai_manager::{self, Configuration, Dialog, Scope};
+use crate::ai_manager::{self, Configuration, Dialog, ModelConfigurationKind, Scope};
 use crate::clipboard_policy::ClipboardPolicy;
 use crate::connection_store::Store;
 use crate::local_ai::model_catalog;
@@ -28,6 +28,8 @@ mod escape_tests;
 pub enum Message {
     Open(window::Id),
     Dialog(window::Id, Box<ai_manager::Message>),
+    ChildDialog(window::Id, Box<ai_manager::Message>),
+    FocusChildDialog(window::Id),
     KnowledgeSync(knowledge_sync::Event),
     LmStudioAuto(lm_studio_auto::Event),
     PolicyAuto(policy_auto::Event),
@@ -40,6 +42,7 @@ pub(super) struct State {
     config: Arc<Configuration>,
     problem: Option<String>,
     surface: Option<(window::Id, Dialog)>,
+    child: Option<window::Id>,
     skill_rule_write: Option<u64>,
     knowledge_sync: knowledge_sync::State,
     lm_studio_auto: lm_studio_auto::State,
@@ -329,15 +332,45 @@ impl Workspace {
     }
 
     pub(super) fn focus_ai_manager(&mut self, id: window::Id) -> Task<Desktop> {
+        if self.ai_manager_id() == Some(id)
+            && let Some(child) = self.ai_manager.child
+        {
+            return window::gain_focus(child);
+        }
         self.focus_hosted_tool(id)
             .unwrap_or_else(|| window::minimize(id, false).chain(window::gain_focus(id)))
     }
 
     pub(super) fn ai_manager_title(&self, id: window::Id) -> Option<&'static str> {
+        if self.ai_manager.child == Some(id) {
+            let dialog = &self.ai_manager.surface.as_ref()?.1;
+            return dialog
+                .runtime_review_title()
+                .or_else(|| dialog.model_configuration_kind().map(|_| "Configure"))
+                .or_else(|| dialog.model_review_title())
+                .or_else(|| dialog.knowledge_settings_title());
+        }
         (self.ai_manager_id() == Some(id)).then_some(ai_manager::TITLE)
     }
 
     pub(super) fn ai_manager_view(&self, id: window::Id) -> Option<Element<'_, Desktop>> {
+        if self.ai_manager.child == Some(id) {
+            let dialog = &self.ai_manager.surface.as_ref()?.1;
+            let view = dialog
+                .runtime_review_view()
+                .or_else(|| dialog.model_configuration_view())
+                .or_else(|| dialog.model_review_view())
+                .or_else(|| {
+                    dialog.knowledge_settings_view(
+                        self.credential_choices(crate::vault_window::Kind::QdrantApiKey),
+                    )
+                })?;
+            return Some(
+                on_escape(view, ai_manager::Message::Escape).map(move |event| {
+                    Desktop::AiManager(Message::ChildDialog(id, Box::new(event)))
+                }),
+            );
+        }
         let (_, dialog) = self
             .ai_manager
             .surface
@@ -345,7 +378,6 @@ impl Workspace {
             .filter(|(owner, _)| *owner == id)?;
         let view = dialog.view_with_skill_credentials(
             self.credential_choices(crate::vault_window::Kind::HuggingFaceToken),
-            self.credential_choices(crate::vault_window::Kind::QdrantApiKey),
             &self.credential_choices(crate::vault_window::Kind::SkillProviderCredential),
         );
         Some(on_escape(view, ai_manager::Message::Escape).map(move |event| wrap(id, event)))
@@ -417,9 +449,170 @@ impl Workspace {
         }
     }
 
-    pub(super) fn remove_ai_manager(&mut self, id: window::Id) {
+    pub(super) fn remove_ai_manager(&mut self, id: window::Id) -> Task<Desktop> {
         if self.ai_manager_id() == Some(id) {
             self.ai_manager.surface = None;
+            if let Some(child) = self.ai_manager.child.take() {
+                return self.close_placed_dialog(child);
+            }
+        }
+        Task::none()
+    }
+
+    pub(super) fn ai_manager_child_modal(
+        &self,
+        owner: window::Id,
+    ) -> Option<(window::Id, Desktop)> {
+        let id = self.ai_manager.child?;
+        (self.placed_dialog_owner(id) == Some(owner)).then(|| (id, focus_ai_manager_child(id)))
+    }
+
+    pub(super) fn close_ai_manager_child(&mut self, id: window::Id) -> Option<Task<Desktop>> {
+        if self.ai_manager.child == Some(id)
+            && self.ai_manager.surface.as_ref().is_some_and(|(_, dialog)| {
+                dialog.model_configuration_kind().is_some() && dialog.busy()
+            })
+        {
+            return Some(Task::none());
+        }
+        if !self.ai_manager_child_closed(id) {
+            return None;
+        }
+        Some(if let Some(owner) = self.placed_dialog_owner(id) {
+            self.close_placed_dialog_and_focus(id, owner)
+        } else {
+            self.close_placed_dialog(id)
+        })
+    }
+
+    pub(super) fn ai_manager_child_closed(&mut self, id: window::Id) -> bool {
+        if self.ai_manager.child != Some(id) {
+            return false;
+        }
+        self.ai_manager.child = None;
+        if let Some((_, dialog)) = &mut self.ai_manager.surface {
+            dialog.cancel_knowledge_settings();
+            dialog.close_runtime_review();
+            dialog.cancel_model_configuration();
+            dialog.cancel_model_review();
+        }
+        true
+    }
+
+    fn open_ai_manager_child(&mut self, manager: window::Id) -> Task<Desktop> {
+        if self.ai_manager.child.is_some() {
+            return Task::none();
+        }
+        let Some((_, dialog)) = self.ai_manager.surface.as_ref() else {
+            return Task::none();
+        };
+        let Some(height) = child_height(dialog) else {
+            return Task::none();
+        };
+        let (kind, width, min_size) = if dialog.runtime_versions_open() {
+            (
+                DialogKind::LocalRuntimeVersions,
+                598.0,
+                Size::new(440.0, 228.0),
+            )
+        } else if dialog.runtime_review_title().is_some() {
+            (
+                DialogKind::LocalRuntimeInstall,
+                490.0,
+                Size::new(420.0, 188.0),
+            )
+        } else if let Some(kind) = dialog.model_configuration_kind() {
+            match kind {
+                ModelConfigurationKind::Gguf => (
+                    DialogKind::GgufModelConfiguration,
+                    668.0,
+                    Size::new(460.0, 314.0),
+                ),
+                ModelConfigurationKind::Mlx => (
+                    DialogKind::MlxModelConfiguration,
+                    622.0,
+                    Size::new(446.0, 212.0),
+                ),
+            }
+        } else if dialog.model_review_title().is_some() {
+            (DialogKind::LocalModelReview, 514.0, Size::new(430.0, 232.0))
+        } else if dialog.knowledge_source_advanced_open() {
+            (
+                DialogKind::KnowledgeSourceAdvanced,
+                526.0,
+                Size::new(410.0, 200.0),
+            )
+        } else if dialog.knowledge_source_sync_open() {
+            (
+                DialogKind::KnowledgeSourceSync,
+                526.0,
+                Size::new(405.0, height),
+            )
+        } else if dialog.knowledge_source_removal_open() {
+            (
+                DialogKind::KnowledgeSourceRemoval,
+                530.0,
+                Size::new(420.0, height),
+            )
+        } else if dialog.knowledge_file_review_open() || dialog.knowledge_source_updates_open() {
+            (
+                DialogKind::KnowledgeSourceReview,
+                800.0,
+                Size::new(630.0, 350.0),
+            )
+        } else {
+            (
+                DialogKind::KnowledgeStoreSettings,
+                668.0,
+                Size::new(440.0, 170.0),
+            )
+        };
+        let owner = self.hosted_tool_owner(manager).unwrap_or(manager);
+        let (id, opened) = self.open_owned_placed_dialog(
+            owner,
+            kind,
+            window::Settings {
+                size: Size::new(width, height),
+                min_size: Some(min_size),
+                position: window::Position::Centered,
+                exit_on_close_request: false,
+                ..window::Settings::default()
+            },
+            Some(focus_ai_manager_child),
+        );
+        self.ai_manager.child = Some(id);
+        opened
+    }
+
+    fn update_ai_manager_child(
+        &mut self,
+        id: window::Id,
+        event: ai_manager::Message,
+    ) -> Task<Desktop> {
+        if self.ai_manager.child != Some(id) {
+            return Task::none();
+        }
+        if matches!(event, ai_manager::Message::Escape) {
+            return self.close_ai_manager_child(id).unwrap_or_else(Task::none);
+        }
+        let Some((manager, dialog)) = &mut self.ai_manager.surface else {
+            return Task::none();
+        };
+        let manager = *manager;
+        let previous_height = child_height(dialog);
+        let task = dialog
+            .update_with_vault(event, self.vault.as_ref())
+            .map(move |event| wrap(manager, event));
+        match child_height(dialog) {
+            Some(height) if previous_height != Some(height) => task.chain(
+                window::size(id)
+                    .then(move |size| window::resize(id, Size::new(size.width, height))),
+            ),
+            Some(_) => task,
+            None => self
+                .close_ai_manager_child(id)
+                .unwrap_or_else(Task::none)
+                .chain(task),
         }
     }
 
@@ -455,10 +648,29 @@ impl Workspace {
         Some(self.update_ai_manager(Message::Dialog(target, Box::new(event))))
     }
 
+    pub(super) fn ai_manager_modifiers(&mut self, id: window::Id, modifiers: Modifiers) {
+        if let Some(target) = self.ai_manager_id()
+            && (id == target || self.hosted_tool_owner(target) == Some(id))
+            && let Some((_, dialog)) = &mut self.ai_manager.surface
+        {
+            dialog.set_selection_modifiers(modifiers);
+        }
+    }
+
     pub(super) fn update_ai_manager(&mut self, message: Message) -> Task<Desktop> {
         let (id, mut event) = match message {
             Message::Open(owner) => return self.open_ai_manager(owner),
             Message::Dialog(id, event) => (id, *event),
+            Message::ChildDialog(id, event) => {
+                return self.update_ai_manager_child(id, *event);
+            }
+            Message::FocusChildDialog(id) => {
+                return if self.ai_manager.child == Some(id) {
+                    window::gain_focus(id)
+                } else {
+                    Task::none()
+                };
+            }
             Message::KnowledgeSync(event) => return self.update_knowledge_sync(event),
             Message::LmStudioAuto(event) => return self.update_lm_studio_auto(event),
             Message::PolicyAuto(event) => return self.update_policy_auto(event),
@@ -520,6 +732,7 @@ impl Workspace {
             saved.skills_changed(&self.ai_manager.config)
                 || saved.policy_profiles_changed(&self.ai_manager.config)
         });
+        let native_owner = self.hosted_tool_owner(id).unwrap_or(id);
         let Some((_, dialog)) = self
             .ai_manager
             .surface
@@ -534,6 +747,9 @@ impl Workspace {
             ai_manager::Message::Escape => dialog.escape_message(),
             event => event,
         };
+        if let Some(picker) = dialog.native_file_picker(&event, native_owner) {
+            return picker.map(move |event| wrap(id, event));
+        }
         match event {
             ai_manager::Message::Help
                 if dialog.profile_wizard_open() || dialog.guided_setup_open() =>
@@ -569,6 +785,15 @@ impl Workspace {
         let task = dialog
             .update_with_vault(event, self.vault.as_ref())
             .map(move |event| wrap(id, event));
+        let dialog_changed = if let Some(child) = self.ai_manager.child
+            && child_height(dialog).is_none()
+        {
+            self.close_ai_manager_child(child)
+                .unwrap_or_else(Task::none)
+        } else {
+            self.open_ai_manager_child(id)
+        };
+        let task = dialog_changed.chain(task);
         if let Some(previous_vision) = previous_vision {
             if configuration_changed && !projection_only {
                 self.invalidate_snippet_apply_requests();
@@ -695,7 +920,7 @@ impl Workspace {
                 owner,
                 DialogKind::AiManager,
                 window::Settings {
-                    size: Size::new(1120.0, 780.0),
+                    size: Size::new(980.0, 640.0),
                     min_size: Some(Size::new(760.0, 480.0)),
                     position: window::Position::Centered,
                     exit_on_close_request: false,
@@ -704,7 +929,7 @@ impl Workspace {
             )
         };
         dialog.set_skill_rule_writing(self.ai_manager.skill_rule_write.is_some());
-        dialog.set_automatic_knowledge_status(self.ai_manager.knowledge_sync.statuses.clone());
+        self.ai_manager.knowledge_sync.update_dialog(&mut dialog);
         dialog.set_runtime_update_status(self.ai_manager.runtime_updates.status());
         self.ai_manager.surface = Some((id, dialog));
         task
@@ -768,6 +993,23 @@ fn memory_scopes(store: &Store) -> Vec<Scope> {
 
 fn wrap(id: window::Id, event: ai_manager::Message) -> Desktop {
     Desktop::AiManager(Message::Dialog(id, Box::new(event)))
+}
+
+fn child_height(dialog: &Dialog) -> Option<f32> {
+    dialog
+        .runtime_review_height()
+        .or_else(|| {
+            dialog.model_configuration_kind().map(|kind| match kind {
+                ModelConfigurationKind::Gguf => 425.0,
+                ModelConfigurationKind::Mlx => 248.0,
+            })
+        })
+        .or_else(|| dialog.model_review_title().map(|_| 256.0))
+        .or_else(|| dialog.knowledge_settings_height())
+}
+
+fn focus_ai_manager_child(id: window::Id) -> Desktop {
+    Desktop::AiManager(Message::FocusChildDialog(id))
 }
 
 #[cfg(test)]

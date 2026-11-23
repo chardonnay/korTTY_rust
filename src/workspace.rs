@@ -61,6 +61,7 @@ mod coding_agent_strip;
 mod coding_agents;
 mod control_access;
 mod dashboard;
+pub(crate) mod dialog_design;
 mod dialog_placement;
 mod effects;
 pub(crate) mod environment_access;
@@ -1055,6 +1056,22 @@ impl Workspace {
         workspace.refresh_ssh_key_choices();
         workspace.load_teamwork_auth();
         let (id, task) = workspace.boot_session_restore();
+        #[cfg(all(debug_assertions, feature = "dialog-preview"))]
+        let task = match std::env::var("KORTTY_DIALOG_PREVIEW").as_deref() {
+            Ok("settings") => task.chain(Task::done(Message::Settings(
+                settings_window::Message::Open(id),
+            ))),
+            Ok("connections") => task.chain(Task::done(Message::OpenConnections(id))),
+            Ok("agent-design" | "agent-design-compact") => {
+                task.chain(Task::done(Message::Settings(
+                    settings_window::Message::OpenAt(id, settings_window::Section::AgentDesign),
+                )))
+            }
+            Ok("ai-manager") => {
+                task.chain(Task::done(Message::AiManager(ai_access::Message::Open(id))))
+            }
+            _ => task,
+        };
         workspace.initialize_scheduler(id, true);
         let recent = workspace.refresh_open_recent();
         let power = workspace.reconcile_sleep_prevention();
@@ -1752,6 +1769,9 @@ impl Workspace {
                 self.palette.dismiss(id);
                 self.dismiss_terminal_context(id);
                 self.dismiss_tab_context(id);
+                if let Some(close) = self.close_ai_manager_child(id) {
+                    return close;
+                }
                 if let Some((dialog, _)) = self.owner_dialog(id) {
                     return window::gain_focus(dialog);
                 }
@@ -1870,6 +1890,7 @@ impl Workspace {
                 self.teamwork_restore_closed(id);
                 self.remove_coding_agent_alias_dialogs(id);
                 self.journal_summary_progress_closed(id);
+                self.ai_manager_child_closed(id);
                 let placed = self.finish_placed_dialog_closed(id);
                 let manager = self.connection_window_closed(id).unwrap_or_else(Task::none);
                 let teamwork = self.resume_teamwork_after_vault(id);
@@ -1935,6 +1956,7 @@ impl Workspace {
                 self.ascii_art_modifiers(id, Modifiers::empty());
                 self.logfile_modifiers(id, Modifiers::empty());
                 self.journal_modifiers(id, Modifiers::empty());
+                self.ai_manager_modifiers(id, Modifiers::empty());
                 if let Some(manager) = self.connection_managers.get_mut(&id) {
                     manager.window.set_modifiers(Modifiers::empty());
                     manager.window.dismiss_tree_context();
@@ -2054,6 +2076,7 @@ impl Workspace {
                     self.ascii_art_modifiers(id, *modifiers);
                     self.logfile_modifiers(id, *modifiers);
                     self.journal_modifiers(id, *modifiers);
+                    self.ai_manager_modifiers(id, *modifiers);
                     if let Some(manager) = self.connection_managers.get_mut(&id) {
                         manager.window.set_modifiers(*modifiers);
                     }
@@ -4592,6 +4615,9 @@ impl Workspace {
         if let Some(close) = self.close_terminal_agent(id) {
             return close;
         }
+        if let Some(close) = self.close_ai_manager_child(id) {
+            return close;
+        }
         if self.main_placement_closing.contains(&id) {
             return Task::none();
         }
@@ -4646,6 +4672,7 @@ impl Workspace {
         }
         if let Some(dialog) = self
             .openpgp_dialog_for_owner(id)
+            .or_else(|| self.ai_manager_child_modal(id).map(|(child, _)| child))
             .or_else(|| self.hosted_ssh_keys_vault_for_owner(id))
             .or_else(|| self.vault_unlock_for_owner(id))
             .or_else(|| self.teamwork_settings_for_owner(id))
@@ -6136,6 +6163,7 @@ impl Workspace {
         if let Some(modal) = self
             .native_application_modal(owner)
             .or_else(|| self.connection_manager_modal(owner))
+            .or_else(|| self.ai_manager_child_modal(owner))
         {
             return Some(modal);
         }

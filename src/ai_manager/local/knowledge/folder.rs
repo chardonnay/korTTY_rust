@@ -35,6 +35,8 @@ pub(in crate::ai_manager::local) struct Folder {
     pub(in crate::ai_manager::local) options: Options,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     approval: Option<Approval>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::ai_manager::local) review_problems: Option<usize>,
     files: Vec<Approved>,
 }
 
@@ -53,6 +55,7 @@ impl Folder {
             .max_file_bytes
             .filter(|limit| !limit.is_reviewed());
         self.approval = None;
+        self.review_problems = None;
         self.files.clear();
     }
 
@@ -60,6 +63,7 @@ impl Folder {
         let mut folder = self.clone();
         folder.options.sync = SyncMode::Manual;
         folder.approval = None;
+        folder.review_problems = None;
         folder
     }
 
@@ -87,6 +91,12 @@ impl Folder {
             }
         }
         self.options.validate()?;
+        if self
+            .review_problems
+            .is_some_and(|count| count > MAX_VISITED)
+        {
+            return Err("Invalid knowledge folder review problem count".into());
+        }
         if self.options.sync != SyncMode::Automatic && self.approval.is_some() {
             return Err("Review the folder to approve its automatic sync boundary.".into());
         }
@@ -157,24 +167,49 @@ pub(in crate::ai_manager::local) fn start(
     explicit: Vec<PathBuf>,
     options: Options,
 ) -> Result<(ReviewReply, Cancel), String> {
+    start_review(move |stop| {
+        scan(
+            root,
+            previous.as_ref(),
+            available,
+            &explicit,
+            stop,
+            options,
+            None,
+        )
+        .map(Arc::new)
+    })
+}
+
+pub(super) fn review_update(
+    previous: &Folder,
+    available: usize,
+    explicit: &[PathBuf],
+    cancelled: &AtomicBool,
+) -> Result<Review, String> {
+    scan(
+        previous.root.clone(),
+        Some(previous),
+        available,
+        explicit,
+        cancelled,
+        previous.options.clone(),
+        None,
+    )
+}
+
+pub(in crate::ai_manager::local) fn start_review<T: Send + 'static>(
+    review: impl FnOnce(&AtomicBool) -> Result<T, String> + Send + 'static,
+) -> Result<(Receiver<Result<T, String>>, Cancel), String> {
     let cancel = Arc::new(AtomicBool::new(false));
     let stop = Arc::clone(&cancel);
     let (send, reply) = async_channel::bounded(1);
     std::thread::Builder::new()
         .name("kortty-knowledge-review".into())
         .spawn(move || {
-            let result = scan(
-                root,
-                previous.as_ref(),
-                available,
-                &explicit,
-                &stop,
-                options,
-                None,
-            );
-            let _ = send.try_send(result.map(Arc::new));
+            let _ = send.try_send(review(&stop));
         })
-        .map_err(|error| format!("Could not start the folder review ({error})."))?;
+        .map_err(|error| format!("Could not start the source review ({error})."))?;
     Ok((reply, Cancel(cancel)))
 }
 
@@ -254,6 +289,7 @@ fn scan(
             root,
             options,
             approval: None,
+            review_problems: None,
             files: Vec::new(),
         },
         rows: Vec::new(),
@@ -265,6 +301,7 @@ fn scan(
         Ok(directory) => directory,
         Err(error) if previous.is_some() && error.kind() == io::ErrorKind::NotFound => {
             review.missing = true;
+            review.folder.review_problems = Some(1);
             review.record_removals(previous);
             return Ok(review);
         }
@@ -349,6 +386,13 @@ fn scan(
             );
         }
     }
+    review.folder.review_problems = Some(
+        review
+            .rows
+            .iter()
+            .filter(|row| matches!(row.status, Status::Skipped(_)))
+            .count(),
+    );
     review.record_removals(previous);
     Ok(review)
 }
@@ -639,87 +683,88 @@ fn ambiguous_character(character: char) -> bool {
         )
 }
 
-fn supported(path: &Path) -> bool {
+pub(in crate::ai_manager) const SUPPORTED_EXTENSIONS: &[&str] = &[
+    "txt",
+    "pdf",
+    "md",
+    "markdown",
+    "adoc",
+    "asciidoc",
+    "rst",
+    "json",
+    "jsonl",
+    "xml",
+    "yaml",
+    "yml",
+    "toml",
+    "ini",
+    "cfg",
+    "conf",
+    "properties",
+    "csv",
+    "tsv",
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "bat",
+    "cmd",
+    "awk",
+    "ps1",
+    "psm1",
+    "psd1",
+    "py",
+    "pyw",
+    "pyi",
+    "rb",
+    "pl",
+    "php",
+    "lua",
+    "java",
+    "kt",
+    "kts",
+    "groovy",
+    "gradle",
+    "gvy",
+    "gy",
+    "gsh",
+    "scala",
+    "sc",
+    "cs",
+    "js",
+    "jsx",
+    "mjs",
+    "cjs",
+    "ts",
+    "tsx",
+    "mts",
+    "cts",
+    "html",
+    "htm",
+    "css",
+    "scss",
+    "sass",
+    "less",
+    "vue",
+    "svelte",
+    "c",
+    "h",
+    "cc",
+    "cpp",
+    "cxx",
+    "hpp",
+    "hxx",
+    "hh",
+    "inl",
+    "go",
+    "rs",
+    "swift",
+    "sql",
+];
+
+pub(in crate::ai_manager) fn supported(path: &Path) -> bool {
     if let Some(extension) = path.extension().and_then(|extension| extension.to_str()) {
-        matches!(
-            extension.to_ascii_lowercase().as_str(),
-            "txt"
-                | "pdf"
-                | "md"
-                | "markdown"
-                | "adoc"
-                | "asciidoc"
-                | "rst"
-                | "json"
-                | "jsonl"
-                | "xml"
-                | "yaml"
-                | "yml"
-                | "toml"
-                | "ini"
-                | "cfg"
-                | "conf"
-                | "properties"
-                | "csv"
-                | "tsv"
-                | "sh"
-                | "bash"
-                | "zsh"
-                | "fish"
-                | "bat"
-                | "cmd"
-                | "awk"
-                | "ps1"
-                | "psm1"
-                | "psd1"
-                | "py"
-                | "pyw"
-                | "pyi"
-                | "rb"
-                | "pl"
-                | "php"
-                | "lua"
-                | "java"
-                | "kt"
-                | "kts"
-                | "groovy"
-                | "gradle"
-                | "gvy"
-                | "gy"
-                | "gsh"
-                | "scala"
-                | "sc"
-                | "cs"
-                | "js"
-                | "jsx"
-                | "mjs"
-                | "cjs"
-                | "ts"
-                | "tsx"
-                | "mts"
-                | "cts"
-                | "html"
-                | "htm"
-                | "css"
-                | "scss"
-                | "sass"
-                | "less"
-                | "vue"
-                | "svelte"
-                | "c"
-                | "h"
-                | "cc"
-                | "cpp"
-                | "cxx"
-                | "hpp"
-                | "hxx"
-                | "hh"
-                | "inl"
-                | "go"
-                | "rs"
-                | "swift"
-                | "sql"
-        )
+        SUPPORTED_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
     } else {
         path.file_name()
             .and_then(|name| name.to_str())

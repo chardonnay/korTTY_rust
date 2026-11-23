@@ -170,6 +170,7 @@ pub(crate) struct Review {
     pub(crate) revision: String,
     pub(crate) files: Vec<Selection>,
     license: Option<String>,
+    published_at: Option<String>,
 }
 
 impl Review {
@@ -187,6 +188,7 @@ impl Review {
             file: selection.files()[0].clone(),
             additional: selection.files()[1..].to_vec(),
             purpose,
+            published_at: self.published_at.clone(),
         };
         plan.validate()?;
         Ok(plan)
@@ -202,6 +204,8 @@ pub(crate) struct Plan {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     additional: Vec<Artifact>,
     pub(crate) purpose: Purpose,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    published_at: Option<String>,
 }
 
 impl Plan {
@@ -713,6 +717,8 @@ struct ModelWire {
     siblings: Vec<Sibling>,
     #[serde(rename = "cardData")]
     card_data: Option<serde_json::Value>,
+    #[serde(rename = "createdAt")]
+    created_at: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -811,7 +817,16 @@ fn parse_review(repository: Repository, wire: ModelWire) -> Result<Review, Strin
         revision,
         files: multipart::selections(files),
         license,
+        published_at: publication_timestamp(wire.created_at.as_ref()).map(|date| date.to_string()),
     })
+}
+
+fn publication_timestamp(value: Option<&serde_json::Value>) -> Option<jiff::Timestamp> {
+    value?
+        .as_str()
+        .filter(|value| value.len() <= 35)?
+        .parse()
+        .ok()
 }
 
 fn license_label(value: &str) -> Option<String> {
@@ -1156,7 +1171,7 @@ mod tests {
         let repository = Repository::parse("example/fixture").unwrap();
         let digest = "a".repeat(64);
         let revision = "b".repeat(40);
-        let wire = json!({"id":repository.id(), "modelId": repository.id(), "sha": revision, "siblings":[
+        let wire = json!({"id":repository.id(), "modelId": repository.id(), "sha": revision, "createdAt":"2025-02-01T12:00:00Z", "siblings":[
             {"rfilename":"folder/Größe.gguf", "size":4000, "lfs":{"size":4000,"sha256":digest}},
             {"rfilename":"../unsafe.gguf", "lfs":{"size":10,"sha256":digest}},
             {"rfilename":"model-00001-of-00002.gguf", "lfs":{"size":10,"sha256":digest}},
@@ -1171,6 +1186,7 @@ mod tests {
         .unwrap();
         assert_eq!(review.files.len(), 1);
         let plan = review.select(&review.files[0], Purpose::Chat).unwrap();
+        assert_eq!(plan.published_at.as_deref(), Some("2025-02-01T12:00:00Z"));
         assert!(
             plan.destination(&plan.file)
                 .ends_with(&format!("/resolve/{revision}/folder/Gr%C3%B6%C3%9Fe.gguf"))

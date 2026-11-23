@@ -38,6 +38,7 @@ pub(crate) struct Catalog {
     bytes: Vec<u8>,
     signature: String,
     choices: Vec<Choice>,
+    pinned_installation: Option<String>,
 }
 
 impl fmt::Debug for Catalog {
@@ -52,6 +53,10 @@ impl fmt::Debug for Catalog {
 impl Catalog {
     pub(crate) fn choices(&self) -> &[Choice] {
         &self.choices
+    }
+
+    pub(crate) fn pinned_installation(&self) -> Option<&str> {
+        self.pinned_installation.as_deref()
     }
 
     pub(crate) fn preferred_choice(&self, required: Option<PackageBackend>) -> Option<&Choice> {
@@ -435,11 +440,38 @@ fn checked_catalog(
         choices.push(Choice::from_package(package));
     }
     choices.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+    let pinned_installation = install::installed(profile, true)
+        .ok()
+        .and_then(|installed| {
+            installed.pinned_runtime()?;
+            installed.policy_status().map(|status| status.id.to_owned())
+        });
     Ok(Catalog {
         index,
         bytes,
         signature,
         choices,
+        pinned_installation,
+    })
+}
+
+pub(crate) fn unpin(profile: PathBuf, catalog: Arc<Catalog>) -> Result<Pending<()>, String> {
+    let expected = catalog
+        .pinned_installation
+        .clone()
+        .ok_or("There is no pinned runtime in the verified review.")?;
+    work(move |cancelled| {
+        let mut current = install::installed(&profile, true).map_err(|error| error.to_string())?;
+        if current.pinned_runtime().is_none()
+            || current
+                .policy_status()
+                .is_none_or(|status| status.id != expected)
+        {
+            return Err("The pinned runtime changed. Open the versions dialog again.".into());
+        }
+        current
+            .clear_pin(&profile, &catalog.index, None, cancelled)
+            .map_err(|error| format!("Could not clear the runtime pin ({error})."))
     })
 }
 

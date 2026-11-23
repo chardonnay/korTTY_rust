@@ -7,7 +7,11 @@ use iced::{Color, Element, Font, Length, Padding, Point, Rectangle, Renderer, Th
 
 use crate::terminal_agent::design::inline::{self, Kind, Role, Step, StepState, Transcript};
 
-use super::{AgentMessage, Presentation, Run, command_review, fade, history::Activity, log_table};
+use super::{
+    AgentMessage, Palette, Presentation, Run, command_review, fade,
+    history::{self, Activity},
+    log_table,
+};
 
 const FADE: Duration = Duration::from_millis(220);
 const SLIDE: Duration = Duration::from_millis(260);
@@ -15,6 +19,12 @@ const CONNECTOR: Duration = Duration::from_millis(320);
 const RAIL_WIDTH: f32 = 18.0;
 const CENTER_Y: f32 = 8.0;
 const INBOUND_FRACTION: f32 = 0.18;
+pub(super) const PANEL_PADDING: Padding = Padding {
+    top: 8.0,
+    right: 8.0,
+    bottom: 8.0,
+    left: 10.0,
+};
 
 #[derive(Clone, Copy)]
 struct Motion {
@@ -100,14 +110,17 @@ pub(super) fn refresh_interval(
 pub(super) fn view<'a>(
     activity: Activity<'a>,
     trace: &'a Transcript,
+    palette: Option<Palette>,
     reduced_motion: bool,
 ) -> Element<'a, AgentMessage> {
+    let palette = palette.unwrap_or_else(Palette::default_status);
+    let muted = palette.muted.color();
     let motion = Motion {
         now: Instant::now(),
         wall: SystemTime::now(),
         reduced: reduced_motion || activity.live_run.is_some_and(|run| run.reopened_history),
     };
-    let size = activity.activity_font;
+    let size = (activity.activity_font - 1.5).max(10.0);
     let active = activity
         .live_run
         .map_or_else(|| !trace.state.finished(), Run::active);
@@ -115,7 +128,7 @@ pub(super) fn view<'a>(
         || trace.state == inline::State::Running,
         |run| active && !run.paused && !run.cancel.requested(),
     );
-    let review = command_review::card(activity);
+    let review = command_review::timeline_card(activity, palette);
     let answer =
         (!active && !trace.final_answer.trim().is_empty()).then(|| trace.final_answer.trim());
     let review_age = motion.age(activity.presentation.review_started);
@@ -137,27 +150,44 @@ pub(super) fn view<'a>(
             .map(|next| motion.step_age(activity.presentation, next))
             .or_else(|| has_tail.then_some(tail_age))
             .map(|age| motion.connector(age));
-        let command = step.kind == Kind::Action;
+        let command = step.command.is_some();
         let title = inline::clean(step.command.as_deref().unwrap_or(&step.title), false);
-        let label = text(title).size(size).font(if command {
-            Font::MONOSPACE
-        } else {
-            Font::DEFAULT
-        });
-        let body = column![
-            label,
-            metadata(step, motion.now).map(|value| text(value).size(size - 1.0))
-        ]
-        .spacing(3)
-        .width(Length::Fill);
-        let role = if command && step.state == StepState::Completed {
-            Role::Accent
+        let label = text(title)
+            .size(size)
+            .font(if command {
+                Font::MONOSPACE
+            } else {
+                Font::DEFAULT
+            })
+            .wrapping(text::Wrapping::WordOrGlyph);
+        let role = if step.kind == Kind::Action && step.state == StepState::Completed {
+            if step.exit_code.is_some_and(|exit| exit != 0) {
+                Role::Error
+            } else {
+                Role::Accent
+            }
         } else {
             inline::marker(step, "◦").role
         };
+        let detail = if step.kind == Kind::Action && !command && !step.detail.trim().is_empty() {
+            Some(history::summary(&step.detail))
+        } else {
+            super::status::step_metadata(step, motion.now)
+        };
+        let body = column![
+            label,
+            detail.map(|value| {
+                text(value)
+                    .size(size - 1.0)
+                    .style(move |_| text::Style { color: Some(muted) })
+            })
+        ]
+        .spacing(1)
+        .width(Length::Fill);
         let node = entry(
             body.into(),
             motion,
+            palette,
             Node {
                 role,
                 age,
@@ -177,6 +207,7 @@ pub(super) fn view<'a>(
         items = items.push(entry(
             card,
             motion,
+            palette,
             Node {
                 role: Role::Warn,
                 age: review_age,
@@ -196,6 +227,7 @@ pub(super) fn view<'a>(
             items = items.push(entry(
                 text(answer).size(size).into(),
                 motion,
+                palette,
                 Node {
                     role: Role::Ok,
                     age: answer_age,
@@ -213,16 +245,42 @@ pub(super) fn view<'a>(
             .saturating_mul(3)
             .saturating_add(if answer.is_some() { 2 } else { 0 })
     };
-    scrollable(items)
-        .id(activity
-            .presentation
-            .timeline_viewport
-            .get_or_init(Id::unique)
-            .clone())
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .follow_bottom(true, end)
-        .into()
+    scrollable(items.padding(Padding {
+        top: 6.0,
+        right: 4.0,
+        bottom: 6.0,
+        left: 0.0,
+    }))
+    .id(activity
+        .presentation
+        .timeline_viewport
+        .get_or_init(Id::unique)
+        .clone())
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .direction(scrollable::Direction::Vertical(
+        scrollable::Scrollbar::new().width(12).scroller_width(10),
+    ))
+    .style(move |theme, status| {
+        let mut style = scrollable::default(theme, status);
+        let active = matches!(
+            status,
+            scrollable::Status::Hovered {
+                is_vertical_scrollbar_hovered: true,
+                ..
+            } | scrollable::Status::Dragged {
+                is_vertical_scrollbar_dragged: true,
+                ..
+            }
+        );
+        style.vertical_rail.background = None;
+        style.vertical_rail.scroller.background =
+            muted.scale_alpha(if active { 0.75 } else { 0.53 }).into();
+        style.vertical_rail.scroller.border = iced::border::rounded(5);
+        style
+    })
+    .follow_bottom(true, end)
+    .into()
 }
 
 pub(super) fn metadata(step: &Step, now: Instant) -> Option<String> {
@@ -257,6 +315,7 @@ struct Node {
 fn entry<'a>(
     body: Element<'a, AgentMessage>,
     motion: Motion,
+    palette: Palette,
     node: Node,
 ) -> Element<'a, AgentMessage> {
     // Review controls must be visible as soon as they can accept terminal keys.
@@ -268,7 +327,7 @@ fn entry<'a>(
             left: RAIL_WIDTH + 6.0 + slide,
             right: 3.0,
             top: 0.0,
-            bottom: 7.0,
+            bottom: 8.0,
         });
     let incoming = if node.incoming {
         ((motion.connector(node.age) - (1.0 - INBOUND_FRACTION)) / INBOUND_FRACTION).clamp(0.0, 1.0)
@@ -279,7 +338,8 @@ fn entry<'a>(
     stack![body]
         .push_under(
             canvas(Rail {
-                role: node.role,
+                ink: palette.role(node.role),
+                connector: palette.border.color(),
                 opacity: motion.fraction(node.age, FADE),
                 pulse: motion.pulse(node.age, node.pulse),
                 incoming,
@@ -292,7 +352,8 @@ fn entry<'a>(
 }
 
 struct Rail {
-    role: Role,
+    ink: Color,
+    connector: Color,
     opacity: f32,
     pulse: f32,
     incoming: f32,
@@ -306,40 +367,42 @@ impl canvas::Program<AgentMessage> for Rail {
         &self,
         _: &(),
         renderer: &Renderer,
-        theme: &Theme,
+        _: &Theme,
         bounds: Rectangle,
         _: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
         let mut frame = canvas::Frame::new(renderer, bounds.size());
-        let palette = theme.extended_palette();
-        let ink = match self.role {
-            Role::Ok => palette.success.base.color,
-            Role::Warn => palette.warning.base.color,
-            Role::Error => palette.danger.base.color,
-            Role::Accent | Role::Think => palette.primary.base.color,
-            _ => palette.background.weak.text.scale_alpha(0.7),
-        };
         let center = Point::new(bounds.width / 2.0, CENTER_Y.min(bounds.height / 2.0));
-        let connector = palette.background.strong.color;
         line(
             &mut frame,
             center.x,
             0.0,
             center.y * self.incoming,
-            connector,
+            self.connector,
         );
         line(
             &mut frame,
             center.x,
             center.y,
             center.y + (bounds.height - center.y) * self.outgoing,
-            connector,
+            self.connector,
         );
-        let radius = (4.4 * self.pulse).min(center.y);
-        frame.fill(
-            &canvas::Path::circle(center, radius),
-            ink.scale_alpha(self.opacity),
+        let radius = (5.0 * self.pulse).min(center.y);
+        let marker = canvas::Path::circle(center, radius);
+        frame.fill(&marker, self.ink.scale_alpha(self.opacity));
+        let peak = self.ink.r.max(self.ink.g).max(self.ink.b);
+        let factor = if peak > 0.0 {
+            1.2_f32.min(1.0 / peak)
+        } else {
+            1.0
+        };
+        let stroke = Color::from_rgba(
+            self.ink.r * factor,
+            self.ink.g * factor,
+            self.ink.b * factor,
+            self.opacity,
         );
+        frame.stroke(&marker, canvas::Stroke::default().with_color(stroke));
         vec![frame.into_geometry()]
     }
 }

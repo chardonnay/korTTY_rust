@@ -222,7 +222,7 @@ fn entries(
         && let Some(trace) = run.transcript
         && (!trace.steps.is_empty() || !trace.final_answer.is_empty() || run.activity.is_empty())
     {
-        return super::timeline::view(run, trace, reduced_motion);
+        return super::timeline::view(run, trace, palette, reduced_motion);
     }
     let size = run.activity_font;
     let selected = run.presentation.selection(run.activity.len());

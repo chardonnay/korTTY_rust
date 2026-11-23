@@ -678,6 +678,16 @@ impl Installed {
         authorize: &Authorization,
         cancelled: &AtomicBool,
     ) -> io::Result<()> {
+        self.clear_pin(profile, catalog, Some(authorize), cancelled)
+    }
+
+    pub(super) fn clear_pin(
+        &mut self,
+        profile: &Path,
+        catalog: &VerifiedIndex,
+        authorize: Option<&Authorization>,
+        cancelled: &AtomicBool,
+    ) -> io::Result<()> {
         let root = Directory::open(profile, false)?.private_child(DIRECTORY, false)?;
         let operation = root.open_lock("operation.lock")?;
         require_single_link(&operation)?;
@@ -697,7 +707,10 @@ impl Installed {
             ));
         }
         if let Some(current) = &mut current {
-            let _permission = authorize()?;
+            let _permission = authorize.map(|authorize| authorize()).transpose()?;
+            if authorize.is_none() {
+                crate::clipboard_policy::ClipboardPolicy::load().require_ai_runtime_downloads()?;
+            }
             current.active.pinned = false;
             current.publish(&root, || check_cancelled(cancelled))?;
             root.sync()?;
@@ -751,6 +764,15 @@ fn installed_in(root: &Directory, include_revoked: bool) -> io::Result<Installed
 pub(crate) fn active_package_backend(profile: &Path) -> io::Result<Option<PackageBackend>> {
     let installed = installed(profile, false)?;
     Ok(installed.package.map(|package| package.backend()))
+}
+
+pub(crate) fn active_package_summary(
+    profile: &Path,
+) -> io::Result<Option<(String, PackageBackend)>> {
+    let installed = installed(profile, false)?;
+    Ok(installed
+        .package
+        .map(|package| (package.installation_id().to_owned(), package.backend())))
 }
 
 pub(crate) fn active_package(profile: &Path) -> io::Result<Option<Choice>> {

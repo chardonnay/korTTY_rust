@@ -3,12 +3,17 @@
 pub(super) mod huggingface;
 mod knowledge;
 mod knowledge_backend;
+mod knowledge_inventory;
 mod knowledge_options;
+pub(super) mod knowledge_settings;
 mod managed;
+pub(super) use managed::ModelId;
+mod model_configuration;
+pub(crate) use model_configuration::Kind as ModelConfigurationKind;
 mod mlx;
 mod online;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -17,7 +22,7 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use iced::widget::{
-    button, checkbox, column, container, pick_list, row, scrollable, text, text_input,
+    button, checkbox, column, container, pick_list, responsive, row, scrollable, text, text_input,
 };
 use iced::{Alignment, Element, Length, Task};
 use serde::{Deserialize, Serialize};
@@ -30,23 +35,78 @@ use crate::local_ai::{
     self, Pending, PolicyModelAuthority, Profile, managed_models, policy_models, runtime_package,
 };
 use crate::vault_window::{Kind as VaultKind, VaultWindow};
+use crate::workspace::dialog_design;
 
 use super::profiles::{Catalog, ProfileRef, picker::DismissOnEscape as _};
 use super::{
-    Configuration, ProfileId, java_knowledge,
+    Configuration, LocalSection, ProfileId, file_chooser, java_knowledge,
     java_models::{self, Hint, Hints, Metadata},
     model_inventory::ModelInventory,
     search::{Reveal, Setting},
 };
 
-use knowledge::folder;
+pub(super) use knowledge::folder::supported as knowledge_file_supported;
 use knowledge::qdrant::{VaultKey, require_vault_revision};
 pub(super) use knowledge::retrieval;
-use knowledge::source::{DEFAULT_TEXT_BYTES, NEW_SOURCE_DEFAULT, SyncMode};
+use knowledge::source::SyncMode;
 pub(crate) use knowledge::sync as knowledge_sync;
 use knowledge::{
-    Cache, Embedding, Index, Scope, SourceKind, SourceMask, Store, UpdateSummary, remote_index,
+    Cache, Embedding, Index, Scope, SourceIssue, SourceKind, SourceMask, SourceUpdates, Store,
+    UpdateSummary, remote_index,
 };
+use knowledge::{file_review, folder};
+use knowledge_inventory::{SourcePhase, SourceWork};
+
+pub(super) fn pick_native_knowledge_sources(
+    owner: &dyn iced::window::Window,
+    kind: SourceKind,
+) -> iced::futures::future::BoxFuture<'static, Option<Vec<PathBuf>>> {
+    let picker = rfd::AsyncFileDialog::new()
+        .set_parent(owner)
+        .set_title(kind.to_string());
+    match kind {
+        SourceKind::File => {
+            // AppKit merges filters into a single extension list. Keep extensionless
+            // supported sources selectable there and validate every result in korTTY.
+            let picker = if cfg!(target_os = "macos") {
+                picker
+            } else {
+                picker
+                    .add_filter("Supported files", folder::SUPPORTED_EXTENSIONS)
+                    .add_filter("All files", &["*"])
+            };
+            let files = picker.pick_files();
+            Box::pin(async move {
+                files
+                    .await
+                    .map(|files| files.iter().map(|file| file.path().to_owned()).collect())
+            })
+        }
+        SourceKind::Folder => {
+            let folder = picker.pick_folder();
+            Box::pin(async move { folder.await.map(|folder| vec![folder.path().to_owned()]) })
+        }
+    }
+}
+
+pub(super) fn pick_native_managed_files(
+    owner: &dyn iced::window::Window,
+) -> iced::futures::future::BoxFuture<'static, Option<Vec<PathBuf>>> {
+    let files = rfd::AsyncFileDialog::new()
+        .set_parent(owner)
+        .set_title("Import GGUF")
+        .add_filter("GGUF models", &["gguf", "GGUF"])
+        .pick_files();
+    Box::pin(async move {
+        files.await.map(|files| {
+            files
+                .iter()
+                .take(managed_models::MAX_MODELS + 1)
+                .map(|file| file.path().to_owned())
+                .collect()
+        })
+    })
+}
 
 const MAX_DRAFT_INDEX_BYTES: usize = 64 * 1024 * 1024;
 const MANAGED_EMBEDDING_DESTINATION: &str = "Managed llama.cpp on this computer";
@@ -57,9 +117,13 @@ fn valid_embedding_model_id(id: &str) -> bool {
 }
 
 pub(super) enum Page<'a> {
-    Models(Vec<CredentialChoice>, &'a Hints),
-    Knowledge(Vec<CredentialChoice>, &'a java_knowledge::Hints, &'a Hints),
-    Preferences,
+    Models {
+        tokens: Vec<CredentialChoice>,
+        hints: &'a Hints,
+        setup_available: bool,
+    },
+    Knowledge(&'a java_knowledge::Hints, &'a Hints),
+    Preferences(LocalSection, Vec<CredentialChoice>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -284,6 +348,20 @@ impl State {
             .collect()
     }
 
+    fn new_store_index(&self, store: &Store) -> Result<usize, String> {
+        if self.stores.len() >= knowledge::MAX_STORES {
+            return Err("Up to 32 knowledge stores are supported.".into());
+        }
+        if self
+            .stores
+            .iter()
+            .any(|existing| existing.name == store.name)
+        {
+            return Err("Enter a unique knowledge store name.".into());
+        }
+        Ok(self.stores.len())
+    }
+
     pub(super) fn validate(&self) -> Result<(), String> {
         if self.stores.len() > knowledge::MAX_STORES
             || self.endpoint.len() > 128
@@ -463,8 +541,10 @@ pub(super) struct Dialog {
     online: online::State,
     hf: huggingface::State,
     runtime_removal: Option<runtime_package::RemovalPlan>,
+    offline_runtime_open: bool,
     backend_repair: Option<BackendRepair>,
     managed: managed::Models,
+    installed_selection: managed::InventorySelection,
     policy_embeddings: Option<PolicyEmbeddings>,
     policy_embedding_load: Option<ModelInventory>,
     mlx: mlx::State,
@@ -474,13 +554,26 @@ pub(super) struct Dialog {
     request: Option<Request>,
     generation: u64,
     selected: Option<usize>,
+    selected_sources: BTreeSet<knowledge::SourceKey>,
+    source_sync_editor: Option<knowledge_inventory::SyncEdit>,
+    source_results: knowledge_inventory::Results,
+    source_work: Option<SourceWork>,
+    source_anchor: Option<knowledge::SourceKey>,
+    selection_modifiers: iced::keyboard::Modifiers,
+    source_removal: Option<SourceRemoval>,
+    source_picker: Option<KnowledgeSourcePicker>,
+    new_store: Option<Store>,
+    knowledge_settings: Option<knowledge_settings::Draft>,
+    manual_source: bool,
     store_name: String,
     java_store_origin: Option<java_knowledge::Origin>,
     source: String,
     knowledge_backend: knowledge_backend::Editor,
     folder_options: knowledge_options::Draft,
     file_size: Option<FileSizeEdit>,
-    automatic_status: BTreeMap<String, String>,
+    folder_advanced: Option<FolderAdvanced>,
+    automatic_status: BTreeMap<String, knowledge_sync::Status>,
+    active_automatic_sources: Option<(String, Arc<knowledge_sync::SourceReport>)>,
     runtime_update_status: Option<String>,
     confirm_remove: bool,
     consent: bool,
@@ -490,18 +583,69 @@ pub(super) struct Dialog {
     drafts: Vec<DraftIndex>,
     hits: Vec<String>,
     folder_review: Option<Arc<folder::Review>>,
+    source_updates: Option<Arc<SourceUpdates>>,
+    approved_update: Option<ApprovedSourceUpdate>,
     folder_review_page: usize,
+}
+
+enum KnowledgeSourcePicker {
+    ChooseInitial(SourceKind),
+    Native {
+        ticket: u64,
+        kind: SourceKind,
+    },
+    Retry(SourceKind),
+    Browse(file_chooser::Chooser),
+    ScanningFiles,
+    ReviewFiles {
+        review: Arc<file_review::Review>,
+        page: usize,
+        size_limit: String,
+    },
+    InitialFolder,
 }
 
 struct DraftIndex {
     index: Arc<Index>,
     vault_revision: Option<Weak<()>>,
+    review: Option<Arc<IndexReview>>,
+}
+
+pub(crate) struct IndexReview {
+    store: Scope,
+    sources: Scope,
+    coverage: SourceMask,
+}
+
+impl fmt::Debug for IndexReview {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("IndexReview([redacted])")
+    }
+}
+
+struct SourceRemoval {
+    store: usize,
+    id: Option<String>,
+    name: String,
+    sources: BTreeSet<knowledge::SourceKey>,
+}
+
+struct ApprovedSourceUpdate {
+    definition: Store,
+    review: Arc<SourceUpdates>,
 }
 
 struct FileSizeEdit {
     path: PathBuf,
     input: String,
     edited: bool,
+}
+
+struct FolderAdvanced {
+    store: usize,
+    path: PathBuf,
+    original: knowledge::source::Options,
+    draft: knowledge_options::Draft,
 }
 
 struct BackendRepair {
@@ -519,6 +663,15 @@ enum Request {
     Folder {
         _cancel: folder::Cancel,
     },
+    SourceUpdates {
+        cancel: Option<folder::Cancel>,
+    },
+    SourceIndex {
+        cancel: Option<local_ai::Cancel>,
+    },
+    Files {
+        _cancel: folder::Cancel,
+    },
     RuntimeRemovalReview {
         _cancel: runtime_package::Cancel,
     },
@@ -530,6 +683,7 @@ enum Request {
 
 #[derive(Clone)]
 pub(crate) enum Message {
+    OpenModelSetup,
     Endpoint(String),
     Discover,
     Model(String),
@@ -537,6 +691,13 @@ pub(crate) enum Message {
     RuntimePath(RuntimeFile, String),
     ImportRuntime,
     CheckRuntimeOnline,
+    OpenStableRuntimeReview,
+    ConfirmStableRuntime,
+    OpenRuntimeVersions,
+    CloseRuntimeReview,
+    OpenOfflineRuntimeFromReview,
+    RevealRuntimeImport,
+    UnpinRuntime,
     ChooseRuntimeOnline(runtime_package::online::Choice),
     InstallRuntimeOnline,
     PauseRuntimeDownload,
@@ -548,10 +709,16 @@ pub(crate) enum Message {
     HuggingFace(huggingface::Action),
     HubSizeResolved(u64, managed_models::huggingface::Repository, Option<u64>),
     ReviewRuntimeRemoval,
+    ToggleOfflineRuntime,
     ConfirmRuntimeRemoval,
     CancelRuntimeRemoval,
     CloseBackendRepair,
     Managed(managed::Message),
+    RevealManagedSetting(super::search::ManagedSetting),
+    RevealMlxConfiguration,
+    ContinueReviewedModelStart(Vec<managed::ReviewedModel>),
+    OpenManagedFilePicker(Arc<()>),
+    ManagedFilesPicked(Arc<()>, Option<Vec<PathBuf>>),
     Mlx(mlx::Action),
     ReviewJavaModel(java_models::Kind, String),
     ReviewJavaKnowledgeStore(String),
@@ -563,7 +730,16 @@ pub(crate) enum Message {
     PolicyEmbeddingsLoaded(PolicyEmbeddings),
     StoreName(String),
     CreateStore,
+    KnowledgeSettings(knowledge_settings::Action),
+    LocalDimensionsDetected {
+        store: String,
+        model: String,
+        value: Option<usize>,
+    },
     SelectStore(usize),
+    RefreshKnowledgeInventory,
+    SelectKnowledgeSource(usize, SourceKind, PathBuf),
+    RevealKnowledgeSetting(super::search::KnowledgeSetting),
     ConfigureStore(EmbeddingField, String),
     KnowledgeBackend {
         store: usize,
@@ -582,8 +758,23 @@ pub(crate) enum Message {
     ConfirmRemove(bool),
     RemoveStore,
     Source(String),
+    ToggleManualSource,
+    PickNativeKnowledgeSources(SourceKind),
+    OpenNativeKnowledgeSourcePicker(u64),
+    NativeKnowledgeSourcesPicked(u64, Option<Vec<PathBuf>>),
+    BrowseKnowledgeSources(SourceKind),
+    KnowledgeSourceBrowse(file_chooser::Message),
+    UseBrowsedKnowledgeSources,
+    ApproveBrowsedKnowledgeFiles,
+    FileReviewPage(usize),
+    FileReviewLimit(String),
+    ReviewWithFileLimit,
+    CloseKnowledgeSourcePicker,
     FolderOptions(knowledge_options::Edit),
     ConfigureFolder(usize),
+    EditFolderAdvanced(knowledge_options::Edit),
+    ReviewFolderAdvanced,
+    CancelFolderAdvanced,
     AddSource,
     SourceEnabled {
         store: usize,
@@ -591,23 +782,26 @@ pub(crate) enum Message {
         path: PathBuf,
         enabled: bool,
     },
-    FileSync {
-        store: usize,
-        path: PathBuf,
-        mode: SyncMode,
-    },
+    OpenSourceSync(usize),
+    SourceSyncMode(SyncMode),
+    ApplySourceSync,
+    CancelSourceSync,
     ConfigureFileSize(usize, PathBuf),
     FileSize(String),
     ApplyFileSize(usize, PathBuf),
     CancelFileSize,
     ApproveAutomaticEmbedding(usize),
-    RemoveSource(usize),
+    ReviewSourceRemoval(usize),
+    CancelSourceRemoval,
+    RemoveSelectedSources,
     ReviewFolder,
-    ReviewFolderUpdate(usize),
+    ReviewSourceUpdates(usize),
+    ApproveSourceUpdates,
+    CancelSourceUpdates,
+    IndexReviewed,
     ApproveFolder,
     FolderReviewPage(usize),
     DiscardFolderReview,
-    RemoveFolder(usize),
     Consent(bool),
     Index {
         rebuild: bool,
@@ -616,7 +810,11 @@ pub(crate) enum Message {
     Search,
     Cancel,
     Finished(u64, Result<Output, String>),
-    ManagedBackendLoaded(u64, Option<PackageBackend>),
+    ManagedBackendLoaded(u64, Option<(String, PackageBackend)>),
+    SourceResults(
+        u64,
+        Arc<BTreeMap<knowledge::SourceKey, knowledge::SourceResult>>,
+    ),
 }
 
 impl fmt::Debug for Message {
@@ -636,19 +834,32 @@ pub(crate) enum Output {
     },
     RuntimeDownloadDiscarded(bool),
     RuntimeCatalog(Arc<runtime_package::online::Catalog>),
+    RuntimeUnpinned,
     HuggingFace(huggingface::Output),
     RuntimeRemovalReviewed(Option<runtime_package::RemovalPlan>),
     RuntimeRemoved(Option<String>),
     ManagedModels {
         models: Vec<managed_models::Model>,
         default: Result<managed::SavedDefault, String>,
-        active_backend: Option<PackageBackend>,
+        active_package: Option<(String, PackageBackend)>,
+        mlx: Option<Result<mlx::ResultValue, String>>,
         notice: String,
     },
     ManagedNotice(String),
     Mlx(mlx::ResultValue),
-    Index(Arc<Index>, bool, UpdateSummary, bool, Option<Weak<()>>),
+    Index(
+        Arc<Index>,
+        bool,
+        UpdateSummary,
+        bool,
+        Option<Weak<()>>,
+        Arc<IndexReview>,
+    ),
     FolderReview(Arc<folder::Review>),
+    SourceUpdates(Arc<SourceUpdates>),
+    SourceIssue(SourceIssue),
+    FileReview(Arc<file_review::Review>),
+    ConfirmedFileReview(file_review::Confirmed),
     Hits {
         query: String,
         hits: Vec<String>,
@@ -698,6 +909,7 @@ impl Dialog {
             return false;
         };
         match setting {
+            LocalDimensions => store.qdrant.is_none(),
             QdrantEndpoint | QdrantCollection | QdrantDimensions | QdrantAuthentication => {
                 store.qdrant.is_some()
             }
@@ -749,6 +961,10 @@ impl Dialog {
             self.select_store(Some(0));
         }
     }
+
+    pub(super) fn reveal_knowledge_path(&mut self) {
+        self.manual_source = true;
+    }
     pub(super) fn new(profile: PathBuf) -> Self {
         Self {
             cache: Cache::new(profile.clone()),
@@ -774,6 +990,7 @@ impl Dialog {
         if self.request.is_some() || self.backend_repair.is_some() {
             return Task::none();
         }
+        self.close_default_menu();
         let managed = self.update_managed(managed::Message::Refresh);
         if self.policy_embedding_load.is_some() {
             return managed;
@@ -796,6 +1013,88 @@ impl Dialog {
         self.backend_repair.is_some()
     }
 
+    pub(super) fn models_escape_message(&self) -> Option<Message> {
+        if self.default_menu_open() {
+            return Some(Message::Managed(managed::Message::CloseDefaultMenu));
+        }
+        if self.online.review.is_some() {
+            return Some(Message::CloseRuntimeReview);
+        }
+        if self.request.is_some() {
+            return None;
+        }
+        self.managed
+            .escape_message()
+            .map(Message::Managed)
+            .or_else(|| {
+                self.mlx
+                    .configuration_open()
+                    .then_some(Message::Mlx(mlx::Action::CancelConfiguration))
+            })
+            .or_else(|| {
+                self.offline_runtime_open
+                    .then_some(Message::ToggleOfflineRuntime)
+            })
+    }
+
+    pub(super) fn runtime_review_title(&self) -> Option<&'static str> {
+        self.online.review.as_ref().map(online::Review::title)
+    }
+
+    pub(super) fn runtime_review_height(&self) -> Option<f32> {
+        self.online.review.as_ref().map(online::Review::height)
+    }
+
+    pub(super) fn runtime_versions_open(&self) -> bool {
+        matches!(self.online.review, Some(online::Review::Versions))
+    }
+
+    pub(super) fn runtime_review_view(&self, can_request: bool) -> Option<Element<'_, Message>> {
+        self.online.review_view(
+            self.status.as_deref(),
+            can_request,
+            self.runtime_downloads_allowed,
+            self.request.is_some(),
+            self.managed.runtime_summary().0,
+        )
+    }
+
+    pub(super) fn close_runtime_review(&mut self) {
+        if self.online.review.take().is_some() {
+            if self.request.is_some() {
+                self.cancel();
+            }
+            self.online.reset_catalog();
+        }
+    }
+
+    pub(super) fn pending_managed_file_picker(&self, ticket: &Arc<()>) -> bool {
+        self.managed.pending_file_picker(ticket)
+    }
+
+    pub(super) fn finish_managed_file_picker(
+        &mut self,
+        ticket: &Arc<()>,
+        paths: Option<Vec<PathBuf>>,
+        can_import: bool,
+    ) -> bool {
+        if !self.managed.pending_file_picker(ticket) {
+            return false;
+        }
+        self.managed.finish_file_picker();
+        if self.request.is_some() || !can_import || self.managed.has_action() {
+            return false;
+        }
+        match paths.map(|paths| self.managed.stage_files(paths)) {
+            Some(Ok(true)) => true,
+            Some(Err(problem)) => {
+                self.status = Some(problem.into());
+                false
+            }
+            _ => false,
+        }
+    }
+
     pub(super) fn can_reveal_managed_setting(
         &self,
         setting: super::search::ManagedSetting,
@@ -804,7 +1103,7 @@ impl Dialog {
     ) -> bool {
         let editable = editable && self.request.is_none();
         self.managed
-            .has_search_setting(setting, editable, editable && ai_enabled)
+            .has_search_setting(setting, editable, editable && ai_enabled, &self.mlx)
     }
 
     pub(super) fn reveal_managed_setting(
@@ -812,7 +1111,11 @@ impl Dialog {
         setting: super::search::ManagedSetting,
         editable: bool,
     ) -> Task<Message> {
+        let previous = self.model_configuration_kind();
         self.managed.reveal_search_setting(setting);
+        if previous.is_none() && self.model_configuration_kind().is_some() {
+            self.status = None;
+        }
         if setting == super::search::ManagedSetting::Select
             && editable
             && self.request.is_none()
@@ -843,6 +1146,15 @@ impl Dialog {
         &mut self,
         setting: super::search::MlxSetting,
     ) -> Task<Message> {
+        use super::search::MlxSetting;
+        if matches!(
+            setting,
+            MlxSetting::Name | MlxSetting::Idle | MlxSetting::NeverUnload
+        ) && !self.managed.has_action()
+            && self.mlx.begin_configuration()
+        {
+            self.status = None;
+        }
         if setting == super::search::MlxSetting::Select && self.mlx.picker_needs_models() {
             self.update_mlx(mlx::Action::Refresh)
         } else {
@@ -927,8 +1239,12 @@ impl Dialog {
         requested
     }
 
-    pub(super) fn has_managed_model_selection(&self) -> bool {
-        self.managed.has_selection() || self.mlx.has_selection()
+    pub(super) fn has_managed_models_to_refresh(&self) -> bool {
+        self.managed.has_models() || self.mlx.has_selection()
+    }
+
+    pub(super) fn reveal_offline_runtime(&mut self) {
+        self.offline_runtime_open = true;
     }
 
     pub(super) fn stage_java_model(&mut self, hint: &Hint) {
@@ -1060,19 +1376,19 @@ impl Dialog {
         message: &Message,
         state: &State,
     ) -> Option<managed::DefaultChange> {
-        if self.busy() || self.managed.has_action() {
+        if self.busy() || !self.can_select_installed() {
             return None;
         }
-        let mark = match message {
-            Message::Managed(managed::Message::SetDefault) => true,
-            Message::Managed(managed::Message::ClearDefault) => false,
+        let id = match message {
+            Message::Managed(managed::Message::SetDefault) => Some(self.installed_current()?),
+            Message::Managed(managed::Message::ClearDefault) => None,
             _ => return None,
         };
         self.managed
-            .default_change(mark, state.default_managed_model.as_deref())
+            .default_change(id, state.default_managed_model.as_deref())
     }
 
-    pub(super) fn set_managed_default(&mut self, id: Option<String>) {
+    pub(super) fn set_managed_default(&mut self, id: Option<managed::ModelId>) {
         self.managed.set_default(id);
     }
 
@@ -1096,14 +1412,24 @@ impl Dialog {
             .filter_map(|draft| {
                 let scope = retained.iter().find(|scope| scope.same_as(&draft.index))?;
                 ((ai_enabled || scope.qdrant.is_none())
+                    && draft
+                        .review
+                        .as_ref()
+                        .is_none_or(|review| &review.store == scope)
                     && !previous.iter().any(|old| old.same_snapshot(scope)))
                 .then_some((draft, scope))
             })
             .map(|(draft, scope)| {
                 Ok(StagedIndex {
                     index: Arc::clone(&draft.index),
-                    scope: scope.clone(),
-                    sources: scope.enabled_sources(),
+                    scope: draft
+                        .review
+                        .as_ref()
+                        .map_or_else(|| scope.clone(), |review| review.sources.clone()),
+                    sources: draft
+                        .review
+                        .as_ref()
+                        .map_or_else(|| scope.enabled_sources(), |review| review.coverage.clone()),
                     vault_key: resolve_reviewed_key(scope, vault, draft.vault_revision.as_ref())?,
                 })
             })
@@ -1136,13 +1462,20 @@ impl Dialog {
 
     pub(super) fn automatic_sync_idle(&self) -> bool {
         !self.busy()
+            && self.knowledge_settings_title().is_none()
             && self.folder_review.is_none()
+            && self.source_updates.is_none()
             && self.backend_repair.is_none()
             && self.runtime_removal.is_none()
     }
 
-    pub(super) fn set_automatic_status(&mut self, status: BTreeMap<String, String>) {
+    pub(super) fn set_automatic_status(
+        &mut self,
+        status: BTreeMap<String, knowledge_sync::Status>,
+        active: Option<(String, Arc<knowledge_sync::SourceReport>)>,
+    ) {
         self.automatic_status = status;
+        self.active_automatic_sources = active;
     }
 
     pub(super) fn set_runtime_update_status(&mut self, status: Option<String>) {
@@ -1167,6 +1500,7 @@ impl Dialog {
         self.discard_stale_drafts(state);
         self.hits.clear();
         self.folder_review = None;
+        self.source_updates = None;
         self.clear_consent();
     }
 
@@ -1211,7 +1545,25 @@ impl Dialog {
         {
             return Task::none();
         }
+        if self.edit_knowledge_settings(&message, state, vault) {
+            if matches!(message, Message::EmbeddingSource(EmbeddingScope::Store, _)) {
+                return self.suggest_local_dimensions();
+            }
+            return Task::none();
+        }
         match message {
+            Message::KnowledgeSettings(action) => {
+                let create = matches!(action, knowledge_settings::Action::Open { create: true });
+                self.update_knowledge_settings(action, state, vault);
+                if create {
+                    return self.suggest_local_dimensions();
+                }
+            }
+            Message::LocalDimensionsDetected {
+                store,
+                model,
+                value,
+            } => self.accept_local_dimensions(&store, &model, value),
             Message::RuntimeUpdateMode(mode)
                 if self.runtime_downloads_allowed && self.request.is_none() =>
             {
@@ -1258,16 +1610,52 @@ impl Dialog {
                 return self.import_runtime();
             }
             Message::CheckRuntimeOnline if self.runtime_online_allowed(ai_allowed) => {
-                self.online = online::State::default();
-                return self.run_managed(
-                    runtime_package::online::check(
-                        self.profile_dir.clone(),
-                        self.required_runtime(),
-                    ),
-                    "Checking the signed runtime channel…",
-                    true,
-                    Output::RuntimeCatalog,
-                );
+                return self.check_runtime_online();
+            }
+            Message::OpenStableRuntimeReview
+                if ai_allowed
+                    && self.request.is_none()
+                    && !self.managed.has_action()
+                    && self.runtime_removal.is_none() =>
+            {
+                let preferred = state
+                    .runtime_update
+                    .backend
+                    .required()
+                    .or(self.managed.runtime_summary().1);
+                self.open_runtime_install(preferred, Vec::new());
+            }
+            Message::ConfirmStableRuntime if self.runtime_online_allowed(ai_allowed) => {
+                if let Some(online::Review::Stable { approved, .. }) = &mut self.online.review {
+                    *approved = true;
+                    return self.check_runtime_online();
+                }
+            }
+            Message::OpenRuntimeVersions
+                if self.runtime_online_allowed(ai_allowed) && !self.managed.has_action() =>
+            {
+                self.online.review = Some(online::Review::Versions);
+                return self.check_runtime_online();
+            }
+            Message::CloseRuntimeReview => self.close_runtime_review(),
+            Message::OpenOfflineRuntimeFromReview
+                if ai_allowed && self.request.is_none() && self.online.review.is_some() =>
+            {
+                self.close_runtime_review();
+                self.reveal_offline_runtime();
+                return Task::done(Message::RevealRuntimeImport);
+            }
+            Message::UnpinRuntime
+                if self.runtime_online_allowed(ai_allowed) && self.online.has_pin() =>
+            {
+                if let Some(catalog) = self.online.catalog.clone() {
+                    return self.run_managed(
+                        runtime_package::online::unpin(self.profile_dir.clone(), catalog),
+                        "Clearing the runtime pin…",
+                        true,
+                        |()| Output::RuntimeUnpinned,
+                    );
+                }
             }
             Message::ChooseRuntimeOnline(choice) if self.runtime_online_allowed(ai_allowed) => {
                 let required = self.required_runtime();
@@ -1306,6 +1694,7 @@ impl Dialog {
             {
                 self.online.progress = Some(progress);
             }
+            Message::ToggleOfflineRuntime => self.offline_runtime_open = !self.offline_runtime_open,
             Message::ReviewRuntimeRemoval
                 if self.request.is_none()
                     && self.runtime_removal.is_none()
@@ -1355,6 +1744,9 @@ impl Dialog {
                 } else {
                     self.update_managed(message)
                 };
+            }
+            Message::ContinueReviewedModelStart(models) if ai_allowed && self.request.is_none() => {
+                return self.start_reviewed_models(models);
             }
             Message::Mlx(action)
                 if self.request.is_none() && (ai_allowed || !action.requires_ai(&self.mlx)) =>
@@ -1459,6 +1851,28 @@ impl Dialog {
             }
             Message::SelectStore(index) if index < state.stores.len() => {
                 self.select_store(Some(index));
+                return self.load_source_results(state);
+            }
+            Message::SourceResults(ticket, results) => self.source_results.loaded(ticket, results),
+            Message::RefreshKnowledgeInventory if self.selected.is_some() && !self.busy() => {
+                return self.load_source_results(state);
+            }
+            Message::SelectKnowledgeSource(index, kind, path) if self.selected == Some(index) => {
+                let row = (kind, path);
+                if let Some(store) = state.stores.get(index) {
+                    let visible: Vec<_> = store.source_keys().collect();
+                    if visible.contains(&row) {
+                        self.source_removal = None;
+                        self.source_sync_editor = None;
+                        crate::input::select_row(
+                            &mut self.selected_sources,
+                            &mut self.source_anchor,
+                            row,
+                            &visible,
+                            self.selection_modifiers,
+                        );
+                    }
+                }
             }
             Message::ConfigureStore(field, value) => {
                 let defaults = state.default_embedding();
@@ -1538,6 +1952,137 @@ impl Dialog {
                 self.source = limited(&value, 4096).into();
                 self.folder_review = None;
             }
+            Message::ToggleManualSource => self.manual_source = !self.manual_source,
+            Message::PickNativeKnowledgeSources(kind) if !self.busy() => {
+                if matches!(
+                    self.source_picker,
+                    None | Some(
+                        KnowledgeSourcePicker::ChooseInitial(_)
+                            | KnowledgeSourcePicker::Retry(_)
+                            | KnowledgeSourcePicker::ReviewFiles { .. }
+                    )
+                ) && let Some(store) = self.source_store(state)
+                    && knowledge_backend::validate(store).is_ok()
+                {
+                    self.generation = self.generation.wrapping_add(1);
+                    let ticket = self.generation;
+                    self.source_picker = Some(KnowledgeSourcePicker::Native { ticket, kind });
+                    self.status = None;
+                    return Task::done(Message::OpenNativeKnowledgeSourcePicker(ticket));
+                }
+            }
+            Message::NativeKnowledgeSourcesPicked(ticket, paths) => {
+                if let Some(kind) = self.pending_native_knowledge_kind(ticket) {
+                    if let Some(paths) = paths.filter(|paths| !paths.is_empty()) {
+                        self.source_picker = Some(KnowledgeSourcePicker::Retry(kind));
+                        match kind {
+                            SourceKind::File => {
+                                return self.review_picked_knowledge_files(state, paths, None);
+                            }
+                            SourceKind::Folder => {
+                                if let [folder] = paths.as_slice() {
+                                    return self
+                                        .review_picked_knowledge_folder(state, folder.clone());
+                                }
+                                self.status = Some("Choose one folder to review.".into());
+                            }
+                        }
+                    } else {
+                        self.close_knowledge_source_picker();
+                    }
+                }
+            }
+            Message::BrowseKnowledgeSources(kind) if !self.busy() => {
+                if let Some(store) = self.source_store(state)
+                    && knowledge_backend::validate(store).is_ok()
+                {
+                    let mode = match kind {
+                        SourceKind::File => file_chooser::Mode::KnowledgeFiles(
+                            knowledge::MAX_SOURCES.saturating_sub(store.source_count()),
+                        ),
+                        SourceKind::Folder => file_chooser::Mode::KnowledgeFolder,
+                    };
+                    let (chooser, task) =
+                        file_chooser::Chooser::open(mode, None, &mut self.generation);
+                    self.source_picker = Some(KnowledgeSourcePicker::Browse(chooser));
+                    self.status = None;
+                    return task.map(Message::KnowledgeSourceBrowse);
+                }
+            }
+            Message::KnowledgeSourceBrowse(message) if !self.busy() => {
+                if let Some(KnowledgeSourcePicker::Browse(chooser)) = &mut self.source_picker {
+                    return chooser
+                        .update(message, &mut self.generation)
+                        .map(Message::KnowledgeSourceBrowse);
+                }
+            }
+            Message::UseBrowsedKnowledgeSources if !self.busy() => {
+                if let Some(KnowledgeSourcePicker::Browse(chooser)) = &self.source_picker {
+                    if let Some(folder) = chooser.chosen_folder() {
+                        return self.review_picked_knowledge_folder(state, folder.to_owned());
+                    }
+                    if !chooser.selection().is_empty() {
+                        return self.review_picked_knowledge_files(
+                            state,
+                            chooser.selection().to_vec(),
+                            None,
+                        );
+                    }
+                }
+            }
+            Message::ApproveBrowsedKnowledgeFiles if !self.busy() => {
+                if let Some(KnowledgeSourcePicker::ReviewFiles {
+                    review, size_limit, ..
+                }) = &self.source_picker
+                    && review.has_ready_files()
+                    && knowledge_options::file_size(size_limit) == Ok(review.file_limit)
+                {
+                    match file_review::confirm(Arc::clone(review)) {
+                        Ok((reply, cancel)) => {
+                            return self.receive(
+                                reply,
+                                Request::Files { _cancel: cancel },
+                                "Verifying the reviewed files…",
+                                Output::ConfirmedFileReview,
+                            );
+                        }
+                        Err(error) => self.status = Some(error),
+                    }
+                }
+            }
+            Message::FileReviewPage(next) => {
+                if let Some(KnowledgeSourcePicker::ReviewFiles { review, page, .. }) =
+                    &mut self.source_picker
+                    && next < review.rows.len().div_ceil(SOURCE_REVIEW_PAGE_SIZE)
+                {
+                    *page = next;
+                }
+            }
+            Message::FileReviewLimit(input) if !self.busy() => {
+                if let Some(KnowledgeSourcePicker::ReviewFiles { size_limit, .. }) =
+                    &mut self.source_picker
+                {
+                    *size_limit = limited(&input, 24).into();
+                }
+            }
+            Message::ReviewWithFileLimit if !self.busy() => {
+                if let Some(KnowledgeSourcePicker::ReviewFiles {
+                    review, size_limit, ..
+                }) = &self.source_picker
+                {
+                    match knowledge_options::file_size(size_limit) {
+                        Ok(limit) => {
+                            return self.review_picked_knowledge_files(
+                                state,
+                                review.rows.iter().map(|row| row.path.clone()).collect(),
+                                limit,
+                            );
+                        }
+                        Err(error) => self.status = Some(error),
+                    }
+                }
+            }
+            Message::CloseKnowledgeSourcePicker => self.close_knowledge_source_picker(),
             Message::FolderOptions(edit) if !self.busy() => {
                 if matches!(&edit, knowledge_options::Edit::MaxFileBytes(_))
                     && self.folder_review.is_some()
@@ -1550,35 +2095,56 @@ impl Dialog {
                 self.folder_options.update(edit);
                 self.folder_review = None;
             }
-            Message::ConfigureFolder(index) if !self.busy() => {
-                if let Some(folder) = self
-                    .selected
-                    .and_then(|selected| state.stores.get(selected))
-                    .and_then(|store| store.folders.get(index))
+            Message::ConfigureFolder(index)
+                if !self.busy() && self.knowledge_settings_title().is_none() =>
+            {
+                if let Some(store) = self.selected
+                    && let Some(folder) = state
+                        .stores
+                        .get(store)
+                        .and_then(|store| store.folders.get(index))
                 {
-                    self.source = folder.root.display().to_string();
-                    self.folder_options.set(&folder.options);
-                    self.folder_review = None;
-                    self.status = Some(
-                        "Edit the folder options, then review and approve the resulting file list."
-                            .into(),
-                    );
+                    self.folder_advanced = Some(FolderAdvanced {
+                        store,
+                        path: folder.root.clone(),
+                        original: folder.options.clone(),
+                        draft: knowledge_options::Draft::advanced(&folder.options),
+                    });
+                    self.status = None;
                 }
             }
-            Message::AddSource => {
-                if let Some(store) = self.selected.and_then(|index| state.stores.get_mut(index)) {
-                    let result = knowledge_backend::validate(store)
-                        .and_then(|()| store.add_source(PathBuf::from(self.source.trim())));
-                    match result {
-                        Ok(()) => {
-                            self.source.clear();
-                            self.invalidate_index();
-                            self.discard_stale_drafts(state);
-                            self.clear_consent();
-                        }
-                        Err(error) => self.status = Some(error),
-                    }
+            Message::EditFolderAdvanced(edit) if !self.busy() => {
+                if let Some(advanced) = &mut self.folder_advanced {
+                    advanced.draft.update(edit);
+                    self.status = None;
                 }
+            }
+            Message::CancelFolderAdvanced => self.folder_advanced = None,
+            Message::ReviewFolderAdvanced if !self.busy() => {
+                if let Some(advanced) = &self.folder_advanced {
+                    let pending = state.stores.get(advanced.store)
+                        .filter(|store| self.selected == Some(advanced.store) && store.folders.iter().any(|folder| {
+                            folder.root == advanced.path && folder.options == advanced.original
+                        }))
+                        .ok_or_else(|| "The selected folder changed. Reopen Advanced to review the current options.".to_owned())
+                        .and_then(|store| {
+                            knowledge_backend::validate(store)?;
+                            let options = advanced.draft.options()?;
+                            store.folder_review_options(advanced.path.clone(), options)
+                        });
+                    if pending.is_ok() {
+                        self.folder_advanced = None;
+                        self.folder_review = None;
+                    }
+                    return self.start_folder_review(pending);
+                }
+            }
+            Message::AddSource if !self.busy() && !self.knowledge_source_picker_open() => {
+                return self.review_picked_knowledge_files(
+                    state,
+                    vec![PathBuf::from(self.source.trim())],
+                    None,
+                );
             }
             Message::SourceEnabled {
                 store,
@@ -1598,51 +2164,100 @@ impl Dialog {
                     });
                 }
             }
-            Message::RemoveSource(source) => {
-                if let Some(store) = self.selected.and_then(|index| state.stores.get_mut(index))
-                    && source < store.sources.len()
+            Message::ReviewSourceRemoval(index)
+                if self.selected == Some(index)
+                    && !self.busy()
+                    && !self.knowledge_source_picker_open()
+                    && self.knowledge_settings_title().is_none() =>
+            {
+                if let Some(store) = state.stores.get(index)
+                    && !self.selected_sources.is_empty()
                 {
-                    if self
-                        .file_size
-                        .as_ref()
-                        .is_some_and(|edit| edit.path == store.sources[source])
-                    {
-                        self.file_size = None;
-                    }
-                    store.remove_file(source);
-                    self.invalidate_index();
-                    self.discard_stale_drafts(state);
-                    self.clear_consent();
+                    self.source_removal = Some(SourceRemoval {
+                        store: index,
+                        id: store.id().map(str::to_owned),
+                        name: store.name.clone(),
+                        sources: self.selected_sources.clone(),
+                    });
                 }
             }
-            Message::FileSync { store, path, mode }
-                if self.selected == Some(store) && !self.busy() =>
+            Message::CancelSourceRemoval => self.source_removal = None,
+            Message::RemoveSelectedSources if !self.busy() => self.remove_selected_sources(state),
+            Message::OpenSourceSync(index)
+                if self.selected == Some(index)
+                    && !self.busy()
+                    && self.knowledge_settings_title().is_none() =>
             {
-                if let Some(store) = state.stores.get_mut(store)
-                    && store.set_file_sync(path, mode)
+                self.source_sync_editor = self.source_sync_edit(state, index);
+            }
+            Message::SourceSyncMode(mode) => {
+                if let Some(edit) = &mut self.source_sync_editor {
+                    edit.mode = mode;
+                }
+            }
+            Message::CancelSourceSync => self.source_sync_editor = None,
+            Message::ApplySourceSync if !self.busy() => {
+                if let Some(edit) = self.source_sync_editor.take()
+                    && self.selected == Some(edit.store)
+                    && self
+                        .source_sync_edit(state, edit.store)
+                        .is_some_and(|current| {
+                            current.source == edit.source && current.mode != edit.mode
+                        })
                 {
-                    self.status =
-                        Some("Source sync mode changed in the draft. Save to apply it.".into());
+                    let (kind, path) = edit.source;
+                    let store = &mut state.stores[edit.store];
+                    match kind {
+                        SourceKind::File => {
+                            if store.set_file_sync(path, edit.mode) {
+                                self.status = Some(
+                                    "Source sync mode changed in the draft. Save to apply it."
+                                        .into(),
+                                );
+                            }
+                        }
+                        SourceKind::Folder => {
+                            if let Some(folder) =
+                                store.folders.iter().find(|folder| folder.root == path)
+                            {
+                                self.folder_options.set(&folder.options);
+                                self.folder_options
+                                    .update(knowledge_options::Edit::Sync(edit.mode));
+                                self.source = path.display().to_string();
+                                self.manual_source = true;
+                                self.folder_review = None;
+                                return self.review_folder(store, path);
+                            }
+                        }
+                    }
                 }
             }
             Message::ConfigureFileSize(store, path)
-                if self.selected == Some(store) && !self.busy() =>
+                if self.selected == Some(store)
+                    && !self.busy()
+                    && (self.file_size.is_some() || self.knowledge_settings_title().is_none()) =>
             {
                 if let Some(store) = state.stores.get(store)
                     && store.sources.contains(&path)
                 {
-                    let input = knowledge_options::file_size_text(store.file_size_limit(&path));
+                    let input = knowledge_options::format_advanced_limit(
+                        store
+                            .file_size_limit(&path)
+                            .unwrap_or(knowledge::source::NEW_SOURCE_DEFAULT),
+                    );
                     self.file_size = Some(FileSizeEdit {
                         path,
                         input,
                         edited: false,
                     });
+                    self.status = None;
                 }
             }
             Message::FileSize(value) if !self.busy() => {
                 if let Some(edit) = &mut self.file_size {
                     edit.input = limited(&value, 32).into();
                     edit.edited = true;
+                    self.status = None;
                 }
             }
             Message::ApplyFileSize(store, path) if self.selected == Some(store) && !self.busy() => {
@@ -1651,12 +2266,8 @@ impl Dialog {
                 {
                     let automatic = store.file_sync(&path) == SyncMode::Automatic;
                     let result = if edit.edited {
-                        knowledge_options::file_size(&edit.input).and_then(|limit| {
-                            store.set_file_size_limit(
-                                path,
-                                Some(limit.unwrap_or(NEW_SOURCE_DEFAULT)),
-                            )
-                        })
+                        knowledge_options::advanced_file_size(&edit.input)
+                            .and_then(|limit| store.set_file_size_limit(path, Some(limit)))
                     } else {
                         Ok(false)
                     };
@@ -1714,17 +2325,105 @@ impl Dialog {
                     return self.review_folder(store, PathBuf::from(self.source.trim()));
                 }
             }
-            Message::ReviewFolderUpdate(index) if !self.busy() => {
-                if let Some(store) = self
-                    .selected
-                    .and_then(|selected| state.stores.get(selected))
-                    && let Some(folder) = store.folders.get(index)
-                {
-                    self.folder_options.set(&folder.options);
-                    return self.review_folder(store, folder.root.clone());
+            Message::ReviewSourceUpdates(index)
+                if !self.busy()
+                    && self.selected == Some(index)
+                    && self.folder_review.is_none()
+                    && !self.knowledge_source_picker_open()
+                    && self.knowledge_settings_title().is_none() =>
+            {
+                if let Some(store) = state.stores.get(index) {
+                    match knowledge_backend::validate(store)
+                        .and_then(|()| store.review_source_updates(index, &self.selected_sources))
+                    {
+                        Ok((reply, cancel)) => {
+                            self.source_work = Some(SourceWork::new(
+                                store,
+                                store.source_keys().filter(|(kind, path)| {
+                                    store.source_enabled(*kind, path)
+                                        && (self.selected_sources.is_empty()
+                                            || self
+                                                .selected_sources
+                                                .contains(&(*kind, path.clone())))
+                                }),
+                                SourcePhase::Scanning,
+                            ));
+                            return self.receive(
+                                reply,
+                                Request::SourceUpdates {
+                                    cancel: Some(cancel),
+                                },
+                                "Checking the enabled sources…",
+                                Output::SourceUpdates,
+                            );
+                        }
+                        Err(error) => self.status = Some(error),
+                    }
                 }
             }
-            Message::ApproveFolder => {
+            Message::ApproveSourceUpdates if !self.busy() => {
+                if let Some(review) = self
+                    .source_updates
+                    .take()
+                    .filter(|review| review.can_approve())
+                {
+                    let result = state
+                        .stores
+                        .get_mut(review.store)
+                        .filter(|_| {
+                            self.selected == Some(review.store)
+                                && self.selected_sources == review.selection
+                        })
+                        .ok_or_else(|| {
+                            "The store or selection changed. Review the selected sources again."
+                                .to_owned()
+                        })
+                        .and_then(|store| {
+                            store.approve_source_updates(&review)?;
+                            Ok(store.clone())
+                        });
+                    self.status = Some(match result {
+                        Ok(definition) => {
+                            self.invalidate_index();
+                            self.discard_stale_drafts(state);
+                            self.clear_consent();
+                            let indexable = review.has_indexable_files();
+                            self.approved_update =
+                                Some(ApprovedSourceUpdate { definition, review });
+                            if indexable {
+                                "Review approved. Enable embedding consent, then choose Index reviewed sources.".into()
+                            } else {
+                                "Review approved. Save the settings to apply the folder changes."
+                                    .into()
+                            }
+                        }
+                        Err(error) => error,
+                    });
+                }
+            }
+            Message::CancelSourceUpdates => {
+                self.source_updates = None;
+                self.status = None;
+            }
+            Message::ApproveFolder
+                if matches!(
+                    self.source_picker,
+                    Some(KnowledgeSourcePicker::InitialFolder)
+                ) =>
+            {
+                if let Some(review) = &self.folder_review
+                    && can_approve_folder_review(review)
+                    && let Some(mut store) = self.new_store.clone()
+                {
+                    match knowledge_backend::validate(&store)
+                        .and_then(|()| store.approve_folder(review))
+                    {
+                        Ok(()) => self.publish_new_store(state, store),
+                        Err(error) => self.status = Some(error),
+                    }
+                }
+            }
+            Message::ApproveFolder if !self.knowledge_source_picker_open() => {
                 if let Some(review) = &self.folder_review
                     && let Some(store) = self.selected.and_then(|index| state.stores.get_mut(index))
                 {
@@ -1753,24 +2452,23 @@ impl Dialog {
                     .folder_review
                     .as_deref()
                     .is_some_and(|review| page < folder_review_pages(review))
+                    || page < self.source_update_pages()
                 {
                     self.folder_review_page = page;
                 }
             }
             Message::DiscardFolderReview => {
                 self.folder_review = None;
-                self.status = Some("Folder review discarded.".into());
-            }
-            Message::RemoveFolder(folder) => {
-                if let Some(store) = self.selected.and_then(|index| state.stores.get_mut(index))
-                    && folder < store.folders.len()
-                {
-                    store.remove_folder(folder);
-                    self.invalidate_index();
-                    self.discard_stale_drafts(state);
-                    self.clear_consent();
-                    self.status =
-                        Some("Folder removed from the draft. Save to apply the change.".into());
+                if matches!(
+                    self.source_picker,
+                    Some(KnowledgeSourcePicker::InitialFolder)
+                ) {
+                    self.cancel();
+                    self.source_picker =
+                        Some(KnowledgeSourcePicker::ChooseInitial(SourceKind::Folder));
+                    self.status = None;
+                } else {
+                    self.status = Some("Folder review discarded.".into());
                 }
             }
             Message::Consent(consent) => {
@@ -1810,20 +2508,44 @@ impl Dialog {
                     }
                 }
             }
-            Message::Index { rebuild }
+            Message::Index { .. } | Message::IndexReviewed
                 if ai_allowed
                     && self.consent
                     && self.request.is_none()
-                    && self.folder_review.is_none() =>
+                    && self.folder_review.is_none()
+                    && self.source_updates.is_none() =>
             {
                 if let Some(store) = self.selected.and_then(|index| state.stores.get(index))
                     && store.has_enabled_sources()
                 {
+                    let rebuild = matches!(message, Message::Index { rebuild: true });
+                    let approval = if matches!(message, Message::IndexReviewed) {
+                        let Some(review) = self.approved_source_update(store) else {
+                            self.status =
+                                Some("Review the current selection before indexing.".into());
+                            return Task::none();
+                        };
+                        Some(Arc::clone(review))
+                    } else {
+                        None
+                    };
                     self.hits.clear();
                     let cache = self.cache.clone();
                     let profile_dir = self.profile_dir.clone();
                     let baseline = saved.clone();
                     let pending = state.scope(store, &self.profile_dir).and_then(|scope| {
+                        let mut reviewed = if !rebuild && !self.selected_sources.is_empty() {
+                            scope.for_source_rows(store, &self.selected_sources)
+                        } else {
+                            scope.clone()
+                        };
+                        if let Some(approval) = &approval {
+                            reviewed.apply_source_reviews(approval);
+                        }
+                        if reviewed.enabled_sources() == SourceMask::default() {
+                            return Err("Select an enabled source to update.".into());
+                        }
+                        let partial = reviewed.enabled_sources() != scope.enabled_sources();
                         self.require_policy_embedding_consent(&scope)?;
                         let vault_key =
                             resolve_reviewed_key(&scope, vault, self.consent_vault_revision.as_ref())?;
@@ -1836,9 +2558,12 @@ impl Dialog {
                         let draft = self
                             .drafts
                             .iter()
-                            .find(|draft| !persistent && scope.same_as(&draft.index))
-                            .map(|draft| Arc::clone(&draft.index));
-                        local_ai::start(scope.profile.clone(), move |client| {
+                            .find(|draft| !persistent && scope.same_as(&draft.index)
+                                && draft.review.as_ref().is_none_or(|review| review.store == scope))
+                            .map(|draft| (Arc::clone(&draft.index), draft.review.clone()));
+                        let rows: BTreeMap<_, _> = reviewed.source_rows(store).collect();
+                        let work = SourceWork::new(store, rows.values().cloned(), SourcePhase::Indexing);
+                        let pending = local_ai::start(scope.profile.clone(), move |client| {
                             let authorize = || {
                                 knowledge::check_active(client)?;
                                 scope.profile.require_current_policy_authority()?;
@@ -1848,7 +2573,8 @@ impl Dialog {
                                 }
                                 Configuration::require_local_settings(&profile_dir, &baseline)
                             };
-                            let (previous, previous_stamp) = if let Some(index) = draft {
+                            let prior_review = draft.as_ref().and_then(|(_, review)| review.as_ref()).cloned();
+                            let (previous, previous_stamp) = if let Some((index, _)) = draft {
                                 (Some((scope.clone(), index)), None)
                             } else if let Some(base) = base {
                                 match cache.load_file_backed(&base, || knowledge::check_active(client)) {
@@ -1863,36 +2589,60 @@ impl Dialog {
                                 (None, None)
                             };
                             authorize()?;
-                            let (index, summary) = Index::update(
+                            let mut failed_source = None;
+                            let result = Index::update_observed(
                                 client,
-                                &scope,
+                                &reviewed,
                                 previous
                                     .as_ref()
                                     .map(|(base, index)| (base, index.as_ref())),
                                 rebuild,
                                 authorize,
-                            )?;
+                                &mut failed_source,
+                            );
+                            let (index, summary) = match result {
+                                Ok(result) => result,
+                                Err(message) => match failed_source.and_then(|position| rows.get(&position)) {
+                                    Some(source) => return Ok(Output::SourceIssue(SourceIssue {
+                                        source: source.clone(),
+                                        message,
+                                    })),
+                                    None => return Err(message),
+                                },
+                            };
+                            let mut coverage = previous.as_ref().map_or_else(
+                                || reviewed.enabled_sources(),
+                                |(base, index)| remote_index::retained_coverage(&scope, &reviewed, base, Some(index)),
+                            );
+                            let mut reviewed = reviewed;
+                            if let Some(prior) = prior_review {
+                                reviewed.include_previous_reviews(&prior.sources);
+                                coverage = coverage.union(&prior.coverage);
+                            }
                             let remote_missing = scope.qdrant.is_some()
                                 && previous.as_ref().and_then(|(base, index)| {
                                     base.same_snapshot(&scope).then_some(index.qdrant_receipt.as_ref()).flatten()
-                                }).is_none_or(|receipt| !receipt.sources.covers(&scope.enabled_sources()));
+                                }).is_none_or(|receipt| !receipt.sources.covers(&coverage));
+                            let index_was_missing = previous.is_none();
                             let previous_scope = previous.map(|(base, _)| base);
                             let require_previous = || {
-                                if scope.qdrant.is_none()
+                                if (scope.qdrant.is_none() || partial)
                                     && let Some((base, stamp)) = previous_scope.as_ref().zip(previous_stamp.as_ref())
                                 {
                                     cache.require_current(base, stamp)?;
+                                } else if partial && persistent && index_was_missing {
+                                    cache.require_absent(&scope)?;
                                 }
                                 Ok::<(), io::Error>(())
                             };
                             require_previous().map_err(|error| format!("The saved knowledge index changed ({error}). Update the index again."))?;
                             let mut cleanup_warning = false;
-                            if persistent && (summary.indexed != 0 || summary.removed != 0 || remote_missing) {
+                            if persistent && (summary.indexed != 0 || summary.removed != 0 || remote_missing || index_was_missing) {
                                 cleanup_warning = Configuration::publish_knowledge_index(&profile_dir, |current| {
                                     if !current.index_scopes(&profile_dir).contains(&scope) {
                                         return Err(io::Error::other("The saved knowledge settings changed. Update the index again."));
                                     }
-                                    remote_index::publish(&cache, &scope, &index, scope.enabled_sources(), Some(client), vault_key.clone(), || {
+                                    remote_index::publish(&cache, &reviewed, &index, coverage.clone(), Some(client), vault_key.clone(), || {
                                         authorize()?;
                                         require_previous().map_err(|error| format!("The saved knowledge index changed ({error}). Update the index again."))
                                     })
@@ -1902,10 +2652,25 @@ impl Dialog {
                                     })?.cleanup_warning;
                             }
                             let revision = vault_key.as_deref().map(VaultKey::revision);
-                            Ok(Output::Index(Arc::new(index), persistent, summary, cleanup_warning, revision))
-                        })
+                            Ok(Output::Index(Arc::new(index), persistent, summary, cleanup_warning, revision,
+                                Arc::new(IndexReview { store: scope, sources: reviewed, coverage })))
+                        })?;
+                        Ok((work, pending))
                     });
-                    return self.run(pending, |output| output);
+                    match pending {
+                        Ok((work, Pending { reply, cancel })) => {
+                            self.source_work = Some(work);
+                            return self.receive(
+                                reply,
+                                Request::SourceIndex {
+                                    cancel: Some(cancel),
+                                },
+                                "Indexing the reviewed sources…",
+                                |output| output,
+                            );
+                        }
+                        Err(error) => self.status = Some(error),
+                    }
                 }
             }
             Message::Query(query) => {
@@ -1916,7 +2681,8 @@ impl Dialog {
                 if ai_allowed
                     && self.consent
                     && self.request.is_none()
-                    && self.folder_review.is_none() =>
+                    && self.folder_review.is_none()
+                    && self.source_updates.is_none() =>
             {
                 if let Some(store) = self.selected.and_then(|index| state.stores.get(index))
                     && store.has_enabled_sources()
@@ -1967,12 +2733,12 @@ impl Dialog {
                     return self.run(pending, |output| output);
                 }
             }
-            Message::Cancel => self.cancel(),
+            Message::Cancel => self.cancel_request(),
             Message::HubSizeResolved(revision, repository, bytes) if ai_allowed => {
                 return self.resolve_hub_size(revision, repository, bytes, vault);
             }
-            Message::ManagedBackendLoaded(generation, backend) if generation == self.generation => {
-                self.managed.set_active_backend(backend);
+            Message::ManagedBackendLoaded(generation, package) if generation == self.generation => {
+                self.managed.set_active_package(package);
             }
             Message::Finished(generation, result) if generation == self.generation => {
                 let request = self.request.take();
@@ -1986,6 +2752,8 @@ impl Dialog {
                     request,
                     Some(
                         Request::Folder { .. }
+                            | Request::SourceUpdates { .. }
+                            | Request::Files { .. }
                             | Request::RuntimeRemovalReview { .. }
                             | Request::Runtime {
                                 requires_ai: false,
@@ -1997,6 +2765,49 @@ impl Dialog {
                     self.invalidate_index();
                     self.status = None;
                     return Task::none();
+                }
+                if matches!(request, Some(Request::SourceUpdates { .. }))
+                    && let Some(work) = &mut self.source_work
+                    && work.phase == SourcePhase::Cancelling
+                {
+                    work.phase = SourcePhase::Cancelled;
+                    self.status = Some("Source update cancelled.".into());
+                    return Task::none();
+                }
+                if matches!(
+                    request,
+                    Some(Request::SourceUpdates { .. } | Request::SourceIndex { .. })
+                ) {
+                    match &result {
+                        Ok(Output::SourceIssue(issue)) => {
+                            if let Some(work) = &mut self.source_work {
+                                if work.phase == SourcePhase::Cancelling {
+                                    work.phase = SourcePhase::Cancelled;
+                                } else {
+                                    work.phase = SourcePhase::Interrupted;
+                                    work.failed = Some(issue.source.clone());
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            if let Some(work) = &mut self.source_work {
+                                work.phase = if work.phase == SourcePhase::Cancelling {
+                                    SourcePhase::Cancelled
+                                } else {
+                                    SourcePhase::Interrupted
+                                };
+                            }
+                        }
+                        Ok(_) => self.source_work = None,
+                    }
+                    if self
+                        .source_work
+                        .as_ref()
+                        .is_some_and(|work| work.phase == SourcePhase::Cancelled)
+                    {
+                        self.status = Some("Source update cancelled.".into());
+                        return Task::none();
+                    }
                 }
                 self.status = Some(match result {
                     Ok(Output::Models(models)) => {
@@ -2014,6 +2825,26 @@ impl Dialog {
                     Ok(Output::HuggingFace(output)) => self.finish_huggingface(output),
                     Ok(Output::RuntimeCatalog(catalog)) => {
                         let count = catalog.choices().len();
+                        if let Some(online::Review::Stable {
+                            approved: true,
+                            required,
+                            ..
+                        }) = &self.online.review
+                            && let Some(choice) = catalog.preferred_choice(*required).cloned()
+                        {
+                            self.online.catalog = Some(catalog);
+                            self.online.selected = Some(choice);
+                            return self.install_runtime_online();
+                        }
+                        if matches!(self.online.review, Some(online::Review::Versions))
+                            && let Some(active) = self.managed.runtime_summary().0
+                        {
+                            self.online.selected = catalog
+                                .choices()
+                                .iter()
+                                .find(|choice| choice.id == active)
+                                .cloned();
+                        }
                         self.online.catalog = Some(catalog);
                         if count == 0 {
                             "The signed channel has no compatible package for this host and backend.".into()
@@ -2022,6 +2853,10 @@ impl Dialog {
                                 "Found {count} compatible signed runtime packages. Choose a package to review."
                             )
                         }
+                    }
+                    Ok(Output::RuntimeUnpinned) => {
+                        self.online.pin_cleared = true;
+                        "The installed runtime now follows stable updates.".into()
                     }
                     Ok(Output::RuntimeDownloadPaused {
                         received,
@@ -2039,8 +2874,23 @@ impl Dialog {
                         "There is no saved runtime download.".into()
                     }
                     Ok(Output::RuntimeActivated(id, backend, cleanup_failed)) => {
+                        let reviewed = self.online.selected.as_ref().is_some_and(|choice| {
+                            choice.id == id && Some(choice.backend) == backend
+                        });
                         self.online.selected = None;
-                        self.managed.set_active_backend(backend);
+                        self.managed
+                            .set_active_package(backend.map(|backend| (id.clone(), backend)));
+                        if reviewed
+                            && let Some(online::Review::Stable {
+                                approved: true,
+                                start,
+                                ..
+                            }) = self.online.review.take()
+                            && !start.is_empty()
+                        {
+                            self.status = Some(format!("Installed {id}."));
+                            return Task::done(Message::ContinueReviewedModelStart(start));
+                        }
                         match &mut self.backend_repair {
                             Some(repair) if backend != Some(repair.required) => {
                                 repair.installed = false;
@@ -2075,17 +2925,18 @@ impl Dialog {
                     }
                     Ok(Output::RuntimeRemoved(warning)) => {
                         self.runtime_removal = None;
-                        self.managed.set_active_backend(None);
+                        self.managed.set_active_package(None);
                         self.refresh_managed_model_status();
                         warning.unwrap_or_else(|| "Removed the installed llama.cpp runtime.".into())
                     }
                     Ok(Output::ManagedModels {
                         models,
                         default,
-                        active_backend,
+                        active_package,
+                        mlx,
                         notice,
                     }) => {
-                        self.managed.set_active_backend(active_backend);
+                        self.managed.set_active_package(active_package);
                         let (default, status) = match default {
                             Ok(default) => (Some(default), notice),
                             Err(error) => (
@@ -2099,19 +2950,83 @@ impl Dialog {
                             state.default_managed_model.as_deref(),
                             &self.profile_dir,
                         );
+                        let status = match mlx {
+                            Some(Ok(output)) => {
+                                self.mlx.finish(output, &self.profile_dir);
+                                status
+                            }
+                            Some(Err(error)) => {
+                                format!("{status}. Could not read the MLX inventory ({error}).")
+                            }
+                            None => status,
+                        };
+                        self.preselect_installed_default(state.default_managed_model.as_deref());
                         status
                     }
                     Ok(Output::ManagedNotice(notice)) => {
                         self.refresh_managed_model_status();
                         notice
                     }
-                    Ok(Output::Mlx(output)) => self.mlx.finish(output, &self.profile_dir),
+                    Ok(Output::Mlx(output)) => {
+                        let status = self.mlx.finish(output, &self.profile_dir);
+                        self.preselect_installed_default(state.default_managed_model.as_deref());
+                        status
+                    }
+                    Ok(Output::FileReview(review)) => {
+                        self.source_picker = Some(KnowledgeSourcePicker::ReviewFiles {
+                            size_limit: knowledge_options::file_size_text(review.file_limit),
+                            review,
+                            page: 0,
+                        });
+                        self.status = None;
+                        return Task::none();
+                    }
+                    Ok(Output::ConfirmedFileReview(confirmed)) => {
+                        self.commit_reviewed_files(state, confirmed);
+                        return Task::none();
+                    }
+                    Ok(Output::SourceUpdates(updates)) => {
+                        if self.selected != Some(updates.store)
+                            || self.selected_sources != updates.selection
+                        {
+                            "The store or selection changed. Review the selected sources again."
+                                .into()
+                        } else {
+                            self.source_updates = Some(updates);
+                            self.folder_review_page = 0;
+                            "Scan complete. Review the proposed source updates.".into()
+                        }
+                    }
+                    Ok(Output::SourceIssue(issue)) => issue.message,
                     Ok(Output::FolderReview(review)) => {
                         self.folder_review = Some(review);
                         self.folder_review_page = 0;
-                        "Folder scan complete. Review the selection before approving it.".into()
+                        self.status = Some(
+                            "Folder scan complete. Review the selection before approving it."
+                                .into(),
+                        );
+                        if matches!(
+                            self.source_picker,
+                            Some(KnowledgeSourcePicker::InitialFolder)
+                        ) {
+                            return Task::none();
+                        }
+                        return Task::done(Message::RevealKnowledgeSetting(
+                            super::search::KnowledgeSetting::FolderReviewSummary,
+                        ));
                     }
-                    Ok(Output::Index(index, persistent, summary, cleanup_warning, revision)) => {
+                    Ok(Output::Index(
+                        index,
+                        persistent,
+                        summary,
+                        cleanup_warning,
+                        revision,
+                        review,
+                    )) => {
+                        if persistent {
+                            self.source_results
+                                .replace(state, self.selected, &index, &review);
+                        }
                         let mut detail = format!(
                             "{} text passages · files reused {}, indexed {}, removed {}",
                             index.len(),
@@ -2134,7 +3049,7 @@ impl Dialog {
                             self.clear_consent();
                             error
                         } else {
-                            self.retain_draft(state, index, revision, &detail)
+                            self.retain_draft(state, index, revision, review, &detail)
                         }
                     }
                     Ok(Output::Hits {
@@ -2160,17 +3075,26 @@ impl Dialog {
                         self.status = None;
                         return Task::none();
                     }
-                    Err(error) => error,
+                    Err(error) => {
+                        if matches!(
+                            self.source_picker,
+                            Some(KnowledgeSourcePicker::ScanningFiles)
+                        ) {
+                            self.source_picker =
+                                Some(KnowledgeSourcePicker::Retry(SourceKind::File));
+                        }
+                        error
+                    }
                 });
                 if refresh_backend {
                     let profile = self.profile_dir.clone();
                     return Task::perform(
                         async move {
-                            runtime_package::active_package_backend(&profile)
+                            runtime_package::active_package_summary(&profile)
                                 .ok()
                                 .flatten()
                         },
-                        move |backend| Message::ManagedBackendLoaded(generation, backend),
+                        move |package| Message::ManagedBackendLoaded(generation, package),
                     );
                 }
             }
@@ -2198,6 +3122,13 @@ impl Dialog {
         let pending = knowledge_backend::validate(store)
             .and_then(|()| self.folder_options.options())
             .and_then(|options| store.folder_review_options(root, options));
+        self.start_folder_review(pending)
+    }
+
+    fn start_folder_review(
+        &mut self,
+        pending: Result<(folder::ReviewReply, folder::Cancel), String>,
+    ) -> Task<Message> {
         let (reply, cancel) = match pending {
             Ok(pending) => pending,
             Err(error) => {
@@ -2235,7 +3166,40 @@ impl Dialog {
     }
 
     fn required_runtime(&self) -> Option<PackageBackend> {
-        self.backend_repair.as_ref().map(|repair| repair.required)
+        self.backend_repair
+            .as_ref()
+            .map(|repair| repair.required)
+            .or_else(|| {
+                self.online
+                    .review
+                    .as_ref()
+                    .and_then(online::Review::required)
+            })
+    }
+
+    fn open_runtime_install(
+        &mut self,
+        required: Option<PackageBackend>,
+        start: Vec<managed::ReviewedModel>,
+    ) {
+        self.online.reset_catalog();
+        self.online.review = Some(online::Review::Stable {
+            upgrade: self.managed.runtime_summary().0.is_some(),
+            required,
+            start,
+            approved: false,
+        });
+        self.status = None;
+    }
+
+    fn check_runtime_online(&mut self) -> Task<Message> {
+        self.online.reset_catalog();
+        self.run_managed(
+            runtime_package::online::check(self.profile_dir.clone(), self.required_runtime()),
+            "Checking the signed runtime channel…",
+            true,
+            Output::RuntimeCatalog,
+        )
     }
 
     fn runtime_online_allowed(&self, ai_allowed: bool) -> bool {
@@ -2410,10 +3374,47 @@ impl Dialog {
         }
     }
 
+    fn cancel_request(&mut self) {
+        match self.request.as_mut() {
+            Some(Request::SourceUpdates { cancel }) => drop(cancel.take()),
+            Some(Request::SourceIndex { cancel }) => drop(cancel.take()),
+            _ => {
+                self.cancel();
+                return;
+            }
+        }
+        if let Some(work) = &mut self.source_work {
+            work.phase = SourcePhase::Cancelling;
+        }
+        self.status = Some("Cancelling the source update…".into());
+    }
+
+    fn source_request(&self) -> bool {
+        matches!(
+            self.request,
+            Some(Request::SourceUpdates { .. } | Request::SourceIndex { .. })
+        )
+    }
+
     fn invalidate_index(&mut self) {
         self.cancel();
+        self.source_work = None;
         self.folder_review = None;
+        self.source_updates = None;
+        self.approved_update = None;
         self.hits.clear();
+    }
+
+    fn approved_source_update(&self, store: &Store) -> Option<&Arc<SourceUpdates>> {
+        self.approved_update
+            .as_ref()
+            .filter(|approved| {
+                approved.definition == *store
+                    && self.selected == Some(approved.review.store)
+                    && self.selected_sources == approved.review.selection
+                    && approved.review.has_indexable_files()
+            })
+            .map(|approved| &approved.review)
     }
 
     fn clear_consent(&mut self) {
@@ -2516,13 +3517,14 @@ impl Dialog {
         state: &State,
         index: Arc<Index>,
         vault_revision: Option<Weak<()>>,
+        review: Arc<IndexReview>,
         detail: &str,
     ) -> String {
         let Some(scope) = self
             .selected
             .and_then(|selected| state.stores.get(selected))
             .and_then(|store| state.scope(store, &self.profile_dir).ok())
-            .filter(|scope| scope.same_as(&index))
+            .filter(|scope| scope.same_as(&index) && *scope == review.store)
         else {
             return "The knowledge settings changed. Update the index again.".into();
         };
@@ -2540,17 +3542,23 @@ impl Dialog {
             return "Save the existing draft indexes before updating another store.".into();
         }
         self.drafts.retain(|draft| !scope.same_as(&draft.index));
+        self.source_results
+            .replace(state, self.selected, &index, &review);
         self.drafts.push(DraftIndex {
             index,
             vault_revision,
+            review: Some(review),
         });
         format!("Prepared {detail}. Save the settings to keep the index.")
     }
 
     pub(super) fn suspend(&mut self) {
+        self.close_knowledge_source_picker();
+        self.close_knowledge_settings();
         self.invalidate_index();
         self.drafts.clear();
         self.clear_consent();
+        self.source_results.reset();
         self.managed.dismiss_action();
         self.mlx.invalidate_review();
         self.online = online::State::default();
@@ -2560,6 +3568,14 @@ impl Dialog {
     fn select_store(&mut self, index: Option<usize>) {
         self.invalidate_index();
         self.selected = index;
+        self.source_results.reset();
+        self.selected_sources.clear();
+        self.source_sync_editor = None;
+        self.source_anchor = None;
+        self.source_removal = None;
+        self.close_knowledge_source_picker();
+        self.close_knowledge_settings();
+        self.manual_source = false;
         if self.java_store_origin.take().is_some() {
             self.store_name.clear();
         }
@@ -2570,7 +3586,180 @@ impl Dialog {
         self.knowledge_backend = knowledge_backend::Editor::default();
         self.folder_options = knowledge_options::Draft::default();
         self.file_size = None;
+        self.folder_advanced = None;
         self.query.clear();
+    }
+
+    pub(super) fn set_selection_modifiers(&mut self, modifiers: iced::keyboard::Modifiers) {
+        self.selection_modifiers = modifiers;
+    }
+
+    fn remove_selected_sources(&mut self, state: &mut State) {
+        let Some(review) = self.source_removal.take() else {
+            return;
+        };
+        let Some(store) = state.stores.get_mut(review.store).filter(|store| {
+            self.selected == Some(review.store)
+                && store.id() == review.id.as_deref()
+                && store.name == review.name
+                && self.selected_sources == review.sources
+                && review.sources.is_subset(&store.source_keys().collect())
+        }) else {
+            self.status = Some("The store or selection changed. Review the removal again.".into());
+            return;
+        };
+        let contains = |kind, path: &PathBuf| review.sources.contains(&(kind, path.clone()));
+        for position in (0..store.sources.len()).rev() {
+            if contains(SourceKind::File, &store.sources[position]) {
+                store.remove_file(position);
+            }
+        }
+        for position in (0..store.folders.len()).rev() {
+            if contains(SourceKind::Folder, &store.folders[position].root) {
+                store.remove_folder(position);
+            }
+        }
+        self.selected_sources.clear();
+        self.source_anchor = None;
+        self.source_sync_editor = None;
+        self.file_size = None;
+        self.folder_advanced = None;
+        self.folder_review = None;
+        self.folder_options = knowledge_options::Draft::default();
+        self.invalidate_index();
+        self.discard_stale_drafts(state);
+        self.clear_consent();
+        self.status = Some(format!(
+            "Removed {} source(s) from the draft. Save to apply the change.",
+            review.sources.len()
+        ));
+    }
+
+    pub(super) fn knowledge_source_picker_open(&self) -> bool {
+        self.source_picker.is_some()
+    }
+
+    fn source_store<'a>(&'a self, state: &'a State) -> Option<&'a Store> {
+        self.new_store
+            .as_ref()
+            .or_else(|| self.selected.and_then(|index| state.stores.get(index)))
+    }
+
+    pub(super) fn pending_native_knowledge_kind(&self, ticket: u64) -> Option<SourceKind> {
+        match self.source_picker {
+            Some(KnowledgeSourcePicker::Native {
+                ticket: current,
+                kind,
+            }) if current == ticket => Some(kind),
+            _ => None,
+        }
+    }
+
+    fn review_picked_knowledge_files(
+        &mut self,
+        state: &State,
+        paths: Vec<PathBuf>,
+        file_limit: Option<u64>,
+    ) -> Task<Message> {
+        let Some(store) = self.source_store(state) else {
+            return Task::none();
+        };
+        let pending = knowledge_backend::validate(store)
+            .and_then(|()| store.check_source_file_overlaps(&paths))
+            .and_then(|()| file_review::start(paths, file_limit));
+        match pending {
+            Ok((reply, cancel)) => {
+                self.source_picker = Some(KnowledgeSourcePicker::ScanningFiles);
+                self.receive(
+                    reply,
+                    Request::Files { _cancel: cancel },
+                    "Checking the selected files…",
+                    Output::FileReview,
+                )
+            }
+            Err(error) => {
+                self.status = Some(error);
+                Task::none()
+            }
+        }
+    }
+
+    fn commit_reviewed_files(&mut self, state: &mut State, confirmed: file_review::Confirmed) {
+        let Some(store) = self.source_store(state) else {
+            return;
+        };
+        match knowledge_backend::validate(store)
+            .and_then(|()| store.review_source_files(&confirmed.paths, confirmed.file_limit))
+        {
+            Ok(updated) if self.new_store.is_some() => self.publish_new_store(state, updated),
+            Ok(updated) => {
+                if let Some(index) = self.selected {
+                    state.stores[index] = updated;
+                    self.source.clear();
+                    self.close_knowledge_source_picker();
+                    self.invalidate_index();
+                    self.discard_stale_drafts(state);
+                    self.clear_consent();
+                    self.status = Some(format!(
+                        "Added {} source files to the draft.",
+                        confirmed.paths.len()
+                    ));
+                }
+            }
+            Err(error) => self.status = Some(error),
+        }
+    }
+
+    fn review_picked_knowledge_folder(&mut self, state: &State, folder: PathBuf) -> Task<Message> {
+        if let Some(store) = &self.new_store {
+            let pending = knowledge_backend::validate(store)
+                .and_then(|()| store.folder_review_options(folder, Default::default()));
+            self.source_picker = Some(KnowledgeSourcePicker::InitialFolder);
+            self.folder_review = None;
+            return self.start_folder_review(pending);
+        }
+        let Some(store) = self.selected.and_then(|index| state.stores.get(index)) else {
+            return Task::none();
+        };
+        self.source_picker = None;
+        self.source = file_chooser::display_path(&folder).into_owned();
+        self.manual_source = true;
+        self.folder_options = knowledge_options::Draft::default();
+        self.review_folder(store, folder)
+    }
+
+    fn publish_new_store(&mut self, state: &mut State, store: Store) {
+        match state.new_store_index(&store).and_then(|index| {
+            store.validate()?;
+            Ok(index)
+        }) {
+            Ok(index) => {
+                state.stores.push(store);
+                self.select_store(Some(index));
+                self.status = Some(
+                    "Knowledge store and sources added to the draft. Save AI Manager to apply them."
+                        .into(),
+                );
+            }
+            Err(error) => self.status = Some(error),
+        }
+    }
+
+    pub(super) fn close_knowledge_source_picker(&mut self) {
+        if let Some(picker) = self.source_picker.take() {
+            if matches!(
+                picker,
+                KnowledgeSourcePicker::ScanningFiles | KnowledgeSourcePicker::ReviewFiles { .. }
+            ) {
+                self.cancel();
+            }
+            if matches!(picker, KnowledgeSourcePicker::InitialFolder) {
+                self.cancel();
+                self.folder_review = None;
+            }
+            self.status = None;
+        }
+        self.new_store = None;
     }
 
     pub(super) fn view<'a>(
@@ -2580,13 +3769,19 @@ impl Dialog {
         profiles: &Catalog,
         editable: bool,
         ai_enabled: bool,
-        reveal: &Reveal,
+        reveal: &'a Reveal,
     ) -> Element<'a, Message> {
         use super::search::{Control, LocalPreference, Setting};
 
         let can_edit = editable && self.request.is_none();
         let can_request = can_edit && ai_enabled;
-        let models_page = matches!(page, Page::Models(..));
+        if matches!(&page, Page::Knowledge(..))
+            && let Some(picker) = &self.source_picker
+        {
+            return self.knowledge_source_picker_view(picker, can_edit, reveal);
+        }
+        let models_page = matches!(page, Page::Models { .. });
+        let preferences_page = matches!(page, Page::Preferences(..));
         let mark_progress = |control, content: Element<'a, Message>| {
             if models_page && self.runtime_request_active() {
                 reveal.action(Setting::Control(control), content)
@@ -2595,14 +3790,19 @@ impl Dialog {
             }
         };
         let progress = row![
-            self.status.as_ref().map(|status| {
-                container(scrollable(
-                    text(status.as_str()).wrapping(text::Wrapping::WordOrGlyph),
-                ))
-                .width(Length::Fill)
-                .max_height(48)
-            }),
-            self.request.as_ref().map(|_| mark_progress(
+            self.status
+                .as_ref()
+                .filter(|_| !preferences_page || self.request.is_some())
+                .map(|status| {
+                    container(scrollable(
+                        text(status.as_str()).wrapping(text::Wrapping::WordOrGlyph),
+                    ))
+                    .width(Length::Fill)
+                    .max_height(48)
+                }),
+            (self.request.is_some()
+                && !(matches!(page, Page::Knowledge(..)) && self.source_request()))
+            .then(|| mark_progress(
                 Control::CancelRuntimeRequest,
                 button("Cancel request").on_press(Message::Cancel).into()
             )),
@@ -2629,8 +3829,11 @@ impl Dialog {
             .spacing(10)
             .into();
         }
-        let preferences_page = matches!(page, Page::Preferences);
-        let inventory_status: Option<Element<'_, Message>> = if models_page {
+        let shows_embedding = matches!(
+            page,
+            Page::Knowledge(..) | Page::Preferences(LocalSection::Runtime, _)
+        );
+        let inventory_status: Option<Element<'_, Message>> = if !shows_embedding {
             None
         } else if self.policy_embedding_load.is_some() {
             Some(text("Loading embedding models…").size(13).into())
@@ -2667,35 +3870,70 @@ impl Dialog {
             None
         };
         let page = match page {
-            Page::Models(tokens, hints) => {
-                self.models_view(state, can_edit, can_request, tokens, hints, reveal)
-            }
-            Page::Knowledge(vault_keys, hints, models) => self.knowledge_view(
+            Page::Models {
+                tokens,
+                hints,
+                setup_available,
+            } => scrollable(self.models_view(
                 state,
-                profiles,
-                can_request,
-                vault_keys,
-                (hints, models),
-                reveal,
-            ),
-            Page::Preferences => preferences(
-                state,
-                profiles,
-                reveal,
-                self.embedding_options(),
                 can_edit,
-                self.runtime_downloads_allowed,
-                self.runtime_update_status.as_deref(),
-            ),
-        };
-        let page = if preferences_page {
-            page
-        } else {
-            scrollable(page)
+                can_request,
+                tokens,
+                (hints, setup_available),
+                reveal,
+            ))
+            .id(reveal.viewport.clone())
+            .spacing(6)
+            .height(Length::Fill)
+            .into(),
+            Page::Knowledge(hints, models) => responsive(move |size| {
+                scrollable(self.knowledge_view(
+                    state,
+                    (can_edit, can_request),
+                    (hints, models),
+                    reveal,
+                    size.height,
+                ))
                 .id(reveal.viewport.clone())
                 .spacing(6)
                 .height(Length::Fill)
                 .into()
+            })
+            .into(),
+            Page::Preferences(section, tokens) => match section {
+                LocalSection::Roles => profile_roles(state, profiles, can_edit, reveal),
+                LocalSection::Runtime => column![
+                    runtime_preferences(
+                        state.runtime_update,
+                        can_edit,
+                        self.runtime_downloads_allowed,
+                        self.runtime_update_status.as_deref(),
+                        reveal,
+                    ),
+                    embedding_preference(state, reveal, self.embedding_options(), can_edit),
+                ]
+                .spacing(14)
+                .into(),
+                LocalSection::HuggingFace if self.model_downloads_allowed => {
+                    let (access, _) = self
+                        .hf
+                        .access_picker(can_request && self.runtime_removal.is_none(), tokens);
+                    column![
+                        reveal.action(
+                            Setting::LocalPreference(LocalPreference::HubAccess),
+                            preference_field("Hugging Face access", access),
+                        ),
+                        preference_hint("Choose a Vault token for gated models, or use anonymous access. The selection applies to this AI Manager session."),
+                    ]
+                    .spacing(8)
+                    .into()
+                }
+                LocalSection::HuggingFace => {
+                    text(crate::clipboard_policy::AI_MODEL_DOWNLOADS_DISABLED)
+                        .size(13)
+                        .into()
+                }
+            },
         };
         column![page, inventory_status, progress].spacing(10).into()
     }
@@ -2706,7 +3944,7 @@ impl Dialog {
         can_edit: bool,
         can_request: bool,
         hub_tokens: Vec<CredentialChoice>,
-        hints: &'a Hints,
+        (hints, setup_available): (&'a Hints, bool),
         reveal: &Reveal,
     ) -> Element<'a, Message> {
         use super::search::{Control::*, Setting};
@@ -2716,9 +3954,9 @@ impl Dialog {
             .placeholder("Select an installed model")
             .width(Length::Fill)
             .dismiss_on_escape();
-        column![
-            text("Local Models").size(20),
-            text("Discover installed models from an explicitly configured local service."),
+        let local_service = column![
+            text("Local model service").size(17),
+            text("Discover models from an explicitly configured service already running on this computer.").size(13),
             reveal.wrap(endpoint, field("Local endpoint", reveal.input(endpoint, can_edit,
                 text_input("Numeric loopback address and port", &state.endpoint).on_input(Message::Endpoint)))),
             row![
@@ -2730,31 +3968,42 @@ impl Dialog {
             ]
             .spacing(8)
             .align_y(Alignment::Center),
-            text("Use a model service already running on this computer.").size(13),
-            self.online.view(
-                can_request && self.runtime_downloads_allowed && self.runtime_removal.is_none(),
-                can_edit,
-                None,
-                reveal,
-            ),
-            (!self.runtime_downloads_allowed)
-                .then(|| text(crate::clipboard_policy::AI_RUNTIME_DOWNLOADS_DISABLED).size(13)),
-            text("Offline llama.cpp Runtime Package").size(17),
-            text("Enter the absolute paths to the stable runtime index, its detached signature and the package ZIP.").size(13),
-            self.runtime_fields(can_edit, reveal),
+        ]
+        .spacing(8);
+        let show_offline = self.offline_runtime_open;
+        let installed = self.managed.runtime_summary().0.is_some();
+        column![
+            text("Install a runtime and register local models to use AI on this computer.").size(13),
+            text("Local runtimes").size(17),
+            self.runtime_table(),
             row![
+                dialog_design::secondary_action(if installed { "Update runtime…" } else { "Install runtime…" })
+                    .on_press_maybe((can_request && self.runtime_removal.is_none()).then_some(Message::OpenStableRuntimeReview)),
+                action(CheckRuntimeOnline, dialog_design::secondary_action("Other versions…")
+                    .on_press_maybe((can_request && self.runtime_downloads_allowed && self.runtime_removal.is_none())
+                        .then_some(Message::OpenRuntimeVersions)),
+                ),
+                dialog_design::secondary_action(if show_offline { "Hide package import" } else { "Import signed package…" })
+                    .on_press_maybe(can_edit.then_some(Message::ToggleOfflineRuntime)),
+                action(RemoveRuntime, dialog_design::secondary_action("Remove installed runtime…")
+                    .on_press_maybe(
+                        (can_edit && installed && self.runtime_removal.is_none() && !self.mlx.runtime_removal_open())
+                            .then_some(Message::ReviewRuntimeRemoval),
+                    )),
+            ]
+            .spacing(8)
+            .wrap(),
+            show_offline.then(|| column![
+                text("Offline llama.cpp runtime package").size(17),
+                text("Enter the absolute paths to the stable runtime index, its detached signature and the package ZIP.").size(13),
+                self.runtime_fields(can_edit, reveal),
                 action(InstallRuntime, button("Install signed runtime").on_press_maybe(
                     (can_request && self.runtime_removal.is_none() && self.runtime_paths_ready())
                         .then_some(Message::ImportRuntime),
                 )),
-                action(RemoveRuntime, button("Remove installed runtime…")
-                    .style(button::secondary)
-                    .on_press_maybe(
-                        (can_edit && self.runtime_removal.is_none() && !self.mlx.runtime_removal_open())
-                            .then_some(Message::ReviewRuntimeRemoval),
-                    )),
-            ]
-            .spacing(8),
+            ].spacing(8)),
+            (!self.runtime_downloads_allowed)
+                .then(|| text(crate::clipboard_policy::AI_RUNTIME_DOWNLOADS_DISABLED).size(13)),
             self.runtime_removal.as_ref().map(|_| column![
                 text("Remove the installed llama.cpp runtime?").size(17),
                 text("This removes the installed runtime packages. Your GGUF models, AI profiles and runtime trust settings stay available.")
@@ -2770,7 +4019,10 @@ impl Dialog {
                 .spacing(8),
             ]
             .spacing(8)),
-            self.managed.view(can_edit, can_request, state.default_managed_model.as_deref(), reveal),
+            self.managed_models_view(
+                can_edit, can_request, state.default_managed_model.as_deref(),
+                setup_available, reveal,
+            ),
             self.mlx.view(
                 can_edit,
                 can_request,
@@ -2779,15 +4031,70 @@ impl Dialog {
                 reveal,
             ),
             self.java_models_view(hints, can_request, reveal),
+            self.online.view(
+                can_request && self.runtime_downloads_allowed && self.runtime_removal.is_none(),
+                can_edit,
+                None,
+                reveal,
+            ),
             self.hf.view(
                 can_request && self.runtime_removal.is_none(),
                 self.model_downloads_allowed,
                 hub_tokens,
                 reveal,
             ),
+            local_service,
         ]
         .spacing(10)
         .width(Length::Fill)
+        .into()
+    }
+
+    fn runtime_table(&self) -> Element<'_, Message> {
+        const WIDTHS: [u16; 4] = [2, 2, 2, 3];
+        use knowledge_inventory::cells;
+        let (version, backend) = self.managed.runtime_summary();
+        let backend_name = backend.map_or_else(|| "—".to_owned(), |backend| backend.to_string());
+        let state = if version.is_some() {
+            "Installed"
+        } else {
+            "Not installed"
+        };
+        column![
+            container(cells(
+                ["Runtime", "Version", "Backend", "State"].map(str::to_owned),
+                WIDTHS,
+                true,
+            ))
+            .padding([5, 8])
+            .style(crate::workspace::dialog_design::header),
+            container(cells(
+                [
+                    "llama.cpp".into(),
+                    version.unwrap_or("—").into(),
+                    backend_name,
+                    state.into()
+                ],
+                WIDTHS,
+                false
+            ))
+            .padding([5, 8])
+            .style(dialog_design::sidebar),
+            self.mlx
+                .runtime_summary()
+                .map(|(version, state)| container(cells(
+                    [
+                        "Apple MLX".into(),
+                        version.into(),
+                        "Metal".into(),
+                        state.into(),
+                    ],
+                    WIDTHS,
+                    false
+                ))
+                .padding([5, 8])),
+            iced::widget::rule::horizontal(1),
+        ]
         .into()
     }
 
@@ -2944,295 +4251,197 @@ impl Dialog {
     fn knowledge_view<'a>(
         &'a self,
         state: &'a State,
-        profiles: &Catalog,
-        can_request: bool,
-        vault_keys: Vec<CredentialChoice>,
+        (can_review, can_request): (bool, bool),
         (hints, models): (&'a java_knowledge::Hints, &'a Hints),
         reveal: &Reveal,
+        viewport_height: f32,
     ) -> Element<'a, Message> {
         use super::search::{KnowledgeSetting, Setting};
         use KnowledgeSetting::*;
         let store_name = Setting::Knowledge(Name);
+        let importing_store = self.java_store_origin.is_some();
         let selected = self
             .selected
             .and_then(|index| state.stores.get(index).map(|store| (index, store)));
-        let stores =
-            state
-                .stores
-                .iter()
-                .enumerate()
-                .fold(column![].spacing(4), |rows, (index, store)| {
-                    rows.push(
-                        button(text(store.name.as_str()).wrapping(text::Wrapping::WordOrGlyph))
-                            .width(Length::Fill)
-                            .style(if self.selected == Some(index) {
-                                button::primary
-                            } else {
-                                button::secondary
-                            })
-                            .on_press(Message::SelectStore(index)),
-                    )
-                });
-        let sidebar = column![
-            reveal.wrap(
-                store_name,
-                reveal.input(
+        let can_configure = can_review && selected.is_some();
+        let backend_valid =
+            selected.is_some_and(|(_, store)| knowledge_backend::validate(store).is_ok());
+        let can_index = selected.is_some_and(|(_, store)| {
+            let (_, model, managed) = state.embedding_fields(store);
+            can_request
+                && backend_valid
+                && self.folder_review.is_none()
+                && self.consent_current()
+                && store.has_enabled_sources()
+                && (managed.is_some() || !model.trim().is_empty())
+        });
+        let create = row![
+            importing_store.then(|| container(
+                reveal.wrap(
                     store_name,
-                    can_request,
-                    text_input("New store name", &self.store_name)
-                        .on_input(Message::StoreName)
-                        .on_submit(Message::CreateStore)
+                    reveal.input(
+                        store_name,
+                        can_review,
+                        text_input("New store name", &self.store_name)
+                            .size(13)
+                            .on_input_maybe(can_review.then_some(Message::StoreName))
+                            .on_submit_maybe(can_review.then_some(Message::CreateStore))
+                    )
+                )
+            )
+            .width(300)),
+            reveal.action(
+                Setting::Knowledge(Create),
+                dialog_design::secondary_action("Create knowledge store").on_press_maybe(
+                    can_review.then_some(if importing_store {
+                        Message::CreateStore
+                    } else {
+                        Message::KnowledgeSettings(knowledge_settings::Action::Open {
+                            create: true,
+                        })
+                    })
+                )
+            ),
+            self.java_store_origin.as_ref().map(|_| {
+                dialog_design::secondary_action("Cancel Java store review")
+                    .on_press(Message::CancelJavaKnowledgeStore)
+            }),
+            dialog_design::secondary_action("Configure").on_press_maybe(can_configure.then_some(
+                Message::KnowledgeSettings(knowledge_settings::Action::Open { create: false })
+            )),
+            reveal.action(
+                Setting::Knowledge(ReviewStoreRemoval),
+                dialog_design::secondary_action("Remove store…").on_press_maybe(
+                    (can_configure && !self.confirm_remove).then_some(Message::ConfirmRemove(true))
+                )
+            ),
+            dialog_design::secondary_action("Test search").on_press_maybe(
+                can_configure.then_some(Message::RevealKnowledgeSetting(TestQuery))
+            ),
+            dialog_design::secondary_action("Refresh")
+                .on_press_maybe(can_configure.then_some(Message::RefreshKnowledgeInventory)),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .wrap();
+        let removal = (selected.is_some() && self.confirm_remove).then(|| {
+            row![
+                text("Remove this store from the profile? The source files stay on disk.").size(13),
+                reveal.action(
+                    Setting::Knowledge(ConfirmStoreRemoval),
+                    button("Remove store")
+                        .style(button::danger)
+                        .on_press(Message::RemoveStore),
+                ),
+                reveal.action(
+                    Setting::Knowledge(CancelStoreRemoval),
+                    dialog_design::secondary_action("Cancel")
+                        .on_press(Message::ConfirmRemove(false)),
+                ),
+            ]
+            .spacing(8)
+            .wrap()
+        });
+        let source_path = row![
+            container(
+                reveal.knowledge_input(
+                    SourcePath,
+                    can_configure,
+                    text_input(
+                        "Absolute path to a UTF-8 file, PDF, or folder",
+                        &self.source
+                    )
+                    .size(13)
+                    .on_input_maybe(can_configure.then_some(Message::Source))
+                )
+            )
+            .width(445),
+            reveal.action(
+                Setting::Knowledge(AddFile),
+                dialog_design::secondary_action("Add file").on_press_maybe(
+                    (can_configure && backend_valid && !self.source.trim().is_empty())
+                        .then_some(Message::AddSource)
                 )
             ),
             reveal.action(
-                Setting::Knowledge(Create),
-                button("Create store").on_press(Message::CreateStore)
+                Setting::Knowledge(ReviewFolder),
+                dialog_design::secondary_action("Review folder…").on_press_maybe(
+                    (can_configure && backend_valid && !self.source.trim().is_empty())
+                        .then_some(Message::ReviewFolder)
+                )
             ),
-            self.java_store_origin
-                .as_ref()
-                .map(|_| button("Cancel Java store review")
-                    .on_press(Message::CancelJavaKnowledgeStore)),
-            stores,
         ]
         .spacing(8)
-        .width(180);
+        .align_y(Alignment::Center)
+        .wrap();
+        let enter_path = self.manual_source;
+        let mut source_actions = row![
+            dialog_design::secondary_action("Add files…").on_press_maybe(
+                (can_configure && backend_valid)
+                    .then_some(Message::PickNativeKnowledgeSources(SourceKind::File)),
+            ),
+            dialog_design::secondary_action("Add folder…").on_press_maybe(
+                (can_configure && backend_valid)
+                    .then_some(Message::PickNativeKnowledgeSources(SourceKind::Folder)),
+            ),
+            reveal.action(
+                Setting::Knowledge(Update),
+                dialog_design::secondary_action("Update now…").on_press_maybe(selected.and_then(
+                    |(index, store)| {
+                        (can_review
+                            && backend_valid
+                            && self.folder_review.is_none()
+                            && store.has_sources_for_update(&self.selected_sources))
+                        .then_some(Message::ReviewSourceUpdates(index))
+                    }
+                ))
+            ),
+            dialog_design::secondary_action("Cancel").on_press_maybe(
+                (self.source_request()
+                    && self
+                        .source_work
+                        .as_ref()
+                        .is_some_and(|work| work.phase != SourcePhase::Cancelling))
+                .then_some(Message::Cancel),
+            ),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+        source_actions = source_actions.extend(self.source_actions(selected, can_review));
+        let mut maintenance = row![
+            button(if enter_path {
+                "Hide path field"
+            } else {
+                "Enter path…"
+            })
+            .style(button::text)
+            .on_press_maybe(can_configure.then_some(Message::ToggleManualSource)),
+            reveal.action(
+                Setting::Knowledge(Rebuild),
+                dialog_design::secondary_action("Rebuild index")
+                    .on_press_maybe(can_index.then_some(Message::Index { rebuild: true }))
+            ),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
         let mut details = column![].spacing(10).width(Length::Fill);
         if let Some((store_index, store)) = selected {
+            if self.approved_source_update(store).is_some() {
+                maintenance = maintenance.push(
+                    dialog_design::secondary_action("Index reviewed sources")
+                        .on_press_maybe(can_index.then_some(Message::IndexReviewed)),
+                );
+            }
             let (endpoint, model, managed) = state.embedding_fields(store);
-            let backend_valid = knowledge_backend::validate(store).is_ok();
             let qdrant_destination = store
                 .qdrant
                 .as_ref()
                 .filter(|_| backend_valid)
                 .map(|settings| settings.destination());
-            let choices = profiles.choices();
-            let bindings = [
-                (
-                    Role::Text,
-                    TerminalChatProfile,
-                    "terminal AI chat",
-                    store.text_profile.as_ref(),
-                ),
-                (
-                    Role::Coding,
-                    CodeAnalysisProfile,
-                    "code analysis",
-                    store.coding_profile.as_ref(),
-                ),
-            ]
-            .into_iter()
-            .fold(
-                column![].spacing(6),
-                |controls, (role, setting, use_case, bound)| {
-                    let profile = state.profile(role).and_then(|expected| {
-                        let id = profiles.resolve_profile_reference(expected)?;
-                        let (_, name) = choices.iter().find(|(candidate, _)| *candidate == id)?;
-                        let binding = profiles.profile_reference(id)?;
-                        Some((id, name, expected.clone(), binding))
-                    });
-                    let control: Element<'_, Message> =
-                        if let Some((id, name, expected_role, binding)) = profile {
-                            reveal.action(
-                                Setting::Knowledge(setting),
-                                checkbox(
-                                    bound.and_then(|reference| {
-                                        profiles.resolve_profile_reference(reference)
-                                    }) == Some(id),
-                                )
-                                .label(format!("Offer this store for {use_case} with {name}"))
-                                .on_toggle(move |enabled| {
-                                    Message::BindKnowledgeProfile {
-                                        store: store_index,
-                                        role,
-                                        expected_role: expected_role.clone(),
-                                        binding: enabled.then(|| binding.clone()),
-                                    }
-                                }),
-                            )
-                        } else if state.profile(role).is_some() {
-                            text(format!(
-                                "The selected profile for {use_case} is unavailable."
-                            ))
-                            .size(13)
-                            .into()
-                        } else {
-                            text(format!(
-                            "Assign a {} in Local Preferences to offer this store for {use_case}.",
-                            role.label()
-                        ))
-                        .size(13)
-                        .into()
-                        };
-                    controls.push(control)
-                },
-            );
-            let can_review = self.request.is_none();
-            let can_index = can_request
-                && backend_valid
-                && self.folder_review.is_none()
-                && self.consent_current()
-                && store.has_enabled_sources()
-                && (managed.is_some() || !model.trim().is_empty());
-            let sources = store.sources.iter().enumerate().fold(
-                column![].spacing(6),
-                |rows, (index, source)| {
-                    let enabled = store.source_enabled(SourceKind::File, source);
-                    rows.push(
-                        column![
-                            row![
-                                text(source.display().to_string())
-                                    .wrapping(text::Wrapping::WordOrGlyph)
-                                    .width(Length::Fill),
-                                can_review.then(|| {
-                                    pick_list(
-                                        SyncMode::ALL,
-                                        Some(store.file_sync(source)),
-                                        move |mode| Message::FileSync {
-                                            store: store_index,
-                                            path: source.clone(),
-                                            mode,
-                                        },
-                                    )
-                                    .dismiss_on_escape()
-                                }),
-                                button("Size limit…").on_press_maybe(can_review.then(|| {
-                                    Message::ConfigureFileSize(store_index, source.clone())
-                                })),
-                                button(if enabled { "Disable" } else { "Enable" }).on_press_maybe(
-                                    can_review.then(|| Message::SourceEnabled {
-                                        store: store_index,
-                                        kind: SourceKind::File,
-                                        path: source.clone(),
-                                        enabled: !enabled
-                                    })
-                                ),
-                                button("Remove").on_press(Message::RemoveSource(index))
-                            ]
-                            .spacing(8)
-                            .align_y(Alignment::Center)
-                            .wrap(),
-                            store.file_size_limit(source).map(|limit| {
-                                let effective = store.effective_file_size_limit(source);
-                                text(if limit == effective {
-                                    format!("Size limit · {limit} bytes")
-                                } else {
-                                    format!("Size limit · {effective} bytes ({limit} configured)")
-                                })
-                                .size(13)
-                            }),
-                            self.file_size
-                                .as_ref()
-                                .filter(|edit| &edit.path == source)
-                                .map(|edit| column![
-                                    text(knowledge_options::file_size_help(source)).size(13),
-                                    reveal.knowledge_input(
-                                        FileSize,
-                                        can_review,
-                                        text_input("Use format default", &edit.input)
-                                            .on_input_maybe(
-                                                can_review.then_some(Message::FileSize)
-                                            )
-                                    ),
-                                    (!edit.edited
-                                        && store.file_size_limit(source).is_some_and(|limit| {
-                                            let default = DEFAULT_TEXT_BYTES as u64;
-                                            limit > default
-                                                && store.effective_file_size_limit(source)
-                                                    == default
-                                        }))
-                                    .then(|| text(
-                                        "Re-enter the saved value to review a higher limit."
-                                    )
-                                    .size(13)),
-                                    row![
-                                        reveal.action(
-                                            Setting::Knowledge(ApplyFileSize),
-                                            button("Apply size limit").on_press_maybe(
-                                                can_review.then(|| Message::ApplyFileSize(
-                                                    store_index,
-                                                    source.clone()
-                                                ))
-                                            )
-                                        ),
-                                        reveal.action(
-                                            Setting::Knowledge(CancelFileSize),
-                                            button("Cancel").on_press(Message::CancelFileSize)
-                                        ),
-                                    ]
-                                    .spacing(6)
-                                    .wrap(),
-                                ]
-                                .spacing(6)),
-                        ]
-                        .spacing(5),
-                    )
-                },
-            );
-            let folders = store.folders.iter().enumerate().fold(
-                column![].spacing(6),
-                |rows, (index, folder)| {
-                    let enabled = store.source_enabled(SourceKind::Folder, &folder.root);
-                    rows.push(
-                        column![
-                            text(format!(
-                                "{} · {} approved files · {}",
-                                folder.root.display(),
-                                folder.len(),
-                                folder.options.sync,
-                            ))
-                            .wrapping(text::Wrapping::WordOrGlyph)
-                            .width(Length::Fill),
-                            folder.options.max_file_bytes.map(|limit| text(format!(
-                                "Configured size limit · {} bytes per file",
-                                limit.bytes(),
-                            ))
-                            .size(13)),
-                            row![
-                                button("Review update…").on_press_maybe(
-                                    (can_review && enabled)
-                                        .then_some(Message::ReviewFolderUpdate(index))
-                                ),
-                                button("Options…").on_press_maybe(
-                                    can_review.then_some(Message::ConfigureFolder(index))
-                                ),
-                                button(if enabled { "Disable" } else { "Enable" }).on_press_maybe(
-                                    can_review.then(|| Message::SourceEnabled {
-                                        store: store_index,
-                                        kind: SourceKind::Folder,
-                                        path: folder.root.clone(),
-                                        enabled: !enabled
-                                    })
-                                ),
-                                button("Remove folder").on_press(Message::RemoveFolder(index)),
-                            ]
-                            .spacing(8)
-                            .wrap(),
-                        ]
-                        .spacing(6),
-                    )
-                },
-            );
-            details = details.push(text(store.name.as_str()).size(19))
-                .push(self.knowledge_backend.view(store_index, store, can_review, vault_keys, reveal))
-                .push(reveal.knowledge_input(SourcePath, can_review, text_input("Absolute path to a UTF-8 file, PDF, or folder", &self.source).on_input_maybe(can_review.then_some(Message::Source))))
-                .push(row![
-                    reveal.action(Setting::Knowledge(AddFile), button("Add file").on_press_maybe(backend_valid.then_some(Message::AddSource))),
-                    reveal.action(Setting::Knowledge(ReviewFolder), button("Review folder…").on_press_maybe((can_review && backend_valid && !self.source.trim().is_empty()).then_some(Message::ReviewFolder))),
-                ].spacing(8).wrap())
+            details = details
+                .push(text("Update uses the selected sources, or all enabled sources when the selection is empty. Rebuild replaces all enabled vectors.").size(13))
                 .push(self.folder_options.view(can_review, reveal).map(Message::FolderOptions))
-                .push(sources)
-                .push(folders)
                 .push(self.folder_review.as_deref().map(|review| folder_review_view(review, self.folder_review_page, reveal)))
-                .push(reveal.wrap(Setting::Knowledge(EmbeddingSource), field("Embedding source", embedding_picker(
-                    self.embedding_options(), managed, EmbeddingScope::Store, can_review,
-                ))))
-                .push(managed.is_none().then(|| column![
-                    field("Local embedding endpoint", reveal.knowledge_input(EmbeddingEndpoint, can_review, text_input("Numeric loopback address and port", endpoint)
-                        .on_input(|value| Message::ConfigureStore(EmbeddingField::Endpoint, value)))),
-                    field("Embedding model", reveal.knowledge_input(EmbeddingModel, can_review, text_input("Installed embedding model", model)
-                        .on_input(|value| Message::ConfigureStore(EmbeddingField::Model, value)))),
-                ].spacing(10)))
-                .push(store.embedding.is_none().then(|| text("This store inherits the default embedding settings until you select its own source.").size(13)))
                 .push(qdrant_destination.as_ref().map(|destination| {
                     text(format!("Source and query embeddings and opaque identifiers will be sent to {destination}."))
                         .wrapping(text::Wrapping::WordOrGlyph).size(13)
@@ -3276,27 +4485,12 @@ impl Dialog {
                             .on_press_maybe((can_request && model_available)
                                 .then_some(Message::ApproveAutomaticEmbedding(store_index))))),
                         approved.then(|| text(self.automatic_status.get(&store.name)
-                            .map_or("Automatic sync checks each store in turn and pauses during edits.", String::as_str))
+                            .map_or("Automatic sync checks each store in turn and pauses during edits.", |status| status.summary.as_str()))
                             .wrapping(text::Wrapping::WordOrGlyph).size(13)),
                     ].spacing(6)
                 }))
-                .push(bindings)
-                .push(reveal.action(Setting::Knowledge(AgentKnowledge), checkbox(store.autonomous_enabled)
-                    .label("Offer this store for Agent, Planning, Swarm, and scheduled AI requests")
-                    .on_toggle_maybe(can_review.then_some(move |enabled| {
-                        Message::EnableAutonomousKnowledge { store: store_index, enabled }
-                    }))))
                 .push(text("Terminal AI chat and code analysis ask separately before embedding a query and show retrieved excerpts before sending the request.").size(13))
                 .push(text("Saved indexes can be searched again after reopening. Updating changed settings takes effect after Save.").size(13))
-                .push(row![
-                    reveal.action(Setting::Knowledge(Update), button("Update index").on_press_maybe(
-                        can_index.then_some(Message::Index { rebuild: false }),
-                    )),
-                    reveal.action(Setting::Knowledge(Rebuild), button("Rebuild index").style(button::secondary).on_press_maybe(
-                        can_index.then_some(Message::Index { rebuild: true }),
-                    )),
-                ].spacing(8).wrap())
-                .push(text("Update reuses unchanged enabled files. Rebuild replaces enabled vectors and keeps disabled vectors that fit the embedding dimensions.").size(13))
                 .push(row![
                     reveal.knowledge_input(TestQuery, can_review, text_input("Test search", &self.query).on_input(Message::Query)),
                     reveal.action(Setting::Knowledge(TestSearch), button("Search").on_press_maybe(
@@ -3306,39 +4500,23 @@ impl Dialog {
             for hit in &self.hits {
                 details = details.push(text(hit.as_str()).wrapping(text::Wrapping::WordOrGlyph));
             }
-            if self.confirm_remove {
-                details = details.push(
-                    row![
-                        text("Remove this store from the profile? The source files stay on disk."),
-                        reveal.action(
-                            Setting::Knowledge(ConfirmStoreRemoval),
-                            button("Remove store")
-                                .style(button::danger)
-                                .on_press(Message::RemoveStore)
-                        ),
-                        reveal.action(
-                            Setting::Knowledge(CancelStoreRemoval),
-                            button("Cancel").on_press(Message::ConfirmRemove(false))
-                        ),
-                    ]
-                    .spacing(8)
-                    .wrap(),
-                );
-            } else {
-                details = details.push(reveal.action(
-                    Setting::Knowledge(ReviewStoreRemoval),
-                    button("Remove store…").on_press(Message::ConfirmRemove(true)),
-                ));
-            }
-        } else {
-            details = details.push(text("Select or create a knowledge store."));
         }
+        let (stores_height, sources_height) = knowledge_inventory::body_heights(viewport_height);
         column![
-            text("Knowledge Stores").size(20),
-            row![sidebar, details].spacing(16),
+            text("Build and search knowledge stores from reviewed files and folders.").size(13),
+            text("Knowledge stores").size(15),
+            self.store_inventory(state, stores_height),
+            create,
+            removal,
+            text("Sources").size(15),
+            self.source_inventory(state, selected, sources_height),
+            source_actions.wrap(),
+            maintenance.wrap(),
+            enter_path.then_some(source_path),
+            details,
             self.java_knowledge_view(hints, models, selected.map(|(_, store)| store), can_request),
         ]
-        .spacing(12)
+        .spacing(8)
         .width(Length::Fill)
         .into()
     }
@@ -3495,10 +4673,10 @@ impl Dialog {
     }
 }
 
-const FOLDER_REVIEW_PAGE_SIZE: usize = 128;
+const SOURCE_REVIEW_PAGE_SIZE: usize = 128;
 
 fn folder_review_pages(review: &folder::Review) -> usize {
-    review.rows.len().div_ceil(FOLDER_REVIEW_PAGE_SIZE)
+    review.rows.len().div_ceil(SOURCE_REVIEW_PAGE_SIZE)
 }
 
 fn can_approve_folder_review(review: &folder::Review) -> bool {
@@ -3516,8 +4694,8 @@ fn folder_review_view<'a>(
     let rows = review
         .rows
         .iter()
-        .skip(page * FOLDER_REVIEW_PAGE_SIZE)
-        .take(FOLDER_REVIEW_PAGE_SIZE)
+        .skip(page * SOURCE_REVIEW_PAGE_SIZE)
+        .take(SOURCE_REVIEW_PAGE_SIZE)
         .fold(column![].spacing(4), |rows, entry| {
             let result = match entry.status {
                 folder::Status::Ready { bytes, change } => format!("{change} · {bytes} bytes"),
@@ -3554,7 +4732,8 @@ fn folder_review_view<'a>(
     };
     column![
         text("Review folder sources").size(17),
-        text(review.folder.root.display().to_string()).wrapping(text::Wrapping::WordOrGlyph),
+        text(file_chooser::display_path(&review.folder.root).into_owned())
+            .wrapping(text::Wrapping::WordOrGlyph),
         review
             .folder
             .options
@@ -3745,17 +4924,12 @@ impl SaveIndexes {
     }
 }
 
-fn preferences(
+fn profile_roles(
     state: &State,
     profiles: &Catalog,
-    reveal: &Reveal,
-    models: Vec<EmbeddingChoice>,
     editable: bool,
-    runtime_downloads_allowed: bool,
-    runtime_status: Option<&str>,
+    reveal: &Reveal,
 ) -> Element<'static, Message> {
-    use super::search::LocalPreference;
-
     let options: Vec<_> = std::iter::once(Choice(None, "Use default".into()))
         .chain(
             profiles
@@ -3768,12 +4942,9 @@ fn preferences(
                 }),
         )
         .collect();
-    let mut content = column![
-        text("Local Preferences").size(20),
-        text("Profile roles").size(17)
-    ]
-    .spacing(10)
-    .width(Length::Fill);
+    let mut content = column![text("Choose which profile handles each AI role.").size(13)]
+        .spacing(8)
+        .width(Length::Fill);
     for role in Role::ALL {
         let mut options = options.clone();
         options.extend(
@@ -3793,22 +4964,33 @@ fn preferences(
                 })
                 .cloned(),
         };
-        content = content.push(
-            reveal.wrap(
-                Setting::Role(role),
-                field(
-                    role.label(),
-                    pick_list(options, selected, move |choice| {
-                        Message::Role(role, choice.0)
-                    })
-                    .placeholder("Selected profile unavailable")
-                    .width(Length::Fill)
-                    .dismiss_on_escape(),
-                ),
-            ),
-        );
+        let picker: Element<'_, Message> = if editable {
+            pick_list(options, selected, move |choice| {
+                Message::Role(role, choice.0)
+            })
+            .placeholder("Selected profile unavailable")
+            .width(Length::Fill)
+            .text_size(13)
+            .dismiss_on_escape()
+        } else {
+            text(selected.map_or_else(|| "Selected profile unavailable".into(), |choice| choice.1))
+                .size(13)
+                .into()
+        };
+        content =
+            content.push(reveal.wrap(Setting::Role(role), preference_field(role.label(), picker)));
     }
-    content = content.push(field(
+    content.into()
+}
+
+fn embedding_preference(
+    state: &State,
+    reveal: &Reveal,
+    models: Vec<EmbeddingChoice>,
+    editable: bool,
+) -> Element<'static, Message> {
+    use super::search::LocalPreference;
+    preference_field(
         Setting::Embedding.title(),
         column![
             reveal.wrap(
@@ -3834,16 +5016,7 @@ fn preferences(
             }),
         ]
         .spacing(8),
-    ));
-    content
-        .push(runtime_preferences(
-            state.runtime_update,
-            editable,
-            runtime_downloads_allowed,
-            runtime_status,
-            reveal,
-        ))
-        .into()
+    )
 }
 
 fn runtime_preferences(
@@ -3881,25 +5054,44 @@ fn runtime_preferences(
         text(settings.backend.to_string()).into()
     };
     column![
-        text("Managed runtime updates").size(17),
         reveal.wrap(
             Setting::LocalPreference(LocalPreference::RuntimeUpdatePolicy),
-            field("Update policy", mode),
+            preference_field("Runtime updates", mode),
         ),
         reveal.wrap(
             Setting::LocalPreference(LocalPreference::RuntimeBackend),
-            field("Preferred backend", backend),
+            preference_field("Preferred backend", backend),
         ),
-        text(if runtime_downloads_allowed {
-            "Save to apply. Notify and Automatic Stable check the signed chardonnay/kortty-llama-runtimes channel on GitHub at startup and daily while AI is enabled. Automatic Stable downloads and installs a compatible verified release when managed requests are idle."
+        preference_hint(if runtime_downloads_allowed {
+            "Notify and Automatic Stable check for signed releases on startup and daily. Automatic Stable installs compatible packages when managed models are idle."
         } else {
             crate::clipboard_policy::AI_RUNTIME_DOWNLOADS_DISABLED
-        })
-            .size(14)
-            .wrapping(text::Wrapping::WordOrGlyph),
-        status.map(|status| text(status.to_owned()).size(14).wrapping(text::Wrapping::WordOrGlyph)),
+        }),
+        status.map(|status| preference_hint(status.to_owned())),
     ]
     .spacing(8)
+    .into()
+}
+
+fn preference_field<'a>(
+    label: &'static str,
+    control: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    row![
+        text(label).size(13).width(166),
+        container(control).width(320)
+    ]
+    .align_y(Alignment::Center)
+    .into()
+}
+
+fn preference_hint<'a>(hint: impl Into<String>) -> Element<'a, Message> {
+    row![
+        iced::widget::space::horizontal().width(166),
+        text(hint.into())
+            .size(12)
+            .wrapping(text::Wrapping::WordOrGlyph)
+    ]
     .into()
 }
 
@@ -4181,6 +5373,430 @@ mod tests {
     }
 
     #[test]
+    fn knowledge_scan_cancellation_stays_bound_to_the_running_source_request() {
+        use iced::futures::{StreamExt as _, executor::block_on};
+
+        let profile = crate::snippets::tests::Profile::new();
+        let path = profile.0.join("review.txt");
+        std::fs::write(&path, "A fixture for the source scan.").unwrap();
+        let mut store = Store::new("Cancellation fixture").unwrap();
+        store.add_source(path.clone()).unwrap();
+        let mut draft = State {
+            stores: vec![store],
+            ..State::default()
+        };
+        let saved = draft.clone();
+        let mut dialog = Dialog::new(profile.0.clone());
+        let _ = dialog.update(Message::SelectStore(0), &mut draft, &saved, true);
+        let task = dialog.update(Message::ReviewSourceUpdates(0), &mut draft, &saved, true);
+        let key = (SourceKind::File, path);
+        let status = |dialog: &Dialog| dialog.source_work.as_ref().unwrap().status(&key);
+        assert_eq!(status(&dialog), Some("Scanning…"));
+        let _ = dialog.update(Message::Cancel, &mut draft, &saved, true);
+        assert_eq!(status(&dialog), Some("Cancelling…"));
+        assert!(dialog.source_request());
+        let overlapping = dialog.update(Message::ReviewSourceUpdates(0), &mut draft, &saved, true);
+        assert!(iced_runtime::task::into_stream(overlapping).is_none());
+        let mut stream = iced_runtime::task::into_stream(task).unwrap();
+        let Some(iced_runtime::Action::Output(reply)) = block_on(stream.next()) else {
+            panic!("source scan did not reply");
+        };
+        let _ = dialog.update(reply, &mut draft, &saved, true);
+        assert_eq!(status(&dialog), Some("Cancelled"));
+        assert!(!dialog.source_request());
+        assert!(dialog.source_updates.is_none());
+        assert_eq!(saved, draft);
+    }
+
+    #[test]
+    fn knowledge_source_selection_survives_row_removal_and_resets_on_store_change() {
+        let saved = State::default();
+        let mut draft = saved.clone();
+        let first = PathBuf::from("earlier.txt");
+        let chosen = PathBuf::from("chosen.txt");
+        let mut store = Store::new("Fixtures").unwrap();
+        store.sources = vec![first, chosen.clone()];
+        draft.stores.push(store);
+        draft.stores.push(Store::new("Other").unwrap());
+        let mut dialog = Dialog::new(PathBuf::new());
+
+        let _ = dialog.update(Message::SelectStore(0), &mut draft, &saved, true);
+        let _ = dialog.update(
+            Message::SelectKnowledgeSource(0, SourceKind::File, chosen.clone()),
+            &mut draft,
+            &saved,
+            true,
+        );
+        let _ = dialog.update(Message::OpenSourceSync(0), &mut draft, &saved, true);
+        assert_eq!(
+            dialog
+                .source_sync_editor
+                .as_ref()
+                .map(|edit| &edit.source.1),
+            Some(&chosen)
+        );
+        let _ = dialog.update(
+            Message::SourceSyncMode(SyncMode::Automatic),
+            &mut draft,
+            &saved,
+            true,
+        );
+        assert_eq!(draft.stores[0].file_sync(&chosen), SyncMode::Manual);
+        draft.stores[0].remove_file(0);
+        assert!(
+            dialog
+                .selected_sources
+                .contains(&(SourceKind::File, chosen.clone()))
+        );
+        let _ = dialog.update(Message::SelectStore(1), &mut draft, &saved, true);
+        assert!(dialog.source_sync_editor.is_none());
+        let _ = dialog.update(
+            Message::SelectKnowledgeSource(0, SourceKind::File, chosen),
+            &mut draft,
+            &saved,
+            true,
+        );
+        assert!(dialog.selected_sources.is_empty());
+        assert_eq!(draft.stores[0].sources.len(), 1);
+    }
+
+    #[test]
+    fn knowledge_source_modifiers_and_removal_follow_the_reviewed_rows() {
+        use iced::keyboard::Modifiers;
+
+        let saved = State::default();
+        let mut draft = saved.clone();
+        let mut store = Store::new("Fixtures").unwrap();
+        let files = ["a.txt", "b.txt", "c.txt", "d.txt"].map(PathBuf::from);
+        store.sources = files.to_vec();
+        draft.stores.push(store);
+        let mut dialog = Dialog::new(PathBuf::new());
+        let press =
+            |path: &PathBuf| Message::SelectKnowledgeSource(0, SourceKind::File, path.clone());
+        let _ = dialog.update(Message::SelectStore(0), &mut draft, &saved, true);
+        let _ = dialog.update(press(&files[0]), &mut draft, &saved, true);
+        #[cfg(target_os = "macos")]
+        dialog.set_selection_modifiers(Modifiers::LOGO);
+        #[cfg(not(target_os = "macos"))]
+        dialog.set_selection_modifiers(Modifiers::CTRL);
+        let _ = dialog.update(press(&files[2]), &mut draft, &saved, true);
+        assert_eq!(
+            dialog.selected_sources,
+            BTreeSet::from([
+                (SourceKind::File, files[0].clone()),
+                (SourceKind::File, files[2].clone())
+            ])
+        );
+        dialog.set_selection_modifiers(Modifiers::SHIFT);
+        let _ = dialog.update(press(&files[3]), &mut draft, &saved, true);
+        assert_eq!(
+            dialog.selected_sources,
+            BTreeSet::from([
+                (SourceKind::File, files[2].clone()),
+                (SourceKind::File, files[3].clone())
+            ])
+        );
+        let _ = dialog.update(Message::ReviewSourceRemoval(0), &mut draft, &saved, true);
+        assert_eq!(
+            dialog.knowledge_settings_title(),
+            Some("Remove knowledge sources")
+        );
+        let _ = dialog.update(Message::CancelSourceRemoval, &mut draft, &saved, true);
+        assert!(dialog.knowledge_settings_height().is_none());
+        let _ = dialog.update(Message::ReviewSourceRemoval(0), &mut draft, &saved, true);
+        dialog.close_knowledge_settings();
+        let _ = dialog.update(Message::RemoveSelectedSources, &mut draft, &saved, true);
+        assert_eq!(draft.stores[0].sources, files);
+        let _ = dialog.update(Message::ReviewSourceRemoval(0), &mut draft, &saved, true);
+        let _ = dialog.update(Message::RemoveSelectedSources, &mut draft, &saved, true);
+        assert_eq!(draft.stores[0].sources, files[..2]);
+        assert!(dialog.selected_sources.is_empty());
+        assert!(dialog.knowledge_settings_height().is_none());
+    }
+
+    #[test]
+    fn knowledge_chooser_reviews_the_exact_files_and_commits_the_batch_atomically() {
+        use iced::futures::{StreamExt as _, executor::block_on};
+
+        let fixture = crate::snippets::tests::Profile::new();
+        let root = fixture.0.canonicalize().unwrap();
+        std::fs::create_dir(root.join("Child")).unwrap();
+        for name in ["alpha.txt", "beta.MD", "ignored.bin"] {
+            std::fs::write(root.join(name), "Reviewed source fixture.").unwrap();
+        }
+        let saved = State::default();
+        let mut draft = saved.clone();
+        draft.stores.push(Store::new("Fixture store").unwrap());
+        draft.stores.push(Store::new("Other store").unwrap());
+        let mut dialog = Dialog::new(root.clone());
+        let _ = dialog.update(Message::SelectStore(0), &mut draft, &saved, true);
+
+        let complete = |dialog: &mut Dialog, draft: &mut State, message| {
+            let mut actions =
+                iced_runtime::task::into_stream(dialog.update(message, draft, &saved, true))
+                    .unwrap();
+            let Some(iced_runtime::Action::Output(result @ Message::Finished(..))) =
+                block_on(actions.next())
+            else {
+                panic!("Missing file review result");
+            };
+            let _ = dialog.update(result, draft, &saved, true);
+        };
+        let review = |dialog: &mut Dialog, draft: &mut State| {
+            let _ = dialog.update(
+                Message::BrowseKnowledgeSources(SourceKind::File),
+                draft,
+                &saved,
+                true,
+            );
+            let _ = dialog.update(
+                Message::KnowledgeSourceBrowse(file_chooser::Message::Listed(
+                    dialog.generation,
+                    Err("Fixture starting folder".into()),
+                )),
+                draft,
+                &saved,
+                true,
+            );
+            let _ = dialog.update(
+                Message::KnowledgeSourceBrowse(file_chooser::Message::Folder(
+                    root.display().to_string(),
+                )),
+                draft,
+                &saved,
+                true,
+            );
+            let task = dialog.update(
+                Message::KnowledgeSourceBrowse(file_chooser::Message::Go),
+                draft,
+                &saved,
+                true,
+            );
+            let mut actions = iced_runtime::task::into_stream(task).unwrap();
+            let Some(iced_runtime::Action::Output(
+                listing @ Message::KnowledgeSourceBrowse(file_chooser::Message::Listed(
+                    ticket,
+                    Ok(_),
+                )),
+            )) = block_on(actions.next())
+            else {
+                panic!("Missing knowledge source listing");
+            };
+            let Message::KnowledgeSourceBrowse(file_chooser::Message::Listed(_, Ok(directory))) =
+                &listing
+            else {
+                unreachable!()
+            };
+            assert_eq!(
+                directory
+                    .entries
+                    .iter()
+                    .map(|entry| entry.display.as_str())
+                    .collect::<Vec<_>>(),
+                ["Child", "alpha.txt", "beta.MD"]
+            );
+            let _ = dialog.update(listing, draft, &saved, true);
+            for row in [1, 2] {
+                let _ = dialog.update(
+                    Message::KnowledgeSourceBrowse(file_chooser::Message::Entry(ticket, row)),
+                    draft,
+                    &saved,
+                    true,
+                );
+            }
+            complete(dialog, draft, Message::UseBrowsedKnowledgeSources);
+            assert!(
+                matches!(&dialog.source_picker, Some(KnowledgeSourcePicker::ReviewFiles { review, .. }) if review.rows.len() == 2 && review.rows[0].path == root.join("alpha.txt") && review.rows[1].path == root.join("beta.MD"))
+            );
+        };
+        review(&mut dialog, &mut draft);
+        assert!(draft.stores[0].sources.is_empty());
+        let _ = dialog.update(Message::SelectStore(1), &mut draft, &saved, true);
+        let _ = dialog.update(
+            Message::ApproveBrowsedKnowledgeFiles,
+            &mut draft,
+            &saved,
+            true,
+        );
+        assert!(draft.stores[1].sources.is_empty());
+
+        let _ = dialog.update(Message::SelectStore(0), &mut draft, &saved, true);
+        review(&mut dialog, &mut draft);
+        let approve = Message::ApproveBrowsedKnowledgeFiles;
+        std::fs::write(root.join("alpha.txt"), "Changed source").unwrap();
+        complete(&mut dialog, &mut draft, approve.clone());
+        assert!(draft.stores[0].sources.is_empty());
+        assert!(
+            dialog
+                .status
+                .as_deref()
+                .is_some_and(|status| status.contains("changed after the scan"))
+        );
+        std::fs::write(root.join("alpha.txt"), "Reviewed source fixture.").unwrap();
+        draft.stores[0].add_source(root.join("beta.MD")).unwrap();
+        complete(&mut dialog, &mut draft, approve.clone());
+        assert_eq!(draft.stores[0].sources, [root.join("beta.MD")]);
+        assert!(
+            dialog
+                .status
+                .as_deref()
+                .is_some_and(|status| status.contains("overlaps"))
+        );
+        draft.stores[0].remove_file(0);
+        complete(&mut dialog, &mut draft, approve);
+        assert_eq!(
+            draft.stores[0].sources,
+            [root.join("alpha.txt"), root.join("beta.MD")]
+        );
+        assert!(!dialog.knowledge_source_picker_open());
+        assert!(saved.stores.is_empty());
+
+        let previous = draft.stores[0].clone();
+        for action in [
+            knowledge_settings::Action::Open { create: true },
+            knowledge_settings::Action::Name("New store".into()),
+            knowledge_settings::Action::Apply,
+        ] {
+            let _ = dialog.update(Message::KnowledgeSettings(action), &mut draft, &saved, true);
+        }
+        let choose_native = Message::PickNativeKnowledgeSources(SourceKind::File);
+        let _ = dialog.update(choose_native.clone(), &mut draft, &saved, true);
+        let discarded_ticket = dialog.generation;
+        assert!(
+            dialog
+                .pending_native_knowledge_kind(discarded_ticket)
+                .is_some()
+        );
+        complete(
+            &mut dialog,
+            &mut draft,
+            Message::NativeKnowledgeSourcesPicked(
+                discarded_ticket,
+                Some(vec![root.join("ignored.bin")]),
+            ),
+        );
+        assert!(matches!(
+            &dialog.source_picker,
+            Some(KnowledgeSourcePicker::ReviewFiles { review, .. }) if !review.has_ready_files()
+        ));
+        let _ = dialog.update(choose_native, &mut draft, &saved, true);
+        let ticket = dialog.generation;
+        let invalid = root.join("binary.txt");
+        std::fs::write(&invalid, [0xff, 0x00]).unwrap();
+        let selected = vec![root.join("alpha.txt"), invalid, root.join("beta.MD")];
+        let _ = dialog.update(
+            Message::NativeKnowledgeSourcesPicked(discarded_ticket, Some(selected.clone())),
+            &mut draft,
+            &saved,
+            true,
+        );
+        assert!(dialog.pending_native_knowledge_kind(ticket).is_some());
+        complete(
+            &mut dialog,
+            &mut draft,
+            Message::NativeKnowledgeSourcesPicked(ticket, Some(selected)),
+        );
+        assert!(
+            matches!(&dialog.source_picker, Some(KnowledgeSourcePicker::ReviewFiles { review, .. }) if matches!(review.rows[1].status, file_review::Status::Skipped(_)))
+        );
+        assert_eq!(draft.stores.len(), 2);
+        assert_eq!(draft.stores[0], previous);
+        draft.stores[1].name = "New store".into();
+        complete(
+            &mut dialog,
+            &mut draft,
+            Message::ApproveBrowsedKnowledgeFiles,
+        );
+        assert_eq!(draft.stores.len(), 2);
+        assert!(dialog.knowledge_source_picker_open());
+        draft.stores[1].name = "Other store".into();
+        complete(
+            &mut dialog,
+            &mut draft,
+            Message::ApproveBrowsedKnowledgeFiles,
+        );
+        assert_eq!(draft.stores[0], previous);
+        assert_eq!(draft.stores[2].name, "New store");
+        assert_eq!(
+            draft.stores[2].sources,
+            [root.join("alpha.txt"), root.join("beta.MD")]
+        );
+        assert_eq!(dialog.selected, Some(2));
+        assert!(!dialog.knowledge_source_picker_open());
+    }
+
+    #[test]
+    fn initial_folder_scan_is_cancelled_or_committed_with_the_new_store() {
+        use iced::futures::{StreamExt as _, executor::block_on};
+
+        let fixture = crate::snippets::tests::Profile::new();
+        let root = fixture.0.canonicalize().unwrap();
+        std::fs::write(root.join("notes.txt"), "Reviewed source fixture.").unwrap();
+        let saved = State::default();
+        let mut draft = saved.clone();
+        let mut dialog = Dialog::new(root.clone());
+
+        for cancel in [true, false] {
+            for action in [
+                knowledge_settings::Action::Open { create: true },
+                knowledge_settings::Action::Name("Folder store".into()),
+                knowledge_settings::Action::Apply,
+            ] {
+                let _ = dialog.update(Message::KnowledgeSettings(action), &mut draft, &saved, true);
+            }
+            let (chooser, listing) = file_chooser::Chooser::open(
+                file_chooser::Mode::KnowledgeFolder,
+                Some(root.clone()),
+                &mut dialog.generation,
+            );
+            dialog.source_picker = Some(KnowledgeSourcePicker::Browse(chooser));
+            let mut actions = iced_runtime::task::into_stream(listing).unwrap();
+            let Some(iced_runtime::Action::Output(
+                listing @ file_chooser::Message::Listed(_, Ok(_)),
+            )) = block_on(actions.next())
+            else {
+                panic!("Missing folder listing");
+            };
+            let _ = dialog.update(
+                Message::KnowledgeSourceBrowse(listing),
+                &mut draft,
+                &saved,
+                true,
+            );
+            let scan = dialog.update(
+                Message::UseBrowsedKnowledgeSources,
+                &mut draft,
+                &saved,
+                true,
+            );
+            let mut actions = iced_runtime::task::into_stream(scan).expect("Folder scan started");
+            let Some(iced_runtime::Action::Output(result @ Message::Finished(_, Ok(_)))) =
+                block_on(actions.next())
+            else {
+                panic!("Missing successful folder review");
+            };
+            assert!(draft.stores.is_empty());
+            if cancel {
+                let _ = dialog.update(
+                    Message::CloseKnowledgeSourcePicker,
+                    &mut draft,
+                    &saved,
+                    true,
+                );
+            }
+            let _ = dialog.update(result, &mut draft, &saved, true);
+            assert_eq!(dialog.folder_review.is_some(), !cancel);
+            assert!(draft.stores.is_empty());
+            let _ = dialog.update(Message::ApproveFolder, &mut draft, &saved, true);
+            assert_eq!(draft.stores.len(), usize::from(!cancel));
+            assert!(!dialog.knowledge_source_picker_open());
+        }
+        assert_eq!(draft.stores[0].name, "Folder store");
+        assert_eq!(draft.stores[0].folders[0].root, root);
+        assert_eq!(draft.stores[0].source_count(), 1);
+    }
+
+    #[test]
     fn folder_review_search_reveals_actions_without_changing_pages_or_approving() {
         use crate::ai_manager::search::{KnowledgeSetting, Setting, Target};
         use crate::ai_manager::{Dialog as Manager, Message as ManagerMessage};
@@ -4189,7 +5805,7 @@ mod tests {
         let root = profile.0.canonicalize().unwrap();
         let source = root.join("sources");
         std::fs::create_dir(&source).unwrap();
-        for index in 0..=FOLDER_REVIEW_PAGE_SIZE {
+        for index in 0..=SOURCE_REVIEW_PAGE_SIZE {
             std::fs::write(
                 source.join(format!("{index:03}.txt")),
                 "Folder review fixture.",
@@ -4199,7 +5815,7 @@ mod tests {
         let (reply, _cancel) = folder::start(
             source,
             None,
-            FOLDER_REVIEW_PAGE_SIZE + 1,
+            SOURCE_REVIEW_PAGE_SIZE + 1,
             Vec::new(),
             knowledge::source::Options::default(),
         )
