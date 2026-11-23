@@ -2518,17 +2518,25 @@ impl Page {
 
     fn keywords(self) -> &'static str {
         match self {
-            Self::General => "enable features timeout agent internet policies global request",
+            Self::General => {
+                "enable features timeout terminal agent triage confirmation security check snippet internet policies global request Tavily Brave Bright Data SearXNG web search"
+            }
             Self::Profiles => {
-                "provider API URL key connection model GGUF llama reasoning vision limits default"
+                "provider API URL key endpoint connection model GGUF llama reasoning vision time limit token limit budget price max output default"
             }
             Self::LocalModels => {
-                "server discovery loopback connection installed model start stop status configure idle remove GGUF Hugging Face"
+                "server discovery loopback connection installed model start stop status configure idle remove GGUF Hugging Face HF download llama.cpp MLX LM Studio"
             }
-            Self::Knowledge => "embedding documents files search retrieval index",
-            Self::Skills => "prompt instructions rules learned learning markdown import export",
-            Self::Memory => "global connection history learned archive restore",
-            Self::LocalPreferences => "preferences default profiles text coding agent journal",
+            Self::Knowledge => "RAG embeddings documents files search retrieval index vector",
+            Self::Skills => {
+                "prompt instructions rules learned learning markdown import export GitHub Anthropic"
+            }
+            Self::Memory => {
+                "global connection history learned archive restore MEMORY.md notes remember context korTTY memory"
+            }
+            Self::LocalPreferences => {
+                "preferences default profiles text coding agent journal Hugging Face HF token"
+            }
         }
     }
 }
@@ -3914,19 +3922,17 @@ impl Dialog {
     fn search_results(&self) -> impl Iterator<Item = search::Target> + '_ {
         let wizard = self.profile_wizard_open();
         let editable = self.editable() && self.profile_form_lock().is_none();
-        search::results(&self.search, self.profiles.searchable_profile())
-            .chain(search::imported_model_results(
-                &self.search,
-                &self.saved.java_model_hints,
-            ))
+        let hints = &self.saved.java_model_hints;
+        let candidates = search::targets(self.profiles.searchable_profile())
+            .chain(search::imported_models(hints))
             .filter(move |_| !wizard)
-            .chain(search::matching(
-                &self.search,
+            .chain(
                 self.profiles
                     .wizard_search_settings(editable)
                     .map(search::Target::Setting),
-            ))
-            .filter(|&target| self.search_target_available(target))
+            )
+            .filter(|&target| self.search_target_available(target));
+        search::matching(&self.search, candidates, hints)
     }
 
     fn search_target_available(&self, target: search::Target) -> bool {
@@ -5232,7 +5238,7 @@ impl Dialog {
         ]
         .height(Length::Fill);
         let mut pages = stack![pages].height(Length::Fill).width(Length::Fill);
-        if !self.search.trim().is_empty() {
+        if crate::settings_search::has_query(&self.search) {
             let results = container(
                 scrollable(self.search_view())
                     .id(self.search_scroll.clone())
@@ -5502,16 +5508,7 @@ impl Dialog {
         let mut results = column![].spacing(2);
         for (index, target) in matches {
             let selected = index == self.search_selection;
-            let label = match target {
-                search::Target::Setting(search::Setting::ImportedJavaModel(key)) => self
-                    .saved
-                    .java_model_hints
-                    .search_hint(key)
-                    .map(|hint| hint.label())
-                    .unwrap_or_else(|| target.label()),
-                search::Target::Setting(setting) => setting.title().into(),
-                _ => target.label(),
-            };
+            let label = target.label(&self.saved.java_model_hints);
             let result = button(
                 row![
                     text(label)
@@ -6179,7 +6176,9 @@ mod tests {
             .save_against(&root, &Configuration::default())
             .unwrap();
         let mut dialog = Dialog::new(Arc::new(config), root.clone(), Vec::new(), true, None);
-        let _ = dialog.update(Message::Search("mutating confirmation".into()));
+        let _ = dialog.update(Message::Search(
+            "Require approval for mutating Agent command sets".into(),
+        ));
         let _ = dialog.update(Message::SearchChoose);
         assert_eq!(
             dialog.revealed.setting,

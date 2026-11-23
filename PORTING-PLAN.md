@@ -41,7 +41,7 @@ records the broader comparison with the tagged Java release.
 | Area | Remaining change | Completion check |
 | --- | --- | --- |
 | B4 · GGUF Configure layout | Match the initial window width and long model-path layout in the Java dialog. The path displayed in Rust now uses the normal Windows spelling. | Compare both dialogs with the same long Windows path and check that fields and footer actions remain reachable at small sizes. |
-| D4 · Searching Settings and AI Manager | Apply the Java matching rules in both dialogs. Normalize German spellings, accents and punctuation, require two normalized characters, rank label and page matches, suppress controls matched only by their page, deduplicate and return at most 40 results. Compare the remaining labeled controls with the tagged dialogs. | Run the tagged matcher cases against both entry points. Check stable order, exact and prefix matches, duplicate labels, one-character queries and the 40-result limit. Verify keyboard navigation to a reachable result while preserving the active draft, provider restrictions and imported-model identity. |
+| D4 · Searchable controls | Compare the remaining Java Settings and AI Manager pages, subpages and labeled controls with the Rust search inventory. Add reachable missing destinations alongside the dialog comparisons. | Verify that controls on a page that has never been opened are discoverable, and that navigation reveals the exact control with the current page state and policy. |
 
 The [November 23 review](PORTING-PARITY.md#november-23-dialog-parity-review)
 records the dialog differences. The [November 22 comparison](PORTING-PARITY.md#november-22-design-editing-command-output-and-settings-search)
@@ -324,6 +324,7 @@ feature is opt-in and its startup command is available in debug builds.
 
 | Area | Implemented in Rust | Remaining verification |
 | --- | --- | --- |
+| D4 · Search matching | Settings and AI Manager use the shared Java matching and ranking rules for visible page and control names, aliases, duplicate suppression and the 40-result limit. Available controls are filtered before ranking. Imported model IDs remain selectable when their normalized names collide. | Compare result labels, ranking and keyboard and pointer navigation against the tagged dialogs on native desktops. [Search matching checkpoint](PORTING-PARITY.md#november-23-settings-search-matching) |
 | A2 · Copying a command step's output | **Copy output** uses all masked stdout and stderr retained for the selected step within the existing capture limits. The compact preview still shows the last eight lines. Retained runs use the same action and clipboard policy. | Verify both streams, a line longer than 320 characters and redaction in the native clipboard for live and retained runs. [Step-copy checkpoint](PORTING-PARITY.md#november-23-complete-masked-step-copy) |
 | B5 · Knowledge source status | Completed source outcomes and problem counts are restored with the existing index metadata. A failed or unavailable source keeps its published index timestamp and leaves the other rows intact. | Verify both manual and automatic failures across a desktop restart and recheck the source rows after correcting the failure. [Source outcome checkpoint](PORTING-PARITY.md#november-23-knowledge-source-outcomes) |
 | A2 · Naming Agent designs | New, Duplicate and Rename use owned prompts with the suggested text selected. Modifying a built-in creates a custom copy with the full preset name and a numeric suffix. The catalog keeps stable IDs and the Settings entry keeps changes in the active draft. | Verify the final compact prompt on Windows ARM64 against Java. Check Rename, deletion, saved names after restart and owner focus on the native desktops. [Naming checkpoint](PORTING-PARITY.md#november-23-agent-design-naming) |
@@ -1156,8 +1157,8 @@ not been identified.
 Continue the [dialog design comparison](#gui-dialog-design-parity) with
 GGUF Configure sizing and desktop acceptance of restored Knowledge Stores
 source status.
-Implement the shared search rules in Settings and AI Manager. Complete
-native desktop checks for Agent step copying, Agent naming and GGUF,
+Compare the remaining searchable controls and complete the native checks
+for both settings searches, Agent step copying, Agent naming and GGUF,
 and live terminal acceptance for Plan and execution. Continue from the
 Windows Font, Window and SSH editor comparisons when reviewing the remaining
 Settings and connection pages. Scheduler, SFTP and the other dialogs still

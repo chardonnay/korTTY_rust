@@ -9,7 +9,6 @@ use iced::widget::{
 use iced::{Alignment, Color, Element, Length, Padding, Size, Task, window};
 use kortty_ssh::KeepAlive;
 use kortty_terminal::TextEncoding;
-use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 
 use crate::clipboard_policy::ClipboardPolicy;
 use crate::connection_store::{
@@ -136,6 +135,34 @@ impl Section {
 
     pub(super) fn guide_chapter(self) -> String {
         format!("Settings · {}", self.label())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SearchTarget {
+    Page(Section),
+    Setting(Setting),
+}
+
+impl SearchTarget {
+    fn candidate(self) -> crate::settings_search::Candidate<'static, Self> {
+        let (label, detail, page, is_page) = match self {
+            Self::Page(section) => (section.label(), "", section.label(), true),
+            Self::Setting(setting) => (
+                setting.label(),
+                setting.keywords(),
+                setting.section().label(),
+                false,
+            ),
+        };
+        crate::settings_search::Candidate {
+            label: label.into(),
+            detail,
+            page,
+            is_page,
+            identity: None,
+            target: self,
+        }
     }
 }
 
@@ -701,7 +728,7 @@ pub enum Message {
     SearchChoose(window::Id),
     SearchClear(window::Id),
     Escape(window::Id),
-    Reveal(window::Id, Setting),
+    Reveal(window::Id, SearchTarget),
     FontFamily(window::Id, String),
     FontSize(window::Id, u8),
     FontSizeInput(window::Id, String),
@@ -1135,8 +1162,8 @@ impl Dialog {
             || self.themes.exchanging().is_some()
     }
 
-    fn search_results(&self, has_transparency: bool) -> impl Iterator<Item = Setting> {
-        search_matches(&self.search).filter(move |setting| match setting {
+    fn search_results(&self, has_transparency: bool) -> impl Iterator<Item = SearchTarget> {
+        search_targets(&self.search, |setting| match setting {
             Setting::Restore => self.draft.restore.is_some(),
             Setting::Transparency => has_transparency,
             _ => true,
@@ -1185,6 +1212,18 @@ impl Dialog {
             .chain(crate::settings_search::focus_if_present(
                 self.revealed_input.clone(),
             ))
+    }
+
+    fn reveal_search_target(&mut self, target: SearchTarget) -> Task<Desktop> {
+        match target {
+            SearchTarget::Setting(setting) => self.reveal_result(setting),
+            SearchTarget::Page(section) => {
+                self.search.clear();
+                self.search_selection = 0;
+                self.select_section(section);
+                self.reveal_page_start()
+            }
+        }
     }
 
     fn input_target(&self, setting: Setting, editable: bool) -> Option<&widget::Id> {
@@ -1542,16 +1581,17 @@ impl Workspace {
             | Message::UseJavaSessionRestore(id)
             | Message::KeyBinding(id, _)) => (id, message),
         };
-        let has_transparency =
-            matches!(message, Message::SearchStep(..) | Message::SearchChoose(_))
-                && self
-                    .settings
-                    .0
-                    .as_ref()
-                    .filter(|dialog| dialog.id == id)
-                    .and_then(|dialog| self.windows.get(&dialog.owner))
-                    .and_then(|window| self.transparency_controls(window))
-                    .is_some();
+        let has_transparency = matches!(
+            message,
+            Message::SearchStep(..) | Message::SearchChoose(_) | Message::Reveal(..)
+        ) && self
+            .settings
+            .0
+            .as_ref()
+            .filter(|dialog| dialog.id == id)
+            .and_then(|dialog| self.windows.get(&dialog.owner))
+            .and_then(|window| self.transparency_controls(window))
+            .is_some();
         if let Some(child) = self.highlight_rules_for_settings(id) {
             return window::gain_focus(child);
         }
@@ -1604,7 +1644,8 @@ impl Workspace {
                 let choice = dialog
                     .search_results(has_transparency)
                     .nth(dialog.search_selection);
-                return choice.map_or_else(Task::none, |setting| dialog.reveal_result(setting));
+                return choice
+                    .map_or_else(Task::none, |target| dialog.reveal_search_target(target));
             }
             Message::SearchClear(_) => {
                 dialog.search.clear();
@@ -1612,7 +1653,16 @@ impl Workspace {
                 dialog.revealed = None;
                 return widget::operation::focus(dialog.search_input.clone());
             }
-            Message::Reveal(_, setting) => return dialog.reveal_result(setting),
+            Message::Reveal(_, target) => {
+                return if dialog
+                    .search_results(has_transparency)
+                    .any(|result| result == target)
+                {
+                    dialog.reveal_search_target(target)
+                } else {
+                    Task::none()
+                };
+            }
             Message::FontFamily(_, family) if dialog.section == Section::Font => {
                 if installed_font(&family).is_some() {
                     dialog.draft.preferences.set_terminal_font_family(family);
@@ -3051,13 +3101,14 @@ impl Workspace {
         }
         let search = container(container(input).max_width(SEARCH_MAX_WIDTH)).center_x(Length::Fill);
         let results = matches.peek().is_some().then(|| {
-            let items = column(matches.enumerate().map(|(index, setting)| {
+            let items = column(matches.enumerate().map(|(index, target)| {
+                let candidate = target.candidate();
                 button(
                     row![
-                        text(setting.label())
+                        text(candidate.label)
                             .wrapping(text::Wrapping::None)
                             .width(Length::Fill),
-                        text(setting.section().label()).size(13),
+                        (!candidate.is_page).then(|| text(candidate.page).size(13)),
                     ]
                     .align_y(Alignment::Center)
                     .spacing(10),
@@ -3069,7 +3120,7 @@ impl Workspace {
                 })
                 .height(SEARCH_ROW_HEIGHT)
                 .width(Length::Fill)
-                .on_press(msg(Message::Reveal(id, setting)))
+                .on_press(msg(Message::Reveal(id, target)))
                 .into()
             }))
             .spacing(4)
@@ -4298,29 +4349,34 @@ impl fmt::Display for RestoreChoice {
     }
 }
 
-fn search_matches(query: &str) -> impl Iterator<Item = Setting> {
-    let query = normalized(query);
-    Setting::ALL.iter().copied().filter(move |setting| {
-        let query = query.trim();
-        if query.chars().take(2).count() < 2 {
-            return false;
-        }
-        let target = normalized(&format!(
-            "{} {} {}",
-            setting.label(),
-            setting.section().label(),
-            setting.keywords()
-        ));
-        query.split_whitespace().all(|word| target.contains(word))
-    })
+fn search_targets(
+    query: &str,
+    available: impl Fn(Setting) -> bool,
+) -> std::vec::IntoIter<SearchTarget> {
+    let available = &available;
+    crate::settings_search::rank(
+        query,
+        Section::ALL
+            .into_iter()
+            .flat_map(|section| {
+                std::iter::once(SearchTarget::Page(section)).chain(
+                    Setting::ALL
+                        .iter()
+                        .copied()
+                        .filter(move |setting| setting.section() == section && available(*setting))
+                        .map(SearchTarget::Setting),
+                )
+            })
+            .map(SearchTarget::candidate),
+    )
 }
 
-fn normalized(value: &str) -> String {
-    value
-        .nfkd()
-        .filter(|&ch| !is_combining_mark(ch))
-        .flat_map(char::to_lowercase)
-        .collect()
+#[cfg(test)]
+fn search_matches(query: &str) -> impl Iterator<Item = Setting> {
+    search_targets(query, |_| true).filter_map(|target| match target {
+        SearchTarget::Setting(setting) => Some(setting),
+        SearchTarget::Page(_) => None,
+    })
 }
 
 fn save_preferences(preferences: &WindowSettings) -> std::io::Result<()> {
@@ -4675,11 +4731,11 @@ mod tests {
         );
         assert_eq!(
             search_matches("font zoom").collect::<Vec<_>>(),
-            [Setting::FontSize, Setting::SnippetFontSize]
+            [Setting::SnippetFontSize, Setting::FontSize]
         );
         assert_eq!(
             search_matches("font face").collect::<Vec<_>>(),
-            [Setting::FontFamily, Setting::SnippetFontFamily]
+            [Setting::SnippetFontFamily, Setting::FontFamily]
         );
         assert_eq!(
             search_matches("terminal bracketed").collect::<Vec<_>>(),
@@ -5055,7 +5111,7 @@ mod tests {
         let _ = workspace.update_settings(Message::SearchChoose(id));
         let dialog = workspace.settings.0.as_ref().unwrap();
         assert_eq!(dialog.section, Section::Terminal);
-        assert_eq!(dialog.revealed, Some(Setting::QuickSelectPatterns));
+        assert_eq!(dialog.revealed, Some(Setting::QuickSelectAlphabet));
         assert!(dialog.search.is_empty());
 
         let _ = workspace.update_settings(Message::Search(id, "z".into()));
@@ -5066,6 +5122,34 @@ mod tests {
         assert!(workspace.settings.0.as_ref().unwrap().search.is_empty());
         let _ = workspace.update_settings(Message::Escape(id));
         assert!(workspace.settings.for_owner(owner).is_none());
+    }
+
+    #[test]
+    fn settings_search_ranks_exact_page_and_opens_it_without_editing_the_draft() {
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.open_settings(owner, Some(Section::Window));
+        let id = workspace.settings.for_owner(owner).unwrap();
+        let preferences = workspace
+            .settings
+            .0
+            .as_ref()
+            .unwrap()
+            .draft
+            .preferences
+            .clone();
+        let _ = workspace.update_settings(Message::Search(id, "Fónt!".into()));
+        let dialog = workspace.settings.0.as_ref().unwrap();
+        assert_eq!(
+            dialog.search_results(false).next(),
+            Some(SearchTarget::Page(Section::Font))
+        );
+        let _ = workspace.update_settings(Message::SearchChoose(id));
+        let dialog = workspace.settings.0.as_ref().unwrap();
+        assert_eq!(dialog.section, Section::Font);
+        assert_eq!(dialog.revealed, None);
+        assert!(dialog.search.is_empty());
+        assert_eq!(dialog.draft.preferences, preferences);
     }
 
     #[test]

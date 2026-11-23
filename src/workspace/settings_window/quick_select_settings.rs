@@ -298,7 +298,7 @@ mod tests {
         };
         assert_eq!(
             search_matches("quick select").collect::<Vec<_>>(),
-            [Setting::QuickSelectAlphabet, Setting::QuickSelectPatterns]
+            [Setting::QuickSelectPatterns, Setting::QuickSelectAlphabet]
         );
         let id = open(&mut workspace);
         edit(&mut workspace, id, Edit::Alphabet("AA".into()));

@@ -70,9 +70,10 @@ Windows ARM64 desktop checks.
 
 At `aaa8d037`, the step menu copied the eight-line preview with at most
 320 characters per line. The [step-copy update](#november-23-complete-masked-step-copy)
-uses the retained output. Settings
-requires two characters and AI Manager accepts one. Both filter entries in
-enumeration order. The [matcher and clipboard comparison](#november-22-design-editing-command-output-and-settings-search)
+uses the retained output. At that checkpoint Settings required two
+characters and AI Manager accepted one. Both filtered entries in
+enumeration order. The [search update](#november-23-settings-search-matching)
+applies the tagged ranking to both dialogs. The [matcher and clipboard comparison](#november-22-design-editing-command-output-and-settings-search)
 links the Java behavior and the corresponding Rust paths.
 
 The last recorded model-configuration check used the Java Windows x64
@@ -215,6 +216,30 @@ passed. The native system clipboard exercise remains open.
 [Step action](src/workspace/terminal_agent/design/actions.rs)
 · [Captured and preview output](src/workspace/terminal_agent/inline_history.rs)
 · [Apple Silicon focused tests](target/verification/20261123-step-output-macos-final.log)
+
+## November 23 Settings search matching
+
+Settings and AI Manager share the tagged Java ranking. The matcher folds
+German spellings and accents, treats punctuation as word separators, and
+requires two normalized UTF-16 code units. All query words must occur in
+the label, its search aliases or the page. A page name alone does not
+qualify its controls. Exact and prefix matches rank above other label
+matches. Equal scores follow dialog order. Repeated settings on the same
+page collapse before the 40-result limit. Distinct imported registrations
+keep their identities when punctuation folds their labels to the same text.
+
+Settings has page results as well as control results. Choosing a control
+uses the existing navigation, scrolling and focus paths. AI Manager filters
+its candidates for the active wizard, provider and policy before ranking.
+Apple Silicon passed 506 focused tests with 12 ignored, including the
+tagged matcher cases, page navigation, keyboard focus, provider filtering
+and distinct model IDs. Windows ARM64 passed the all-target compilation
+check for the matcher.
+The remaining native acceptance covers the visual results and the inventory
+of searchable controls on the other tagged pages.
+[Rust matcher](src/settings_search.rs)
+· [Tagged Java matcher](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SettingsSearchMatcher.java)
+· [Apple Silicon focused tests](target/verification/20261123-settings-ranking-macos-final.log)
 
 ## November 22 AI Manager and Agent Design on Windows ARM64
 
