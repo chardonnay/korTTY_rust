@@ -11,6 +11,9 @@ license = "MIT"
 description = "Native desktop terminal workspace"
 default-run = "kortty"
 
+[features]
+dialog-preview = []
+
 [dependencies]
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "zeroize"] }
 base64 = "0.22.1"
@@ -73,6 +76,7 @@ ttf-parser = { version = "=0.25.1", default-features = false }
 sevenz-rust2 = { version = "=0.25.0", path = "vendor/sevenz-rust2", default-features = false, features = ["compress", "aes256"] }
 jsonschema = { version = "0.61.2", default-features = false }
 referencing = { version = "0.61.2", default-features = false }
+rfd = "=0.18.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Use the system's libc interface for Linux desktop dependencies.

@@ -1594,6 +1594,7 @@ pub(crate) enum Section {
     Connection,
     Model,
     Limits,
+    Budget,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2229,7 +2230,7 @@ impl Editor {
         self.selected().filter(|profile| {
             self.wizard.is_none()
                 && !profile.is_cli()
-                && (self.section == Section::Limits || profile.policy_definition().is_some())
+                && (self.section == Section::Budget || profile.policy_definition().is_some())
         })
     }
 

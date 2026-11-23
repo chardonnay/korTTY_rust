@@ -197,6 +197,11 @@ impl Recommendations {
         });
         column![
             text("Recommended GGUF models").size(16),
+            text(self.catalog.as_ref().map_or_else(
+                || "Model and prompt catalog · Bundled".into(),
+                |catalog| format!("Model and prompt catalog · {}", catalog.version()),
+            ))
+            .size(13),
             text(memory).size(13),
             row![
                 reveal.action(Setting::Hub(HubSetting::RecommendationRole), role),
@@ -315,6 +320,37 @@ impl State {
         review.select(file, self.install_purpose())
     }
 
+    pub(super) fn access_picker(
+        &self,
+        enabled: bool,
+        credentials: Vec<CredentialChoice>,
+    ) -> (Element<'_, Message>, bool) {
+        let tokens = std::iter::once(Token::Anonymous)
+            .chain(credentials.into_iter().map(Token::Saved))
+            .collect::<Vec<_>>();
+        let selected = tokens
+            .iter()
+            .find(|choice| match choice {
+                Token::Anonymous => self.token.is_none(),
+                Token::Saved(choice) => Some(choice.id.as_str()) == self.token.as_deref(),
+            })
+            .cloned();
+        let authentication = if enabled {
+            pick_list(tokens, selected.clone(), |token| {
+                Message::HuggingFace(Action::Token(token))
+            })
+            .placeholder("Select Hugging Face access")
+            .dismiss_on_escape()
+        } else {
+            text(selected.as_ref().map_or_else(
+                || "Unlock Vault to use the selected token".into(),
+                ToString::to_string,
+            ))
+            .into()
+        };
+        (authentication, selected.is_some())
+    }
+
     pub(super) fn view(
         &self,
         enabled: bool,
@@ -331,29 +367,7 @@ impl State {
             .spacing(8)
             .into();
         }
-        let tokens = std::iter::once(Token::Anonymous)
-            .chain(credentials.into_iter().map(Token::Saved))
-            .collect::<Vec<_>>();
-        let selected = tokens
-            .iter()
-            .find(|choice| match choice {
-                Token::Anonymous => self.token.is_none(),
-                Token::Saved(choice) => Some(choice.id.as_str()) == self.token.as_deref(),
-            })
-            .cloned();
-        let authentication: Element<'_, Message> = if enabled {
-            pick_list(tokens, selected.clone(), |token| {
-                Message::HuggingFace(Action::Token(token))
-            })
-            .placeholder("Select Hugging Face access")
-            .dismiss_on_escape()
-        } else {
-            text(selected.as_ref().map_or_else(
-                || "Unlock Vault to use the selected token".into(),
-                ToString::to_string,
-            ))
-            .into()
-        };
+        let (authentication, access_selected) = self.access_picker(enabled, credentials);
         let review = self.review.as_ref().map(|review| {
             let file: Element<'_, Message> = if enabled && !review.files.is_empty() {
                 pick_list(review.files.as_slice(), self.file.as_ref(), |artifact| {
@@ -390,8 +404,8 @@ impl State {
                         (enabled
                             && self.file.is_some()
                             && self.paused.is_none()
-                            && selected.is_some())
-                        .then_some(Message::HuggingFace(Action::Download))
+                            && access_selected)
+                            .then_some(Message::HuggingFace(Action::Download))
                     )
                 ),
             ]
@@ -406,7 +420,7 @@ impl State {
                     enabled.then_some(|query| Message::HuggingFace(Action::Query(query))),
                 )
                 .on_submit_maybe(
-                    (enabled && selected.is_some()).then_some(Message::HuggingFace(Action::Search)),
+                    (enabled && access_selected).then_some(Message::HuggingFace(Action::Search)),
                 ),
         );
         let format_picker = crate::local_ai::mlx_runtime::supported().then(|| {
@@ -424,13 +438,13 @@ impl State {
             text("Hugging Face Models").size(17),
             text("Search the Hub over HTTPS and review an immutable commit, file size, and SHA-256 before downloading. A selected vault token goes to huggingface.co.").size(13),
             reveal.action(Setting::Hub(HubSetting::Access), row![text("Hub access"), authentication].spacing(8)),
-            self.recommendations.view(enabled, selected.is_some(), reveal),
+            self.recommendations.view(enabled, access_selected, reveal),
             row![
                 reveal.wrap(query_setting, query),
-                reveal.action(Setting::Hub(HubSetting::Search), button("Search Hugging Face").on_press_maybe((enabled && selected.is_some()).then_some(Message::HuggingFace(Action::Search)))),
+                reveal.action(Setting::Hub(HubSetting::Search), button("Search Hugging Face").on_press_maybe((enabled && access_selected).then_some(Message::HuggingFace(Action::Search)))),
                 format_picker,
                 (!self.next_pages.is_empty()).then(|| reveal.action(Setting::Hub(HubSetting::LoadMore),
-                    button("Load more results").on_press_maybe((enabled && selected.is_some())
+                    button("Load more results").on_press_maybe((enabled && access_selected)
                         .then(|| Message::HuggingFace(Action::LoadMore(self.next_pages.clone())))))),
             ].spacing(8).wrap(),
             (!self.repositories.is_empty()).then(|| reveal.action(
@@ -439,26 +453,26 @@ impl State {
                     .on_toggle_maybe(enabled.then_some(|show| Message::HuggingFace(Action::ShowAllModels(show)))),
             )),
             (!self.repositories.is_empty()).then(|| reveal.wrap(Setting::Hub(HubSetting::Repository), self.browser_view(enabled))),
-            (!self.selected_mlx()).then(|| reveal.action(Setting::Hub(HubSetting::ReviewRepository), button("Review repository").on_press_maybe((enabled && self.repository.is_some() && selected.is_some()).then_some(Message::HuggingFace(Action::Review))))),
+            (!self.selected_mlx()).then(|| reveal.action(Setting::Hub(HubSetting::ReviewRepository), button("Review repository").on_press_maybe((enabled && self.repository.is_some() && access_selected).then_some(Message::HuggingFace(Action::Review))))),
             self.selected_mlx().then(|| reveal.action(Setting::Hub(HubSetting::ReviewMlx),
-                button("Review MLX package").on_press_maybe((enabled && selected.is_some()).then_some(Message::HuggingFace(Action::Review))))),
+                button("Review MLX package").on_press_maybe((enabled && access_selected).then_some(Message::HuggingFace(Action::Review))))),
             review,
             self.mlx_review.as_ref().map(|(review, _)| column![
                 reveal.wrap(Setting::Hub(HubSetting::MlxFiles), mlx_package_view(review)),
                 reveal.action(Setting::Hub(HubSetting::DownloadMlx),
-                    button("Download and register MLX model").on_press_maybe((enabled && selected.is_some() && self.mlx_paused.is_none()).then_some(Message::HuggingFace(Action::DownloadMlx)))),
+                    button("Download and register MLX model").on_press_maybe((enabled && access_selected && self.mlx_paused.is_none()).then_some(Message::HuggingFace(Action::DownloadMlx)))),
             ].spacing(6)),
             self.paused_actions(enabled, reveal),
             self.paused.as_ref().map(|plan| column![
                 text("Paused download").size(15),
                 plan_summary(plan),
-                reveal.action(Setting::Hub(HubSetting::Resume), button("Resume reviewed download").on_press_maybe((enabled && selected.is_some()).then_some(Message::HuggingFace(Action::Resume)))),
+                reveal.action(Setting::Hub(HubSetting::Resume), button("Resume reviewed download").on_press_maybe((enabled && access_selected).then_some(Message::HuggingFace(Action::Resume)))),
             ].spacing(6)),
             self.mlx_paused.as_ref().map(|review| column![
                 text("Paused MLX download").size(15),
                 mlx_package_view(review),
                 reveal.action(Setting::Hub(HubSetting::ResumeMlx),
-                    button("Resume reviewed MLX download").on_press_maybe((enabled && selected.is_some()).then_some(Message::HuggingFace(Action::ResumeMlx)))),
+                    button("Resume reviewed MLX download").on_press_maybe((enabled && access_selected).then_some(Message::HuggingFace(Action::ResumeMlx)))),
             ].spacing(6)),
             self.progress.map(|progress| row![
                 text(format!("{} / {} MiB", progress.received / (1024 * 1024), progress.total.div_ceil(1024 * 1024))).size(13),
@@ -1101,7 +1115,9 @@ impl Dialog {
                 sync_warning,
             }) => {
                 let mut notice = format!("Registered {}.", model.name);
+                let id = super::managed::ModelId::Mlx(model.id.clone());
                 self.mlx.add_hub_model(model, &self.profile_dir);
+                let _ = self.select_installed(Some(id), Some(iced::keyboard::Modifiers::empty()));
                 self.hf.mlx_paused = None;
                 self.hf.clear_review();
                 if cleanup_warning {
@@ -1141,7 +1157,9 @@ impl Dialog {
             }
             Output::Download(Downloaded::Installed(model, sync_failed)) => {
                 let notice = format!("Registered {}.", model.name);
+                let id = super::managed::ModelId::Gguf(model.id.clone());
                 self.managed.add_model(model, &self.profile_dir);
+                let _ = self.select_installed(Some(id), Some(iced::keyboard::Modifiers::empty()));
                 self.hf.paused = None;
                 self.hf.clear_review();
                 if sync_failed {

@@ -2,17 +2,20 @@
 
 use std::fmt;
 
-use iced::Element;
-use iced::widget::{column, pick_list, text, text_input};
+use iced::widget::{column, container, pick_list, row, text, text_input};
+use iced::{Alignment, Element, Length};
 
 use crate::connection_window::CredentialChoice;
 
 use crate::ai_manager::profiles::picker::DismissOnEscape as _;
 use crate::ai_manager::search::{KnowledgeSetting, Reveal, Setting};
+use crate::workspace::dialog_design::{self, number_step};
 
-use super::knowledge::Store;
-use super::knowledge::qdrant::Settings;
-use super::{Message, field};
+use super::Message;
+use super::knowledge::qdrant::{self, Settings};
+use super::knowledge::{MAX_DIMENSIONS, Store};
+
+const SPINNER_WIDTH: f32 = 156.0;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum Backend {
@@ -54,18 +57,30 @@ impl Editor {
             return false;
         }
         let previous = store.qdrant.clone();
+        let previous_local = store.local_dimensions;
         match (edit, &mut store.qdrant) {
             (Edit::Backend(Backend::Local), qdrant) => {
                 *qdrant = None;
                 self.dimensions = None;
             }
             (Edit::Backend(Backend::Qdrant), qdrant) => {
+                if qdrant.is_none() {
+                    self.dimensions = None;
+                    store.local_dimensions = store
+                        .local_dimensions
+                        .filter(|value| (1..=MAX_DIMENSIONS).contains(value));
+                }
                 qdrant.get_or_insert_with(Settings::default);
             }
             (Edit::Endpoint(value), Some(settings)) => settings.endpoint = value,
             (Edit::Collection(value), Some(settings)) => settings.collection = value,
             (Edit::Dimensions(value), Some(settings)) => {
                 settings.dimensions = value.trim().parse().unwrap_or_default();
+                self.dimensions = Some(value);
+            }
+            (Edit::Dimensions(value), None) => {
+                store.local_dimensions =
+                    (!value.trim().is_empty()).then(|| value.trim().parse().unwrap_or_default());
                 self.dimensions = Some(value);
             }
             (Edit::CredentialVariable(value), Some(settings)) if settings.vault_key.is_none() => {
@@ -79,7 +94,7 @@ impl Editor {
             }
             (Edit::CredentialVariable(_), Some(_)) | (_, None) => return false,
         }
-        previous != store.qdrant
+        previous != store.qdrant || previous_local != store.local_dimensions
     }
 
     pub(super) fn view<'a>(
@@ -109,7 +124,7 @@ impl Editor {
         } else {
             text(backend.to_string()).into()
         };
-        let settings = store.qdrant.as_ref().map(|settings| {
+        let settings: Element<'_, Message> = if let Some(settings) = &store.qdrant {
             let vault_key = settings.vault_key.as_deref().unwrap_or_default();
             let mut choices = vec![CredentialChoice {
                 id: String::new(),
@@ -136,13 +151,6 @@ impl Editor {
             } else {
                 text(selected.map_or_else(String::new, |choice| choice.label)).into()
             };
-            let dimensions = self.dimensions.clone().unwrap_or_else(|| {
-                if settings.dimensions == 0 {
-                    String::new()
-                } else {
-                    settings.dimensions.to_string()
-                }
-            });
             column![
                 field(
                     "Qdrant endpoint",
@@ -150,6 +158,7 @@ impl Editor {
                         KnowledgeSetting::QdrantEndpoint,
                         can_edit,
                         text_input("HTTPS URL or loopback HTTP URL", &settings.endpoint)
+                            .style(dialog_design::form_input)
                             .on_input_maybe(
                                 can_edit.then_some(move |value| message(Edit::Endpoint(value)))
                             )
@@ -160,24 +169,16 @@ impl Editor {
                     reveal.knowledge_input(
                         KnowledgeSetting::QdrantCollection,
                         can_edit,
-                        text_input("Collection name", &settings.collection).on_input_maybe(
-                            can_edit.then_some(move |value| message(Edit::Collection(value)))
-                        )
-                    ),
-                ),
-                field(
-                    "Embedding dimensions",
-                    reveal.knowledge_input(
-                        KnowledgeSetting::QdrantDimensions,
-                        can_edit,
-                        text_input("Match the embedding model", &dimensions).on_input_maybe(
-                            can_edit.then_some(move |value| message(Edit::Dimensions(value)))
-                        )
+                        text_input("Collection name", &settings.collection)
+                            .style(dialog_design::form_input)
+                            .on_input_maybe(
+                                can_edit.then_some(move |value| message(Edit::Collection(value)))
+                            )
                     ),
                 ),
                 reveal.wrap(
                     Setting::Knowledge(KnowledgeSetting::QdrantAuthentication),
-                    field("Qdrant authentication", key_picker)
+                    field("Qdrant API key", key_picker)
                 ),
                 settings.vault_key.is_none().then(|| field(
                     "API key variable",
@@ -188,6 +189,7 @@ impl Editor {
                             "Optional environment variable name",
                             &settings.credential_env
                         )
+                        .style(dialog_design::form_input)
                         .on_input_maybe(
                             idle.then_some(move |value| message(Edit::CredentialVariable(value)))
                         )
@@ -199,25 +201,103 @@ impl Editor {
                 .size(13)),
             ]
             .spacing(6)
+            .into()
+        } else {
+            let defaults = Settings::default();
+            let inactive_input = |value: &str| {
+                text_input::<Message, iced::Theme, iced::Renderer>("", value)
+                    .width(SPINNER_WIDTH)
+                    .size(13)
+                    .style(dialog_design::form_input)
+            };
+            column![
+                field("Qdrant endpoint", inactive_input(&defaults.endpoint)),
+                field("Qdrant collection", inactive_input(&defaults.collection)),
+                field("Qdrant API key", inactive_input("")),
+            ]
+            .spacing(6)
+            .into()
+        };
+        let dimensions = self.dimensions.clone().unwrap_or_else(|| {
+            store
+                .qdrant
+                .as_ref()
+                .map(|settings| settings.dimensions)
+                .or(store.local_dimensions)
+                .filter(|value| *value != 0)
+                .map_or_else(String::new, |value| value.to_string())
         });
-        column![
+        let (dimension_setting, dimension_placeholder, maximum, initial) = match backend {
+            Backend::Local => (
+                KnowledgeSetting::LocalDimensions,
+                "Automatic",
+                MAX_DIMENSIONS,
+                1024,
+            ),
+            Backend::Qdrant => (
+                KnowledgeSetting::QdrantDimensions,
+                "Dimensions",
+                qdrant::MAX_DIMENSIONS,
+                Settings::default().dimensions,
+            ),
+        };
+        let numeric = dimensions.trim().parse::<usize>().ok();
+        let step = |value: usize| message(Edit::Dimensions(value.to_string()));
+        let up = (can_edit && numeric.is_none_or(|value| value < maximum))
+            .then(|| step(numeric.map_or(initial, |value| value + 1)));
+        let down = (can_edit && numeric.is_none_or(|value| value > 1))
+            .then(|| step(numeric.map_or(initial, |value| (value - 1).min(maximum))));
+        let dimension_setting = Setting::Knowledge(dimension_setting);
+        let spinner = row![
+            reveal.input(
+                dimension_setting,
+                can_edit,
+                text_input(dimension_placeholder, &dimensions)
+                    .width(Length::Fill)
+                    .size(13)
+                    .style(dialog_design::form_input)
+                    .on_input_maybe(
+                        can_edit.then_some(move |value| message(Edit::Dimensions(value)))
+                    ),
+            ),
+            column![number_step("▴", up), number_step("▾", down)],
+        ]
+        .align_y(Alignment::Center)
+        .width(SPINNER_WIDTH);
+        let form = column![
             reveal.wrap(Setting::Knowledge(KnowledgeSetting::VectorStorage), field("Vector storage", picker)),
+            reveal.wrap(dimension_setting, field("Embedding dimensions", spinner)),
             settings,
             (!editable).then(|| text(
                 "Remove the store's sources before changing the backend, endpoint, collection, or embedding dimensions."
             )
             .size(13)),
         ]
-        .spacing(6)
-        .into()
+        .spacing(6);
+        container(form)
+            .padding(8)
+            .width(Length::Fill)
+            .style(dialog_design::page)
+            .into()
     }
 }
 
-fn editable(store: &Store) -> bool {
+fn field<'a>(
+    label: &'static str,
+    control: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    row![text(label).size(13).width(145), control.into()]
+        .align_y(Alignment::Center)
+        .spacing(8)
+        .into()
+}
+
+pub(super) fn editable(store: &Store) -> bool {
     store.sources.is_empty() && store.folders.is_empty()
 }
 
 pub(super) fn validate(store: &Store) -> Result<(), String> {
+    store.validate_local_dimensions()?;
     match &store.qdrant {
         Some(settings) => settings.validate(),
         None => Ok(()),
@@ -305,7 +385,7 @@ mod tests {
         assert!(dialog.local.request.is_none());
         assert_eq!(serde_json::to_value(&dialog.local_state).unwrap(), before);
     }
-    use super::super::{Dialog, State, SyncMode};
+    use super::super::{Dialog, SourceKind, State, SyncMode};
     use super::*;
     use std::io::{self, Write as _};
 
@@ -314,6 +394,18 @@ mod tests {
 
     use crate::local_ai::test_support;
     use crate::vault_window::{self, VaultWindow};
+
+    fn approve_file(mut update: impl FnMut(Message) -> iced::Task<Message>) {
+        for action in [Message::AddSource, Message::ApproveBrowsedKnowledgeFiles] {
+            let mut events = iced_runtime::task::into_stream(update(action)).unwrap();
+            let Some(iced_runtime::Action::Output(result @ Message::Finished(_, Ok(_)))) =
+                block_on(events.next())
+            else {
+                panic!("file review did not finish successfully");
+            };
+            let _ = update(result);
+        }
+    }
 
     #[test]
     fn qdrant_draft_save_requires_the_reviewed_vault_revision() {
@@ -356,7 +448,13 @@ mod tests {
             edit(Edit::CredentialVariable("KORTTY_FIXTURE_QDRANT".into())),
             edit(Edit::Dimensions("3".into())),
             Message::Source(source.display().to_string()),
-            Message::AddSource,
+        ] {
+            let _ = dialog.update_with_vault(message, &mut state, &saved, true, Some(&vault));
+        }
+        approve_file(|message| {
+            dialog.update_with_vault(message, &mut state, &saved, true, Some(&vault))
+        });
+        for message in [
             edit(Edit::VaultKey(Some(id.clone()))),
             edit(Edit::CredentialVariable("KORTTY_STALE_QDRANT".into())),
             Message::Consent(true),
@@ -477,7 +575,7 @@ mod tests {
         assert!(dialog.status.is_some());
 
         let _ = dispatch(&mut dialog, &mut state, edit(Edit::Dimensions("3".into())));
-        let _ = dispatch(&mut dialog, &mut state, Message::AddSource);
+        approve_file(|message| dispatch(&mut dialog, &mut state, message));
         assert_eq!(
             state.stores[0].sources.as_slice(),
             std::slice::from_ref(&source)
@@ -494,12 +592,15 @@ mod tests {
         let _ = dispatch(
             &mut dialog,
             &mut state,
-            Message::FileSync {
-                store: 0,
-                path: source,
-                mode: SyncMode::Automatic,
-            },
+            Message::SelectKnowledgeSource(0, SourceKind::File, source),
         );
+        let _ = dispatch(&mut dialog, &mut state, Message::OpenSourceSync(0));
+        let _ = dispatch(
+            &mut dialog,
+            &mut state,
+            Message::SourceSyncMode(SyncMode::Automatic),
+        );
+        let _ = dispatch(&mut dialog, &mut state, Message::ApplySourceSync);
         assert!(!state.automatic_ready(&state.stores[0]));
         let _ = dispatch(
             &mut dialog,

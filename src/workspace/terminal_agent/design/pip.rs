@@ -177,7 +177,7 @@ fn body<'a>(
                 (state, id),
                 panel_review,
             ))
-            .push(super::controls_with_menu(run, None));
+            .push(super::controls_with_menu(run, None, true));
     }
     panel_view(content, palette)
 }

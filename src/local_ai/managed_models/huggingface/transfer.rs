@@ -449,6 +449,7 @@ fn register(
         components[0].1.context,
         plan.purpose,
     )?;
+    model.published_at.clone_from(&plan.published_at);
     if plan.count() > 1 {
         model.shard_bytes = plan.files().map(Artifact::size).collect();
     }
@@ -798,6 +799,7 @@ mod tests {
                 digest: hex(&HashAlgorithm::Sha256.digest(&bytes).unwrap()),
             },
             purpose: Purpose::Chat,
+            published_at: None,
             additional: Vec::new(),
         };
         let mut hub = Hub::new(None, Duration::from_secs(5)).unwrap();
@@ -849,6 +851,7 @@ mod tests {
                 digest: hex(&HashAlgorithm::Sha256.digest(&bytes).unwrap()),
             },
             purpose: Purpose::Chat,
+            published_at: Some("2025-02-01T12:00:00Z".into()),
             additional: Vec::new(),
         };
         let wire_path = format!(
@@ -912,8 +915,15 @@ mod tests {
         let Downloaded::Installed(model, _) = final_result else {
             panic!("expected the verified model registration");
         };
+        assert_eq!(model.published_at, plan.published_at);
+        let registry = Registry::new(root.clone());
+        let mut updated = model.clone();
+        updated.name = "Renamed fixture".into();
+        updated.published_at = None;
+        registry.configure(updated).unwrap();
+        assert_eq!(registry.list().unwrap()[0].published_at, plan.published_at);
         assert_eq!(
-            std::fs::read(Registry::new(root.clone()).open(&model.id).unwrap().path).unwrap(),
+            std::fs::read(registry.open(&model.id).unwrap().path).unwrap(),
             bytes
         );
         assert!(read_paused(&root).unwrap().is_none());

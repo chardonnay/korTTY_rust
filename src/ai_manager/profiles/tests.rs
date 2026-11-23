@@ -296,7 +296,7 @@ fn profile_actions_are_reachable_above_both_columns() {
         (Size::new(960.0, 580.0), true),
         (Size::new(480.0, 280.0), false),
     ] {
-        let mut view = editor.view(true, create, create, None, &reveal);
+        let mut view = editor.view(true, create, create, true, None, &reveal);
         let mut tree = Tree::new(view.as_widget());
         let node = view.as_widget_mut().layout(
             &mut tree,

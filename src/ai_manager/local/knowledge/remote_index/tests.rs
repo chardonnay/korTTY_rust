@@ -624,11 +624,11 @@ fn automatic_qdrant_coverage_carries_only_previous_approved_enabled_sources() {
         sources: 0b0101.into(),
     });
     assert_eq!(
-        automatic_coverage(&saved, &reviewed, &previous, Some(&index)),
+        retained_coverage(&saved, &reviewed, &previous, Some(&index)),
         0b0011.into()
     );
     assert_eq!(
-        automatic_coverage(&saved, &reviewed, &previous, None),
+        retained_coverage(&saved, &reviewed, &previous, None),
         0b0001.into()
     );
 }

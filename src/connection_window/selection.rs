@@ -101,24 +101,7 @@ impl Selection {
     }
 
     pub(super) fn press(&mut self, row: RowKey, visible: &[RowKey], modifiers: Modifiers) {
-        if modifiers.shift()
-            && let Some(anchor) = self.anchor.as_ref()
-            && let Some(start) = visible.iter().position(|item| item == anchor)
-            && let Some(end) = visible.iter().position(|item| item == &row)
-        {
-            if !modifiers.command() {
-                self.rows.clear();
-            }
-            self.rows
-                .extend(visible[start.min(end)..=start.max(end)].iter().cloned());
-        } else if modifiers.command() {
-            if !self.rows.remove(&row) {
-                self.rows.insert(row.clone());
-            }
-            self.anchor = Some(row);
-        } else {
-            self.replace(Some(row));
-        }
+        crate::input::select_row(&mut self.rows, &mut self.anchor, row, visible, modifiers);
     }
 
     pub(super) fn retain(&mut self, mut visible: impl FnMut(&RowKey) -> bool) {

@@ -13,6 +13,7 @@ pub(in crate::connection_window) enum Icon {
     Folder,
     FolderAdd,
     Rename,
+    Undo,
     Search,
     ViewList,
     Star,
@@ -35,7 +36,7 @@ pub(in crate::connection_window) enum Icon {
 }
 
 impl Icon {
-    const ALL: [Self; 26] = [
+    const ALL: [Self; 27] = [
         Self::AddServer,
         Self::Edit,
         Self::Duplicate,
@@ -43,6 +44,7 @@ impl Icon {
         Self::Folder,
         Self::FolderAdd,
         Self::Rename,
+        Self::Undo,
         Self::Search,
         Self::ViewList,
         Self::Star,
@@ -80,6 +82,11 @@ impl Icon {
 
     fn handle(self, enabled: bool) -> Handle {
         let (outline, accent, color) = match self {
+            Self::Undo => (
+                "M5 9 H15 A5.5 5.5 0 0 1 15 20 H9",
+                "M9 4.5 L4.5 9 L9 13.5",
+                "#58a6ff",
+            ),
             Self::Teamwork => (
                 "M9 4 A3.5 3.5 0 1 0 9.01 4 M2.5 20 Q2.5 14 9 14 Q15.5 14 15.5 20",
                 "M15.5 4.5 A3 3 0 0 1 15.5 10.5 M18 14.3 Q21.5 15.5 21.5 20",

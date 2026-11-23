@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::clipboard_policy::{AiMemoryLearningMode, AiMemoryPolicy, UserMemoryMode};
 use crate::local_ai;
 use crate::vault_window::VaultWindow;
+use crate::workspace::dialog_design;
 
 use super::profiles::picker::DismissOnEscape as _;
 use super::{Configuration, document_find};
@@ -1185,7 +1186,9 @@ impl State {
             }
         }
         let can_change_settings = self.editable && !self.pending && self.decision.is_none();
-        let enabled = checkbox(self.settings.enabled).label("Enable AI memory");
+        let enabled = checkbox(self.settings.enabled)
+            .label("Enable AI memory")
+            .text_size(13);
         let enabled = if can_change_settings {
             enabled.on_toggle(Message::Enable)
         } else {
@@ -1198,6 +1201,7 @@ impl State {
                     Some(self.settings.learning),
                     Message::Learning,
                 )
+                .text_size(13)
                 .dismiss_on_escape()
             } else {
                 text(self.effective_learning().to_string()).into()
@@ -1211,29 +1215,27 @@ impl State {
             can_edit_budget,
             text_input(&budget_hint, &self.token_input)
                 .on_input_maybe(can_edit_budget.then_some(Message::Tokens))
-                .width(115),
+                .size(13)
+                .width(140),
         );
         let budget = f32::from(self.effective_budget());
-        let token_label = format!(
-            "Approx. {} / {:.0} tokens in this file",
-            self.base
-                .as_ref()
-                .map_or(0, |file| format::estimate(&file.text)),
-            budget
-        );
         let estimated = self
             .base
             .as_ref()
-            .map_or(0, |file| format::estimate(&file.text)) as f32;
+            .map_or(0, |file| format::estimate(&file.text));
+        let token_label = format!("Approx. {estimated} / {budget:.0} tokens");
         let selector = pick_list(self.scopes.as_slice(), Some(&self.scope), Message::Scope)
-            .width(Length::Fill)
+            .width(320)
+            .text_size(13)
             .dismiss_on_escape();
         let can_edit = self.can_edit_rows() && !self.pending && self.decision.is_none();
         let mut body = column![
             environment_notice,
             self.organization_rules(),
-            text("Memory settings").size(19),
-            reveal.wrap(Setting::Control(MemoryEnabled), enabled),
+            row![
+                iced::widget::space::horizontal().width(92),
+                reveal.wrap(Setting::Control(MemoryEnabled), enabled),
+            ],
             self.imported_preferences.enabled.map(|enabled| row![
                 text(format!(
                     "Imported from Java: Memory {}",
@@ -1281,7 +1283,7 @@ impl State {
             reveal.wrap(
                 Setting::Control(Learning),
                 row![
-                    text("Learning").width(140),
+                    text("Learning").size(13).width(82),
                     learning,
                     self.policy
                         .learning
@@ -1293,7 +1295,7 @@ impl State {
             reveal.wrap(
                 budget_field,
                 row![
-                    text("Token budget").width(140),
+                    text("Token budget").size(13).width(82),
                     tokens,
                     self.policy
                         .max_tokens
@@ -1304,63 +1306,71 @@ impl State {
             ),
             rule::horizontal(1),
             row![
-                text("Scope").width(85),
-                reveal.wrap(Setting::Control(Scope), selector),
+                text("Scope").size(13),
+                reveal.action(Setting::Control(Scope), selector),
                 action(
                     ReloadMemory,
-                    button("Reload").on_press_maybe((!self.pending).then_some(Message::Reload))
+                    dialog_design::secondary_action("Reload")
+                        .on_press_maybe((!self.pending).then_some(Message::Reload))
                 ),
             ]
             .spacing(10)
             .align_y(Alignment::Center),
             row![
-                progress_bar(0.0..=budget, estimated.min(budget)),
-                text(token_label).size(13)
+                progress_bar(0.0..=budget, (estimated as f32).min(budget)).girth(14),
+                text(token_label).size(12).width(156)
             ]
             .spacing(10)
             .align_y(Alignment::Center),
             row![
                 action(
                     Entries,
-                    button("Entries")
-                        .style(if matches!(self.page, Page::Entries) {
-                            button::primary
-                        } else {
-                            button::secondary
-                        })
+                    button(text("Entries").size(13))
+                        .padding([6, 12])
+                        .style(move |theme, status| dialog_design::segment(
+                            theme,
+                            status,
+                            matches!(self.page, Page::Entries)
+                        ))
                         .on_press(Message::Entries)
                 ),
                 action(
                     MemoryMarkdown,
-                    button("Markdown")
-                        .style(if matches!(self.page, Page::Markdown) {
-                            button::primary
-                        } else {
-                            button::secondary
-                        })
+                    button(text("Markdown").size(13))
+                        .padding([6, 12])
+                        .style(move |theme, status| dialog_design::segment(
+                            theme,
+                            status,
+                            matches!(self.page, Page::Markdown)
+                        ))
                         .on_press_maybe(self.row_edit.is_none().then_some(Message::Markdown))
+                ),
+            ]
+            .spacing(1),
+            self.current_page(can_edit, cleanup_ai_available, reveal),
+            row![
+                action(
+                    CleanMemory,
+                    dialog_design::secondary_action("Clean up…")
+                        .on_press_maybe(can_edit.then_some(Message::ShowCleanup))
                 ),
                 action(
                     Archive,
-                    button("Archive…").on_press_maybe(
+                    dialog_design::secondary_action("Archive…").on_press_maybe(
                         (!self.has_unsaved_document() && !self.pending)
                             .then_some(Message::ShowArchive)
                     )
                 ),
                 action(
                     History,
-                    button("History…").on_press_maybe(
+                    dialog_design::secondary_action("History…").on_press_maybe(
                         (!self.has_unsaved_document() && !self.pending)
                             .then_some(Message::ShowHistory)
                     )
                 ),
                 action(
-                    CleanMemory,
-                    button("Clean up…").on_press_maybe(can_edit.then_some(Message::ShowCleanup))
-                ),
-                action(
                     ClearMemory,
-                    button("Clear…").on_press_maybe(
+                    dialog_design::secondary_action("Clear…").on_press_maybe(
                         (can_edit && self.base.as_ref().is_some_and(|base| !base.text.is_empty()))
                             .then_some(Message::Clear)
                     )
@@ -1368,10 +1378,9 @@ impl State {
             ]
             .spacing(6)
             .wrap(),
-            self.current_page(can_edit, cleanup_ai_available, reveal),
             action(
                 ExternalMemory,
-                button("External memory files…").on_press_maybe(
+                dialog_design::secondary_action("External memory files…").on_press_maybe(
                     (!self.pending
                         && !self.has_unsaved_document()
                         && !matches!(self.page, Page::References(_)))
@@ -1740,7 +1749,13 @@ impl State {
         };
         let entries = rows(&base.text);
         if entries.is_empty() {
-            return text("No entries. Switch to Markdown to add your own notes.").into();
+            return container(
+                text("No entries. Switch to Markdown to add your own notes.").size(13),
+            )
+            .center_x(Length::Fill)
+            .center_y(164)
+            .style(dialog_design::sidebar)
+            .into();
         }
         let mut list = column![].spacing(8);
         for (index, item) in entries.into_iter().enumerate() {

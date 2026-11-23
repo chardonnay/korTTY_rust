@@ -6,6 +6,7 @@ use iced::{Alignment, Element, Length};
 
 use crate::ai_manager::search::{ProfileAction, ProfileSetting, Reveal, Setting};
 use crate::clipboard_policy::{AI_PROFILE_CREATION_DISABLED, PolicyAiProfile, PolicyAiProvider};
+use crate::workspace::dialog_design;
 
 use super::{
     ConnectionMode, Editor, Field, MAX_PROFILES, Message, ModelMode, Number, Profile, ProfileId,
@@ -104,6 +105,7 @@ impl Editor {
         editable: bool,
         can_open_wizard: bool,
         creation_allowed: bool,
+        catalog_dirty: bool,
         form_lock: Option<&'static str>,
         reveal: &'a Reveal,
     ) -> Element<'a, Message> {
@@ -112,17 +114,15 @@ impl Editor {
             return self.wizard_view(wizard, profile_actions_allowed, form_lock, reveal);
         }
         let profile_actions = row![
-            button("Setup wizard").on_press_maybe(
+            dialog_design::secondary_action("+  Setup wizard").on_press_maybe(
                 (can_open_wizard && self.catalog.profiles.len() < MAX_PROFILES)
                     .then_some(Message::Wizard(wizard::Action::Open))
             ),
-            button("Add profile").on_press_maybe(
+            dialog_design::secondary_action("+  Add").on_press_maybe(
                 (editable && creation_allowed && self.catalog.profiles.len() < MAX_PROFILES)
                     .then_some(Message::Add)
             ),
-            button("Refresh")
-                .style(button::secondary)
-                .on_press(Message::Refresh),
+            dialog_design::secondary_action("Refresh").on_press(Message::Refresh),
             (!creation_allowed && form_lock != Some(AI_PROFILE_CREATION_DISABLED))
                 .then(|| text(AI_PROFILE_CREATION_DISABLED).size(13)),
         ]
@@ -165,7 +165,7 @@ impl Editor {
                         .on_press(Message::Select(profile.id)),
                 )
             });
-        let list = scrollable(list).height(Length::Fill).width(190);
+        let list = scrollable(list).height(Length::Fill).width(150);
         let body: Element<'_, Message> = match self.selected() {
             Some(profile) if let Some(definition) = profile.policy_definition() => self
                 .policy_profile_form(
@@ -188,28 +188,146 @@ impl Editor {
                 .into()
             })
             .into(),
-            None => column![
-                text("No AI profiles configured"),
-                creation_allowed.then(|| {
-                    text("Add a profile for a local OpenAI-compatible API to get started.").size(13)
-                }),
-                self.status.as_deref().map(|status| text(status).size(13)),
-                space::vertical().height(Length::Fill),
-                row![
-                    space::horizontal(),
-                    button("Save").on_press_maybe(editable.then_some(Message::Save))
-                ],
-            ]
-            .spacing(10)
+            None => responsive(move |size| {
+                self.empty_profile(
+                    editable && catalog_dirty,
+                    form_lock,
+                    reveal,
+                    size.height < 200.0,
+                )
+                .into()
+            })
             .into(),
         };
         let content = row![list, container(body).width(Length::Fill)]
             .spacing(18)
             .height(Length::Fill);
         column![profile_actions, content]
+            .padding(6)
             .spacing(10)
             .height(Length::Fill)
             .into()
+    }
+
+    fn empty_profile<'a>(
+        &'a self,
+        can_save: bool,
+        form_lock: Option<&'static str>,
+        reveal: &Reveal,
+        compact: bool,
+    ) -> iced::widget::Column<'a, Message> {
+        use ProfileSetting::*;
+        let name = disabled_value("", Length::Fill);
+        let default = checkbox(false)
+            .label(ProfileSetting::Default.title())
+            .text_size(13);
+        let header = profile_heading(name, Some(default.into()));
+        let form = match self.section {
+            Section::Connection => column![
+                profile_row(
+                    Connection.title(),
+                    disabled_value("Local OpenAI-compatible API", 235)
+                ),
+                profile_row(Endpoint.title(), disabled_value("", Length::Fill)),
+                profile_row(Credential.title(), disabled_value("", Length::Fill)),
+                profile_row(
+                    "",
+                    checkbox(false)
+                        .label("Trust this local endpoint with an API key")
+                        .text_size(13)
+                ),
+            ]
+            .spacing(10)
+            .into(),
+            Section::Model => column![
+                profile_row(Model.title(), disabled_value("", 260)),
+                profile_row(Reasoning.title(), disabled_value("Model default", 220)),
+                profile_row(Vision.title(), disabled_value("Auto (detect)", 220)),
+                profile_row(
+                    PromptPreset.title(),
+                    disabled_value("Auto (model detection)", 220)
+                ),
+            ]
+            .spacing(10)
+            .into(),
+            Section::Limits => column![
+                profile_row(SelectionLimit.title(), disabled_value("1000000", 125)),
+                unset_override(Timeout, "Override timeout", "1"),
+                unset_override(OutputLimit, "Override limit", "16000"),
+            ]
+            .spacing(10)
+            .into(),
+            Section::Budget => self.budget(None, false, reveal),
+        };
+        let actions = row![
+            dialog_design::secondary_action("Test connection"),
+            space::horizontal(),
+            dialog_design::secondary_action("Delete"),
+            dialog_design::secondary_action("Save")
+                .on_press_maybe(can_save.then_some(Message::Save)),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .into();
+        profile_layout(
+            self.editor_header(header, form_lock),
+            form,
+            actions,
+            compact,
+            reveal,
+        )
+    }
+
+    fn budget<'a>(
+        &'a self,
+        profile: Option<&'a Profile>,
+        editable: bool,
+        reveal: &Reveal,
+    ) -> Element<'a, Message> {
+        let tokenizer = if let Some(profile) = profile {
+            field(
+                reveal,
+                ProfileSetting::Tokenizer,
+                choice(
+                    local_ai::Tokenizer::ALL,
+                    profile.tokenizer,
+                    editable,
+                    Message::Tokenizer,
+                ),
+            )
+        } else {
+            profile_row(
+                ProfileSetting::Tokenizer.title(),
+                disabled_value("Estimate", 164),
+            )
+        };
+        column![tokenizer, self.usage.view(profile, editable, reveal)]
+            .spacing(10)
+            .into()
+    }
+
+    fn editor_header<'a>(
+        &'a self,
+        heading: impl Into<Element<'a, Message>>,
+        form_lock: Option<&'static str>,
+    ) -> iced::widget::Column<'a, Message> {
+        let sections = row![
+            section("Connection", Section::Connection, self.section),
+            section("Model & capabilities", Section::Model, self.section),
+            section("Limits & timeouts", Section::Limits, self.section),
+            section("Budget & usage", Section::Budget, self.section),
+        ]
+        .spacing(2)
+        .wrap();
+        column![
+            heading.into(),
+            form_lock.map(|notice| text(notice).size(13)),
+            self.status.as_deref().map(|status| text(status).size(13)),
+            container(sections)
+                .width(Length::Fill)
+                .style(dialog_design::sidebar),
+        ]
+        .spacing(8)
     }
 
     fn policy_profile_form<'a>(
@@ -369,43 +487,42 @@ impl Editor {
             self.catalog.is_marked_default(profile.id)
         };
         let name = text_input(ProfileSetting::Name.title(), &profile.name)
+            .size(13)
+            .style(dialog_design::form_input)
             .on_input_maybe(editable.then_some(|value| Message::Edit(Field::Name, value)));
-        let mut is_default = checkbox(default).label(if server_selected {
-            "Terminal Chat default"
-        } else {
-            ProfileSetting::Default.title()
-        });
+        let mut is_default = checkbox(default)
+            .label(if server_selected {
+                "Terminal Chat default"
+            } else {
+                ProfileSetting::Default.title()
+            })
+            .text_size(13);
         if editable && self.can_set_default(profile.id) {
             let id = profile.id;
             is_default = is_default.on_toggle(move |_| Message::SetDefault(id));
         }
-        let header = row![
+        let header = profile_heading(
             reveal.wrap(
                 Setting::Profile(ProfileSetting::Name),
                 reveal.input(Setting::Profile(ProfileSetting::Name), editable, name),
             ),
             (!profile.is_cli())
-                .then(|| reveal.wrap(Setting::Profile(ProfileSetting::Default), is_default)),
-        ]
-        .spacing(12)
-        .align_y(Alignment::Center);
-        let sections = row![
-            section("Connection", Section::Connection, self.section),
-            section("Model", Section::Model, self.section),
-            section("Limits and timeouts", Section::Limits, self.section),
-        ]
-        .spacing(6)
-        .wrap();
+                .then(|| reveal.action(Setting::Profile(ProfileSetting::Default), is_default)),
+        );
         let form = match self.section {
-            Section::Connection => column![
-                self.connection(profile, editable, reveal),
+            Section::Connection => self.connection(profile, editable, reveal),
+            Section::Model => column![
+                self.model(profile, editable, reveal),
                 (!profile.is_cli() && !profile.restore_review)
                     .then(|| self.web_search_view(profile, editable, reveal)),
             ]
             .spacing(10)
             .into(),
-            Section::Model => self.model(profile, editable, reveal),
             Section::Limits => self.limits(profile, editable, reveal),
+            Section::Budget if !profile.is_cli() => self.budget(Some(profile), editable, reveal),
+            Section::Budget => text("Budget and usage are unavailable for CLI profiles.")
+                .size(13)
+                .into(),
         };
         let actions = if self.deleting {
             row![
@@ -432,7 +549,7 @@ impl Editor {
             row![
                 reveal.action(
                     Setting::ProfileAction(target),
-                    button(label).style(button::secondary).on_press_maybe(
+                    dialog_design::secondary_action(label).on_press_maybe(
                         self.can_reveal_profile_action(target, editable)
                             .then_some(Message::Test)
                     )
@@ -440,35 +557,22 @@ impl Editor {
                 space::horizontal(),
                 reveal.action(
                     Setting::ProfileAction(ProfileAction::Delete),
-                    button("Delete")
-                        .style(button::danger)
+                    dialog_design::secondary_action("Delete")
                         .on_press_maybe(editable.then_some(Message::Delete))
                 ),
-                button("Save").on_press_maybe(editable.then_some(Message::Save)),
+                dialog_design::secondary_action("Save")
+                    .on_press_maybe(editable.then_some(Message::Save)),
             ]
         }
         .spacing(8)
         .align_y(Alignment::Center);
-        let header = column![
-            header,
-            form_lock.map(|notice| text(notice).size(13)),
-            self.status.as_deref().map(|status| text(status).size(13)),
-            sections,
-        ]
-        .spacing(10);
-        let form = container(form).padding(4);
-        let (editor, content): (_, Element<'a, Message>) = if compact {
-            (column![].spacing(10), header.push(form).into())
-        } else {
-            (header, form.into())
-        };
-        editor
-            .push(
-                scrollable(content)
-                    .id(reveal.viewport.clone())
-                    .height(Length::Fill),
-            )
-            .push(actions)
+        profile_layout(
+            self.editor_header(header, form_lock),
+            form,
+            actions.into(),
+            compact,
+            reveal,
+        )
     }
 
     pub(in crate::ai_manager::profiles) fn connection<'a>(
@@ -565,11 +669,12 @@ impl Editor {
                 text_field(reveal, ProfileSetting::Endpoint, editable, text_input(placeholder, &profile.endpoint)
                     .on_input_maybe(editable.then_some(|value| Message::Edit(Field::Endpoint, value)))),
                 destination.as_ref().map(|url| text(format!("Request destination · {url}")).size(13)),
-                field(reveal, ProfileSetting::Trust, checkbox(profile.trusted_remote_endpoint)
-                    .label("Trust this HTTPS destination to receive reviewed AI requests")
-                    .on_toggle_maybe((editable && destination.is_some()).then_some(Message::TrustRemote))),
                 text_field(reveal, ProfileSetting::Credential, credential_editable, text_input(if lm_studio || loopback_messages { "Environment variable name (optional)" } else { "API key environment variable name" }, &profile.credential_env)
                     .on_input_maybe(credential_editable.then_some(|value| Message::Edit(Field::Credential, value)))),
+                field(reveal, ProfileSetting::Trust, checkbox(profile.trusted_remote_endpoint)
+                    .label("Trust this HTTPS destination to receive reviewed AI requests")
+                    .text_size(13)
+                    .on_toggle_maybe((editable && destination.is_some()).then_some(Message::TrustRemote))),
                 text(if lm_studio || loopback_messages {
                     "Certificate verification uses the system trust store. The profile stores only the credential variable name."
                 } else {
@@ -578,13 +683,13 @@ impl Editor {
             ].spacing(10).into();
         }
         let loopback_messages = profile.connection_mode == ConnectionMode::LoopbackAnthropic;
-        let mut trusted = checkbox(profile.trusted_local_endpoint).label(
-            if profile.restore_review || loopback_messages {
+        let mut trusted = checkbox(profile.trusted_local_endpoint)
+            .label(if profile.restore_review || loopback_messages {
                 "Review and trust this local AI endpoint"
             } else {
                 "Trust this local endpoint with an API key"
-            },
-        );
+            })
+            .text_size(13);
         if editable && profile.local_endpoint_is_valid() {
             trusted = trusted.on_toggle(Message::TrustLocal);
         }
@@ -602,9 +707,9 @@ impl Editor {
             loopback_messages.then(|| profile.destination().ok())
                 .flatten().map(|url| text(format!("Request destination · {url}")).size(13)),
             profile.restore_review.then(|| text("Check that the restored endpoint runs on this computer before enabling the profile.").size(13)),
-            field(reveal, ProfileSetting::Trust, trusted),
             text_field(reveal, ProfileSetting::Credential, credential_editable, text_input("Environment variable name (optional)", &profile.credential_env)
                 .on_input_maybe(credential_editable.then_some(|value| Message::Edit(Field::Credential, value)))),
+            field(reveal, ProfileSetting::Trust, trusted),
             text("Store only the name of the environment variable here. A loopback address can also point to a tunnel or proxy. Enable trust only if this endpoint runs on this computer.").size(13),
             (profile.connection_mode == ConnectionMode::LmStudio).then(|| text("Uses /api/v1/chat with server-side conversation storage disabled. Reviewed conversation history is included as an ordered transcript.").size(13)),
             (profile.connection_mode == ConnectionMode::LmStudioCompatible).then(|| text("Sends chat requests to /v1/chat/completions. Model discovery uses /api/v1/models.").size(13)),
@@ -920,11 +1025,6 @@ impl Editor {
             text_field(reveal, ProfileSetting::SelectionLimit, editable, self.number(profile.id, Number::Selection, profile.selection_limit, editable)),
             override_row(ProfileSetting::Timeout, Number::Timeout, profile.timeout_minutes, 1),
             (!profile.is_cli()).then(|| override_row(ProfileSetting::OutputLimit, Number::OutputTokens, profile.max_output_tokens, 16_000)),
-            (!profile.is_cli()).then(|| field(
-                reveal,
-                ProfileSetting::Tokenizer,
-                choice(crate::local_ai::Tokenizer::ALL, profile.tokenizer, editable, Message::Tokenizer),
-            )),
             (profile.remote_protocol().is_some() && profile.policy_definition().is_none()).then(||
                 reveal.wrap(Setting::Profile(ProfileSetting::ReviewedAgentHttps), checkbox(profile.permits_reviewed_agent_https())
                     .label(if profile.uses_server_default_model() {
@@ -944,7 +1044,6 @@ impl Editor {
             } else {
                 "Profiles inherit the timeout set in General. An override of zero uses the transport’s default timeout."
             }).size(13),
-            (!profile.is_cli()).then(|| self.usage.view(profile, editable, reveal)),
         ]
         .spacing(10)
         .into()
@@ -1091,16 +1190,84 @@ impl Editor {
     }
 }
 
+fn profile_heading<'a>(
+    name: impl Into<Element<'a, Message>>,
+    default: Option<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    row![
+        text("Profile name:").size(13).width(76),
+        name.into(),
+        default
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+fn profile_layout<'a>(
+    header: iced::widget::Column<'a, Message>,
+    form: Element<'a, Message>,
+    actions: Element<'a, Message>,
+    compact: bool,
+    reveal: &Reveal,
+) -> iced::widget::Column<'a, Message> {
+    let form = container(form).padding(8);
+    let (editor, content): (_, Element<'a, Message>) = if compact {
+        (column![].spacing(8), header.push(form).into())
+    } else {
+        (header, form.into())
+    };
+    editor
+        .push(
+            scrollable(content)
+                .id(reveal.viewport.clone())
+                .height(Length::Fill),
+        )
+        .push(actions)
+}
+
+fn profile_row<'a>(
+    label: &'static str,
+    control: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    row![text(label).size(13).width(116), control.into()]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .into()
+}
+
+fn disabled_value(value: &str, width: impl Into<Length>) -> TextInput<'_, Message> {
+    text_input("", value)
+        .size(13)
+        .width(width)
+        .style(dialog_design::form_input)
+}
+
+fn unset_override<'a>(
+    setting: ProfileSetting,
+    label: &'static str,
+    value: &'a str,
+) -> Element<'a, Message> {
+    profile_row(
+        setting.title(),
+        row![
+            checkbox(false).label(label).text_size(13),
+            disabled_value(value, 90)
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+    )
+}
+
 fn section(
     label: &'static str,
     target: Section,
     active: Section,
 ) -> iced::widget::Button<'static, Message> {
-    button(label)
-        .style(if active == target {
-            button::primary
-        } else {
-            button::secondary
+    button(text(label).size(13))
+        .padding([7, 12])
+        .style(move |theme, status| {
+            crate::workspace::dialog_design::tab(theme, status, active == target)
         })
         .on_press(Message::Section(target))
 }
@@ -1110,12 +1277,12 @@ fn field<'a>(
     setting: ProfileSetting,
     input: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
-    reveal.wrap(
-        Setting::Profile(setting),
-        row![text(setting.title()).width(172).size(13), input.into()]
-            .spacing(8)
-            .align_y(Alignment::Center),
-    )
+    let label = if setting == ProfileSetting::Trust {
+        ""
+    } else {
+        setting.title()
+    };
+    reveal.wrap(Setting::Profile(setting), profile_row(label, input))
 }
 
 fn policy_field<'a>(
@@ -1139,7 +1306,11 @@ fn text_field<'a>(
     field(
         reveal,
         setting,
-        reveal.input(Setting::Profile(setting), editable, input),
+        reveal.input(
+            Setting::Profile(setting),
+            editable,
+            input.size(13).style(dialog_design::form_input),
+        ),
     )
 }
 
@@ -1165,7 +1336,7 @@ pub(super) fn choice<T: ToString + PartialEq + Clone + 'static, const N: usize>(
     select: impl Fn(T) -> Message + 'static,
 ) -> Element<'static, Message> {
     if editable {
-        super::picker::escape_dismissible(pick_list(options, Some(current), select))
+        super::picker::escape_dismissible(pick_list(options, Some(current), select).text_size(13))
     } else {
         text(current.to_string()).into()
     }
@@ -1179,6 +1350,53 @@ mod tests {
     use iced::{Event, Font, Renderer, Size, mouse};
 
     use super::{super::Catalog, *};
+
+    #[test]
+    fn empty_profile_can_save_a_pending_removal_but_cannot_test_or_delete() {
+        let editor = Editor::new(Catalog::default());
+        let reveal = Reveal::default();
+        let renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+        for can_save in [false, true] {
+            let mut view: Element<'_, Message> =
+                editor.empty_profile(can_save, None, &reveal, false).into();
+            let mut tree = Tree::new(view.as_widget());
+            let node = view.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(740.0, 420.0)),
+            );
+            let layout = Layout::new(&node);
+            let actions = layout.children().last().unwrap();
+            for (index, control) in actions.children().enumerate() {
+                if index == 1 {
+                    continue;
+                }
+                let mut messages = Vec::new();
+                let cursor = mouse::Cursor::Available(control.bounds().center());
+                for event in [
+                    mouse::Event::ButtonPressed(mouse::Button::Left),
+                    mouse::Event::ButtonReleased(mouse::Button::Left),
+                ] {
+                    view.as_widget_mut().update(
+                        &mut tree,
+                        &Event::Mouse(event),
+                        layout,
+                        cursor,
+                        &renderer,
+                        &mut clipboard::Null,
+                        &mut Shell::new(&mut messages),
+                        &layout.bounds(),
+                    );
+                }
+                if can_save && index == 3 {
+                    assert!(matches!(messages.as_slice(), [Message::Save]));
+                } else {
+                    assert!(messages.is_empty());
+                }
+            }
+        }
+        assert!(editor.selected().is_none());
+    }
 
     #[test]
     fn managed_ai_profile_form_exposes_only_permitted_local_actions() {

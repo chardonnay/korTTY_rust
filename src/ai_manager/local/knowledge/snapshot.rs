@@ -15,7 +15,7 @@ use crate::private_files::{Directory, FileStamp, require_single_link};
 use super::{
     CHUNK_BYTES, Index, LEGACY_MAX_SOURCES, Location, MAX_CHUNKS, MAX_DIMENSIONS,
     MAX_LOCAL_INDEX_PASSAGES, MAX_QDRANT_INDEX_PASSAGES, MAX_SOURCES, MAX_STORES, Passage,
-    QdrantReceipt, Scope, SourceMask, hnsw, pdf, qdrant, valid_text,
+    QdrantReceipt, Scope, SourceMask, SourceResult, hnsw, pdf, qdrant, valid_text,
 };
 
 const DIRECTORY: &str = "knowledge-indexes";
@@ -27,6 +27,9 @@ const MAGIC_V5: &[u8; 8] = b"KTRAG\0\0\x05";
 const MAGIC_V6: &[u8; 8] = b"KTRAG\0\0\x06";
 const MAGIC_V7: &[u8; 8] = b"KTRAG\0\0\x07";
 const MAGIC_V8: &[u8; 8] = b"KTRAG\0\0\x08";
+const MAGIC_V9: &[u8; 8] = b"KTRAG\0\0\x09";
+const MAGIC_V10: &[u8; 8] = b"KTRAG\0\0\x0a";
+pub(super) const LEGACY_MAX_DIMENSIONS: usize = 16_384;
 const V6_MAX_CHUNKS: usize = 32_768;
 const LEGACY_MAX_CHUNKS: usize = 256;
 const LEGACY_MAX_LINE: usize = 128 * 1024;
@@ -35,6 +38,8 @@ const MAX_LOCAL_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const MAX_QDRANT_BYTES: u64 = 96 * 1024 * 1024;
 pub(super) const V4_BASE_BYTES: usize = 47;
 pub(super) const V8_BASE_BYTES: usize = V4_BASE_BYTES + 2;
+pub(super) const V9_BASE_BYTES: usize = V8_BASE_BYTES + 2;
+pub(super) const SOURCE_RESULT_BYTES: usize = size_of::<u32>() + size_of::<i64>();
 const MAX_DIRECTORY_ENTRIES: usize = 4 * MAX_STORES;
 const CHECK_INTERVAL: usize = 256;
 
@@ -455,6 +460,55 @@ impl Cache {
         })
     }
 
+    pub(in crate::ai_manager::local) fn source_results(
+        &self,
+        scope: &Scope,
+        active: impl Fn() -> Result<(), String>,
+    ) -> io::Result<Vec<SourceResult>> {
+        let file = self.open_snapshot(scope)?;
+        let stamp = FileStamp::read(&file)?;
+        let length = file.metadata()?.len();
+        let mut reader = BufReader::new(&file).take(length);
+        let header = read_header(&mut reader, scope)?;
+        if length > header.byte_limit() {
+            return Err(invalid());
+        }
+        header.require_minimum_length(reader.limit())?;
+        let Some(results) = header.results else {
+            // Older indexes store source positions only in the passage records.
+            let (index, _) = self.load_file_backed(scope, active)?;
+            return Ok(index
+                .source_results(
+                    index
+                        .qdrant_receipt
+                        .as_ref()
+                        .map(|receipt| &receipt.sources),
+                )
+                .collect());
+        };
+        stamp.require_unchanged(&file)?;
+        self.require_current(scope, &stamp)?;
+        Ok(results
+            .into_iter()
+            .enumerate()
+            .map(|(source, (chunks, indexed_at))| {
+                if header
+                    .receipt
+                    .as_ref()
+                    .is_some_and(|receipt| !receipt.sources.contains(source))
+                {
+                    SourceResult::default()
+                } else {
+                    SourceResult {
+                        files: usize::from(chunks != 0),
+                        chunks: chunks as usize,
+                        indexed_at,
+                    }
+                }
+            })
+            .collect())
+    }
+
     fn load_with_storage(
         &self,
         scope: &Scope,
@@ -570,7 +624,7 @@ impl Cache {
         Ok(file)
     }
 
-    pub(super) fn require_absent(&self, scope: &Scope) -> io::Result<()> {
+    pub(in crate::ai_manager::local) fn require_absent(&self, scope: &Scope) -> io::Result<()> {
         match self.open_snapshot(scope) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error),
@@ -643,8 +697,10 @@ fn encoded_size(
         .is_some_and(|vectors| !vectors.staged || receipt.is_some())
         || index.sources.len() > MAX_SOURCES
         || !valid_dimensions(count, dimensions, passage_limit(receipt.is_some()), true)
+        || (receipt.is_some() && dimensions > qdrant::MAX_DIMENSIONS)
         || (count > MAX_CHUNKS && index.graph.is_some())
         || (count == 0 && index.graph.is_some())
+        || (!index.indexed_at.is_empty() && index.indexed_at.len() != index.sources.len())
         || receipt.is_some_and(|receipt| !valid_receipt(receipt, index.sources.len()))
     {
         return Err(invalid());
@@ -701,7 +757,11 @@ fn encoded_size(
         }
         bytes += graph_bytes;
     }
-    if receipt.is_none() && wide_local_header(count, bytes) {
+    if !index.indexed_at.is_empty() {
+        bytes += V9_BASE_BYTES - V4_BASE_BYTES + SOURCE_RESULT_BYTES * index.sources.len();
+    } else if dimensions > LEGACY_MAX_DIMENSIONS {
+        bytes += V9_BASE_BYTES - V4_BASE_BYTES;
+    } else if receipt.is_none() && wide_local_header(count, bytes) {
         bytes += V8_BASE_BYTES - V4_BASE_BYTES;
     }
     if bytes as u64 > limit {
@@ -730,7 +790,9 @@ fn write_index_checked(
     active: &impl Fn() -> io::Result<()>,
 ) -> io::Result<()> {
     let bytes = encoded_size(index, receipt, active)?;
-    let wide = receipt.is_none() && wide_local_header(index.len(), bytes);
+    let reports = !index.indexed_at.is_empty();
+    let wide_dimensions = reports || index.dimensions > LEGACY_MAX_DIMENSIONS;
+    let wide = wide_dimensions || (receipt.is_none() && wide_local_header(index.len(), bytes));
     let mut output = ExactWriter {
         output,
         remaining: bytes,
@@ -738,12 +800,18 @@ fn write_index_checked(
     let expanded = index.sources.len() > LEGACY_MAX_SOURCES
         || index.entries.len() > MAX_CHUNKS
         || index.entries.iter().any(|(passage, _)| matches!(passage.location, Location::Line(line) if line > super::source::PREVIOUS_LARGE_TEXT_BYTES));
-    output.write_all(match (receipt.is_some(), expanded, wide) {
-        (_, _, true) => MAGIC_V8,
-        (true, true, false) => MAGIC_V7,
-        (true, false, false) => MAGIC_V5,
-        (false, true, false) => MAGIC_V6,
-        (false, false, false) => MAGIC_V4,
+    output.write_all(if reports {
+        MAGIC_V10
+    } else if wide_dimensions {
+        MAGIC_V9
+    } else {
+        match (receipt.is_some(), expanded, wide) {
+            (_, _, true) => MAGIC_V8,
+            (true, true, false) => MAGIC_V7,
+            (true, false, false) => MAGIC_V5,
+            (false, true, false) => MAGIC_V6,
+            (false, false, false) => MAGIC_V4,
+        }
     })?;
     output.write_all(&index.scope)?;
     if let Some(receipt) = receipt {
@@ -752,7 +820,11 @@ fn write_index_checked(
             output.write_all(&receipt.sources.word(index).to_le_bytes())?;
         }
     }
-    write_size(&mut output, index.dimensions)?;
+    if wide_dimensions {
+        output.write_all(&(index.dimensions as u32).to_le_bytes())?;
+    } else {
+        write_size(&mut output, index.dimensions)?;
+    }
     if wide {
         output.write_all(
             &u32::try_from(index.len())
@@ -767,6 +839,12 @@ fn write_index_checked(
         output.write_all(&[u8::from(source.is_some())])?;
         if let Some(digest) = source {
             output.write_all(digest)?;
+        }
+    }
+    if reports {
+        for (range, &indexed_at) in index.source_ranges.iter().zip(&index.indexed_at) {
+            output.write_all(&(range.len() as u32).to_le_bytes())?;
+            output.write_all(&indexed_at.to_le_bytes())?;
         }
     }
     write_entries(&mut output, index, active).map_err(io::Error::other)?;
@@ -865,6 +943,7 @@ struct Header {
     dimensions: usize,
     count: usize,
     sources: Vec<Option<[u8; 32]>>,
+    results: Option<Vec<(u32, i64)>>,
     receipt: Option<QdrantReceipt>,
     expanded: bool,
 }
@@ -872,8 +951,8 @@ struct Header {
 impl Header {
     fn byte_limit(&self) -> u64 {
         match (self.wide, self.receipt.is_some()) {
-            (true, _) => MAX_LOCAL_BYTES,
-            (false, true) => MAX_QDRANT_BYTES,
+            (_, true) => MAX_QDRANT_BYTES,
+            (true, false) => MAX_LOCAL_BYTES,
             (false, false) => V6_MAX_BYTES,
         }
     }
@@ -895,10 +974,13 @@ fn read_header(input: &mut impl Read, scope: &Scope) -> io::Result<Header> {
         MAGIC_V1 => (false, false, false),
         MAGIC_V2 => (true, false, false),
         MAGIC_V3 => (true, true, false),
-        MAGIC_V4 | MAGIC_V5 | MAGIC_V6 | MAGIC_V7 | MAGIC_V8 => (true, true, true),
+        MAGIC_V4 | MAGIC_V5 | MAGIC_V6 | MAGIC_V7 | MAGIC_V8 | MAGIC_V9 | MAGIC_V10 => {
+            (true, true, true)
+        }
         _ => return Err(invalid()),
     };
-    let has_receipt = matches!(&magic, MAGIC_V5 | MAGIC_V7);
+    let reports = &magic == MAGIC_V10;
+    let has_receipt = matches!(&magic, MAGIC_V5 | MAGIC_V7) || reports && scope.qdrant.is_some();
     if scope.sources.len() > MAX_SOURCES
         || has_receipt != scope.qdrant.is_some()
         || read::<32>(input)? != scope.digest
@@ -907,7 +989,7 @@ fn read_header(input: &mut impl Read, scope: &Scope) -> io::Result<Header> {
     }
     let receipt = if has_receipt {
         let generation = read(input)?;
-        let words = if &magic == MAGIC_V7 {
+        let words = if &magic == MAGIC_V7 || reports {
             SourceMask::word_count(scope.sources.len()).max(1)
         } else {
             1
@@ -922,23 +1004,37 @@ fn read_header(input: &mut impl Read, scope: &Scope) -> io::Result<Header> {
     } else {
         None
     };
-    let dimensions = read_size(input)?;
-    let wide = &magic == MAGIC_V8;
+    let wide_dimensions = matches!(&magic, MAGIC_V9 | MAGIC_V10);
+    let dimensions = if wide_dimensions {
+        u32::from_le_bytes(read(input)?) as usize
+    } else {
+        read_size(input)?
+    };
+    let wide = matches!(&magic, MAGIC_V8 | MAGIC_V9 | MAGIC_V10);
     let count = if wide {
         u32::from_le_bytes(read(input)?) as usize
     } else {
         read_size(input)?
     };
     let source_count = read_size(input)?;
-    let expanded = matches!(&magic, MAGIC_V6 | MAGIC_V7 | MAGIC_V8);
+    let expanded = matches!(
+        &magic,
+        MAGIC_V6 | MAGIC_V7 | MAGIC_V8 | MAGIC_V9 | MAGIC_V10
+    );
     let max_count = match &magic {
-        MAGIC_V8 => MAX_LOCAL_INDEX_PASSAGES,
-        MAGIC_V7 => MAX_QDRANT_INDEX_PASSAGES,
+        MAGIC_V8 | MAGIC_V9 => MAX_LOCAL_INDEX_PASSAGES,
+        MAGIC_V7 | MAGIC_V10 if has_receipt => MAX_QDRANT_INDEX_PASSAGES,
+        MAGIC_V10 => MAX_LOCAL_INDEX_PASSAGES,
         MAGIC_V6 => V6_MAX_CHUNKS,
         _ if graph_tag => MAX_CHUNKS,
         _ => LEGACY_MAX_CHUNKS,
     };
     if !valid_dimensions(count, dimensions, max_count, optional)
+        || (!reports && wide_dimensions != (dimensions > LEGACY_MAX_DIMENSIONS))
+        || (count != 0
+            && scope
+                .local_dimensions
+                .is_some_and(|expected| expected != dimensions))
         || source_count > MAX_SOURCES
         || source_count != scope.sources.len()
         || (!expanded && source_count > LEGACY_MAX_SOURCES)
@@ -965,6 +1061,27 @@ fn read_header(input: &mut impl Read, scope: &Scope) -> io::Result<Header> {
             read::<32>(input).map(Some).map_err(index_header_error)
         })
         .collect::<io::Result<Vec<_>>>()?;
+    let results = if reports {
+        let mut results = Vec::with_capacity(source_count);
+        let mut total = 0_u64;
+        for digest in &sources {
+            let chunks = u32::from_le_bytes(read(input)?);
+            let indexed_at = i64::from_le_bytes(read(input)?);
+            if (digest.is_none() && (chunks != 0 || indexed_at != 0))
+                || (indexed_at != 0 && jiff::Timestamp::from_second(indexed_at).is_err())
+            {
+                return Err(invalid());
+            }
+            total += u64::from(chunks);
+            results.push((chunks, indexed_at));
+        }
+        if total != count as u64 {
+            return Err(invalid());
+        }
+        Some(results)
+    } else {
+        None
+    };
     Ok(Header {
         wide,
         typed,
@@ -972,6 +1089,7 @@ fn read_header(input: &mut impl Read, scope: &Scope) -> io::Result<Header> {
         dimensions,
         count,
         sources,
+        results,
         receipt,
         expanded,
     })
@@ -1011,6 +1129,7 @@ fn read_index_with_file(
         dimensions,
         count,
         sources,
+        results,
         receipt,
         expanded,
         wide: _,
@@ -1130,6 +1249,14 @@ fn read_index_with_file(
         snapshot_vectors,
     )?;
     index.qdrant_receipt = receipt;
+    if let Some(results) = results {
+        for ((chunks, indexed_at), range) in results.into_iter().zip(&index.source_ranges) {
+            if chunks as usize != range.len() {
+                return Err(invalid());
+            }
+            index.indexed_at.push(indexed_at);
+        }
+    }
     Ok(index)
 }
 
@@ -1198,6 +1325,66 @@ fn invalid() -> io::Error {
 mod tests {
     use super::super::{Entry, Store};
     use super::*;
+
+    #[test]
+    fn source_results_reopen_without_counting_unpublished_remote_passages() {
+        let profile = crate::snippets::tests::Profile::new();
+        let cache = Cache::new(profile.0.clone());
+        for remote in [false, true] {
+            let mut scope = fixture_scope(&["first.txt", "second.txt", "unindexed.txt"]);
+            scope.qdrant = remote.then(|| qdrant::Settings {
+                dimensions: 2,
+                ..Default::default()
+            });
+            let mut index = Index::from_parts(
+                scope.digest,
+                vec![Some([1; 32]), Some([2; 32]), None],
+                vec![entry(0, "First"), entry(1, "Second"), entry(1, "Third")],
+                2,
+                None,
+            )
+            .unwrap();
+            let receipt = remote.then_some(QdrantReceipt {
+                generation: [7; 16],
+                sources: 1.into(),
+            });
+            cache
+                .save_index(&index, receipt.as_ref(), || Ok(()), || Ok(()))
+                .unwrap();
+            let legacy = cache.source_results(&scope, || Ok(())).unwrap();
+            assert_eq!(
+                legacy[0],
+                SourceResult {
+                    files: 1,
+                    chunks: 1,
+                    indexed_at: 0
+                }
+            );
+            assert_eq!(legacy[1].chunks, if remote { 0 } else { 2 });
+            index.indexed_at = vec![100, 200, 0];
+            cache
+                .save_index(&index, receipt.as_ref(), || Ok(()), || Ok(()))
+                .unwrap();
+            let results = cache.source_results(&scope, || Ok(())).unwrap();
+            assert_eq!(results[0].indexed_at, 100);
+            assert_eq!(results[1].indexed_at, if remote { 0 } else { 200 });
+            assert_eq!(results[2], SourceResult::default());
+            assert_eq!(cache.load(&scope).unwrap().indexed_at, [100, 200, 0]);
+
+            let mut encoded = Vec::new();
+            write_index(&mut encoded, &index, receipt.as_ref()).unwrap();
+            assert!(encoded.starts_with(MAGIC_V10));
+            let first_result = V9_BASE_BYTES - 1
+                + 33 * 2
+                + 1
+                + receipt.as_ref().map_or(0, |_| qdrant_receipt_bytes(3));
+            encoded[first_result] = 2;
+            assert!(read_index(&mut encoded.as_slice(), &scope).is_err());
+            // Even internally consistent summary totals must match the passage records.
+            encoded[first_result + SOURCE_RESULT_BYTES] = 1;
+            assert!(read_index(&mut encoded.as_slice(), &scope).is_err());
+        }
+    }
 
     #[test]
     fn expanded_qdrant_snapshot_keeps_high_source_positions_and_passages() {
@@ -1397,6 +1584,32 @@ mod tests {
             cache.directory(false).unwrap().names(2).unwrap(),
             [std::ffi::OsString::from(name(&scope.digest))]
         );
+    }
+
+    #[test]
+    fn wide_local_dimensions_round_trip_and_require_the_reviewed_shape() {
+        let mut scope = fixture_scope(&["wide.txt"]);
+        scope.local_dimensions = Some(MAX_DIMENSIONS);
+        let mut passage = entry(0, "Wide vector");
+        passage.1.resize(MAX_DIMENSIONS, 0.0);
+        let index = Index::from_parts(
+            scope.digest,
+            vec![Some([7; 32])],
+            vec![passage],
+            MAX_DIMENSIONS,
+            None,
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        write_index(&mut bytes, &index, None).unwrap();
+        assert_eq!(&bytes[..8], MAGIC_V9);
+        let reopened = read_index(&mut bytes.as_slice(), &scope).unwrap();
+        assert_eq!(reopened.dimensions, MAX_DIMENSIONS);
+        assert_eq!(reopened.entries[0].0.text, "Wide vector");
+        assert_eq!(reopened.entries[0].1, index.entries[0].1);
+
+        scope.local_dimensions = Some(MAX_DIMENSIONS - 1);
+        assert!(read_index(&mut bytes.as_slice(), &scope).is_err());
     }
 
     #[test]
@@ -1694,7 +1907,7 @@ mod tests {
         assert!(output.is_empty());
 
         for invalid in [
-            header(&scope, MAGIC_V4, MAX_DIMENSIONS, MAX_CHUNKS),
+            header(&scope, MAGIC_V4, LEGACY_MAX_DIMENSIONS, MAX_CHUNKS),
             header(&scope, MAGIC_V4, 1, MAX_CHUNKS + 1),
         ] {
             assert_eq!(

@@ -36,15 +36,15 @@ pub(crate) enum History {
 impl History {
     pub(crate) const ALL: [Self; 10] = [
         Self::Transcript,
-        Self::StepCards,
-        Self::Timeline,
         Self::InlineBlocks,
+        Self::Timeline,
         Self::PlanExecution,
         Self::CardStack,
         Self::Tmux,
         Self::Conversation,
         Self::LogTable,
         Self::Focus,
+        Self::StepCards,
     ];
 
     pub(crate) fn inline_style(self) -> Option<super::inline::Style> {
@@ -102,8 +102,6 @@ pub(crate) enum Status {
 
 impl Status {
     pub(crate) const ALL: [Self; 12] = [
-        Self::Steps,
-        Self::Pill,
         Self::Hidden,
         Self::Metro,
         Self::Powerline,
@@ -114,6 +112,8 @@ impl Status {
         Self::Spotlight,
         Self::Toasts,
         Self::Orbit,
+        Self::Pill,
+        Self::Steps,
     ];
 }
 

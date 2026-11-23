@@ -54,6 +54,7 @@ pub(crate) enum Surface {
     MinimapStep(u64),
     Toast,
     StatusRun(Status),
+    TimelineRun,
     StatusStepList,
     PaneStepList,
     DetachedStepList,
@@ -404,7 +405,10 @@ impl State {
         if self.menu.is_some_and(|menu| {
             matches!(
                 menu.surface,
-                Surface::StatusRun(_) | Surface::Minimap(_) | Surface::MinimapStep(_)
+                Surface::StatusRun(_)
+                    | Surface::TimelineRun
+                    | Surface::Minimap(_)
+                    | Surface::MinimapStep(_)
             )
         }) {
             self.menu = None;
@@ -785,6 +789,75 @@ pub(super) fn status_run_context<'a>(
         .menu
         .filter(|menu| menu.surface == surface);
     context::anchor(trigger, menu, surface, None, |page| run_menu.entries(page))
+}
+
+pub(super) fn status_icon_menu<'a>(
+    activity: Activity<'a>,
+    status: Status,
+    icon: impl FnOnce(AgentMessage) -> Element<'a, AgentMessage>,
+) -> Element<'a, AgentMessage> {
+    let surface = Surface::StatusRun(status);
+    run_icon_menu(activity, surface, icon, move |entries| {
+        if activity.live_run.is_some() {
+            entries.push(context::Entry::action(
+                "Open activity window",
+                AgentMessage::Focus,
+            ));
+        }
+        if activity.live_run.is_none() || status == Status::Metro {
+            entries.push(context::Entry::action(
+                if activity.presentation.drawer_open() {
+                    "Hide steps"
+                } else {
+                    "Show steps"
+                },
+                AgentMessage::Design(presentation::Message::ToggleDrawer),
+            ));
+        }
+    })
+}
+
+pub(super) fn timeline_icon_menu<'a>(
+    activity: Activity<'a>,
+    hide: AgentMessage,
+    icon: impl FnOnce(AgentMessage) -> Element<'a, AgentMessage>,
+) -> Element<'a, AgentMessage> {
+    run_icon_menu(activity, Surface::TimelineRun, icon, move |entries| {
+        if activity.live_run.is_some() {
+            entries.push(context::Entry::action(
+                "Open activity window",
+                AgentMessage::Focus,
+            ));
+        } else {
+            entries.push(context::Entry::action("Hide timeline", hide.clone()));
+        }
+    })
+}
+
+fn run_icon_menu<'a>(
+    activity: Activity<'a>,
+    surface: Surface,
+    icon: impl FnOnce(AgentMessage) -> Element<'a, AgentMessage>,
+    add_actions: impl Fn(&mut Vec<context::Entry>) + 'a,
+) -> Element<'a, AgentMessage> {
+    let menu = activity
+        .presentation
+        .log_table
+        .menu
+        .filter(|menu| menu.surface == surface);
+    let trigger = icon(event(Message::OpenMenu(
+        surface,
+        None,
+        Point::new(0.0, 22.0),
+    )));
+    context::anchor(trigger, menu, surface, None, |page| {
+        let run_menu = context::RunMenu::for_activity(activity);
+        let mut entries = run_menu.entries(page);
+        if page == context::Page::Actions {
+            add_actions(&mut entries);
+        }
+        entries
+    })
 }
 
 impl super::Run {

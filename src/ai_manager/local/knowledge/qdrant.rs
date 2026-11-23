@@ -19,8 +19,9 @@ use zeroize::Zeroizing;
 use crate::local_ai::{self, Client};
 use crate::vault_window::VaultWindow;
 
-use super::{MAX_DIMENSIONS, MAX_QDRANT_INDEX_PASSAGES, MAX_SOURCES, sha256};
+use super::{MAX_QDRANT_INDEX_PASSAGES, MAX_SOURCES, sha256};
 
+pub(in crate::ai_manager::local) const MAX_DIMENSIONS: usize = 16_384;
 const MAX_ENDPOINT_BYTES: usize = 2048;
 const MAX_COLLECTION_BYTES: usize = 128;
 const MAX_BATCH_POINTS: usize = 128;

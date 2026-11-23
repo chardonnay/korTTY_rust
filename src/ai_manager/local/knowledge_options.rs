@@ -2,19 +2,21 @@
 
 use std::path::Path;
 
-use iced::Element;
-use iced::widget::{checkbox, column, pick_list, text, text_input};
+use iced::widget::{checkbox, column, pick_list, row, text, text_editor, text_input};
+use iced::{Alignment, Element};
 
 use crate::knowledge_pdf as pdf;
 
 use crate::ai_manager::profiles::picker::DismissOnEscape as _;
 use crate::ai_manager::search::{KnowledgeSetting, Reveal, Setting};
+use crate::workspace::dialog_design::number_step;
 
 use super::knowledge::source::{
     FileSizeLimit, MAX_CONFIGURED_BYTES, NEW_SOURCE_DEFAULT, Options, SyncMode, validate_file_size,
 };
 
 const MIB: usize = 1024 * 1024;
+const MAX_PATTERN_CHARS: usize = 4096;
 
 #[derive(Clone)]
 pub(crate) enum Edit {
@@ -25,6 +27,8 @@ pub(crate) enum Edit {
     MaxFileBytes(String),
     Includes(String),
     Excludes(String),
+    IncludeLines(text_editor::Action),
+    ExcludeLines(text_editor::Action),
 }
 
 #[derive(Default)]
@@ -32,17 +36,33 @@ pub(super) struct Draft {
     options: Options,
     max_file_bytes: String,
     size_edited: bool,
-    includes: String,
-    excludes: String,
+    includes: text_editor::Content,
+    excludes: text_editor::Content,
+    multiline: bool,
 }
 
 impl Draft {
     pub(super) fn set(&mut self, options: &Options) {
         self.options = options.clone();
-        self.max_file_bytes = file_size_text(options.max_file_bytes.map(FileSizeLimit::bytes));
+        let limit = options.max_file_bytes.map(FileSizeLimit::bytes);
+        self.max_file_bytes = if self.multiline {
+            format_advanced_limit(limit.unwrap_or(NEW_SOURCE_DEFAULT))
+        } else {
+            file_size_text(limit)
+        };
         self.size_edited = false;
-        self.includes = options.includes.join("; ");
-        self.excludes = options.excludes.join("; ");
+        let separator = if self.multiline { "\n" } else { "; " };
+        self.includes = text_editor::Content::with_text(&options.includes.join(separator));
+        self.excludes = text_editor::Content::with_text(&options.excludes.join(separator));
+    }
+
+    pub(super) fn advanced(options: &Options) -> Self {
+        let mut draft = Self {
+            multiline: true,
+            ..Self::default()
+        };
+        draft.set(options);
+        draft
     }
 
     pub(super) fn update(&mut self, edit: Edit) {
@@ -52,46 +72,78 @@ impl Draft {
             Edit::GitIgnore(value) => self.options.respect_gitignore = value,
             Edit::IncludePdf(value) => self.options.include_pdf = value,
             Edit::MaxFileBytes(value) => {
-                self.max_file_bytes = value;
+                self.max_file_bytes = value[..value.floor_char_boundary(32)].to_owned();
                 self.size_edited = true;
             }
-            Edit::Includes(value) => self.includes = value.chars().take(4096).collect(),
-            Edit::Excludes(value) => self.excludes = value.chars().take(4096).collect(),
+            Edit::Includes(value) => {
+                self.includes = text_editor::Content::with_text(
+                    &value.chars().take(MAX_PATTERN_CHARS).collect::<String>(),
+                );
+            }
+            Edit::Excludes(value) => {
+                self.excludes = text_editor::Content::with_text(
+                    &value.chars().take(MAX_PATTERN_CHARS).collect::<String>(),
+                );
+            }
+            Edit::IncludeLines(action) => edit_pattern(&mut self.includes, action),
+            Edit::ExcludeLines(action) => edit_pattern(&mut self.excludes, action),
         }
     }
 
     pub(super) fn options(&self) -> Result<Options, String> {
         let mut options = self.options.clone();
         if self.size_edited {
-            let limit = file_size(&self.max_file_bytes)?.unwrap_or(NEW_SOURCE_DEFAULT);
+            let limit = if self.multiline {
+                advanced_file_size(&self.max_file_bytes)?
+            } else {
+                file_size(&self.max_file_bytes)?.unwrap_or(NEW_SOURCE_DEFAULT)
+            };
             options.max_file_bytes = Some(FileSizeLimit::reviewed(limit));
         }
+        let separator = if self.multiline { '\n' } else { ';' };
         let patterns = |text: &str| {
-            text.split(';')
+            text.split(separator)
                 .map(str::trim)
                 .filter(|pattern| !pattern.is_empty())
                 .map(str::to_owned)
                 .collect()
         };
-        options.includes = patterns(&self.includes);
-        options.excludes = patterns(&self.excludes);
+        options.includes = patterns(&self.includes.text());
+        options.excludes = patterns(&self.excludes.text());
         options.validate()?;
         Ok(options)
     }
 
     pub(super) fn view(&self, enabled: bool, reveal: &Reveal) -> Element<'_, Edit> {
+        self.scan_options_view(enabled, reveal, true)
+    }
+
+    pub(super) fn scan_options_view(
+        &self,
+        enabled: bool,
+        reveal: &Reveal,
+        show_sync: bool,
+    ) -> Element<'_, Edit> {
         let legacy_size = !self.size_edited
             && self
                 .options
                 .max_file_bytes
                 .is_some_and(FileSizeLimit::uses_previous_boundary);
+        let pattern_editor = |content, action: fn(text_editor::Action) -> Edit| {
+            let editor = text_editor(content).height(60).size(13);
+            if enabled {
+                editor.on_action(action)
+            } else {
+                editor
+            }
+        };
         column![
-            text("Folder scan options").size(16),
-            enabled.then(|| {
+            show_sync.then(|| text("Folder scan options").size(16)),
+            (show_sync && enabled).then(|| {
                 reveal.wrap(Setting::Knowledge(KnowledgeSetting::FolderSync),
                     pick_list(SyncMode::ALL, Some(self.options.sync), Edit::Sync).dismiss_on_escape())
             }),
-            (self.options.sync == SyncMode::Automatic).then(|| text("Automatic sync checks new and changed files within these reviewed rules. Approve the embedding destination separately.").size(13)),
+            (show_sync && self.options.sync == SyncMode::Automatic).then(|| text("Automatic sync checks new and changed files within these reviewed rules. Approve the embedding destination separately.").size(13)),
             reveal.wrap(Setting::Knowledge(KnowledgeSetting::FolderRecursive), checkbox(self.options.recursive)
                 .label("Include subfolders")
                 .on_toggle_maybe(enabled.then_some(Edit::Recursive))),
@@ -101,19 +153,29 @@ impl Draft {
             reveal.wrap(Setting::Knowledge(KnowledgeSetting::FolderPdf), checkbox(self.options.include_pdf)
                 .label("Include PDFs with a text layer")
                 .on_toggle_maybe(enabled.then_some(Edit::IncludePdf))),
-            text(format!(
+            (!self.multiline).then(|| text(format!(
                 "Enter a per-file limit up to {} MiB. New sources default to {} MiB. A scan accepts up to {} MiB in total.",
                 MAX_CONFIGURED_BYTES / MIB as u64,
                 NEW_SOURCE_DEFAULT / MIB as u64,
                 pdf::MAX_FILE_BYTES / MIB,
-            )).size(13),
-            reveal.knowledge_input(KnowledgeSetting::FolderFileLimit, enabled, text_input("Default for this source", &self.max_file_bytes)
-                .on_input_maybe(enabled.then_some(Edit::MaxFileBytes))),
+            )).size(13)),
+            if self.multiline {
+                size_spinner(KnowledgeSetting::FolderFileLimit, &self.max_file_bytes, enabled, Edit::MaxFileBytes, reveal)
+            } else {
+                reveal.knowledge_input(KnowledgeSetting::FolderFileLimit, enabled, text_input("Default for this source", &self.max_file_bytes)
+                    .on_input_maybe(enabled.then_some(Edit::MaxFileBytes)))
+            },
             legacy_size.then(|| text("Re-enter a saved size to review it against the higher format limits.").size(13)),
-            reveal.knowledge_input(KnowledgeSetting::FolderIncludes, enabled, text_input("Include globs separated by semicolons", &self.includes)
-                .on_input_maybe(enabled.then_some(Edit::Includes))),
-            reveal.knowledge_input(KnowledgeSetting::FolderExcludes, enabled, text_input("Exclude globs separated by semicolons", &self.excludes)
-                .on_input_maybe(enabled.then_some(Edit::Excludes))),
+            self.multiline.then(|| column![
+                text("Include globs (one per line)").size(13),
+                pattern_editor(&self.includes, Edit::IncludeLines),
+                text("Exclude globs (one per line)").size(13),
+                pattern_editor(&self.excludes, Edit::ExcludeLines),
+            ].spacing(6)),
+            (!self.multiline).then(|| reveal.knowledge_input(KnowledgeSetting::FolderIncludes, enabled, text_input("Include globs separated by semicolons", &self.includes.text())
+                .on_input_maybe(enabled.then_some(Edit::Includes)))),
+            (!self.multiline).then(|| reveal.knowledge_input(KnowledgeSetting::FolderExcludes, enabled, text_input("Exclude globs separated by semicolons", &self.excludes.text())
+                .on_input_maybe(enabled.then_some(Edit::Excludes)))),
             text("Use relative paths with /, * for one segment and ** for subfolders. Review the resulting file list before applying these options.").size(13),
         ]
         .spacing(6)
@@ -121,19 +183,108 @@ impl Draft {
     }
 }
 
-pub(super) fn file_size_help(path: &Path) -> String {
-    if pdf::is_pdf(path) {
-        format!(
-            "Maximum PDF size in bytes, configurable up to {} MiB. The scan cap is {} MiB. Clearing the field restores the 50 MiB default.",
-            MAX_CONFIGURED_BYTES / MIB as u64,
-            pdf::MAX_FILE_BYTES / MIB,
-        )
-    } else {
-        format!(
-            "Maximum UTF-8 file size in bytes, configurable up to {} MiB. The scan cap is 500 MiB. Clearing the field restores the 50 MiB default.",
-            MAX_CONFIGURED_BYTES / MIB as u64,
-        )
+fn edit_pattern(content: &mut text_editor::Content, action: text_editor::Action) {
+    let before = action.is_edit().then(|| content.text());
+    content.perform(action);
+    if let Some(before) = before
+        && content.text().chars().count() > MAX_PATTERN_CHARS
+    {
+        *content = text_editor::Content::with_text(&before);
     }
+}
+
+pub(super) fn file_size_help(path: &Path) -> String {
+    let format = if pdf::is_pdf(path) { "PDF" } else { "UTF-8" };
+    let cap = if pdf::is_pdf(path) {
+        pdf::MAX_FILE_BYTES / MIB
+    } else {
+        500
+    };
+    format!("The {format} scan cap is {cap} MiB. Clearing the field restores the 50 MiB default.")
+}
+
+pub(super) fn format_advanced_limit(bytes: u64) -> String {
+    let mib = MIB as u64;
+    if bytes % mib == 0 {
+        (bytes / mib).to_string()
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+pub(super) fn advanced_file_size(input: &str) -> Result<u64, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok(NEW_SOURCE_DEFAULT);
+    }
+    let invalid = || {
+        format!(
+            "Enter a size from 1 to {} MiB, or use B for an exact byte limit.",
+            MAX_CONFIGURED_BYTES / MIB as u64
+        )
+    };
+    let bytes = if let Some(bytes) = input.strip_suffix(['B', 'b']) {
+        bytes.trim().parse::<u64>().map_err(|_| invalid())?
+    } else {
+        input
+            .parse::<u64>()
+            .ok()
+            .and_then(|mib| mib.checked_mul(MIB as u64))
+            .ok_or_else(invalid)?
+    };
+    validate_file_size(Some(bytes)).map_err(|_| invalid())?;
+    Ok(bytes)
+}
+
+fn step_limit(input: &str, increase: bool) -> Option<String> {
+    let value = advanced_file_size(input).ok()?;
+    let step = MIB as u64;
+    let next = if increase {
+        value.saturating_add(step).min(MAX_CONFIGURED_BYTES)
+    } else {
+        value.saturating_sub(step).max(value.min(step))
+    };
+    (next != value).then(|| format_advanced_limit(next))
+}
+
+pub(super) fn size_spinner<'a, Message: Clone + 'a>(
+    setting: KnowledgeSetting,
+    input: &str,
+    enabled: bool,
+    edit: fn(String) -> Message,
+    reveal: &Reveal,
+) -> Element<'a, Message> {
+    let step = |increase| {
+        enabled
+            .then(|| step_limit(input, increase))
+            .flatten()
+            .map(edit)
+    };
+    let setting = Setting::Knowledge(setting);
+    column![
+        text("Maximum size per file (MiB)").size(13),
+        reveal.action(
+            setting,
+            row![
+                reveal.input(
+                    setting,
+                    enabled,
+                    text_input("50", input)
+                        .width(128)
+                        .size(13)
+                        .on_input_maybe(enabled.then_some(edit))
+                ),
+                column![number_step("▴", step(true)), number_step("▾", step(false))].width(24),
+            ]
+            .width(152)
+            .align_y(Alignment::Center)
+        ),
+        text("Add B to enter an exact byte limit.")
+            .size(12)
+            .style(text::secondary),
+    ]
+    .spacing(4)
+    .into()
 }
 
 pub(super) fn file_size(input: &str) -> Result<Option<u64>, String> {
@@ -157,6 +308,21 @@ mod tests {
     use super::super::{Configuration, Dialog, Message, Output, State};
     use super::*;
     use iced::futures::{StreamExt as _, executor::block_on};
+
+    #[test]
+    fn advanced_spinner_keeps_exact_bytes_and_respects_the_size_bounds() {
+        assert_eq!(advanced_file_size("").unwrap(), NEW_SOURCE_DEFAULT);
+        assert_eq!(advanced_file_size("51").unwrap(), 51 * MIB as u64);
+        assert_eq!(advanced_file_size("4096 B").unwrap(), 4096);
+        assert_eq!(format_advanced_limit(4096), "4096 B");
+        assert_eq!(step_limit("", true).as_deref(), Some("51"));
+        assert_eq!(step_limit("1", false), None);
+        assert_eq!(step_limit("1024", true), None);
+        assert_eq!(step_limit("4096 B", true).as_deref(), Some("1052672 B"));
+        for invalid in ["0", "1025", "1.5", "18446744073709551615", "0 B"] {
+            assert!(advanced_file_size(invalid).is_err(), "{invalid}");
+        }
+    }
 
     #[test]
     fn legacy_folder_size_only_changes_when_the_size_field_is_edited() {
@@ -232,7 +398,7 @@ mod tests {
         for event in [
             Message::Consent(true),
             Message::ConfigureFileSize(0, text_path.clone()),
-            Message::FileSize(limit.to_string()),
+            Message::FileSize(format_advanced_limit(limit)),
             Message::ApplyFileSize(0, text_path.clone()),
         ] {
             send(&mut dialog, &mut draft, event);
@@ -250,7 +416,7 @@ mod tests {
 
         for event in [
             Message::ConfigureFileSize(0, pdf_path.clone()),
-            Message::FileSize(pdf_limit.to_string()),
+            Message::FileSize(format_advanced_limit(pdf_limit)),
             Message::ApplyFileSize(0, pdf_path.clone()),
             Message::ConfigureFileSize(0, pdf_path.clone()),
         ] {
@@ -260,10 +426,7 @@ mod tests {
             draft.stores[0].effective_file_size_limit(&pdf_path),
             pdf_limit
         );
-        assert_eq!(
-            dialog.file_size.as_ref().unwrap().input,
-            pdf_limit.to_string()
-        );
+        assert_eq!(dialog.file_size.as_ref().unwrap().input, "4");
     }
 
     #[test]
@@ -325,7 +488,7 @@ mod tests {
         for event in [
             Message::SelectStore(0),
             Message::ConfigureFileSize(0, text.clone()),
-            Message::FileSize(bytes.to_string()),
+            Message::FileSize(format_advanced_limit(bytes)),
         ] {
             let _ = dialog.update(event, &mut draft, &saved, false);
         }
@@ -379,8 +542,8 @@ mod tests {
         };
         let mut draft = saved.clone();
         let mut dialog = Dialog::new(profile.0.clone());
-        let finish = |dialog: &mut Dialog, draft: &mut State| {
-            let task = dialog.update(Message::ReviewFolder, draft, &saved, false);
+        let finish = |dialog: &mut Dialog, draft: &mut State, action| {
+            let task = dialog.update(action, draft, &saved, false);
             let mut stream = iced_runtime::task::into_stream(task).unwrap();
             let Some(iced_runtime::Action::Output(message)) = block_on(stream.next()) else {
                 panic!("folder review did not finish");
@@ -405,7 +568,7 @@ mod tests {
         ] {
             let _ = dialog.update(Message::FolderOptions(edit), &mut draft, &saved, false);
         }
-        finish(&mut dialog, &mut draft);
+        finish(&mut dialog, &mut draft, Message::ReviewFolder);
         let review = dialog.folder_review.as_ref().unwrap();
         assert!(review.rows.iter().any(|row| {
             row.path == "at-limit.rs"
@@ -440,16 +603,33 @@ mod tests {
             &saved,
             false,
         );
-        finish(&mut dialog, &mut draft);
+        finish(&mut dialog, &mut draft, Message::ReviewFolder);
         let _ = dialog.update(Message::ApproveFolder, &mut draft, &saved, false);
         assert_eq!(draft.stores[0].source_count(), 1);
 
         let _ = dialog.update(Message::ConfigureFolder(0), &mut draft, &saved, false);
-        assert_eq!(dialog.folder_options.max_file_bytes, "15");
+        assert_eq!(
+            dialog
+                .folder_advanced
+                .as_ref()
+                .unwrap()
+                .draft
+                .max_file_bytes,
+            "15 B"
+        );
+        let _ = dialog.update(
+            Message::EditFolderAdvanced(Edit::Includes("*.txt".into())),
+            &mut draft,
+            &saved,
+            false,
+        );
+        let _ = dialog.update(Message::CancelFolderAdvanced, &mut draft, &saved, false);
+        assert_eq!(draft.stores[0].folders[0].options.includes, ["**/*.rs"]);
+        let _ = dialog.update(Message::ConfigureFolder(0), &mut draft, &saved, false);
         for edit in [Edit::Recursive(true), Edit::GitIgnore(false)] {
-            let _ = dialog.update(Message::FolderOptions(edit), &mut draft, &saved, false);
+            let _ = dialog.update(Message::EditFolderAdvanced(edit), &mut draft, &saved, false);
         }
-        finish(&mut dialog, &mut draft);
+        finish(&mut dialog, &mut draft, Message::ReviewFolderAdvanced);
         assert_eq!(draft.stores[0].source_count(), 1);
         let _ = dialog.update(Message::ApproveFolder, &mut draft, &saved, false);
         assert_eq!(draft.stores[0].source_count(), 3);

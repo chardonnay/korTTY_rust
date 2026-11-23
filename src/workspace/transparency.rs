@@ -174,6 +174,12 @@ impl Workspace {
             .is_some_and(|window| self.terminal_transparency(id, window) > 0);
         if let Some(palette) = self.window_settings.appearance.design().palette() {
             self.theme_cache.resolve_application(palette, transparent)
+        } else if self.settings.title(id).is_some()
+            || self.ai_manager_title(id).is_some()
+            || self.connection_managers.contains_key(&id)
+            || self.connection_editor_manager(id).is_some()
+        {
+            super::dialog_design::normal_theme()
         } else {
             self.theme_cache
                 .resolve_terminal(self.window_settings.themes.appearance(), transparent)

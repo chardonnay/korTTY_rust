@@ -165,6 +165,14 @@ fn columns(value: &str) -> usize {
         .sum()
 }
 
+pub(crate) fn compact_tokens(tokens: u64) -> String {
+    if tokens >= 1000 {
+        format!("{:.1}k tokens", tokens as f64 / 1000.0)
+    } else {
+        format!("{tokens} tokens")
+    }
+}
+
 pub(crate) fn clean(value: &str, multiline: bool) -> String {
     value.chars().take(MAX_TEXT).map(|ch| {
         if multiline && ch == '\n' { '\n' }

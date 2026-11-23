@@ -740,7 +740,7 @@ mod tests {
     #[test]
     fn backup_settings_are_searchable_and_cancel_discards_drafts() {
         assert_eq!(
-            &Section::ALL[4..11],
+            &Section::ALL[4..12],
             &[
                 Section::Terminal,
                 Section::Messaging,
@@ -748,6 +748,7 @@ mod tests {
                 Section::Backup,
                 Section::Logging,
                 Section::Export,
+                Section::Updates,
                 Section::Window,
             ],
         );

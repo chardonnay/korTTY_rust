@@ -518,6 +518,7 @@ impl Editor {
                     Message::OpenProviders => Screen::Providers(providers::Panel::new(store)),
                     _ => unreachable!(),
                 };
+                self.library = super::LibraryView::External;
                 self.external = Some(Panel::new(screen));
                 return Task::none();
             }

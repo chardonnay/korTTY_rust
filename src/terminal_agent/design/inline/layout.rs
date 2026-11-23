@@ -53,27 +53,43 @@ fn justify(left: Vec<Segment>, right: Vec<Segment>, width: usize) -> Line {
 fn wrap(value: &str, width: usize, maximum: usize) -> Vec<String> {
     let width = width.max(1);
     let mut lines = Vec::new();
-    let mut current = String::new();
-    let mut used = 0;
-    for ch in clean(value, true).chars() {
-        let cells = kortty_terminal::character_cell_width(ch).unwrap_or(0);
-        if ch == '\n' || used + cells > width {
-            lines.push(std::mem::take(&mut current));
-            used = 0;
+    let value = clean(value, true);
+    if value.trim().is_empty() {
+        return lines;
+    }
+    for paragraph in value.split('\n') {
+        let mut rest = paragraph.trim_end_matches(' ');
+        loop {
             if lines.len() == maximum {
                 return lines;
             }
-            if ch == '\n' {
-                continue;
+            let mut used = 0;
+            let mut last_space = None;
+            let mut seen_word = false;
+            let overflow = rest.char_indices().find(|&(position, ch)| {
+                let cells = kortty_terminal::character_cell_width(ch).unwrap_or(0);
+                if ch == ' ' && seen_word {
+                    last_space = Some(position);
+                }
+                seen_word |= ch != ' ';
+                used += cells;
+                used > width
+            });
+            let Some((position, ch)) = overflow else {
+                lines.push(rest.to_owned());
+                break;
+            };
+            if position == 0 {
+                rest = &rest[ch.len_utf8()..];
+            } else {
+                let boundary = last_space.unwrap_or(position);
+                lines.push(rest[..boundary].trim_end_matches(' ').to_owned());
+                rest = rest[boundary..].trim_start_matches(' ');
+            }
+            if rest.is_empty() {
+                break;
             }
         }
-        if cells <= width && (cells > 0 || used > 0) {
-            current.push(ch);
-            used += cells;
-        }
-    }
-    if !current.is_empty() && lines.len() < maximum {
-        lines.push(current);
     }
     lines
 }
@@ -86,7 +102,7 @@ fn elapsed(milliseconds: u64) -> String {
 fn meta(milliseconds: u64, tokens: Option<u64>) -> String {
     let mut text = elapsed(milliseconds);
     if let Some(tokens) = tokens {
-        text.push_str(&format!(" · {tokens} tokens"));
+        text.push_str(&format!(" · {}", compact_tokens(tokens)));
     }
     text
 }
@@ -284,12 +300,12 @@ fn inline(model: &Transcript, width: usize, spinner: &str) -> Vec<Line> {
             _ => ("✓", Role::Ok),
         };
         status.push(segment(label, role));
-        let commands = model
+        let steps = model
             .steps
             .iter()
-            .filter(|step| step.command.is_some())
+            .filter(|step| step.kind == Kind::Action)
             .count();
-        status.push(segment(format!(" {commands} commands · "), Role::Muted));
+        status.push(segment(format!(" {steps} steps · "), Role::Muted));
     } else {
         status.push(segment(
             if model.state == State::Paused {

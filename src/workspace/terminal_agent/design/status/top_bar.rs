@@ -3,15 +3,15 @@
 use std::time::{Duration, Instant};
 
 use iced::widget::{button, column, container, responsive, row, scrollable, text, tooltip};
-use iced::{Alignment, Background, Color, Element, Length, Theme, gradient};
+use iced::{Alignment, Background, Color, Element, Font, Length, Theme, font, gradient};
 
 use super::{
-    AgentMessage, Message, Surface, Tone, Trace, bar_controls, history, palette, trace_drawer,
-    usage_label,
+    AgentMessage, Message, Surface, Tone, Trace, history, palette, trace_drawer, usage_label,
 };
-use crate::workspace::terminal_agent::design::Presentation;
+use crate::terminal_agent::design::Status;
+use crate::workspace::terminal_agent::design::{Presentation, actions, log_table};
 
-pub(in crate::workspace::terminal_agent::design) const HEIGHT: f32 = 38.0;
+pub(in crate::workspace::terminal_agent::design) const HEIGHT: f32 = 30.0;
 const DRAWER_HEIGHT: f32 = 148.0;
 const COMPACT_WIDTH: f32 = 520.0;
 const COMPACT_TRACK_WIDTH: f32 = 68.0;
@@ -73,15 +73,44 @@ fn one_line<'a>(value: String, size: u32) -> Element<'a, AgentMessage> {
         .into()
 }
 
+pub(super) fn icon<'a>(
+    glyph: &'static str,
+    label: &'static str,
+    action: Option<AgentMessage>,
+) -> Element<'a, AgentMessage> {
+    tooltip(
+        button(text(glyph).size(13).center())
+            .width(24)
+            .height(22)
+            .padding(0)
+            .style(|theme, status| {
+                let style = button::secondary(theme, status);
+                let accent = theme.palette().primary;
+                button::Style {
+                    border: iced::Border {
+                        width: 1.0,
+                        color: Color { a: 0.18, ..accent },
+                        radius: 4.0.into(),
+                    },
+                    ..style
+                }
+            })
+            .on_press_maybe(action),
+        text(label).size(12),
+        tooltip::Position::Bottom,
+    )
+    .into()
+}
+
 pub(super) fn view<'a>(
     activity: history::Activity<'a>,
     phase: &str,
     trace: Trace<'a>,
     palette: Option<palette::Palette>,
-    has_archive: bool,
     sample_controls: impl Fn() -> Element<'a, AgentMessage>,
 ) -> Element<'a, AgentMessage> {
-    let sweep = (trace.active && !trace.paused && !trace.reduced_motion)
+    let palette = Some(palette.unwrap_or_else(palette::Palette::default_status));
+    let sweep = (trace.active && !trace.paused && !trace.waiting && !trace.reduced_motion)
         .then(|| trace.animation_age.as_secs_f32() % SWEEP.as_secs_f32() / SWEEP.as_secs_f32());
     let tone = trace.tone;
     let waiting = trace.waiting;
@@ -91,9 +120,16 @@ pub(super) fn view<'a>(
         .iter()
         .filter(|step| step.command.is_some())
         .count();
-    let unit = if commands == 1 { "command" } else { "commands" };
-    let current = format!("{commands} {unit} · {}", trace.current_label(phase));
+    let current = format!("{commands} · {}", trace.current_label(phase));
     let goal = history::summary(activity.goal);
+    let sample_usage = if trace.run.is_none() {
+        activity
+            .transcript
+            .and_then(|transcript| transcript.tokens)
+            .map(|tokens| format!("{tokens} tokens"))
+    } else {
+        None
+    };
     let header = responsive(move |size| {
         let compact = size.width < COMPACT_WIDTH;
         let track = container(iced::widget::space::vertical().height(4))
@@ -101,6 +137,7 @@ pub(super) fn view<'a>(
             .style(move |theme| {
                 container::Style::default()
                     .background(track_background(theme, tone, waiting, sweep))
+                    .border(iced::border::rounded(2))
             });
         let label = column![track, one_line(current.clone(), 11)].spacing(2);
         let mut header = if compact {
@@ -110,7 +147,12 @@ pub(super) fn view<'a>(
                 text(trace.elapsed_label()).size(11),
             ]
             .spacing(3);
-            if let Some(usage) = activity.presentation.model_usage.compact() {
+            if let Some(usage) = activity
+                .presentation
+                .model_usage
+                .compact()
+                .or_else(|| sample_usage.clone())
+            {
                 summary = summary.push(text(usage).size(11));
             }
             row![
@@ -122,55 +164,105 @@ pub(super) fn view<'a>(
                 .width(Length::Fill)
             ]
         } else {
+            let dot = container(iced::widget::space::Space::new().width(7).height(7)).style(
+                move |theme: &Theme| {
+                    let colors = theme.palette();
+                    let color = match tone {
+                        Tone::Finished => colors.success,
+                        Tone::Stopped => colors.danger,
+                        Tone::Active if waiting => colors.warning,
+                        Tone::Active => colors.primary,
+                    };
+                    container::Style::default()
+                        .background(color)
+                        .border(iced::border::rounded(4))
+                },
+            );
+            let title = container(
+                text(goal.clone())
+                    .size(12)
+                    .font(Font {
+                        weight: font::Weight::Semibold,
+                        ..Font::DEFAULT
+                    })
+                    .wrapping(text::Wrapping::None),
+            )
+            .width(Length::Fill)
+            .clip(true);
             let mut wide = row![
-                container(one_line(goal.clone(), 12)).width(Length::FillPortion(2)),
-                container(label).width(Length::FillPortion(3)),
-                text(trace.elapsed_label()).size(11),
+                container(row![dot, title].spacing(7).align_y(Alignment::Center))
+                    .width(Length::FillPortion(2))
+                    .max_width(280),
+                container(label)
+                    .width(Length::FillPortion(3))
+                    .max_width(420),
+                iced::widget::space::horizontal(),
             ];
             if let Some(usage) = usage_label(activity, palette) {
                 wide = wide.push(usage);
+            } else if let Some(usage) = &sample_usage {
+                wide = wide.push(text(usage.clone()).size(11));
             }
-            wide
+            wide.push(text(trace.elapsed_label()).size(11))
         }
         .spacing(6)
         .align_y(Alignment::Center);
-        if let Some(controls) =
-            bar_controls(&trace, has_archive, drawer, compact, Message::ToggleDrawer)
-        {
-            let activity_button = || {
-                tooltip(
-                    button("Activity")
-                        .style(button::text)
-                        .padding(3)
-                        .on_press(AgentMessage::Focus),
-                    text("Activity window").size(12),
-                    tooltip::Position::Bottom,
-                )
-            };
-            if compact {
-                let mut actions = controls;
-                if !waiting {
-                    actions = actions.push(activity_button());
-                }
-                let bar = scrollable::Scrollbar::new().width(2).scroller_width(2);
-                let actions = scrollable(actions)
-                    .direction(scrollable::Direction::Horizontal(bar))
-                    .width(Length::Shrink);
-                header = header.push(
-                    container(actions).max_width((size.width - COMPACT_TRACK_WIDTH).max(0.0)),
-                );
-            } else {
-                if !waiting {
-                    header = header.push(activity_button());
-                }
-                header = header.push(controls);
-            }
-        } else {
-            header = header.push(
-                button(if drawer { "Close details" } else { "Details" })
+        let details = || {
+            icon(
+                if drawer { "▴" } else { "▾" },
+                if drawer { "Hide steps" } else { "Show steps" },
+                Some(AgentMessage::Design(Message::ToggleDrawer)),
+            )
+        };
+        let mut controls = row![].spacing(2).align_y(Alignment::Center);
+        if waiting && trace.run.is_some() {
+            controls = controls.push(
+                button(text("Review…").size(12))
                     .style(button::text)
-                    .on_press(AgentMessage::Design(Message::ToggleDrawer)),
+                    .padding(3)
+                    .on_press(AgentMessage::Focus),
             );
+        }
+        if compact {
+            controls = controls.push(details());
+        }
+        controls = controls
+            .push(icon(
+                if trace.paused { "▶" } else { "Ⅱ" },
+                if trace.paused { "Resume" } else { "Pause" },
+                (trace.active && !waiting).then_some(AgentMessage::Pause),
+            ))
+            .push(icon(
+                "■",
+                "Cancel run",
+                trace.active.then_some(AgentMessage::Cancel),
+            ));
+        if !compact {
+            controls = controls.push(details());
+        }
+        controls = controls
+            .push(log_table::status_icon_menu(
+                activity,
+                Status::TopBar,
+                |action| icon("⋯", "More actions", Some(action)),
+            ))
+            .push(icon(
+                "✕",
+                "Hide Agent status",
+                Some(trace.run.map_or(
+                    AgentMessage::Design(Message::HideStatus),
+                    actions::hide_status,
+                )),
+            ));
+        if compact {
+            let bar = scrollable::Scrollbar::new().width(2).scroller_width(2);
+            let actions = scrollable(controls)
+                .direction(scrollable::Direction::Horizontal(bar))
+                .width(Length::Shrink);
+            header = header
+                .push(container(actions).max_width((size.width - COMPACT_TRACK_WIDTH).max(0.0)));
+        } else {
+            header = header.push(controls);
         }
         palette::panel(
             palette,

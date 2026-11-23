@@ -79,6 +79,11 @@ fn assert_escape(messages: &[Desktop], id: window::Id) {
 fn escape_from_focused_ai_manager_field_uses_the_close_guard_in_window_and_tab() {
     for hosted in [false, true] {
         let (mut workspace, owner, id) = manager(hosted);
+        let _ = workspace.update(wrap(
+            id,
+            ai_manager::Message::Search("global request timeout".into()),
+        ));
+        let focus = workspace.update(wrap(id, ai_manager::Message::SearchChoose));
         let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
         let (cache, messages) = {
             let mut interface = UserInterface::build(
@@ -87,8 +92,7 @@ fn escape_from_focused_ai_manager_field_uses_the_close_guard_in_window_and_tab()
                 Cache::default(),
                 &mut renderer,
             );
-            focus_next(&mut interface, &renderer);
-            focus_next(&mut interface, &renderer);
+            crate::settings_search::test_input::apply(&mut interface, &renderer, focus);
             let messages = dispatch(
                 &mut interface,
                 &mut renderer,
@@ -224,7 +228,7 @@ fn ai_manager_general_picker_consumes_escape_before_the_close_guard() {
         }
 
         fn text(&mut self, _id: Option<&Id>, bounds: Rectangle, label: &str) {
-            if label == "AI chat code blocks in the terminal" {
+            if label.trim_end_matches(':') == "AI chat code blocks in the terminal" {
                 self.0 = Some(bounds);
             }
         }

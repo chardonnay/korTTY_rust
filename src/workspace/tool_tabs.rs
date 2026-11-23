@@ -362,7 +362,7 @@ impl Workspace {
             Kind::SshKeys => self.remove_hosted_ssh_keys(tool.instance),
             Kind::SessionProcesses => self.remove_hosted_session_processes(tool.instance),
             Kind::RecordingManager => self.remove_hosted_recording_manager(tool.instance),
-            Kind::AiManager => self.remove_ai_manager(tool.instance),
+            Kind::AiManager => return self.remove_ai_manager(tool.instance),
             Kind::AiChat => {
                 self.terminal_chats.remove(&tool.instance);
             }
@@ -828,7 +828,7 @@ impl Workspace {
                     }
                 }
                 CloseTarget::NativeAiManager(id) => {
-                    self.remove_ai_manager(id);
+                    tasks.push(self.remove_ai_manager(id));
                     match pending.scope {
                         CloseScope::Tab => tasks.push(self.close_window(id)),
                         // The main-window close task detaches its native children first.

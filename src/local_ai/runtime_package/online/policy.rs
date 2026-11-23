@@ -56,7 +56,7 @@ impl Backend {
         ]
     }
 
-    fn required(self) -> Option<PackageBackend> {
+    pub(crate) fn required(self) -> Option<PackageBackend> {
         match self {
             Self::Auto => None,
             Self::Cpu => Some(PackageBackend::Cpu),

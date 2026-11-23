@@ -1,6 +1,6 @@
 # Remaining Java-to-Rust porting plan
 
-Porting plan reconciled on 2026-11-22. This plan tracks the scope agreed in
+Porting plan reconciled on 2026-11-23. This plan tracks the scope agreed in
 [HANDOFF.md](HANDOFF.md). The [parity record](PORTING-PARITY.md) identifies the
 source and environment for earlier checks. Paths under `target/verification/`
 are local to the checkout that ran the tests. Historical logs referenced
@@ -9,21 +9,43 @@ the porting worktree.
 
 ## Current result and actionable backlog
 
-**Java v2.26.0 parity remains partial.** The comparison uses Java tag
-`v2.26.0` (`b235d91f2035`). The current Rust worktree is based on merged
-PR #32 (`cb622a66`). Agent-to-Chat continuation, the Agent profile
-role, Journal chat exports, command summaries, the snippet structure panel
-and Lua editor tools are implemented. AI Manager search reaches every page
-and many individual controls, including imported GGUF and MLX models. The
-latest comparison found differences in how design edits are saved, how
-much command output a step can copy and how both settings searches rank
-results. The [November 22 comparison](PORTING-PARITY.md#november-22-design-editing-command-output-and-settings-search)
-records the Java and Rust paths for these differences. The
-[November 19 comparison](PORTING-PARITY.md#november-19-java-release-source-comparison)
-records the broader release audit and its tested revisions.
-The [Standard design](PORTING-PARITY.md#november-21-terminal-agent-standard-design)
-and [overlapping Agent runs](PORTING-PARITY.md#november-21-overlapping-terminal-agent-runs)
-are recorded under A2.
+**Java v2.26.0 parity remains partial.** The implementation reviewed in
+[PR #34](https://github.com/chardonnay/korTTY_rust/pull/34) is `aaa8d037`,
+based on [PR #33](https://github.com/chardonnay/korTTY_rust/pull/33)
+(`f64a3340`). The Java reference is tag `v2.26.0` at `b235d91f2035`.
+Windows ARM64 desktop checks cover the Settings frame and Font and Window
+pages, the Connection Manager and selected SSH editor tabs, and specific
+AI Manager and Agent Design workflows. The standalone Agent Design editor
+already saves changes to a built-in as a custom copy. GGUF and MLX have
+owned Configure dialogs. The recorded desktop save and cancel check covered
+GGUF. [November 23 review and test scope](PORTING-PARITY.md#november-23-dialog-parity-review)
+
+Start with the [confirmed implementation work](#confirmed-implementation-work).
+Other open areas include the remaining Settings pages and connection editor
+tabs, [Java backup field and identity mappings](#remaining-field-and-identity-audit),
+and the [Teamwork Agent/Swarm Scheduler extension](#implemented-workflows-awaiting-acceptance-and-requested-extensions).
+The [implementation order](#implementation-order)
+also covers provider, transfer and editor workflows. The [native and release
+gates](#native-acceptance-and-release-gates) track platform acceptance, the
+independent SSH review and release-candidate verification.
+The [November 19 audit](PORTING-PARITY.md#november-19-java-release-source-comparison)
+records the broader comparison with the tagged Java release.
+
+### Confirmed implementation work
+
+| Area | Remaining change | Completion check |
+| --- | --- | --- |
+| A2 · Plan and execution (d06) | Place Metro above the bottom history panel. Match the prompt, run controls and Plan checklist. Java starts the draggable divider at 42% in a panel 152 logical pixels high. Rust fixes the left column at 40%. | Compare the same combination in the standard and compact Windows previews. Drag the divider and verify that a live run shows its command output and approvals. Recheck Metro across a side timeline. |
+| A2 · Naming Agent designs | Activating a different module on a built-in already creates and saves a custom design. Java uses the preset name for that copy, for example `Standard 2`. New, Duplicate and Rename prompt for a name. Rust generates `Custom design N` and edits the name inline. | Cancel New and Duplicate and verify the catalog on reopen. Accept a name and change one role. Verify IDs, the original preset, the default and unrelated Settings edits through rename, delete and restart. |
+| B4 · GGUF import and configuration | Move the private-copy or external-reference choice into an owned dialog after file selection. On Configure save, offer the matching signed runtime when the saved model requires a different active backend. Align the model path display and window width. | Cancel after selecting multiple files and check the registry. Verify each import choice, a long Windows path, and both responses to the backend offer. |
+| B4 · MLX model age | Carry the Hub publication date through registration and reload into the installed table, as GGUF already does. | Verify the displayed age and sorting after restart on Apple Silicon, including an older registration with no date. |
+| B5 · Knowledge source status | Restore the last per-source outcome and problem count after restart alongside the existing index metadata. | Index two sources, fail a later update for one, restart, and verify its status, last successful index and the other source's row. |
+| A2 · Copying a command step's output | The step menu currently copies the last eight lines, each clipped to 320 characters. Make **Copy output** use all masked stdout and stderr retained for the selected step within the existing capture limits. Keep the compact inline preview. | Use distinct markers on two steps, more than eight lines across stdout and stderr, and a line longer than 320 characters. Verify the clipboard value for the selected step, including redaction, in a live and a retained run. |
+| D4 · Searching Settings and AI Manager | Apply the Java matching rules in both dialogs. Normalize German spellings, accents and punctuation, require two normalized characters, rank label and page matches, suppress controls matched only by their page, deduplicate and return at most 40 results. Compare the remaining labeled controls with the tagged dialogs. | Run the tagged matcher cases against both entry points. Check stable order, exact and prefix matches, duplicate labels, one-character queries and the 40-result limit. Verify keyboard navigation to a reachable result while preserving the active draft, provider restrictions and imported-model identity. |
+
+The [November 23 review](PORTING-PARITY.md#november-23-dialog-parity-review)
+records the dialog differences. The [November 22 comparison](PORTING-PARITY.md#november-22-design-editing-command-output-and-settings-search)
+traces step copying and both search matchers.
 
 ### GUI dialog design parity
 
@@ -56,6 +78,227 @@ The [tagged Java dialog sources](https://github.com/chardonnay/korTTY/tree/v2.26
 and the [native acceptance matrix](#native-acceptance-and-release-gates)
 define the reference and target platforms for this work.
 
+The shared Settings frame and Font page now follow the Normal Java design.
+The Window page groups tool-window hosting with window preferences. A
+Windows ARM64 comparison covered both pages, search result focus, the
+font-size preview and cancellation. A direct-start recheck confirmed the
+Font field order. Rust has 17 tabs in a scrolling strip. Java has 21
+sections and an overflow menu.
+Resources, Security, Privacy, Language
+and Translation still need a comparison of their Java controls and Rust
+entry points. The tab overflow affordance, control styling and deeper
+Settings pages still need visual work. [Desktop comparison](PORTING-PARITY.md#november-22-java-dialog-design-on-windows-arm64)
+
+The Connection Manager adopts the Java toolbar order, places Undo in the
+Folder group and groups Connect and Close at the right. The SSH editor
+organizes its existing form into Connection, Terminal Settings, SSH Tunnels,
+Jump Server, Terminal Logging and Window Geometry. The Java Journal and AI
+tabs, the Manager's separate Teamwork sidebar group, form alignment and
+narrower-window checks remain open. The Windows desktop check covered
+the three-pane Manager, its Map view,
+opening the editor and navigating between editor tabs.
+
+The AI Manager now uses the Java window size, a search overlay, underlined
+primary tabs and General subpages. The profile form retains its four
+sections without a selection, and the empty and editable forms share
+field alignment. Budget & usage contains the tokenizer, quota, warning
+thresholds, reset and prices. Local AI separates
+profile roles, runtime settings and Hugging Face access. Local Models
+starts with runtime and GGUF inventories. Knowledge Stores stacks
+store and source inventories and places file and folder selection below
+the source table. The shared picker can review multiple files together.
+Folder selection opens the existing scan review. Create and Configure
+open a separate owned store settings window with model and role fields
+and collapsible advanced storage settings. Create continues to a compact
+initial-source dialog. Approving the file or folder review stages the new
+store and its sources together. AI Manager Save applies the draft and
+indexing requires separate consent. Knowledge source actions use native
+file and folder pickers. Individual files are scanned locally before an
+owned preview shows the usable files and the reasons for skipped entries.
+Approving the preview checks the reviewed contents again before staging
+the usable sources. Oversized files can be rescanned with a reviewed
+per-file limit before they are added. The Advanced form exposes local
+embedding dimensions from 1 to 65,536. New stores suggest the selected
+registered GGUF model's declared size, and a blank field retains automatic
+detection. The local index checks the selected size before publishing vectors
+and retains compatibility with existing snapshots. Verify the native pickers
+and previews on macOS and Linux. The Windows comparison confirmed the
+single-line dimension label, arrow controls, and inactive Qdrant fields
+in Java's order. Both applications step the same GGUF dimension up and
+down. The Rust spinner enforces the limit of the selected backend. The
+advanced spacing and active Qdrant credential rows still differ. Rust
+now supports range and toggle selection in the source inventory. Update
+reads the selected enabled sources, or all enabled sources with an empty
+selection, and preserves existing compatible vectors for other sources.
+Removal opens a separate confirmation owned by AI Manager and lists the
+exact selected paths before changing the store draft. Save applies the
+draft change. Both inventories grow with the AI Manager window. At
+standard height the source inventory has room for four rows. The shared
+source action row wraps at smaller widths, and the page scrolls to keep
+the tables and controls reachable at the minimum size. The source actions
+now stay in the Java order, and secondary index actions sit below them.
+Refresh reloads the selected store's index inventory. Sync mode opens
+an owned choice dialog. Changing a folder's mode requires reviewing its
+file list, and AI Manager Save applies the staged changes. Both tables
+use neutral selected rows in the Normal theme. Advanced opens an owned
+file or folder editor. Folder include and exclude globs each have a
+multiline field. Review checks the file list before updating the draft.
+The owned editors use an editable MiB value and adjacent increment and
+decrement buttons. A B suffix accepts or displays exact byte limits
+already present in saved profiles. Align the remaining table column
+widths. Java also shows filters in its individual-file form. Its
+scanner and watcher apply those filters during folder traversal.
+Update scans the selected enabled files and folders together, or all enabled sources
+when no source is selected. The owned preview shows path, format, size,
+status, and reason. Approval stages the folder manifests and holds the
+reviewed individual-file digests for the approved selection. Index
+reviewed sources remains a separate action with embedding consent.
+It verifies the reviewed contents before sending them to the provider.
+The source table shows Files / chunks, Skipped / failed and Last indexed.
+File and folder totals reflect the matching index snapshot. New snapshots
+carry per-file timestamps, and partial refreshes retain the times of
+unchanged sources. Earlier snapshots retain their counts and show no
+timestamp. Folder review problems persist with the approved manifest.
+Manual updates show scanning, indexing and cancellation in the requested
+source rows. Cancel sits beside Update now and keeps the operation pending
+until its worker returns. An unreadable folder appears as a skipped row in
+the mixed review. Ready sources can still be approved, and the unavailable
+folder retains its saved manifest and vectors. An indexing failure tied to
+a particular file marks its source row and keeps the previous committed index.
+Automatic sync now reports scanning, indexing, unavailable sources,
+required review and source-specific indexing failures in the same inventory.
+The latest result stays visible while the application is running. Java
+restores the last status, problem count and last successful index time per
+source. Record the failed attempt's status and problem count while retaining
+the last success, then show them when the manager reopens after a restart.
+At the source limit, a mixed folder review now counts all successful
+decreases before admitting growth in inventory order. Skipped folders
+continue to count with their saved manifests. Folder preview rows
+distinguish unchanged files from files to be indexed, in the Status column.
+Align the remaining control styling and source actions.
+[Windows ARM64 source table comparison](target/verification/20261123-dialog-tables-windows-arm64-desktop.md)
+[Windows ARM64 mixed source comparison](target/verification/20261123-knowledge-source-updates-windows-arm64-desktop.md)
+[Windows ARM64 folder update comparison](target/verification/20261123-knowledge-folders-windows-arm64-desktop.md)
+[Windows ARM64 inventory layout comparison](target/verification/20261123-knowledge-table-layout-windows-arm64-desktop.md)
+[Windows ARM64 source selection comparison](target/verification/20261123-knowledge-selection-windows-arm64-desktop.md)
+[Windows ARM64 automatic source status comparison](target/verification/20261123-automatic-sources-windows-arm64-desktop.md)
+[Windows ARM64 source control comparison](target/verification/20261123-inventory-actions-windows-arm64-desktop.md)
+[Windows ARM64 advanced source comparison](target/verification/20261123-advanced-dialog-windows-arm64-desktop.md)
+[Windows ARM64 source size comparison](target/verification/20261123-source-stepper-windows-arm64-desktop.md)
+[Desktop verification](target/verification/20261123-knowledge-spinner-windows-arm64-desktop.md)
+Skills places preferences and the Local/External switch next to the
+editor. Memory groups entry and Markdown actions beneath the selected
+view. Local Models places the runtime inventory above the installed
+models and groups the actions immediately below each table. Its model
+columns follow the Java order. New Hugging Face GGUF downloads retain
+the repository publication timestamp, and existing registrations
+without publication metadata show an em dash. The signed-package import
+discloses its verification fields. Import GGUF opens a native multiple-file
+picker and then shows the selected paths, model purpose, and private-copy
+or external-reference options. A manual path entry remains available.
+The installed model table combines GGUF and MLX registrations on Apple
+Silicon. Other hosts display GGUF. The headers sort by the selected column
+in either direction. Ctrl or Command toggles rows, Shift extends the range
+in the displayed order, and the focused table accepts the arrow keys and
+Select All. Refresh reads both supported registries. Configure follows the
+current row. Start, Stop, and Remove act on the selected models across
+both runtimes. Start can warm two models concurrently. Its estimate
+includes selected and resident GGUF and MLX weights and opens a separate
+confirmation at the 80 percent threshold. Remove opens a separate
+confirmation listing the reviewed registrations and validates each
+registration again under its registry lock before unpublishing it.
+Install runtime and Other versions open separate dialogs. Starting selected
+GGUF models without a compatible runtime offers the signed installation
+first. Cancel preserves the selection. After the reviewed online package
+activates, the manager checks the selected registrations again before
+starting them. The version chooser filters the signed channel for the
+current host and backend, and lets users return a pinned install to
+stable updates. The toolbar and row context menu set or clear a single
+default for GGUF or MLX. The manager restores its star and preselects it
+when there is no live selection. Existing GGUF preferences keep their
+format. MLX preferences record the model family explicitly.
+Continue with storing the upstream publication date for downloaded MLX
+models. Verify the mixed inventory, the MLX default, and live model starts on
+Apple Silicon. Native Windows ARM64 installation,
+version selection with rows, and the subsequent model start need a
+compatible signed runtime.
+Configure opens an owned window for GGUF and MLX. Both show the model
+location and use numeric steppers for the editable unload time. GGUF also
+shows backend, purpose, context size, CPU threads, and GPU layers in the
+Java order. Escape dismisses the draft. Save checks the current
+registration before writing it. The runtime repair action remains
+available after saving a backend mismatch. Java offers its matching
+runtime immediately after such a save. Enter path opens the manual
+import fields in the manager. Move the import review into a separate
+dialog to match Java.
+[Windows ARM64 model inventory comparison](target/verification/20261123-model-inventory-windows-arm64-desktop.md)
+[Windows ARM64 native model picker and sorting](target/verification/20261123-model-picker-windows-arm64-desktop.md)
+[Windows ARM64 model selection and group actions](target/verification/20261123-model-selection-windows-arm64-desktop.md)
+[Windows ARM64 runtime dialogs](target/verification/20261123-runtime-review-windows-arm64-desktop.md)
+[Windows ARM64 installed model table](target/verification/20261123-mixed-model-windows-arm64-desktop.md)
+[Windows ARM64 model group actions](target/verification/20261123-model-batch-windows-arm64-desktop.md)
+[Windows ARM64 local model default](target/verification/20261123-model-default-windows-arm64-desktop.md)
+[Windows ARM64 model configuration](target/verification/20261123-model-config-windows-arm64-desktop.md#ai-manager)
+Agent Design now opens
+as a standalone dialog with a module table and adjacent sample. Changing
+a built-in creates a custom copy. The standalone dialog saves its own
+preferences as they change, including auto-hide and reduced animations.
+Replay and changes to Reduce animations restart the selected module
+preview. The disclosure next to Replay opens the sample controls and
+dock preferences. The General Settings entry
+retains its draft behavior. The Windows comparison confirmed the auto-hide
+stepper, the Standard choice caption, bold table headings, and measured
+ellipses with full description tooltips in the standard and compact views.
+The shared Metro presenter now places the title and prompt on the left,
+the station track in the center, and run metadata and actions on the right
+in a 52-pixel logical bar. Windows confirmed the standard and compact
+previews, the compact sample approval strip, and the steps menu. The
+module selection highlight spans the full table row, including the Active
+column. The table participates in Tab focus. Up, Down, Home and End preview
+and reveal the selected row. Space activates a module using the existing
+custom-copy behavior. Compare the remaining sample content, approval
+actions, keyboard details and additional preview and dock actions. Side
+timeline uses Java's default 240-pixel panel width. The shared presenter
+shows the run title, usage, elapsed time, prompt, and actions. Metro
+spans the terminal and side dock in the shared composition. Windows
+confirmed the row-driven timeline preview, independent hide, and
+restoration through Replay. The timeline uses the Java role colors,
+transparent header actions, and the Java preview prompt, answer and
+reported token count. It also shows exit codes with available output line
+counts and wraps long commands within the dock. Side timeline now uses
+the reference panel insets and more compact text, a muted scrollbar,
+and inline command review controls. The existing bound approval and
+number-key checks still apply. Metro groups compact token usage and
+elapsed time into one label, also used by Side timeline. Continue
+comparing the remaining module details, preview controls and dock actions.
+For Plan and execution, place Metro above the bottom history panel. Use
+Java's prompt and run controls in the header, its Plan checklist on the
+left and its adjustable divider. The [A2 completion check](#confirmed-implementation-work)
+covers the shared preview and live terminal layout.
+The sample prompt, disk-usage output and outline caret now render from
+ANSI terminal cells. Blocks in the terminal show the action-step count and
+compact token usage. The summary wraps at words within the terminal cell
+width. Continue comparing the presentation of each module around the shared
+sample.
+[Windows ARM64 Side timeline comparison](target/verification/20261123-agent-timeline-windows-arm64-desktop.md)
+[Windows ARM64 Metro comparison](target/verification/20261123-metro-layout-windows-arm64-desktop.md)
+[Windows ARM64 module selection comparison](target/verification/20261123-inventory-actions-windows-arm64-desktop.md#agent-design)
+[Windows ARM64 module keyboard verification](target/verification/20261123-advanced-dialog-windows-arm64-desktop.md#agent-design-keyboard)
+[Windows ARM64 preview control comparison](target/verification/20261123-source-stepper-windows-arm64-desktop.md#agent-design)
+[Windows ARM64 Plan and execution comparison](target/verification/20261123-model-config-windows-arm64-desktop.md#agent-design)
+[AI dialog comparison](PORTING-PARITY.md#november-22-ai-manager-and-agent-design-on-windows-arm64)
+
+For standalone Windows previews, build the development application with
+`cargo rustc --locked -p kortty --bin kortty --features dialog-preview -- -C linker=rust-lld`.
+Run `scripts/preview-windows-dialog.ps1` with `-Dialog settings`,
+`connections`, `ai-manager`, `agent-design` or `agent-design-compact`.
+The compact variant opens Agent Design at its 940 by 480 minimum client size.
+Each run creates a private
+Normal-theme profile and opens the requested dialog through the application's
+usual startup and window routes. Use these entry points for Windows desktop
+comparison without operator interaction in the terminal window. The preview
+feature is opt-in and its startup command is available in debug builds.
+
 ### Reconciliation against the current working tree
 
 | Implemented in the working tree | Evidence and remaining acceptance |
@@ -67,27 +310,12 @@ define the reference and target platforms for this work.
 | Reviewed recursive SFTP deletion, terminal text/file drop routing, remembered snippet translation language and selectable AI alternatives with diff and undo | Direct and jump OpenSSH deletion passed on Apple Silicon and Fedora. The GTK text gesture reached the inactive split on X11 at 100% and 200% and on Xwayland at 100%. Remaining desktop sources and live provider interaction are in V1–V5. [Desktop drop evidence](PORTING-PARITY.md#x11-text-drops-in-terminal-panes) · [Snippet evidence](PORTING-PARITY.md#selectable-snippet-alternatives) |
 | Local knowledge snapshots up to five million passages and 64 GiB, recording interchange, diagram export and native package staging | Measure real corpora, check configured Qdrant recovery, and complete native playback, exports and release verification. Merge CI passed for Windows, macOS and Ubuntu. Later local changes have targeted records. [Merge CI](https://github.com/chardonnay/korTTY_rust/actions/runs/44106367721) |
 
-### Confirmed implementation work
-
-| Area | Remaining change | Completion check |
-| --- | --- | --- |
-| A2 · Editing Agent designs | Let the user change one module directly on Standard or Classic. Java selects a new custom copy containing that change. Rust currently requires an explicit duplicate, then a separate Settings save. Persist committed design edits, the default design, auto-hide time and reduced-motion preference as the user changes them. | Change one role on each built-in, close the dialog and restart. Check the other roles, the built-in and the current default. Verify rename, deletion of the default, explicit default selection and both preferences across restart. Module previews stay transient and unrelated Settings edits stay pending. |
-| A2 · Copying a command step's output | The step menu currently copies the last eight lines, each clipped to 320 characters. Make **Copy output** use all masked stdout and stderr retained for the selected step within the existing capture limits. Keep the compact inline preview. | Use distinct markers on two steps, more than eight lines across stdout and stderr, and a line longer than 320 characters. Verify the clipboard value for the selected step, including redaction, in a live and a retained run. |
-| D4 · Searching Settings and AI Manager | Apply the Java matching rules in both dialogs. Normalize German spellings, accents and punctuation, require two normalized characters, rank label and page matches, suppress controls matched only by their page, deduplicate and return at most 40 results. Compare the remaining labeled controls with the tagged dialogs. | Run the tagged matcher cases against both entry points. Check stable order, exact and prefix matches, duplicate labels, one-character queries and the 40-result limit. Verify keyboard navigation to a reachable result while preserving the active draft, provider restrictions and imported-model identity. |
-
-The [source comparison](PORTING-PARITY.md#november-22-design-editing-command-output-and-settings-search)
-documents these three gaps. The [portable-data audit](#remaining-field-and-identity-audit)
-tracks unresolved Java fields and identity mappings (M1). The
-[implementation order](#implementation-order) also covers provider endpoint
-compatibility, automatic web-tool behavior and remaining editor language
-coverage. Q1 tracks the requested Teamwork Agent/Swarm extension below.
-
 ### Implemented features with outstanding checks
 
 | Area | Implemented in Rust | Remaining verification |
 | --- | --- | --- |
 | A2 · Terminal Agent | The design presenters and earlier-run selection paths are implemented. The Log Table shows sortable typed step metadata and a live Duration column that adopts the measured result at completion. A double-click opens the selected masked output or the finished answer. Live step and answer details allow read-only selection and policy-checked partial copying. A right-click offers step actions on retained rows and run actions on the answer or table background, including Earlier runs. Export all finished runs remains available while a different run is active. The export review fixes the selection when it opens. New rows flash for 900 ms and running rows use a 120 ms spinner. Reduced animations keeps the running marker still, omits the flash and updates elapsed time once per second. Reviewed model requests create a running row and update it with the accepted response metadata. An outstanding command review has a masked, read-only Approval row that is removed when the review ends. | The live table, detached history and Settings preview support focused keyboard navigation. Ctrl+Shift+F6 focuses the visible table in the active terminal pane. Tab reaches the detached table and scrolls the Settings preview into view. With live table focus, the Context Menu key or unassigned Shift+F10 opens the selected row's actions. Fedora ARM64 X11 verified focus, row selection, opening details, the keyboard step menu and source terminal input isolation in a docked table. Open details receive more of the dock height, with model usage in a compact scrollable summary. Fedora ARM64 X11 verified Tab entry, row details, exact output copying and reattachment in detached history. It also verified that the Settings preview reveals the table and selected sample output with the keyboard. Verify the keyboard paths on the other native desktops. Columns fit the viewport above font-scaled minimum widths. Verify resizing and numeric alignment on native desktops. Chronological tables follow new rows at the bottom and preserve the reading position when reviewing older activity. Scrolling up exposes Latest activity without selecting a row. Fedora ARM64 X11 verified stable reading through command approvals and continued following after Latest activity. Fixed column headers stay visible during vertical scrolling and follow the data cells horizontally. Column dividers adjust widths within the fitted table. Fedora ARM64 X11 verified Step sorting in both directions, fixed headings while scrolling vertically and horizontally, divider dragging and sort retention after resizing. Verify these paths on the other native desktops. Exercise the narrow viewport, elapsed time, sorting, selected output, approval-row lifecycle, step actions and motion preferences. Verify the decision and repair rows with a configured provider. Exercise the terminal context menu and the keyboard and pointer paths for the Log Table menus and run/step controls on native desktops. Switch runs, copy individual outputs, export one or all finished runs and open an unsaved step as a snippet. |
-| D4 · AI Manager search | The search reveals provider presets, CLI and MiniMax fields, reviewed HTTPS options, usage quota and cost, and the Web search controls exposed by the active provider and policy. The profile wizard searches its reachable steps using the same validation as Next. General search reveals the shortcut toggle, alias name, case preference and retained Java settings individually. The Profiles search reveals connection and CLI tests, model discovery and inventory refresh, imported model mapping and the active deletion review. Local Preferences search reaches the runtime update policy, preferred backend, embedding controls and each retained Java role in one scrollable page. Runtime repair searches its signed-package fields and compatible release controls. The search highlights active signed-runtime cancellation and pause, the separate keep and discard actions, and the open llama.cpp runtime removal review. Selecting one of these results preserves the operation or review. Knowledge Store search follows the selected backend, source options and embedding mode, and reveals active folder reviews, source file size edits, store removal controls, profile bindings, Agent availability and embedding consent. Local Models search reaches Hugging Face and the managed GGUF and Apple MLX workflows, including model selection, runtime controls, configuration and active reviews. Imported GGUF and MLX settings can be found by name, format or registry ID. The result highlights the matching row and leaves review and adoption explicit. Memory search reveals imported preferences, active Markdown and entry editor actions, history restore and external file review controls. Skills search reveals the library filter and sort, the direct Java-style Providers entry point, available editor fields and actions, eligible Java preference suggestions, and the fields and actions of the open provider editor. | Select a control by keyboard and mouse, verify its page, scroll position and highlight, and preserve editor-local Find in Skills and Memory. Native widget tests verify keyboard focus and draft retention for GGUF and MLX controls and MLX runtime download policy. Exercise search from a partially completed wizard, repair or model review and verify draft retention and cancellation on native desktops. |
+| D4 · AI Manager search | The search reveals provider presets, CLI and MiniMax fields, reviewed HTTPS options, usage quota and cost, and the Web search controls exposed by the active provider and policy. The profile wizard searches its reachable steps using the same validation as Next. General search reveals the shortcut toggle, alias name, case preference and retained Java settings individually. The Profiles search reveals connection and CLI tests, model discovery and inventory refresh, imported model mapping and the active deletion review. Local AI search opens the relevant Profile roles, Local runtime or Hugging Face subtab and reveals the matching control. Runtime repair searches its signed-package fields and compatible release controls. The search highlights active signed-runtime cancellation and pause, the separate keep and discard actions, and the open llama.cpp runtime removal review. Selecting one of these results preserves the operation or review. Knowledge Store search follows the selected backend, source options and embedding mode, and reveals active folder reviews, source file size edits, store removal controls, profile bindings, Agent availability and embedding consent. Local Models search reaches Hugging Face and the managed GGUF and Apple MLX workflows, including model selection, runtime controls, configuration and active reviews. Imported GGUF and MLX settings can be found by name, format or registry ID. The result highlights the matching row and leaves review and adoption explicit. Memory search reveals imported preferences, active Markdown and entry editor actions, history restore and external file review controls. Skills search reveals the library filter and sort, the direct Java-style Providers entry point, available editor fields and actions, eligible Java preference suggestions, and the fields and actions of the open provider editor. | Select a control by keyboard and mouse, verify its page, scroll position and highlight, and preserve editor-local Find in Skills and Memory. Native widget tests verify keyboard focus and draft retention for GGUF and MLX controls and MLX runtime download policy. Exercise search from a partially completed wizard, repair or model review and verify draft retention and cancellation on native desktops. |
 | B4 · Hugging Face model browser | Rust loads additional pages, sorts metadata and resolves missing sizes for the RAM filter. Apple Silicon offers All formats, GGUF and MLX with independent continuations. Review MLX package fixes the commit, exact sizes and SHA-256 digests. Download and register validates the complete directory through the native MLX registry. Paused MLX downloads can be found, reviewed, resumed or discarded after restart. | Exercise continuation, sorting, RAM filtering, format changes, review, installation and recovery in the native desktop. The native transfer has passed a live pause, resume and registration test against a pinned public Hub package. [Java browser](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/LocalModelManagerPane.java#L803) · [Rust MLX Hub transfer](src/local_ai/managed_models/huggingface/mlx/download.rs) |
 | D2 · Connection folders | Drag writable SSH and serial rows to a local folder in the tree or sidebar. List and map share successive Undo. | Exercise native pointer gestures across the list, sidebar and map, reverse two saved moves and check read-only Teamwork entries. |
 | Q1 · Scheduler target picker | The job editor can filter saved SSH connections and groups by name, host or group path and apply a batch to one draft. | Exercise the picker on native desktops with an individual target, overlapping groups and a source-qualified Teamwork group. Verify search, reviewed order and cancellation. |
@@ -136,7 +364,7 @@ paths are relative to `src/main/java/de/kortty/`, J manual paths to
 | Work package | Implemented scope and remaining work | Source comparison and completion condition |
 | --- | --- | --- |
 | B1 / M1 | Manual and server-selected profiles preserve validated exact loopback chat and OpenAI-compatible HTTPS completion paths, including custom OpenAI-compatible gateway paths, case variants and a trailing slash. Automatic inventory requires the canonical route. An omitted mode with a Java-blank model infers Auto where discovery is supported. Explicit `DEFAULT` restores as a server-selected chat profile. A reviewed Java global assignment can be adopted as the Terminal Chat default. A reviewed Java Text assignment applies to Terminal Chat, manual questions and journal note translation. A reviewed Java Agent assignment applies to standalone Ask and Run. Reviewed Java Coding and Security assignments apply to interactive snippet and file assistance. Reviewed loopback and exact HTTPS Anthropic Messages profiles preserve the Messages route and explicit model, including Java Auto and Default profiles. Journal questions support saved server-selected HTTP loopback and reviewed HTTPS profiles; text summaries support reviewed OpenAI-compatible HTTPS and compatible loopback HTTPS. Java Journal-role adoption is implemented. Other Java path families and the named exact-model consumers below still need a disposition. | J `core/AiServiceFactory.java`, `core/LocalLmModelResolver.java`, `model/AiProfile.java`. R `src/ai_manager/profiles/java_backup.rs::read_http_profile`. Preserve endpoint, protocol, source identity and earlier import fingerprints. Verify native review against a configured HTTPS gateway and assess explicitly reviewed use in other foreground workflows. |
-| B4 | Complete managed local model acceptance. Signed mlx-lm 0.31.3 passed Qwen3 On/None, GPT-OSS Low/Medium/High, stale-setting rejection, Java profile adoption and startup rollback. GGUF vision and external inference with a single file and with three shards passed on Apple Silicon, Fedora ARM64 and Windows x64 under emulation. MLX settings offer the Java Never unload checkbox and retain the unsaved timed value while it is checked. | J `ai/mlx/EmbeddedMlxAiService.java`; R `src/ai_manager/profiles/imported_model.rs`, `src/local_ai/mlx_models/reasoning.rs`, `src/local_ai/streaming/harmony.rs`, `src/local_ai/managed_models/tests.rs`. The [MLX settings round trip](PORTING-PARITY.md#november-20-mlx-idle-timeout-and-never-unload) passed on Apple Silicon. Verify its desktop interaction, native Windows inference and additional signed runtime versions when available. |
+| B4 | Complete the local-model dialog and MLX publication-date work, then verify the managed runtimes. Signed mlx-lm 0.31.3 passed Qwen3 On/None, GPT-OSS Low/Medium/High, stale-setting rejection, Java profile adoption and startup rollback. GGUF vision and external inference with a single file and with three shards passed on Apple Silicon, Fedora ARM64 and Windows x64 under emulation. MLX settings offer the Java Never unload checkbox and retain the unsaved timed value while it is checked. | J `ai/mlx/EmbeddedMlxAiService.java`; R `src/ai_manager/profiles/imported_model.rs`, `src/local_ai/mlx_models/reasoning.rs`, `src/local_ai/streaming/harmony.rs`, `src/local_ai/managed_models/tests.rs`. The [MLX settings round trip](PORTING-PARITY.md#november-20-mlx-idle-timeout-and-never-unload) passed on Apple Silicon. Verify its desktop interaction, native Windows inference and additional signed runtime versions when available. |
 | B6 | Newly added files and folders default to 50 MiB per file. Reviewed UTF-8, PDF and folder settings accept up to 1 GiB, with a 500 MiB scan limit. Legacy approvals retain their earlier bounds. Native Windows and Fedora ARM64 workers processed 500 MiB fixtures. Windows also passed cancellation and cleanup tests. | J `features/rag.md` and `rag/RagSourceScanner.java`. R `src/ai_manager/local/knowledge/source.rs` and `src/knowledge_pdf.rs`. Apple Silicon passed packaged-worker extraction, the exact 500 MiB limit, cancellation and spool cleanup. The local backend supports 5,000,000 passages and 64 GiB per snapshot. Above 8,192 passages, search reads vectors from the validated snapshot and index construction stages vectors in a temporary file. The expanded local format uses a 32-bit passage count. Fedora ARM64 passed staging, exact search, refresh and replacement publication with 524,288 dense synthetic 1,536-dimensional vectors. Apple Silicon passed the same workflow at 1,048,576 passages. Windows ARM64 passed 524,288 passages after correcting publication with an open reader. Verify higher corpus tiers with configured providers and real sources. |
 | B8 | Verify LM Studio MCP over loopback HTTPS with a configured provider. Java Toolpack profiles can retain an inactive plugin hint. Adoption in AI Manager requires endpoint trust, a locally enrolled credential and exact user-entered tool names. | J `core/AiServiceFactory.java`, `core/LmStudioNativeAiService.java`; R `src/ai_manager/profiles/web.rs`, `src/local_ai/web_search/mcp.rs::search`. Verify native adoption and invocation with an installed LM Studio and the configured plugin. Preserve certificate validation, exact integration, masked query/excerpt review and model binding. Broader automatic web selection from later command output requires a scope decision. |
 | T3 / T4 | Reviewed existing-file replacement destinations and native acceptance of macOS file drag-out. AppKit Copy starts from the original mouse gesture in the SFTP Manager or terminal sidebar. Reviewed AI replacement of the compared right server file uses the native Linux, macOS or Windows helper. | J `ui/SFTPManagerTab.java`, `ui/TerminalRemoteSidebar.java`; R `src/sftp_window/drag.rs`, `src/workspace/remote_dock/desktop_drag.rs`, `src/sftp_window/compare/ai.rs`. Verify the new AppKit drags in Finder, including cancellation, delayed file reads and route or policy revocation. General replacement must preserve reviewed identity, metadata and recovery under external changes. |
@@ -667,6 +895,8 @@ results cover the individual scopes below and in the parity record.
 
 | Snapshot and platform | Retained result | Limit of the result |
 | --- | --- | --- |
+| November 23 dialog implementation in PR #34, Windows ARM64 | The recorded native development run passed 571 focused tests, with 12 ignored and 3,611 filtered out. Automatic desktop launches compared GGUF Configure and Plan and execution with the Java x64 release on the same host. [Dialog review](PORTING-PARITY.md#november-23-dialog-parity-review) | Selected dialogs and a focused suite. The release candidate still needs full native suites and package verification. |
+| PR #33 implementation `abca21a5`, Windows ARM64 | 4,731 workspace tests passed with 98 ignored and zero failed across 74 binaries. Strict workspace Clippy passed. [PR verification](https://github.com/chardonnay/korTTY_rust/pull/33) | Predates the dialog changes in PR #34. |
 | PR #8 head `fb8870149949`, November 18 | Full native suites and release builds passed on Windows ARM64 (4,371 passed, 95 ignored), Apple Silicon (4,474 passed, 208 ignored) and Fedora ARM64 (4,524 passed, 269 ignored). Checksums, architecture and packaged CLI startup passed on all three. The Mac ZIP passed ad hoc signature verification. [PR verification](https://github.com/chardonnay/korTTY_rust/pull/8) | Covers the tested PR head. Subsequent worktree changes require a new candidate. |
 | November 19 Windows ARM64 | The [portable release](PORTING-PARITY.md#november-19-windows-arm64-portable-release) and matching full suite cover source fingerprint `64f505367778`. The subsequent [Agent Design desktop run](PORTING-PARITY.md#agent-design-module-preview-and-status-preferences) used a development executable with SHA-256 prefix `3efbe2807fba`. | The later desktop run covers the Agent interactions recorded there. |
 | PR #7 merge, `e3c1760` | Windows, Ubuntu and macOS passed their configured tests and release staging. [GitHub Actions](https://github.com/chardonnay/korTTY_rust/actions/runs/44106367721) | Covers the merged revision. |
@@ -909,10 +1139,14 @@ not been identified.
 
 ## Implementation order
 
-Start the [dialog design comparison](#gui-dialog-design-parity) with the
-Settings and Agent Design work. Apply it as each remaining dialog is
-revised. Complete design editing and step output, then align Settings and
-AI Manager search using the [A2 and D4 completion checks](#confirmed-implementation-work).
+Continue the [dialog design comparison](#gui-dialog-design-parity) with
+Plan and execution in the preview and live terminal, then the Agent naming
+dialogs and the local-model and Knowledge Stores items. Follow the
+[completion checks](#confirmed-implementation-work) for these changes,
+masked step output and both settings searches. Continue from the Windows
+Font, Window and SSH editor comparisons when reviewing the remaining
+Settings and connection pages. Scheduler, SFTP and the other dialogs
+still need their own Java comparisons.
 Continue the unresolved portable restore mappings and the requested
 shared Teamwork Agent/Swarm extension. Run native acceptance for the
 existing connection-folder gestures, Scheduler picker, SFTP partial-file
@@ -1206,7 +1440,7 @@ an English answer. Keep this difference visible when comparing transcripts.
 | ID | State and implemented coverage | Remaining work |
 | --- | --- | --- |
 | A1 | Implementation + acceptance. Built-in Run/Ask/Plan, reviewed local/SSH execution, skills/quota, bounded history, opt-in `agent` aliases, Tab completion, sudo/vault challenges and mirror holds exist. PowerShell/CMD integration and per-pane setup/status now ship in source. Native ConPTY PowerShell 5.1/CMD and Fedora SSH Agent routes passed. Permitted terminal AI initializes an in-memory SSH credential mask independently of capture, including incognito, without enabling logging. R `src/workspace/terminal_agent/shortcut.rs`, `src/workspace/ssh_access.rs`, `src/session/shell_activity.rs`, `crates/pty/src/shell_integration.rs`. | The inline root-bypass option and grant revocation passed targeted native macOS/Fedora tests; automatic read-only dispatch and inline per-run confirmation passed targeted native macOS/Fedora tests. Verify remaining supported shells, native desktops and current packages. The sandboxed SSH manual password flow passed on Fedora Wayland and X11. Verify the manual flow and local system sudo on macOS, and exercise history and run controls, mirror release, changed targets, and revocation. Direct custom Bash, Zsh, Fish, PowerShell and CMD profiles can use the Agent with validated interactive startup flags and a reviewed native runner. Verify the custom profiles in live desktop panes. See the diagnostic contract below. |
-| A2 | Implementation, acceptance and bounded audit. Planning stages, design module IDs d01–d20, docking/status/approval placement, inline history, picture-in-picture, usage/repair display, seven activity export formats and Agent-to-Chat/Journal links exist. The worktree includes the in-pane Spotlight prompt with entry and submission transitions, compact step progress, animated toast entry, countdown, fade and collapse, Orbit and the Adaptive Dock countdown. A chooser switches between retained runs in the same pane from status, history and the terminal context menu. Up to five finished runs remain available after the Activity window closes, bound to the original non-private stream. Settings uses the same status presenters and persists auto-hide and reduced motion on Save. Java restore fills both unset preferences independently. Windows ARM64 verified the earlier Settings workflow, live d14 display and cancellation, d19 layering and detach/reattach, and d20 pane resizing. [Spotlight and status checkpoint](PORTING-PARITY.md#november-20-terminal-agent-spotlight-and-status) | Implement editing a built-in through an automatic copy, immediate persistence of committed design changes and copying all retained masked output for the selected step. [Completion checks](#confirmed-implementation-work) Verify reopening finished runs and earlier-run selection and the contextual run and step actions. Verify Spotlight focus and profile selection, the timed displays with reduced motion and auto-hide disabled, the remaining d14 interactions, and live d19 run following. Verify inline selection and Kitty row mapping, exports, linked Journal cards, live provider usage/repair and native desktop behavior across platforms. |
+| A2 | Implementation, acceptance and bounded audit. Planning stages, design module IDs d01–d20, docking/status/approval placement, inline history, picture-in-picture, usage/repair display, seven activity export formats and Agent-to-Chat/Journal links exist. The worktree includes the in-pane Spotlight prompt with entry and submission transitions, compact step progress, animated toast entry, countdown, fade and collapse, Orbit and the Adaptive Dock countdown. A chooser switches between retained runs in the same pane from status, history and the terminal context menu. Up to five finished runs remain available after the Activity window closes, bound to the original non-private stream. The standalone editor creates a custom copy on module activation and writes committed edits and display preferences immediately. General Settings applies its draft on Save. Java restore fills both unset preferences independently. Windows ARM64 verified the earlier Settings workflow, live d14 display and cancellation, d19 layering and detach/reattach, and d20 pane resizing. [Spotlight and status checkpoint](PORTING-PARITY.md#november-20-terminal-agent-spotlight-and-status) | Align the d06 layout and design naming flows, and copy all retained masked output for the selected step. [Completion checks](#confirmed-implementation-work) Verify reopening finished runs and earlier-run selection and the contextual run and step actions. Verify Spotlight focus and profile selection, the timed displays with reduced motion and auto-hide disabled, the remaining d14 interactions, and live d19 run following. Verify inline selection and Kitty row mapping, exports, linked Journal cards, live provider usage/repair and native desktop behavior across platforms. |
 | A3 | Acceptance + bounded audit. Live and saved targets, named pre-run saved SSH drafts, completed interactive rounds with renaming, reviewed continuation, connection groups and working-directory metadata, history search, Markdown/text/PDF export, saved journal defaults, estimate and journal links are implemented. A batch review binds one approval to the displayed ordinary commands and target identities. R `src/workspace/terminal_agent/swarm.rs` and its `batch.rs`/`comparison.rs`/`conversation.rs`. | Verify native renaming, selection, batch review and revocation, comparison, failure isolation, workflow drafts and continuation over pinned SSH. Evaluate Java's standing batch policy and incognito target scope against native authority requirements. Saved follow-up uses reviewed saved SSH routes. |
 | A4 | Acceptance. All eight pinned Agent verbs, events, wait/start/rename and `notification.show` have native Control/CLI routes. Windows socket backpressure and native notification submission have evidence. | Native visible delivery and exact focus/target routing, stale agents, moved splits, timeouts and losses across desktops. Admission/native submission receipts alone do not prove a displayed notice or activation. |
 | A5 | Acceptance. Explicit `control-api = "allow"` starts the listener and locks the setting while retaining the personal preference. The parser normalizes feature keys and values. MCP stdio keeps its independent opt-in, retains its write tools preference while disabled, and gates writes on effective policy and consent. Masked reads, reconnect identity guards and managed MCP denial exist. | Verify managed activation, lock display and relaxation on native desktops. Complete affirmative write consent and invalidation across those desktops. P1 owns shared policy acceptance. |
@@ -1276,7 +1510,8 @@ The drawer opens over older terminal rows, shows the recorded step list and
 offers the exact step actions. The bar and drawer stay within their own
 terminal column next to a docked history. Reduced animations keeps the
 track steady and opens the drawer immediately. The Settings preview uses
-the same presenter. A compact header keeps Details early in the action row,
+the same 30-pixel presenter and icon actions for pause, cancel, steps,
+run menu and hide. A compact header keeps the step toggle early in the action row,
 places run metadata in the progress tooltip, and scrolls the action row
 when it overflows. Fedora ARM64 Wayland verified Review focus, drawer
 motion, the step and run menus in a 42-column split, and stable pane
@@ -1761,8 +1996,8 @@ selection and clearing, restart and backup review on the remaining desktops.
 | B1 | Implementation + acceptance. Managed/local, native LM Studio, OpenAI-compatible HTTPS, Anthropic HTTPS and reviewed exact HTTP(S) loopback Messages profiles, and reviewed configured CLI profiles exist. Server default can be selected in an explicit Terminal Chat review on supported HTTP transports and in standalone Agent Ask and Run for loopback and explicitly opted-in OpenAI-compatible HTTPS profiles. Advisory Planning supports loopback and explicitly opted-in OpenAI-compatible HTTPS server-selected profiles. Automatic text journal summaries support an explicitly assigned saved HTTP loopback Journal profile with server selection. The named CLI catalogue provides passive native path suggestions, fixed presets and reviewed LM Studio model loading. The Manager offers catalog-based GGUF recommendations by role and RAM, eight cloud presets with offline examples, and anonymous loopback model discovery. The separately signed model and prompt catalog verifies the current sequence and falls back to the verified cache or bundled data. The guided setup reviews the signed runtime and exact model files, runs a local test for each model, and saves the selected roles together. Standalone Agent Ask/Run, interactive and scheduled Swarm and Agent, and journal summaries use reviewed HTTPS or CLI requests. | Verify the live server-default workflows with a provider that supports omission and the loopback Messages flow with configured providers and native review. Assess Swarm, scheduled Agent/Swarm and the vision/embedding consumers that still require a resolved model. Resolve noncanonical Java paths against pinned examples. Verify the live signed catalog with the publisher trust key and audit the remaining specialized prompt consumers. Verify a real guided install, inference, cancellation and role save on native desktops. Verify the reviewed routes with enabled providers and native UI, including MiniMax login and regional endpoints, live LM Studio loading, macOS executable quarantine and owned-helper cancellation. J `core/AiCliProviderRegistry.java`, `core/AiServiceFactory.java`. |
 | B2 | Acceptance. Bounded answer/reasoning streams and provisional analysis/progress are implemented for supported native providers. Generic CLI buffering until exit also matches the pinned CLI behavior. R `src/local_ai/streaming.rs`. | Real provider interruption, protocol errors, cancellation and complete saved/exported final results. Do not list streaming itself as absent. |
 | B3 | Acceptance. Reviewed single/split GGUF acquisition, resume, signed runtime channels, Off/Notify/Automatic Stable, version pins, withdrawals and idle staged activation exist. | Signed-channel interruption, disk limits, withdrawn packages and actual supported runtime execution on each native target. Preserve leases and last verified usable installation through failures. U1 is the separate application-update channel. |
-| B4 | Acceptance. Apple Silicon passed signed MLX reasoning, Java setting adoption, stale-setting rejection, live cancellation, idle restart, runtime reinstallation and rollback. Signed llama.cpp runtimes passed GGUF vision and inference from external single files and split sets on Apple Silicon, Fedora ARM64 and Windows x64 under emulation. All three detected replacement of the final shard, and re-registration restored inference. Windows blocked replacement while the read lease was active. | Exercise native Windows GGUF vision and external references, and additional runtime versions when published. Native Windows x64 needs an x64 host and native Windows ARM64 needs a signed ARM64 package. An unsupported-model request on mlx-lm 0.31.3 reached the configured request timeout. |
-| B5 | Acceptance. Persistent indexes, approved automatic refresh and per-store opt-in exist. Agent Ask/Run, Planning, Swarm members and comparison have separate query and prompt reviews. Scheduler proposals, per-firing Agent and Swarm, read-only Swarm and optional scheduled comparisons can include exact reviewed excerpts from local and anonymous or vault-backed Qdrant indexes. | Verify native Manager and request previews, cancellation, saved/reopened jobs and source/embedding changes with configured providers. Durable environment-key Qdrant is a native extension. Compare larger corpora under B6. J `ui/RagKnowledgeStorePane.java`, `rag/RagRuntimeService.java`. |
+| B4 | Implementation and acceptance. GGUF and MLX Configure windows are implemented. Windows ARM64 verified GGUF field order, save and cancel. Apple Silicon passed signed MLX reasoning, Java setting adoption, stale-setting rejection, live cancellation, idle restart, runtime reinstallation and rollback. Signed llama.cpp runtimes passed GGUF vision and inference from external single files and split sets on Apple Silicon, Fedora ARM64 and Windows x64 under emulation. All three detected replacement of the final shard, and re-registration restored inference. Windows blocked replacement while the read lease was active. | Finish the GGUF import dialog, backend-mismatch offer and MLX publication date. [Completion checks](#confirmed-implementation-work) Exercise the combined inventory, MLX default and Configure on Apple Silicon. Exercise native Windows GGUF vision and external references, and additional runtime versions when published. Native Windows x64 needs an x64 host and native Windows ARM64 needs a signed ARM64 package. An unsupported-model request on mlx-lm 0.31.3 reached the configured request timeout. |
+| B5 | Implementation and acceptance. Persistent indexes, approved automatic refresh and per-store opt-in exist. Agent Ask/Run, Planning, Swarm members and comparison have separate query and prompt reviews. Scheduler proposals, per-firing Agent and Swarm, read-only Swarm and optional scheduled comparisons can include exact reviewed excerpts from local and anonymous or vault-backed Qdrant indexes. | Restore the last per-source status and problem count across restart. [Completion check](#confirmed-implementation-work) Verify native Manager and request previews, cancellation, saved/reopened jobs and source/embedding changes with configured providers. Durable environment-key Qdrant is a native extension. Compare larger corpora under B6. J `ui/RagKnowledgeStorePane.java`, `rag/RagRuntimeService.java`. |
 | B6 | Acceptance + capacity audit. UTF-8/PDF ingestion, page citations, persistent local HNSW and optional Qdrant exist. The PDF producer streams and hashes the held descriptor in 64 KiB chunks under the worker permit. New sources default to 50 MiB. Reviewed UTF-8, PDF and folder settings support up to 1 GiB with a 500 MiB scan limit. Large PDFs use private temporary input mapping. A store supports up to 5,000 source files. Local snapshots support up to 5,000,000 passages and 64 GiB. Qdrant snapshots are bounded to 16,384 passages and 96 MiB. Above the 8,192-passage HNSW limit, search and refresh read vectors from the validated local snapshot for exact scoring or reuse. New and reused vectors are staged in a private temporary file for large local builds and refreshes. Saved Search bounds the exact score heap to the requested hits. Terminal Chat consumes exact scores in rank order until the excerpt budget is full. Earlier automatic approvals retain their original format, discovery and Qdrant bounds until reviewed again. | The version 8 passage ceiling matches the Java snapshot reader at 5,000,000. Verify indexing, retrieval and refresh with real sources and realistic embeddings at higher corpus tiers. Large queries and refreshes read the previous snapshot text from the held file. Large builds and refreshes stage replacement passage text and vectors in private temporary files. Snapshot decoding and local publication support cancellation. Measure disk and CPU costs at the largest supported sizes. Verify native limit/Vault controls and configured HTTPS Qdrant recovery. J `rag/RagSourceScanner.java` and `rag/LocalHnswStore.java`. |
 | B7 | Acceptance + bounded audit. Connection skills, reviewed relevance/classification, usage ledgers, forecasts and graphical profile quota meters exist. Profiles can select Estimate, CL100K, O200K, P50K or R50K for reviewed request forecasts. J `model/AiTokenizerType.java`. | Audit other consumers for exact missing forecast/usage paths. Complete native meter and real-provider accounting acceptance. |
 | B8 | Acceptance + scope decision. Reviewed local/SFTP text attachments, saved masked snapshots, native flowcharts, direct Tavily and the five LM Studio MCP internet modes exist through reviewed loopback HTTP or HTTPS. Supported profiles can submit an exact reviewed webpage URL through Tavily Extract, Bright Data or SearXNG. Java migration offers supported integrations for explicit adoption. The imported Toolpack plugin requires exact tool names supplied during configuration. A standing Scheduler review can authorize a model-selected search and up to two follow-up lookups about a public topic at every firing. Guided iterative Swarm supports separately reviewed searches and opt-in page reads after command batches. J `model/AiInternetAccessMode.java`. | Verify the review, TLS and imported Toolpack workflows against installed LM Studio. Verify attachment identity, size and change, archived follow-up and actual configured MCP services. Review the data scope for automatic tool selection from later command output. |
@@ -3326,7 +3561,7 @@ the recorded platform, package and audit evidence from its earlier snapshot.
 | V4 | All 21 emulations exist. Complete GUI/key/reply/charset/mode/resize/reflow and supported Scheduler comparisons per profile. Restore the pinned SithTermFX checkout before fixture regeneration. Verify audible Windows/Linux bell and retain documented Wyse differences. Real TN3270/TN5250, HP application/device and physical serial break/modem/flow-control remain explicitly user-deferred. |
 | V5 | Enabled real providers and signed runtimes, every AI Manager section hosted/detached, editor source jumps after edits, seven bounded diagram families, clicks after zoom, full SVG/PNG/PDF beyond the viewport, retained analyses after restart and consent/cancellation at mutation boundaries. Include current A/B/S/J changes. |
 | V6 | The separate SSH source review led to two transport fixes with native wire regressions. Apple Silicon passed the packaged App Sandbox, changed pin, tampered helper, approved tunnel, cancellation and jump fixtures. Resolve the recorded `crypto-bigint` and OpenPGP RSA findings after refreshing the dependency audit, obtain external independent review, and complete native Windows x64 and macOS Intel packaged isolation. Keep the SFTP external replacement race as a separate hardening risk. See the [SSH audit](target/verification/20261112-step6-ssh-audit.md). |
-| V7 | Merge CI passed for `e3c1760` on Windows, macOS and Ubuntu. The November 19 Windows ARM64 ZIP passed checksum, payload, startup, restart and packaged LPAC worker readiness verification. Its exact source also passed 4,526 native workspace tests with 96 ignored and passed strict workspace Clippy. [Windows portable release](PORTING-PARITY.md#november-19-windows-arm64-portable-release) PR #8 recorded later full native suites and release builds on Windows ARM64, Apple Silicon and Fedora ARM64 at `fb8870149949`, including ad hoc signature verification on the Mac. These runs predate the current worktree. Build the release candidate from one fixed revision, run the full suites and native gates, and verify clean installation, upgrade, removal, signatures and macOS notarization, stapling and Gatekeeper. Measure same-host startup, idle memory and p95 input latency, including 5K macOS. [Source and package evidence](#current-evidence-and-distribution) |
+| V7 | Merge CI passed for `e3c1760` on Windows, macOS and Ubuntu. The November 19 Windows ARM64 ZIP passed checksum, payload, startup, restart and packaged LPAC worker readiness verification. Its exact source also passed 4,526 native workspace tests with 96 ignored and passed strict workspace Clippy. [Windows portable release](PORTING-PARITY.md#november-19-windows-arm64-portable-release) PR #8 recorded the November 18 full native suites and release builds on Windows ARM64, Apple Silicon and Fedora ARM64 at `fb8870149949`, including ad hoc signature verification on the Mac. These runs predate the current worktree. Build the release candidate from one fixed revision, run the full suites and native gates, and verify clean installation, upgrade, removal, signatures and macOS notarization, stapling and Gatekeeper. Measure same-host startup, idle memory and p95 input latency, including 5K macOS. [Source and package evidence](#current-evidence-and-distribution) |
 
 Forwarding currently permits thirteen concurrent streams and four remote listener
 registrations per SSH connection. Establish a reference workload before raising

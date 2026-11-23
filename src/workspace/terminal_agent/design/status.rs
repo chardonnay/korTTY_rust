@@ -6,12 +6,14 @@ use iced::widget::{Row, button, column, container, progress_bar, row, scrollable
 use iced::{Alignment, Element, Font, Length, window};
 
 use crate::terminal_agent::design::Status;
-use crate::terminal_agent::design::inline::{self, Kind, Role, State, Step, StepState, Transcript};
+use crate::terminal_agent::design::inline::{
+    self, Kind, Role, State, Step, StepState, Transcript, compact_tokens,
+};
 
 use super::super::{Message as AgentMessage, Phase};
 use super::{
     Message, Run, history,
-    log_table::{Surface, status_run_context, step_context},
+    log_table::{self, Surface, status_run_context, step_context},
     palette::{self, Palette},
     presentation::Notice,
     toast,
@@ -50,7 +52,7 @@ pub(super) struct Trace<'a> {
 }
 
 impl<'a> Trace<'a> {
-    fn live(run: &'a Run, now: Instant, reduced_motion: bool) -> Self {
+    pub(super) fn live(run: &'a Run, now: Instant, reduced_motion: bool) -> Self {
         let (transcript, elapsed, started_at) =
             run.status_transcript()
                 .map_or((None, Duration::ZERO, None), |(transcript, start)| {
@@ -167,6 +169,105 @@ impl<'a> Trace<'a> {
     }
 }
 
+pub(super) fn timeline_header<'a>(
+    activity: history::Activity<'a>,
+    trace: Trace<'a>,
+    palette: Option<Palette>,
+) -> Element<'a, AgentMessage> {
+    let colors = palette.unwrap_or_else(Palette::default_status);
+    let accent = colors.accent.color();
+    let muted = colors.muted.color();
+    let ink = colors.text.color();
+    let icon = move |glyph, label, action| {
+        tooltip(
+            button(text(glyph).size(11).center())
+                .height(21)
+                .padding([1, 5])
+                .style(move |_, state| {
+                    let hovered =
+                        matches!(state, button::Status::Hovered | button::Status::Pressed);
+                    button::Style {
+                        background: hovered.then(|| accent.scale_alpha(0.18).into()),
+                        text_color: if hovered { ink } else { muted },
+                        border: iced::Border {
+                            radius: 4.0.into(),
+                            ..iced::Border::default()
+                        },
+                        ..button::Style::default()
+                    }
+                })
+                .on_press_maybe(action),
+            text(label).size(12),
+            tooltip::Position::Bottom,
+        )
+    };
+    let hide = trace.run.map_or(
+        AgentMessage::Design(Message::HideTimelineSample),
+        super::actions::hide_history,
+    );
+    let usage = usage_label(activity, Some(colors)).or_else(|| {
+        activity
+            .transcript
+            .and_then(|transcript| transcript.tokens)
+            .map(|tokens| {
+                let label = format!("{} ·", compact_tokens(tokens));
+                text(label)
+                    .size(11)
+                    .style(move |_| text::Style { color: Some(muted) })
+                    .into()
+            })
+    });
+    column![
+        row![
+            container(
+                text("◆ AI agent")
+                    .size(13)
+                    .font(Font {
+                        weight: iced::font::Weight::Bold,
+                        ..Font::DEFAULT
+                    })
+                    .wrapping(text::Wrapping::None)
+                    .style(move |_| text::Style { color: Some(ink) })
+            )
+            .width(Length::Fill)
+            .clip(true),
+            icon(
+                if trace.paused { "▶" } else { "Ⅱ" },
+                if trace.paused { "Resume" } else { "Pause" },
+                (trace.active && !trace.waiting).then_some(AgentMessage::Pause)
+            ),
+            icon(
+                "■",
+                "Cancel run",
+                trace.active.then_some(AgentMessage::Cancel)
+            ),
+            log_table::timeline_icon_menu(activity, hide.clone(), |action| {
+                icon("⋯", "Run actions", Some(action)).into()
+            }),
+            icon("✕", "Hide timeline", Some(hide)),
+        ]
+        .align_y(Alignment::Center)
+        .spacing(4),
+        row![
+            usage,
+            text(trace.elapsed_label())
+                .size(11)
+                .style(move |_| text::Style { color: Some(muted) })
+        ]
+        .spacing(6),
+        container(
+            text(history::summary(activity.goal))
+                .size(12)
+                .wrapping(text::Wrapping::WordOrGlyph)
+        )
+        .max_height(36)
+        .clip(true),
+    ]
+    .spacing(4)
+    .width(Length::Fill)
+    .into()
+}
+
 pub(super) fn step_interval(steps: &[Step], active: bool, still: bool) -> Option<u64> {
     (active
         && steps.iter().any(|step| {
@@ -281,12 +382,12 @@ pub(super) fn render<'a>(
         .align_y(Alignment::Center)
         .wrap()
         .into(),
-        Status::Metro => metro::view(run, phase, &trace, palette, has_archive),
+        Status::Metro => metro::view(run, phase, &trace, palette),
         Status::Minimap => return minimap::view(run, trace, phase, palette),
         Status::Powerline => {
             return powerline::view(run, phase, trace, palette, has_archive, controls);
         }
-        Status::TopBar => return top_bar::view(run, phase, trace, palette, has_archive, controls),
+        Status::TopBar => return top_bar::view(run, phase, trace, palette, controls),
         Status::Neon => neon::view(run, phase, &trace, palette, has_archive),
         Status::Hud => return hud::view(run, phase, &trace, palette, has_archive, controls),
         Status::Spotlight => {
@@ -411,6 +512,9 @@ pub(super) fn render<'a>(
     let drawer = run.presentation.drawer_open();
     let has_own_controls = matches!(status, Status::Metro | Status::Neon);
     if has_own_controls && !drawer {
+        if status == Status::Metro && trace.run.is_none() && trace.waiting {
+            return column![header, controls()].into();
+        }
         return header;
     }
     let simple = matches!(status, Status::Steps | Status::Pill);
@@ -465,7 +569,7 @@ pub(super) fn step_list(
     )
 }
 
-fn step_metadata(step: &Step, now: Instant) -> Option<String> {
+pub(super) fn step_metadata(step: &Step, now: Instant) -> Option<String> {
     if step.state == StepState::Running && matches!(step.kind, Kind::Action | Kind::Thinking) {
         return Some(step.elapsed_at(now).map_or_else(
             || "Running".into(),
@@ -481,7 +585,7 @@ fn step_metadata(step: &Step, now: Instant) -> Option<String> {
                 lines => format!("Exit {code} · {lines} lines"),
             },
         )),
-        Kind::Thinking => step.tokens.map(|tokens| format!("{tokens} tokens")),
+        Kind::Thinking => step.tokens.map(compact_tokens),
         _ => None,
     }
 }

@@ -3,7 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
 use iced::widget::{button, checkbox, column, pick_list, row, text, text_input, tooltip};
-use iced::{Alignment, Element};
+use iced::{Alignment, Element, Length};
 use kortty_terminal::TerminalProfile;
 
 use crate::clipboard_policy::PasteWarningMode;
@@ -25,6 +25,7 @@ mod geometry;
 
 #[derive(Clone, Debug)]
 pub enum Edit {
+    Page(Page),
     Name(String),
     Tag(String),
     Emulation(TerminalProfile),
@@ -48,6 +49,39 @@ pub enum Edit {
     AddTunnel,
     RemoveTunnel(usize),
     Tunnel(usize, TunnelEdit),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Page {
+    #[default]
+    Connection,
+    Settings,
+    Tunnels,
+    JumpHost,
+    Logging,
+    WindowGeometry,
+}
+
+impl Page {
+    const ALL: [Self; 6] = [
+        Self::Connection,
+        Self::Settings,
+        Self::Tunnels,
+        Self::JumpHost,
+        Self::Logging,
+        Self::WindowGeometry,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Connection => "Connection",
+            Self::Settings => "Terminal Settings",
+            Self::Tunnels => "SSH Tunnels",
+            Self::JumpHost => "Jump Server",
+            Self::Logging => "Terminal Logging",
+            Self::WindowGeometry => "Window Geometry",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -147,6 +181,7 @@ impl fmt::Display for PasteChoice {
 }
 
 pub(super) struct Draft {
+    page: Page,
     id: u64,
     name: String,
     tag: String,
@@ -202,6 +237,7 @@ impl Draft {
 
     pub fn new() -> Self {
         Self {
+            page: Page::default(),
             id: 0,
             name: String::new(),
             tag: String::new(),
@@ -227,6 +263,7 @@ impl Draft {
 
     pub fn from_profile(connection: &Connection, os_badge: Option<&str>, duplicate: bool) -> Self {
         Self {
+            page: Page::default(),
             id: if duplicate { 0 } else { connection.id },
             name: if duplicate {
                 format!("{} (copy)", connection.name)
@@ -268,6 +305,10 @@ impl Draft {
 
     pub fn update(&mut self, edit: Edit) {
         match edit {
+            Edit::Page(page) => {
+                self.page = page;
+                return;
+            }
             Edit::Name(value) => self.name = bounded(value, 160),
             Edit::Tag(value) => self.tag = bounded(value, 96),
             Edit::Emulation(profile) => self.profile = profile,
@@ -386,29 +427,112 @@ impl Draft {
         custom_badges: &'a Catalog,
         group: Element<'a, Message>,
     ) -> Element<'a, Message> {
-        let valid = self.connection();
-        let paste_choice = |mode| PasteChoice {
-            mode,
-            default: choices.default_paste_warning,
-        };
-        let paste_choices: Vec<_> = std::iter::once(None)
-            .chain(PasteWarningMode::ALL.map(Some))
-            .map(paste_choice)
-            .collect();
-        let mut editor = column![
-            text(if self.id == 0 {
-                "New connection"
-            } else {
-                "Edit connection"
-            })
-            .size(21),
-            row![
-                text_input("Connection name", &self.name)
-                    .on_input(|value| Message::Edit(Edit::Name(value))),
-                text_input("Tag (optional)", &self.tag)
-                    .on_input(|value| Message::Edit(Edit::Tag(value))),
+        use crate::workspace::dialog_design;
+        use iced::widget::{container, keyed_column, scrollable, space};
+
+        let tabs = Page::ALL.into_iter().fold(row![], |tabs, page| {
+            let selected = self.page == page;
+            tabs.push(
+                button(text(page.label()).size(13))
+                    .padding([8, 12])
+                    .style(move |theme, status| dialog_design::tab(theme, status, selected))
+                    .on_press(Message::Edit(Edit::Page(page))),
+            )
+        });
+        let index = Page::ALL
+            .iter()
+            .position(|page| *page == self.page)
+            .expect("every editor page has a tab");
+        let arrows = row![
+            space::horizontal(),
+            text(format!("{} / {}", index + 1, Page::ALL.len())).size(13),
+            button(text("◂").size(13))
+                .style(button::secondary)
+                .padding([4, 8])
+                .on_press_maybe(
+                    index
+                        .checked_sub(1)
+                        .map(|previous| Message::Edit(Edit::Page(Page::ALL[previous])))
+                ),
+            button(text("▸").size(13))
+                .style(button::secondary)
+                .padding([4, 8])
+                .on_press_maybe(
+                    Page::ALL
+                        .get(index + 1)
+                        .map(|next| Message::Edit(Edit::Page(*next)))
+                ),
+        ]
+        .align_y(Alignment::Center)
+        .spacing(4);
+        let content = match self.page {
+            Page::Connection => self.connection_page(choices, custom_badges, group),
+            Page::Settings => self.settings_page(choices),
+            Page::Tunnels => self.tunnels_page(),
+            Page::JumpHost => column![
+                checkbox(self.jump.is_some())
+                    .label("Use a jump host")
+                    .on_toggle(|value| Message::Edit(Edit::UseJump(value))),
+                self.jump.as_ref().map(|jump| jump.view(
+                    true,
+                    choices.passwords,
+                    choices.passphrases,
+                    choices.keys,
+                )),
             ]
-            .spacing(8),
+            .spacing(10)
+            .into(),
+            Page::Logging => self
+                .logging
+                .view(!self.incognito, true)
+                .map(|edit| Message::Edit(Edit::Logging(edit))),
+            Page::WindowGeometry => self
+                .window_geometry
+                .view()
+                .map(|edit| Message::Edit(Edit::WindowGeometry(edit))),
+        };
+        let page = container(
+            scrollable(container(content).width(Length::Fill).padding(20))
+                .height(Length::Fill)
+                .width(Length::Fill),
+        )
+        .style(dialog_design::page);
+        column![
+            arrows,
+            tabs,
+            keyed_column![(self.page, page)].height(Length::Fill),
+            self.connection().err().map(|error| text(error).size(13)),
+        ]
+        .spacing(4)
+        .height(Length::Fill)
+        .into()
+    }
+
+    fn connection_page<'a>(
+        &'a self,
+        choices: &ViewChoices<'_>,
+        custom_badges: &'a Catalog,
+        group: Element<'a, Message>,
+    ) -> Element<'a, Message> {
+        column![
+            row![
+                text("Name").width(105),
+                text_input("Connection name", &self.name)
+                    .on_input(|value| Message::Edit(Edit::Name(value)))
+                    .width(250),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+            self.login
+                .view(false, choices.passwords, choices.passphrases, choices.keys),
+            row![
+                text("Tag").width(105),
+                text_input("Tag (optional)", &self.tag)
+                    .on_input(|value| Message::Edit(Edit::Tag(value)))
+                    .width(250),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
             group,
             os_badge::picker(
                 os_badge::Badge::resolve(self.os_badge_id(), custom_badges),
@@ -418,9 +542,40 @@ impl Draft {
                 None,
                 |badge| Message::Edit(Edit::OsBadge(badge)),
             ),
-            pick_list(TerminalProfile::ALL, Some(self.profile), |value| {
-                Message::Edit(Edit::Emulation(value))
-            }),
+            row![
+                text("Terminal emulation").width(144),
+                pick_list(TerminalProfile::ALL, Some(self.profile), |value| {
+                    Message::Edit(Edit::Emulation(value))
+                }),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+            checkbox(self.incognito)
+                .label(if choices.incognito_allowed {
+                    "Incognito session"
+                } else {
+                    "Incognito session · managed policy"
+                })
+                .on_toggle_maybe(
+                    choices
+                        .incognito_allowed
+                        .then_some(|value| Message::Edit(Edit::Incognito(value)))
+                ),
+        ]
+        .spacing(10)
+        .into()
+    }
+
+    fn settings_page<'a>(&'a self, choices: &ViewChoices<'_>) -> Element<'a, Message> {
+        let paste_choice = |mode| PasteChoice {
+            mode,
+            default: choices.default_paste_warning,
+        };
+        let paste_choices: Vec<_> = std::iter::once(None)
+            .chain(PasteWarningMode::ALL.map(Some))
+            .map(paste_choice)
+            .collect();
+        let mut editor = column![
             column![
                 text("Tab color").size(16),
                 tooltip(
@@ -474,21 +629,9 @@ impl Draft {
                 .view(135.0)
                 .map(|(field, value)| Message::Edit(Edit::Startup(field, value))),
             self.startup.keepalive_view(135.0).map(|edit| Message::Edit(Edit::KeepAlive(edit))),
-            checkbox(self.incognito)
-                .label(if choices.incognito_allowed {
-                    "Incognito session"
-                } else {
-                    "Incognito session · managed policy"
-                })
-                .on_toggle_maybe(
-                    choices
-                        .incognito_allowed
-                        .then_some(|value| Message::Edit(Edit::Incognito(value)))
-                ),
+            self.terminal.view(choices).map(|edit| Message::Edit(Edit::Terminal(edit))),
         ]
-        .spacing(8)
-        .push(self.terminal.view(choices).map(|edit| Message::Edit(Edit::Terminal(edit))))
-        .push(self.window_geometry.view().map(|edit| Message::Edit(Edit::WindowGeometry(edit))));
+        .spacing(8);
         if let Some(effects) = choices.terminal_effects {
             editor = editor.push(
                 column![
@@ -502,47 +645,44 @@ impl Draft {
                 .spacing(6),
             );
         }
-        editor = editor
-            .push(text("Destination").size(16))
-            .push(
-                self.login
-                    .view(false, choices.passwords, choices.passphrases, choices.keys),
-            )
-            .push(
-                checkbox(self.jump.is_some())
-                    .label("Use a jump host")
-                    .on_toggle(|value| Message::Edit(Edit::UseJump(value))),
-            );
-        if let Some(jump) = &self.jump {
-            editor = editor.push(text("Jump host").size(16)).push(jump.view(
-                true,
-                choices.passwords,
-                choices.passphrases,
-                choices.keys,
-            ));
-        }
-        editor = editor.push(
-            self.logging
-                .view(!self.incognito, true)
-                .map(|edit| Message::Edit(Edit::Logging(edit))),
-        );
-        editor = editor.push(
-            row![
-                text("SSH tunnels").size(17),
-                button("Add tunnel").on_press_maybe(
-                    (self.tunnels.len() < MAX_TUNNELS).then_some(Message::Edit(Edit::AddTunnel))
-                ),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
-        );
-        for (index, tunnel) in self.tunnels.iter().enumerate() {
-            editor = editor.push(tunnel.view(index));
-        }
-        if let Err(error) = valid {
-            editor = editor.push(text(error).size(13));
-        }
         editor.into()
+    }
+
+    fn tunnels_page(&self) -> Element<'_, Message> {
+        column![button("Add tunnel").on_press_maybe(
+            (self.tunnels.len() < MAX_TUNNELS).then_some(Message::Edit(Edit::AddTunnel))
+        )]
+        .extend(
+            self.tunnels
+                .iter()
+                .enumerate()
+                .map(|(index, tunnel)| tunnel.view(index)),
+        )
+        .spacing(8)
+        .into()
+    }
+}
+
+#[cfg(test)]
+mod page_tests {
+    use super::*;
+
+    #[test]
+    fn switching_pages_preserves_the_draft_without_making_it_dirty() {
+        let mut draft = Draft::new();
+        draft.update(Edit::Page(Page::JumpHost));
+        assert!(!draft.changed);
+        draft.update(Edit::UseJump(true));
+        draft.update(Edit::Login(true, LoginEdit::Host("jump.example".into())));
+        draft.update(Edit::Page(Page::Connection));
+        draft.update(Edit::Name("Build host".into()));
+        draft.update(Edit::Login(false, LoginEdit::Host("build.example".into())));
+        draft.update(Edit::Page(Page::Logging));
+
+        let connection = draft.connection().unwrap();
+        assert_eq!(connection.name, "Build host");
+        assert_eq!(connection.login.endpoint.host, "build.example");
+        assert_eq!(connection.jump.unwrap().endpoint.host, "jump.example");
     }
 }
 

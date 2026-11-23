@@ -649,10 +649,13 @@ fn knowledge_large_update_rejects_projected_size_after_the_first_embedding_batch
         &Client::new(scope.profile.clone()),
         &scope,
         None,
-        false,
-        None,
-        limits,
+        super::IndexOptions {
+            rebuild: false,
+            automatic_qdrant: None,
+            limits,
+        },
         || Ok(()),
+        &mut None,
     );
     let limit = limits.bytes / (1024 * 1024);
     assert!(

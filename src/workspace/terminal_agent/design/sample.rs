@@ -11,7 +11,7 @@ use crate::terminal_agent::design::{Arrangement, History, Layout, Status, inline
 use super::{
     AgentMessage, Desktop, DockExtents, DockPreferences, Message, Presentation, SampleLogCommand,
     SampleLogKey, Slot, adaptive_status, adaptive_timeline, compose, history, history_body,
-    log_table, pip, placement, status, status_slot, tmux,
+    log_table, palette, pip, placement, status, status_slot, tmux,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -20,6 +20,7 @@ pub(crate) enum Action {
     PictureInPicture(pip::Message),
     Grid(Grid),
     Approve,
+    Pause,
     Cancel,
     Ignore,
 }
@@ -30,6 +31,7 @@ impl From<AgentMessage> for Action {
             AgentMessage::Design(action) => Self::Detail(action),
             AgentMessage::Pip(action) => Self::PictureInPicture(action),
             AgentMessage::Approve(_) => Self::Approve,
+            AgentMessage::Pause => Self::Pause,
             AgentMessage::Cancel => Self::Cancel,
             _ => Self::Ignore,
         }
@@ -137,7 +139,7 @@ impl Sample {
         };
     }
 
-    pub(in crate::workspace) fn sync(&mut self, transcript: &inline::Transcript) {
+    pub(in crate::workspace) fn sync(&mut self, transcript: &inline::Transcript, layout: Layout) {
         let now = Instant::now();
         let clock = SystemTime::now();
         let prior_prompt = self.transcript.prompt.is_some();
@@ -195,7 +197,11 @@ impl Sample {
         }
         self.presentation.activity.expand_all = transcript.expanded;
         if transcript.prompt.is_some() && !prior_prompt {
-            self.presentation.review(super::super::Phase::Approval);
+            if self.status_position(layout).0 == Status::Metro {
+                self.presentation.review_started = Some(now);
+            } else {
+                self.presentation.review(super::super::Phase::Approval);
+            }
         } else if transcript.prompt.is_none() {
             self.presentation.review_started = None;
         }
@@ -343,7 +349,7 @@ impl Sample {
             }
             Action::PictureInPicture(action) => self.presentation.pip.update_sample(action),
             Action::Grid(grid) => self.grid = grid,
-            Action::Approve | Action::Cancel | Action::Ignore => {}
+            Action::Approve | Action::Pause | Action::Cancel | Action::Ignore => {}
         }
     }
 
@@ -373,19 +379,41 @@ impl Sample {
             owner: None,
             panel_review: None,
         };
+        let (status_kind, position) = self.status_position(layout);
         let approval = view
             .approval
             .filter(|_| !super::command_review::handles(layout.history));
         let controls = move || -> Element<'a, AgentMessage> {
             if let Some(command) = approval {
+                let choices = row![
+                    button("Allow once").on_press(AgentMessage::Approve(0)),
+                    button("Cancel").on_press(AgentMessage::Cancel),
+                ]
+                .spacing(5);
+                if status_kind == Status::Metro {
+                    return container(
+                        row![
+                            container(
+                                text(command)
+                                    .font(iced::Font::MONOSPACE)
+                                    .size(12)
+                                    .wrapping(text::Wrapping::None)
+                            )
+                            .width(Length::Fill)
+                            .clip(true),
+                            choices,
+                        ]
+                        .spacing(7)
+                        .align_y(iced::Alignment::Center),
+                    )
+                    .padding([3, 8])
+                    .width(Length::Fill)
+                    .style(container::bordered_box)
+                    .into();
+                }
                 column![
                     text(command).font(iced::Font::MONOSPACE).size(12),
-                    row![
-                        button("Allow once").on_press(AgentMessage::Approve(0)),
-                        button("Cancel").on_press(AgentMessage::Cancel),
-                    ]
-                    .spacing(5)
-                    .wrap(),
+                    choices.wrap(),
                 ]
                 .spacing(4)
                 .into()
@@ -394,24 +422,51 @@ impl Sample {
             }
         };
         let history_panel = || -> Element<'a, AgentMessage> {
-            container(
+            let palette = (layout.history == History::Timeline
+                && layout.arrangement != Arrangement::PictureInPicture)
+                .then(palette::Palette::default_status);
+            let header = if palette.is_some() {
+                status::timeline_header(
+                    activity,
+                    status::Trace::sample(&self.transcript, self.started, now, view.reduced_motion),
+                    palette,
+                )
+            } else {
+                text(format!("{} · {}", layout.history, view.phase.0))
+                    .size(13)
+                    .into()
+            };
+            let panel = container(
                 column![
-                    text(format!("{} · {}", layout.history, view.phase.0)).size(13),
+                    header,
                     history_body(
-                        history::view_as(activity, layout.history, None, view.reduced_motion),
+                        history::view_as(activity, layout.history, palette, view.reduced_motion),
                         controls(),
                         layout.approval,
                     ),
                 ]
-                .spacing(5),
+                .spacing(if palette.is_some() { 4 } else { 5 }),
             )
-            .padding(7)
-            .style(container::bordered_box)
+            .padding(if palette.is_some() {
+                super::timeline::PANEL_PADDING
+            } else {
+                iced::Padding::from(7)
+            })
             .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
+            .height(Length::Fill);
+            if palette.is_some() {
+                palette::panel(palette, panel)
+            } else {
+                panel.style(container::bordered_box).into()
+            }
         };
-        let (status_kind, position) = self.status_position(layout);
+        let status_opacity = view.status_opacity.filter(|_| {
+            !matches!(status_kind, Status::TopBar | Status::Metro)
+                || self
+                    .presentation
+                    .status_opacity(status_kind, 0, now, view.reduced_motion)
+                    .is_some()
+        });
         if status_kind == Status::Powerline && view.status_opacity.is_none() {
             self.presentation.dismiss_powerline_drawer();
         }
@@ -423,9 +478,12 @@ impl Sample {
         } else if status_kind != Status::Hud {
             self.presentation.status_visibility.hud_entrance.hide();
         }
-        let history_position = view.dock.history_slot(layout);
+        let history_position = view
+            .dock
+            .history_slot(layout)
+            .filter(|_| !self.presentation.dock_hidden);
         let adaptive_side = layout.arrangement == Arrangement::Adaptive && position == Slot::Right;
-        let status = view.status_opacity.and_then(|opacity| {
+        let status = status_opacity.and_then(|opacity| {
             if status_kind == Status::Hidden || adaptive_side && layout.history == History::Timeline
             {
                 None
@@ -505,7 +563,10 @@ impl Sample {
                 view.reduced_motion,
                 forward,
             )
-        } else if history_position.is_none() && layout.history.inline_style().is_none() {
+        } else if history_position.is_none()
+            && !self.presentation.dock_hidden
+            && layout.history.inline_style().is_none()
+        {
             column![
                 terminal,
                 container(history_panel().map(forward)).height(148)
@@ -516,5 +577,54 @@ impl Sample {
         } else {
             terminal
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metro_preview_waits_for_an_explicit_steps_action() {
+        let transcript = inline::Transcript {
+            prompt: Some(inline::Prompt::Approval {
+                message: "Sample approval".into(),
+                commands: Vec::new(),
+                allow_always: false,
+                keyboard: false,
+            }),
+            ..inline::Transcript::default()
+        };
+        let mut sample = Sample::default();
+        sample.sync(
+            &transcript,
+            Layout {
+                status: Status::Metro,
+                ..Layout::default()
+            },
+        );
+        assert!(sample.presentation.review_started.is_some());
+        assert!(!sample.presentation.drawer_open());
+
+        sample.interact(Action::Detail(Message::ToggleDrawer));
+        assert!(sample.presentation.drawer_open());
+        sample.interact(Action::Detail(Message::HideStatus));
+        assert!(!sample.presentation.drawer_open());
+        assert!(
+            sample
+                .presentation
+                .status_opacity(Status::Metro, 0, Instant::now(), true)
+                .is_none()
+        );
+
+        sample.reset();
+        sample.sync(
+            &transcript,
+            Layout {
+                status: Status::TopBar,
+                ..Layout::default()
+            },
+        );
+        assert!(sample.presentation.drawer_open());
     }
 }

@@ -336,6 +336,7 @@ impl<'a> Registry<'a> {
         Ok(opened)
     }
 
+    #[cfg(test)]
     pub(crate) fn configure(&self, id: &str, name: &str, idle_minutes: u16) -> io::Result<Model> {
         self.configure_checked(id, name, idle_minutes, |_| Ok(()))
     }
@@ -369,12 +370,28 @@ impl<'a> Registry<'a> {
         Ok(model)
     }
 
+    #[cfg(test)]
     pub(crate) fn remove(&self, id: &str) -> io::Result<()> {
+        self.remove_checked(id, None)
+    }
+
+    pub(crate) fn remove_reviewed(&self, expected: &Model) -> io::Result<()> {
+        self.remove_checked(&expected.id, Some(expected))
+    }
+
+    fn remove_checked(&self, id: &str, expected: Option<&Model>) -> io::Result<()> {
         require_id(id)?;
         let root = self.root(false)?;
         let _lock = lock(&root, LOCK, false)?;
         let directory = root.private_child(id, false)?;
         let lease = lock(&directory, LEASE, false)?;
+        if let Some(expected) = expected
+            && read_model(&directory, id)? != *expected
+        {
+            return Err(invalid(
+                "The MLX model registration changed. Refresh and review the removal again",
+            ));
+        }
         let staging = prepare_staging(&root)?;
         drop(lease);
         drop(directory);
@@ -973,6 +990,27 @@ mod tests {
         std::fs::write(source.join("model.safetensors"), &weights).unwrap();
         std::fs::write(source.join("model.py"), b"must never be imported").unwrap();
         source
+    }
+
+    #[test]
+    fn removal_rejects_a_changed_mlx_registration() {
+        let profile = crate::snippets::tests::Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        let directory = fixture(&root);
+        let registry = Registry::new(&root);
+        let cancelled = AtomicBool::new(false);
+        let review = Review::prepare(&directory, &cancelled).unwrap();
+        let original = registry.import(&review, &cancelled).unwrap();
+        let changed = registry
+            .configure(&original.id, "Updated name", 25)
+            .unwrap();
+        assert_eq!(
+            registry.remove_reviewed(&original).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(registry.list().unwrap(), [changed.clone()]);
+        registry.remove_reviewed(&changed).unwrap();
+        assert!(registry.list().unwrap().is_empty());
     }
 
     #[test]

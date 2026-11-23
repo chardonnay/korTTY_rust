@@ -1,5 +1,6 @@
-//! Local multi-file selection for the Markdown skill importer.
+//! Shared local file and folder selection for AI Manager.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -8,9 +9,9 @@ use iced::{Alignment, Element, Length, Task};
 
 use crate::sftp_window::{Directory, EntryKind, Location, list_local};
 
-use super::{MAX_IMPORT_FILES, MAX_PATH_BYTES, bounded};
-
 const PAGE_SIZE: usize = 64;
+const MAX_PATH_BYTES: usize = 4096;
+pub(super) const MAX_MARKDOWN_FILES: usize = 32;
 
 #[derive(Clone)]
 pub(crate) enum Message {
@@ -27,6 +28,26 @@ pub(super) enum Mode {
     #[default]
     Markdown,
     ExportFolder,
+    KnowledgeFiles(usize),
+    KnowledgeFolder,
+}
+
+impl Mode {
+    fn file_limit(self) -> usize {
+        match self {
+            Self::Markdown => MAX_MARKDOWN_FILES,
+            Self::KnowledgeFiles(limit) => limit,
+            Self::ExportFolder | Self::KnowledgeFolder => 0,
+        }
+    }
+
+    fn allows_file(self, path: &Path) -> bool {
+        match self {
+            Self::Markdown => markdown_path(path),
+            Self::KnowledgeFiles(_) => super::local::knowledge_file_supported(path),
+            Self::ExportFolder | Self::KnowledgeFolder => false,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -74,7 +95,7 @@ impl Chooser {
                 match result {
                     Ok(directory) => {
                         if let Location::Local(path) = &directory.path {
-                            self.folder = path.to_str().unwrap_or_default().to_owned();
+                            self.folder = display_path(path).into_owned();
                         }
                         self.directory = Some(directory);
                         return operation::snap_to(list_id(), operation::RelativeOffset::START);
@@ -84,7 +105,7 @@ impl Chooser {
             }
             _ if self.loading => {}
             Message::Folder(folder) => {
-                self.folder = bounded(folder, MAX_PATH_BYTES);
+                self.folder = folder[..folder.floor_char_boundary(MAX_PATH_BYTES)].to_owned();
                 self.problem = None;
             }
             Message::Go => {
@@ -110,10 +131,7 @@ impl Chooser {
                     if entry.kind == EntryKind::Directory {
                         return self.browse(path, generation);
                     }
-                    if self.mode == Mode::Markdown
-                        && entry.kind == EntryKind::File
-                        && markdown_path(&path)
-                    {
+                    if entry.kind == EntryKind::File && self.mode.allows_file(&path) {
                         self.toggle(path);
                     }
                 }
@@ -146,11 +164,10 @@ impl Chooser {
                 .map(|mut directory| {
                     directory.entries.retain(|entry| {
                         entry.kind == EntryKind::Directory
-                            || mode == Mode::Markdown
-                                && entry.kind == EntryKind::File
+                            || entry.kind == EntryKind::File
                                 && matches!(
                                     directory.path.with(&entry.name),
-                                    Some(Location::Local(path)) if markdown_path(&path)
+                                    Some(Location::Local(path)) if mode.allows_file(&path)
                                 )
                     });
                     Arc::new(directory)
@@ -164,10 +181,10 @@ impl Chooser {
         self.problem = None;
         if let Some(index) = self.selected.iter().position(|selected| selected == &path) {
             self.selected.remove(index);
-        } else if self.selected.len() < MAX_IMPORT_FILES {
+        } else if self.selected.len() < self.mode.file_limit() {
             self.selected.push(path);
         } else {
-            self.problem = Some(format!("Choose up to {MAX_IMPORT_FILES} Markdown files."));
+            self.problem = Some(format!("Choose up to {} files.", self.mode.file_limit()));
         }
     }
 
@@ -182,9 +199,14 @@ impl Chooser {
         Some(folder)
     }
 
-    pub(super) fn export_folder(&self) -> Option<&Path> {
+    pub(super) fn chosen_folder(&self) -> Option<&Path> {
         self.current_folder()
-            .filter(|path| path.to_str().unwrap_or_default() == self.folder)
+            .filter(|_| self.chooses_folder())
+            .filter(|path| path.to_str().is_some() && display_path(path) == self.folder)
+    }
+
+    pub(super) fn chooses_folder(&self) -> bool {
+        matches!(self.mode, Mode::ExportFolder | Mode::KnowledgeFolder)
     }
 
     fn last_page(&self) -> usize {
@@ -200,8 +222,9 @@ impl Chooser {
             .on_submit_maybe(enabled.then_some(Message::Go));
         let navigation = row![
             folder,
-            button("Go").on_press_maybe(enabled.then_some(Message::Go)),
-            button("Up")
+            crate::workspace::dialog_design::secondary_action("Go")
+                .on_press_maybe(enabled.then_some(Message::Go)),
+            crate::workspace::dialog_design::secondary_action("Up")
                 .on_press_maybe((enabled && self.parent().is_some()).then_some(Message::Up)),
         ]
         .spacing(8)
@@ -210,7 +233,8 @@ impl Chooser {
         if self.loading {
             entries = entries.push(text(match self.mode {
                 Mode::Markdown => "Loading folders and Markdown files…",
-                Mode::ExportFolder => "Loading folders…",
+                Mode::KnowledgeFiles(_) => "Loading folders and supported files…",
+                Mode::ExportFolder | Mode::KnowledgeFolder => "Loading folders…",
             }));
         } else if let Some(directory) = &self.directory {
             let start = self.page * PAGE_SIZE;
@@ -242,7 +266,8 @@ impl Chooser {
             if directory.entries.is_empty() {
                 entries = entries.push(text(match self.mode {
                     Mode::Markdown => "No Markdown files or folders.",
-                    Mode::ExportFolder => "No subfolders.",
+                    Mode::KnowledgeFiles(_) => "No supported files or subfolders.",
+                    Mode::ExportFolder | Mode::KnowledgeFolder => "No subfolders.",
                 }));
             }
         }
@@ -263,11 +288,19 @@ impl Chooser {
         let (title, description) = match self.mode {
             Mode::Markdown => (
                 "Import Markdown",
-                format!("Select up to {MAX_IMPORT_FILES} .md or .markdown files in this folder."),
+                format!("Select up to {MAX_MARKDOWN_FILES} .md or .markdown files in this folder."),
             ),
             Mode::ExportFolder => (
                 "Choose export folder",
                 "The selected skills will be exported to the current folder.".into(),
+            ),
+            Mode::KnowledgeFiles(_) => (
+                "Add files",
+                "Select the files to review for this knowledge store.".into(),
+            ),
+            Mode::KnowledgeFolder => (
+                "Add folder",
+                "Open the folder you want to review for this knowledge store.".into(),
             ),
         };
         column![
@@ -286,8 +319,21 @@ impl Chooser {
     }
 }
 
+pub(super) fn display_path(path: &Path) -> Cow<'_, str> {
+    let label = path.to_string_lossy();
+    #[cfg(windows)]
+    if let Some(rest) = label.strip_prefix(r"\\?\UNC\") {
+        return Cow::Owned(format!(r"\\{rest}"));
+    } else if let Some(rest) = label.strip_prefix(r"\\?\")
+        && matches!(rest.as_bytes(), [drive, b':', b'\\', ..] if drive.is_ascii_alphabetic())
+    {
+        return Cow::Owned(rest.to_owned());
+    }
+    label
+}
+
 fn list_id() -> iced::widget::Id {
-    iced::widget::Id::new("ai-skill-import-chooser-list")
+    iced::widget::Id::new("ai-manager-file-chooser-list")
 }
 
 fn markdown_path(path: &Path) -> bool {
@@ -304,17 +350,17 @@ mod tests {
     #[test]
     fn skill_markdown_chooser_enforces_the_selection_limit_and_allows_deselection() {
         let mut chooser = Chooser::default();
-        for index in 0..MAX_IMPORT_FILES {
+        for index in 0..MAX_MARKDOWN_FILES {
             chooser.toggle(PathBuf::from(format!("{index}.md")));
         }
         let extra = PathBuf::from("extra.md");
         chooser.toggle(extra.clone());
-        assert_eq!(chooser.selection().len(), MAX_IMPORT_FILES);
+        assert_eq!(chooser.selection().len(), MAX_MARKDOWN_FILES);
         assert!(!chooser.selection().contains(&extra));
         assert!(chooser.problem.is_some());
         chooser.toggle(PathBuf::from("0.md"));
         chooser.toggle(extra.clone());
-        assert_eq!(chooser.selection().len(), MAX_IMPORT_FILES);
+        assert_eq!(chooser.selection().len(), MAX_MARKDOWN_FILES);
         assert_eq!(chooser.selection().last(), Some(&extra));
         assert!(chooser.problem.is_none());
     }

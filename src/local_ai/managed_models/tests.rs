@@ -31,10 +31,14 @@ fn string(file: &mut Vec<u8>, value: &str) {
 
 // A minimal GGUF fixture with a metadata array and one F32 tensor.
 pub(crate) fn fixture(context: u32, split: u16) -> Vec<u8> {
+    fixture_with_dimensions(context, split, None)
+}
+
+fn fixture_with_dimensions(context: u32, split: u16, dimensions: Option<u32>) -> Vec<u8> {
     let mut file = b"GGUF".to_vec();
     file.extend_from_slice(&3_u32.to_le_bytes());
     file.extend_from_slice(&1_u64.to_le_bytes());
-    file.extend_from_slice(&3_u64.to_le_bytes());
+    file.extend_from_slice(&(3 + u64::from(dimensions.is_some())).to_le_bytes());
     string(&mut file, "tokenizer.ggml.tokens");
     file.extend_from_slice(&9_u32.to_le_bytes());
     file.extend_from_slice(&8_u32.to_le_bytes());
@@ -46,6 +50,11 @@ pub(crate) fn fixture(context: u32, split: u16) -> Vec<u8> {
     string(&mut file, "split.count");
     file.extend_from_slice(&2_u32.to_le_bytes());
     file.extend_from_slice(&split.to_le_bytes());
+    if let Some(dimensions) = dimensions {
+        string(&mut file, "llama.embedding_length");
+        file.extend_from_slice(&4_u32.to_le_bytes());
+        file.extend_from_slice(&dimensions.to_le_bytes());
+    }
     string(&mut file, "test.weight");
     file.extend_from_slice(&1_u32.to_le_bytes());
     file.extend_from_slice(&1_u64.to_le_bytes());
@@ -54,6 +63,28 @@ pub(crate) fn fixture(context: u32, split: u16) -> Vec<u8> {
     file.resize(file.len().next_multiple_of(32), 0);
     file.extend_from_slice(&1_f32.to_le_bytes());
     file
+}
+
+#[test]
+fn knowledge_embedding_dimensions_use_registered_gguf_metadata() {
+    let profile = Profile::new();
+    let path = profile.0.join("dimensions.gguf");
+    let registry = profile.registry();
+    let cancelled = AtomicBool::new(false);
+    for dimensions in [None, Some(65_536), Some(65_537)] {
+        fs::write(&path, fixture_with_dimensions(2048, 1, dimensions)).unwrap();
+        let model = registry
+            .import(&path, Purpose::Embedding, &cancelled)
+            .unwrap();
+        match dimensions {
+            Some(65_537) => assert!(registry.embedding_dimensions(&model.id).is_err()),
+            value => assert_eq!(
+                registry.embedding_dimensions(&model.id).unwrap(),
+                value.map(|value| value as usize)
+            ),
+        }
+        registry.remove(&model.id).unwrap();
+    }
 }
 
 #[test]

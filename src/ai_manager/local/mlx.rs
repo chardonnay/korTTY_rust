@@ -2,6 +2,7 @@
 
 use iced::widget::{button, checkbox, column, pick_list, row, text, text_input};
 use iced::{Element, Length, Task};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11,6 +12,7 @@ use std::time::Duration;
 use crate::local_ai::{self, mlx_models, mlx_runtime, runtime_package};
 use mlx_runtime::{InstallationState, online};
 
+use super::managed::inventory::{ModelId, Row};
 use super::{Dialog, Message, Output, limited};
 use crate::ai_manager::java_models::{self, Hint, Metadata};
 use crate::ai_manager::profiles::picker::DismissOnEscape as _;
@@ -42,11 +44,11 @@ pub(crate) enum Action {
     Confirm,
     ConfirmOnline(u64),
     Discard,
-    Select(String),
     Start,
     Test,
     Stop,
     Configure,
+    CancelConfiguration,
     ReviewRemoval,
 }
 
@@ -126,19 +128,7 @@ impl fmt::Debug for ResultValue {
     }
 }
 
-#[derive(Clone, Eq, PartialEq)]
-struct Choice {
-    id: String,
-    name: String,
-    bytes: u64,
-    idle_minutes: u16,
-}
-
-impl fmt::Display for Choice {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{} ({})", self.name, &self.id[..8])
-    }
-}
+type Choice = mlx_models::Model;
 
 #[derive(Default)]
 pub(super) struct State {
@@ -148,9 +138,12 @@ pub(super) struct State {
     idle: String,
     never_unload: bool,
     java_review: bool,
+    configuration_open: bool,
     review: Option<Review>,
     choices: Vec<Choice>,
     selected: Option<String>,
+    inventory_selected: BTreeSet<String>,
+    row_statuses: BTreeMap<String, runtime_package::ModelStatus>,
     detached: bool,
     runtime: InstallationState,
     online: Option<Arc<online::Catalog>>,
@@ -160,6 +153,145 @@ pub(super) struct State {
 }
 
 impl State {
+    pub(super) fn inventory(&self) -> impl Iterator<Item = Row> + '_ {
+        self.choices.iter().map(|choice| {
+            let status = self
+                .row_statuses
+                .get(&choice.id)
+                .copied()
+                .unwrap_or(runtime_package::ModelStatus::Stopped);
+            Row::mlx(
+                &choice.id,
+                &choice.name,
+                choice.idle_minutes,
+                status.to_string(),
+            )
+        })
+    }
+
+    pub(super) fn inventory_selected(&self, id: &str) -> bool {
+        self.inventory_selected.contains(id)
+    }
+
+    pub(super) fn contains_model(&self, id: &str) -> bool {
+        self.choices.iter().any(|model| model.id == id)
+    }
+
+    pub(super) fn has_inventory_selection(&self) -> bool {
+        !self.inventory_selected.is_empty()
+    }
+
+    pub(super) fn selected_models(&self) -> impl Iterator<Item = &mlx_models::Model> {
+        self.choices
+            .iter()
+            .filter(|model| self.inventory_selected(&model.id))
+    }
+
+    pub(super) fn start_candidates(&self) -> impl Iterator<Item = &mlx_models::Model> {
+        use runtime_package::ModelStatus::{Failed, Stopped};
+        self.selected_models().filter(|model| {
+            matches!(
+                self.row_statuses.get(&model.id),
+                Some(Stopped | Failed) | None
+            ) && !(self.detached && self.selected.as_deref() == Some(&model.id))
+        })
+    }
+
+    pub(super) fn start_weights(&self, selected: &[super::managed::ReviewedModel]) -> u128 {
+        use runtime_package::ModelStatus::{Busy, Ready, Sleeping, Starting};
+        self.choices.iter().filter(|model| {
+            matches!(self.row_statuses.get(&model.id), Some(Starting | Ready | Busy | Sleeping))
+                || selected.iter().any(|entry| matches!(entry, super::managed::ReviewedModel::Mlx(reviewed) if reviewed.id == model.id))
+        }).map(|model| u128::from(model.bytes)).sum()
+    }
+
+    pub(super) fn can_stop_inventory_models(&self) -> bool {
+        self.inventory_selected.iter().any(|id| {
+            self.row_statuses.get(id).is_some_and(|status| {
+                matches!(
+                    status,
+                    runtime_package::ModelStatus::Ready
+                        | runtime_package::ModelStatus::Sleeping
+                        | runtime_package::ModelStatus::Failed
+                )
+            })
+        })
+    }
+
+    pub(super) fn inventory_stops(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.choices.iter().filter_map(|choice| {
+            (self.inventory_selected(&choice.id)
+                && self
+                    .row_statuses
+                    .get(&choice.id)
+                    .is_some_and(|status| *status != runtime_package::ModelStatus::Stopped))
+            .then_some((choice.id.as_str(), choice.name.as_str()))
+        })
+    }
+
+    pub(super) fn has_review(&self) -> bool {
+        self.review.is_some() || self.configuration_open
+    }
+
+    pub(super) fn configuration_open(&self) -> bool {
+        self.configuration_open
+    }
+
+    pub(super) fn begin_configuration(&mut self) -> bool {
+        if self.configuration_open
+            || self.review.is_some()
+            || self.choice().is_none()
+            || matches!(
+                self.status,
+                Some(runtime_package::ModelStatus::Starting | runtime_package::ModelStatus::Busy)
+            )
+        {
+            return false;
+        }
+        self.configuration_open = true;
+        true
+    }
+
+    pub(super) fn cancel_configuration(&mut self) {
+        if self.configuration_open {
+            self.select(self.choice().cloned());
+        }
+    }
+
+    pub(super) fn select_inventory(
+        &mut self,
+        selected: &BTreeSet<ModelId>,
+        lead: Option<&ModelId>,
+        profile: &Path,
+    ) {
+        self.inventory_selected = selected
+            .iter()
+            .filter_map(|id| match id {
+                ModelId::Mlx(id) => Some(id.clone()),
+                ModelId::Gguf(_) => None,
+            })
+            .collect();
+        let current = match lead {
+            Some(ModelId::Mlx(id)) => self.choices.iter().find(|choice| &choice.id == id).cloned(),
+            _ => None,
+        };
+        if self.choice() != current.as_ref() {
+            self.select(current);
+            self.refresh_status(profile);
+            self.refresh_reattachment(profile);
+        }
+    }
+
+    pub(super) fn runtime_summary(&self) -> Option<(&str, &str)> {
+        mlx_runtime::supported().then(|| match self.runtime.active_installation_id() {
+            Some(version) if self.runtime.pending_first_launch() => {
+                (version, "First launch pending")
+            }
+            Some(version) => (version, "Installed"),
+            None => ("—", "Not installed"),
+        })
+    }
+
     fn choice(&self) -> Option<&Choice> {
         self.choices
             .iter()
@@ -187,14 +319,25 @@ impl State {
         self.name.clone_from(&hint.name);
         self.set_idle_draft(idle_minutes);
         self.java_review = true;
+        self.configuration_open = true;
         true
     }
 
     pub(super) fn refresh_status(&mut self, profile: &Path) {
+        self.row_statuses = self
+            .choices
+            .iter()
+            .map(|choice| {
+                (
+                    choice.id.clone(),
+                    runtime_package::mlx_model_status(profile, &choice.id),
+                )
+            })
+            .collect();
         self.status = self
             .selected
             .as_deref()
-            .map(|id| runtime_package::mlx_model_status(profile, id));
+            .and_then(|id| self.row_statuses.get(id).copied());
     }
 
     fn refresh_reattachment(&mut self, profile: &Path) {
@@ -206,22 +349,19 @@ impl State {
     }
 
     pub(super) fn add_hub_model(&mut self, model: mlx_models::Model, profile: &Path) {
-        let choice = Choice {
-            id: model.id,
-            name: model.name,
-            bytes: model.bytes,
-            idle_minutes: model.idle_minutes,
-        };
+        let choice = model;
         self.choices.retain(|other| other.id != choice.id);
         self.choices.push(choice.clone());
         self.choices
             .sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+        self.inventory_selected = BTreeSet::from([choice.id.clone()]);
         self.select(Some(choice));
         self.refresh_status(profile);
         self.refresh_reattachment(profile);
     }
 
     pub(super) fn invalidate_review(&mut self) {
+        self.cancel_configuration();
         if !self.review.as_ref().is_some_and(Review::removal) {
             self.review = None;
         }
@@ -301,19 +441,10 @@ impl State {
             }
             ResultValue::Snapshot(models, runtime, notice) => {
                 self.runtime = runtime;
-                self.choices = models
-                    .into_iter()
-                    .map(|model| Choice {
-                        id: model.id,
-                        name: model.name,
-                        bytes: model.bytes,
-                        idle_minutes: model.idle_minutes,
-                    })
-                    .collect();
-                let selected = self
-                    .choice()
-                    .cloned()
-                    .or_else(|| self.choices.first().cloned());
+                self.choices = models;
+                self.inventory_selected
+                    .retain(|id| self.choices.iter().any(|choice| &choice.id == id));
+                let selected = self.choice().cloned();
                 self.select(selected);
                 self.refresh_status(profile);
                 self.refresh_reattachment(profile);
@@ -324,6 +455,7 @@ impl State {
 
     fn select(&mut self, choice: Option<Choice>) {
         self.java_review = false;
+        self.configuration_open = false;
         self.selected = choice.as_ref().map(|choice| choice.id.clone());
         self.name = choice
             .as_ref()
@@ -399,6 +531,92 @@ impl State {
         self.choices.is_empty()
     }
 
+    pub(super) fn configuration_view<'a>(
+        &'a self,
+        profile: &Path,
+        enabled: bool,
+        can_cancel: bool,
+        status: Option<&'a str>,
+        reveal: &Reveal,
+    ) -> Option<Element<'a, Message>> {
+        use super::{field, model_configuration};
+        use MlxSetting as Target;
+        let choice = self.choice().filter(|_| self.configuration_open)?;
+        let model_path = profile.join(mlx_models::BACKUP_DIRECTORY).join(&choice.id);
+        let setting = Setting::Mlx(Target::Idle);
+        let idle_enabled = enabled && !self.never_unload;
+        let edit_idle: fn(String) -> Message =
+            |value| Message::Mlx(Action::Edit(Field::Idle, value));
+        let idle = model_configuration::number(
+            reveal.input(
+                setting,
+                idle_enabled,
+                text_input("", &self.idle).on_input_maybe(idle_enabled.then_some(edit_idle)),
+            ),
+            &self.idle,
+            1..=1440,
+            1,
+            idle_enabled.then_some(edit_idle),
+        );
+        let name = Setting::Mlx(Target::Name);
+        let fields =
+            column![
+                reveal.wrap(
+                    name,
+                    field(
+                        "Name",
+                        reveal.input(
+                            name,
+                            enabled,
+                            text_input("Name", &self.name).on_input_maybe(enabled.then_some(
+                                |value| { Message::Mlx(Action::Edit(Field::Name, value)) }
+                            ))
+                        )
+                    )
+                ),
+                field(
+                    "Model directory",
+                    text(model_path.to_string_lossy().into_owned())
+                        .size(13)
+                        .wrapping(text::Wrapping::WordOrGlyph)
+                ),
+                field("Backend", text("MLX").size(13)),
+                field(
+                    "Unload after",
+                    row![
+                        reveal.action(setting, idle),
+                        text("minutes").size(13),
+                        reveal.action(
+                            Setting::Mlx(Target::NeverUnload),
+                            checkbox(self.never_unload).label("Never").on_toggle_maybe(
+                                enabled.then_some(|value| Message::Mlx(Action::NeverUnload(value)))
+                            )
+                        ),
+                    ]
+                    .spacing(8)
+                    .align_y(iced::Alignment::Center)
+                    .wrap()
+                ),
+            ]
+            .spacing(8);
+        let save = reveal.action(
+            Setting::Mlx(Target::Save),
+            button("Save").on_press_maybe(
+                (enabled && !self.name.trim().is_empty() && self.idle_value().is_some())
+                    .then_some(Message::Mlx(Action::Configure)),
+            ),
+        );
+        let cancel = crate::workspace::dialog_design::secondary_action("Cancel")
+            .on_press_maybe(can_cancel.then_some(Message::Mlx(Action::CancelConfiguration)));
+        Some(model_configuration::window(
+            fields.into(),
+            reveal.viewport.clone(),
+            status,
+            save,
+            cancel.into(),
+        ))
+    }
+
     pub(super) fn view(
         &self,
         can_edit: bool,
@@ -435,21 +653,6 @@ impl State {
             )
         };
         let selected = self.choice();
-        let models = pick_list(self.choices.as_slice(), selected, |choice| {
-            Message::Mlx(Action::Select(choice.id))
-        })
-        .placeholder("Choose a registered MLX model")
-        .width(Length::Fill);
-        let model_pick: Element<'_, Message> = if editing {
-            models.dismiss_on_escape()
-        } else {
-            text(
-                selected
-                    .map(|choice| choice.name.as_str())
-                    .unwrap_or("No MLX model selected"),
-            )
-            .into()
-        };
         Some(column![
             text("Managed Apple MLX").size(18),
             text("Install a signed runtime and import a local safetensors directory. MLX profiles serve text requests on this computer.").size(13),
@@ -516,7 +719,6 @@ impl State {
             ].spacing(8).wrap(),
             field(Target::Source, "Absolute path to a local MLX model directory", &self.source, Field::Source),
             action(Target::ReviewImport, "Review model import…", Action::ReviewModel, can_request && Path::new(self.source.trim()).is_absolute()),
-            reveal.wrap(Setting::Mlx(Target::Select), model_pick),
             selected.map(|choice| column![
                 text(format!("{} bytes · {}", choice.bytes, self.status.map_or_else(|| "Checking status".into(), |status| status.to_string()))).size(13),
                 row![
@@ -527,13 +729,6 @@ impl State {
                     action(Target::Stop, "Stop", Action::Stop, editing),
                     action(Target::ReviewRemoval, "Remove model…", Action::ReviewRemoval, editing),
                 ].spacing(8).wrap(),
-                field(Target::Name, "Model display name", &self.name, Field::Name),
-                field(Target::Idle, "Idle timeout (1–1440 minutes)", &self.idle, Field::Idle),
-                reveal.action(Setting::Mlx(Target::NeverUnload),
-                    checkbox(self.never_unload)
-                        .label("Never unload while idle")
-                        .on_toggle_maybe(editing.then_some(|value| Message::Mlx(Action::NeverUnload(value))))),
-                action(Target::Save, "Save MLX model settings", Action::Configure, can_request && !self.name.trim().is_empty() && self.idle_value().is_some()),
             ].spacing(8)),
             self.review.as_ref().and_then(|review| {
                 let (heading, detail, confirm) = match review {
@@ -607,6 +802,10 @@ impl Dialog {
         let requires_ai = action.requires_ai(&self.mlx);
         let profile = self.profile_dir.clone();
         let pending = match action {
+            Action::CancelConfiguration => {
+                self.cancel_model_configuration();
+                return Task::none();
+            }
             Action::Discard => {
                 self.mlx.review = None;
                 return Task::none();
@@ -668,7 +867,7 @@ impl Dialog {
                 Some(Review::Remove(choice)) if self.mlx.selected.as_ref() == Some(&choice.id) => {
                     runtime_package::work(move |_| {
                         runtime_package::with_stopped_mlx_model(&profile, &choice.id, || {
-                            mlx_models::Registry::new(&profile).remove(&choice.id)
+                            mlx_models::Registry::new(&profile).remove_reviewed(&choice)
                         })
                         .map_err(|error| error.to_string())?;
                         snapshot(&profile, format!("Removed MLX model {}.", choice.name))
@@ -722,8 +921,11 @@ impl Dialog {
                     mlx_runtime::unpin(&profile, &expected, cancelled).map(ResultValue::Unpinned)
                 })
             }
-            Action::NeverUnload(value) if self.mlx.choice().is_some() => {
+            Action::NeverUnload(value) if self.mlx.configuration_open => {
                 self.mlx.never_unload = value;
+                return Task::none();
+            }
+            Action::Edit(Field::Name | Field::Idle, _) if !self.mlx.configuration_open => {
                 return Task::none();
             }
             Action::Edit(Field::Idle, _) if self.mlx.never_unload => return Task::none(),
@@ -737,20 +939,6 @@ impl Dialog {
                     Field::Idle => &mut self.mlx.idle,
                 };
                 *target = limited(&value, 4096).into();
-                return Task::none();
-            }
-            Action::Select(id) => {
-                if let Some(choice) = self
-                    .mlx
-                    .choices
-                    .iter()
-                    .find(|choice| choice.id == id)
-                    .cloned()
-                {
-                    self.mlx.select(Some(choice));
-                    self.mlx.refresh_status(&profile);
-                    self.mlx.refresh_reattachment(&profile);
-                }
                 return Task::none();
             }
             Action::ReviewRemoval => {
@@ -813,6 +1001,7 @@ impl Dialog {
                         .map_err(|error| error.to_string())
                 })
             }
+            Action::Configure if !self.mlx.configuration_open => return Task::none(),
             Action::Start | Action::Test | Action::Stop | Action::Configure => {
                 let Some(choice) = self.mlx.choice().cloned() else {
                     return Task::none();
@@ -851,20 +1040,15 @@ impl Dialog {
                                 idle.ok_or("Enter an MLX idle timeout from 1 to 1440 minutes or choose Never unload.")?;
                             runtime_package::with_stopped_mlx_model(&profile, &choice.id, || {
                                 let registry = mlx_models::Registry::new(&profile);
-                                if java_review {
-                                    registry.configure_checked(&choice.id, &name, idle, |current| {
+                                registry.configure_checked(&choice.id, &name, idle, |current| {
+                                    if java_review {
                                         java_models::require_review_policy()?;
-                                        if current.name != choice.name
-                                            || current.idle_minutes != choice.idle_minutes
-                                            || current.bytes != choice.bytes
-                                        {
-                                            return Err(std::io::Error::other("The selected MLX model changed. Refresh and review it again."));
-                                        }
-                                        Ok(())
-                                    })
-                                } else {
-                                    registry.configure(&choice.id, &name, idle)
-                                }
+                                    }
+                                    if current != &choice {
+                                        return Err(std::io::Error::other("The selected MLX model changed. Refresh and review it again."));
+                                    }
+                                    Ok(())
+                                })
                             })
                             .map_err(|error| error.to_string())?;
                             "Saved the MLX model settings."
@@ -885,7 +1069,7 @@ impl Dialog {
     }
 }
 
-fn snapshot(profile: &Path, notice: String) -> Result<ResultValue, String> {
+pub(super) fn snapshot(profile: &Path, notice: String) -> Result<ResultValue, String> {
     let models = mlx_models::Registry::new(profile)
         .list()
         .map_err(|error| error.to_string())?;
@@ -972,12 +1156,14 @@ mod tests {
             return;
         }
 
-        let choice = Choice {
-            id: "0123456789abcdef0123456789abcdef".into(),
-            name: "Fixture".into(),
-            bytes: 1024,
-            idle_minutes: 10,
-        };
+        let choice: Choice = serde_json::from_value(serde_json::json!({
+            "id": "0123456789abcdef0123456789abcdef",
+            "name": "Fixture",
+            "bytes": 1024,
+            "idle_minutes": 10,
+            "assets": {},
+        }))
+        .unwrap();
         manager.local.mlx.choices.push(choice.clone());
         manager.local.mlx.selected = Some(choice.id.clone());
         manager.local.mlx.name.clone_from(&choice.name);
@@ -998,7 +1184,13 @@ mod tests {
             assert_eq!(manager.revealed.setting, Some(destination));
             let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
             let mut interface = UserInterface::build(
-                manager.view(Vec::new(), Vec::new()),
+                if setting == MlxSetting::RuntimeSignature {
+                    manager.view(Vec::new(), Vec::new())
+                } else {
+                    manager
+                        .model_configuration_view()
+                        .expect("MLX configuration window")
+                },
                 Size::new(900.0, 480.0),
                 Cache::default(),
                 &mut renderer,
@@ -1090,6 +1282,7 @@ mod tests {
         );
         manager.page = Page::LocalModels;
         manager.local.mlx.add_hub_model(existing, &root);
+        assert!(manager.local.mlx.begin_configuration());
         assert!(manager.local.mlx.never_unload);
         assert_eq!(manager.local.mlx.idle_value(), Some(0));
         assert_eq!(
@@ -1172,6 +1365,31 @@ mod tests {
         let test = test_profile(&profile.0, id).unwrap();
         assert_eq!(test.usage_estimate_profile().0, id);
         assert_eq!(test.effective_output_limit(), 32);
+    }
+
+    #[test]
+    fn mlx_configuration_cancel_restores_the_registered_draft() {
+        let choice: Choice = serde_json::from_value(serde_json::json!({
+            "id": "0123456789abcdef0123456789abcdef",
+            "name": "Original",
+            "bytes": 0,
+            "idle_minutes": 37,
+            "assets": {},
+        }))
+        .unwrap();
+        let mut state = State {
+            choices: vec![choice.clone()],
+            ..State::default()
+        };
+        state.select(Some(choice.clone()));
+        assert!(state.begin_configuration());
+        state.name = "Unsaved".into();
+        state.never_unload = true;
+        state.cancel_configuration();
+        assert!(!state.configuration_open());
+        assert!(state.choice() == Some(&choice));
+        assert_eq!(state.name, "Original");
+        assert_eq!(state.idle_value(), Some(37));
     }
 
     #[test]

@@ -9,7 +9,8 @@ mod process;
 #[cfg(test)]
 pub(crate) use install::review_removal as inspect_removal;
 pub(crate) use install::{
-    RemovalPlan, active_package, active_package_backend, lock_active_package,
+    RemovalPlan, active_package, active_package_backend, active_package_summary,
+    lock_active_package,
 };
 pub(super) use pool::acquire_mlx;
 pub(super) use pool::{Lease, acquire as acquire_model};

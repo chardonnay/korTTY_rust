@@ -2,7 +2,9 @@
 
 use std::time::{Duration, Instant};
 
-use iced::widget::{Canvas, Id, button, column, container, pick_list, responsive, row, text};
+use iced::widget::{
+    Canvas, Id, button, column, container, pick_list, responsive, row, text, tooltip,
+};
 use iced::{Element, Length, Task, window};
 
 use crate::terminal_agent::design::{Approval, Arrangement, Layout, Status, inline};
@@ -17,8 +19,8 @@ mod canvas;
 
 const READ: &str = "du -xh /var --max-depth=2 | sort -h | tail -3";
 const VACUUM: &str = "sudo journalctl --vacuum-size=500M";
-const GOAL: &str = "Why is /var almost full?";
-const ANSWER: &str = "The system journal used 21.4 GB. The approved cleanup freed 20.9 GB.";
+const GOAL: &str = "why is /var almost full?";
+const ANSWER: &str = "/var/log/journal takes 21.4 GB of the 37 GB. Old journals can be shrunk safely: journalctl --vacuum-size=500M";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Token {
@@ -40,6 +42,7 @@ pub(crate) enum Action {
 }
 
 pub(super) struct Demo {
+    pub(super) layout: Layout,
     generation: u64,
     stage: u8,
     playing: bool,
@@ -52,6 +55,7 @@ pub(super) struct Demo {
 impl Default for Demo {
     fn default() -> Self {
         let mut demo = Self {
+            layout: Layout::default(),
             generation: 1,
             stage: 0,
             playing: true,
@@ -120,6 +124,11 @@ impl Demo {
         match action {
             Action::Replay => return self.replay(),
             Action::Pause if self.active() => self.playing = !self.playing,
+            Action::Interact(token, SampleAction::Pause)
+                if token == self.token() && self.active() && self.stage != 3 =>
+            {
+                self.playing = !self.playing;
+            }
             Action::Details => self.expanded = !self.expanded,
             Action::Tick(token) if token == self.token() && self.playing && self.active() => {
                 self.stage += 1
@@ -150,7 +159,7 @@ impl Demo {
 
     fn sync_sample(&mut self) {
         let model = self.model();
-        self.sample.sync(&model);
+        self.sample.sync(&model, self.layout);
     }
 
     fn phase(&self) -> &'static str {
@@ -171,7 +180,7 @@ impl Demo {
     fn model(&self) -> Transcript {
         let mut model = Transcript {
             goal: GOAL.into(),
-            elapsed_ms: [500, 1700, 3000, 5300, 7800, 9200, 5300][usize::from(self.stage)],
+            elapsed_ms: [0, 1200, 2500, 4800, 7300, 8700, 4800][usize::from(self.stage)],
             expanded: self.expanded,
             state: match self.stage {
                 _ if self.cancelled => State::Cancelled,
@@ -198,10 +207,15 @@ impl Demo {
             model.upsert(Step {
                 id: 2,
                 kind: Kind::Thinking,
-                title: "Find the largest directories before proposing changes".into(),
+                title: if self.stage == 1 {
+                    "Thinking"
+                } else {
+                    "The journal is the largest item under /var"
+                }
+                .into(),
                 detail: "Read disk usage and measure the journal. Ask for approval before cleanup."
                     .into(),
-                tokens: Some(128),
+                tokens: (self.stage > 1).then_some(1_284),
                 state: if self.stage == 1 {
                     StepState::Running
                 } else {
@@ -209,7 +223,7 @@ impl Demo {
                 },
                 ..Step::default()
             });
-            model.tokens = Some(128);
+            model.tokens = (self.stage > 1).then_some(1_284);
         }
         if self.stage >= 2 {
             model.upsert(Step {
@@ -253,6 +267,12 @@ impl Demo {
         if self.stage == 4 || self.stage == 5 {
             model.upsert(Step {
                 id: 5,
+                kind: Kind::Question,
+                title: "Shrink the journal to 500 MB?".into(),
+                ..Step::default()
+            });
+            model.upsert(Step {
+                id: 6,
                 kind: Kind::Action,
                 title: "Shrink the journal".into(),
                 command: Some(VACUUM.into()),
@@ -304,6 +324,7 @@ pub(super) fn view(
     dock: super::DockPreferences,
     auto_hide_seconds: u8,
     reduced_motion: bool,
+    show_options: bool,
     id: window::Id,
 ) -> Element<'_, Desktop> {
     let mut model = demo.model();
@@ -380,7 +401,6 @@ pub(super) fn view(
         demo.sample.view(terminal, &preview, bounds, map)
     });
     let mut controls = row![
-        container(button("Replay").on_press(message(id, Action::Replay))).id("agent-demo-replay"),
         button(if demo.playing {
             "Pause demo"
         } else {
@@ -409,15 +429,44 @@ pub(super) fn view(
             map(SampleAction::Grid(grid))
         })
     });
+    let actions = row![
+        container(
+            button(text("Replay").size(13))
+                .style(crate::workspace::dialog_design::secondary_button)
+                .on_press(message(id, Action::Replay))
+        )
+        .id("agent-demo-replay"),
+        tooltip(
+            crate::workspace::dialog_design::secondary_action("…").on_press(Desktop::Settings(
+                Message::AgentDesignCatalog(id, Edit::TogglePreviewOptions)
+            )),
+            text(if show_options {
+                "Hide sample and dock options"
+            } else {
+                "Show sample and dock options"
+            })
+            .size(13),
+            tooltip::Position::Bottom,
+        ),
+    ]
+    .spacing(6)
+    .align_y(iced::Alignment::Center);
     column![
-        text("Design preview").size(17),
+        text("Preview").size(13),
         grid,
         container(scene)
-            .height(384)
+            .height(360)
             .width(Length::Fill)
-            .style(container::bordered_box),
-        text("Sample only. Commands are never executed.").size(12),
-        controls.wrap(),
+            .padding(1)
+            .style(|theme: &iced::Theme| {
+                crate::workspace::dialog_design::page(theme).border(iced::Border {
+                    color: theme.extended_palette().background.strong.color,
+                    width: 1.0,
+                    radius: 4.0.into(),
+                })
+            }),
+        actions,
+        show_options.then(|| controls.wrap()),
     ]
     .spacing(6)
     .into()

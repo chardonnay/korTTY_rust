@@ -139,7 +139,7 @@ pub(in crate::ai_manager::local) fn retire(
         .delete(receipt.generation, check)
 }
 
-pub(super) fn automatic_coverage(
+pub(in crate::ai_manager::local) fn retained_coverage(
     saved: &Scope,
     reviewed: &Scope,
     previous: &Scope,

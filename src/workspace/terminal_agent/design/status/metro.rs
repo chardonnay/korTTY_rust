@@ -1,15 +1,24 @@
 //! The d08 rail projects typed steps into stations and animates only the visible rail.
 
 use std::f32::consts::TAU;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use iced::widget::{button, canvas, column, container, responsive, row, stack, text, tooltip};
-use iced::{Alignment, Element, Event, Length, Point, Rectangle, Renderer, Theme, mouse, window};
+use iced::widget::{
+    button, canvas, column, container, responsive, row, scrollable, space, stack, text, tooltip,
+};
+use iced::{
+    Alignment, Color, Element, Event, Font, Point, Rectangle, Renderer, Theme, font, mouse, window,
+};
 
+use crate::terminal_agent::design::Status;
 use crate::terminal_agent::design::inline::{Kind, State, Step, StepState};
+use crate::workspace::terminal_agent::design::{actions, log_table};
 
+use super::top_bar::icon;
 use super::{AgentMessage, Message, Palette, Tone, Trace, history, palette};
 
+const BAR_HEIGHT: f32 = 52.0;
 const HEIGHT: f32 = 32.0;
 const RAIL_Y: f32 = 9.0;
 const STATION_WIDTH: f32 = 58.0;
@@ -277,11 +286,11 @@ impl canvas::Program<AgentMessage> for Track {
             };
             if mark == Mark::Attention || pulsing {
                 frame.fill(
-                    &canvas::Path::circle(point, 7.4),
+                    &canvas::Path::circle(point, 8.0),
                     stroke.scale_alpha(0.24 + 0.22 * alpha),
                 );
             }
-            let dot = canvas::Path::circle(point, 4.4 + 1.3 * alpha);
+            let dot = canvas::Path::circle(point, 5.4 + 1.3 * alpha);
             frame.fill(&dot, fill);
             frame.stroke(
                 &dot,
@@ -309,14 +318,10 @@ fn station_label<'a>(station: &Station<'a>, width: f32, live: bool) -> Element<'
                 _ => None,
             },
         });
-    let message = if live {
-        match station.id {
-            Id::Step(id) => Some(AgentMessage::Design(Message::SelectStep(id))),
-            Id::Review => Some(AgentMessage::Focus),
-            Id::Answer => None,
-        }
-    } else {
-        None
+    let message = match station.id {
+        Id::Step(id) => Some(AgentMessage::Design(Message::SelectStep(id))),
+        Id::Review if live => Some(AgentMessage::Focus),
+        _ => None,
     };
     let label = container(label)
         .center_x(width)
@@ -347,8 +352,8 @@ pub(super) fn view<'a>(
     phase: &'a str,
     trace: &Trace<'a>,
     palette: Option<Palette>,
-    has_archive: bool,
 ) -> Element<'a, AgentMessage> {
+    let palette = Some(palette.unwrap_or_else(Palette::default_status));
     let cancelled = trace.run.map_or_else(
         || {
             activity
@@ -357,7 +362,7 @@ pub(super) fn view<'a>(
         },
         |run| run.phase == super::Phase::Cancelled,
     );
-    let stations = stations(trace, phase, cancelled);
+    let stations = Rc::new(stations(trace, phase, cancelled));
     let current = current(&stations);
     let (started, active, live, moving) = (
         trace.started_at,
@@ -365,7 +370,7 @@ pub(super) fn view<'a>(
         trace.run.is_some(),
         trace.active && !trace.paused && !trace.reduced_motion,
     );
-    let rail = responsive(move |size| {
+    let rail = move |size: iced::Size| {
         let hidden = hidden_stations(size.width, stations.len());
         let shown = &stations[hidden..];
         let count = shown.len() + usize::from(hidden > 0);
@@ -404,41 +409,125 @@ pub(super) fn view<'a>(
             .width(total_width)
             .height(HEIGHT)
             .into()
+    };
+    let goal = history::summary(activity.goal);
+    let active_runs = trace.active_runs;
+    let (paused, waiting, elapsed) = (trace.paused, trace.waiting, trace.elapsed_label());
+    let hide = trace.run.map_or(
+        AgentMessage::Design(Message::HideStatus),
+        actions::hide_status,
+    );
+    let sample_tokens = (!live)
+        .then(|| activity.transcript.and_then(|value| value.tokens))
+        .flatten();
+    responsive(move |size| {
+        let title = metro_title(&goal, active, active_runs, (size.width * 0.29).min(170.0));
+        let track = responsive(rail.clone()).height(HEIGHT);
+        let actions = row![
+            icon(
+                if paused { "▶" } else { "Ⅱ" },
+                if paused { "Resume" } else { "Pause" },
+                (active && !waiting).then_some(AgentMessage::Pause)
+            ),
+            icon("■", "Cancel run", active.then_some(AgentMessage::Cancel)),
+            log_table::status_icon_menu(activity, Status::Metro, |action| {
+                icon("⋯", "More actions", Some(action))
+            }),
+            icon("✕", "Hide Agent status", Some(hide.clone())),
+        ]
+        .spacing(5)
+        .align_y(Alignment::Center);
+        let mut bar = row![
+            if size.width >= 290.0 {
+                Some(title)
+            } else {
+                None
+            },
+            track
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center);
+        if size.width >= 450.0 {
+            let usage = super::usage_label(activity, palette);
+            if let Some(tokens) = sample_tokens.filter(|_| usage.is_none()) {
+                let muted = palette.map(|palette| palette.muted.color());
+                bar = bar.push(
+                    text(format!("{} · {elapsed}", super::compact_tokens(tokens)))
+                        .size(11)
+                        .style(move |_| text::Style { color: muted }),
+                );
+            } else {
+                bar = bar.push(usage).push(text(elapsed.clone()).size(11));
+            }
+        }
+        if size.width < 220.0 {
+            let scrollbar = scrollable::Scrollbar::new().width(2).scroller_width(2);
+            bar = bar.push(
+                container(
+                    scrollable(actions).direction(scrollable::Direction::Horizontal(scrollbar)),
+                )
+                .max_width((size.width - 96.0).max(0.0)),
+            );
+        } else {
+            bar = bar.push(actions);
+        }
+        palette::panel(
+            palette,
+            container(bar)
+                .center_y(BAR_HEIGHT)
+                .padding([0, 8])
+                .clip(true),
+        )
+    })
+    .height(BAR_HEIGHT)
+    .into()
+}
+
+fn metro_title<'a>(
+    goal: &str,
+    active: bool,
+    active_runs: usize,
+    width: f32,
+) -> Element<'a, AgentMessage> {
+    let dot = container(space().width(7).height(7)).style(move |theme: &Theme| {
+        container::Style::default()
+            .background(if active {
+                theme.palette().primary
+            } else {
+                Color::TRANSPARENT
+            })
+            .border(iced::border::rounded(4))
     });
-    let mut header = row![
-        text(format!("Agent · {phase}")).size(12),
-        tooltip(
-            text(short_text(activity.goal, 27)).size(11),
-            container(text(activity.goal).size(12))
-                .padding(5)
-                .max_width(360),
-            tooltip::Position::Top,
-        ),
-        text(trace.elapsed_label()).size(11),
+    let mut title = row![
+        dot,
+        text("AI agent").size(13).font(Font {
+            weight: font::Weight::Bold,
+            ..Font::DEFAULT
+        })
     ]
-    .spacing(8)
+    .spacing(6)
     .align_y(Alignment::Center);
-    if trace.active_runs > 1 {
-        header = header.push(text(format!("+{}", trace.active_runs - 1)).size(11));
+    if active_runs > 1 {
+        title = title.push(text(format!("+{}", active_runs - 1)).size(11));
     }
-    if let Some(usage) = super::usage_label(activity, palette) {
-        header = header.push(usage);
-    }
-    if let Some(controls) = super::bar_controls(
-        trace,
-        has_archive,
-        activity.presentation.drawer_open(),
-        false,
-        Message::ToggleDrawer,
-    ) {
-        header = header.push(controls.wrap());
-    }
-    palette::panel(
-        palette,
-        container(column![header.wrap(), container(rail).height(HEIGHT)])
-            .padding([1, 6])
-            .width(Length::Fill),
+    container(
+        column![
+            title,
+            tooltip(
+                text(goal.to_owned())
+                    .size(11)
+                    .wrapping(text::Wrapping::None),
+                container(text(goal.to_owned()).size(12))
+                    .padding(5)
+                    .max_width(360),
+                tooltip::Position::Top,
+            ),
+        ]
+        .spacing(3),
     )
+    .width(width)
+    .clip(true)
+    .into()
 }
 
 #[cfg(test)]

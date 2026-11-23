@@ -168,8 +168,13 @@ fn numbered_history_review(history: History) {
     );
     let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
     let mut ui = UserInterface::build(pane, size, Cache::default(), &mut renderer);
+    let cancel = if history == History::Timeline {
+        "2 Cancel"
+    } else {
+        "[2] Cancel"
+    };
     let mut messages =
-        super::pip::click_log_label(&mut ui, &mut renderer, "[2] Cancel", mouse::Button::Left);
+        super::pip::click_log_label(&mut ui, &mut renderer, cancel, mouse::Button::Left);
     drop(ui);
     assert!(
         matches!(&messages[..], [Desktop::TerminalAgent(actual, Message::PanelReview(_))] if *actual == id),
@@ -634,7 +639,7 @@ fn top_bar_drawer_lists_exact_steps_without_resizing_the_terminal() {
         Cache::default(),
         &mut renderer,
     );
-    let mut messages = click_log_label(&mut ui, &mut renderer, "Details", mouse::Button::Left);
+    let mut messages = click_log_label(&mut ui, &mut renderer, "▾", mouse::Button::Left);
     drop(ui);
     assert!(
         matches!(messages.as_slice(), [Desktop::TerminalAgent(actual, Message::Design(design::Message::ToggleDrawer))] if *actual == id)
@@ -677,16 +682,17 @@ fn top_bar_drawer_lists_exact_steps_without_resizing_the_terminal() {
 
     let split = Size::new(720.0, 420.0);
     let closed = terminal_bounds(&fixture, stream, split);
-    assert!(closed.width < 460.0, "{closed:?}");
+    // The 240-pixel timeline and its 3-pixel divider sit beside the terminal.
+    assert_eq!(closed.width, split.width - 240.0 - 3.0);
     let mut ui = UserInterface::build(
         design_fixture(&fixture, stream, split),
         split,
         Cache::default(),
         &mut renderer,
     );
-    let details = log_label_position(&mut ui, &renderer, "Details");
+    let details = log_label_position(&mut ui, &renderer, "▾");
     assert!(details.x < closed.x + closed.width, "{details:?}");
-    let messages = click_log_label(&mut ui, &mut renderer, "Details", mouse::Button::Left);
+    let messages = click_log_label(&mut ui, &mut renderer, "▾", mouse::Button::Left);
     drop(ui);
     assert!(
         matches!(messages.as_slice(), [Desktop::TerminalAgent(actual, Message::Design(design::Message::ToggleDrawer))] if *actual == id)

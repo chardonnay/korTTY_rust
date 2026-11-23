@@ -1,7 +1,37 @@
+use std::collections::BTreeSet;
+
 use iced::keyboard::{Key, Location, Modifiers, key::Named};
 use kortty_terminal::{KeyModifiers, ScreenSnapshot, TerminalKey, TerminalProfile, TextEncoding};
 
 use crate::session::{IbmAid, IbmEdit, IbmInput, IbmKind};
+
+pub(crate) fn select_row<T: Clone + Ord>(
+    rows: &mut BTreeSet<T>,
+    anchor: &mut Option<T>,
+    row: T,
+    visible: &[T],
+    modifiers: Modifiers,
+) {
+    if modifiers.shift()
+        && let Some(anchor) = anchor.as_ref()
+        && let Some(start) = visible.iter().position(|item| item == anchor)
+        && let Some(end) = visible.iter().position(|item| item == &row)
+    {
+        if !modifiers.command() {
+            rows.clear();
+        }
+        rows.extend(visible[start.min(end)..=start.max(end)].iter().cloned());
+    } else if modifiers.command() {
+        if !rows.remove(&row) {
+            rows.insert(row.clone());
+        }
+        *anchor = Some(row);
+    } else {
+        rows.clear();
+        *anchor = Some(row.clone());
+        rows.insert(row);
+    }
+}
 
 pub fn encode_ibm_key(
     kind: IbmKind,
