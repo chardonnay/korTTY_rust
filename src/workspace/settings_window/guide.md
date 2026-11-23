@@ -54,6 +54,12 @@ Configure startup geometry, the dashboard, session restoration and toolbar icon 
 
 Find a command by its name or menu and record the keys you want to use. Resolve duplicate assignments before saving. Reset a command to restore its default shortcut.
 
+## Settings · Security
+
+**Change master password…** opens the Credential Vault. If the vault is locked, unlock it first. The vault then asks for the current password and the new password twice. Enter and confirm them in the vault window.
+
+Enable **Require master password at startup** and choose **Save** to unlock or create the vault before the next workspace opens. An installation policy can require this and lock the setting.
+
 ## Settings · Editor
 
 Choose a block, line or underscore cursor and enter a cursor color as `#RRGGBB`. File editors use the terminal font and colors. Use **Reset zoom** in a file editor to restore the current terminal font size.

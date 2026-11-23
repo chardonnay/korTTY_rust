@@ -76,6 +76,7 @@ pub enum Section {
     Export,
     Window,
     Keyboard,
+    Security,
     Editor,
     SnippetEditor,
     AgentDesign,
@@ -84,7 +85,7 @@ pub enum Section {
 }
 
 impl Section {
-    pub(in crate::workspace) const ALL: [Self; 17] = [
+    pub(in crate::workspace) const ALL: [Self; 18] = [
         Self::Font,
         Self::Colors,
         Self::Themes,
@@ -98,6 +99,7 @@ impl Section {
         Self::Updates,
         Self::Window,
         Self::Keyboard,
+        Self::Security,
         Self::Sftp,
         Self::Editor,
         Self::SnippetEditor,
@@ -118,6 +120,7 @@ impl Section {
             Self::Export => "Export",
             Self::Window => "Window",
             Self::Keyboard => "Keyboard",
+            Self::Security => "Security",
             Self::Editor => "Editor",
             Self::SnippetEditor => "Snippet Editor",
             Self::AgentDesign => "AI Agent Design",
@@ -230,6 +233,7 @@ pub enum Setting {
     ExportSnippetCode,
     ToolbarIconSize,
     StartupMasterPassword,
+    ChangeMasterPassword,
     RememberGeometry,
     RememberDashboard,
     FixedGeometry,
@@ -326,6 +330,7 @@ impl Setting {
         Self::ExportSnippetCode,
         Self::ToolbarIconSize,
         Self::StartupMasterPassword,
+        Self::ChangeMasterPassword,
         Self::RememberGeometry,
         Self::RememberDashboard,
         Self::FixedGeometry,
@@ -434,6 +439,7 @@ impl Setting {
             Self::ExportSnippetCode => "Include full script in analysis reports by default",
             Self::ToolbarIconSize => "Toolbar icon size",
             Self::StartupMasterPassword => "Require master password at startup",
+            Self::ChangeMasterPassword => "Change master password",
             Self::RememberGeometry => "Remember window geometry",
             Self::RememberDashboard => "Remember dashboard state",
             Self::FixedGeometry => "Use fixed window geometry",
@@ -527,8 +533,8 @@ impl Setting {
             | Self::JournalVision
             | Self::JournalAutomaticVision => Section::Logging,
             Self::ExportWatermark | Self::ExportFooter | Self::ExportSnippetCode => Section::Export,
+            Self::StartupMasterPassword | Self::ChangeMasterPassword => Section::Security,
             Self::ToolbarIconSize
-            | Self::StartupMasterPassword
             | Self::RememberGeometry
             | Self::RememberDashboard
             | Self::FixedGeometry
@@ -672,6 +678,7 @@ impl Setting {
             }
             Self::ToolbarIconSize => "symbol size toolbar button pixels appearance",
             Self::StartupMasterPassword => "vault unlock startup login authentication security",
+            Self::ChangeMasterPassword => "vault rotate credential password security",
             Self::RememberGeometry => "startup normal bounds size position maximized",
             Self::RememberDashboard => "startup show hide dashboard state navigation dock",
             Self::FixedGeometry => "startup width height fixed window position dimensions",
@@ -766,6 +773,7 @@ pub enum Message {
         Result<crate::recording_window::preferences::Preferences, String>,
     ),
     Startup(window::Id, startup_settings::Edit),
+    ChangeMasterPassword(window::Id),
     ToolWindowTabs(window::Id, bool),
     ConnectionColorBorder(window::Id, bool),
     SplitPaneFocusRing(window::Id, bool),
@@ -1457,6 +1465,24 @@ impl Workspace {
                     .map(|dialog| dialog.section.guide_chapter())
                     .map_or_else(Task::none, |chapter| self.show_manual_chapter(&chapter));
             }
+            Message::ChangeMasterPassword(id) => {
+                let Some(dialog) = self
+                    .settings
+                    .0
+                    .as_ref()
+                    .filter(|dialog| dialog.id == id && dialog.section == Section::Security)
+                else {
+                    return Task::none();
+                };
+                let opened = self.show_vault(dialog.owner);
+                return match self.vault_id {
+                    Some(vault) => opened.chain(Task::done(Desktop::Vault(
+                        vault,
+                        crate::vault_window::Message::ChangeMaster,
+                    ))),
+                    None => opened,
+                };
+            }
             Message::Escape(id) => {
                 return self.dismiss_settings(id);
             }
@@ -1819,13 +1845,16 @@ impl Workspace {
                     (size != self.chrome.toolbar_icon_size()).then_some(size);
                 dialog.problem = None;
             }
-            Message::Startup(_, edit) if dialog.section == Section::Window => {
-                if matches!(edit, startup_settings::Edit::MasterPassword(_))
-                    && (self.clipboard.policy.problem.is_some()
-                        || self.clipboard.policy.require_master_password)
-                {
-                    return Task::none();
-                }
+            Message::Startup(_, edit)
+                if match edit {
+                    startup_settings::Edit::MasterPassword(_) => {
+                        dialog.section == Section::Security
+                            && self.clipboard.policy.problem.is_none()
+                            && !self.clipboard.policy.require_master_password
+                    }
+                    _ => dialog.section == Section::Window,
+                } =>
+            {
                 dialog
                     .startup
                     .update(&mut dialog.draft.preferences.startup, edit);
@@ -3247,6 +3276,7 @@ impl Workspace {
             Section::Logging => self.logging_settings_page(dialog),
             Section::Export => export_settings::view(dialog),
             Section::Window => self.window_settings_page(dialog, transparency),
+            Section::Security => self.security_settings_page(dialog),
             Section::Keyboard => highlighted(
                 dialog,
                 Setting::Shortcuts,
@@ -3805,6 +3835,53 @@ impl Workspace {
             .into()
     }
 
+    fn security_settings_page(&self, dialog: &Dialog) -> Element<'static, Desktop> {
+        let id = dialog.id;
+        let policy = &self.clipboard.policy;
+        let require_password = policy.require_master_password
+            || dialog.draft.preferences.startup.require_master_password;
+        let password_editable = policy.problem.is_none() && !policy.require_master_password;
+        column![
+            text("Master password").size(18),
+            text("Your master password unlocks the local credential vault.").size(13),
+            highlighted(
+                dialog,
+                Setting::ChangeMasterPassword,
+                dialog_design::secondary_action("Change master password…")
+                    .on_press(Desktop::Settings(Message::ChangeMasterPassword(id))),
+            ),
+            rule::horizontal(1),
+            highlighted(
+                dialog,
+                Setting::StartupMasterPassword,
+                column![
+                    checkbox(require_password)
+                        .label(Setting::StartupMasterPassword.label())
+                        .on_toggle_maybe(password_editable.then_some(move |enabled| {
+                            Desktop::Settings(Message::Startup(
+                                id,
+                                startup_settings::Edit::MasterPassword(enabled),
+                            ))
+                        })),
+                    if policy.require_master_password {
+                        text("Managed by your organization.").size(13)
+                    } else if policy.problem.is_some() {
+                        text("The startup setting is locked until the policy can be read.").size(13)
+                    } else {
+                        text("Takes effect the next time korTTY starts.").size(13)
+                    },
+                    (!require_password).then(|| text(
+                        "Unlock the vault manually when you need saved credentials."
+                    )
+                    .size(13)),
+                ]
+                .spacing(5),
+            ),
+        ]
+        .spacing(12)
+        .into()
+    }
+
     fn window_settings_page<'a>(
         &self,
         dialog: &'a Dialog,
@@ -3937,25 +4014,6 @@ impl Workspace {
             )),
             (None, _) => page.push(text("Session recovery is unavailable.").size(14)),
         };
-        let master_password_managed = self.clipboard.policy.require_master_password;
-        let edit_master_password =
-            !master_password_managed && self.clipboard.policy.problem.is_none();
-        page = page.push(highlighted(
-            dialog,
-            Setting::StartupMasterPassword,
-            column![
-                checkbox(master_password_managed || startup.require_master_password)
-                    .label(Setting::StartupMasterPassword.label())
-                    .on_toggle_maybe(edit_master_password.then_some(move |enabled| {
-                        Desktop::Settings(Message::Startup(id, startup_settings::Edit::MasterPassword(enabled)))
-                    })),
-                text(if master_password_managed {
-                    "Managed by your organization."
-                } else {
-                    "Unlock or create the credential vault before opening the workspace. Takes effect at the next start."
-                }).size(13),
-            ].spacing(4),
-        ));
         let output = dialog.draft.preferences.restore_output;
         let managed = self.clipboard.policy.session_restore_output;
         let enabled = managed.unwrap_or(output.enabled);
@@ -5122,6 +5180,50 @@ mod tests {
         assert!(workspace.settings.0.as_ref().unwrap().search.is_empty());
         let _ = workspace.update_settings(Message::Escape(id));
         assert!(workspace.settings.for_owner(owner).is_none());
+    }
+
+    #[test]
+    fn settings_security_search_reveals_master_password_controls_and_respects_policy() {
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.open_settings(owner, Some(Section::Window));
+        let id = workspace.settings.for_owner(owner).unwrap();
+
+        let _ = workspace.update_settings(Message::Search(id, "change master password".into()));
+        let _ = workspace.update_settings(Message::SearchChoose(id));
+        let dialog = workspace.settings.0.as_ref().unwrap();
+        assert_eq!(dialog.section, Section::Security);
+        assert_eq!(dialog.revealed, Some(Setting::ChangeMasterPassword));
+
+        let _ = workspace.update_settings(Message::Search(
+            id,
+            "require master password at startup".into(),
+        ));
+        let _ = workspace.update_settings(Message::SearchChoose(id));
+        assert_eq!(
+            workspace.settings.0.as_ref().unwrap().revealed,
+            Some(Setting::StartupMasterPassword)
+        );
+
+        let edit = |enabled| Message::Startup(id, startup_settings::Edit::MasterPassword(enabled));
+        let _ = workspace.update_settings(edit(true));
+        assert!(!workspace.window_settings.startup.require_master_password);
+        workspace.clipboard.policy.require_master_password = true;
+        let _ = workspace.update_settings(edit(false));
+        assert!(
+            workspace
+                .settings
+                .0
+                .as_ref()
+                .unwrap()
+                .draft
+                .preferences
+                .startup
+                .require_master_password
+        );
+        workspace.clipboard.policy.require_master_password = false;
+        let _ = workspace.save_settings_to(id, |_| Ok(()));
+        assert!(workspace.window_settings.startup.require_master_password);
     }
 
     #[test]

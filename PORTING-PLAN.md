@@ -45,6 +45,7 @@ records the broader comparison with the tagged Java release.
 
 | Area | Remaining change | Completion check |
 | --- | --- | --- |
+| D4 · Security settings | The native Security page includes password rotation and the managed startup requirement. Compare the Java global temporary-key switch and isolation default with the native connection routes. Resolve Java's optional startup auto-unlock against native vault custody. | Exercise the defaults in normal entry points, check managed floors, and extend the native Security comparison to the complete page. [Security checkpoint](PORTING-PARITY.md#november-23-settings-security) |
 | D4 · Searchable controls | Compare the remaining Java Settings and AI Manager pages, subpages and labeled controls with the Rust search inventory. Add reachable missing destinations alongside the dialog comparisons. | Verify that controls on a page that has never been opened are discoverable, and that navigation reveals the exact control with the current page state and policy. |
 
 The [November 23 review](PORTING-PARITY.md#november-23-dialog-parity-review)
@@ -86,19 +87,19 @@ The shared Settings frame and Font page now follow the Normal Java design.
 The Window page groups tool-window hosting with window preferences. A
 Windows ARM64 comparison covered both pages, search result focus, the
 font-size preview and cancellation. A direct-start recheck confirmed the
-Font field order. Rust has 17 tabs in a scrolling strip. Java has 21
-sections and an overflow menu.
-Resources, Security, Privacy, Language
+Font field order. Rust has 18 tabs in a scrolling strip. Java has 21
+sections and an overflow menu. The first Security comparison covered the
+master-password group and both search results. Resources, Privacy, Language
 and Translation still need a comparison of their Java controls and Rust
 entry points. The tab overflow affordance, control styling and deeper
 Settings pages still need visual work. [Desktop comparison](PORTING-PARITY.md#november-22-java-dialog-design-on-windows-arm64)
 
-The next Settings inventory should start at the tagged dialog's five
-unmatched sections. Resources exposes a JVM launch profile and its heap
-limit. Compare the native resource controls before specifying a Rust
-equivalent. Security groups the master-password actions and the global
-temporary SSH key setting. The Rust startup password setting and connection
-key entry provide existing routes to audit. Privacy exposes Java telemetry
+Resources exposes a JVM launch profile and its heap limit. Compare the
+native resource controls before specifying a Rust equivalent. Next in
+Security, trace the global temporary SSH key switch and isolation default
+through the Connection Manager and Quick Connect. Compare default
+resolution for local and SSH sessions, including managed floors and
+configured sandbox availability. Privacy exposes Java telemetry
 consent. Record the native app's behavior and the handling of imported
 consent before designing the corresponding surface. Language selects the
 application language. Translation manages application translation profiles,

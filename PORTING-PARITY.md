@@ -89,6 +89,36 @@ The checkout's `target/verification/` directory holds the desktop record
 `20261123-model-config-windows-arm64-desktop.md` and its test log
 `20261123-model-config-windows-arm64-tests.log`.
 
+## November 23 Settings Security
+
+The Java v2.26.0 Security page groups the master password, temporary SSH
+keys and session isolation. The native Security tab now groups credential
+rotation and the managed startup requirement. The startup control uses
+the existing draft, Save and policy checks. **Change master password…**
+opens the existing Credential Vault workflow. For an existing locked
+vault, a successful unlock opens the change form and failed authentication
+keeps the request at the unlock step.
+
+The Windows desktop comparison used fresh private profiles and the
+Normal theme. The released Java x64 reference under emulation and native
+Windows ARM64 Rust both opened Settings at 1,122 by 1,112 pixels.
+The change action appeared before the startup checkbox in both versions.
+Rust search revealed and highlighted each action with Enter. The desktop
+comparison covered navigation and presentation. The native tests exercise
+the policy, draft and credential workflow. Windows ARM64 passed 95 Settings
+tests, 10 Vault tests and the manual link coverage check. The Vault
+regression checks a rejected password, a successful unlock and a cleared
+password form ready for the requested rotation.
+
+The remaining Java controls are startup auto-unlock, the global temporary
+key switch, default isolation and sandbox availability. Compare headings,
+help and warning presentation again when the remaining controls are added.
+[Tagged Java Settings](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SettingsDialog.java)
+· [Rust Settings](src/workspace/settings_window.rs)
+· [Credential Vault](src/vault_window.rs)
+· [Windows Settings tests](target/verification/20261123-security-settings-windows-tests.log)
+· [Windows Vault and manual tests](target/verification/20261123-security-settings-windows-vault-and-guide-tests.log)
+
 ## November 23 Plan and execution layout
 
 The shared terminal and preview layout places Metro before the bottom

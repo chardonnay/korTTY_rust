@@ -1141,7 +1141,9 @@ impl VaultWindow {
                     });
                 }
             }
-            Message::ChangeMaster if self.draft.is_none() && self.operation.is_none() => {
+            Message::ChangeMaster
+                if self.exists && self.draft.is_none() && self.operation.is_none() =>
+            {
                 self.revoke_webhook_test();
                 self.operation = Some(Operation::ChangeMaster);
             }
@@ -1154,7 +1156,9 @@ impl VaultWindow {
                 self.operation = Some(Operation::Restore);
             }
             Message::BackupPath(value) => self.backup_path = bound(value, 4096),
-            Message::SubmitMaster if self.operation == Some(Operation::ChangeMaster) => {
+            Message::SubmitMaster
+                if self.is_unlocked() && self.operation == Some(Operation::ChangeMaster) =>
+            {
                 if self.primary.is_empty() || !self.master_confirmed(&self.next_master) {
                     return Task::none();
                 }
@@ -1195,7 +1199,13 @@ impl VaultWindow {
                     self.exists = exists;
                 }
                 if finished.status.is_ok() {
+                    let resume_password_change = self.vault.is_none()
+                        && self.operation == Some(Operation::ChangeMaster)
+                        && finished.vault.is_some();
                     self.clear_form();
+                    if resume_password_change {
+                        self.operation = Some(Operation::ChangeMaster);
+                    }
                 }
                 self.vault = finished.vault;
                 self.sudo_revision = Arc::new(());
@@ -1352,7 +1362,9 @@ impl VaultWindow {
         }
         contents = contents
             .push(
-                text(if self.exists {
+                text(if self.operation == Some(Operation::ChangeMaster) {
+                    "Unlock the vault to change its master password"
+                } else if self.exists {
                     "Unlock the vault"
                 } else {
                     "Create a new vault"
@@ -2110,6 +2122,37 @@ mod tests {
                 && input.server_pattern.is_empty()
                 && input.environment.is_empty()
         );
+    }
+
+    #[test]
+    fn password_change_requested_while_locked_opens_after_unlock() {
+        let profile = crate::snippets::tests::Profile::new();
+        let path = profile.0.join("vault.bin");
+        let master = test_vault_password();
+        let wrong = test_vault_password();
+        drop(Vault::create(&path, &master[..]).unwrap());
+        let mut window = VaultWindow::open(path.clone()).unwrap();
+
+        let _ = window.update(Message::ChangeMaster);
+        let _ = window.update(Message::Completed(Completion::unlock_fixture(
+            &path,
+            &wrong[..],
+            false,
+        )));
+        assert!(!window.is_unlocked());
+        assert!(window.operation == Some(Operation::ChangeMaster));
+
+        let _ = window.update(Message::Completed(Completion::unlock_fixture(
+            &path,
+            &master[..],
+            true,
+        )));
+        assert!(window.is_unlocked());
+        assert!(window.operation == Some(Operation::ChangeMaster));
+        assert!(window.primary.is_empty());
+        assert!(window.next_master.is_empty());
+        window.close_form();
+        assert!(window.operation.is_none());
     }
 
     #[test]
