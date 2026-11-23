@@ -651,7 +651,11 @@ pub(crate) fn local_dock_path() -> io::Result<PathBuf> {
 }
 
 pub(crate) fn window_settings_path() -> io::Result<PathBuf> {
-    Ok(path()?.with_file_name("window-settings.json"))
+    Ok(window_settings_path_at(&root()?))
+}
+
+pub(crate) fn window_settings_path_at(root: &Path) -> PathBuf {
+    root.join("window-settings.json")
 }
 
 pub(crate) fn session_security_path() -> io::Result<PathBuf> {

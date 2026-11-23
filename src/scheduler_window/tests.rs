@@ -1597,6 +1597,7 @@ fn swarm_scheduler_handoff_builds_disabled_unapproved_draft() {
 
     let targets = [1, 2].map(|id| ConnectionRef {
         teamwork: None,
+        temporary_keys: None,
         id,
         target: LoginTarget {
             host: format!("host-{id}.example.test"),

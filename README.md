@@ -1063,6 +1063,16 @@ Both pane filters accept a filename fragment or wildcard. On the server side, **
 
 **Scheduler** opens job definitions, the run journal, and a native dependency diagram. A job executes a command, a script stored in the job, or a **Shared snippet** on an already confirmed SSH target. Linked snippets retain their ID when renamed. Each run reads the last saved version. Bash, Python 3, Perl, and Ruby are available for scripts. The server requires a POSIX login shell and the selected interpreter. Each argument line with content is passed as its own value. `jobs.json` in the Rust profile stores the path of the unencrypted SSH key, the source, and structured results. Jobs can start manually, at fixed times, at intervals, or in dependency chains. **Run now** and **Run with successors** save the current job draft before checking dependencies. If saving fails, the draft stays open and no job starts. While kortty is running, due jobs are executed even if the scheduler window is closed. Up to four SSH jobs run simultaneously. The SFTP actions create directories, rename entries without overwriting, and set octal POSIX permissions. They require absolute server paths and operate via the SFTP subsystem. **Upload file** and **Download file** transfer one regular file up to 1 GiB each between full paths. The file transfer policy applies before the SSH setup. A new target is published only after the transfer is complete. In case of connection loss, a private upload staging folder may remain on the server.
 
+To run a saved SSH or rsync job with a temporary private key, turn on
+**Enable temporary SSH key option** in Security. Save the key in Connection
+Manager with automatic selection enabled. A target and its jump host can
+each use their own saved key. Verify the host keys for both destinations,
+choose or reselect the connection in Scheduler, and save the job. Leave
+the vault unlocked when it runs. Each key keeps its original expiration.
+When replacing a key, select the route again and renew any applicable
+rsync transfer approval. Restored portable jobs that used temporary keys
+require local route selection before enabling them.
+
 In a Scheduler ownership action with one saved SSH target, use **Resolve
 Name…** next to the UID or GID field. Check the endpoint and its host key
 fingerprints, look up the exact server name, and accept the numeric result

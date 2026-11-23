@@ -43,6 +43,7 @@ mod rsync_mixed;
 mod rsync_privileged;
 mod rsync_routes;
 mod scheduled_swarm;
+mod temporary_keys;
 
 struct Profile(PathBuf);
 

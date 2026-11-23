@@ -1666,6 +1666,7 @@ mod tests {
     fn connection(id: u64, host: &str) -> ConnectionRef {
         ConnectionRef {
             teamwork: None,
+            temporary_keys: None,
             id,
             target: LoginTarget {
                 host: host.into(),

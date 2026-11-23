@@ -124,6 +124,11 @@ pub(crate) fn installed_default_isolation() -> std::io::Result<IsolationLevel> {
         Err(error) => Err(error),
     }
 }
+
+pub(crate) fn installed_temporary_ssh_keys_enabled(root: &std::path::Path) -> bool {
+    tab_titles::WindowSettings::read(&crate::profile::window_settings_path_at(root))
+        .is_ok_and(|settings| settings.temporary_ssh_key_enabled)
+}
 pub(crate) use tab_titles::{analysis_content_limit_at, analysis_history_limit_at};
 mod tab_watch;
 mod teamwork_auth;

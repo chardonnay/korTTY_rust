@@ -216,11 +216,13 @@ impl PipeTransport {
 pub struct Authentication {
     credential: Option<Credential>,
     interactive: Option<InteractiveAuth>,
+    key_authority: Option<Box<dyn Fn() -> io::Result<()> + Send>>,
 }
 
 enum Credential {
     Password(Zeroizing<String>),
     PrivateKey(KeyCredential),
+    ScopedKey(Box<dyn Fn() -> io::Result<Zeroizing<Vec<u8>>> + Send>),
 }
 
 struct KeyCredential {
@@ -234,6 +236,7 @@ impl Authentication {
         Self {
             credential: Some(Credential::Password(Zeroizing::new(password))),
             interactive: None,
+            key_authority: None,
         }
     }
 
@@ -247,6 +250,7 @@ impl Authentication {
                 passphrase: None,
             })),
             interactive: None,
+            key_authority: None,
         }
     }
 
@@ -258,6 +262,7 @@ impl Authentication {
                 passphrase: Some(Zeroizing::new(passphrase)),
             })),
             interactive: None,
+            key_authority: None,
         }
     }
 
@@ -269,6 +274,7 @@ impl Authentication {
         Self {
             credential: None,
             interactive: Some(InteractiveAuth::new(handler)),
+            key_authority: None,
         }
     }
 
@@ -285,6 +291,33 @@ impl Authentication {
     ) -> Self {
         self.interactive = Some(InteractiveAuth::new(handler));
         self
+    }
+
+    /// Loads an unencrypted key after host verification. The authorization check
+    /// runs before the key is loaded, offered or used to sign.
+    pub fn scoped_private_key(
+        load: impl Fn() -> io::Result<Zeroizing<Vec<u8>>> + Send + 'static,
+        authorize: impl Fn() -> io::Result<()> + Send + 'static,
+    ) -> Self {
+        Self {
+            credential: Some(Credential::ScopedKey(Box::new(load))),
+            interactive: None,
+            key_authority: Some(Box::new(authorize)),
+        }
+    }
+}
+
+impl Credential {
+    fn signing_key(&self) -> Result<Option<SignKey>, ConnectError> {
+        match self {
+            Self::Password(_) => Ok(None),
+            Self::PrivateKey(key) => key.signing_key().map(Some),
+            Self::ScopedKey(load) => {
+                let bytes = load()?;
+                validate_private_key_size(&bytes, None)?;
+                KeyCredential::parse_signing_key(&bytes, None).map(Some)
+            }
+        }
     }
 }
 
@@ -2062,9 +2095,14 @@ impl Wire {
         let Authentication {
             mut credential,
             mut interactive,
+            key_authority,
         } = user.authentication;
+        let authorize_key = || key_authority.as_ref().map_or(Ok(()), |check| check());
         self.runner.client_auth_methods(
-            matches!(credential, Some(Credential::PrivateKey(_))),
+            matches!(
+                credential,
+                Some(Credential::PrivateKey(_) | Credential::ScopedKey(_))
+            ),
             matches!(credential, Some(Credential::Password(_))),
             interactive.is_some(),
         )?;
@@ -2103,12 +2141,18 @@ impl Wire {
                     true
                 }
                 Event::Cli(CliEvent::Pubkey(request)) => {
-                    if let Some(Credential::PrivateKey(key)) = credential.as_ref() {
-                        startup.remaining()?;
-                        let signing_key = key.signing_key()?;
+                    authorize_key()?;
+                    startup.remaining()?;
+                    let signing_key = credential
+                        .as_ref()
+                        .map(Credential::signing_key)
+                        .transpose()?
+                        .flatten();
+                    if let Some(signing_key) = signing_key {
                         startup.remaining()?;
                         startup.authorize_authentication()?;
-                        if startup.before_authentication.is_some() {
+                        authorize_key()?;
+                        if startup.before_authentication.is_some() || key_authority.is_some() {
                             request.pubkey_deferred(signing_key)?;
                         } else {
                             request.pubkey(signing_key)?;
@@ -2120,11 +2164,13 @@ impl Wire {
                     true
                 }
                 Event::Cli(CliEvent::AgentSign(request))
-                    if startup.before_authentication.is_some() =>
+                    if startup.before_authentication.is_some() || key_authority.is_some() =>
                 {
                     startup.authorize_authentication()?;
+                    authorize_key()?;
                     let signature = request.sign_private()?;
                     startup.remaining()?;
+                    authorize_key()?;
                     request.signed(&signature)?;
                     true
                 }

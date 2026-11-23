@@ -482,6 +482,7 @@ mod tests {
         let jump = Some(saved_login("jump.example"));
         let reference = ConnectionRef {
             teamwork: None,
+            temporary_keys: None,
             id: 1,
             target: login.endpoint.clone(),
             jump: jump.as_ref().map(|login| login.endpoint.clone()),

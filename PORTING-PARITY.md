@@ -481,11 +481,10 @@ Java's non-interactive tab restore consults the saved profile and can use
 a registered, valid temporary key. Tabs that need input are deferred for
 interactive resolution. The Java Scheduler remote session can also use
 temporary key contents and makes an owner-only key file for an external
-SSH process when required. The Rust Scheduler currently treats temporary
+SSH process when required. At that checkpoint the Rust Scheduler treated temporary
 keys as interactive credentials. Its rsync bridge uses the existing
-native SSH transport. The remaining Scheduler work is to bind eligible
-temporary keys to the reviewed job and route and verify the resulting
-native SSH and rsync runs.
+native SSH transport. The [scheduled temporary-key checkpoint](#scheduled-ssh-and-rsync-with-temporary-keys)
+records the implementation after this Java comparison.
 [Java tab restore](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/TabRestoreTriage.java)
 · [Java Scheduler remote session](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/jobscheduler/JobSchedulerRemoteSession.java)
 · [Rust Scheduler authentication](src/job_executor/connection.rs)
@@ -518,6 +517,28 @@ SFTP fixtures. Windows ARM64 passed the all-target application check with
 reconnect still need acceptance.
 [Apple Silicon project and SSH tests](target/verification/20261123-project-temporary-key-macos-final.log)
 · [Windows application check](target/verification/20261123-project-temporary-key-windows-final-check.log)
+
+## Scheduled SSH and rsync with temporary keys
+
+Selecting and saving a local SSH connection in Scheduler records its
+temporary-key binding for the exact saved account and endpoint. A jump
+login can use a different eligible key. A run requires an unlocked vault
+and automatic selection for each temporary key. Changing a key reference
+requires choosing the route again and renewing any applicable rsync
+approval. Portable backup strips the binding and disables the job.
+
+The native transport loads key material after verifying the host and
+rechecks expiry, the vault revision, current permissions and the saved
+route before offering or signing with a key. The rsync bridge uses the
+same authenticated native transport. AI Agent and Swarm jobs retain
+their existing authentication options.
+
+The Apple Silicon OpenSSH fixture verified direct and jump authentication
+with the expected public-key fingerprints. It also checked account and
+key mismatches, credential replacement, vault locking and a Security change
+after opening TCP. The focused expiry and portable backup tests passed.
+The Scheduler desktop review and key replacement interactions remain open.
+[Apple Silicon verification](target/verification/scheduler-temp-ssh-macos-native-final.log)
 
 ## November 23 Native vault startup unlock
 

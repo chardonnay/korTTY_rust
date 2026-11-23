@@ -195,6 +195,7 @@ fn resolve_target(
 fn connection_reference(route: &JavaImportedRoute) -> ConnectionRef {
     ConnectionRef {
         teamwork: None,
+        temporary_keys: None,
         id: route.id,
         target: route.target.clone(),
         jump: route.jump.clone(),

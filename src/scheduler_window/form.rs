@@ -3708,6 +3708,12 @@ impl Draft {
             if let Some(jump) = &connection.jump {
                 fields = fields.push(text(format!("Jump host: {}", jump.label())).size(13));
             }
+            if std::iter::once(connection)
+                .chain(self.additional_connections.iter())
+                .any(|route| route.temporary_keys.is_some())
+            {
+                fields = fields.push(text("Saving reviews the selected temporary keys for this job. Each key must allow automatic selection in its saved SSH login. Select the connection again after a key is replaced.").size(12));
+            }
             let additional = connections.get(1..).unwrap_or_default();
             if !additional.is_empty() && self.allows_additional_agent_targets() {
                 fields = fields.push(

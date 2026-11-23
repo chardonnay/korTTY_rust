@@ -1,16 +1,17 @@
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 
 use kortty_ssh::{Authentication, Endpoint, SshTarget, TrustStore};
 use kortty_vault::Secret;
 
-use crate::clipboard_policy::ServerAccess;
+use crate::clipboard_policy::{ClipboardPolicy, ServerAccess};
 use crate::connection_store::{ActiveAuth, Auth, Connection, SavedLogin, Store};
 use crate::scheduler_window::{ConnectionRef, SharedAuth, SshCommand};
 use crate::ssh_connection;
-use crate::ssh_dialog::{LoginTarget, Password};
+use crate::ssh_dialog::{LoginTarget, Password, TemporaryKey};
 use crate::ssh_key_catalog::Catalog;
-use crate::vault_window::Kind;
+use crate::vault_window::{Kind, VAULT_LOCKED, VaultWindow};
 
 use super::Failure;
 
@@ -74,6 +75,41 @@ enum LoginAuth {
         id: u64,
         passphrase: Option<Secret>,
     },
+    TemporaryKey {
+        key: TemporaryKey,
+        revision: Weak<()>,
+        path: PathBuf,
+        reference: Box<ConnectionRef>,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct TemporaryKeys<'a> {
+    pub(crate) enabled: bool,
+    pub(crate) vault: Option<&'a VaultWindow>,
+    pub(crate) connections: &'a Path,
+}
+
+impl TemporaryKeys<'_> {
+    fn resolve(
+        self,
+        reference: &ConnectionRef,
+        endpoint: &LoginTarget,
+        id: &str,
+    ) -> Result<LoginAuth, &'static str> {
+        if !self.enabled {
+            return Err("Temporary SSH keys are disabled in Security settings.");
+        }
+        let vault = self.vault.ok_or(VAULT_LOCKED)?;
+        let revision = vault.credential_revision().ok_or(VAULT_LOCKED)?;
+        let key = vault.temporary_ssh_key(id, endpoint, true)?;
+        Ok(LoginAuth::TemporaryKey {
+            key,
+            revision,
+            path: self.connections.to_owned(),
+            reference: Box::new(reference.clone()),
+        })
+    }
 }
 
 impl Credentials {
@@ -95,6 +131,7 @@ impl Credentials {
                 LoginAuth::Key(_, passphrase) | LoginAuth::StoredKey { passphrase, .. } => {
                     passphrase.as_ref()
                 }
+                LoginAuth::TemporaryKey { .. } => None,
             };
             if let Some(secret) = secret {
                 secrets.add(secret.as_str());
@@ -152,11 +189,22 @@ impl Credentials {
         self.into_route().map_err(|failure| failure.detail)
     }
 
+    #[cfg(test)]
     pub(crate) fn resolve_batch(
         action: &SshCommand,
         store: &Store,
         server_access: &ServerAccess,
+        secret: impl FnMut(&str, Kind, &LoginTarget) -> Result<Secret, &'static str>,
+    ) -> BatchAuth {
+        Self::resolve_scheduled_batch(action, store, server_access, secret, None)
+    }
+
+    pub(crate) fn resolve_scheduled_batch(
+        action: &SshCommand,
+        store: &Store,
+        server_access: &ServerAccess,
         mut secret: impl FnMut(&str, Kind, &LoginTarget) -> Result<Secret, &'static str>,
+        temporary: Option<TemporaryKeys<'_>>,
     ) -> BatchAuth {
         action.validate_target_selection()?;
         let profiles = action
@@ -177,18 +225,20 @@ impl Credentials {
         Ok(profiles
             .into_iter()
             .map(|(reference, profile)| {
-                Self::resolve_for(
+                Self::resolve_reviewed(
                     Some(reference),
                     profile,
                     false,
                     &mut keys,
                     server_access,
                     &mut secret,
+                    temporary,
                 )
             })
             .collect())
     }
 
+    #[cfg(test)]
     pub(crate) fn resolve(
         action: &SshCommand,
         current: &Connection,
@@ -213,11 +263,58 @@ impl Credentials {
         server_access: &ServerAccess,
         secret: impl FnMut(&str, Kind, &LoginTarget) -> Result<Secret, &'static str>,
     ) -> Result<Self, &'static str> {
+        Self::resolve_reviewed(
+            reviewed,
+            current,
+            recording,
+            keys,
+            server_access,
+            secret,
+            None,
+        )
+    }
+
+    pub(crate) fn resolve_scheduled(
+        reviewed: &ConnectionRef,
+        current: &Connection,
+        recording: bool,
+        server_access: &ServerAccess,
+        secret: impl FnMut(&str, Kind, &LoginTarget) -> Result<Secret, &'static str>,
+        temporary: TemporaryKeys<'_>,
+    ) -> Result<Self, &'static str> {
+        Self::resolve_reviewed(
+            Some(reviewed),
+            current,
+            recording,
+            &mut None,
+            server_access,
+            secret,
+            Some(temporary),
+        )
+    }
+
+    fn resolve_reviewed(
+        reviewed: Option<&ConnectionRef>,
+        current: &Connection,
+        recording: bool,
+        keys: &mut KeyCatalog,
+        server_access: &ServerAccess,
+        secret: impl FnMut(&str, Kind, &LoginTarget) -> Result<Secret, &'static str>,
+        temporary: Option<TemporaryKeys<'_>>,
+    ) -> Result<Self, &'static str> {
         let reference = ConnectionRef::from(current);
         if reviewed != Some(&reference) {
             return Err("The saved SSH route changed. Choose the connection again in this job.");
         }
-        Self::resolve_current(reference, current, recording, keys, server_access, secret)
+        Self::resolve_current(
+            reference,
+            current,
+            recording,
+            keys,
+            server_access,
+            secret,
+            temporary,
+        )
     }
 
     pub(crate) fn bind_shared_vault_revision(&mut self, revision: Weak<()>) {
@@ -256,6 +353,7 @@ impl Credentials {
             &mut None,
             server_access,
             secret,
+            None,
         )
     }
 
@@ -266,6 +364,7 @@ impl Credentials {
         keys: &mut KeyCatalog,
         server_access: &ServerAccess,
         mut secret: impl FnMut(&str, Kind, &LoginTarget) -> Result<Secret, &'static str>,
+        temporary: Option<TemporaryKeys<'_>>,
     ) -> Result<Self, &'static str> {
         if !reference_allowed(&reference, server_access) {
             return Err(SERVER_BLOCKED);
@@ -280,7 +379,16 @@ impl Credentials {
             if login.endpoint.validate().is_err() {
                 return Err("The saved SSH login needs a valid username before this job can run.");
             }
-            if login.keyboard_interactive || login.auth.requires_interactive() {
+            let automatic_key = temporary.is_some()
+                && matches!(
+                    login.auth,
+                    Auth::TemporaryKey {
+                        credential: Some(_),
+                        automatic: true,
+                        ..
+                    }
+                );
+            if login.keyboard_interactive || (login.auth.requires_interactive() && !automatic_key) {
                 return Err("The saved connection requires an interactive SSH login.");
             }
             if recording && matches!(login.auth.active(), ActiveAuth::VaultPassword(_)) {
@@ -314,7 +422,18 @@ impl Credentials {
                     }
                 }
                 ActiveAuth::Prompt | ActiveAuth::KeyboardInteractive => {
-                    return Err("The saved connection requires an interactive SSH login.");
+                    let (
+                        Some(scope),
+                        Auth::TemporaryKey {
+                            credential: Some(id),
+                            automatic: true,
+                            ..
+                        },
+                    ) = (temporary, &login.auth)
+                    else {
+                        return Err("The saved connection requires an interactive SSH login.");
+                    };
+                    scope.resolve(&reference, endpoint, id)?
                 }
             };
             Ok(Login {
@@ -322,10 +441,12 @@ impl Credentials {
                 authentication,
             })
         };
+        let target = resolve(&current.login)?;
+        let jump = current.jump.as_ref().map(resolve).transpose()?;
         Ok(Self {
             reference,
-            target: resolve(&current.login)?,
-            jump: current.jump.as_ref().map(resolve).transpose()?,
+            target,
+            jump,
             server_access: server_access.clone(),
             sudo_password: None,
             shared_vault_revision: None,
@@ -447,6 +568,24 @@ impl Login {
                     None => Authentication::private_key(bytes),
                 }
             }
+            LoginAuth::TemporaryKey {
+                key,
+                revision,
+                path,
+                reference,
+            } => {
+                temporary_key_authority(&key, &revision, &path, &reference)
+                    .map_err(Failure::blocked)?;
+                let key_to_load = key.clone();
+                Authentication::scoped_private_key(
+                    move || key_to_load.copy_for_attempt(),
+                    move || {
+                        temporary_key_authority(&key, &revision, &path, &reference).map_err(
+                            |detail| io::Error::new(io::ErrorKind::PermissionDenied, detail),
+                        )
+                    },
+                )
+            }
         };
         Ok(SshTarget {
             endpoint,
@@ -454,6 +593,40 @@ impl Login {
             authentication,
         })
     }
+}
+
+fn temporary_key_authority(
+    key: &TemporaryKey,
+    revision: &Weak<()>,
+    path: &Path,
+    reference: &ConnectionRef,
+) -> Result<(), &'static str> {
+    if !key.is_current() {
+        return Err("The scheduled temporary SSH key expired.");
+    }
+    if revision.strong_count() == 0 {
+        return Err("The vault changed or was locked after resolving the temporary SSH key.");
+    }
+    let policy = ClipboardPolicy::load();
+    if !path
+        .parent()
+        .is_some_and(crate::workspace::installed_temporary_ssh_keys_enabled)
+        || policy.problem.is_some()
+        || !policy.minimum_isolation.is_none()
+        || !reference_allowed(reference, policy.server_access())
+    {
+        return Err("Current settings or managed policy forbid the temporary SSH route.");
+    }
+    let store =
+        Store::open(path.to_owned()).map_err(|_| "The saved SSH connections are unavailable.")?;
+    let connection = store
+        .get(reference.id)
+        .filter(|connection| ConnectionRef::from(*connection) == *reference)
+        .ok_or("The saved temporary SSH route changed. Review the job again.")?;
+    if connection.incognito || store.connection_requires_isolation(connection) {
+        return Err("The saved SSH route requires privacy or isolation unavailable to jobs.");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -499,6 +672,31 @@ mod tests {
             window_geometry: None,
             terminal: Default::default(),
         }
+    }
+
+    #[test]
+    fn expired_temporary_keys_are_rejected_before_ssh_authentication() {
+        let profile = saved_profile();
+        let reference = ConnectionRef::from(&profile);
+        let key = TemporaryKey::from_vault(kortty_vault::TemporarySshKey {
+            private_key: "unused fixture material",
+            options: kortty_vault::TemporarySshKeyOptions {
+                minutes: 1,
+                automatic: true,
+            },
+            remaining: std::time::Duration::ZERO,
+        })
+        .unwrap();
+        let revision = Arc::new(());
+        assert_eq!(
+            temporary_key_authority(
+                &key,
+                &Arc::downgrade(&revision),
+                Path::new("unused"),
+                &reference
+            ),
+            Err("The scheduled temporary SSH key expired.")
+        );
     }
 
     #[test]
