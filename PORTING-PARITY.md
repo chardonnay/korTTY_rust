@@ -361,7 +361,9 @@ option. Java encrypts the stored key and preserves its ciphertext if
 an unrelated edit is saved while the vault is locked. Its connection
 authentication asks for a fresh key when the saved key is expired or
 still held by the locked vault. Session snapshots omit the temporary
-material. Rust Quick Connect
+material. The private connection XML carries the encrypted key, configured
+lifetime and permanent option. It carries no original expiry timestamp.
+Rust Quick Connect
 already holds temporary keys for the lifetime of an interactive SSH or
 SFTP attempt, including a retry. The later
 [saved temporary-key update](#november-23-native-saved-temporary-ssh-keys)
@@ -410,13 +412,13 @@ the terminal, and downloaded the exact SFTP fixture bytes after unlocking.
 · [Windows vault suite](target/verification/20261123-saved-temporary-ssh-windows-vault-final.log)
 · [Windows application check](target/verification/20261123-saved-temporary-ssh-windows-check-final.log)
 
-Remaining work includes reviewed adoption of encrypted Java keys, native
-desktop coverage of the editor and reconnect flow, and acceptance for
-isolated workers or unattended and restored routes that require separate
-authority. The Java decoder already
-has a tested temporary-key case. Connect that path to restore review and
-exact route mapping.
+Native desktop coverage of the editor and reconnect flow and verification
+through the isolated SSH worker remain open. Java backup restore still
+omits these keys. Its decoder has a tested temporary-key case, and
+credential review and exact route mapping still need to be wired in.
+Unattended and restored sessions require a separate credential audit.
 [Java credential decoder](src/profile_backup/java_secrets.rs)
+· [Java backup review](src/profile_backup/java_migration.rs)
 
 ## November 23 Native vault startup unlock
 

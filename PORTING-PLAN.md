@@ -9,10 +9,10 @@ the porting worktree.
 
 ## Current result and actionable backlog
 
-**Java v2.26.0 parity remains partial.** The implementation checkpoint
-in [PR #35](https://github.com/chardonnay/korTTY_rust/pull/35) is `338ef64e`.
-It builds on the PR #34 merge at `10e4ee78`. The Java reference is tag
-`v2.26.0` at `b235d91f2035`.
+**Java v2.26.0 parity remains partial.** [PR #35](https://github.com/chardonnay/korTTY_rust/pull/35)
+includes the device-local vault unlock checkpoint (`fe110de1`) and the
+saved temporary SSH key checkpoint (`cff7d8e7`). It builds on the PR #34
+merge at `10e4ee78`. The Java reference is tag `v2.26.0` at `b235d91f2035`.
 Windows ARM64 desktop checks cover the Settings frame and Font and Window
 pages, the Connection Manager and selected SSH editor tabs, and specific
 AI Manager and Agent Design workflows. The standalone Agent Design editor
@@ -79,8 +79,13 @@ records the broader comparison with the tagged Java release.
 
 | Area | Remaining change | Completion check |
 | --- | --- | --- |
-| D2/M1 · Java temporary-key migration | Adopt compatible encrypted Java temporary keys through explicit review and bind them to the matching native connection and account. Audit other Java consumers that may act without the native login form. | Verify import and restore with a disposable encrypted key, missing or locked credentials, incompatible scope, duplicate profiles and preservation of the selected lifetime. Verify unattended execution separately. [Java credential comparison](PORTING-PARITY.md#november-23-java-credential-workflow-review) |
+| D2/M1 · Java temporary-key migration | Connect the Java credential decoder to backup review and restore. Bind an adopted key to the exact reviewed connection, login account and route. Java persists a configured lifetime and automatic selection without an original expiry timestamp. Define the imported expiry explicitly in the review. | Test restore after restart with a disposable encrypted Java key. Cover skipped review, wrong or unavailable credentials, endpoint or account changes, duplicate or existing profiles, lifetime and selection, and replay. [Java credential comparison](PORTING-PARITY.md#november-23-java-credential-workflow-review) |
 | D4 · Searchable controls | Compare the remaining Java Settings and AI Manager pages, subpages and labeled controls with the Rust search inventory. Add reachable missing destinations alongside the dialog comparisons. | Verify that controls on a page that has never been opened are discoverable, and that navigation reveals the exact control with the current page state and policy. |
+
+Audit temporary-key use in session restore, Scheduler and other paths that
+launch outside the native login form. Establish each path's credential
+authority before extending it, then test it against current policy and
+expiry separately from the interactive backup review.
 
 The [November 23 review](PORTING-PARITY.md#november-23-dialog-parity-review)
 records the dialog differences. The [November 22 comparison](PORTING-PARITY.md#november-22-design-editing-command-output-and-settings-search)
@@ -383,10 +388,10 @@ feature is opt-in and its startup command is available in debug builds.
 
 | Area | Implemented in Rust | Remaining verification |
 | --- | --- | --- |
-| D4/P1 · Vault startup | An explicit profile opt-in stores the current derived vault key in the protected device credential store. Startup authenticates the vault, falls back to the password prompt on failure, and checks both managed and personal password requirements. Password rotation refreshes the saved key and disabling removes it. | Exercise the Security flow and an actual restart on each native desktop. Include a signed macOS app with an available Keychain, Linux Secret Service and Flatpak Secret portal, and a managed startup policy set after opting in. [Startup unlock checkpoint](PORTING-PARITY.md#november-23-native-vault-startup-unlock) |
+| D4/P1 · Vault startup | An explicit profile opt-in stores the current derived vault key in the protected device credential store. Startup authenticates the vault, falls back to the password prompt on failure, and checks both managed and personal password requirements. Native credential-store fixtures on Windows ARM64 and Fedora ARM64 verified rotation, reopen and removal. Apple Silicon passed the vault and startup suites. | Exercise Security through an actual restart on each native desktop. Include interactive Keychain access with a signed macOS app, the installed Flatpak Secret portal and a managed startup policy set after opting in. [Startup unlock checkpoint](PORTING-PARITY.md#november-23-native-vault-startup-unlock) |
 | D2/P1 · Session isolation and reconnect | Effective isolation appears in the folder and connection editors. Windows ARM64 verified saved local-shell recovery with inherited and managed Sandbox choices. The native Apple Silicon fixture verified saved SSH and Teamwork reconnect over pinned direct OpenSSH. | Exercise a fresh local launch, unavailable sandbox feedback, desktop reconnect and a live jump-host reconnect. Repeat the applicable desktop checks on macOS and Linux. [Windows desktop checks](PORTING-PARITY.md#november-23-windows-isolation-dialogs-and-launches) · [OpenSSH reconnect checks](PORTING-PARITY.md#november-23-saved-and-teamwork-ssh-reconnect) |
 | D2/D4 · Quick Connect temporary keys | The saved Security opt-in enables in-memory temporary authentication for interactive SSH and SFTP, with destination validation, expiry and retry. | Use a disposable key for a live SSH and SFTP login, retry after expiry, and disable the option while a form or retry holds a key. [Quick Connect checkpoint](PORTING-PARITY.md#november-23-quick-connect-temporary-ssh-keys) |
-| D2 · Saved temporary keys | Connection Manager stores the key, expiry, and exact account and destination in the encrypted vault. The login form uses an unexpired saved key with optional automatic selection or accepts a replacement for that attempt. A pinned Apple Silicon OpenSSH fixture passed a terminal connection and SFTP download. | Exercise the desktop editor, locked unrelated saves, reconnection on expiry and after replacement, the isolated SSH worker, and related restore flows. [Saved temporary-key checkpoint](PORTING-PARITY.md#november-23-native-saved-temporary-ssh-keys) |
+| D2 · Saved temporary keys | Connection Manager stores the key, expiry, and exact account and destination in the encrypted vault. The login form uses an unexpired saved key with optional automatic selection or accepts a replacement for that attempt. A pinned Apple Silicon OpenSSH fixture verified locked-vault rejection and SSH and SFTP after unlocking. | Exercise the desktop editor, locked unrelated saves, reconnection on expiry and after replacement, and the isolated SSH worker. Check Quick Connect's in-memory paths separately. [Saved temporary-key checkpoint](PORTING-PARITY.md#november-23-native-saved-temporary-ssh-keys) |
 | B4 · GGUF Configure styling | The measured path width, compact two-column form, joined numeric controls and fixed actions follow the tagged Java layout. [Configure checkpoint](PORTING-PARITY.md#november-23-gguf-configure-sizing) | Compare the same layout with the platform theme on the remaining native desktops. |
 | D4 · Search matching | Settings and AI Manager use the shared Java matching and ranking rules for visible page and control names, aliases, duplicate suppression and the 40-result limit. Available controls are filtered before ranking. Imported model IDs remain selectable when their normalized names collide. | Compare result labels, ranking and keyboard and pointer navigation against the tagged dialogs on native desktops. [Search matching checkpoint](PORTING-PARITY.md#november-23-settings-search-matching) |
 | A2 · Copying a command step's output | **Copy output** uses all masked stdout and stderr retained for the selected step within the existing capture limits. The compact preview still shows the last eight lines. Retained runs use the same action and clipboard policy. | Verify both streams, a line longer than 320 characters and redaction in the native clipboard for live and retained runs. [Step-copy checkpoint](PORTING-PARITY.md#november-23-complete-masked-step-copy) |
@@ -1225,8 +1230,9 @@ not been identified.
 
 ## Implementation order
 
-Implement reviewed Java temporary-key adoption from the
-[credential backlog](#confirmed-implementation-work). Continue native
+Finish Java temporary-key backup review and exact-route restore from the
+[credential backlog](#confirmed-implementation-work). Check Scheduler and
+session restore against their own credential rules. Continue native
 desktop acceptance for [vault auto-unlock](PORTING-PARITY.md#november-23-native-vault-startup-unlock)
 and exercise the [saved key](PORTING-PARITY.md#november-23-native-saved-temporary-ssh-keys)
 and Quick Connect workflows with disposable keys.
