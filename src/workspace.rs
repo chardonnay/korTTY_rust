@@ -115,6 +115,14 @@ mod ssh_keys_ui;
 mod tab_context;
 mod tab_drag;
 mod tab_titles;
+
+pub(crate) fn installed_default_isolation() -> std::io::Result<IsolationLevel> {
+    match tab_titles::WindowSettings::read(&crate::profile::window_settings_path()?) {
+        Ok(settings) => Ok(settings.default_session_isolation.unwrap_or_default()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(IsolationLevel::None),
+        Err(error) => Err(error),
+    }
+}
 pub(crate) use tab_titles::{analysis_content_limit_at, analysis_history_limit_at};
 mod tab_watch;
 mod teamwork_auth;

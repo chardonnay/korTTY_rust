@@ -130,7 +130,17 @@ impl Workspace {
                 );
                 return Task::none();
             };
-            floor = floor.max(saved.connection.isolation);
+            let isolation = match saved.isolation(self) {
+                Ok(level) => level,
+                Err(error) => {
+                    self.notice(
+                        owner,
+                        format!("Could not resolve session isolation ({error})"),
+                    );
+                    return Task::none();
+                }
+            };
+            floor = floor.max(isolation);
             saved.form(profile, floor)
         } else {
             ssh.form(pane_profile)

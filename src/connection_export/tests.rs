@@ -61,6 +61,7 @@ fn fixture() -> Connection {
         ],
         incognito: true,
         isolation: IsolationLevel::Process,
+        inherit_isolation: false,
         startup: ConnectOptions::new(19, 4).unwrap(),
         logging: Default::default(),
         terminal_effect: Some(Selection {

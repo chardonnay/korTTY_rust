@@ -11,7 +11,7 @@ use crate::connection_store::custom_os_badges::Catalog;
 use crate::connection_store::{
     Auth, AuthMethod, Connection, MAX_TUNNELS, SavedLogin, TunnelConfig, TunnelRule, TunnelTarget,
 };
-use crate::session_security::IsolationLevel;
+use crate::session_security::{IsolationChoice, IsolationLevel, resolve_isolation};
 use crate::ssh_dialog::{
     KeepAliveEdit, KeyChoice, LoginTarget, StartupField, StartupFields, normalize_host,
 };
@@ -30,7 +30,7 @@ pub enum Edit {
     Tag(String),
     Emulation(TerminalProfile),
     Incognito(bool),
-    Isolation(IsolationLevel),
+    Isolation(IsolationChoice),
     Startup(StartupField, String),
     KeepAlive(KeepAliveEdit),
     Logging(crate::terminal_logging::Edit),
@@ -187,7 +187,7 @@ pub(super) struct Draft {
     tag: String,
     profile: TerminalProfile,
     incognito: bool,
-    isolation: IsolationLevel,
+    isolation: IsolationChoice,
     startup: StartupFields,
     logging: crate::terminal_logging::Form,
     terminal_effect: EffectDraft,
@@ -243,7 +243,7 @@ impl Draft {
             tag: String::new(),
             profile: TerminalProfile::Xterm,
             incognito: false,
-            isolation: IsolationLevel::None,
+            isolation: IsolationChoice::default(),
             startup: StartupFields::new(Default::default()),
             logging: crate::terminal_logging::Form::new(Default::default()),
             terminal_effect: EffectDraft::default(),
@@ -273,7 +273,7 @@ impl Draft {
             tag: connection.tag.clone(),
             profile: connection.profile().unwrap_or(TerminalProfile::Xterm),
             incognito: connection.incognito,
-            isolation: connection.isolation,
+            isolation: IsolationChoice(connection.isolation_override()),
             startup: StartupFields::new(connection.startup),
             logging: crate::terminal_logging::Form::new(connection.logging.clone()),
             terminal_effect: EffectDraft::new(connection.terminal_effect),
@@ -407,7 +407,8 @@ impl Draft {
             emulation: self.profile.term_name().into(),
             tunnels,
             incognito: self.incognito,
-            isolation: self.isolation,
+            isolation: self.isolation.0.unwrap_or_default(),
+            inherit_isolation: self.isolation.0.is_none(),
             startup: self.startup.options().map_err(|error| error.to_string())?,
             logging: self.logging.config().map_err(|error| error.to_string())?,
             terminal_effect: self.terminal_effect.selection(),
@@ -426,6 +427,7 @@ impl Draft {
         choices: &ViewChoices<'_>,
         custom_badges: &'a Catalog,
         group: Element<'a, Message>,
+        inherited: Option<(&str, IsolationLevel)>,
     ) -> Element<'a, Message> {
         use crate::workspace::dialog_design;
         use iced::widget::{container, keyed_column, scrollable, space};
@@ -467,7 +469,7 @@ impl Draft {
         .spacing(4);
         let content = match self.page {
             Page::Connection => self.connection_page(choices, custom_badges, group),
-            Page::Settings => self.settings_page(choices),
+            Page::Settings => self.settings_page(choices, inherited),
             Page::Tunnels => self.tunnels_page(),
             Page::JumpHost => column![
                 checkbox(self.jump.is_some())
@@ -566,7 +568,19 @@ impl Draft {
         .into()
     }
 
-    fn settings_page<'a>(&'a self, choices: &ViewChoices<'_>) -> Element<'a, Message> {
+    fn settings_page<'a>(
+        &'a self,
+        choices: &ViewChoices<'_>,
+        inherited: Option<(&str, IsolationLevel)>,
+    ) -> Element<'a, Message> {
+        let (level, source) = resolve_isolation(
+            choices.isolation.0,
+            inherited,
+            self.isolation.0,
+            None,
+            false,
+            choices.isolation.1,
+        );
         let paste_choice = |mode| PasteChoice {
             mode,
             default: choices.default_paste_warning,
@@ -615,16 +629,13 @@ impl Draft {
             row![
                 text("SSH isolation"),
                 pick_list(
-                    [
-                        IsolationLevel::None,
-                        IsolationLevel::Process,
-                        IsolationLevel::Sandbox
-                    ],
+                    IsolationChoice::ALL,
                     Some(self.isolation),
                     |value| Message::Edit(Edit::Isolation(value))
                 ),
             ]
             .spacing(8),
+            text(format!("Effective isolation · {level} · {source}")).size(13),
             self.startup
                 .view(135.0)
                 .map(|(field, value)| Message::Edit(Edit::Startup(field, value))),

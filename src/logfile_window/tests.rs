@@ -84,6 +84,7 @@ fn saved_log_folders_are_discovered_once_and_protect_manual_entries() {
                 tunnels: Vec::new(),
                 incognito: false,
                 isolation: Default::default(),
+                inherit_isolation: false,
                 startup: Default::default(),
                 logging: serde_json::from_value(serde_json::json!({"folder": folder})).unwrap(),
                 terminal_effect: None,

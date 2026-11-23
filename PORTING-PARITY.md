@@ -204,11 +204,52 @@ PTY all-target cross-check passed. [Windows application check](target/verificati
 · [Apple Silicon Seatbelt test](target/verification/20261123-isolation-default-apple-silicon-seatbelt.log)
 · [Linux compilation](target/verification/20261123-isolation-default-linux-cross-check.log)
 
-Remaining work includes folder and connection inheritance, the displayed
-source of the resolved level, the exact Teamwork request precedence, Java
-backup adoption and native desktop comparison. [Rust Security page](src/workspace/settings_window.rs)
+The [connection isolation update](#november-23-connection-and-folder-isolation)
+adds SSH inheritance and Teamwork request precedence. [Rust Security page](src/workspace/settings_window.rs)
 · [Local launch resolution](src/workspace/session_security.rs)
 · [Local sandbox prerequisites](crates/pty/src/lib.rs)
+
+## November 23 Connection and folder isolation
+
+The Connection Manager stores the local folder choice with its path. A
+folder rename moves the choices for its descendants and deletion removes
+them. Saving a stale edit checks the current folder value. A saved SSH
+profile can choose Inherit or a specific level, including None. Old Rust
+records with an omitted level keep their established explicit None. The
+editor displays the effective level and its source for the current draft's
+folder, including the managed minimum where it raises the level.
+
+Interactive saved SSH and SFTP, Quick Connect, the saved SSH tab Control API,
+and saved SSH reopen and reconnect use the resolver. On personal routes an
+explicit request or connection choice takes precedence over the nearest
+configured folder and the global default. Teamwork takes the strongest of
+the local global default, local folder selection and shared choice or
+explicit session request. The managed minimum applies in both cases. Routes
+reviewed for unattended execution continue to require an eligible unisolated
+transport. The Java-format connection XML importer and exporter distinguish
+an omitted isolation mode from explicit None.
+
+The final native Apple Silicon run passed 213 Scheduler cases and 12
+isolation-related cases. The selections overlap. Coverage includes a
+profile round trip, stale folder edit rejection, rename and deletion,
+explicit request precedence and enforcement of the managed minimum. The
+Scheduler run verifies locally bound Teamwork credentials and jump profiles
+after the effective shared route has been checked.
+[Apple Silicon tests](target/verification/20261123-isolation-inheritance-apple-silicon-final.log)
+
+The final Windows ARM64 regression passed 396 selected application tests,
+including 214 Scheduler cases, with two ignored. Both Teamwork regressions
+passed after the executor kept the shared route's resolved level when
+constructing its temporary login. The application all-target check passed
+with `dialog-preview`. [Windows native tests](target/verification/20261123-isolation-inheritance-windows-final-tests.log)
+· [Windows application check](target/verification/20261123-isolation-inheritance-windows-verified-check.log)
+
+Remaining work includes saved local-shell profile overrides, Java global and
+folder backup settings, native desktop comparison and live launch acceptance.
+[Connection Manager editor](src/connection_window/form.rs)
+· [Folder and connection storage](src/connection_store.rs)
+· [Isolation resolver](src/session_security.rs)
+· [Interactive SSH launch](src/workspace/ssh_access.rs)
 
 ## November 23 Plan and execution layout
 

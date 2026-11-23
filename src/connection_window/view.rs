@@ -13,6 +13,7 @@ use crate::connection_store::teamwork;
 use crate::connection_store::{
     Auth, Connection, JavaGroupColor, LocalProfile, SerialProfile, Store,
 };
+use crate::session_security::{IsolationChoice, IsolationLevel};
 use crate::ssh_dialog::KeyChoice;
 use crate::terminal_agent::design::Choice as AgentDesignChoice;
 use crate::terminal_effects::Effect;
@@ -48,6 +49,7 @@ pub(crate) struct ViewChoices<'a> {
     pub(crate) terminal_effects: Option<&'a [Effect]>,
     pub(crate) default_paste_warning: PasteWarningMode,
     pub(crate) minimum_paste_warning: PasteWarningMode,
+    pub(crate) isolation: (IsolationLevel, IsolationLevel),
 }
 
 #[derive(Default)]
@@ -412,7 +414,16 @@ impl ConnectionWindow {
             .into()
         } else {
             let draft = self.draft.as_ref()?;
-            draft.view(&choices, &self.custom_badges, self.editor_group_picker())
+            let inherited = self
+                .draft_group
+                .as_deref()
+                .and_then(|path| self.store.inherited_group_isolation(path));
+            draft.view(
+                &choices,
+                &self.custom_badges,
+                self.editor_group_picker(),
+                inherited,
+            )
         };
         let form: Element<'_, Message> =
             if self.draft.is_some() && !self.confirming_close && !self.busy {
@@ -1472,6 +1483,19 @@ impl ConnectionWindow {
             ]
             .spacing(6),
             heading("FOLDER"),
+            row![
+                fact(
+                    "Session isolation",
+                    self.store.inherited_group_isolation(path).map_or_else(
+                        || "Global Settings".into(),
+                        |(source, level)| format!("{level} · Folder {source}")
+                    )
+                ),
+                button("Edit isolation…")
+                    .style(button::secondary)
+                    .on_press(Message::EditGroupIsolation),
+            ]
+            .spacing(8),
             self.store
                 .inherited_group_color(path)
                 .map(|(source, color)| {
@@ -1750,6 +1774,30 @@ fn folder_dialog<'a>(dialog: &'a FolderDialog, store: &'a Store) -> Element<'a, 
             ..
         } => {
             return folder_color_dialog(path, draft, imported.as_ref(), store);
+        }
+        FolderDialog::Isolation { path, draft, .. } => {
+            let inherited = path
+                .rsplit_once('/')
+                .and_then(|(parent, _)| store.inherited_group_isolation(parent));
+            let source = inherited.map_or_else(
+                || "Global Settings".into(),
+                |(folder, level)| format!("{level} · Folder {folder}"),
+            );
+            return column![
+                text("Folder session isolation").size(22),
+                text(path),
+                pick_list(IsolationChoice::ALL, Some(*draft), Message::GroupIsolation),
+                text(format!("Inherited from {source}.")),
+                row![
+                    button("Cancel")
+                        .style(button::secondary)
+                        .on_press(Message::CancelGroup),
+                    button("Save").on_press(Message::CommitGroup),
+                ]
+                .spacing(8),
+            ]
+            .spacing(10)
+            .into();
         }
     };
     let mut contents = column![text(title).size(22)].spacing(10);
@@ -2044,6 +2092,7 @@ fn teamwork_auth_picker_displays_missing_references_without_offering_them() {
         terminal_effects: None,
         default_paste_warning: PasteWarningMode::default(),
         minimum_paste_warning: PasteWarningMode::Off,
+        isolation: Default::default(),
     };
     for draft in [
         DefaultAuth::Password {

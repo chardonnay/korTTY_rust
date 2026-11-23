@@ -425,7 +425,7 @@ impl Workspace {
 
 fn eligible(connection: &Connection) -> bool {
     !connection.incognito
-        && connection.isolation.is_none()
+        && !connection.requires_isolated_launch()
         && connection.missing_username().is_none()
         && std::iter::once(&connection.login)
             .chain(connection.jump.iter())
@@ -478,6 +478,7 @@ mod tests {
             tunnels: Vec::new(),
             incognito: false,
             isolation: Default::default(),
+            inherit_isolation: false,
             startup: Default::default(),
             logging: Default::default(),
             terminal_effect: None,

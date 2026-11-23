@@ -662,6 +662,8 @@ pub(super) fn connection(
     {
         connection.isolation = IsolationLevel::from_id(value.trim())
             .ok_or_else(|| invalid("unknown isolation level in kortty connection XML"))?;
+    } else {
+        connection.inherit_isolation = true;
     }
     connection.incognito = boolean(node, "incognito")?;
     connection.terminal_effect = terminal_effect(node)?;

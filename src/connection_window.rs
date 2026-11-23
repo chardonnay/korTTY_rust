@@ -12,6 +12,7 @@ use crate::connection_store::{
     Connection, JavaGroupColor, LocalProfile, Search, SerialProfile, Store, TabColor,
 };
 use crate::serial_dialog;
+use crate::session_security::{IsolationChoice, IsolationLevel};
 use crate::terminal_effects::Effect;
 
 mod color;
@@ -64,6 +65,8 @@ pub enum Message {
     RenameGroup,
     DeleteGroup,
     EditGroupColor,
+    EditGroupIsolation,
+    GroupIsolation(IsolationChoice),
     GroupColorEnabled(bool),
     GroupColorInput(String),
     PickJavaGroupColor(JavaGroupColor),
@@ -222,6 +225,11 @@ enum FolderDialog {
         original: Option<TabColor>,
         draft: ColorDraft,
         imported: Option<JavaGroupColor>,
+    },
+    Isolation {
+        path: String,
+        original: Option<IsolationLevel>,
+        draft: IsolationChoice,
     },
 }
 
@@ -833,6 +841,9 @@ impl ConnectionWindow {
                 FolderDialog::Create { name, .. } => !name.is_empty(),
                 FolderDialog::Rename { path, name } => path.rsplit('/').next() != Some(name),
                 FolderDialog::Delete { .. } => false,
+                FolderDialog::Isolation {
+                    original, draft, ..
+                } => *original != draft.0,
                 FolderDialog::Color {
                     original,
                     draft,
@@ -935,6 +946,12 @@ impl ConnectionWindow {
             self.folder = None;
             self.notice =
                 Some("The folder's tab color changed. Reopen the editor before saving.".into());
+        }
+        if let Some(FolderDialog::Isolation { path, original, .. }) = &self.folder
+            && (!store.has_group(path) || store.group_isolation(path) != *original)
+        {
+            self.folder = None;
+            self.notice = Some("Folder isolation changed. Open the folder settings again.".into());
         }
         self.store = store;
         self.reconcile_selection();
@@ -1067,6 +1084,7 @@ impl ConnectionWindow {
                     Message::GroupName(_)
                         | Message::GroupColorEnabled(_)
                         | Message::GroupColorInput(_)
+                        | Message::GroupIsolation(_)
                         | Message::PickJavaGroupColor(_)
                         | Message::CommitGroup
                         | Message::CancelGroup
@@ -1494,6 +1512,23 @@ impl ConnectionWindow {
                     self.notice = None;
                 }
             }
+            Message::EditGroupIsolation if self.can_browse() => {
+                if let Some(path) = self.selection.single_group() {
+                    let original = self.store.group_isolation(path);
+                    self.folder = Some(FolderDialog::Isolation {
+                        path: path.to_owned(),
+                        original,
+                        draft: IsolationChoice(original),
+                    });
+                    self.notice = None;
+                }
+            }
+            Message::GroupIsolation(choice) => {
+                if let Some(FolderDialog::Isolation { draft, .. }) = &mut self.folder {
+                    *draft = choice;
+                    self.notice = None;
+                }
+            }
             Message::GroupColorEnabled(enabled) => {
                 if let Some(FolderDialog::Color {
                     draft, imported, ..
@@ -1726,6 +1761,14 @@ impl ConnectionWindow {
                         )?;
                     }
                     (Scope::Group(path), "Folder tab color saved.", None)
+                }
+                FolderDialog::Isolation {
+                    path,
+                    original,
+                    draft,
+                } => {
+                    store.set_group_isolation(&path, original, draft.0)?;
+                    (Scope::Group(path), "Folder isolation saved.", None)
                 }
             };
             Ok(Persisted {

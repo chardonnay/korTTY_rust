@@ -95,6 +95,8 @@ struct CachedConnection {
     tunnels: Vec<TunnelConfig>,
     incognito: bool,
     isolation: IsolationLevel,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    inherit_isolation: bool,
     #[serde(with = "startup_options")]
     startup: ConnectOptions,
     terminal_effect: Option<Selection>,
@@ -159,6 +161,7 @@ impl From<&Connection> for CachedConnection {
             tunnels: connection.tunnels.clone(),
             incognito: connection.incognito,
             isolation: connection.isolation,
+            inherit_isolation: connection.inherit_isolation,
             startup: connection.startup,
             terminal_effect: connection.terminal_effect,
             command_timestamps: connection.command_timestamps,
@@ -181,6 +184,7 @@ impl From<CachedConnection> for Connection {
             tunnels: connection.tunnels,
             incognito: connection.incognito,
             isolation: connection.isolation,
+            inherit_isolation: connection.inherit_isolation,
             startup: connection.startup,
             logging: Default::default(),
             terminal_effect: connection.terminal_effect,

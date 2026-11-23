@@ -488,6 +488,7 @@ fn saved_tab_group_changes_only_when_the_connection_folder_changes() {
                 tunnels: Vec::new(),
                 incognito: false,
                 isolation: Default::default(),
+                inherit_isolation: false,
                 startup: Default::default(),
                 logging: Default::default(),
                 terminal_effect: None,

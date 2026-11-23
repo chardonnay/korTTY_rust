@@ -112,6 +112,7 @@ fn openssh_registered_copy_reaches_kitty_desktop_session() {
             tunnels: Vec::new(),
             incognito: false,
             isolation: IsolationLevel::None,
+            inherit_isolation: false,
             startup: Default::default(),
             logging: Default::default(),
             terminal_effect: None,

@@ -50,6 +50,10 @@ impl ReviewedRoute {
         &self.identity
     }
 
+    pub(crate) fn group(&self) -> &str {
+        &self.group
+    }
+
     pub(crate) fn endpoint(&self) -> &LoginTarget {
         &self.target.endpoint
     }

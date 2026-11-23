@@ -225,6 +225,7 @@ pub struct SshDialog {
     profile: TerminalProfile,
     isolation: IsolationLevel,
     minimum_isolation: IsolationLevel,
+    inherits_isolation: bool,
     startup: StartupFields,
     logging: crate::terminal_logging::Form,
 }
@@ -422,6 +423,7 @@ impl SshDialog {
             profile,
             isolation: IsolationLevel::None,
             minimum_isolation: IsolationLevel::None,
+            inherits_isolation: false,
             startup: StartupFields::new(ConnectOptions::default()),
             logging: crate::terminal_logging::Form::new(Default::default()),
         }
@@ -439,6 +441,7 @@ impl SshDialog {
             profile,
             isolation: IsolationLevel::None,
             minimum_isolation: IsolationLevel::None,
+            inherits_isolation: false,
             startup: StartupFields::new(ConnectOptions::default()),
             logging: crate::terminal_logging::Form::new(Default::default()),
         }
@@ -451,6 +454,7 @@ impl SshDialog {
             profile,
             isolation: connection.isolation,
             minimum_isolation: IsolationLevel::None,
+            inherits_isolation: connection.inherit_isolation,
             startup: StartupFields::new(connection.startup),
             logging: crate::terminal_logging::Form::new(connection.logging.clone()),
         }
@@ -556,6 +560,10 @@ impl SshDialog {
         self.isolation = isolation;
         self.minimum_isolation = isolation;
         self
+    }
+
+    pub(crate) fn inherits_isolation(&self) -> bool {
+        self.inherits_isolation
     }
 
     pub fn focus(&self) -> Task<Message> {
@@ -679,6 +687,7 @@ impl SshDialog {
             tunnels: Vec::new(),
             incognito: false,
             isolation: self.isolation,
+            inherit_isolation: false,
             startup: self.startup.options().map_err(std::io::Error::other)?,
             logging: self.logging.config()?,
             terminal_effect: None,
@@ -1734,6 +1743,7 @@ mod tests {
             tunnels: Vec::new(),
             incognito: false,
             isolation: IsolationLevel::None,
+            inherit_isolation: false,
             startup: Default::default(),
             logging: Default::default(),
             terminal_effect: None,

@@ -53,6 +53,7 @@ fn connection(name: &str, tag: &str) -> Connection {
         tunnels: Vec::new(),
         incognito: false,
         isolation: IsolationLevel::None,
+        inherit_isolation: false,
         startup: Default::default(),
         logging: Default::default(),
         terminal_effect: None,
@@ -1272,6 +1273,7 @@ fn connection_manager_pointer_drags_accept_local_folders_and_refuse_teamwork_sou
         terminal_effects: Some(&Effect::ALL),
         default_paste_warning: Default::default(),
         minimum_paste_warning: PasteWarningMode::Off,
+        isolation: Default::default(),
     });
     let renderer = Renderer::new(Font::DEFAULT, 16.0.into());
     let mut tree = Tree::new(view.as_widget());
@@ -1382,6 +1384,7 @@ fn native_workbench_keeps_reference_side_widths_at_default_and_minimum_size() {
             terminal_effects: Some(&Effect::ALL),
             default_paste_warning: Default::default(),
             minimum_paste_warning: PasteWarningMode::Off,
+            isolation: Default::default(),
         });
         let mut tree = Tree::new(view.as_widget());
         let layout = view.as_widget_mut().layout(
@@ -1432,6 +1435,7 @@ fn long_scope_titles_keep_list_and_map_visible_at_minimum_width() {
             terminal_effects: Some(&Effect::ALL),
             default_paste_warning: Default::default(),
             minimum_paste_warning: PasteWarningMode::Off,
+            isolation: Default::default(),
         });
         let mut tree = Tree::new(view.as_widget());
         let node = view.as_widget_mut().layout(

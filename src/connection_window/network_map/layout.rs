@@ -469,6 +469,7 @@ mod tests {
             tunnels: Vec::new(),
             incognito: false,
             isolation: Default::default(),
+            inherit_isolation: false,
             startup: Default::default(),
             logging: Default::default(),
             terminal_effect: None,

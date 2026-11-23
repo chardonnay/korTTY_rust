@@ -161,6 +161,7 @@ pub(super) struct Dialog {
     ai: AiAssignments,
     ai_edited: bool,
     minimum_isolation: IsolationLevel,
+    default_isolation: IsolationLevel,
     local_shell: LocalShell,
     local_emulation: TerminalProfile,
     local: local::Draft,
@@ -204,6 +205,7 @@ impl Dialog {
             ai: AiAssignments::default(),
             ai_edited: false,
             minimum_isolation,
+            default_isolation: IsolationLevel::None,
             local_shell: LocalShell::default(),
             local_emulation: profile,
             local: local::Draft::default(),
@@ -222,8 +224,16 @@ impl Dialog {
         if let Some(connection) = store.get(id)
             && let Some(profile) = connection.profile()
         {
+            let isolation = store
+                .connection_isolation(
+                    connection,
+                    self.default_isolation,
+                    None,
+                    self.minimum_isolation,
+                )
+                .0;
             self.ssh = SshDialog::from_saved(profile, connection)
-                .with_isolation(IsolationLevel::None, self.minimum_isolation);
+                .with_isolation(isolation, self.minimum_isolation);
             self.selected_ssh = Some((id, connection.incognito));
             self.protocol = Protocol::Ssh;
         } else if let Some(saved) = store.serial(id)
@@ -456,10 +466,12 @@ impl Workspace {
             profile,
             self.clipboard.policy.minimum_isolation,
         );
+        dialog.default_isolation = self
+            .window_settings
+            .default_session_isolation
+            .unwrap_or_default();
         dialog.ssh = dialog.ssh.with_isolation(
-            self.window_settings
-                .default_session_isolation
-                .unwrap_or_default(),
+            dialog.default_isolation,
             self.clipboard.policy.minimum_isolation,
         );
         dialog.set_temporary_key_enabled(self.quick_temporary_key_enabled());
@@ -1296,10 +1308,18 @@ impl Workspace {
         let Some(profile) = connection.profile() else {
             return Task::none();
         };
-        let form = SshDialog::from_saved(profile, &connection).with_isolation(
-            IsolationLevel::None,
-            self.clipboard.policy.minimum_isolation,
-        );
+        let isolation = match self.saved_launch_isolation(&connection, None, None) {
+            Ok(level) => level,
+            Err(error) => {
+                self.notice(
+                    owner,
+                    format!("Could not resolve session isolation ({error})"),
+                );
+                return Task::none();
+            }
+        };
+        let form = SshDialog::from_saved(profile, &connection)
+            .with_isolation(isolation, self.clipboard.policy.minimum_isolation);
         self.start_quick_ssh(
             owner,
             form,

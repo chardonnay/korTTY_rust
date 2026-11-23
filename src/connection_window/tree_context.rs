@@ -150,6 +150,7 @@ enum Action {
     RenameFolder,
     CreateSubfolder,
     FolderColor,
+    FolderIsolation,
     ExportFolder,
     DeleteFolder,
     Badge(Option<String>),
@@ -370,6 +371,7 @@ impl ConnectionWindow {
                         Entry::item("Create Subfolder", A::CreateSubfolder, exists),
                         Separator,
                         Entry::item("Tab Color…", A::FolderColor, exists),
+                        Entry::item("Session Isolation…", A::FolderIsolation, exists),
                         Separator,
                         Entry::item("Assign Tag", A::AssignTag, exists),
                         Entry::item("Remove Tag", A::RemoveTag, exists),
@@ -597,6 +599,7 @@ impl ConnectionWindow {
             Action::RenameFolder
             | Action::CreateSubfolder
             | Action::FolderColor
+            | Action::FolderIsolation
             | Action::DeleteFolder => {
                 if !group.is_some_and(|path| self.select_context_group(path)) {
                     return Task::none();
@@ -605,6 +608,7 @@ impl ConnectionWindow {
                     Action::RenameFolder => ConnectionMessage::RenameGroup,
                     Action::CreateSubfolder => ConnectionMessage::NewGroup,
                     Action::FolderColor => ConnectionMessage::EditGroupColor,
+                    Action::FolderIsolation => ConnectionMessage::EditGroupIsolation,
                     _ => ConnectionMessage::DeleteGroup,
                 })
             }

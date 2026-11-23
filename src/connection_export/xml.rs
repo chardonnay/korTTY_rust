@@ -74,12 +74,14 @@ pub(super) fn kortty(
             };
             field(&mut xml, "    ", "pasteWarningMode", mode);
         }
-        let isolation = match connection.isolation {
-            IsolationLevel::None => "none",
-            IsolationLevel::Process => "process",
-            IsolationLevel::Sandbox => "sandbox",
-        };
-        field(&mut xml, "    ", "isolationMode", isolation);
+        if let Some(isolation) = connection.isolation_override() {
+            let value = match isolation {
+                IsolationLevel::None => "none",
+                IsolationLevel::Process => "process",
+                IsolationLevel::Sandbox => "sandbox",
+            };
+            field(&mut xml, "    ", "isolationMode", value);
+        }
         field(&mut xml, "    ", "incognito", connection.incognito);
         terminal_settings(
             &mut xml,

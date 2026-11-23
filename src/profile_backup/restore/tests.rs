@@ -3902,6 +3902,7 @@ fn save_fixture_connection(root: &Path, host: &str) -> (crate::connection_store:
             }],
             incognito: false,
             isolation: Default::default(),
+            inherit_isolation: false,
             startup: Default::default(),
             logging: Default::default(),
             terminal_effect: None,

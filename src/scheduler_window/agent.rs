@@ -872,7 +872,7 @@ impl Target {
             return Err("The saved SSH route changed.");
         }
         if connection.incognito
-            || !connection.isolation.is_none()
+            || connection.requires_isolated_launch()
             || connection.terminal.ai_agent_disabled
             || std::iter::once(&connection.login)
                 .chain(connection.jump.iter())

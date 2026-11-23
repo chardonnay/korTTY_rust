@@ -517,6 +517,12 @@ impl Workspace {
                 terminal_effects: effects.as_deref(),
                 default_paste_warning: self.window_settings.paste_warning,
                 minimum_paste_warning: self.clipboard.policy.minimum_paste_warning,
+                isolation: (
+                    self.window_settings
+                        .default_session_isolation
+                        .unwrap_or_default(),
+                    self.clipboard.policy.minimum_isolation,
+                ),
             };
             if editor_owner.is_some() {
                 return Some(manager.window.editor_view(choices).map_or_else(

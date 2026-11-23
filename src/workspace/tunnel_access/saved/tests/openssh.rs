@@ -766,6 +766,7 @@ fn openssh_reopen_closed_ssh_verifies_the_pin_and_starts_a_fresh_saved_session()
             tunnels: Vec::new(),
             incognito: false,
             isolation: Default::default(),
+            inherit_isolation: false,
             startup: Default::default(),
             logging: Default::default(),
             terminal_effect: None,

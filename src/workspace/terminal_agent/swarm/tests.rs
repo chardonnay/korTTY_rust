@@ -108,6 +108,7 @@ fn swarm_scheduler_handoff_preserves_saved_targets_and_blocks_route_changes() {
                 tunnels: Vec::new(),
                 incognito: false,
                 isolation: Default::default(),
+                inherit_isolation: false,
                 startup: Default::default(),
                 logging: Default::default(),
                 terminal_effect: None,

@@ -566,6 +566,57 @@ impl fmt::Debug for DialResponse {
 }
 
 impl Workspace {
+    pub(super) fn saved_launch_isolation(
+        &self,
+        connection: &Connection,
+        store_path: Option<&std::path::Path>,
+        request: Option<IsolationLevel>,
+    ) -> std::io::Result<IsolationLevel> {
+        let minimum = self.clipboard.policy.minimum_isolation;
+        if let Some(level) = request.or(connection.isolation_override()) {
+            return Ok(level.max(minimum));
+        }
+        let path = match store_path {
+            Some(path) => path.to_owned(),
+            None => crate::profile::connections_path()?,
+        };
+        let store = Store::open(path)?;
+        if store.get(connection.id) != Some(connection) {
+            return Err(std::io::Error::other(
+                "The saved connection changed. Select it again.",
+            ));
+        }
+        Ok(store
+            .connection_isolation(
+                connection,
+                self.window_settings
+                    .default_session_isolation
+                    .unwrap_or_default(),
+                request,
+                minimum,
+            )
+            .0)
+    }
+
+    fn teamwork_launch_isolation(
+        &self,
+        selection: &TeamworkSelection,
+        request: Option<IsolationLevel>,
+    ) -> std::io::Result<IsolationLevel> {
+        let store = Store::open(selection.store_path.clone())?;
+        let folder = store.inherited_group_isolation(selection.route.group());
+        Ok(crate::session_security::resolve_isolation(
+            self.window_settings
+                .default_session_isolation
+                .unwrap_or_default(),
+            folder,
+            selection.connection.isolation_override(),
+            request,
+            true,
+            self.clipboard.policy.minimum_isolation,
+        )
+        .0)
+    }
     fn allow_ssh_transport(&mut self, window: window::Id, transport: &str) -> bool {
         if self.clipboard.policy.problem.is_some()
             || (self.clipboard.policy.minimum_isolation == IsolationLevel::Sandbox
@@ -1133,6 +1184,17 @@ impl Workspace {
             );
             return Task::none();
         }
+        let resolved = if let Some(launch) = &control {
+            launch.floor
+        } else {
+            match self.saved_launch_isolation(&connection, None, None) {
+                Ok(level) => level,
+                Err(error) => {
+                    self.notice(id, format!("Could not resolve session isolation ({error})"));
+                    return Task::none();
+                }
+            }
+        };
         let Some(state) = self.windows.get_mut(&id) else {
             return Task::none();
         };
@@ -1143,10 +1205,7 @@ impl Workspace {
         let form = if let Some(launch) = &control {
             form.with_launch_isolation(launch.floor).with_fixed_route()
         } else {
-            form.with_isolation(
-                IsolationLevel::None,
-                self.clipboard.policy.minimum_isolation,
-            )
+            form.with_isolation(resolved, self.clipboard.policy.minimum_isolation)
         };
         let focus = form
             .focus()
@@ -1266,10 +1325,22 @@ impl Workspace {
         let Some(profile) = connection.profile() else {
             return Task::none();
         };
+        let floor = match self
+            .teamwork_launch_isolation(&selection, control.and_then(|options| options.isolation))
+        {
+            Ok(level) => level,
+            Err(error) => {
+                self.notice(
+                    owner,
+                    format!("Could not resolve Teamwork isolation ({error})"),
+                );
+                return Task::none();
+            }
+        };
         let Ok(route) = SshTarget::from_imported_route(
             login,
             connection.jump.as_ref().map(|jump| jump.endpoint.clone()),
-            connection.isolation,
+            floor,
         ) else {
             self.notice(
                 owner,
@@ -1277,19 +1348,6 @@ impl Workspace {
             );
             return Task::none();
         };
-        let floor = route
-            .isolation
-            .max(
-                self.window_settings
-                    .default_session_isolation
-                    .unwrap_or_default(),
-            )
-            .max(self.clipboard.policy.minimum_isolation)
-            .max(
-                control
-                    .and_then(|options| options.isolation)
-                    .unwrap_or_default(),
-            );
         let mut form = route
             .form(profile)
             .with_startup(connection.startup)
@@ -1690,6 +1748,17 @@ impl Workspace {
         if self.drop_stale_ssh_split(window) || !self.validate_ssh_reconnect(window) {
             return Task::none();
         }
+        let minimum = match self.current_ssh_isolation_floor(window) {
+            Ok(level) => level,
+            Err(error) => {
+                let canceled = self.cancel_ssh_login(window);
+                self.notice(
+                    window,
+                    format!("Could not resolve session isolation ({error})"),
+                );
+                return canceled;
+            }
+        };
         if !self.quick_temporary_key_enabled()
             && self.pending_ssh(window).is_some_and(|pending| {
                 pending.teamwork.is_none()
@@ -1703,7 +1772,6 @@ impl Workspace {
         let split = self
             .pending_ssh_mut(window)
             .and_then(|pending| pending.split);
-        let minimum = self.clipboard.policy.minimum_isolation;
         let Some(PendingSsh {
             stage: Stage::Form(form),
             sftp,
@@ -1921,6 +1989,56 @@ impl Workspace {
             shared_name,
             None,
         )
+    }
+
+    fn current_ssh_isolation_floor(&self, window: window::Id) -> io::Result<IsolationLevel> {
+        let minimum = self.clipboard.policy.minimum_isolation;
+        let Some(pending) = self.pending_ssh(window) else {
+            return Ok(minimum);
+        };
+        let request = pending
+            .control
+            .as_ref()
+            .and_then(|launch| launch.options.isolation);
+        if let Some(teamwork) = &pending.teamwork {
+            return self.teamwork_launch_isolation(&teamwork.selection, request);
+        }
+        let Some(id) = pending
+            .saved
+            .filter(|_| matches!(&pending.stage, Stage::Form(form) if form.inherits_isolation()))
+        else {
+            return Ok(minimum);
+        };
+        if let Some(level) = request {
+            return Ok(level.max(minimum));
+        }
+        let saved = pending
+            .reopen
+            .as_ref()
+            .and_then(|launch| launch.saved.as_deref())
+            .or_else(|| {
+                pending
+                    .reconnect
+                    .as_ref()
+                    .and_then(|launch| launch.saved.as_deref())
+            });
+        if let Some(saved) = saved {
+            return saved.isolation(self);
+        }
+        let store = Store::open(crate::profile::connections_path()?)?;
+        let connection = store.get(id).ok_or_else(|| {
+            io::Error::other("The saved connection is unavailable. Select it again.")
+        })?;
+        Ok(store
+            .connection_isolation(
+                connection,
+                self.window_settings
+                    .default_session_isolation
+                    .unwrap_or_default(),
+                None,
+                minimum,
+            )
+            .0)
     }
 
     fn launch_prepared_ssh(

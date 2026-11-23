@@ -103,6 +103,7 @@ fn connection_map_pdf_writes_a4_metadata_searchable_text_and_vector_routes() {
         tunnels: Vec::new(),
         incognito: false,
         isolation: Default::default(),
+        inherit_isolation: false,
         startup: Default::default(),
         logging: Default::default(),
         terminal_effect: None,

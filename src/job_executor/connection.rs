@@ -233,7 +233,12 @@ impl Credentials {
         secret: impl FnMut(&str, Kind, &LoginTarget) -> Result<Secret, &'static str>,
     ) -> Result<Self, &'static str> {
         reference.require_shared_route(entry)?;
+        if store.teamwork_requires_isolation(entry) {
+            return Err("This Teamwork connection requires isolation unavailable to jobs.");
+        }
         let mut current = entry.connection.clone();
+        // This temporary login carries the resolved level of the reviewed shared route.
+        current.inherit_isolation = false;
         current.login.endpoint = reference.target.clone();
         current.jump = reference.shared_jump_login(entry, store)?.cloned();
         current.login.auth = match reference.shared_auth() {
@@ -265,7 +270,7 @@ impl Credentials {
         if !reference_allowed(&reference, server_access) {
             return Err(SERVER_BLOCKED);
         }
-        if current.incognito || !current.isolation.is_none() {
+        if current.incognito || current.requires_isolated_launch() {
             return Err("This saved connection requires privacy or isolation unavailable to jobs.");
         }
         if let Some(problem) = current.missing_username() {
@@ -484,6 +489,7 @@ mod tests {
             tunnels: Vec::new(),
             incognito: false,
             isolation: IsolationLevel::None,
+            inherit_isolation: false,
             startup: Default::default(),
             logging: Default::default(),
             terminal_effect: None,
