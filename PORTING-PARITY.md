@@ -537,8 +537,20 @@ The Apple Silicon OpenSSH fixture verified direct and jump authentication
 with the expected public-key fingerprints. It also checked account and
 key mismatches, credential replacement, vault locking and a Security change
 after opening TCP. The focused expiry and portable backup tests passed.
-The Scheduler desktop review and key replacement interactions remain open.
 [Apple Silicon verification](target/verification/scheduler-temp-ssh-macos-native-final.log)
+
+Fedora ARM64 passed strict application Clippy and the native application
+build. The same OpenSSH fixture authenticated both hops with their
+separately saved temporary keys, transferred a file through the native
+rsync bridge and verified the downloaded bytes. Its expiry and portable
+backup tests also passed.
+[Fedora OpenSSH and rsync verification](target/verification/scheduler-temp-ssh-fedora-native-storage.log)
+
+Windows ARM64 passed strict Clippy for the app and SSH crate and all 60
+regular SSH crate tests. One opt-in test was ignored. The Scheduler
+desktop review and key replacement interactions remain open.
+[Windows Clippy](target/verification/scheduler-temp-ssh-windows-final-clippy.log)
+· [Windows SSH tests](target/verification/scheduler-temp-ssh-windows-ssh-suite.log)
 
 ## November 23 Native vault startup unlock
 
