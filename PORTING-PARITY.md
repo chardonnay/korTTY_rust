@@ -16,6 +16,25 @@ open until a result is recorded for the tested revision and environment. Both
 Mosh modes are out of scope. The editor has a reduced native scope with structure
 navigation for classes, functions, variables, and placeholders.
 
+## November 23 full native workspace tests
+
+All three native ARM64 hosts passed workspace formatting and strict Clippy
+for all targets on [PR #35](https://github.com/chardonnay/korTTY_rust/pull/35)
+at `ab5b101e`. The regular workspace suite reported the following results.
+Each test counts once, including tests that start a child copy of themselves.
+
+| Platform | Passed | Failed | Ignored by default |
+| --- | ---: | ---: | ---: |
+| Windows ARM64 | 4,804 | 0 | 100 |
+| macOS on Apple Silicon | 4,909 | 0 | 226 |
+| Fedora ARM64 | 4,953 | 0 | 290 |
+
+The Windows Credential Manager round trip also passed. On Apple Silicon,
+four opt-in tests covered the saved-key editor, SSH and SFTP with saved
+and Java-imported keys, and project reconnect after vault unlock and key
+expiry. The [release gates](PORTING-PLAN.md#native-acceptance-and-release-gates)
+track package, desktop and independent SSH acceptance separately.
+
 ## November 23 dialog parity review
 
 Rust implementation `aaa8d037` in [PR #34](https://github.com/chardonnay/korTTY_rust/pull/34)
