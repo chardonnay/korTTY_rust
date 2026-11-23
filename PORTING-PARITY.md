@@ -332,15 +332,40 @@ and editing, global Settings and workspace backup preferences.
 · [Windows native tests](target/verification/20261123-java-security-restore-windows-tests.log)
 
 The [Windows isolation review](#november-23-windows-isolation-dialogs-and-launches)
-records the native desktop comparison and sandbox launch evidence.
-Check live inherited SSH and the interactive SSH and SFTP temporary-key
-routes with disposable keys.
-Startup auto-unlock and encrypted temporary keys in the saved-connection
-editor remain open. The tagged Settings dialog updates its remembered
-unlock credential after a master password change and clears it when the
-user disables auto-unlock. Include those transitions and the managed
-startup requirement in native acceptance.
-[Tagged Java Settings dialog](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SettingsDialog.java)
+records the native desktop comparison and sandbox launch evidence. The
+[Apple Silicon reconnect checkpoint](#november-23-saved-and-teamwork-ssh-reconnect)
+covers live inherited SSH and Teamwork over direct OpenSSH. The
+interactive SSH and SFTP temporary-key routes still need live login checks
+with disposable keys. Complete the desktop Save and restart check for
+eligible imported Security and folder choices.
+
+## November 23 Java credential workflow review
+
+In Java v2.26.0, the optional startup setting stores an obfuscated master
+password in a local file. The Settings dialog refreshes it after rotation
+and clears it when the setting is disabled. A stale or invalid remembered
+password falls back to a prompt. Java's fresh-profile bootstrap supplies
+its own default password. Rust currently has the startup prompt and
+master-password rotation. The open Rust feature is explicit auto-unlock
+for an existing vault using protected device-local storage. Verify
+normal vault setup on a fresh profile, password rotation, manual fallback,
+disabling and precedence of the managed startup requirement.
+[Java Settings](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SettingsDialog.java)
+· [Java master password manager](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/security/MasterPasswordManager.java)
+· [Rust startup gate](src/startup.rs)
+· [Rust Credential Vault](src/vault_window.rs)
+
+The tagged Java saved-connection editor exposes a temporary SSH key,
+an expiry from 1 to 1,440 minutes with a default of 60, and a permanent
+option. Java encrypts the stored key and preserves its ciphertext if
+an unrelated edit is saved while the vault is locked. Rust Quick Connect
+already holds temporary keys for the lifetime of an interactive SSH or
+SFTP attempt, including a retry. Saving encrypted temporary keys in the
+Rust connection editor is still open. The native acceptance checklist
+includes expiry, removal, restart, and preservation on locked edits.
+[Java connection editor](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ConnectionEditDialog.java)
+· [Java XML repository](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/persistence/XMLConnectionRepository.java)
+· [Rust Quick Connect](src/workspace/quick_connect.rs)
 
 ## November 23 Windows isolation dialogs and launches
 
@@ -395,8 +420,8 @@ startup auto-unlock and saved temporary-key workflows remain open.
 A terminal opened from the Teamwork catalog retains the reviewed
 selection. Manual reconnect stages a new Teamwork login for the same
 endpoint, username and jump route. It applies the current local
-authentication preference, checks
-the shared source and managed policy, and takes the strongest of the
+authentication preference, checks the shared source and managed policy,
+and takes the strongest of the
 previous session level and the current Teamwork isolation rule. The
 original tab and scrollback remain available while the replacement starts.
 The app compares the source, credential choice and isolation rule again
@@ -422,8 +447,9 @@ to Own process. The Teamwork reconnect retained Own process after the
 folder rule was removed. Both routes replaced their original panes in
 place. The model test also passed on Apple Silicon. The Windows ARM64
 test build passed 36 selected SSH, reconnect and folder-isolation cases.
-The runtime test uses a direct loopback route. Native desktop navigation
-and jump-host reconnect still need their own checks.
+The Apple Silicon test drives the native application tasks over a direct
+loopback route. Live desktop navigation and the jump-host wire route still
+need their own checks.
 [Apple Silicon OpenSSH and model tests](target/verification/20261123-teamwork-reconnect-apple-silicon-verified.log)
 · [Windows ARM64 regressions](target/verification/20261123-teamwork-reconnect-windows-final-tests.log)
 

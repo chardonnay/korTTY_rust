@@ -9,10 +9,10 @@ the porting worktree.
 
 ## Current result and actionable backlog
 
-**Java v2.26.0 parity remains partial.** The implementation reviewed in
-[PR #34](https://github.com/chardonnay/korTTY_rust/pull/34) is `aaa8d037`.
-This worktree continues from the merge at `10e4ee78`. The Java reference
-is tag `v2.26.0` at `b235d91f2035`.
+**Java v2.26.0 parity remains partial.** The implementation checkpoint
+in [PR #35](https://github.com/chardonnay/korTTY_rust/pull/35) is `338ef64e`.
+It builds on the PR #34 merge at `10e4ee78`. The Java reference is tag
+`v2.26.0` at `b235d91f2035`.
 Windows ARM64 desktop checks cover the Settings frame and Font and Window
 pages, the Connection Manager and selected SSH editor tabs, and specific
 AI Manager and Agent Design workflows. The standalone Agent Design editor
@@ -53,6 +53,13 @@ The Windows ARM64 comparison verified effective isolation in the profile
 inspectors and the managed Security display. Native application recovery
 reopened a saved local profile in the sandbox under both folder inheritance
 and an installed minimum. [Windows isolation checks](PORTING-PARITY.md#november-23-windows-isolation-dialogs-and-launches)
+On Apple Silicon, the native application fixture reconnected saved SSH
+and Teamwork terminals through a pinned direct OpenSSH route. Saved SSH
+picked up a stricter folder rule, and Teamwork retained its reviewed route
+and the existing isolation floor. Both replaced the original pane in
+place. Windows ARM64 passed 36 focused regressions. The desktop reconnect
+flow and the jump-host wire path are still open.
+[SSH reconnect checks](PORTING-PARITY.md#november-23-saved-and-teamwork-ssh-reconnect)
 
 Start with the [confirmed implementation work](#confirmed-implementation-work).
 Other open areas include the remaining Settings pages and connection editor
@@ -69,7 +76,8 @@ records the broader comparison with the tagged Java release.
 
 | Area | Remaining change | Completion check |
 | --- | --- | --- |
-| D4/M1 · Credential settings and migration | Resolve and implement native vault custody for Java's optional startup auto-unlock and encrypted connection-editor temporary keys. | Verify startup policy precedence and review the imported temporary-key opt-in in the native Security page. Exercise the implemented interactive Quick Connect SSH and SFTP routes with disposable keys. [Security checkpoint](PORTING-PARITY.md#november-23-settings-security) · [Temporary SSH keys](PORTING-PARITY.md#november-23-quick-connect-temporary-ssh-keys) |
+| D4/P1 · Vault startup | Implement Java's optional startup auto-unlock using device-local protected credential storage and an explicit profile opt-in. Keep the managed password requirement authoritative. | Verify normal startup, unavailable or stale credentials, password rotation, disabling, and a managed requirement applied to an opted-in profile. [Java credential comparison](PORTING-PARITY.md#november-23-java-credential-workflow-review) |
+| D2/M1 · Saved-connection temporary keys | Define and implement encrypted custody for the saved SSH editor's temporary authentication. Cover the Java expiry and permanent options, vault-locked editing and explicit adoption of compatible imported credentials. | Verify protected storage, save and reload, expiry and replacement, removal and preservation during unrelated locked edits. Verify that import and restore require review. [Java credential comparison](PORTING-PARITY.md#november-23-java-credential-workflow-review) |
 | D4 · Searchable controls | Compare the remaining Java Settings and AI Manager pages, subpages and labeled controls with the Rust search inventory. Add reachable missing destinations alongside the dialog comparisons. | Verify that controls on a page that has never been opened are discoverable, and that navigation reveals the exact control with the current page state and policy. |
 
 The [November 23 review](PORTING-PARITY.md#november-23-dialog-parity-review)
@@ -121,9 +129,11 @@ Settings pages still need visual work. [Desktop comparison](PORTING-PARITY.md#no
 Resources exposes a JVM launch profile and its heap limit. Compare the
 native resource controls before specifying a Rust equivalent. The Security
 page offers the imported global isolation and Quick Connect temporary-key
-choices for explicit adoption.
-Verify those actions and the folder review in the native desktop. Audit
-the remaining connection-editor credential workflow. Privacy exposes Java
+choices for explicit adoption. Windows ARM64 verified the managed display,
+below-minimum rejection and folder review presentation. Exercise the Save
+and restart flow for reviewed choices and repeat it on the other native
+desktops. The saved-connection temporary-key workflow is in the
+[implementation backlog](#confirmed-implementation-work). Privacy exposes Java
 telemetry consent. Record the native app's behavior and the handling of imported
 consent before designing the corresponding surface. Language selects the
 application language. Translation manages application translation profiles,
@@ -371,6 +381,8 @@ feature is opt-in and its startup command is available in debug builds.
 
 | Area | Implemented in Rust | Remaining verification |
 | --- | --- | --- |
+| D2/P1 · Session isolation and reconnect | Effective isolation appears in the folder and connection editors. Windows ARM64 verified saved local-shell recovery with inherited and managed Sandbox choices. The native Apple Silicon fixture verified saved SSH and Teamwork reconnect over pinned direct OpenSSH. | Exercise a fresh local launch, unavailable sandbox feedback, desktop reconnect and a live jump-host reconnect. Repeat the applicable desktop checks on macOS and Linux. [Windows desktop checks](PORTING-PARITY.md#november-23-windows-isolation-dialogs-and-launches) · [OpenSSH reconnect checks](PORTING-PARITY.md#november-23-saved-and-teamwork-ssh-reconnect) |
+| D2/D4 · Quick Connect temporary keys | The saved Security opt-in enables in-memory temporary authentication for interactive SSH and SFTP, with destination validation, expiry and retry. | Use a disposable key for a live SSH and SFTP login, retry after expiry, and disable the option while a form or retry holds a key. [Quick Connect checkpoint](PORTING-PARITY.md#november-23-quick-connect-temporary-ssh-keys) |
 | B4 · GGUF Configure styling | The measured path width, compact two-column form, joined numeric controls and fixed actions follow the tagged Java layout. [Configure checkpoint](PORTING-PARITY.md#november-23-gguf-configure-sizing) | Compare the same layout with the platform theme on the remaining native desktops. |
 | D4 · Search matching | Settings and AI Manager use the shared Java matching and ranking rules for visible page and control names, aliases, duplicate suppression and the 40-result limit. Available controls are filtered before ranking. Imported model IDs remain selectable when their normalized names collide. | Compare result labels, ranking and keyboard and pointer navigation against the tagged dialogs on native desktops. [Search matching checkpoint](PORTING-PARITY.md#november-23-settings-search-matching) |
 | A2 · Copying a command step's output | **Copy output** uses all masked stdout and stderr retained for the selected step within the existing capture limits. The compact preview still shows the last eight lines. Retained runs use the same action and clipboard policy. | Verify both streams, a line longer than 320 characters and redaction in the native clipboard for live and retained runs. [Step-copy checkpoint](PORTING-PARITY.md#november-23-complete-masked-step-copy) |
@@ -485,8 +497,8 @@ The following work requires native acceptance or a scope decision.
   obtain independent external SSH review, build and verify one fixed source
   snapshot per target, and measure startup, idle memory and p95 input latency.
   An existing test count or notarization does not cover subsequent source edits.
-- **Product decisions** cover remembered vault unlock, persisted temporary
-  keys, automatic web requests using later command output, and round-wide
+- **Product decisions** cover the custody and import rules for persisted
+  temporary keys, automatic web requests using later command output, and round-wide
   approval of future commands across Swarm targets. An explicit grant for one
   run or one target already exists. Larger or dynamic Swarms, incognito scope,
   optional telemetry and third-party effects also need decisions. Review
@@ -789,8 +801,9 @@ The design editor, step output and shared settings-search behavior have
   The connection-group checkpoint passed 3,308 application tests, including
   encrypted backup/startup replay coverage. A later historical checkpoint passed
   3,320. Native desktop review and cross-host acceptance remain open. M1 tracks
-  remaining fields, action options and shared target identities. Persisted temporary keys
-  still need a scope decision.
+  remaining fields, action options and shared target identities. The
+  [credential backlog](#confirmed-implementation-work) tracks persisted
+  temporary keys and their migration separately.
 
 The Rust packager stages ZIP archives for Windows and macOS and a TAR.GZ for
 Linux. The optional `--linux-zip` flag emits a portable Linux ZIP and checksum
@@ -904,7 +917,8 @@ The broader release audit also confirmed these workflow differences:
   executable and arguments, reviewed SSH pins and one approval per launch.
   Java also supports free-form shell commands. Define any additional shell,
   Java credential migration or unattended support before implementing it.
-  Persisted temporary keys and remembered vault unlock need a scope decision.
+  The optional startup unlock and saved temporary-key editor are tracked in
+  the [implementation backlog](#confirmed-implementation-work).
 - **D5/A4 — Coding-agent indicators.** Native badges exist on macOS and
   Windows. Linux emits a persistent LauncherEntry D-Bus counter with an
   installed desktop entry. The native bus and count lifecycle have a
@@ -1205,6 +1219,12 @@ not been identified.
 
 ## Implementation order
 
+Implement optional vault auto-unlock and the saved-connection temporary-key
+workflow from the [credential backlog](#confirmed-implementation-work).
+Verify that fresh profiles use the normal vault setup and that managed
+startup prompts take precedence. The existing Quick Connect SSH and SFTP
+workflow can be exercised with disposable keys in parallel.
+
 Continue the [native session isolation checks](PORTING-PARITY.md#november-23-windows-isolation-dialogs-and-launches)
 with the macOS and Linux Security page and folder, SSH and local-shell
 editors. Launch a new saved local profile in the desktop sandbox and
@@ -1212,9 +1232,9 @@ check the editor feedback for an unavailable backend.
 Windows ARM64 recovery already exercised folder inheritance and the
 managed minimum in running local sessions.
 Use the [saved and Teamwork reconnect checkpoint](PORTING-PARITY.md#november-23-saved-and-teamwork-ssh-reconnect)
-for the pinned live OpenSSH coverage on Apple Silicon. Continue the native
-desktop SSH and Teamwork checks on Windows and Linux, including jump-host
-routes and the visible reconnect flow.
+for the pinned live OpenSSH coverage on Apple Silicon. Exercise the visible
+SSH and Teamwork reconnect flow on the native desktops and add a live
+jump-host test.
 Continue the [dialog design comparison](#gui-dialog-design-parity) with
 the remaining Settings and AI Manager pages. Repeat the verified Windows
 Knowledge Store restart and recovery paths on the other native desktops.
@@ -2740,7 +2760,7 @@ Agent and native-tool outputs against their own review scopes.
 | Q1 | Implementation + acceptance. The job editor supports searchable multi-selection of saved SSH connections and source-qualified groups. A batch rechecks the selected routes, expands group descendants and removes duplicate targets before changing the draft. [Scheduler picker parity](PORTING-PARITY.md#november-20-scheduler-target-picker) Missing-only SFTP sync, one-use/standing/cascade/predecessor reviews, multi-target Agent/Swarm, per-round approval, comparison and saved follow-up exist. Read-only and iterative scheduled Swarms admit up to sixteen reviewed target workflows and queue the remainder of up to 32 routes. Windows and Unix have a one-use reviewed changed-file download path. Ordinary uploads can replace reviewed private files owned by the remote login. Recurring approval can explicitly authorize replacements in either direction within the firing budget. rsync supports reviewed regular-file and directory transfer on Unix and Windows, including literal batches and mixed file and folder projections. Each combined route stages and verifies one tree with named or contents placement, scoped mirror deletion and recovery. Existing downloads support protected local folders and regular files on Linux, macOS and Windows. Direct file replacement supports one-use and recurring approval, with explicit distinct local paths for grouped routes. Recurring single and mixed existing-directory plans bind calendar and Chain occurrences, a reviewed receiver per route, and aggregate byte, entry and removal limits. Recurring Linux uploads use the protected v3 helper. Passwordless elevation uses a fixed Linux helper for direct and combined transfers, including guarded existing-directory upload and download. | Verify Teamwork scheduler and rsync jobs over native OpenSSH. Verify protected operations on shared routes and add shared-route support to Agent/Swarm approvals. Verify native recovery of abandoned private rsync staging after forced helper termination. Verify native larger Swarm runs over pinned SSH with configured providers, cancellation, journal/report/reopen and saved group refresh and reapproval after membership changes. Verify the implemented recurring file replacement paths on native desktops. Verify the implemented recurring vacant-folder progression under T3 through deployed native routes and address reference-required remote destinations outside the supported upload scope. Fedora verified ordinary SFTP Calendar and Chain starts through pinned OpenSSH. Verify configured deployments and remaining native editor paths for combined passwordless transfers. Passwordless standing rsync covers existing protected remote files and remote or local directories. Fedora verified recurring direct-file downloads with ordinary and passwordless pinned OpenSSH. Windows verified the one-use direct-file receiver over pinned OpenSSH. Confirm native approval and recovery and verify the remaining platform cases. Fedora verified first publication and replacement at vacant Linux server file and directory receivers through ordinary and passwordless routes. Verify disjoint and shared file and directory hierarchies and imported group layout through native Scheduler review and adoption. Verify merge, mirror and recurring approval through native desktop interaction. Verify deletion scope, recurrence, cascade and expiry, groups and batches on Windows and native macOS. |
 | Q2 | Implementation + acceptance. Elevated command/script/snippet, reviewed new-file/new-tree transfers, one-use and bounded recurring protected file replacement in both directions, one-use and recurring protected folder transfers with confirmed vacant-to-existing receiver progression, desktop outcomes and independently approved HTTPS webhooks exist. Typed Linux sudo actions cover mkdir, octal and explicit-class symbolic chmod, numeric chown, regular-file and recursive folder copy to vacant paths, no-replace file/folder rename and protected deletion. The Scheduler can resolve names through a bounded read-only command on one pinned saved route. Explicit acceptance stores the UID or GID. Recursive operations support up to 128 total entries. The browser and Scheduler support server-only ZIP, TAR, TAR.BZ2 and 7z creation with reviewed output UID, GID and ordinary mode through the updated helper. Ordinary Scheduler jobs can create vault-backed AES-256 ZIP and verify and publish an optional local copy using the same SSH session. An opt-in Linux workflow supports ordinary same-path archive updates, ZIP Add, fresh TAR output and recovery for the remote and local files. A separately installed Linux helper supports these archive formats and AES-256 ZIP through a path-constrained Scheduler sudo route with either an explicit passwordless review or a separately reviewed vault password. An administrator download root can permit a local copy of its newly published archive through the same command channel. | Ordinary SFTP symbolic permissions require a canonical path and the server's no-follow `lsetstat` extension. Verify symbolically computed ordinary modes through the descriptor-held sudo path with an authorized SSH route. Verify recurring vacant-folder progression, existing-folder standing approval, durable pending state and native recovery through the installed helper and native Scheduler windows. Verify the installed folder helper through a configured native Scheduler route. Verify recurring file replacements and reapproval from native Scheduler windows against a deployed helper. Verify native adoption of restored Java sudo staging drafts. Fedora verified ordinary and sudo client update fixtures and the Java archive layouts. Verify a configured desktop route with the installed helper. Verify the optional protected archive copy with pinned SSH, configured download roots, revocation and local publication. The native pinned client and the installed V2 helper passed separate Fedora checks, including actual sudo/PAM in an isolated test account. Verify deployment on a saved desktop route. Verify archive output metadata through the installed helper and live pinned SSH. The privileged route retains root-owned private output, consistent with Java's archive sudo controls. Verify named ownership over a live native SSH route, the installed archive helper under transfer denial, real authorized sudo, Windows/macOS publication, configured webhooks and live desktop delivery. J `jobscheduler/JobSchedulerJobRunner.java`, R `src/job_executor/remote/privileged.rs`. |
 | Q3 | Acceptance. Per-target Session Journals, capture revocation independent of execution, closing summaries, retention, estimates/totals, result links and Java retention-preference XML exist. | Native viewer/details/estimate/options and import/export dialogs, actual run/provider outcomes and target lifecycle. Verify a successful scheduled command under installed capture denial while existing retention continues. Java JAXB 0/37/3650 round trips already exist. |
-| P1 | Acceptance + bounded audit. Managed Control activation, SFTP separation, update feed, encrypted recovery output, scoped AI restrictions, protected/provisioned models, custom headers, automation capture and managed SFTP conflict defaults exist. Startup supports managed and personal password requirements. The shared `allow-telemetry` Boolean is accepted for compatibility. Scoped `rule.ai-memory.statistics` controls local collection. | Decide the scope of remembered vault unlock. Verify startup vault setup and unlock, the stricter host-pin lock contract, native worker enforcement, scoped precedence and revocation, SMB sources, signed protected inference and macOS protected-cache restart. See the [field audit](target/verification/20261112-step5-policy-audit.md) for the earlier snapshot. |
+| P1 | Implementation + acceptance. Managed Control activation, SFTP separation, update feed, encrypted recovery output, scoped AI restrictions, protected/provisioned models, custom headers, automation capture and managed SFTP conflict defaults exist. Startup supports managed and personal password requirements. The shared `allow-telemetry` Boolean is accepted for compatibility. Scoped `rule.ai-memory.statistics` controls local collection. | Implement and verify optional device-local vault auto-unlock under the managed startup requirement. Verify the stricter host-pin lock contract, native worker enforcement, scoped precedence and revocation, SMB sources, signed protected inference and macOS protected-cache restart. See the [field audit](target/verification/20261112-step5-policy-audit.md) for the earlier snapshot. |
 | R1 | Acceptance. Native/tiled playback, visible IBM recording, Java JSONL/GZIP import/export, legacy plain JSONL import, and reviewed WebM/VP9 and MKV/FFV1 exports exist. Java reader compatibility and both Fedora codecs have evidence. | Native wide/resize/synchronized playback and approved encoder execution/cancellation/cleanup on Windows/macOS. Java recording interchange and video export are no longer implementation gaps. |
 
 ### Concrete policy work and residual schema audit
@@ -2808,8 +2828,10 @@ search coverage.
   `temporarySshKeyEnabled` become Security page proposals. Existing native
   choices retain their authority, and the managed minimum applies at
   launch. Native fixtures cover restore and replay of these settings.
-  Verify the desktop adoption flow and managed behavior after restore.
-  Resolve custody of encrypted temporary keys separately.
+  Windows ARM64 verified the managed display and the blocked below-minimum
+  proposal. Verify Save and restart for eligible proposals on the native
+  desktops. The encrypted key material has a separate
+  [custody task](#confirmed-implementation-work).
   [Java backup security checkpoint](PORTING-PARITY.md#november-23-java-backup-security-settings)
 - Java restore maps `maxBackupCount` and `autoBackupInterval`. At desktop
   startup these values initialize absent native backup settings. Existing
@@ -3571,9 +3593,10 @@ Source references are J `core/BackupManager.java` and
 `src/profile_backup/java_migration.rs`,
 `src/profile_backup/java_scheduler.rs`, and
 `src/ai_manager/profiles/java_backup.rs`. Stored execution approvals,
-model/file paths, provider credentials, temporary keys and remembered unlock
-retain their explicit policy or scope decisions. A disabled imported job is
-not authorized to run.
+model/file paths, provider credentials and temporary keys require their
+applicable migration reviews. A remembered unlock credential belongs to
+the local device and profile. A disabled imported job requires explicit
+review before activation.
 
 ## Distribution, help and residual product audits
 
