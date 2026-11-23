@@ -386,9 +386,46 @@ passed with `dialog-preview`.
 · [Windows all-target check](target/verification/20261123-isolation-desktop-windows-verified-check.log)
 
 Remaining acceptance includes a fresh saved-profile desktop launch,
-inherited live SSH and Teamwork reconnect, backend-unavailable editor
+the other desktop SSH and Teamwork checks, backend-unavailable editor
 feedback and the macOS and Linux desktop comparisons. The separate Java
 startup auto-unlock and saved temporary-key workflows remain open.
+
+## November 23 Saved and Teamwork SSH reconnect
+
+A terminal opened from the Teamwork catalog retains the reviewed
+selection. Manual reconnect stages a new Teamwork login for the same
+endpoint, username and jump route. It applies the current local
+authentication preference, checks
+the shared source and managed policy, and takes the strongest of the
+previous session level and the current Teamwork isolation rule. The
+original tab and scrollback remain available while the replacement starts.
+The app compares the source, credential choice and isolation rule again
+before publishing the replacement pane. The saved-selection reference
+lives in the active session. Project and workspace restore use their own
+route records.
+
+The native OpenSSH fixture pins its generated host key before connecting.
+It drives the application login and reconnect tasks for both route types,
+including a personal folder that changes from None to Own process and a
+Teamwork folder that relaxes while the first Own process session is open.
+It checks which transport completed the dial and reads terminal output
+over the replacement connection. The Windows model regression changes
+the Teamwork source during review and checks that the original pane stays
+in place.
+[SSH reconnect entry point](src/workspace/ssh_access/reconnect.rs)
+· [Replacement checks](src/workspace/reconnect.rs)
+· [Native OpenSSH fixture](src/workspace/ssh_access/tests/native_isolation_reconnect.rs)
+
+The native Apple Silicon wire test passed four authenticated SSH dials
+across the two routes. The personal reconnect raised isolation from None
+to Own process. The Teamwork reconnect retained Own process after the
+folder rule was removed. Both routes replaced their original panes in
+place. The model test also passed on Apple Silicon. The Windows ARM64
+test build passed 36 selected SSH, reconnect and folder-isolation cases.
+The runtime test uses a direct loopback route. Native desktop navigation
+and jump-host reconnect still need their own checks.
+[Apple Silicon OpenSSH and model tests](target/verification/20261123-teamwork-reconnect-apple-silicon-verified.log)
+· [Windows ARM64 regressions](target/verification/20261123-teamwork-reconnect-windows-final-tests.log)
 
 ## November 23 Plan and execution layout
 

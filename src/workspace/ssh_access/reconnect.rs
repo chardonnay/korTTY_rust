@@ -77,6 +77,9 @@ impl Workspace {
         let Some(ssh) = pane.ssh.as_ref() else {
             return Task::none();
         };
+        if !project && let Some(teamwork) = pane.teamwork_ssh.clone() {
+            return self.open_teamwork_ssh(owner, teamwork, false, true, None, Some(target));
+        }
         let incognito = tab.incognito;
         let saved_id = ssh.saved_id();
         let pane_profile = pane.frame.screen.profile;

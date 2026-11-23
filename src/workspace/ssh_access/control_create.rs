@@ -84,7 +84,7 @@ impl Workspace {
                 .with("detail", serde_json::json!(error.to_string()))
             })?;
         self.allow_control_ssh(floor, options.incognito || selection.connection.incognito)?;
-        let focus = self.open_teamwork_ssh(owner, selection, false, true, Some(options));
+        let focus = self.open_teamwork_ssh(owner, selection, false, true, Some(options), None);
         self.start_control_ssh(owner, focus)
     }
 

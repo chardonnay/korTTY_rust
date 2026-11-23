@@ -1207,11 +1207,14 @@ not been identified.
 
 Continue the [native session isolation checks](PORTING-PARITY.md#november-23-windows-isolation-dialogs-and-launches)
 with the macOS and Linux Security page and folder, SSH and local-shell
-editors. Exercise saved SSH and Teamwork against a verified host and
-reconnect an inherited route. Launch a new saved local profile in the
-desktop sandbox and check the editor feedback for an unavailable backend.
+editors. Launch a new saved local profile in the desktop sandbox and
+check the editor feedback for an unavailable backend.
 Windows ARM64 recovery already exercised folder inheritance and the
 managed minimum in running local sessions.
+Use the [saved and Teamwork reconnect checkpoint](PORTING-PARITY.md#november-23-saved-and-teamwork-ssh-reconnect)
+for the pinned live OpenSSH coverage on Apple Silicon. Continue the native
+desktop SSH and Teamwork checks on Windows and Linux, including jump-host
+routes and the visible reconnect flow.
 Continue the [dialog design comparison](#gui-dialog-design-parity) with
 the remaining Settings and AI Manager pages. Repeat the verified Windows
 Knowledge Store restart and recovery paths on the other native desktops.

@@ -694,6 +694,7 @@ struct PaneSession {
     strict_escapes: bool,
     saved_strict_escapes: bool,
     teamwork_terminal_input: Option<ssh_access::TeamworkTerminalInput>,
+    teamwork_ssh: Option<ssh_access::TeamworkSelection>,
     local_security: Option<LocalSettings>,
     saved_local: Option<crate::connection_store::LocalProfile>,
     local_use_pending: bool,
@@ -3775,6 +3776,7 @@ impl Workspace {
                 strict_escapes: false,
                 saved_strict_escapes: false,
                 teamwork_terminal_input: None,
+                teamwork_ssh: None,
                 local_security: None,
                 saved_local: None,
                 journal_config: Default::default(),
@@ -4309,7 +4311,14 @@ impl Workspace {
             self.sync_pane_appearance(session);
         }
         if let Some(target) = reconnect {
-            return self.start_reconnect_worker(window, target, session, None, Default::default());
+            return self.start_reconnect_worker(
+                window,
+                target,
+                session,
+                None,
+                Default::default(),
+                None,
+            );
         } else if let Some((index, pane, old)) = replacement {
             if let Some(tab) = self
                 .windows

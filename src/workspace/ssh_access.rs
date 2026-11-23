@@ -209,7 +209,7 @@ pub(super) struct PendingSsh {
     stage: Stage,
 }
 
-struct TeamworkLaunch {
+pub(super) struct TeamworkLaunch {
     selection: TeamworkSelection,
     route: SshTarget,
     auth: AuthSnapshot,
@@ -223,6 +223,7 @@ pub(super) struct TeamworkUnlock {
     sftp: bool,
     preference: teamwork::DefaultAuth,
     control: Option<CreateOptions>,
+    reconnect: Option<super::reconnect::ReconnectTarget>,
 }
 
 #[derive(Clone)]
@@ -300,6 +301,40 @@ impl TeamworkSelection {
 
 const TEAMWORK_RESELECT: &str =
     "This Teamwork connection changed or is no longer available. Select it again.";
+
+impl TeamworkLaunch {
+    fn stale_reason(&self, workspace: &Workspace) -> Option<&'static str> {
+        if !workspace.teamwork_sync_allowed() {
+            Some("Managed policy blocks Teamwork connections.")
+        } else if !self.selection.matches_catalog(workspace) {
+            Some(TEAMWORK_RESELECT)
+        } else if !self
+            .auth
+            .is_current(workspace, &self.selection, &self.route.login)
+        {
+            Some("Teamwork authentication changed or is unavailable. Select the connection again.")
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn reconnect_stale_reason(
+        &self,
+        workspace: &Workspace,
+        target: &SshTarget,
+    ) -> Option<String> {
+        target.blocked_server(workspace).or_else(|| {
+            self.stale_reason(workspace).map(str::to_owned).or_else(|| {
+                (!workspace
+                    .teamwork_launch_isolation(&self.selection, None)
+                    .is_ok_and(|level| level <= target.isolation))
+                .then(|| {
+                    "Teamwork isolation settings changed. Reconnect again to apply them.".into()
+                })
+            })
+        })
+    }
+}
 
 struct RetryLogin {
     keyboard: (KeyboardOptions, Option<KeyboardOptions>),
@@ -825,17 +860,13 @@ impl Workspace {
             return false;
         };
         pending.form_key() == key
-            && match key {
-                Some(FormKey::Teamwork(_)) => true,
-                None => {
-                    self.quick_temporary_key_enabled()
-                        && pending
-                            .retry
-                            .as_ref()
-                            .is_some_and(|retry| retry.temporary_key.is_some())
-                }
-                _ => false,
-            }
+            && (pending.teamwork.is_some()
+                || (key.is_none()
+                    && self.quick_temporary_key_enabled()
+                    && pending
+                        .retry
+                        .as_ref()
+                        .is_some_and(|retry| retry.temporary_key.is_some())))
     }
 
     fn paste_pending_temporary_key(&mut self, owner: window::Id) -> Task<WorkspaceMessage> {
@@ -916,18 +947,7 @@ impl Workspace {
             .as_ref()?
             .teamwork
             .as_ref()?;
-        let reason = if !self.teamwork_sync_allowed() {
-            "Managed policy blocks Teamwork connections."
-        } else if !shared.selection.matches_catalog(self) {
-            TEAMWORK_RESELECT
-        } else if !shared
-            .auth
-            .is_current(self, &shared.selection, &shared.route.login)
-        {
-            "Teamwork authentication changed or is unavailable. Select the connection again."
-        } else {
-            return None;
-        };
+        let reason = shared.stale_reason(self)?;
         let cancel = self.cancel_ssh_login(owner);
         self.notice(owner, reason.into());
         Some(cancel)
@@ -1244,7 +1264,7 @@ impl Workspace {
         selection: TeamworkSelection,
         sftp: bool,
     ) -> Task<WorkspaceMessage> {
-        self.open_teamwork_ssh(owner, selection, sftp, true, None)
+        self.open_teamwork_ssh(owner, selection, sftp, true, None, None)
     }
 
     fn open_teamwork_ssh(
@@ -1254,6 +1274,7 @@ impl Workspace {
         sftp: bool,
         offer_unlock: bool,
         control: Option<CreateOptions>,
+        reconnect: Option<super::reconnect::ReconnectTarget>,
     ) -> Task<WorkspaceMessage> {
         if self.exiting
             || !self.teamwork_sync_allowed()
@@ -1271,7 +1292,25 @@ impl Workspace {
         if !self.allow_saved_server(owner, connection) {
             return Task::none();
         }
-        let incognito = connection.incognito || control.is_some_and(|options| options.incognito);
+        let original = if let Some(target) = reconnect {
+            if self.reconnect_sftp_busy(target.source) {
+                self.notice(owner, super::reconnect::SFTP_BUSY.into());
+                return Task::none();
+            }
+            let Some((tab, pane)) = self.reconnect_target(owner, target) else {
+                return Task::none();
+            };
+            let Some(route) = &pane.ssh else {
+                return Task::none();
+            };
+            Some((route.clone(), tab.incognito))
+        } else {
+            None
+        };
+        let incognito = original.as_ref().map_or_else(
+            || connection.incognito || control.is_some_and(|options| options.incognito),
+            |(_, incognito)| *incognito,
+        );
         if incognito && !self.clipboard.policy.incognito_allowed {
             self.notice(
                 owner,
@@ -1309,6 +1348,7 @@ impl Workspace {
                         sftp,
                         preference: self.teamwork_auth_default().clone(),
                         control,
+                        reconnect,
                     });
                     return open;
                 }
@@ -1325,7 +1365,7 @@ impl Workspace {
         let Some(profile) = connection.profile() else {
             return Task::none();
         };
-        let floor = match self
+        let mut floor = match self
             .teamwork_launch_isolation(&selection, control.and_then(|options| options.isolation))
         {
             Ok(level) => level,
@@ -1337,11 +1377,19 @@ impl Workspace {
                 return Task::none();
             }
         };
-        let Ok(route) = SshTarget::from_imported_route(
-            login,
-            connection.jump.as_ref().map(|jump| jump.endpoint.clone()),
-            floor,
-        ) else {
+        let jump = connection.jump.as_ref().map(|jump| &jump.endpoint);
+        if let Some((route, _)) = &original {
+            if !route.matches_endpoints(&login, jump) {
+                self.notice(owner, TEAMWORK_RESELECT.into());
+                return Task::none();
+            }
+            floor = floor.max(route.isolation);
+            if floor == IsolationLevel::Sandbox && !ssh_worker::sandbox_available() {
+                self.notice(owner, "SSH sandbox is unavailable on this system.".into());
+                return Task::none();
+            }
+        }
+        let Ok(route) = SshTarget::from_imported_route(login, jump.cloned(), floor) else {
             self.notice(
                 owner,
                 "This Teamwork connection has an invalid SSH route.".into(),
@@ -1355,7 +1403,11 @@ impl Workspace {
             .with_fixed_route();
         auth.apply_to(&mut form, &route.login);
         let form_revision = self.allocate();
-        let key = Some(FormKey::Teamwork(form_revision));
+        let key = Some(if reconnect.is_some() {
+            FormKey::Reconnect(form_revision)
+        } else {
+            FormKey::Teamwork(form_revision)
+        });
         let focus = form
             .focus()
             .map(move |message| wrap(form_message(owner, key, message)));
@@ -1372,7 +1424,12 @@ impl Workspace {
             replace: None,
             split: None,
             reopen: None,
-            reconnect: None,
+            reconnect: reconnect.map(|target| ReconnectLaunch {
+                target,
+                form_revision,
+                saved: None,
+                project: false,
+            }),
             control: control.map(|options| ControlLaunch {
                 options,
                 floor,
@@ -1436,6 +1493,7 @@ impl Workspace {
             pending.sftp,
             false,
             pending.control,
+            pending.reconnect,
         );
         if pending.control.is_some() {
             return self
@@ -2315,6 +2373,7 @@ impl Workspace {
             (*replace, target.clone(), *profile, *sftp, *incognito, *font);
         let dial_grid = *grid;
         let control = control.is_some();
+        let teamwork_selection = teamwork.as_ref().map(|shared| shared.selection.clone());
         let teamwork_terminal = teamwork.as_ref().map(|teamwork| {
             let options = &teamwork.selection.connection().terminal;
             TeamworkTerminalInput {
@@ -2510,6 +2569,7 @@ impl Workspace {
                     pane.strict_escapes = strict;
                     pane.saved_strict_escapes = saved_strict.is_some();
                     pane.teamwork_terminal_input = teamwork_terminal;
+                    pane.teamwork_ssh = teamwork_selection;
                     pane.credential_environment_source = environment_credential;
                     if let Some(selection) = terminal_effect {
                         pane.effect = Some(super::effects::Active::from_saved(selection));
@@ -2525,19 +2585,21 @@ impl Workspace {
                     Some((
                         pending.reconnect.take()?,
                         std::mem::take(&mut pending.key_snapshots),
+                        pending.teamwork.take(),
                     ))
                 });
                 if let Some(state) = self.windows.get_mut(&window) {
                     state.pending_ssh = None;
                     state.notice = None;
                 }
-                if let Some((reconnect, key_snapshots)) = reconnect {
+                if let Some((reconnect, key_snapshots, teamwork)) = reconnect {
                     return self.start_reconnect_worker(
                         window,
                         reconnect.target,
                         session_id,
                         reconnect.saved,
                         key_snapshots,
+                        teamwork,
                     );
                 }
                 if let Some((tab, pane, old)) = slot {

@@ -406,12 +406,19 @@ impl Session {
         prompts: &mut PromptHandler<'_>,
         trust: &TrustStore,
     ) -> Result<Self, ConnectError> {
+        let executable = std::env::current_exe()?;
+        #[cfg(test)]
+        let executable = if std::env::var_os("KORTTY_SSH_TEST_EXE").is_some() {
+            test_executable()
+        } else {
+            executable
+        };
         Self::dial_executable(
             request,
             size,
             sftp,
             cancellation,
-            &std::env::current_exe()?,
+            &executable,
             trust,
             Some(prompts),
         )
