@@ -108,16 +108,19 @@ pub(super) struct Form {
 
 impl Default for Form {
     fn default() -> Self {
+        Self::with_minutes(60)
+    }
+}
+
+impl Form {
+    pub(super) fn with_minutes(minutes: u16) -> Self {
         Self {
-            minutes: "60".into(),
+            minutes: minutes.to_string(),
             key: None,
             pending_paste: None,
             failed_paste: false,
         }
     }
-}
-
-impl Form {
     pub(super) fn set_minutes(&mut self, minutes: String) {
         if minutes.len() <= 4
             && minutes.bytes().all(|byte| byte.is_ascii_digit())

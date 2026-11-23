@@ -45,7 +45,7 @@ records the broader comparison with the tagged Java release.
 
 | Area | Remaining change | Completion check |
 | --- | --- | --- |
-| D4 · Security settings | The native Security page includes password rotation and the managed startup requirement. Compare the Java global temporary-key switch and isolation default with the native connection routes. Resolve Java's optional startup auto-unlock against native vault custody. | Exercise the defaults in normal entry points, check managed floors, and extend the native Security comparison to the complete page. [Security checkpoint](PORTING-PARITY.md#november-23-settings-security) |
+| D4 · Security settings | The native Security page includes password rotation, the managed startup requirement and the temporary-key switch for Quick Connect SSH and SFTP. Port the global isolation default and sandbox availability. Resolve Java's optional startup auto-unlock and encrypted connection-editor temporary keys against native vault custody. | Exercise the defaults in normal entry points, check managed floors, and extend the native Security comparison to the complete page. [Security checkpoint](PORTING-PARITY.md#november-23-settings-security) · [Temporary SSH keys](PORTING-PARITY.md#november-23-quick-connect-temporary-ssh-keys) |
 | D4 · Searchable controls | Compare the remaining Java Settings and AI Manager pages, subpages and labeled controls with the Rust search inventory. Add reachable missing destinations alongside the dialog comparisons. | Verify that controls on a page that has never been opened are discoverable, and that navigation reveals the exact control with the current page state and policy. |
 
 The [November 23 review](PORTING-PARITY.md#november-23-dialog-parity-review)
@@ -96,10 +96,11 @@ Settings pages still need visual work. [Desktop comparison](PORTING-PARITY.md#no
 
 Resources exposes a JVM launch profile and its heap limit. Compare the
 native resource controls before specifying a Rust equivalent. Next in
-Security, trace the global temporary SSH key switch and isolation default
-through the Connection Manager and Quick Connect. Compare default
-resolution for local and SSH sessions, including managed floors and
-configured sandbox availability. Privacy exposes Java telemetry
+Security, trace the isolation default through the Connection Manager and
+Quick Connect. Compare default resolution for local and SSH sessions,
+including managed floors and configured sandbox availability. The
+Quick Connect temporary-key switch is implemented. Audit the related
+Java backup flag and connection-editor credentials. Privacy exposes Java telemetry
 consent. Record the native app's behavior and the handling of imported
 consent before designing the corresponding surface. Language selects the
 application language. Translation manages application translation profiles,

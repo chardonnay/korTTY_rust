@@ -60,6 +60,8 @@ Find a command by its name or menu and record the keys you want to use. Resolve 
 
 Enable **Require master password at startup** and choose **Save** to unlock or create the vault before the next workspace opens. An installation policy can require this and lock the setting.
 
+Enable **Enable temporary SSH key option** and choose **Save** to use the temporary-key method for SSH or SFTP in Quick Connect. Enter the host and username, set the key lifetime, and use **Paste private key**. The key is held in memory for the attempt and its retries until it expires. For a saved connection with reusable key authentication, use a registered SSH key.
+
 ## Settings · Editor
 
 Choose a block, line or underscore cursor and enter a cursor color as `#RRGGBB`. File editors use the terminal font and colors. Use **Reset zoom** in a file editor to restore the current terminal font size.

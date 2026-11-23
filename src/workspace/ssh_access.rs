@@ -549,7 +549,7 @@ pub enum Message {
 
 #[derive(Clone, Copy, Debug)]
 pub struct TemporaryKeyPaste {
-    form_revision: u64,
+    form_key: Option<FormKey>,
     request: u64,
     internal_clipboard: bool,
 }
@@ -615,7 +615,7 @@ impl Workspace {
                 self.update_ssh_form(window, message)
             }
             Message::TemporaryKeyPasted(window, paste, value) => {
-                if self.guarded_ssh_form_key(window) != Some(FormKey::Teamwork(paste.form_revision))
+                if !self.can_paste_pending_temporary_key(window, paste.form_key)
                     || !self.pending_ssh_mut(window).is_some_and(|pending| {
                         matches!(&pending.stage, Stage::Form(form)
                             if form.expects_temporary_key_paste(paste.request))
@@ -754,7 +754,7 @@ impl Workspace {
         match message {
             ssh_dialog::Message::Connect => self.connect_ssh(owner),
             ssh_dialog::Message::OpenVault => self.show_vault(owner),
-            ssh_dialog::Message::PasteTemporaryKey => self.paste_teamwork_key(owner),
+            ssh_dialog::Message::PasteTemporaryKey => self.paste_pending_temporary_key(owner),
             ssh_dialog::Message::Cancel => self.cancel_ssh_login(owner),
             message => {
                 if let Some(PendingSsh {
@@ -769,15 +769,34 @@ impl Workspace {
         }
     }
 
-    fn paste_teamwork_key(&mut self, owner: window::Id) -> Task<WorkspaceMessage> {
-        let Some(FormKey::Teamwork(revision)) = self.guarded_ssh_form_key(owner) else {
-            return Task::none();
+    fn can_paste_pending_temporary_key(&self, owner: window::Id, key: Option<FormKey>) -> bool {
+        let Some(pending) = self.pending_ssh(owner) else {
+            return false;
         };
+        pending.form_key() == key
+            && match key {
+                Some(FormKey::Teamwork(_)) => true,
+                None => {
+                    self.quick_temporary_key_enabled()
+                        && pending
+                            .retry
+                            .as_ref()
+                            .is_some_and(|retry| retry.temporary_key.is_some())
+                }
+                _ => false,
+            }
+    }
+
+    fn paste_pending_temporary_key(&mut self, owner: window::Id) -> Task<WorkspaceMessage> {
+        let form_key = self.guarded_ssh_form_key(owner);
+        if !self.can_paste_pending_temporary_key(owner, form_key) {
+            return Task::none();
+        }
         if let Some(cancel) = self.cancel_stale_routed_ssh_login(owner) {
             return cancel;
         }
         let paste = TemporaryKeyPaste {
-            form_revision: revision,
+            form_key,
             request: self.allocate(),
             internal_clipboard: self.clipboard.policy.internal,
         };
@@ -799,6 +818,23 @@ impl Workspace {
                 ssh_dialog::Password::new(value.unwrap_or_default()),
             ))
         })
+    }
+
+    pub(super) fn discard_quick_temporary_ssh_retries(&mut self) {
+        for pending in self
+            .windows
+            .values_mut()
+            .filter_map(|window| window.pending_ssh.as_mut())
+            .chain(self.sftp_logins.values_mut())
+            .filter(|pending| pending.teamwork.is_none())
+        {
+            if let Some(retry) = &mut pending.retry {
+                retry.temporary_key = None;
+            }
+            if let Stage::Form(form) = &mut pending.stage {
+                form.set_quick_temporary_key_enabled(false);
+            }
+        }
     }
 
     fn cancel_stale_routed_ssh_login(
@@ -1643,6 +1679,16 @@ impl Workspace {
             return self.fail_pending_reopen_ssh(window);
         }
         if self.drop_stale_ssh_split(window) || !self.validate_ssh_reconnect(window) {
+            return Task::none();
+        }
+        if !self.quick_temporary_key_enabled()
+            && self.pending_ssh(window).is_some_and(|pending| {
+                pending.teamwork.is_none()
+                    && matches!(&pending.stage, Stage::Form(form) if form.temporary_key_selected())
+            })
+        {
+            self.discard_quick_temporary_ssh_retries();
+            self.notice(window, "The temporary SSH key option is disabled.".into());
             return Task::none();
         }
         let split = self
@@ -2692,10 +2738,13 @@ impl Workspace {
         if let Some(floor) = control_floor {
             form = form.with_isolation(floor, floor).with_fixed_route();
         }
+        let quick_temporary_key_enabled = self.quick_temporary_key_enabled();
         if let Some(pending) = self.pending_ssh_mut(window) {
             if let Some(retry) = &pending.retry {
                 if let Some(shared) = &pending.teamwork {
                     shared.auth.enable_retry(&mut form);
+                } else if retry.temporary_key.is_some() {
+                    form.set_quick_temporary_key_enabled(quick_temporary_key_enabled);
                 }
                 retry.restore(&mut form, &target.login);
             } else if let Some(shared) = &pending.teamwork {

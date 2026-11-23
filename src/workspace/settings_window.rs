@@ -234,6 +234,7 @@ pub enum Setting {
     ToolbarIconSize,
     StartupMasterPassword,
     ChangeMasterPassword,
+    TemporarySshKey,
     RememberGeometry,
     RememberDashboard,
     FixedGeometry,
@@ -331,6 +332,7 @@ impl Setting {
         Self::ToolbarIconSize,
         Self::StartupMasterPassword,
         Self::ChangeMasterPassword,
+        Self::TemporarySshKey,
         Self::RememberGeometry,
         Self::RememberDashboard,
         Self::FixedGeometry,
@@ -440,6 +442,7 @@ impl Setting {
             Self::ToolbarIconSize => "Toolbar icon size",
             Self::StartupMasterPassword => "Require master password at startup",
             Self::ChangeMasterPassword => "Change master password",
+            Self::TemporarySshKey => "Enable temporary SSH key option",
             Self::RememberGeometry => "Remember window geometry",
             Self::RememberDashboard => "Remember dashboard state",
             Self::FixedGeometry => "Use fixed window geometry",
@@ -533,7 +536,9 @@ impl Setting {
             | Self::JournalVision
             | Self::JournalAutomaticVision => Section::Logging,
             Self::ExportWatermark | Self::ExportFooter | Self::ExportSnippetCode => Section::Export,
-            Self::StartupMasterPassword | Self::ChangeMasterPassword => Section::Security,
+            Self::StartupMasterPassword | Self::ChangeMasterPassword | Self::TemporarySshKey => {
+                Section::Security
+            }
             Self::ToolbarIconSize
             | Self::RememberGeometry
             | Self::RememberDashboard
@@ -679,6 +684,7 @@ impl Setting {
             Self::ToolbarIconSize => "symbol size toolbar button pixels appearance",
             Self::StartupMasterPassword => "vault unlock startup login authentication security",
             Self::ChangeMasterPassword => "vault rotate credential password security",
+            Self::TemporarySshKey => "quick connect sftp paste in memory expires private key",
             Self::RememberGeometry => "startup normal bounds size position maximized",
             Self::RememberDashboard => "startup show hide dashboard state navigation dock",
             Self::FixedGeometry => "startup width height fixed window position dimensions",
@@ -774,6 +780,7 @@ pub enum Message {
     ),
     Startup(window::Id, startup_settings::Edit),
     ChangeMasterPassword(window::Id),
+    TemporarySshKey(window::Id, bool),
     ToolWindowTabs(window::Id, bool),
     ConnectionColorBorder(window::Id, bool),
     SplitPaneFocusRing(window::Id, bool),
@@ -967,6 +974,11 @@ impl Draft {
             if edit.startup.use_fixed_geometry {
                 current.startup.fixed = edit.startup.fixed;
             }
+        }
+        if policy.problem.is_none()
+            && edit.temporary_ssh_key_enabled != before.temporary_ssh_key_enabled
+        {
+            current.temporary_ssh_key_enabled = edit.temporary_ssh_key_enabled;
         }
         if edit.paste_warning != before.paste_warning {
             current.paste_warning = edit.paste_warning.max(policy.minimum_paste_warning);
@@ -1557,6 +1569,7 @@ impl Workspace {
             | Message::PasteLineDelay(id, _)
             | Message::ToolbarIconSize(id, _)
             | Message::Startup(id, _)
+            | Message::TemporarySshKey(id, _)
             | Message::ToolWindowTabs(id, _)
             | Message::ConnectionColorBorder(id, _)
             | Message::SplitPaneFocusRing(id, _)
@@ -1859,6 +1872,12 @@ impl Workspace {
                     .startup
                     .update(&mut dialog.draft.preferences.startup, edit);
                 dialog.problem = None;
+            }
+            Message::TemporarySshKey(_, enabled)
+                if dialog.section == Section::Security
+                    && self.clipboard.policy.problem.is_none() =>
+            {
+                dialog.draft.preferences.temporary_ssh_key_enabled = enabled;
             }
             Message::ToolWindowTabs(_, enabled) => {
                 dialog.draft.preferences.open_tool_windows_as_tabs = enabled;
@@ -2920,6 +2939,7 @@ impl Workspace {
             let agent_animations_changed =
                 next.agent_animations() != self.window_settings.agent_animations();
             self.window_settings = next;
+            self.sync_quick_temporary_key_preference();
             if agent_animations_changed {
                 self.refresh_agent_inline_animations();
             }
@@ -3876,6 +3896,18 @@ impl Workspace {
                     .size(13)),
                 ]
                 .spacing(5),
+            ),
+            rule::horizontal(1),
+            text("Temporary SSH keys").size(18),
+            text("Paste a private key in Quick Connect for SSH or SFTP. The key is kept in memory for its selected lifetime.").size(13),
+            highlighted(
+                dialog,
+                Setting::TemporarySshKey,
+                checkbox(dialog.draft.preferences.temporary_ssh_key_enabled)
+                    .label(Setting::TemporarySshKey.label())
+                    .on_toggle_maybe(policy.problem.is_none().then_some(move |enabled| {
+                        Desktop::Settings(Message::TemporarySshKey(id, enabled))
+                    })),
             ),
         ]
         .spacing(12)
@@ -5224,6 +5256,39 @@ mod tests {
         workspace.clipboard.policy.require_master_password = false;
         let _ = workspace.save_settings_to(id, |_| Ok(()));
         assert!(workspace.window_settings.startup.require_master_password);
+    }
+
+    #[test]
+    fn temporary_ssh_key_preference_is_searchable_and_applies_on_save() {
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.open_settings(owner, Some(Section::Window));
+        let id = workspace.settings.for_owner(owner).unwrap();
+
+        assert!(
+            !WindowSettings::decode(b"{}")
+                .unwrap()
+                .temporary_ssh_key_enabled
+        );
+        let _ = workspace.update_settings(Message::Search(id, "enable temporary ssh key".into()));
+        let _ = workspace.update_settings(Message::SearchChoose(id));
+        let dialog = workspace.settings.0.as_ref().unwrap();
+        assert_eq!(dialog.section, Section::Security);
+        assert_eq!(dialog.revealed, Some(Setting::TemporarySshKey));
+
+        let _ = workspace.update_settings(Message::TemporarySshKey(id, true));
+        assert!(!workspace.window_settings.temporary_ssh_key_enabled);
+        let mut snapshot = Vec::new();
+        let _ = workspace.save_settings_to(id, |settings| {
+            snapshot = serde_json::to_vec(settings)?;
+            Ok(())
+        });
+        assert!(workspace.window_settings.temporary_ssh_key_enabled);
+        assert!(
+            WindowSettings::decode(&snapshot)
+                .unwrap()
+                .temporary_ssh_key_enabled
+        );
     }
 
     #[test]

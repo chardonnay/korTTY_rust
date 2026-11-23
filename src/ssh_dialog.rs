@@ -473,6 +473,16 @@ impl SshDialog {
         }
     }
 
+    pub(crate) fn set_quick_temporary_key_enabled(&mut self, enabled: bool) {
+        if enabled {
+            self.target
+                .temporary_key
+                .get_or_insert_with(|| temporary_key::Form::with_minutes(15));
+        } else if self.target.temporary_key.take().is_some() && self.temporary_key_selected() {
+            self.target.method = Method::Password;
+        }
+    }
+
     pub(crate) fn temporary_key_selected(&self) -> bool {
         self.target.method == Method::TemporaryKey
     }
@@ -1206,6 +1216,9 @@ impl LoginForm {
     }
 
     fn clear_references(&mut self) {
+        if let Some(form) = &mut self.temporary_key {
+            form.clear();
+        }
         self.stored_password = None;
         self.stored_passphrase = None;
         self.stored_key = None;

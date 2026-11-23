@@ -110,14 +110,46 @@ tests, 10 Vault tests and the manual link coverage check. The Vault
 regression checks a rejected password, a successful unlock and a cleared
 password form ready for the requested rotation.
 
-The remaining Java controls are startup auto-unlock, the global temporary
-key switch, default isolation and sandbox availability. Compare headings,
-help and warning presentation again when the remaining controls are added.
+The remaining Java controls at this checkpoint were startup auto-unlock,
+the global temporary key switch, default isolation and sandbox availability.
+The [temporary SSH key checkpoint](#november-23-quick-connect-temporary-ssh-keys)
+records the subsequent Quick Connect work. Compare headings, help and
+warning presentation again when the remaining controls are added.
 [Tagged Java Settings](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SettingsDialog.java)
 · [Rust Settings](src/workspace/settings_window.rs)
 · [Credential Vault](src/vault_window.rs)
 · [Windows Settings tests](target/verification/20261123-security-settings-windows-tests.log)
 · [Windows Vault and manual tests](target/verification/20261123-security-settings-windows-vault-and-guide-tests.log)
+
+## November 23 Quick Connect temporary SSH keys
+
+Java v2.26.0 gates the temporary-key fields in Quick Connect and the
+connection editor behind the Security setting. Rust now saves the same
+opt-in for Quick Connect SSH and SFTP. The first paste uses a 15-minute
+lifetime by default. Users select or edit the destination before pasting.
+Changing the destination, method or lifetime invalidates any in-progress
+paste and clears the old key. Saved connections keep their own identifiers
+while a temporary authentication applies to the interactive attempt.
+
+A failed connection can reopen with its current in-memory key and accept a
+fresh paste after expiry. Turning off the option discards Quick Connect
+form and retry keys. Teamwork continues to use its separately configured
+temporary-key method. The native Save connection control applies to the
+other authentication methods. The Java connection editor's encrypted
+temporary-key persistence and the Java preference migration remain open.
+
+The native Windows ARM64 development build passed. The Settings desktop
+opened the Security page from its search result and displayed the saved
+opt-in. The native suites passed 96 Settings tests, 13 Quick Connect tests
+and 35 SSH access tests. The focused temporary-key suite also verified
+expiry and memory wiping. The new routing tests use synthetic key text
+and verify stale paste rejection, retry retention and disposal on disable.
+A live SSH and SFTP login with a disposable key remains a native acceptance
+check.
+[Tagged Java Quick Connect](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/QuickConnectDialog.java)
+· [Rust Quick Connect](src/workspace/quick_connect.rs)
+· [Rust retry handling](src/workspace/ssh_access.rs)
+· [Windows regressions](target/verification/20261123-temporary-ssh-key-windows-regressions.log)
 
 ## November 23 Plan and execution layout
 

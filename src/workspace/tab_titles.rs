@@ -81,6 +81,8 @@ pub(super) struct WindowSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) java_swarm_journal: Option<crate::session_journal::automation::Options>,
     pub(super) startup: StartupPreferences,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(super) temporary_ssh_key_enabled: bool,
     pub(super) prevent_system_sleep: bool,
     #[serde(skip_serializing_if = "super::open_recent::Preferences::is_default")]
     pub(super) open_recent: super::open_recent::Preferences,
@@ -325,6 +327,7 @@ impl Default for WindowSettings {
             java_teamwork: None,
             java_swarm_journal: None,
             startup: StartupPreferences::default(),
+            temporary_ssh_key_enabled: false,
             prevent_system_sleep: false,
             open_recent: super::open_recent::Preferences::default(),
             app_logging: crate::app_logging::Settings::default(),

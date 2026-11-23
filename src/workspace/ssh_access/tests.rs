@@ -782,6 +782,48 @@ fn teamwork_temporary_key_uses_managed_clipboard_mode_and_rechecks_teamwork_poli
     );
 }
 
+#[test]
+fn a_quick_temporary_key_can_be_retried_until_the_preference_is_disabled() {
+    let mut workspace = Workspace::default();
+    let (owner, _) = workspace.open_window(false);
+    workspace.window_settings.temporary_ssh_key_enabled = true;
+    let endpoint = LoginTarget {
+        host: "retry.test".into(),
+        port: 22,
+        username: "fixture".into(),
+    };
+    let mut form = SshDialog::with_target(PROFILE, &endpoint, None);
+    form.set_quick_temporary_key_enabled(true);
+    form.update(ssh_dialog::Message::Target(LoginMessage::Authentication(
+        ssh_dialog::Method::TemporaryKey,
+    )));
+    assert!(form.begin_temporary_key_paste(1));
+    form.finish_temporary_key_paste(1, ssh_dialog::Password::new(TEAMWORK_TEST_KEY.into()));
+    let request = form.take_request().unwrap();
+    let retry = RetryLogin::new(&request, None, Default::default());
+    drop(request);
+    let _ = workspace.show_shell_ssh(owner, None, false);
+    workspace.pending_ssh_mut(owner).unwrap().retry = Some(retry);
+    let target = SshTarget::from_imported_route(endpoint, None, IsolationLevel::None).unwrap();
+    let _ = workspace.reopen_ssh_form(owner, target, PROFILE, "Retry fixture".into());
+    assert!(matches!(&workspace.pending_ssh(owner).unwrap().stage,
+        Stage::Form(form) if form.temporary_key_selected() && form.can_connect()));
+
+    let paste = system_temporary_key_paste(
+        request_temporary_key_paste(&mut workspace, owner, None),
+        TEAMWORK_TEST_KEY,
+    );
+    let _ = workspace.update_ssh(paste);
+    assert!(matches!(&workspace.pending_ssh(owner).unwrap().stage,
+        Stage::Form(form) if form.can_connect()));
+
+    workspace.window_settings.temporary_ssh_key_enabled = false;
+    workspace.sync_quick_temporary_key_preference();
+    let pending = workspace.pending_ssh(owner).unwrap();
+    assert!(pending.retry.as_ref().unwrap().temporary_key.is_none());
+    assert!(matches!(&pending.stage, Stage::Form(form) if !form.temporary_key_selected()));
+}
+
 const TEAMWORK_TEST_KEY: &str =
     "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture-only\n-----END OPENSSH PRIVATE KEY-----";
 
