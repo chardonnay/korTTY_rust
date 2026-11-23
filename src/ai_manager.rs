@@ -4227,6 +4227,8 @@ impl Dialog {
         {
             return scroll;
         }
+        // Selecting the initial store cancels unfinished work from the previous view.
+        let source_results = self.load_knowledge_source_results();
         let load = match self.page {
             Page::Memory
                 if self.revealed.setting
@@ -4280,7 +4282,7 @@ impl Dialog {
             load,
             self.load_profile_usage(),
             self.refresh_lm_studio_metadata(),
-            self.load_knowledge_source_results(),
+            source_results,
         ])
     }
 

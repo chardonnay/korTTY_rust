@@ -5511,7 +5511,30 @@ mod tests {
     }
 
     #[test]
-    fn knowledge_source_outcome_reopens_after_a_failed_manual_update() {
+    fn knowledge_page_selects_its_initial_store_before_loading_managed_models() {
+        use crate::ai_manager::{Dialog as Manager, Message as ManagerMessage, Page};
+
+        let profile = crate::snippets::tests::Profile::new();
+        let config = Configuration {
+            local: State {
+                stores: vec![Store::new("Source outcome fixture").unwrap()],
+                ..State::default()
+            },
+            ..Configuration::default()
+        };
+        let mut manager = Manager::new(Arc::new(config), profile.0.clone(), Vec::new(), true, None);
+
+        let _task = manager.update(ManagerMessage::Page(Page::Knowledge));
+
+        assert_eq!(manager.local.selected, Some(0));
+        assert_eq!(
+            manager.local.status.as_deref(),
+            Some("Reading managed models…")
+        );
+    }
+
+    #[test]
+    fn knowledge_source_outcome_reopens_after_a_failed_then_repaired_manual_update() {
         use iced::futures::{StreamExt as _, executor::block_on};
         use std::io::Write as _;
 
@@ -5525,19 +5548,32 @@ mod tests {
         let (server, _) = local_ai::test_support::listener();
         let endpoint = server.local_addr().unwrap().to_string();
         let reply = std::thread::spawn(move || {
-            let mut socket = local_ai::test_support::accept(&server);
-            local_ai::test_support::wire_request(&mut socket, "POST /api/embed HTTP/1.1");
-            socket
-                .get_mut()
-                .write_all(
-                    local_ai::test_support::fixture_http_response(
-                        "200 OK",
-                        "",
-                        r#"{"embeddings":[[1.0,0.0],[0.0,1.0]]}"#,
-                    )
-                    .as_bytes(),
+            for (inputs, embeddings) in [
+                (
+                    &["First indexed source", "Second indexed source"][..],
+                    &[[1.0, 0.0], [0.0, 1.0]][..],
+                ),
+                (&["First repaired source"][..], &[[1.0, 1.0]][..]),
+            ] {
+                let mut socket = local_ai::test_support::accept(&server);
+                let request: serde_json::Value = serde_json::from_slice(
+                    &local_ai::test_support::wire_request(&mut socket, "POST /api/embed HTTP/1.1"),
                 )
                 .unwrap();
+                assert_eq!(request["input"], serde_json::json!(inputs));
+                let response = serde_json::json!({ "embeddings": embeddings });
+                socket
+                    .get_mut()
+                    .write_all(
+                        local_ai::test_support::fixture_http_response(
+                            "200 OK",
+                            "",
+                            &response.to_string(),
+                        )
+                        .as_bytes(),
+                    )
+                    .unwrap();
+            }
         });
         let mut store = Store::new("Source outcome fixture").unwrap();
         store.add_source(failing.clone()).unwrap();
@@ -5571,7 +5607,6 @@ mod tests {
         let _ = dialog.update(Message::Consent(true), &mut state, &saved, true);
         let task = dialog.update(Message::Index { rebuild: false }, &mut state, &saved, true);
         finish(&mut dialog, &mut state, task);
-        reply.join().unwrap();
         let first = (SourceKind::File, failing.clone());
         let second = (SourceKind::File, unchanged);
         let first_index = dialog.source_results.restored(&first).1.unwrap();
@@ -5592,7 +5627,7 @@ mod tests {
         );
         drop(dialog);
 
-        let mut reopened = Dialog::new(root);
+        let mut reopened = Dialog::new(root.clone());
         let _ = reopened.update(Message::SelectStore(0), &mut state, &saved, true);
         let task = reopened.load_source_results(&state);
         finish(&mut reopened, &mut state, task);
@@ -5603,6 +5638,36 @@ mod tests {
         assert_eq!(SourceStatus::Error.problems(), Some(1));
         assert_eq!(
             reopened.source_results.restored(&second),
+            (
+                Some(SourceStatus::Checked { problems: 0 }),
+                Some(second_index)
+            )
+        );
+
+        std::fs::write(&first.1, "First repaired source").unwrap();
+        let _ = reopened.update(
+            Message::SelectKnowledgeSource(0, first.0, first.1.clone()),
+            &mut state,
+            &saved,
+            true,
+        );
+        let _ = reopened.update(Message::Consent(true), &mut state, &saved, true);
+        let task = reopened.update(Message::Index { rebuild: false }, &mut state, &saved, true);
+        finish(&mut reopened, &mut state, task);
+        reply.join().unwrap();
+        drop(reopened);
+
+        let mut recovered = Dialog::new(root);
+        let _ = recovered.update(Message::SelectStore(0), &mut state, &saved, true);
+        let task = recovered.load_source_results(&state);
+        finish(&mut recovered, &mut state, task);
+        let (status, result) = recovered.source_results.restored(&first);
+        assert_eq!(status, Some(SourceStatus::Checked { problems: 0 }));
+        let result = result.unwrap();
+        assert_eq!((result.files, result.chunks), (1, 1));
+        assert!(result.indexed_at >= first_index.indexed_at);
+        assert_eq!(
+            recovered.source_results.restored(&second),
             (
                 Some(SourceStatus::Checked { problems: 0 }),
                 Some(second_index)

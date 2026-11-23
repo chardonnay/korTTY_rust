@@ -198,13 +198,35 @@ test indexes two sources, fails a later update, then opens a new Manager
 and verifies the error, problem count, both saved timestamps and the
 other row. Automatic sync also restores an unavailable source, preserving
 its published passages. A changed source limit cleared the affected
-outcome and preserved the other source's stored problem count. The Windows
-ARM64 all-target compilation check passed.
-The remaining desktop check covers manual and automatic failures across
-a process restart, followed by a successful update of the affected source.
+outcome and preserved the other source's stored problem count.
+
+The Windows ARM64 desktop initialized two indexed synthetic files through
+a loopback embedding service. The manual **Update now** review reported
+the first file missing. The background refresh independently detected the
+second missing file. Both rows showed Unavailable, one problem, and the
+original 1 / 1 file and chunk counts. A separate application process
+opened the same profile with automatic embedding paused. It showed both
+saved outcomes and the original Last indexed values. The index and the
+outcome file kept their SHA-256 digests across that restart, and the
+loopback service received no requests during either failure or restoration.
+
+Restoring the automatic file with new content triggered one embedding
+request. Its row returned to Ready with no problems and a new Last indexed
+time. The manual row kept its saved state and original timestamp. Once its
+file returned, the desktop review listed one ready file and none skipped.
+The native manual fixture indexed a repaired source and opened a fresh
+Manager to verify the saved result and the unchanged sibling. The first
+desktop run exposed a premature cancellation of model inventory loading.
+Selecting the initial Knowledge Store now precedes starting that inventory
+request. The corrected Windows build opened the page and loaded its
+inventory without the cancellation message. The Windows ARM64 AI Manager
+suite passed 411 tests with ten ignored, including the page-open regression
+and the manual failure and recovery fixture. Complete desktop manual
+indexing after repair and repeat the restart checks on the other platforms.
 [Source outcome store](src/ai_manager/local/knowledge/outcomes.rs)
 · [Source inventory](src/ai_manager/local/knowledge_inventory.rs)
 · [Apple Silicon focused tests](target/verification/20261123-source-outcomes-macos-final.log)
+· [Windows ARM64 AI Manager tests](target/verification/20261123-knowledge-source-restart-windows-final-tests.log)
 
 ## November 23 Complete masked step copy
 
