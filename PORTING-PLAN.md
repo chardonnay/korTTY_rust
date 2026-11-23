@@ -27,7 +27,13 @@ The same checkpoint restores Knowledge Store source outcomes after restart,
 copies the complete retained and masked output of the selected Agent step,
 and applies the Java matching and ranking rules to Settings and AI Manager.
 The GGUF Configure window now sizes to the model path and keeps the action
-buttons visible when the form scrolls.
+buttons visible when the form scrolls. The Windows ARM64 comparison also
+covered the compact field layout and both native import storage choices.
+Knowledge Stores opens with its model inventory loading intact, and a
+Windows ARM64 restart restored both manual and automatic source outcomes.
+Global Settings groups password rotation and the managed startup requirement
+under Security. Its temporary-key switch enables the interactive Quick
+Connect SSH and SFTP paths. [Current PR](https://github.com/chardonnay/korTTY_rust/pull/35)
 The remaining desktop checks are in the [dialog backlog](#gui-dialog-design-parity).
 
 Start with the [confirmed implementation work](#confirmed-implementation-work).
@@ -45,7 +51,8 @@ records the broader comparison with the tagged Java release.
 
 | Area | Remaining change | Completion check |
 | --- | --- | --- |
-| D4 · Security settings | The native Security page includes password rotation, the managed startup requirement and the temporary-key switch for Quick Connect SSH and SFTP. Port the global isolation default and sandbox availability. Resolve Java's optional startup auto-unlock and encrypted connection-editor temporary keys against native vault custody. | Exercise the defaults in normal entry points, check managed floors, and extend the native Security comparison to the complete page. [Security checkpoint](PORTING-PARITY.md#november-23-settings-security) · [Temporary SSH keys](PORTING-PARITY.md#november-23-quick-connect-temporary-ssh-keys) |
+| D2/D4/P1 · Session isolation | Add the global default, the runtime sandbox availability display, and the Connection Manager's inherited folder and connection choices. Apply the tagged local and Teamwork precedence before the managed minimum. Include reviewed adoption of Java defaults and folder settings in M1. | Check existing Rust profiles, explicit None versus inheritance, nested folders, Teamwork and request overrides, Quick Connect, local and SSH launches, managed floors, and unavailable backends. Compare the native Security page and connection editor with Java. [Isolation source audit](PORTING-PARITY.md#november-23-session-isolation-source-audit) |
+| D4/M1 · Credential settings and migration | Decide native vault custody for Java's optional startup auto-unlock and encrypted connection-editor temporary keys. Audit adoption of the Java global temporary-key opt-in independently of credential import. | Verify startup policy precedence and reviewed adoption without activating credentials. Exercise the implemented interactive Quick Connect SSH and SFTP routes with disposable keys. [Security checkpoint](PORTING-PARITY.md#november-23-settings-security) · [Temporary SSH keys](PORTING-PARITY.md#november-23-quick-connect-temporary-ssh-keys) |
 | D4 · Searchable controls | Compare the remaining Java Settings and AI Manager pages, subpages and labeled controls with the Rust search inventory. Add reachable missing destinations alongside the dialog comparisons. | Verify that controls on a page that has never been opened are discoverable, and that navigation reveals the exact control with the current page state and policy. |
 
 The [November 23 review](PORTING-PARITY.md#november-23-dialog-parity-review)
@@ -96,11 +103,11 @@ Settings pages still need visual work. [Desktop comparison](PORTING-PARITY.md#no
 
 Resources exposes a JVM launch profile and its heap limit. Compare the
 native resource controls before specifying a Rust equivalent. Next in
-Security, trace the isolation default through the Connection Manager and
-Quick Connect. Compare default resolution for local and SSH sessions,
-including managed floors and configured sandbox availability. The
-Quick Connect temporary-key switch is implemented. Audit the related
-Java backup flag and connection-editor credentials. Privacy exposes Java telemetry
+Security, implement the isolation default and availability display, then
+verify inheritance through the Connection Manager, Quick Connect and
+local and SSH launches. The Quick Connect temporary-key switch is
+implemented. Audit the related Java backup flag and connection-editor
+credentials. Privacy exposes Java telemetry
 consent. Record the native app's behavior and the handling of imported
 consent before designing the corresponding surface. Language selects the
 application language. Translation manages application translation profiles,
@@ -1182,6 +1189,9 @@ not been identified.
 
 ## Implementation order
 
+Start with [session isolation](PORTING-PARITY.md#november-23-session-isolation-source-audit).
+Port the Settings control and availability display with the launch resolver,
+then connect folder and connection inheritance and audit Java restore.
 Continue the [dialog design comparison](#gui-dialog-design-parity) with
 the remaining Settings and AI Manager pages. Repeat the verified Windows
 Knowledge Store restart and recovery paths on the other native desktops.
@@ -2769,6 +2779,13 @@ decisions. For example, `aiSkillsEnabled` has a working delegated import.
 A literal match also requires checking its behavior. The figures measure
 search coverage.
 
+- Audit the tagged Java `connectionIsolationDefault`,
+  `connectionGroupIsolation`, per-connection `isolationMode` and
+  `temporarySshKeyEnabled` fields. Cover a missing per-connection field
+  and an explicit `none`, nested and ambiguous folder identities, existing
+  native choices and managed minimums. Keep the temporary-key opt-in
+  separate from the custody decision for encrypted key material.
+  [Isolation source audit](PORTING-PARITY.md#november-23-session-isolation-source-audit)
 - Java restore maps `maxBackupCount` and `autoBackupInterval`. At desktop
   startup these values initialize absent native backup settings. Existing
   settings take precedence. Automatic execution requires a native

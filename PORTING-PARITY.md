@@ -151,6 +151,34 @@ check.
 · [Rust retry handling](src/workspace/ssh_access.rs)
 · [Windows regressions](target/verification/20261123-temporary-ssh-key-windows-regressions.log)
 
+## November 23 Session isolation source audit
+
+Java v2.26.0 starts at None on a fresh installation. With a personally saved
+connection, an explicit per-connection choice takes precedence over the
+nearest configured folder, then the global default. An explicit session
+request takes the place of the connection's choice. A Teamwork connection
+uses the strongest of the global, folder and connection or request levels.
+The organization's minimum can raise the result in all cases. Java keeps
+the source of the effective choice for display. The Security page builds
+its selector from the permitted levels and probes sandbox availability
+asynchronously.
+
+Rust already has per-session isolation, saved levels and the managed
+minimum. Blank Quick Connect SSH starts at None subject to that minimum.
+Rust has an SSH sandbox availability probe outside Global Settings. The
+global default, folder inheritance and Security-page probe remain open.
+The migration needs to distinguish explicit None
+from inheritance. Older Rust records can omit a None value, so tests must
+cover those records before changing how they resolve. Verify new local and
+SSH launches, saved connections, session requests and shared folders, and
+show the availability of the actual native backends. This is a source
+comparison. Desktop and backend checks remain open for these additions.
+[Tagged Java resolver](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/isolation/IsolationSettings.java)
+· [Tagged Java Settings](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SettingsDialog.java)
+· [Rust isolation levels](src/session_security.rs)
+· [Rust Quick Connect](src/workspace/quick_connect.rs)
+· [Rust SSH availability](src/ssh_worker.rs)
+
 ## November 23 Plan and execution layout
 
 The shared terminal and preview layout places Metro before the bottom
