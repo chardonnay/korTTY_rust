@@ -16,6 +16,65 @@ open until a result is recorded for the tested revision and environment. Both
 Mosh modes are out of scope. The editor has a reduced native scope with structure
 navigation for classes, functions, variables, and placeholders.
 
+## November 23 dialog parity review
+
+Rust implementation `aaa8d037` in [PR #34](https://github.com/chardonnay/korTTY_rust/pull/34)
+was compared with Java tag `v2.26.0` (`b235d91f2035`) and the recorded
+Windows ARM64 desktop checks.
+
+- **Agent designs.** Activating another module on Standard or Classic already
+  creates a custom design. The standalone editor saves the change. A fresh Rust
+  process restored the custom default, delay and reduced animations. Java
+  names an automatic copy after its preset, for example `Standard 2`, and opens
+  a name dialog for New, Duplicate and Rename. Rust generates `Custom design N`
+  and renames inline. [Java editor](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignPluginManagerDialog.java)
+  · [Rust editor](src/workspace/settings_window/agent_design_settings.rs)
+  · [Rust catalog](src/terminal_agent/design/custom.rs)
+- **Plan and execution.** At 1,202 by 694 pixels, Java placed Metro above the
+  bottom history and Rust placed it below. Java gives the prompt and run
+  controls one header above the Plan checklist and execution column. Its
+  divider starts at 42% and can be dragged. The shared Rust layout puts Metro
+  below the composed pane, and the Rust presenter uses Goal and Activity
+  headings and fixed column proportions. [Java panel](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignPlanExecution.java)
+  · [Rust placement](src/workspace/terminal_agent/design/placement.rs)
+  · [Rust panel](src/workspace/terminal_agent/design/plan_execution.rs)
+- **Local models.** Both GGUF and MLX have owned Configure windows. The
+  GGUF desktop comparison confirmed field order, cancellation and a saved
+  context size and idle timeout. The same long path wrapped in Rust. Java
+  prompts for copy or reference after the file picker and offers a matching
+  runtime when a saved GGUF model requires a different backend. Rust
+  embeds import review and offers runtime repair separately. Java stores the
+  Hub publication date for MLX, while Rust's MLX inventory row supplies no
+  date. MLX Configure and the mixed inventory still need Apple Silicon
+  desktop acceptance. [Java model manager](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/LocalModelManagerPane.java)
+  · [Rust window routing](src/workspace/ai_access.rs)
+  · [Rust GGUF actions](src/ai_manager/local/managed.rs)
+  · [Rust inventory](src/ai_manager/local/managed/inventory.rs)
+- **Knowledge Stores.** Java serializes the latest status, problem count
+  and last successful index time for each source. Rust reads successful
+  index counts and timestamps from snapshots and retains reviewed folder
+  issues. A subsequent failed update can appear in the running manager.
+  Restoring that outcome after restart is the remaining persistence task.
+  [Java source configuration](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/rag/RagConfigurationManager.java)
+  · [Rust source inventory](src/ai_manager/local/knowledge_inventory.rs)
+
+Two November 22 findings still apply at `aaa8d037`. The step menu copies
+the eight-line preview with at most 320 characters per line. Settings
+requires two characters and AI Manager accepts one. Both filter entries in
+enumeration order. The [matcher and clipboard comparison](#november-22-design-editing-command-output-and-settings-search)
+links the Java behavior and the corresponding Rust paths.
+
+The last recorded model-configuration check used the Java Windows x64
+release under emulation and a native Windows ARM64 Rust development build
+with SHA-256 `7692A5BF7C435F5843F9BE7A142DD0A91DC9CF793EF6B3A0B320EDF68E2DE00B`.
+The dialogs opened automatically with private profiles. The focused native
+test run recorded 571 passed, 0 failed, 12 ignored and 3,611 filtered out.
+Full workspace and release-candidate checks are tracked by revision in
+the [release matrix](PORTING-PLAN.md#native-acceptance-and-release-gates).
+The checkout's `target/verification/` directory holds the desktop record
+`20261123-model-config-windows-arm64-desktop.md` and its test log
+`20261123-model-config-windows-arm64-tests.log`.
+
 ## November 22 AI Manager and Agent Design on Windows ARM64
 
 The published Java v2.26.0 Windows package was observed under x64
@@ -478,7 +537,9 @@ The Windows ARM64 installed model comparison verified the shared table's
 GGUF path with three rows. Java and Rust displayed the same columns,
 purpose labels, idle values and stopped states. Rust retained selection
 and sorting on refresh and opened the settings for the selected model.
-Java uses a separate settings window and Rust embeds those settings.
+At this checkpoint Java used a separate settings window and Rust embedded
+those settings. The later [Configure comparison](#november-23-dialog-parity-review)
+covers the owned Rust window.
 The Agent Design dialog also opened directly and previewed Side timeline
 while retaining the Standard combination. Live MLX and mixed-registry
 desktop actions remain to be verified on Apple Silicon.
@@ -636,9 +697,10 @@ gives completion checks for each difference.
   The default is a separate choice. Java saves committed changes to
   combinations, the default, auto-hide and reduced animations immediately.
   Rust offers module previews on both presets and custom designs. The
-  editable role selectors appear on custom designs, and edits to the
-  design catalog and preferences reach storage through the outer Settings
-  save. [Java design editor](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignPluginManagerDialog.java)
+  editable role selectors at this checkpoint appeared on custom designs,
+  and edits reached storage through the outer Settings save. The subsequent
+  [standalone editor and restart checks](#november-23-dialog-parity-review)
+  cover automatic copies and immediate persistence. [Java design editor](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignPluginManagerDialog.java)
   · [Rust design editor](src/workspace/settings_window/agent_design_settings.rs)
   · [Rust Settings draft and save](src/workspace/settings_window.rs)
 - **Command step output (A2).** Java's step menu joins the stdout and
