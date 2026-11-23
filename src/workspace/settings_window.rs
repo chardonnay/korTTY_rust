@@ -177,7 +177,10 @@ pub enum Setting {
     FontSize,
     Colors,
     Themes,
-    Appearance,
+    AppDesign,
+    PreviousAppDesign,
+    NextAppDesign,
+    DesignAnimations,
     PasteWarning,
     LargePasteWarning,
     PasteLineDelay,
@@ -278,7 +281,10 @@ impl Setting {
         Self::FontSize,
         Self::Colors,
         Self::Themes,
-        Self::Appearance,
+        Self::AppDesign,
+        Self::PreviousAppDesign,
+        Self::NextAppDesign,
+        Self::DesignAnimations,
         Self::PasteWarning,
         Self::LargePasteWarning,
         Self::PasteLineDelay,
@@ -379,7 +385,10 @@ impl Setting {
             Self::FontSize => "Terminal font size",
             Self::Colors => "Terminal colors",
             Self::Themes => "Terminal themes",
-            Self::Appearance => "App design and animations",
+            Self::AppDesign => "App Design",
+            Self::PreviousAppDesign => "Previous design",
+            Self::NextAppDesign => "Next design",
+            Self::DesignAnimations => "Enable design animations",
             Self::PasteWarning => "Warn about line breaks and control characters",
             Self::LargePasteWarning => "Warn about pastes larger than",
             Self::PasteLineDelay => "Pause between pasted lines",
@@ -492,7 +501,10 @@ impl Setting {
             Self::FontFamily | Self::FontSize => Section::Font,
             Self::Colors => Section::Colors,
             Self::Themes => Section::Themes,
-            Self::Appearance => Section::Appearance,
+            Self::AppDesign
+            | Self::PreviousAppDesign
+            | Self::NextAppDesign
+            | Self::DesignAnimations => Section::Appearance,
             Self::AgentDesign => Section::AgentDesign,
             Self::ApplicationUpdates | Self::ApplicationUpdateInterval => Section::Updates,
             Self::SftpParallel
@@ -591,7 +603,10 @@ impl Setting {
                 "color profile palette foreground background cursor blink selection ANSI SGR TrueColor"
             }
             Self::Themes => "palette background foreground cursor colors appearance light dark",
-            Self::Appearance => "windows dialogs menus toolbar theme light dark reduced motion",
+            Self::AppDesign => "application design windows dialogs menus toolbar theme light dark",
+            Self::PreviousAppDesign => "previous app design",
+            Self::NextAppDesign => "next app design",
+            Self::DesignAnimations => "animation reduced motion transitions",
             Self::PasteWarning => {
                 "paste safety protection multiline bracketed escape bidi confirmation"
             }
@@ -3349,11 +3364,7 @@ impl Workspace {
                     )
                     .map(move |edit| msg(Message::Theme(id, edit))),
             ),
-            Section::Appearance => highlighted(
-                dialog,
-                Setting::Appearance,
-                appearance_settings::view(dialog.draft.preferences.appearance, id).map(msg),
-            ),
+            Section::Appearance => appearance_settings::view(dialog),
             Section::Terminal => self.terminal_settings_page(dialog),
             Section::Sftp => self.sftp_settings_page(dialog),
             Section::Messaging => messaging_settings_page(
@@ -4605,13 +4616,24 @@ fn highlighted<'a>(
     setting: Setting,
     content: impl Into<Element<'a, Desktop>>,
 ) -> Element<'a, Desktop> {
-    let row = container(content).width(Length::Fill).padding(4);
+    highlight_setting(
+        dialog,
+        setting,
+        container(content).width(Length::Fill).padding(4),
+    )
+    .into()
+}
+
+fn highlight_setting<'a>(
+    dialog: &Dialog,
+    setting: Setting,
+    row: widget::Container<'a, Desktop>,
+) -> widget::Container<'a, Desktop> {
     if dialog.revealed == Some(setting) {
         row.id(dialog.revealed_row.clone())
             .style(container::secondary)
-            .into()
     } else {
-        row.style(container::transparent).into()
+        row.style(container::transparent)
     }
 }
 
@@ -5660,6 +5682,82 @@ mod tests {
         assert_eq!(dialog.revealed, None);
         assert!(dialog.search.is_empty());
         assert_eq!(dialog.draft.preferences, preferences);
+    }
+
+    #[test]
+    fn appearance_search_reveals_distinct_controls_without_editing_the_draft() {
+        use iced::advanced::widget::Operation;
+        use iced::{Font, Rectangle, Renderer};
+        use iced_runtime::{UserInterface, user_interface::Cache};
+
+        struct FindHighlight<'a> {
+            id: &'a widget::Id,
+            bounds: Option<Rectangle>,
+        }
+
+        impl Operation for FindHighlight<'_> {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+
+            fn container(&mut self, id: Option<&widget::Id>, bounds: Rectangle) {
+                if id == Some(self.id) {
+                    assert!(self.bounds.replace(bounds).is_none());
+                }
+            }
+        }
+
+        let measure = |query: &str, setting| {
+            let mut workspace = Workspace::default();
+            let (owner, _) = workspace.open_window(false);
+            let _ = workspace.open_settings(owner, Some(Section::Font));
+            let id = workspace.settings.for_owner(owner).unwrap();
+            let dialog = workspace.settings.0.as_ref().unwrap();
+            assert_eq!(dialog.section, Section::Font);
+            let appearance = dialog.draft.preferences.appearance;
+
+            let _ = workspace.update_settings(Message::Search(id, query.into()));
+            assert_eq!(
+                workspace
+                    .settings
+                    .0
+                    .as_ref()
+                    .unwrap()
+                    .search_results(false)
+                    .next(),
+                Some(SearchTarget::Setting(setting)),
+            );
+            let _ = workspace.update_settings(Message::SearchChoose(id));
+
+            let dialog = workspace.settings.0.as_ref().unwrap();
+            assert_eq!(dialog.section, Section::Appearance);
+            assert_eq!(dialog.revealed, Some(setting));
+            assert!(dialog.search.is_empty());
+            assert_eq!(dialog.draft.preferences.appearance, appearance);
+            let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+            let mut interface = UserInterface::build(
+                workspace.settings_view(id).unwrap(),
+                Size::new(620.0, 300.0),
+                Cache::default(),
+                &mut renderer,
+            );
+            let mut highlight = FindHighlight {
+                id: &dialog.revealed_row,
+                bounds: None,
+            };
+            interface.operate(&renderer, &mut highlight);
+            highlight
+                .bounds
+                .expect("the selected control has a highlight")
+        };
+
+        let picker = measure("App Design", Setting::AppDesign);
+        let previous = measure("previous app design", Setting::PreviousAppDesign);
+        let next = measure("Next design", Setting::NextAppDesign);
+        let animations = measure("reduced motion", Setting::DesignAnimations);
+        assert!(picker.x + picker.width <= previous.x);
+        assert!(previous.x + previous.width <= next.x);
+        assert!(picker.y + picker.height < animations.y);
     }
 
     #[test]

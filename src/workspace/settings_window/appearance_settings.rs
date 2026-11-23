@@ -1,46 +1,67 @@
 use iced::widget::{button, checkbox, column, container, pick_list, row, space, text, tooltip};
-use iced::{Alignment, Border, Element, Font, Length, window};
+use iced::{Alignment, Border, Element, Font, Length};
 
 use crate::terminal_theme::Scheme;
 
 use super::super::appearance::{Design, Preferences};
-use super::Message;
+use super::{Desktop, Dialog, Message, Setting, highlight_setting, highlighted};
 
-pub(super) fn view(preferences: Preferences, id: window::Id) -> Element<'static, Message> {
+pub(super) fn view(dialog: &Dialog) -> Element<'_, Desktop> {
+    let id = dialog.id;
+    let preferences = dialog.draft.preferences.appearance;
     let design = preferences.design();
-    let step = |forward, arrow, label| {
-        tooltip(
-            button(arrow)
-                .style(button::secondary)
-                .on_press(Message::Design(id, design.step(forward))),
-            text(label),
-            tooltip::Position::Bottom,
+    let select = move |selected| Desktop::Settings(Message::Design(id, selected));
+    let step = |setting: Setting, forward, arrow| {
+        highlight_setting(
+            dialog,
+            setting,
+            container(tooltip(
+                button(arrow)
+                    .style(button::secondary)
+                    .on_press(select(design.step(forward))),
+                text(setting.label()),
+                tooltip::Position::Bottom,
+            ))
+            .padding(4),
         )
     };
     let controls = row![
-        text("App Design"),
-        pick_list(Design::ALL, Some(design), move |selected| Message::Design(
-            id, selected
-        ))
-        .width(220),
-        step(false, "◀", "Previous design"),
-        step(true, "▶", "Next design"),
+        highlight_setting(
+            dialog,
+            Setting::AppDesign,
+            container(
+                row![
+                    text(Setting::AppDesign.label()),
+                    pick_list(Design::ALL, Some(design), select).width(220),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center)
+            )
+            .padding(4),
+        ),
+        step(Setting::PreviousAppDesign, false, "◀"),
+        step(Setting::NextAppDesign, true, "▶"),
     ]
-    .spacing(8)
     .align_y(Alignment::Center);
     column![
         controls,
-        checkbox(preferences.animations())
-            .label("Enable design animations")
-            .on_toggle(move |enabled| Message::DesignAnimations(id, enabled)),
-        text("Applies to app windows and dialogs. Terminal sessions and editor content keep their own color settings.")
-            .size(13).width(460),
-        text("Preview").size(14),
-        preview(preferences),
+        highlighted(
+            dialog,
+            Setting::DesignAnimations,
+            checkbox(preferences.animations())
+                .label(Setting::DesignAnimations.label())
+                .on_toggle(move |enabled| Desktop::Settings(Message::DesignAnimations(id, enabled))),
+        ),
+        container(column![
+            text("Applies to app windows and dialogs. Terminal sessions and editor content keep their own color settings.")
+                .size(13).width(460),
+            text("Preview").size(14),
+            preview(preferences),
+        ].spacing(14)).padding([0, 4]),
     ].spacing(14).into()
 }
 
-fn preview(preferences: Preferences) -> Element<'static, Message> {
+fn preview(preferences: Preferences) -> Element<'static, Desktop> {
     let Some(palette) = preferences.design().palette() else {
         return container(text("No preview is available for this design.").size(13))
             .center_x(452)

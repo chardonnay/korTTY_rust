@@ -923,21 +923,39 @@ comparison in the running desktop application remains open.
 
 ## November 24 Appearance inventory
 
-The next Settings search comparison starts with Appearance. The Rust
-page groups the App Design picker, previous and next design buttons,
-and animations checkbox behind one search target. The tagged Java page
-has an App Design field label and a separate animations checkbox label.
-Its design navigation buttons have one-character labels and named tooltips.
-They fall below the Java search index's minimum label length, and Rust can
-give both buttons named search entries.
+Rust Settings search independently reveals the App Design selector,
+Previous design and Next design buttons, and Enable design animations
+checkbox. Choosing a result highlights only the matched control and
+leaves the settings draft untouched. The Java search ranks the design
+field and animations label. Its one-character navigation button labels
+fall below the label-length threshold. Rust uses their tooltip names.
 
-The tagged Java Appearance page also contains manual and automatic
-application font scaling and a Chat color profile selector. The Rust
-Appearance page has neither preference. The Java backup adapter reads
-the manual font scale as a compatibility fallback for Snippet Editor
-zoom. That fallback does not scale the application UI.
+Windows ARM64 and Apple Silicon each passed all 49 Settings tests.
+Apple Silicon also passed strict application Clippy for all targets.
+Windows ran the native test binary linked by LLVM from the objects
+produced by the Cargo test build. Its original Microsoft linker was
+stopped after the LLVM-linked suite passed.
+The regression opened Settings on Font, searched for each Appearance
+control and checked the distinct highlight bounds at 620 by 300 logical
+pixels and the unchanged draft. Native desktop visual comparison
+remains open. On Windows, the standalone Settings preview can open the
+dialog for that comparison without terminal-window interaction.
+[Apple Silicon Settings tests](target/verification/20261124-appearance-search-macos.log)
+· [Windows ARM64 Settings tests](target/verification/20261124-appearance-search-windows-lld.log)
+
+Two preferences still need implementation. Java's Chat color profile
+offers Automatic (theme) and ten fixed palettes in the AI Chat and
+Swarm conversations. Each concrete palette has nine color slots,
+including separate code block and user message colors. The Java
+application font scale has a manual range of 80–160%. Automatic mode
+uses the primary display's logical height to choose 100%, 110%, 125% or
+140%. The application-scale path leaves terminal, editor and AI chat
+font sizes independent. The Rust Java backup adapter currently uses a
+legacy manual UI font scale only as a fallback for Snippet Editor zoom.
 [Tagged Java Appearance page](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SettingsDialog.java)
 · [Tagged Java index](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SettingsSearchBar.java)
+· [Tagged Java chat palettes](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ChatColorProfileSupport.java)
+· [Tagged Java UI font scaling](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/UiFontScaleSupport.java)
 · [Rust Appearance page](src/workspace/settings_window/appearance_settings.rs)
 
 ## November 23 GGUF Configure sizing
