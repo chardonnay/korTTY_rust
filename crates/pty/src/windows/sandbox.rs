@@ -382,59 +382,74 @@ struct Environment {
     _module: Module,
 }
 
+pub(super) fn check_available() -> io::Result<()> {
+    load_supported_module().map(|_| ())
+}
+
+fn support_unavailable(_: io::Error) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Windows Process Security Environment 1.1 is unavailable",
+    )
+}
+
+fn load_supported_module() -> io::Result<Module> {
+    let module = Module::load_system("processmodel.dll").map_err(support_unavailable)?;
+    // SAFETY: each named processmodel export has the corresponding native ABI.
+    let (query, version) = unsafe {
+        (
+            std::mem::transmute::<Export, Query>(
+                module
+                    .export(c"QueryProcessSecurityEnvironmentSupport")
+                    .map_err(support_unavailable)?,
+            ),
+            std::mem::transmute::<Export, Version>(
+                module
+                    .export(c"IsProcessSecurityEnvironmentVersionSupported")
+                    .map_err(support_unavailable)?,
+            ),
+        )
+    };
+    let mut flags = 0;
+    let mut supported = 0;
+    let mut minor = 0;
+    // SAFETY: the native queries write into the output variables of the declared types.
+    native_result("query Windows sandbox support", unsafe {
+        query(&mut flags)
+    })?;
+    native_result("query Windows sandbox version", unsafe {
+        version(1, &mut supported, &mut minor)
+    })?;
+    const FILESYSTEM_DENY: u64 = 1;
+    const NETWORK_INGRESS: u64 = 8;
+    let required = FILESYSTEM_DENY | NETWORK_INGRESS;
+    if flags & required != required || supported == 0 || minor < 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Windows Process Security Environment 1.1 with filesystem denial and network ingress policy is required",
+        ));
+    }
+    Ok(module)
+}
+
 impl Environment {
     fn new(policy: &[u8]) -> io::Result<Self> {
-        let unavailable = |_| {
-            io::Error::new(
-                io::ErrorKind::Unsupported,
-                "Windows Process Security Environment 1.1 is unavailable",
-            )
-        };
-        let module = Module::load_system("processmodel.dll").map_err(unavailable)?;
+        let module = load_supported_module()?;
         // SAFETY: each named processmodel export has the corresponding native ABI.
-        let (create, query, version, close) = unsafe {
+        let (create, close) = unsafe {
             (
                 std::mem::transmute::<Export, Create>(
                     module
                         .export(c"CreateProcessSecurityEnvironment")
-                        .map_err(unavailable)?,
-                ),
-                std::mem::transmute::<Export, Query>(
-                    module
-                        .export(c"QueryProcessSecurityEnvironmentSupport")
-                        .map_err(unavailable)?,
-                ),
-                std::mem::transmute::<Export, Version>(
-                    module
-                        .export(c"IsProcessSecurityEnvironmentVersionSupported")
-                        .map_err(unavailable)?,
+                        .map_err(support_unavailable)?,
                 ),
                 std::mem::transmute::<Export, Close>(
                     module
                         .export(c"CloseProcessSecurityEnvironment")
-                        .map_err(unavailable)?,
+                        .map_err(support_unavailable)?,
                 ),
             )
         };
-        let mut flags = 0;
-        let mut supported = 0;
-        let mut minor = 0;
-        // SAFETY: the native queries write into the output variables of the declared types.
-        native_result("query Windows sandbox support", unsafe {
-            query(&mut flags)
-        })?;
-        native_result("query Windows sandbox version", unsafe {
-            version(1, &mut supported, &mut minor)
-        })?;
-        const FILESYSTEM_DENY: u64 = 1;
-        const NETWORK_INGRESS: u64 = 8;
-        let required = FILESYSTEM_DENY | NETWORK_INGRESS;
-        if flags & required != required || supported == 0 || minor < 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "Windows Process Security Environment 1.1 with filesystem denial and network ingress policy is required",
-            ));
-        }
         let mut handle = null_mut();
         // SAFETY: the encoded PSEC 1.1 buffer is readable and handle is writable.
         native_result("create Windows sandbox", unsafe {

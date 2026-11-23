@@ -3617,9 +3617,7 @@ impl Workspace {
                 "Managed policy could not be applied. Sessions are locked.",
             ));
         }
-        let mut settings = self
-            .security
-            .local_settings(saved, self.clipboard.policy.minimum_isolation)?;
+        let mut settings = self.local_settings(saved)?;
         if let Some(local) = &local {
             local.validate()?;
             profile = local.profile().ok_or_else(|| {

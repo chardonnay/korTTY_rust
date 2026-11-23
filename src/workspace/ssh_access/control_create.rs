@@ -72,6 +72,11 @@ impl Workspace {
         let floor = selection
             .connection
             .isolation
+            .max(
+                self.window_settings
+                    .default_session_isolation
+                    .unwrap_or_default(),
+            )
             .max(options.isolation.unwrap_or_default())
             .max(self.clipboard.policy.minimum_isolation);
         self.allow_control_ssh(floor, options.incognito || selection.connection.incognito)?;

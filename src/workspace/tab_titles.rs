@@ -13,6 +13,7 @@ use crate::connection_store::{
 use crate::profile;
 use crate::scheduler_window::{DEFAULT_JOURNAL_RETENTION_DAYS, MAX_JOURNAL_RETENTION_DAYS};
 use crate::session::CodingAgentState;
+use crate::session_security::IsolationLevel;
 use crate::snippet_analysis::model::{DEFAULT_CONTENT_BYTES, valid_content_limit};
 use crate::snippet_analysis::store::{DEFAULT_HISTORY_LIMIT, HISTORY_LIMITS};
 use crate::terminal_theme::{
@@ -83,6 +84,8 @@ pub(super) struct WindowSettings {
     pub(super) startup: StartupPreferences,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub(super) temporary_ssh_key_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) default_session_isolation: Option<IsolationLevel>,
     pub(super) prevent_system_sleep: bool,
     #[serde(skip_serializing_if = "super::open_recent::Preferences::is_default")]
     pub(super) open_recent: super::open_recent::Preferences,
@@ -328,6 +331,7 @@ impl Default for WindowSettings {
             java_swarm_journal: None,
             startup: StartupPreferences::default(),
             temporary_ssh_key_enabled: false,
+            default_session_isolation: None,
             prevent_system_sleep: false,
             open_recent: super::open_recent::Preferences::default(),
             app_logging: crate::app_logging::Settings::default(),

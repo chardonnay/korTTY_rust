@@ -62,6 +62,8 @@ Enable **Require master password at startup** and choose **Save** to unlock or c
 
 Enable **Enable temporary SSH key option** and choose **Save** to use the temporary-key method for SSH or SFTP in Quick Connect. Enter the host and username, set the key lifetime, and use **Paste private key**. The key is held in memory for the attempt and its retries until it expires. For a saved connection with reusable key authentication, use a registered SSH key.
 
+Use **Default isolation** for new local shells and new SSH or SFTP logins. Saved personal SSH connections keep their own setting. Teamwork connections can raise the default, and the managed minimum always applies. The Security page reports the local shell and SSH sandbox backends separately. To start a local sandbox, set an absolute workspace in **Session security**. Existing local-only settings apply until a default is selected in Global Settings.
+
 ## Settings · Editor
 
 Choose a block, line or underscore cursor and enter a cursor color as `#RRGGBB`. File editors use the terminal font and colors. Use **Reset zoom** in a file editor to restore the current terminal font size.

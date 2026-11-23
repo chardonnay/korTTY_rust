@@ -163,21 +163,52 @@ the source of the effective choice for display. The Security page builds
 its selector from the permitted levels and probes sandbox availability
 asynchronously.
 
-Rust already has per-session isolation, saved levels and the managed
-minimum. Blank Quick Connect SSH starts at None subject to that minimum.
-Rust has an SSH sandbox availability probe outside Global Settings. The
-global default, folder inheritance and Security-page probe remain open.
-The migration needs to distinguish explicit None
-from inheritance. Older Rust records can omit a None value, so tests must
-cover those records before changing how they resolve. Verify new local and
-SSH launches, saved connections, session requests and shared folders, and
-show the availability of the actual native backends. This is a source
-comparison. Desktop and backend checks remain open for these additions.
+At the PR #35 audit checkpoint Rust had per-session isolation, saved
+levels and the managed minimum. Blank Quick Connect SSH started at None
+subject to that minimum. The existing SSH sandbox probe ran outside Global
+Settings. The migration needs to distinguish explicit None from
+inheritance. Older Rust records can omit a None value, so tests must cover
+those records before changing how they resolve.
 [Tagged Java resolver](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/isolation/IsolationSettings.java)
 · [Tagged Java Settings](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SettingsDialog.java)
 · [Rust isolation levels](src/session_security.rs)
 · [Rust Quick Connect](src/workspace/quick_connect.rs)
 · [Rust SSH availability](src/ssh_worker.rs)
+
+## November 23 Global session isolation
+
+Global Settings → Security saves a default for new local shells, ad hoc
+SSH and SFTP, including Quick Connect and the incognito SSH form. The
+Teamwork SSH form and Control API also include the global choice in their
+launch minimum. Existing personal SSH connection settings and restored
+local session levels retain their precedence. Legacy local settings apply
+until a global choice is saved. Managed minimums apply at launch, and an
+isolated local shell still requires a reviewed absolute workspace.
+
+The Security page checks the local PTY and SSH worker backends separately
+on the application executor. The local check reuses Windows PSEC platform
+queries, macOS Seatbelt prerequisites and Linux Landlock prerequisites.
+The SSH result uses the worker's existing platform check. The native launch
+paths still verify individual sandboxed processes and workspaces.
+
+Windows ARM64 passed the application all-target check with `dialog-preview`
+and 97 selected application cases. The cases include saved defaults, policy
+changes, stale availability results, old local session records and new
+Quick Connect SSH and SFTP logins. The native Windows PSEC and LPAC worker
+harnesses also passed. Apple Silicon passed the native Seatbelt test for
+the local shell and its descendants against the revised PTY component.
+The Mac run used a private checkout with the three changed Apple-platform
+PTY source files applied to the published PR snapshot. The Linux x86-64
+PTY all-target cross-check passed. [Windows application check](target/verification/20261123-isolation-default-windows-check.log)
+· [Windows native tests](target/verification/20261123-isolation-default-windows-tests.log)
+· [Apple Silicon Seatbelt test](target/verification/20261123-isolation-default-apple-silicon-seatbelt.log)
+· [Linux compilation](target/verification/20261123-isolation-default-linux-cross-check.log)
+
+Remaining work includes folder and connection inheritance, the displayed
+source of the resolved level, the exact Teamwork request precedence, Java
+backup adoption and native desktop comparison. [Rust Security page](src/workspace/settings_window.rs)
+· [Local launch resolution](src/workspace/session_security.rs)
+· [Local sandbox prerequisites](crates/pty/src/lib.rs)
 
 ## November 23 Plan and execution layout
 

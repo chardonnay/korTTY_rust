@@ -33,7 +33,11 @@ Knowledge Stores opens with its model inventory loading intact, and a
 Windows ARM64 restart restored both manual and automatic source outcomes.
 Global Settings groups password rotation and the managed startup requirement
 under Security. Its temporary-key switch enables the interactive Quick
-Connect SSH and SFTP paths. [Current PR](https://github.com/chardonnay/korTTY_rust/pull/35)
+Connect SSH and SFTP paths. Security also provides the global session
+isolation default and shows the native local-shell and SSH sandbox
+prerequisites. New local shells, ad hoc SSH and SFTP, and Teamwork SSH use
+the default subject to their applicable managed limits. The remaining
+inheritance and migration work is listed below.
 The remaining desktop checks are in the [dialog backlog](#gui-dialog-design-parity).
 
 Start with the [confirmed implementation work](#confirmed-implementation-work).
@@ -51,7 +55,7 @@ records the broader comparison with the tagged Java release.
 
 | Area | Remaining change | Completion check |
 | --- | --- | --- |
-| D2/D4/P1 · Session isolation | Add the global default, the runtime sandbox availability display, and the Connection Manager's inherited folder and connection choices. Apply the tagged local and Teamwork precedence before the managed minimum. Include reviewed adoption of Java defaults and folder settings in M1. | Check existing Rust profiles, explicit None versus inheritance, nested folders, Teamwork and request overrides, Quick Connect, local and SSH launches, managed floors, and unavailable backends. Compare the native Security page and connection editor with Java. [Isolation source audit](PORTING-PARITY.md#november-23-session-isolation-source-audit) |
+| D2/D4/P1 · Session isolation | Add the Connection Manager's inherited folder and connection choices, including their source labels. Apply the tagged local and Teamwork precedence for folders and explicit requests before the managed minimum. Include reviewed adoption of Java defaults and folder settings in M1. | Check existing Rust profiles, explicit None versus inheritance, nested folders, Teamwork and request overrides, Quick Connect, local and SSH launches, managed floors, and unavailable backends. Compare the native Security page and connection editor with Java. [Isolation source audit](PORTING-PARITY.md#november-23-session-isolation-source-audit) |
 | D4/M1 · Credential settings and migration | Decide native vault custody for Java's optional startup auto-unlock and encrypted connection-editor temporary keys. Audit adoption of the Java global temporary-key opt-in independently of credential import. | Verify startup policy precedence and reviewed adoption without activating credentials. Exercise the implemented interactive Quick Connect SSH and SFTP routes with disposable keys. [Security checkpoint](PORTING-PARITY.md#november-23-settings-security) · [Temporary SSH keys](PORTING-PARITY.md#november-23-quick-connect-temporary-ssh-keys) |
 | D4 · Searchable controls | Compare the remaining Java Settings and AI Manager pages, subpages and labeled controls with the Rust search inventory. Add reachable missing destinations alongside the dialog comparisons. | Verify that controls on a page that has never been opened are discoverable, and that navigation reveals the exact control with the current page state and policy. |
 
@@ -103,9 +107,9 @@ Settings pages still need visual work. [Desktop comparison](PORTING-PARITY.md#no
 
 Resources exposes a JVM launch profile and its heap limit. Compare the
 native resource controls before specifying a Rust equivalent. Next in
-Security, implement the isolation default and availability display, then
-verify inheritance through the Connection Manager, Quick Connect and
-local and SSH launches. The Quick Connect temporary-key switch is
+Security, continue with isolation inheritance through the Connection
+Manager, Quick Connect and local and SSH launches. The global default and
+availability display are implemented. The Quick Connect temporary-key switch is
 implemented. Audit the related Java backup flag and connection-editor
 credentials. Privacy exposes Java telemetry
 consent. Record the native app's behavior and the handling of imported
@@ -1190,8 +1194,8 @@ not been identified.
 ## Implementation order
 
 Start with [session isolation](PORTING-PARITY.md#november-23-session-isolation-source-audit).
-Port the Settings control and availability display with the launch resolver,
-then connect folder and connection inheritance and audit Java restore.
+Connect folder and connection inheritance to the global default, resolve
+explicit session requests and audit Java restore.
 Continue the [dialog design comparison](#gui-dialog-design-parity) with
 the remaining Settings and AI Manager pages. Repeat the verified Windows
 Knowledge Store restart and recovery paths on the other native desktops.

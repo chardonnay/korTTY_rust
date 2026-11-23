@@ -16,6 +16,7 @@ use crate::connection_store::{
 };
 use crate::profile::{self, session::RestoreMode};
 use crate::profile_backup::preferences::Preferences as BackupPreferences;
+use crate::session_security::IsolationLevel;
 use crate::sftp_window::ConflictDefault;
 #[cfg(test)]
 use crate::terminal_agent::design::Preset as AgentDesign;
@@ -235,6 +236,8 @@ pub enum Setting {
     StartupMasterPassword,
     ChangeMasterPassword,
     TemporarySshKey,
+    DefaultIsolation,
+    SandboxAvailability,
     RememberGeometry,
     RememberDashboard,
     FixedGeometry,
@@ -333,6 +336,8 @@ impl Setting {
         Self::StartupMasterPassword,
         Self::ChangeMasterPassword,
         Self::TemporarySshKey,
+        Self::DefaultIsolation,
+        Self::SandboxAvailability,
         Self::RememberGeometry,
         Self::RememberDashboard,
         Self::FixedGeometry,
@@ -443,6 +448,8 @@ impl Setting {
             Self::StartupMasterPassword => "Require master password at startup",
             Self::ChangeMasterPassword => "Change master password",
             Self::TemporarySshKey => "Enable temporary SSH key option",
+            Self::DefaultIsolation => "Default isolation",
+            Self::SandboxAvailability => "Sandbox availability",
             Self::RememberGeometry => "Remember window geometry",
             Self::RememberDashboard => "Remember dashboard state",
             Self::FixedGeometry => "Use fixed window geometry",
@@ -536,9 +543,11 @@ impl Setting {
             | Self::JournalVision
             | Self::JournalAutomaticVision => Section::Logging,
             Self::ExportWatermark | Self::ExportFooter | Self::ExportSnippetCode => Section::Export,
-            Self::StartupMasterPassword | Self::ChangeMasterPassword | Self::TemporarySshKey => {
-                Section::Security
-            }
+            Self::StartupMasterPassword
+            | Self::ChangeMasterPassword
+            | Self::TemporarySshKey
+            | Self::DefaultIsolation
+            | Self::SandboxAvailability => Section::Security,
             Self::ToolbarIconSize
             | Self::RememberGeometry
             | Self::RememberDashboard
@@ -685,6 +694,12 @@ impl Setting {
             Self::StartupMasterPassword => "vault unlock startup login authentication security",
             Self::ChangeMasterPassword => "vault rotate credential password security",
             Self::TemporarySshKey => "quick connect sftp paste in memory expires private key",
+            Self::DefaultIsolation => {
+                "session isolation local shell ssh containment separate process managed minimum"
+            }
+            Self::SandboxAvailability => {
+                "session isolation security sandbox backend status local shell ssh"
+            }
             Self::RememberGeometry => "startup normal bounds size position maximized",
             Self::RememberDashboard => "startup show hide dashboard state navigation dock",
             Self::FixedGeometry => "startup width height fixed window position dimensions",
@@ -781,6 +796,8 @@ pub enum Message {
     Startup(window::Id, startup_settings::Edit),
     ChangeMasterPassword(window::Id),
     TemporarySshKey(window::Id, bool),
+    DefaultIsolation(window::Id, IsolationLevel),
+    SandboxAvailability(window::Id, String),
     ToolWindowTabs(window::Id, bool),
     ConnectionColorBorder(window::Id, bool),
     SplitPaneFocusRing(window::Id, bool),
@@ -980,6 +997,14 @@ impl Draft {
         {
             current.temporary_ssh_key_enabled = edit.temporary_ssh_key_enabled;
         }
+        if policy.problem.is_none()
+            && edit.default_session_isolation != before.default_session_isolation
+            && edit
+                .default_session_isolation
+                .is_some_and(|level| level >= policy.minimum_isolation)
+        {
+            current.default_session_isolation = edit.default_session_isolation;
+        }
         if edit.paste_warning != before.paste_warning {
             current.paste_warning = edit.paste_warning.max(policy.minimum_paste_warning);
         }
@@ -1133,6 +1158,7 @@ struct Dialog {
     standalone_agent_design: bool,
     initial: Draft,
     draft: Draft,
+    sandbox_availability: Option<String>,
     installed_sftp_conflict_policy: SftpConflictPolicy,
     sftp_xml: sftp_settings::java::Exchange,
     initial_highlighting: highlight::Preferences,
@@ -1495,6 +1521,12 @@ impl Workspace {
                     None => opened,
                 };
             }
+            Message::SandboxAvailability(id, availability) => {
+                if let Some(dialog) = self.settings.dialog_mut(id) {
+                    dialog.sandbox_availability = Some(availability);
+                }
+                return Task::none();
+            }
             Message::Escape(id) => {
                 return self.dismiss_settings(id);
             }
@@ -1570,6 +1602,7 @@ impl Workspace {
             | Message::ToolbarIconSize(id, _)
             | Message::Startup(id, _)
             | Message::TemporarySshKey(id, _)
+            | Message::DefaultIsolation(id, _)
             | Message::ToolWindowTabs(id, _)
             | Message::ConnectionColorBorder(id, _)
             | Message::SplitPaneFocusRing(id, _)
@@ -1878,6 +1911,13 @@ impl Workspace {
                     && self.clipboard.policy.problem.is_none() =>
             {
                 dialog.draft.preferences.temporary_ssh_key_enabled = enabled;
+            }
+            Message::DefaultIsolation(_, level)
+                if dialog.section == Section::Security
+                    && self.clipboard.policy.problem.is_none()
+                    && level >= self.clipboard.policy.minimum_isolation =>
+            {
+                dialog.draft.preferences.default_session_isolation = Some(level);
             }
             Message::ToolWindowTabs(_, enabled) => {
                 dialog.draft.preferences.open_tool_windows_as_tabs = enabled;
@@ -2357,6 +2397,7 @@ impl Workspace {
             standalone_agent_design,
             initial: draft.clone(),
             draft,
+            sandbox_availability: None,
             installed_sftp_conflict_policy: SftpConflictPolicy::load(),
             sftp_xml: sftp_settings::java::Exchange::default(),
             initial_highlighting: highlighting.clone(),
@@ -2396,12 +2437,25 @@ impl Workspace {
             quick_select,
             video: video_settings::Editor::new(self.video.preferences()),
         });
-        opened.chain(
+        let reveal = opened.chain(
             self.settings
                 .0
                 .as_ref()
                 .map_or_else(Task::none, Dialog::reveal_tab),
-        )
+        );
+        if standalone_agent_design {
+            reveal
+        } else {
+            Task::batch([
+                reveal,
+                Task::perform(
+                    async { probe_sandbox_availability() },
+                    move |availability| {
+                        Desktop::Settings(Message::SandboxAvailability(id, availability))
+                    },
+                ),
+            ])
+        }
     }
 
     pub(super) fn open_journal_options(&mut self, owner: window::Id) -> Task<Desktop> {
@@ -3861,6 +3915,26 @@ impl Workspace {
         let require_password = policy.require_master_password
             || dialog.draft.preferences.startup.require_master_password;
         let password_editable = policy.problem.is_none() && !policy.require_master_password;
+        let minimum = policy.minimum_isolation;
+        let isolation = dialog
+            .draft
+            .preferences
+            .default_session_isolation
+            .unwrap_or_default()
+            .max(minimum);
+        let allowed = IsolationLevel::ALL
+            .into_iter()
+            .filter(|level| *level >= minimum)
+            .collect::<Vec<_>>();
+        let isolation_control: Element<'_, Desktop> =
+            if policy.problem.is_some() || allowed.len() == 1 {
+                text(isolation.to_string()).into()
+            } else {
+                pick_list(allowed, Some(isolation), move |level| {
+                    Desktop::Settings(Message::DefaultIsolation(id, level))
+                })
+                .into()
+            };
         column![
             text("Master password").size(18),
             text("Your master password unlocks the local credential vault.").size(13),
@@ -3909,6 +3983,20 @@ impl Workspace {
                         Desktop::Settings(Message::TemporarySshKey(id, enabled))
                     })),
             ),
+            rule::horizontal(1),
+            text("Session isolation").size(18),
+            text("Choose the default for new local and SSH sessions. Saved SSH connections can specify their own level.").size(13),
+            highlighted(
+                dialog,
+                Setting::DefaultIsolation,
+                row![
+                    text(Setting::DefaultIsolation.label()),
+                    isolation_control,
+                ].spacing(8).align_y(Alignment::Center),
+            ),
+            (minimum != IsolationLevel::None).then(|| text(format!("Managed minimum · {minimum}")).size(13)),
+            highlighted(dialog, Setting::SandboxAvailability, text(dialog.sandbox_availability.clone().unwrap_or_else(|| "Checking sandbox availability…".into())).size(13)),
+            (isolation == IsolationLevel::Sandbox).then(|| text("Set an absolute sandbox workspace for local shells in Session security.").size(13)),
         ]
         .spacing(12)
         .into()
@@ -4409,6 +4497,20 @@ fn font_settings_page(dialog: &Dialog) -> Element<'_, Desktop> {
     ]
     .spacing(4)
     .into()
+}
+
+fn probe_sandbox_availability() -> String {
+    let local = kortty_pty::local_sandbox_backend().map_err(|error| error.to_string());
+    let ssh = crate::ssh_worker::sandbox_availability();
+    let status = |result: &Result<&str, String>| match result {
+        Ok(backend) => format!("available ({backend})"),
+        Err(reason) => format!("unavailable ({reason})"),
+    };
+    format!(
+        "Local shell sandbox: {}\nSSH sandbox: {}",
+        status(&local),
+        status(ssh)
+    )
 }
 
 fn highlighted<'a>(
@@ -5288,6 +5390,84 @@ mod tests {
             WindowSettings::decode(&snapshot)
                 .unwrap()
                 .temporary_ssh_key_enabled
+        );
+    }
+
+    #[test]
+    fn default_isolation_is_searchable_saved_and_checked_against_current_policy() {
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.open_settings(owner, Some(Section::Window));
+        let id = workspace.settings.for_owner(owner).unwrap();
+        assert_eq!(
+            WindowSettings::decode(b"{}")
+                .unwrap()
+                .default_session_isolation,
+            None
+        );
+
+        let _ = workspace.update_settings(Message::Search(id, "default isolation".into()));
+        let _ = workspace.update_settings(Message::SearchChoose(id));
+        let dialog = workspace.settings.0.as_ref().unwrap();
+        assert_eq!(dialog.section, Section::Security);
+        assert_eq!(dialog.revealed, Some(Setting::DefaultIsolation));
+
+        let _ = workspace.update_settings(Message::DefaultIsolation(id, IsolationLevel::Process));
+        assert_eq!(workspace.window_settings.default_session_isolation, None);
+        let mut snapshot = Vec::new();
+        let _ = workspace.save_settings_to(id, |settings| {
+            snapshot = serde_json::to_vec(settings)?;
+            Ok(())
+        });
+        assert_eq!(
+            WindowSettings::decode(&snapshot)
+                .unwrap()
+                .default_session_isolation,
+            Some(IsolationLevel::Process)
+        );
+
+        let _ = workspace.open_settings(owner, Some(Section::Security));
+        let id = workspace.settings.for_owner(owner).unwrap();
+        let _ = workspace.update_settings(Message::DefaultIsolation(id, IsolationLevel::None));
+        workspace.clipboard.policy.minimum_isolation = IsolationLevel::Process;
+        let _ = workspace.save_settings_to(id, |_| Ok(()));
+        assert_eq!(
+            workspace.window_settings.default_session_isolation,
+            Some(IsolationLevel::Process)
+        );
+    }
+
+    #[test]
+    fn sandbox_availability_reports_both_backends_to_its_settings_window() {
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.open_settings(owner, Some(Section::Security));
+        let id = workspace.settings.for_owner(owner).unwrap();
+        let availability = probe_sandbox_availability();
+        assert!(availability.starts_with("Local shell sandbox: "));
+        assert!(availability.contains("\nSSH sandbox: "));
+        let _ = workspace.update_settings(Message::SandboxAvailability(id, availability.clone()));
+        assert_eq!(
+            workspace
+                .settings
+                .0
+                .as_ref()
+                .unwrap()
+                .sandbox_availability
+                .as_deref(),
+            Some(availability.as_str())
+        );
+        let _ = workspace.update_settings(Message::Cancel(id));
+        let _ = workspace.open_settings(owner, Some(Section::Security));
+        let _ = workspace.update_settings(Message::SandboxAvailability(id, availability));
+        assert!(
+            workspace
+                .settings
+                .0
+                .as_ref()
+                .unwrap()
+                .sandbox_availability
+                .is_none()
         );
     }
 

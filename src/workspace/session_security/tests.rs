@@ -9,6 +9,43 @@ use super::*;
 use crate::workspace::{recording_access, ssh_access};
 
 #[test]
+fn default_isolation_applies_to_new_shells_and_preserves_explicit_restores() {
+    let mut workspace = Workspace::default();
+    workspace.security.local.isolation = IsolationLevel::Process;
+    assert_eq!(
+        workspace.local_settings(None).unwrap().isolation,
+        IsolationLevel::Process
+    );
+    workspace.window_settings.default_session_isolation = Some(IsolationLevel::None);
+    assert_eq!(
+        workspace.local_settings(None).unwrap().isolation,
+        IsolationLevel::None
+    );
+
+    workspace.window_settings.default_session_isolation = Some(IsolationLevel::Sandbox);
+    let sandbox = workspace.local_settings(None).unwrap();
+    assert_eq!(sandbox.isolation, IsolationLevel::Sandbox);
+    assert_eq!(
+        sandbox.validate().unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+    let restored = serde_json::from_str::<LocalSettings>("{}").unwrap();
+    assert_eq!(
+        workspace
+            .local_settings(Some(restored.clone()))
+            .unwrap()
+            .isolation,
+        IsolationLevel::None
+    );
+
+    workspace.clipboard.policy.minimum_isolation = IsolationLevel::Process;
+    assert_eq!(
+        workspace.local_settings(Some(restored)).unwrap().isolation,
+        IsolationLevel::Process
+    );
+}
+
+#[test]
 fn incognito_layout_omits_private_panes_and_remaps_selected_tab() {
     let mut workspace = Workspace::default();
     let (regular, _) = workspace.open_window(false);

@@ -931,7 +931,9 @@ impl Workspace {
             };
             (
                 SshDialog::new(state.local_profile).with_isolation(
-                    IsolationLevel::None,
+                    self.window_settings
+                        .default_session_isolation
+                        .unwrap_or_default(),
                     self.clipboard.policy.minimum_isolation,
                 ),
                 None,
@@ -1277,6 +1279,11 @@ impl Workspace {
         };
         let floor = route
             .isolation
+            .max(
+                self.window_settings
+                    .default_session_isolation
+                    .unwrap_or_default(),
+            )
             .max(self.clipboard.policy.minimum_isolation)
             .max(
                 control
@@ -1539,7 +1546,9 @@ impl Workspace {
         let form = target.map_or_else(
             || {
                 SshDialog::new(TerminalProfile::Xterm).with_isolation(
-                    IsolationLevel::None,
+                    self.window_settings
+                        .default_session_isolation
+                        .unwrap_or_default(),
                     self.clipboard.policy.minimum_isolation,
                 )
             },

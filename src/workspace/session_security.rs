@@ -79,30 +79,35 @@ impl Security {
             self.draft = None;
         }
     }
+}
 
+impl Workspace {
     pub(super) fn local_settings(
         &self,
         stored: Option<LocalSettings>,
-        minimum: IsolationLevel,
     ) -> io::Result<LocalSettings> {
-        if let Some(error) = &self.problem {
+        if let Some(error) = &self.security.problem {
             return Err(io::Error::other(format!(
                 "session security settings could not be applied ({error})"
             )));
         }
-        let mut settings = stored.unwrap_or_else(|| self.local.clone());
+        let mut settings = stored.unwrap_or_else(|| {
+            let mut settings = self.security.local.clone();
+            if let Some(default) = self.window_settings.default_session_isolation {
+                settings.isolation = default;
+            }
+            settings
+        });
         if settings.directory.is_empty() {
-            settings.directory.clone_from(&self.local.directory);
+            settings
+                .directory
+                .clone_from(&self.security.local.directory);
         }
-        Ok(settings.with_minimum(minimum))
+        Ok(settings.with_minimum(self.clipboard.policy.minimum_isolation))
     }
-}
 
-impl Workspace {
     pub(super) fn local_settings_for_shell(&self, shell: LocalShell) -> io::Result<LocalSettings> {
-        let mut settings = self
-            .security
-            .local_settings(None, self.clipboard.policy.minimum_isolation)?;
+        let mut settings = self.local_settings(None)?;
         settings.shell = shell;
         settings.shell_integration &= kortty_pty::validate_shell_integration(shell, None).is_ok();
         Ok(settings)
@@ -135,16 +140,19 @@ impl Workspace {
                     .get_mut(&id)
                     .expect("open terminal window")
                     .cancel_paste();
-                let draft = self
-                    .security
-                    .local
-                    .clone()
-                    .with_minimum(self.clipboard.policy.minimum_isolation);
+                let mut draft = self.security.local.clone();
+                draft.isolation = self
+                    .window_settings
+                    .default_session_isolation
+                    .unwrap_or(draft.isolation)
+                    .max(self.clipboard.policy.minimum_isolation);
                 self.security.draft = Some((id, draft));
             }
             Message::Close(id) => self.security.close(id),
             Message::Isolation(id, level) if self.security.editing(id) => {
-                if level >= self.clipboard.policy.minimum_isolation {
+                if self.window_settings.default_session_isolation.is_none()
+                    && level >= self.clipboard.policy.minimum_isolation
+                {
                     self.security
                         .draft
                         .as_mut()
@@ -169,14 +177,20 @@ impl Workspace {
                     .expect("editing security settings")
                     .1;
                 let saved = draft.validate().and_then(|()| {
+                    let mut local = draft.clone();
+                    if self.window_settings.default_session_isolation.is_some() {
+                        local.isolation = self.security.local.isolation;
+                    }
+                    local.validate()?;
                     profile::save_atomic(
                         &profile::session_security_path()?,
-                        &serde_json::to_vec(draft)?,
-                    )
+                        &serde_json::to_vec(&local)?,
+                    )?;
+                    Ok(local)
                 });
                 match saved {
-                    Ok(()) => {
-                        self.security.local = draft.clone();
+                    Ok(local) => {
+                        self.security.local = local;
                         self.security.problem = None;
                         self.security.close(id);
                         self.notice(id, "Security settings apply to new local sessions.".into());
@@ -216,18 +230,26 @@ impl Workspace {
             .into_iter()
             .filter(|level| *level >= minimum)
             .collect::<Vec<_>>();
-        let mut panel = column![
-            text("Session security").size(19),
-            row![
-                text("Default local shell isolation"),
-                pick_list(options, Some(draft.isolation), move |level| {
-                    Desktop::SessionSecurity(Message::Isolation(id, level))
-                }),
-            ]
-            .spacing(8),
-        ]
-        .spacing(10)
-        .padding(16);
+        let isolation: Element<'_, Desktop> =
+            if self.window_settings.default_session_isolation.is_some() {
+                text(format!(
+                    "Local shell isolation from Global Settings · {}",
+                    draft.isolation
+                ))
+                .into()
+            } else {
+                row![
+                    text("Default local shell isolation"),
+                    pick_list(options, Some(draft.isolation), move |level| {
+                        Desktop::SessionSecurity(Message::Isolation(id, level))
+                    }),
+                ]
+                .spacing(8)
+                .into()
+            };
+        let mut panel = column![text("Session security").size(19), isolation]
+            .spacing(10)
+            .padding(16);
         if minimum != IsolationLevel::None {
             panel = panel.push(text(format!("Managed minimum · {minimum}")).size(13));
         }

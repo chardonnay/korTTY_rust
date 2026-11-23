@@ -378,8 +378,7 @@ impl Workspace {
             );
         }
         let mut settings = self
-            .security
-            .local_settings(None, self.clipboard.policy.minimum_isolation)
+            .local_settings(None)
             .map_err(|_| "Local session settings are unavailable.")?;
         if settings.isolation == IsolationLevel::Sandbox {
             return Err("A sandboxed shell uses its own isolated startup environment.");
@@ -455,6 +454,12 @@ impl Workspace {
             split,
             self.allocate(),
             profile,
+            self.clipboard.policy.minimum_isolation,
+        );
+        dialog.ssh = dialog.ssh.with_isolation(
+            self.window_settings
+                .default_session_isolation
+                .unwrap_or_default(),
             self.clipboard.policy.minimum_isolation,
         );
         dialog.set_temporary_key_enabled(self.quick_temporary_key_enabled());
@@ -1340,6 +1345,40 @@ fn wrap(id: window::Id, message: Message) -> Desktop {
 mod tests {
     use super::*;
     use crate::ssh_dialog::{LoginMessage, Password};
+
+    #[test]
+    fn quick_connect_applies_the_default_to_new_ssh_and_sftp_logins() {
+        let mut workspace = Workspace::default();
+        workspace.window_settings.default_session_isolation = Some(IsolationLevel::Process);
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.show_quick_connect(owner);
+        let id = workspace.quick_connect_for_owner(owner).unwrap();
+        for message in [
+            LoginMessage::Host("isolation.test".into()),
+            LoginMessage::Username("operator".into()),
+            LoginMessage::Password(Password::new("fixture".into())),
+        ] {
+            let _ = workspace
+                .update_quick_connect(id, Message::Ssh(ssh_dialog::Message::Target(message)));
+        }
+        let draft = workspace
+            .quick_connect
+            .as_ref()
+            .unwrap()
+            .ssh
+            .saved_draft("fixture")
+            .unwrap();
+        assert_eq!(draft.isolation, IsolationLevel::Process);
+        let _ = workspace.update_quick_connect(id, Message::Protocol(Protocol::Sftp));
+        let request = workspace
+            .quick_connect
+            .as_mut()
+            .unwrap()
+            .ssh
+            .take_request()
+            .unwrap();
+        assert_eq!(request.isolation, IsolationLevel::Process);
+    }
 
     #[test]
     fn quick_temporary_key_follows_the_preference_and_drops_stale_paste_results() {
