@@ -895,6 +895,51 @@ passed strict application Clippy for all targets.
 [Apple Silicon search tests](target/verification/20261124-knowledge-inventory-search-macos-acceptance.log)
 · [Windows Clippy](target/verification/20261124-knowledge-inventory-search-windows-clippy-final.log)
 
+## November 24 Local Models toolbar search
+
+The tagged Java Local Models toolbar exposes the selected runtime's
+install or update action, other versions, local package import and
+removal. Its model toolbar also exposes Import GGUF. Rust now indexes
+the visible llama.cpp install or update, Other versions and signed
+package controls alongside the existing Remove action. The GGUF import
+toggle and Choose GGUF files button have their own search targets.
+
+Selecting a result reveals the current control while preserving runtime
+and model state. Selecting Choose GGUF files reveals the import form
+with the picker button highlighted. The user opens the file picker from
+that button. Runtime and import actions keep their existing policy and
+confirmation checks. Parent toolbar entries are unavailable inside an
+owned review or editor.
+[Tagged Java toolbar](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/LocalModelManagerPane.java)
+· [Rust search targets](src/ai_manager/search.rs)
+
+Apple Silicon passed strict application Clippy for all targets and five
+focused tests. They verified first-visit search and widget placement,
+current runtime state, stale results, and preservation of draft paths.
+Windows ARM64 passed strict application Clippy for all targets. Visual
+comparison in the running desktop application remains open.
+[Apple Silicon search tests](target/verification/20261124-local-models-toolbar-search-macos.log)
+· [Windows Clippy](target/verification/20261124-local-models-toolbar-search-windows-clippy.log)
+
+## November 24 Appearance inventory
+
+The next Settings search comparison starts with Appearance. The Rust
+page groups the App Design picker, previous and next design buttons,
+and animations checkbox behind one search target. The tagged Java page
+has an App Design field label and a separate animations checkbox label.
+Its design navigation buttons have one-character labels and named tooltips.
+They fall below the Java search index's minimum label length, and Rust can
+give both buttons named search entries.
+
+The tagged Java Appearance page also contains manual and automatic
+application font scaling and a Chat color profile selector. The Rust
+Appearance page has neither preference. The Java backup adapter reads
+the manual font scale as a compatibility fallback for Snippet Editor
+zoom. That fallback does not scale the application UI.
+[Tagged Java Appearance page](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SettingsDialog.java)
+· [Tagged Java index](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SettingsSearchBar.java)
+· [Rust Appearance page](src/workspace/settings_window/appearance_settings.rs)
+
 ## November 23 GGUF Configure sizing
 
 Java sizes the Configure grid to its path label. Rust now measures the

@@ -175,6 +175,9 @@ impl Setting {
             Self::Managed(ManagedSetting::IdleMinutes | ManagedSetting::NeverUnload) => {
                 "idle unload llama.cpp"
             }
+            Self::Managed(ManagedSetting::OpenImport | ManagedSetting::ChooseFiles) => {
+                "local model file picker register"
+            }
             Self::Managed(_) => "llama.cpp",
             Self::Mlx(MlxSetting::Idle) => "idle timeout unload",
             Self::Mlx(MlxSetting::NeverUnload) => "keep running",
@@ -182,6 +185,12 @@ impl Setting {
             Self::ImportedJavaModel(_) => "imported Java model settings",
             Self::Control(Control::DiscardRuntimeDownload) => "ZIP",
             Self::Control(Control::KeepRuntimeDownload) => "runtime download",
+            Self::Control(Control::UpdateStableRuntime) => "check install runtime update llama.cpp",
+            Self::Control(Control::InstallStableRuntime) => "stable signed llama.cpp",
+            Self::Control(Control::RuntimeVersionsEntry) => {
+                "other version check signed runtime updates"
+            }
+            Self::Control(Control::OpenSignedPackage) => "import local package offline ZIP",
             Self::SkillProvider(_) | Self::Control(_) => "",
         }
     }
@@ -345,6 +354,9 @@ impl ProfileAction {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ManagedSetting {
+    OpenImport,
+    CloseImport,
+    ChooseFiles,
     Source,
     Projector,
     ImportPurpose,
@@ -376,7 +388,10 @@ pub(crate) enum ManagedSetting {
 }
 
 impl ManagedSetting {
-    const ALL: [Self; 28] = [
+    const ALL: [Self; 31] = [
+        Self::OpenImport,
+        Self::CloseImport,
+        Self::ChooseFiles,
         Self::Source,
         Self::Projector,
         Self::ImportPurpose,
@@ -423,6 +438,9 @@ impl ManagedSetting {
 
     fn title(self) -> &'static str {
         match self {
+            Self::OpenImport => "Import GGUF…",
+            Self::CloseImport => "Close GGUF import",
+            Self::ChooseFiles => "Choose GGUF files…",
             Self::Source => "GGUF model path",
             Self::Projector => "Vision projector path",
             Self::ImportPurpose => "GGUF import purpose",
@@ -717,6 +735,11 @@ pub(crate) enum Control {
     RefreshModels,
     InstalledModel,
     TestModel,
+    InstallStableRuntime,
+    UpdateStableRuntime,
+    RuntimeVersionsEntry,
+    OpenSignedPackage,
+    HideSignedPackage,
     SignedIndex,
     IndexSignature,
     RuntimePackage,
@@ -788,12 +811,17 @@ pub(crate) enum Control {
 }
 
 impl Control {
-    const ALL: [Self; 76] = [
+    const ALL: [Self; 81] = [
         Self::LocalSetup,
         Self::LocalEndpoint,
         Self::RefreshModels,
         Self::InstalledModel,
         Self::TestModel,
+        Self::InstallStableRuntime,
+        Self::UpdateStableRuntime,
+        Self::RuntimeVersionsEntry,
+        Self::OpenSignedPackage,
+        Self::HideSignedPackage,
         Self::SignedIndex,
         Self::IndexSignature,
         Self::RuntimePackage,
@@ -874,6 +902,11 @@ impl Control {
             | Self::RefreshModels
             | Self::InstalledModel
             | Self::TestModel
+            | Self::InstallStableRuntime
+            | Self::UpdateStableRuntime
+            | Self::RuntimeVersionsEntry
+            | Self::OpenSignedPackage
+            | Self::HideSignedPackage
             | Self::SignedIndex
             | Self::IndexSignature
             | Self::RuntimePackage
@@ -954,6 +987,7 @@ impl Control {
 
     pub(super) fn contextual_runtime(self) -> bool {
         self.runtime_progress()
+            || self.runtime_toolbar()
             || matches!(
                 self,
                 Self::DiscardRuntimeDownload
@@ -962,6 +996,17 @@ impl Control {
                     | Self::ConfirmRuntimeRemoval
                     | Self::CancelRuntimeRemoval
             )
+    }
+
+    pub(super) fn runtime_toolbar(self) -> bool {
+        matches!(
+            self,
+            Self::InstallStableRuntime
+                | Self::UpdateStableRuntime
+                | Self::RuntimeVersionsEntry
+                | Self::OpenSignedPackage
+                | Self::HideSignedPackage
+        )
     }
 
     pub(super) fn contextual_memory(self) -> bool {
@@ -1025,6 +1070,11 @@ impl Control {
             Self::RefreshModels => "Refresh installed models",
             Self::InstalledModel => "Select an installed model",
             Self::TestModel => "Test model",
+            Self::InstallStableRuntime => "Install runtime…",
+            Self::UpdateStableRuntime => "Update runtime…",
+            Self::RuntimeVersionsEntry => "Other runtime versions…",
+            Self::OpenSignedPackage => "Import signed package…",
+            Self::HideSignedPackage => "Hide package import",
             Self::SignedIndex => "Signed index",
             Self::IndexSignature => "Index signature",
             Self::RuntimePackage => "Runtime package",
@@ -2420,6 +2470,55 @@ mod tests {
                 y >= position.viewport.y && y < position.viewport.y + position.viewport.height,
                 "{} is outside the Knowledge Stores viewport",
                 action.title()
+            );
+        }
+    }
+
+    #[test]
+    fn local_models_search_reveals_runtime_and_gguf_buttons_on_first_visit() {
+        for (query, setting) in [
+            (
+                "install runtime",
+                Setting::Control(Control::InstallStableRuntime),
+            ),
+            (
+                "other version",
+                Setting::Control(Control::RuntimeVersionsEntry),
+            ),
+            (
+                "import local package",
+                Setting::Control(Control::OpenSignedPackage),
+            ),
+            ("import gguf", Setting::Managed(ManagedSetting::OpenImport)),
+            (
+                "choose gguf files",
+                Setting::Managed(ManagedSetting::ChooseFiles),
+            ),
+        ] {
+            let mut dialog = Dialog::new(
+                Arc::new(Configuration::default()),
+                PathBuf::new(),
+                Vec::new(),
+                true,
+                None,
+            );
+            assert_eq!(dialog.page, Page::General);
+            let _ = dialog.update(Message::Search(query.into()));
+            assert_eq!(
+                dialog.search_results().next(),
+                Some(Target::Setting(setting))
+            );
+            let reveal = dialog.update(Message::SearchChoose);
+            assert_eq!(dialog.page, Page::LocalModels);
+            assert_eq!(dialog.revealed.setting, Some(setting));
+            let position = applied_position(&dialog, reveal);
+            let y = position
+                .row_y
+                .unwrap_or_else(|| panic!("no reveal row for {query}"))
+                - position.offset;
+            assert!(
+                y >= position.viewport.y && y < position.viewport.y + position.viewport.height,
+                "{query} is outside the Local Models viewport",
             );
         }
     }

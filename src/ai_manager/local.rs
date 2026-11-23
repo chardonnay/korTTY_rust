@@ -1116,6 +1116,12 @@ impl Dialog {
         editable: bool,
         ai_enabled: bool,
     ) -> bool {
+        use super::search::ManagedSetting::{ChooseFiles, CloseImport, OpenImport};
+        if matches!(setting, OpenImport | CloseImport | ChooseFiles)
+            && !self.model_toolbar_visible()
+        {
+            return false;
+        }
         let editable = editable && self.request.is_none();
         self.managed
             .has_search_setting(setting, editable, editable && ai_enabled, &self.mlx)
@@ -1192,6 +1198,16 @@ impl Dialog {
             && self.runtime_removal.is_none();
         let repair = self.backend_repair.as_ref();
         match control {
+            _ if control.runtime_toolbar() => {
+                self.model_toolbar_visible()
+                    && match control {
+                        InstallStableRuntime => self.managed.runtime_summary().0.is_none(),
+                        UpdateStableRuntime => self.managed.runtime_summary().0.is_some(),
+                        OpenSignedPackage => !self.offline_runtime_open,
+                        HideSignedPackage => self.offline_runtime_open,
+                        _ => true,
+                    }
+            }
             CancelRuntimeRequest => self.runtime_request_active(),
             PauseRuntimeDownload => self.runtime_request_active() && self.online.can_pause(),
             CloseRuntimeRepair => repair.is_some(),
@@ -1201,8 +1217,8 @@ impl Dialog {
             ConfirmRuntimeRemoval | CancelRuntimeRemoval => {
                 repair.is_none() && self.runtime_removal.is_some()
             }
-            CheckRuntimeOnline
-            | RuntimeOnlineChoice
+            CheckRuntimeOnline => repair.is_some(),
+            RuntimeOnlineChoice
             | DownloadRuntimeOnline
             | DiscardRuntimeDownload
             | KeepRuntimeDownload => self.online.has_search_control(
@@ -1212,6 +1228,14 @@ impl Dialog {
             ),
             _ => repair.is_none(),
         }
+    }
+
+    fn model_toolbar_visible(&self) -> bool {
+        self.backend_repair.is_none()
+            && self.online.review.is_none()
+            && !self.runtime_removal_review_open()
+            && self.model_configuration_kind().is_none()
+            && self.model_review_title().is_none()
     }
 
     fn runtime_request_active(&self) -> bool {
@@ -4063,19 +4087,31 @@ impl Dialog {
         .spacing(8);
         let show_offline = self.offline_runtime_open;
         let installed = self.managed.runtime_summary().0.is_some();
+        let (runtime_action, runtime_label) = if installed {
+            (UpdateStableRuntime, "Update runtime…")
+        } else {
+            (InstallStableRuntime, "Install runtime…")
+        };
+        let (package_action, package_label) = if show_offline {
+            (HideSignedPackage, "Hide package import")
+        } else {
+            (OpenSignedPackage, "Import signed package…")
+        };
         column![
             text("Install a runtime and register local models to use AI on this computer.").size(13),
             text("Local runtimes").size(17),
             self.runtime_table(),
             row![
-                dialog_design::secondary_action(if installed { "Update runtime…" } else { "Install runtime…" })
+                action(runtime_action, dialog_design::secondary_action(runtime_label)
                     .on_press_maybe((can_request && self.runtime_removal.is_none()).then_some(Message::OpenStableRuntimeReview)),
-                action(CheckRuntimeOnline, dialog_design::secondary_action("Other versions…")
+                ),
+                action(RuntimeVersionsEntry, dialog_design::secondary_action("Other versions…")
                     .on_press_maybe((can_request && self.runtime_downloads_allowed && self.runtime_removal.is_none())
                         .then_some(Message::OpenRuntimeVersions)),
                 ),
-                dialog_design::secondary_action(if show_offline { "Hide package import" } else { "Import signed package…" })
+                action(package_action, dialog_design::secondary_action(package_label)
                     .on_press_maybe(can_edit.then_some(Message::ToggleOfflineRuntime)),
+                ),
                 action(RemoveRuntime, dialog_design::secondary_action("Remove installed runtime…")
                     .on_press_maybe(
                         (can_edit && installed && self.runtime_removal.is_none() && !self.mlx.runtime_removal_open())
@@ -6445,6 +6481,73 @@ mod tests {
                 assert!(!cancelled.load(Ordering::Acquire));
             }
         }
+    }
+
+    #[test]
+    fn runtime_toolbar_search_preserves_review_state_and_offline_paths() {
+        use crate::ai_manager::search::{Control, Setting, Target};
+        use crate::ai_manager::{Dialog as Manager, Message as ManagerMessage};
+
+        let profile = crate::snippets::tests::Profile::new();
+        let mut manager = Manager::new(
+            Arc::new(Configuration::default()),
+            profile.0.clone(),
+            Vec::new(),
+            true,
+            None,
+        );
+        manager.local.set_runtime_downloads_allowed(false);
+        let import = Target::Setting(Setting::Control(Control::OpenSignedPackage));
+        let install = Target::Setting(Setting::Control(Control::InstallStableRuntime));
+        let _ = manager.update(ManagerMessage::Search("import signed package".into()));
+        assert_eq!(manager.search_results().next(), Some(import));
+        let _ = manager.update(ManagerMessage::SearchChoose);
+        assert!(!manager.local.offline_runtime_open);
+        assert!(!manager.local.busy());
+
+        manager
+            .local
+            .managed
+            .set_active_package(Some(("fixture runtime".into(), PackageBackend::Cpu)));
+        let update = Setting::Control(Control::UpdateStableRuntime);
+        let _ = manager.update(ManagerMessage::Search(
+            "check install runtime update".into(),
+        ));
+        assert_eq!(
+            manager.search_results().next(),
+            Some(Target::Setting(update))
+        );
+        let _ = manager.update(ManagerMessage::SearchChoose);
+        assert_eq!(manager.revealed.setting, Some(update));
+        assert!(manager.local.runtime_review_title().is_none());
+        assert!(!manager.local.busy());
+        assert!(!manager.search_target_available(install));
+        let _ = manager.open_page(install);
+        assert_eq!(manager.revealed.setting, Some(update));
+
+        let _ = manager.update(ManagerMessage::Local(Message::RuntimePath(
+            RuntimeFile::Index,
+            "fixture-index.json".into(),
+        )));
+        let index = Setting::Control(Control::SignedIndex);
+        let _ = manager.open_page(Target::Setting(index));
+        assert_eq!(manager.revealed.setting, Some(index));
+        assert!(manager.local.offline_runtime_open);
+        assert!(!manager.search_target_available(import));
+        let hide = Setting::Control(Control::HideSignedPackage);
+        let _ = manager.update(ManagerMessage::Search("hide package import".into()));
+        assert_eq!(manager.search_results().next(), Some(Target::Setting(hide)));
+        let _ = manager.update(ManagerMessage::SearchChoose);
+        assert_eq!(manager.revealed.setting, Some(hide));
+        assert!(manager.local.offline_runtime_open);
+        assert_eq!(manager.local.runtime_paths()[0], "fixture-index.json");
+        assert!(!manager.local.busy());
+
+        manager.local.online.review = Some(online::Review::Versions);
+        assert!(!manager.search_target_available(Target::Setting(hide)));
+        let _ = manager.open_page(Target::Setting(hide));
+        assert!(manager.local.runtime_versions_open());
+        assert_eq!(manager.local.runtime_paths()[0], "fixture-index.json");
     }
 
     #[test]
