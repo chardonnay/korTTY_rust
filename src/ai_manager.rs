@@ -4963,6 +4963,10 @@ impl Dialog {
         self.local.model_configuration_kind()
     }
 
+    pub(crate) fn gguf_configuration_width(&self) -> f32 {
+        self.local.gguf_configuration_width()
+    }
+
     pub(crate) fn model_configuration_view(&self) -> Option<Element<'_, Message>> {
         self.local
             .model_configuration_view(

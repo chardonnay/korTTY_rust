@@ -5282,13 +5282,16 @@ fn embedding_picker(
     }
 }
 
+const FORM_LABEL_WIDTH: f32 = 175.0;
+const FORM_COLUMN_GAP: f32 = 8.0;
+
 fn field<'a>(
     label: &'static str,
     control: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
-    row![text(label).width(175), control.into()]
+    row![text(label).width(FORM_LABEL_WIDTH), control.into()]
         .align_y(Alignment::Center)
-        .spacing(8)
+        .spacing(FORM_COLUMN_GAP)
         .into()
 }
 

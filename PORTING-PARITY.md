@@ -45,7 +45,9 @@ Windows ARM64 desktop checks.
   · [Rust panel](src/workspace/terminal_agent/design/plan_execution.rs)
 - **Local models.** Both GGUF and MLX have owned Configure windows. The
   GGUF desktop comparison confirmed field order, cancellation and a saved
-  context size and idle timeout. The same long path wrapped in Rust. Java
+  context size and idle timeout. The same long path wrapped in Rust at that
+  checkpoint. The [Configure sizing update](#november-23-gguf-configure-sizing)
+  measures the model path before opening. Java
   prompts for copy or reference after the file picker and offers a matching
   runtime when a saved GGUF model requires a different backend. Rust
   embedded import review and offered runtime repair separately at that
@@ -169,9 +171,11 @@ display form while registration retains the canonical source.
 The focused Apple Silicon run passed 64 tests serially, including picker
 cancellation, batch import, split-model reattachment and both replies to
 the runtime offer. Two tests in the earlier parallel run hit the shared
-managed-model operation lock. Native desktop acceptance remains open for
-both import choices, both runtime responses, and the Configure width and
-long-path layout against Java.
+managed-model operation lock. Windows ARM64 opened the file picker and
+the owned import review for the long-path fixture. Both storage choices
+were visible. The Configure sizing comparison used a model registered
+through manual path entry. Complete the storage choices from the owned
+review and both runtime responses in native desktops.
 [Rust GGUF actions](src/ai_manager/local/managed.rs)
 · [Apple Silicon serial retest](target/verification/20261123-gguf-import-review-macos-current.log)
 
@@ -237,9 +241,33 @@ and distinct model IDs. Windows ARM64 passed the all-target compilation
 check for the matcher.
 The remaining native acceptance covers the visual results and the inventory
 of searchable controls on the other tagged pages.
+In the Windows ARM64 AI Manager, typing `Lócal Módels!` ranked the Local
+Models page first. Enter opened the page and cleared the search.
 [Rust matcher](src/settings_search.rs)
 · [Tagged Java matcher](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SettingsSearchMatcher.java)
 · [Apple Silicon focused tests](target/verification/20261123-settings-ranking-macos-final.log)
+
+## November 23 GGUF Configure sizing
+
+Java sizes the Configure grid to its path label. Rust now measures the
+displayed model path at the same font size used in the form and requests
+enough width for one line. A narrower monitor or remembered size lets
+the path wrap while the form scrolls above the fixed footer.
+
+The Windows desktop comparison used the same synthetic registration path
+in Java v2.26.0 x64 under emulation and native Windows ARM64 Rust. Configure
+opened at 1,604 by 435 pixels in Java and 1,672 by 457 pixels in Rust.
+Both showed the complete path on one line. Rust's label column is wider
+and the spacing above the footer differs. At a remembered 622 by 362 pixels,
+Rust wrapped the path, kept Save and Cancel visible, and allowed scrolling
+to the unload settings. Saving the changed context stepper persisted 4,608
+tokens for the fixture's external registration.
+
+Apple Silicon passed 52 focused tests, including one-line layout at the
+preferred width and wrapping at the narrower width. The Windows ARM64
+all-target compilation check and native development build passed.
+[Rust configuration sizing](src/ai_manager/local/model_configuration.rs)
+· [Apple Silicon focused tests](target/verification/20261123-gguf-configure-sizing-macos.log)
 
 ## November 22 AI Manager and Agent Design on Windows ARM64
 

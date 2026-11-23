@@ -286,12 +286,7 @@ impl Configuration {
                     )
                 ),
             ),
-            field(
-                "GGUF file",
-                text(location)
-                    .size(13)
-                    .wrapping(text::Wrapping::WordOrGlyph)
-            ),
+            field("GGUF file", super::model_configuration::gguf_path(location)),
             reveal.wrap(
                 Setting::Managed(Backend),
                 field("Backend", backend_picker(self.backend, enabled)),
@@ -1247,6 +1242,21 @@ fn import_models(
 }
 
 impl Dialog {
+    fn configured_gguf_path(&self) -> Option<String> {
+        let model = &self.managed.selected.as_ref()?.model;
+        Some(
+            super::file_chooser::display_path(&model.registered_weights_path(&self.profile_dir))
+                .into_owned(),
+        )
+    }
+
+    pub(in crate::ai_manager) fn gguf_configuration_width(&self) -> f32 {
+        self.configured_gguf_path().map_or(
+            super::model_configuration::GGUF_MINIMUM_PREFERRED_WIDTH,
+            |path| super::model_configuration::gguf_preferred_width(&path),
+        )
+    }
+
     pub(in crate::ai_manager) fn model_configuration_kind(
         &self,
     ) -> Option<super::ModelConfigurationKind> {
@@ -1281,12 +1291,8 @@ impl Dialog {
                 let Some(Action::Configure(configuration)) = &self.managed.action else {
                     return None;
                 };
-                let model = &self.managed.selected.as_ref()?.model;
                 let fields = configuration.fields(
-                    super::file_chooser::display_path(
-                        &model.registered_weights_path(&self.profile_dir),
-                    )
-                    .into_owned(),
+                    self.configured_gguf_path()?,
                     enabled,
                     self.managed.active_backend,
                     reveal,

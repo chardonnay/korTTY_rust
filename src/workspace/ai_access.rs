@@ -525,7 +525,7 @@ impl Workspace {
             match kind {
                 ModelConfigurationKind::Gguf => (
                     DialogKind::GgufModelConfiguration,
-                    668.0,
+                    dialog.gguf_configuration_width(),
                     Size::new(460.0, 314.0),
                 ),
                 ModelConfigurationKind::Mlx => (
