@@ -191,7 +191,15 @@ pub(super) fn parse(root: Node<'_, '_>, source: Source) -> io::Result<Preview> {
                     .is_ok_and(|jump| jump.is_none_or(reusable_target_auth));
             profile.java_memory_id = declared_id.map(str::to_owned);
             if declared_id.is_some() {
-                profile.java_route = declared_route(entry, &profile.connection).ok().flatten();
+                profile.java_route = declared_route(entry, &profile.connection, false)
+                    .ok()
+                    .flatten();
+                if source == Source::CredentialReview {
+                    profile.java_temporary_key_route =
+                        declared_route(entry, &profile.connection, true)
+                            .ok()
+                            .flatten();
+                }
                 if key_reference && source_id.is_some() && profile.java_route.is_some() {
                     profile.java_key_id = binding_field(entry, "sshKeyId")
                         .ok()
@@ -221,6 +229,7 @@ pub(super) fn parse(root: Node<'_, '_>, source: Source) -> io::Result<Preview> {
                 .is_some_and(|id| duplicate_ids.contains(id))
             {
                 entry.java_route = None;
+                entry.java_temporary_key_route = None;
             }
             clear_duplicate_favorite(&mut entry.java_favorite_id, &duplicate_ids);
         }
@@ -307,6 +316,7 @@ fn shared_backup_route(
 fn declared_route(
     node: Node<'_, '_>,
     connection: &super::Connection,
+    temporary: bool,
 ) -> io::Result<Option<(LoginTarget, Option<LoginTarget>)>> {
     if !matches!(
         binding_field(node, "connectionSource")?.map(str::trim),
@@ -314,7 +324,7 @@ fn declared_route(
     ) || !matches!(
         binding_field(node, "protocol")?.map(str::trim),
         None | Some("SSH_TCP")
-    ) || temporary_identity(node)?
+    ) || temporary_identity(node)? != temporary
     {
         return Ok(None);
     }

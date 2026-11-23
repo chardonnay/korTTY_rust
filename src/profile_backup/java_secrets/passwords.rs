@@ -397,7 +397,7 @@ fn stored_password<'a>(node: Node<'a, '_>) -> Result<(CredentialInput, &'a str),
     ))
 }
 
-fn endpoint<'a>(node: Node<'a, '_>) -> Result<(&'a str, LoginTarget), ()> {
+pub(super) fn endpoint<'a>(node: Node<'a, '_>) -> Result<(&'a str, LoginTarget), ()> {
     let source_host = required(node, "host")?;
     let host = normalize_host(source_host).map_err(|_| ())?;
     let username = raw_scalar(node, "username")?.ok_or(())?;
@@ -422,7 +422,7 @@ fn has_password_fields(node: Node<'_, '_>) -> bool {
         || children(node, "encryptedPassword").next().is_some()
 }
 
-fn valid_source_id(id: &str) -> bool {
+pub(super) fn valid_source_id(id: &str) -> bool {
     (1..=128).contains(&id.len()) && !id.chars().any(char::is_whitespace) && !unsafe_text(id)
 }
 

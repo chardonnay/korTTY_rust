@@ -22,6 +22,145 @@ const JAVA_ENVIRONMENTS: &[u8] = br##"<environments>
     <colors><color id="PRODUCTION" color="#abc"/><color id="custom-deadbeef" color="#123456"/></colors>
 </environments>"##;
 
+#[test]
+fn java_temporary_keys_restore_only_after_review_for_the_exact_account() {
+    use crate::connection_store::{Auth, Store};
+    use kortty_vault::TemporarySshKeyOptions;
+    use zip::{AesMode, ZipWriter, write::SimpleFileOptions};
+
+    let source = Scratch::new();
+    let path = source.0.join("java-temporary.zip");
+    let archive_password = Secret::new("fixture archive password".into());
+    let java_password = Secret::new("päss🔑例".into());
+    let envelope = include_str!("../java_secrets/fixtures/envelopes.txt")
+        .lines()
+        .nth(2)
+        .unwrap();
+    let connections = format!(
+        r#"<connections schemaVersion="2">
+          <connection id="temp-direct">
+            <name>Temporary key</name><host>target.example</host><port>2222</port>
+            <username>tester</username><authMethod>PUBLIC_KEY</authMethod>
+            <privateKeyPath>TEMPORARY:__ENCRYPTED__</privateKeyPath>
+            <temporaryKeyContent>{envelope}</temporaryKeyContent>
+            <temporaryKeyExpirationMinutes>47</temporaryKeyExpirationMinutes>
+            <temporaryKeyPermanent>true</temporaryKeyPermanent>
+            <jumpServer><enabled>true</enabled><host>jump.example</host>
+              <username>jump-user</username></jumpServer>
+          </connection>
+          <connection id="temp-plain">
+            <name>Unsealed</name><host>unsafe.example</host><username>tester</username>
+            <authMethod>PUBLIC_KEY</authMethod><temporaryKeyContent>unsealed</temporaryKeyContent>
+          </connection>
+        </connections>"#
+    );
+    let mut zip = ZipWriter::new(File::create(&path).unwrap());
+    let options = SimpleFileOptions::default()
+        .with_aes_encryption_bytes(AesMode::Aes256, archive_password.as_bytes());
+    for (name, bytes) in [
+        ("connections.xml", connections.as_bytes()),
+        (
+            "master.key",
+            include_bytes!("../java_secrets/fixtures/master.properties").as_slice(),
+        ),
+    ] {
+        zip.start_file(name, options).unwrap();
+        zip.write_all(bytes).unwrap();
+    }
+    zip.finish().unwrap();
+
+    let inspect = || super::super::inspect_java_password(&path, &archive_password).unwrap();
+    let skipped = Scratch::new();
+    let preview = inspect();
+    assert!(preview.has_java_temporary_keys());
+    super::super::queue_restore_at(&skipped.0, preview, RestoreMode::JavaAdditive).unwrap();
+    drop(ProfileLease::acquire(&skipped.0, || false).unwrap());
+    let store = Store::open(skipped.0.join(CONNECTIONS)).unwrap();
+    assert_eq!(store.connections().len(), 2);
+    assert!(
+        store
+            .connections()
+            .iter()
+            .all(|connection| { !matches!(connection.login.auth, Auth::TemporaryKey { .. }) })
+    );
+
+    let target = Scratch::new();
+    Directory::open(&target.0, false)
+        .unwrap()
+        .private_child("vault", true)
+        .unwrap();
+    let vault_path = crate::profile::vault_path_at(&target.0);
+    let master = b"fixture destination master password";
+    let vault = Vault::create(&vault_path, master).unwrap();
+    let initial_vault = fs::read(&vault_path).unwrap();
+    let mut preview = inspect();
+    let prepare = super::super::prepare_java_credentials;
+    assert!(prepare(&mut preview, Some(&java_password), None, &target.0).is_err());
+    let wrong_password = Secret::new("incorrect Java password".into());
+    assert!(prepare(&mut preview, Some(&wrong_password), Some(&vault), &target.0).is_err());
+    prepare(&mut preview, Some(&java_password), Some(&vault), &target.0).unwrap();
+    assert_eq!(preview.java_temporary_key_summary(), Some((1, 1)));
+    assert_eq!(fs::read(&vault_path).unwrap(), initial_vault);
+    assert!(!target.0.join(CONNECTIONS).exists());
+
+    super::super::queue_restore_at(&target.0, preview, RestoreMode::JavaAdditive).unwrap();
+    let pending = fs::read(target.0.join(PENDING)).unwrap();
+    for secret in [envelope, java_password.as_str(), "BEGIN PRIVATE KEY"] {
+        assert!(
+            !pending
+                .windows(secret.len())
+                .any(|part| part == secret.as_bytes())
+        );
+    }
+    assert_eq!(fs::read(&vault_path).unwrap(), initial_vault);
+    drop(vault);
+    drop(ProfileLease::acquire(&target.0, || false).unwrap());
+
+    let vault = Vault::unlock(&vault_path, master).unwrap();
+    let store = Store::open(target.0.join(CONNECTIONS)).unwrap();
+    let connection = store
+        .connections()
+        .iter()
+        .find(|entry| entry.name == "Temporary key")
+        .unwrap();
+    let Auth::TemporaryKey {
+        credential: Some(id),
+        minutes: 47,
+        automatic: true,
+    } = &connection.login.auth
+    else {
+        panic!("expected an imported temporary key with the reviewed options");
+    };
+    let key = vault
+        .temporary_ssh_key(id, ("target.example", 2222, "tester"))
+        .unwrap();
+    assert_eq!(
+        key.options,
+        TemporarySshKeyOptions {
+            minutes: 47,
+            automatic: true
+        }
+    );
+    assert!(key.remaining <= std::time::Duration::from_secs(47 * 60));
+    kortty_ssh::validate_private_key(key.private_key.as_bytes(), None).unwrap();
+    for endpoint in [
+        ("target.example", 22, "tester"),
+        ("target.example", 2222, "jump-user"),
+        ("jump.example", 2222, "tester"),
+    ] {
+        assert!(vault.temporary_ssh_key(id, endpoint).is_none());
+    }
+    assert!(matches!(
+        connection.jump.as_ref().unwrap().auth,
+        Auth::Prompt
+    ));
+
+    let mut replay = inspect();
+    prepare(&mut replay, Some(&java_password), Some(&vault), &target.0).unwrap();
+    assert_eq!(replay.java_temporary_key_summary(), Some((0, 2)));
+    assert!(replay.java_credentials.is_none());
+}
+
 struct Scratch(PathBuf);
 
 impl Scratch {

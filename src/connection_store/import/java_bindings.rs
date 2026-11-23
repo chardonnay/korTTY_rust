@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 
+use kortty_vault::TemporarySshKeyOptions;
+
 use super::super::{ActiveAuth, AuthMethod, Document};
 use super::{
     Auth, ImportedProfile, JavaLibrarySettings, LoginTarget, MAX_BYTES, MAX_PROFILES, Preview,
@@ -19,6 +21,14 @@ pub(crate) struct JavaPasswordBinding<'a> {
 pub(crate) struct JavaManagedKeyBinding<'a> {
     pub(crate) source_key_id: &'a str,
     pub(crate) key: usize,
+}
+
+pub(crate) struct JavaTemporaryKeyBinding<'a> {
+    pub(crate) source_id: &'a str,
+    pub(crate) target: &'a LoginTarget,
+    pub(crate) jump: Option<&'a LoginTarget>,
+    pub(crate) credential: usize,
+    pub(crate) options: TemporarySshKeyOptions,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -172,6 +182,7 @@ impl JavaSourceGroups {
 enum Credential {
     Password(usize),
     ManagedKey(usize),
+    TemporaryKey(usize, TemporarySshKeyOptions),
 }
 
 /// A connection import bound to the native catalogue reviewed before sealing.
@@ -181,6 +192,7 @@ pub(crate) struct JavaConnectionBindings {
     slots: BTreeMap<(usize, bool), Credential>,
     omitted: usize,
     omitted_keys: usize,
+    omitted_temporary_keys: usize,
 }
 
 impl JavaConnectionBindings {
@@ -277,14 +289,63 @@ impl JavaConnectionBindings {
             slots,
             omitted,
             omitted_keys,
+            omitted_temporary_keys: 0,
         })
+    }
+
+    pub(crate) fn with_temporary_keys(
+        mut self,
+        bindings: &[JavaTemporaryKeyBinding<'_>],
+        policy: &ServerAccess,
+    ) -> io::Result<Self> {
+        let entries: BTreeMap<_, _> = self
+            .imports
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| entry.java_id.as_deref().map(|id| (id, (index, entry))))
+            .collect();
+        for binding in bindings {
+            let slot = entries.get(binding.source_id).filter(|(_, entry)| {
+                entry
+                    .java_temporary_key_route
+                    .as_ref()
+                    .is_some_and(|(target, jump)| {
+                        target == binding.target && jump.as_ref() == binding.jump
+                    })
+                    && matches!(
+                        entry.connection.login.auth,
+                        Auth::Configured {
+                            method: AuthMethod::PublicKey,
+                            credential: None,
+                            key: None,
+                        }
+                    )
+                    && eligible(entry, &self.local.document, policy)
+            });
+            let Some((index, _)) = slot else {
+                self.omitted_temporary_keys += 1;
+                continue;
+            };
+            if self
+                .slots
+                .insert(
+                    (*index, false),
+                    Credential::TemporaryKey(binding.credential, binding.options),
+                )
+                .is_some()
+            {
+                return Err(invalid("Ambiguous Java temporary SSH key binding."));
+            }
+        }
+        Ok(self)
     }
 
     pub(crate) fn needed(&self) -> BTreeSet<usize> {
         self.slots
             .values()
             .filter_map(|credential| match credential {
-                Credential::Password(index) => Some(*index),
+                Credential::Password(index) | Credential::TemporaryKey(index, _) => Some(*index),
                 Credential::ManagedKey(_) => None,
             })
             .collect()
@@ -298,21 +359,25 @@ impl JavaConnectionBindings {
         self.omitted_keys
     }
 
+    pub(crate) fn omitted_temporary_keys(&self) -> usize {
+        self.omitted_temporary_keys
+    }
+
     pub(crate) fn bind(
         self,
-        password_ids: &BTreeMap<usize, String>,
+        vault_ids: &BTreeMap<usize, String>,
         key_ids: &BTreeMap<usize, u64>,
     ) -> io::Result<Option<Vec<u8>>> {
         if self.slots.is_empty() {
             return Ok(None);
         }
-        self.bind_with_routes(password_ids, key_ids, &ServerAccess::default())
+        self.bind_with_routes(vault_ids, key_ids, &ServerAccess::default())
             .map(|prepared| prepared.contents)
     }
 
     pub(crate) fn bind_with_routes(
         mut self,
-        password_ids: &BTreeMap<usize, String>,
+        vault_ids: &BTreeMap<usize, String>,
         key_ids: &BTreeMap<usize, u64>,
         policy: &ServerAccess,
     ) -> io::Result<JavaConnectionImport> {
@@ -328,7 +393,7 @@ impl JavaConnectionBindings {
             };
             login.auth = match credential {
                 Credential::Password(index) => Auth::VaultPassword(
-                    password_ids
+                    vault_ids
                         .get(&index)
                         .ok_or_else(|| invalid("Java password was not sealed."))?
                         .clone(),
@@ -338,6 +403,16 @@ impl JavaConnectionBindings {
                         .get(&index)
                         .ok_or_else(|| invalid("Java managed SSH key was not staged."))?,
                 ),
+                Credential::TemporaryKey(index, options) => Auth::TemporaryKey {
+                    credential: Some(
+                        vault_ids
+                            .get(&index)
+                            .ok_or_else(|| invalid("Java temporary SSH key was not sealed."))?
+                            .clone(),
+                    ),
+                    minutes: options.minutes,
+                    automatic: options.automatic,
+                },
             };
         }
         stage_import(&self.local, self.imports, policy)
@@ -658,12 +733,18 @@ pub(crate) fn check_java_connection_routes(
     policy: &ServerAccess,
 ) -> io::Result<()> {
     let candidate = super::super::decode_document(candidate)?;
-    let passwords: BTreeSet<_> = credential_ids.iter().map(String::as_str).collect();
+    let credentials: BTreeSet<_> = credential_ids.iter().map(String::as_str).collect();
     let keys: BTreeSet<_> = key_ids.iter().copied().collect();
-    let bound = |auth: &Auth| match auth.active() {
-        ActiveAuth::VaultPassword(id) => passwords.contains(id),
-        ActiveAuth::StoredKey(id) => keys.contains(&id),
-        _ => false,
+    let bound = |auth: &Auth| match auth {
+        Auth::TemporaryKey {
+            credential: Some(id),
+            ..
+        } => credentials.contains(id.as_str()),
+        _ => match auth.active() {
+            ActiveAuth::VaultPassword(id) => credentials.contains(id),
+            ActiveAuth::StoredKey(id) => keys.contains(&id),
+            _ => false,
+        },
     };
     if candidate.connections.iter().any(|connection| {
         (bound(&connection.login.auth)

@@ -413,12 +413,49 @@ the terminal, and downloaded the exact SFTP fixture bytes after unlocking.
 · [Windows application check](target/verification/20261123-saved-temporary-ssh-windows-check-final.log)
 
 Native desktop coverage of the editor and reconnect flow and verification
-through the isolated SSH worker remain open. Java backup restore still
-omits these keys. Its decoder has a tested temporary-key case, and
-credential review and exact route mapping still need to be wired in.
-Unattended and restored sessions require a separate credential audit.
-[Java credential decoder](src/profile_backup/java_secrets.rs)
-· [Java backup review](src/profile_backup/java_migration.rs)
+through the isolated SSH worker remain open. The following checkpoint
+adds reviewed Java backup restore.
+
+## November 23 Java temporary SSH key restore
+
+Review SSH Credentials uses the Java master password and the unlocked
+native vault. The preview reports which encrypted temporary keys can be
+adopted and how many were omitted. It checks source identity, login
+account, destination and any declared jump host before binding the key to
+an eligible new saved profile. Conflicting local profiles take precedence.
+The supported lifetime and automatic selection are retained. The lifetime
+starts at review because Java stores the configured duration without an
+original expiry timestamp. Merge on Restart publishes the sealed vault
+and the reviewed connection catalogue through the existing restore
+transaction. That transaction rechecks the current server policy before
+initial publication.
+[Java temporary key reader](src/profile_backup/java_secrets/temporary_keys.rs)
+· [Route binding](src/connection_store/import/java_bindings.rs)
+· [Restore transaction](src/profile_backup/restore.rs)
+
+Apple Silicon passed 159 profile-backup tests with two ignored and 30
+connection-import tests. The encrypted Java fixture verifies a skipped
+review, locked or incorrect credentials, omission of unsealed input,
+installation after restart, account and port isolation, the declared
+jump route, and replay without renewing the key. Windows ARM64 passed the
+all-target application check with `dialog-preview`, 15 vault tests with
+one ignored, and strict vault Clippy. The interactive desktop review
+and sign-in with an imported key remain open.
+[Apple Silicon backup and import tests](target/verification/20261123-java-temporary-key-macos.log)
+· [Windows application check](target/verification/20261123-java-temporary-key-windows-check.log)
+· [Windows vault tests](target/verification/20261123-java-temporary-key-windows-vault.log)
+· [Windows vault Clippy](target/verification/20261123-java-temporary-key-windows-vault-clippy.log)
+
+Java's non-interactive tab restore consults the saved profile and can use
+a registered, valid temporary key. Tabs that need input are deferred for
+interactive resolution. The Java Scheduler remote session can also use
+temporary key contents and makes an owner-only key file for an external
+SSH process when required. The Rust Scheduler currently treats temporary
+keys as interactive credentials. Cover these routes separately from
+backup restore, including explicit authority, expiry and cleanup.
+[Java tab restore](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/TabRestoreTriage.java)
+· [Java Scheduler remote session](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/jobscheduler/JobSchedulerRemoteSession.java)
+· [Rust Scheduler authentication](src/job_executor/connection.rs)
 
 ## November 23 Native vault startup unlock
 
@@ -515,8 +552,7 @@ passed with `dialog-preview`.
 
 Remaining acceptance includes a fresh saved-profile desktop launch,
 the other desktop SSH and Teamwork checks, backend-unavailable editor
-feedback and the macOS and Linux desktop comparisons. Encrypted Java
-temporary-key migration remains in the implementation backlog.
+feedback and the macOS and Linux desktop comparisons.
 
 ## November 23 Saved and Teamwork SSH reconnect
 

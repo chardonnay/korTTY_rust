@@ -483,14 +483,18 @@ impl Dialog {
             self.offers_java_credential_review(JavaCredentialReview::KeysWithoutPassphrases);
         let password_summary = preview.java_password_summary();
         let key_summary = preview.java_key_summary();
+        let temporary_key_summary = preview.java_temporary_key_summary();
+        let review_temporary_keys = review_credentials && preview.has_java_temporary_keys();
         let merge_label = match (
             review_keys,
             review_credentials && preview.has_java_passwords(),
+            review_temporary_keys,
         ) {
-            (true, true) => "Merge Without SSH Credentials",
-            (true, false) => "Merge Without SSH Keys",
-            (false, true) => "Merge Without Passwords",
-            (false, false) => "Merge on Restart",
+            (false, false, true) => "Merge Without Temporary SSH Keys",
+            (true, false, _) => "Merge Without SSH Keys",
+            (false, true, false) => "Merge Without Passwords",
+            (false, false, false) => "Merge on Restart",
+            _ => "Merge Without SSH Credentials",
         };
         column![
             text("Review Java Backup").size(23),
@@ -512,9 +516,14 @@ impl Dialog {
                     JavaCredentialReview::KeysWithoutPassphrases,
                 )),
             ].spacing(8).align_y(Alignment::Center)),
-            review_credentials.then(|| self.java_credential_fields(vault_ready, review_keys)),
+            review_credentials.then(|| self.java_credential_fields(
+                vault_ready,
+                review_keys || review_temporary_keys,
+                review_temporary_keys,
+            )),
             password_summary.map(|(ready, omitted)| text(format!("SSH passwords ready to add: {ready}. Passwords omitted: {omitted}."))),
             key_summary.map(|(ready, omitted)| text(format!("Managed SSH keys ready to add: {ready}. Keys omitted: {omitted}."))),
+            temporary_key_summary.map(|(ready, omitted)| text(format!("Temporary SSH keys ready to add: {ready}. Keys omitted: {omitted}."))),
             preview.java_memory_review().map(|review| row![
                 button(if review.open { "Hide AI Memory Destinations" } else { "Review AI Memory Destinations…" })
                     .on_press(Message::ShowJavaMemory(self.revision)),
@@ -538,14 +547,21 @@ impl Dialog {
         ].spacing(12).height(Length::Fill).into()
     }
 
-    fn java_credential_fields(&self, vault_ready: bool, review_keys: bool) -> Element<'_, Message> {
+    fn java_credential_fields(
+        &self,
+        vault_ready: bool,
+        review_keys: bool,
+        review_temporary_keys: bool,
+    ) -> Element<'_, Message> {
         if !vault_ready {
             return row![
                 text(if review_keys {
-                    "Unlock the credential vault to include SSH passwords and keys with passphrases."
+                    "Unlock the credential vault to review protected Java SSH credentials."
                 } else {
                     "Unlock the credential vault to review the Java SSH passwords."
-                }).size(13).width(Length::Fill),
+                })
+                .size(13)
+                .width(Length::Fill),
                 button("Credential Vault…").on_press(Message::OpenVault),
             ]
             .spacing(8)
@@ -559,19 +575,35 @@ impl Dialog {
             .then_some(Message::ReviewJavaCredentials(revision, mode));
         column![
             text(if review_keys {
-                "Use the Java korTTY master password to include SSH passwords and keys with passphrases."
+                "Use the Java korTTY master password to review protected SSH credentials."
             } else {
                 "Use the Java korTTY master password to review which SSH passwords can be imported."
-            }).size(13),
+            })
+            .size(13),
+            review_temporary_keys.then(|| text(
+                "The lifetime of each imported temporary SSH key starts when you review it.",
+            )
+            .size(13)),
             row![
                 text_input("Java Master Password", &self.java_master_password)
                     .secure(true)
-                    .on_input(move |value| Message::JavaMasterPassword(revision, Password::new(value)))
+                    .on_input(move |value| Message::JavaMasterPassword(
+                        revision,
+                        Password::new(value)
+                    ))
                     .on_submit_maybe(submit.clone()),
-                button(if review_keys { "Review SSH Credentials" } else { "Review SSH Passwords" })
-                    .on_press_maybe(submit),
-            ].spacing(8).align_y(Alignment::Center),
-        ].spacing(5).into()
+                button(if review_keys {
+                    "Review SSH Credentials"
+                } else {
+                    "Review SSH Passwords"
+                })
+                .on_press_maybe(submit),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        ]
+        .spacing(5)
+        .into()
     }
 
     fn exported<'a>(&self, archive: &'a Exported) -> Element<'a, Message> {

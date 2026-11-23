@@ -404,6 +404,7 @@ impl Dialog {
                     || preview.count() != 0
                     || preview.has_java_managed_keys()
                     || preview.has_java_passwords()
+                    || preview.has_java_temporary_keys()
             }
             Phase::Form | Phase::Browse(_) => {
                 self.path != self.initial_path
@@ -568,13 +569,18 @@ impl Dialog {
         let Phase::Review(preview) = &self.phase else {
             return false;
         };
-        if preview.java_password_summary().is_some() || preview.java_key_summary().is_some() {
+        if preview.java_password_summary().is_some()
+            || preview.java_key_summary().is_some()
+            || preview.java_temporary_key_summary().is_some()
+        {
             return false;
         }
         match mode {
             JavaCredentialReview::KeysWithoutPassphrases => preview.has_java_managed_keys(),
             JavaCredentialReview::WithVault => {
-                preview.has_java_passwords() || preview.has_java_managed_keys()
+                preview.has_java_passwords()
+                    || preview.has_java_managed_keys()
+                    || preview.has_java_temporary_keys()
             }
         }
     }

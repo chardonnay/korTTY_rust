@@ -1,7 +1,10 @@
 use std::fmt::Write as _;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use super::{CredentialInput, CredentialKind, Entry, Error, MAX_SECRET_BYTES, Secret, Vault};
+use super::{
+    CredentialAddition, CredentialInput, CredentialKind, Entry, Error, MAX_SECRET_BYTES, Secret,
+    Vault,
+};
 
 const VERSION: &str = "kortty-temporary-ssh-key-v1";
 pub const MAX_TEMPORARY_SSH_KEY_BYTES: usize = MAX_SECRET_BYTES - 64;
@@ -19,16 +22,15 @@ pub struct TemporarySshKey<'a> {
     pub remaining: Duration,
 }
 
-impl Vault {
-    /// Creates a credential bound to an exact SSH host, port and account.
-    /// The key is never renewed by opening the vault or reading the credential.
-    pub fn save_temporary_ssh_key(
-        &mut self,
+impl CredentialAddition {
+    /// Builds an expiring SSH credential for a prepared vault transaction.
+    /// The lifetime starts at preparation and remains fixed in the sealed record.
+    pub fn temporary_ssh_key(
         label: String,
         endpoint: (&str, u16, &str),
         options: TemporarySshKeyOptions,
         key: Secret,
-    ) -> Result<String, Error> {
+    ) -> Result<Self, Error> {
         let created = now()?;
         let value = key.trim();
         if !valid_key(value) || duration(options.minutes).is_none() {
@@ -50,8 +52,8 @@ impl Vault {
         } else {
             format!("{host}:{port}")
         };
-        self.save_entry(
-            CredentialInput {
+        Ok(Self {
+            input: CredentialInput {
                 label,
                 username: account.to_owned(),
                 server_pattern,
@@ -59,8 +61,23 @@ impl Vault {
                 ..CredentialInput::default()
             },
             secret,
-            Default::default(),
-        )
+            webhook: None,
+        })
+    }
+}
+
+impl Vault {
+    /// Creates a credential bound to an exact SSH host, port and account.
+    /// The key is never renewed by opening the vault or reading the credential.
+    pub fn save_temporary_ssh_key(
+        &mut self,
+        label: String,
+        endpoint: (&str, u16, &str),
+        options: TemporarySshKeyOptions,
+        key: Secret,
+    ) -> Result<String, Error> {
+        let addition = CredentialAddition::temporary_ssh_key(label, endpoint, options, key)?;
+        self.save_entry(addition.input, addition.secret, Default::default())
     }
 
     /// Borrows an unexpired private key only for the account and destination
