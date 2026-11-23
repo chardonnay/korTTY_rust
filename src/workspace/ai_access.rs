@@ -1036,6 +1036,7 @@ mod tests {
             store
                 .save_local(LocalProfile {
                     id: 0,
+                    isolation: Default::default(),
                     name: name.to_owned(),
                     shell: Default::default(),
                     command: None,

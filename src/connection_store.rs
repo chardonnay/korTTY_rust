@@ -1194,6 +1194,9 @@ impl Store {
         candidate
             .serial_profiles
             .retain(|entry| !ids.contains(&entry.id));
+        candidate
+            .local_profiles
+            .retain(|entry| !ids.contains(&entry.id));
         candidate.approvals.retain(|id, _| !ids.contains(id));
         self.commit(candidate)
     }

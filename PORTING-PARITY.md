@@ -244,12 +244,54 @@ constructing its temporary login. The application all-target check passed
 with `dialog-preview`. [Windows native tests](target/verification/20261123-isolation-inheritance-windows-final-tests.log)
 · [Windows application check](target/verification/20261123-isolation-inheritance-windows-verified-check.log)
 
-Remaining work includes saved local-shell profile overrides, Java global and
-folder backup settings, native desktop comparison and live launch acceptance.
+The [local shell update](#november-23-local-shell-profile-isolation) adds
+saved local-shell overrides. Java global and folder backup settings, native
+desktop comparison and live SSH acceptance remain open.
 [Connection Manager editor](src/connection_window/form.rs)
 · [Folder and connection storage](src/connection_store.rs)
 · [Isolation resolver](src/session_security.rs)
 · [Interactive SSH launch](src/workspace/ssh_access.rs)
+
+## November 23 Local shell profile isolation
+
+The Connection Manager stores a local shell's isolation choice and folder
+assignment. New profiles can inherit the nearest folder's choice, then the
+global default. Existing Rust profiles with the original format continue
+to follow the global local-shell default. An explicit level includes None,
+and the managed minimum applies to every launch. The editor and Quick
+Connect display the effective level and its source.
+
+Local profiles appear in the same folder tree as SSH and serial profiles.
+Duplicating a profile keeps its folder until the user chooses a different
+one. Folder deletion includes its assigned local profiles in the existing
+confirmation. Quick Connect can launch a modified copy without saving it
+or dropping its folder's isolation rule. A sandboxed profile can use its
+explicit absolute starting directory as the workspace. The launch still
+checks the stored path and the platform sandbox. Reopening a previously
+sandboxed shell preserves its recorded isolation and workspace.
+
+The Java-compatible and Rust-specific local connection XML forms retain
+their isolation choice and folder. Tagged Java XML without an explicit
+level inherits. Native exports record the distinction when a profile
+follows Global Settings directly. Reviewed adoption of the global and
+folder preferences from a Java backup remains open.
+[Local profile storage](src/connection_store/local.rs)
+· [Local editor](src/connection_window/local.rs)
+· [Launch and restore settings](src/workspace/session_security.rs)
+
+Apple Silicon passed 16 local-shell cases, four local-profile cases and 31
+Connection Manager cases. The overlapping selections include native PTY
+launches from the Manager and Quick Connect, retained restored sandbox
+settings and the local-profile XML round trip. The sandbox workspace check
+exercises launch options. Desktop comparison and a sandboxed launch through
+the installed application's GUI remain open.
+[Apple Silicon tests](target/verification/20261123-local-profile-isolation-apple-silicon.log)
+
+Windows ARM64 passed 332 selected tests with one ignored, including 152
+profile backup tests and native local-shell launches through the Manager and
+Quick Connect. The final application all-target check passed with
+`dialog-preview`. [Windows tests](target/verification/20261123-local-profile-isolation-windows-tests.log)
+· [Windows application check](target/verification/20261123-local-profile-isolation-windows-verified-check.log)
 
 ## November 23 Plan and execution layout
 

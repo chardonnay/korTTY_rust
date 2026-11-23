@@ -7,7 +7,7 @@ use kortty_pty::LocalShell;
 
 use crate::profile;
 use crate::session::Status;
-use crate::session_security::{IsolationLevel, LocalSettings};
+use crate::session_security::{IsolationLevel, LocalIsolation, LocalSettings};
 
 use super::{Message as Desktop, PaneSession, Tab, Workspace, ssh_access};
 
@@ -82,6 +82,75 @@ impl Security {
 }
 
 impl Workspace {
+    pub(super) fn default_local_isolation(&self) -> IsolationLevel {
+        self.window_settings
+            .default_session_isolation
+            .unwrap_or(self.security.local.isolation)
+    }
+
+    pub(super) fn local_profile_isolation(
+        &self,
+        isolation: LocalIsolation,
+        id: Option<u64>,
+        store_path: Option<&Path>,
+    ) -> io::Result<IsolationLevel> {
+        let default = self.default_local_isolation();
+        let minimum = self.clipboard.policy.minimum_isolation;
+        if isolation == LocalIsolation::Inherit
+            && let Some(id) = id
+        {
+            let path = match store_path {
+                Some(path) => path.to_owned(),
+                None => profile::connections_path()?,
+            };
+            let store = crate::connection_store::Store::open(path)?;
+            if store.local(id).is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "The saved local shell profile no longer exists",
+                ));
+            }
+            let folder = store
+                .group_of(id)
+                .and_then(|path| store.inherited_group_isolation(path));
+            return Ok(isolation.resolve(default, folder, minimum).0);
+        }
+        Ok(isolation.resolve(default, None, minimum).0)
+    }
+
+    pub(super) fn local_settings_for_profile(
+        &self,
+        saved: Option<LocalSettings>,
+        local: &crate::connection_store::LocalProfile,
+        quick_source: Option<(u64, &Path)>,
+    ) -> io::Result<LocalSettings> {
+        let retained = saved.as_ref().map(|settings| settings.isolation);
+        let mut settings = self.local_settings(saved)?;
+        local.validate()?;
+        settings.saved_profile = (local.id != 0).then_some(local.id);
+        if retained.is_none() || !local.isolation.is_global() {
+            let resolved = self.local_profile_isolation(
+                local.isolation,
+                settings.saved_profile.or(quick_source.map(|(id, _)| id)),
+                quick_source.map(|(_, path)| path),
+            )?;
+            settings.isolation = resolved.max(retained.unwrap_or_default());
+        }
+        settings.shell = local.shell;
+        settings.command.clone_from(&local.command);
+        settings
+            .working_directory
+            .clone_from(&local.working_directory);
+        settings.shell_integration = local.shell_integration;
+        if settings.isolation == IsolationLevel::Sandbox
+            && !local.isolation.is_global()
+            && retained != Some(IsolationLevel::Sandbox)
+            && let Some(workspace) = settings.working_directory.as_deref().and_then(Path::to_str)
+        {
+            settings.directory = workspace.to_owned();
+        }
+        Ok(settings)
+    }
     pub(super) fn local_settings(
         &self,
         stored: Option<LocalSettings>,
@@ -93,9 +162,7 @@ impl Workspace {
         }
         let mut settings = stored.unwrap_or_else(|| {
             let mut settings = self.security.local.clone();
-            if let Some(default) = self.window_settings.default_session_isolation {
-                settings.isolation = default;
-            }
+            settings.isolation = self.default_local_isolation();
             settings
         });
         if settings.directory.is_empty() {

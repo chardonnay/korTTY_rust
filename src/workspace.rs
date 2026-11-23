@@ -2,6 +2,7 @@ use std::cell::OnceCell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_channel::Receiver;
@@ -732,6 +733,7 @@ enum LocalLaunchView {
     QuickConnect(
         Option<Option<crate::terminal_effects::Selection>>,
         Option<crate::connection_store::TerminalAppearance>,
+        Option<(u64, PathBuf)>,
     ),
     Existing(GridSize, Option<Appearance>),
 }
@@ -3625,23 +3627,23 @@ impl Workspace {
                 "Managed policy could not be applied. Sessions are locked.",
             ));
         }
-        let mut settings = self.local_settings(saved)?;
-        if let Some(local) = &local {
-            local.validate()?;
+        let settings = if let Some(local) = &local {
             profile = local.profile().ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "Unsupported local terminal emulation",
                 )
             })?;
-            settings.saved_profile = (local.id != 0).then_some(local.id);
-            settings.shell = local.shell;
-            settings.command.clone_from(&local.command);
-            settings
-                .working_directory
-                .clone_from(&local.working_directory);
-            settings.shell_integration = local.shell_integration;
-        }
+            let quick_source = match &view {
+                LocalLaunchView::QuickConnect(_, _, Some((id, path))) => {
+                    Some((*id, path.as_path()))
+                }
+                _ => None,
+            };
+            self.local_settings_for_profile(saved, local, quick_source)?
+        } else {
+            self.local_settings(saved)?
+        };
         let mut options = settings.launch_options()?;
         options.shell_integration = settings.shell_integration
             && settings.isolation != IsolationLevel::Sandbox
@@ -3659,7 +3661,7 @@ impl Workspace {
                 None,
                 None,
             ),
-            LocalLaunchView::QuickConnect(effect, style) => (
+            LocalLaunchView::QuickConnect(effect, style, _) => (
                 self.configured_initial_grid(profile, terminal, InitialTerminalSize::default()),
                 None,
                 effect,
@@ -7514,6 +7516,7 @@ mod tests {
         };
         let local = LocalProfile {
             id: 1,
+            isolation: Default::default(),
             name: "Startup color query".into(),
             shell: LocalShell::default(),
             command: Some(vec![

@@ -245,6 +245,7 @@ fn local_shell_integration_xml_round_trip_retains_opt_in_and_native_presets() {
     {
         profiles.push(LocalProfile {
             id: index as u64 + 1,
+            isolation: Default::default(),
             name: format!("Integrated shell {index}"),
             shell,
             command,
@@ -293,10 +294,12 @@ fn local_shell_integration_xml_round_trip_retains_opt_in_and_native_presets() {
 
 #[test]
 fn local_shell_xml_round_trip_keeps_java_compatible_and_exact_rust_launches() {
+    use crate::session_security::LocalIsolation;
     let scratch = Scratch::new();
     let directory = scratch.0.join("local project");
     let java = LocalProfile {
         id: 5,
+        isolation: LocalIsolation::Sandbox,
         name: "Java-compatible local profile".into(),
         shell: Default::default(),
         command: Some(vec![
@@ -320,6 +323,7 @@ fn local_shell_xml_round_trip_keeps_java_compatible_and_exact_rust_launches() {
         },
     };
     let mut rust = java.clone();
+    rust.isolation = LocalIsolation::None;
     rust.id = 6;
     rust.name = "Exact native arguments".into();
     rust.command

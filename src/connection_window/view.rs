@@ -50,6 +50,7 @@ pub(crate) struct ViewChoices<'a> {
     pub(crate) default_paste_warning: PasteWarningMode,
     pub(crate) minimum_paste_warning: PasteWarningMode,
     pub(crate) isolation: (IsolationLevel, IsolationLevel),
+    pub(crate) local_isolation_default: IsolationLevel,
 }
 
 #[derive(Default)]
@@ -363,14 +364,25 @@ impl ConnectionWindow {
         } else if self.busy {
             text("Updating connection profiles…").into()
         } else if let Some(draft) = &self.local_draft {
-            draft.view(title, &choices).map(Message::Local)
+            let inherited = self
+                .draft_group
+                .as_deref()
+                .and_then(|path| self.store.inherited_group_isolation(path));
+            draft
+                .view(
+                    title,
+                    &choices,
+                    self.editor_group_picker(super::local::Edit::Folder),
+                    inherited,
+                )
+                .map(Message::Local)
         } else if let Some(draft) = &self.serial_draft {
             column![
                 text(title).size(21),
                 text_input("Name (defaults to port and speed)", &draft.name)
                     .on_input(Message::SerialName),
                 text_input("Tag", &draft.tag).on_input(Message::SerialTag),
-                self.editor_group_picker(),
+                self.editor_group_picker(Message::DraftGroup),
                 draft.form.editor_fields().map(Message::Serial),
                 row![
                     text("Paste line delay (ms)"),
@@ -421,7 +433,7 @@ impl ConnectionWindow {
             draft.view(
                 &choices,
                 &self.custom_badges,
-                self.editor_group_picker(),
+                self.editor_group_picker(Message::DraftGroup),
                 inherited,
             )
         };
@@ -1004,7 +1016,7 @@ impl ConnectionWindow {
                     self.connection_row(connection, indent)
                 }
                 VisualRow::Serial(profile, indent) => self.serial_row(profile, indent),
-                VisualRow::Local(profile) => self.local_row(profile),
+                VisualRow::Local(profile, indent) => self.local_row(profile, indent),
                 VisualRow::Shared(entry) => {
                     if self.scope != Scope::Recent && shared_group != Some(&entry.group) {
                         list = list.push(heading(teamwork::group_title(&entry.group)));
@@ -1363,7 +1375,10 @@ impl ConnectionWindow {
         self.tree_context_view(&key, base)
     }
 
-    fn editor_group_picker(&self) -> Element<'_, Message> {
+    fn editor_group_picker<Msg: Clone + 'static>(
+        &self,
+        edit: fn(Option<String>) -> Msg,
+    ) -> Element<'_, Msg> {
         let options: Vec<_> = std::iter::once(GroupChoice(None))
             .chain(
                 self.store
@@ -1374,9 +1389,9 @@ impl ConnectionWindow {
         let selected = GroupChoice(self.draft_group.clone());
         row![
             text("Folder").size(14),
-            pick_list(options, Some(selected), |choice: GroupChoice| {
-                Message::DraftGroup(choice.0)
-            })
+            pick_list(options, Some(selected), move |choice: GroupChoice| edit(
+                choice.0
+            ))
             .width(Length::Fill),
         ]
         .spacing(8)
@@ -1432,11 +1447,11 @@ impl ConnectionWindow {
         self.tree_context_view(&key, base)
     }
 
-    fn local_row<'a>(&'a self, profile: &'a LocalProfile) -> Element<'a, Message> {
+    fn local_row<'a>(&'a self, profile: &'a LocalProfile, indent: usize) -> Element<'a, Message> {
         let key = RowKey::Local(profile.id);
         let open = self.open_count(profile.id);
         let line = row![
-            space::horizontal().width(10),
+            space::horizontal().width((10 + indent * 20) as u32),
             tile(Icon::Tab, 20, 29),
             column![
                 text(&profile.name).size(15).wrapping(text::Wrapping::None),
@@ -2093,6 +2108,7 @@ fn teamwork_auth_picker_displays_missing_references_without_offering_them() {
         default_paste_warning: PasteWarningMode::default(),
         minimum_paste_warning: PasteWarningMode::Off,
         isolation: Default::default(),
+        local_isolation_default: Default::default(),
     };
     for draft in [
         DefaultAuth::Password {

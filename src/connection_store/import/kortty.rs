@@ -414,6 +414,14 @@ fn local_profile(
         });
     let profile = LocalProfile {
         id: 0,
+        isolation: match (
+            boolean(node, "rustLocalGlobalIsolation")?,
+            isolation_mode(node)?,
+        ) {
+            (true, None) => crate::session_security::LocalIsolation::Global,
+            (true, Some(_)) => return Err(invalid("conflicting local shell isolation settings")),
+            (false, level) => crate::session_security::LocalIsolation::from_override(level),
+        },
         name,
         shell,
         command,
@@ -657,11 +665,8 @@ pub(super) fn connection(
         Some("always") => Some(PasteWarningMode::Always),
         _ => None,
     };
-    if let Some(value) = raw_scalar(node, "isolationMode")?
-        && !value.trim().is_empty()
-    {
-        connection.isolation = IsolationLevel::from_id(value.trim())
-            .ok_or_else(|| invalid("unknown isolation level in kortty connection XML"))?;
+    if let Some(level) = isolation_mode(node)? {
+        connection.isolation = level;
     } else {
         connection.inherit_isolation = true;
     }
@@ -679,6 +684,16 @@ pub(super) fn connection(
     entry.has_password = has_embedded_password(node);
     entry.jump_has_password = jump_has_password;
     Ok((entry, skipped))
+}
+
+fn isolation_mode(node: Node<'_, '_>) -> io::Result<Option<IsolationLevel>> {
+    raw_scalar(node, "isolationMode")?
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            IsolationLevel::from_id(value.trim())
+                .ok_or_else(|| invalid("unknown isolation level in kortty connection XML"))
+        })
+        .transpose()
 }
 
 fn rsync_folder(node: Node<'_, '_>, id: &str) -> io::Result<Option<String>> {

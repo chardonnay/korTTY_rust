@@ -5,6 +5,7 @@ use iced::widget::{button, checkbox, column, pick_list, row, text, text_input};
 use kortty_pty::{LocalShell, available_local_shells};
 
 use crate::connection_store::LocalProfile;
+use crate::session_security::LocalIsolation;
 
 use super::{Dialog, Message, Workspace, view::labeled};
 
@@ -14,6 +15,7 @@ const MAX_ARGUMENTS: usize = 127;
 pub enum Edit {
     Custom(bool),
     Directory(String),
+    Isolation(LocalIsolation),
     Program(String),
     AddArgument,
     Argument(usize, String),
@@ -24,6 +26,7 @@ pub enum Edit {
 pub(super) struct Draft {
     custom: bool,
     directory: String,
+    isolation: LocalIsolation,
     program: String,
     arguments: Vec<String>,
 }
@@ -35,6 +38,7 @@ impl Draft {
                 .working_directory
                 .as_ref()
                 .map_or_else(String::new, |path| path.to_string_lossy().into_owned()),
+            isolation: profile.isolation,
             ..Self::default()
         };
         if let Some(command) = &profile.command
@@ -51,6 +55,7 @@ impl Draft {
         match edit {
             Edit::Custom(custom) => self.custom = custom,
             Edit::Directory(directory) if directory.len() <= 4096 => self.directory = directory,
+            Edit::Isolation(isolation) => self.isolation = isolation,
             Edit::Program(program) if self.custom && program.len() <= 8192 => {
                 self.program = program;
             }
@@ -95,6 +100,7 @@ impl Dialog {
         let directory = self.local.directory.trim();
         let mut profile = LocalProfile {
             id: saved.map_or(0, |saved| saved.id),
+            isolation: self.local.isolation,
             name: saved.map_or_else(|| "Local Shell".into(), |saved| saved.name.clone()),
             shell: self.local.shell(self.local_shell),
             command: self.local.command(),
@@ -114,6 +120,17 @@ impl Dialog {
 impl Workspace {
     pub(super) fn quick_local_view<'a>(&self, dialog: &'a Dialog) -> Element<'a, Message> {
         let draft = &dialog.local;
+        let folder = dialog.selected_local.and_then(|id| {
+            let store = dialog.store.as_ref()?;
+            store
+                .group_of(id)
+                .and_then(|path| store.inherited_group_isolation(path))
+        });
+        let (isolation, source) = draft.isolation.resolve(
+            self.default_local_isolation(),
+            folder,
+            self.clipboard.policy.minimum_isolation,
+        );
         let mut fields = column![
             labeled(
                 "",
@@ -126,6 +143,13 @@ impl Workspace {
                 text_input("Absolute path (optional)", &draft.directory)
                     .on_input(|path| Message::Local(Edit::Directory(path))),
             ),
+            labeled(
+                "Session isolation",
+                pick_list(LocalIsolation::ALL, Some(draft.isolation), |value| {
+                    Message::Local(Edit::Isolation(value))
+                })
+            ),
+            text(format!("Effective isolation · {isolation} · {source}")).size(13),
         ]
         .spacing(8);
         if draft.custom {
@@ -167,6 +191,7 @@ impl Workspace {
             dialog.local_emulation,
             draft.shell(dialog.local_shell),
             command.as_deref(),
+            Some(isolation),
         );
         fields = fields.push(labeled(
             "Shell integration",
@@ -205,6 +230,7 @@ mod tests {
 
     #[test]
     fn quick_local_shell_runs_with_edited_arguments_and_directory_without_changing_the_profile() {
+        use crate::session_security::IsolationLevel;
         let scratch = crate::snippets::tests::Profile::new();
         let directory = scratch.0.join("quick launch");
         std::fs::create_dir(&directory).unwrap();
@@ -226,23 +252,32 @@ mod tests {
         let final_arg = command.len() - 2;
         let path = scratch.0.join("connections.json");
         let mut store = Store::open(path.clone()).unwrap();
+        let group = store.create_group(None, "Development").unwrap();
+        store
+            .set_group_isolation(&group, None, Some(IsolationLevel::Process))
+            .unwrap();
         let saved = store
-            .save_local(LocalProfile {
-                id: 0,
-                name: "Custom Shell".into(),
-                shell: LocalShell::Default,
-                command: Some(command),
-                working_directory: Some(scratch.0.clone()),
-                shell_integration: false,
-                emulation: TerminalProfile::Xterm.term_name().into(),
-                terminal_effect: None,
-                terminal: crate::connection_store::TerminalOverrides {
-                    strict_terminal_mode: Some(true),
-                    ..Default::default()
+            .save_local_in_group(
+                LocalProfile {
+                    id: 0,
+                    isolation: LocalIsolation::Inherit,
+                    name: "Custom Shell".into(),
+                    shell: LocalShell::Default,
+                    command: Some(command),
+                    working_directory: Some(scratch.0.clone()),
+                    shell_integration: false,
+                    emulation: TerminalProfile::Xterm.term_name().into(),
+                    terminal_effect: None,
+                    terminal: crate::connection_store::TerminalOverrides {
+                        strict_terminal_mode: Some(true),
+                        ..Default::default()
+                    },
                 },
-            })
+                Some(&group),
+            )
             .unwrap();
         let mut workspace = Workspace::default();
+        workspace.window_settings.default_session_isolation = Some(IsolationLevel::Sandbox);
         let (owner, _) = workspace.open_window(false);
         let _ = workspace.show_quick_connect(owner);
         let id = workspace.quick_connect_for_owner(owner).unwrap();
@@ -272,6 +307,7 @@ mod tests {
         assert!(pane.saved_local.is_none());
         let settings = pane.local_security.as_ref().unwrap();
         assert!(settings.saved_profile.is_none());
+        assert_eq!(settings.isolation, IsolationLevel::Process);
         assert_eq!(
             settings.working_directory.as_deref(),
             Some(directory.as_path())

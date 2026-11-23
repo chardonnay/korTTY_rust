@@ -800,7 +800,9 @@ impl ConnectionWindow {
     }
 
     fn folder_profile_count(&self, path: &str) -> usize {
-        self.store.in_group(path).count() + self.store.serial_in_group(path).count()
+        self.store.in_group(path).count()
+            + self.store.serial_in_group(path).count()
+            + self.store.local_in_group(path).count()
     }
 
     fn visible_connections(&self) -> Vec<&Connection> {
@@ -903,11 +905,14 @@ impl ConnectionWindow {
                     .draft_group
                     .as_deref()
                     .is_some_and(|group| !store.has_group(group))
-        }) || self
-            .local_draft
-            .as_ref()
-            .is_some_and(|draft| self.store.local(draft.id) != store.local(draft.id))
-        {
+        }) || self.local_draft.as_ref().is_some_and(|draft| {
+            self.store.local(draft.id) != store.local(draft.id)
+                || self.store.group_of(draft.id) != store.group_of(draft.id)
+                || self
+                    .draft_group
+                    .as_deref()
+                    .is_some_and(|group| !store.has_group(group))
+        }) {
             self.draft_conflict = true;
             self.notice = Some("This connection changed in another window. Discard the draft and reopen it before saving.".into());
         }
@@ -934,7 +939,11 @@ impl ConnectionWindow {
                 || !self
                     .store
                     .serial_in_group(path)
-                    .eq(store.serial_in_group(path)))
+                    .eq(store.serial_in_group(path))
+                || !self
+                    .store
+                    .local_in_group(path)
+                    .eq(store.local_in_group(path)))
         {
             self.folder = None;
             self.notice =
@@ -1293,6 +1302,9 @@ impl ConnectionWindow {
                     } else if let Some(draft) = &mut self.serial_draft {
                         self.draft_group = group;
                         draft.changed = true;
+                    } else if let Some(draft) = &mut self.local_draft {
+                        self.draft_group = group;
+                        draft.changed = true;
                     }
                 }
             }
@@ -1398,6 +1410,9 @@ impl ConnectionWindow {
                 }
             }
             Message::Serial(message) => return self.update_serial(message),
+            Message::Local(local::Edit::Folder(group)) => {
+                return self.update(Message::DraftGroup(group));
+            }
             Message::Local(edit) => {
                 if let Some(draft) = &mut self.local_draft {
                     draft.update(edit);

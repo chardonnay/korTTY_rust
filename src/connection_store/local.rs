@@ -7,6 +7,8 @@ use kortty_pty::LocalShell;
 use kortty_terminal::TerminalProfile;
 use serde::{Deserialize, Serialize};
 
+use crate::session_security::LocalIsolation;
+
 use super::{Search, Store, StoreLock, TerminalOverrides, invalid, read_document, valid_text};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,6 +22,8 @@ pub(crate) struct LocalProfile {
     pub(crate) command: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) working_directory: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "LocalIsolation::is_global")]
+    pub(crate) isolation: LocalIsolation,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) shell_integration: bool,
     pub(crate) emulation: String,
@@ -35,6 +39,7 @@ impl LocalProfile {
             && self.shell == other.shell
             && self.command == other.command
             && self.working_directory == other.working_directory
+            && self.isolation == other.isolation
             && self.emulation == other.emulation
             && self.shell_integration == other.shell_integration
     }
@@ -106,6 +111,15 @@ impl Store {
             .find(|profile| profile.id == id)
     }
 
+    pub(crate) fn local_in_group<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> impl Iterator<Item = &'a LocalProfile> {
+        self.local_profiles()
+            .iter()
+            .filter(move |profile| self.is_in_group(profile.id, path))
+    }
+
     pub(crate) fn search_local<'a>(
         &'a self,
         query: &str,
@@ -146,9 +160,19 @@ impl Store {
         Ok(())
     }
 
-    pub(crate) fn save_local(&mut self, mut profile: LocalProfile) -> io::Result<u64> {
+    pub(crate) fn save_local(&mut self, profile: LocalProfile) -> io::Result<u64> {
+        let group = self.group_of(profile.id).map(str::to_owned);
+        self.save_local_in_group(profile, group.as_deref())
+    }
+
+    pub(crate) fn save_local_in_group(
+        &mut self,
+        mut profile: LocalProfile,
+        group: Option<&str>,
+    ) -> io::Result<u64> {
         profile.validate()?;
         let mut candidate = self.document.clone();
+        candidate.library.require_group(group)?;
         if profile.id == 0 {
             profile.id = candidate.allocate_id()?;
             candidate.local_profiles.push(profile.clone());
@@ -159,6 +183,14 @@ impl Store {
                 .find(|entry| entry.id == profile.id)
                 .ok_or_else(|| invalid("saved local shell profile no longer exists"))?;
             *original = profile.clone();
+        }
+        if let Some(group) = group {
+            candidate
+                .library
+                .membership
+                .insert(profile.id, group.to_owned());
+        } else {
+            candidate.library.membership.remove(&profile.id);
         }
         self.commit(candidate)?;
         Ok(profile.id)

@@ -61,7 +61,7 @@ records the broader comparison with the tagged Java release.
 
 | Area | Remaining change | Completion check |
 | --- | --- | --- |
-| D2/D4/P1 · Session isolation | Extend per-profile isolation to saved local-shell profiles. Add reviewed adoption of Java global defaults and folder settings in M1, with exact folder identity checks. | Verify the native Security page, connection editor and folder action against Java. Exercise saved SSH and Teamwork with a verified host, reconnect an inherited route, and check unavailable backends, existing profiles and managed floors. [Connection isolation checkpoint](PORTING-PARITY.md#november-23-connection-and-folder-isolation) |
+| D2/D4/P1 · Session isolation | Add reviewed adoption of Java global defaults and folder settings in M1, with exact folder identity checks. | Verify the native Security page and folder, SSH and local-shell editors against Java. Exercise saved SSH and Teamwork with a verified host, reconnect an inherited route and launch a saved local profile in the native desktop sandbox. Check unavailable backends, existing profiles and managed floors. [Connection isolation checkpoint](PORTING-PARITY.md#november-23-connection-and-folder-isolation) · [Local shell checkpoint](PORTING-PARITY.md#november-23-local-shell-profile-isolation) |
 | D4/M1 · Credential settings and migration | Decide native vault custody for Java's optional startup auto-unlock and encrypted connection-editor temporary keys. Audit adoption of the Java global temporary-key opt-in independently of credential import. | Verify startup policy precedence and reviewed adoption without activating credentials. Exercise the implemented interactive Quick Connect SSH and SFTP routes with disposable keys. [Security checkpoint](PORTING-PARITY.md#november-23-settings-security) · [Temporary SSH keys](PORTING-PARITY.md#november-23-quick-connect-temporary-ssh-keys) |
 | D4 · Searchable controls | Compare the remaining Java Settings and AI Manager pages, subpages and labeled controls with the Rust search inventory. Add reachable missing destinations alongside the dialog comparisons. | Verify that controls on a page that has never been opened are discoverable, and that navigation reveals the exact control with the current page state and policy. |
 
@@ -113,9 +113,10 @@ Settings pages still need visual work. [Desktop comparison](PORTING-PARITY.md#no
 
 Resources exposes a JVM launch profile and its heap limit. Compare the
 native resource controls before specifying a Rust equivalent. Next in
-Security, extend the existing SSH isolation inheritance to saved local-shell
-profiles and audit adoption of Java isolation settings. The global default
-and availability display are implemented. The Quick Connect temporary-key
+Security, audit adoption of Java isolation settings and compare the remaining
+controls on native desktops. Saved local-shell and SSH profiles now have
+isolation choices. The global default and availability display are
+implemented. The Quick Connect temporary-key
 switch is implemented. Audit the related Java backup flag and connection-editor
 credentials. Privacy exposes Java telemetry
 consent. Record the native app's behavior and the handling of imported
@@ -1200,7 +1201,7 @@ not been identified.
 ## Implementation order
 
 Continue [session isolation](PORTING-PARITY.md#november-23-connection-and-folder-isolation)
-with saved local-shell profiles and reviewed Java restore.
+with reviewed Java restore of the global isolation default and folder settings.
 Continue the [dialog design comparison](#gui-dialog-design-parity) with
 the remaining Settings and AI Manager pages. Repeat the verified Windows
 Knowledge Store restart and recovery paths on the other native desktops.

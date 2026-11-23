@@ -172,6 +172,7 @@ fn saved_window_geometry_applies_only_to_the_explicit_new_ssh_window() {
 
 #[test]
 fn saved_local_profile_launches_from_manager_and_captures_only_a_private_reference() {
+    use crate::session_security::{IsolationLevel, LocalIsolation};
     use std::time::Instant;
 
     let scratch = crate::snippets::tests::Profile::new();
@@ -199,6 +200,7 @@ fn saved_local_profile_launches_from_manager_and_captures_only_a_private_referen
     let saved = store
         .save_local(LocalProfile {
             id: 0,
+            isolation: LocalIsolation::Process,
             name: "Development Shell".into(),
             shell: Default::default(),
             command: Some(command),
@@ -214,6 +216,7 @@ fn saved_local_profile_launches_from_manager_and_captures_only_a_private_referen
         })
         .unwrap();
     let mut workspace = Workspace::default();
+    workspace.window_settings.default_session_isolation = Some(IsolationLevel::Sandbox);
     let (owner, _) = workspace.open_window(false);
     let (manager, _) =
         workspace.install_connection_manager(owner, ConnectionWindow::open(path).unwrap());
@@ -267,6 +270,7 @@ fn saved_local_profile_launches_from_manager_and_captures_only_a_private_referen
         panic!("expected a local profile reference");
     };
     assert_eq!(settings.saved_profile, Some(saved));
+    assert_eq!(settings.isolation, IsolationLevel::Process);
     assert!(
         !serde_json::to_string(&layout)
             .unwrap()

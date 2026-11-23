@@ -33,6 +33,14 @@ impl IsolationLevel {
             _ => None,
         }
     }
+
+    pub(crate) fn id(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Process => "process",
+            Self::Sandbox => "sandbox",
+        }
+    }
 }
 
 impl fmt::Display for IsolationLevel {
@@ -63,6 +71,68 @@ impl fmt::Display for IsolationChoice {
             Some(level) => level.fmt(formatter),
             None => formatter.write_str("Inherit"),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LocalIsolation {
+    #[default]
+    Global,
+    Inherit,
+    None,
+    Process,
+    Sandbox,
+}
+
+impl LocalIsolation {
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Inherit,
+        Self::None,
+        Self::Process,
+        Self::Sandbox,
+        Self::Global,
+    ];
+
+    pub(crate) fn is_global(&self) -> bool {
+        *self == Self::Global
+    }
+
+    pub(crate) fn from_override(level: Option<IsolationLevel>) -> Self {
+        match level {
+            None => Self::Inherit,
+            Some(IsolationLevel::None) => Self::None,
+            Some(IsolationLevel::Process) => Self::Process,
+            Some(IsolationLevel::Sandbox) => Self::Sandbox,
+        }
+    }
+
+    pub(crate) fn level(self) -> Option<IsolationLevel> {
+        match self {
+            Self::Global | Self::Inherit => None,
+            Self::None => Some(IsolationLevel::None),
+            Self::Process => Some(IsolationLevel::Process),
+            Self::Sandbox => Some(IsolationLevel::Sandbox),
+        }
+    }
+
+    pub(crate) fn resolve(
+        self,
+        default: IsolationLevel,
+        folder: Option<(&str, IsolationLevel)>,
+        minimum: IsolationLevel,
+    ) -> (IsolationLevel, IsolationSource<'_>) {
+        let folder = if self == Self::Inherit { folder } else { None };
+        resolve_isolation(default, folder, self.level(), None, false, minimum)
+    }
+}
+
+impl fmt::Display for LocalIsolation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_global() {
+            return formatter.write_str("Global Settings");
+        }
+        IsolationChoice(self.level()).fmt(formatter)
     }
 }
 
@@ -205,6 +275,31 @@ fn invalid(message: &'static str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_isolation_distinguishes_legacy_defaults_folder_inheritance_and_explicit_none() {
+        let folder = Some(("Development", IsolationLevel::Sandbox));
+        let default = IsolationLevel::Process;
+        assert_eq!(
+            LocalIsolation::default().resolve(default, folder, IsolationLevel::None),
+            (default, IsolationSource::Settings)
+        );
+        assert_eq!(
+            LocalIsolation::Inherit.resolve(default, folder, IsolationLevel::None),
+            (
+                IsolationLevel::Sandbox,
+                IsolationSource::Folder("Development")
+            )
+        );
+        assert_eq!(
+            LocalIsolation::None.resolve(default, folder, IsolationLevel::None),
+            (IsolationLevel::None, IsolationSource::Connection)
+        );
+        assert_eq!(
+            LocalIsolation::None.resolve(default, folder, IsolationLevel::Process),
+            (IsolationLevel::Process, IsolationSource::Managed)
+        );
+    }
 
     #[test]
     fn teamwork_isolation_resolves_request_in_place_of_the_shared_connection_choice() {

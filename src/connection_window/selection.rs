@@ -117,7 +117,7 @@ pub(super) enum VisualRow<'a> {
     Connection(&'a Connection, usize),
     Shared(&'a teamwork::Entry),
     Serial(&'a SerialProfile, usize),
-    Local(&'a LocalProfile),
+    Local(&'a LocalProfile, usize),
     Group {
         path: &'a str,
         indent: usize,
@@ -132,7 +132,7 @@ impl VisualRow<'_> {
             Self::Connection(connection, _) => RowKey::Connection(connection.id),
             Self::Shared(entry) => RowKey::Shared(entry.identity.clone()),
             Self::Serial(profile, _) => RowKey::Serial(profile.id),
-            Self::Local(profile) => RowKey::Local(profile.id),
+            Self::Local(profile, _) => RowKey::Local(profile.id),
             Self::Group { path, .. } => RowKey::Group((*path).to_owned()),
         }
     }
@@ -150,7 +150,8 @@ impl ConnectionWindow {
             let id = match entry {
                 VisualRow::Connection(profile, _) => profile.id,
                 VisualRow::Serial(profile, _) => profile.id,
-                _ => unreachable!("the folder tree contains only SSH and serial profiles"),
+                VisualRow::Local(profile, _) => profile.id,
+                _ => unreachable!("the folder tree contains local profiles"),
             };
             let group = self.store.group_of(id);
             tree.entries.entry(group).or_default().push(entry);
@@ -190,7 +191,7 @@ impl ConnectionWindow {
             } else if let Some(profile) = self.store.serial(id) {
                 VisualRow::Serial(profile, 0)
             } else {
-                VisualRow::Local(self.store.local(id)?)
+                VisualRow::Local(self.store.local(id)?, 0)
             };
             Some((self.store.last_used_at(id), row))
         });
@@ -221,7 +222,7 @@ impl ConnectionWindow {
                 .filter(|row| match row {
                     VisualRow::Connection(connection, _) => search.manager(connection),
                     VisualRow::Serial(profile, _) => search.serial(profile),
-                    VisualRow::Local(profile) => search.local(profile),
+                    VisualRow::Local(profile, _) => search.local(profile),
                     VisualRow::Shared(entry) => search.manager(&entry.connection),
                     VisualRow::Group { .. } => false,
                 })
@@ -236,7 +237,11 @@ impl ConnectionWindow {
                     .into_iter()
                     .map(|profile| VisualRow::Serial(profile, 0)),
             )
-            .chain(self.visible_local().into_iter().map(VisualRow::Local))
+            .chain(
+                self.visible_local()
+                    .into_iter()
+                    .map(|profile| VisualRow::Local(profile, 0)),
+            )
             .collect()
     }
 
@@ -245,18 +250,17 @@ impl ConnectionWindow {
             return entries;
         }
         let mut profiles = Vec::new();
-        let mut direct = Vec::new();
         let mut shared = Vec::new();
         for row in entries {
             match row {
-                VisualRow::Connection(..) | VisualRow::Serial(..) => profiles.push(row),
-                VisualRow::Local(_) => direct.push(row),
+                VisualRow::Connection(..) | VisualRow::Serial(..) | VisualRow::Local(..) => {
+                    profiles.push(row)
+                }
                 VisualRow::Shared(_) => shared.push(row),
                 VisualRow::Group { .. } => unreachable!("visible entries contain connections only"),
             }
         }
         let mut rows = self.tree_rows(profiles);
-        rows.extend(direct);
         rows.extend(shared);
         rows
     }
@@ -281,7 +285,8 @@ impl<'a> Tree<'a> {
             rows.extend(entries.iter().map(|entry| match *entry {
                 VisualRow::Connection(profile, _) => VisualRow::Connection(profile, indent),
                 VisualRow::Serial(profile, _) => VisualRow::Serial(profile, indent),
-                _ => unreachable!("the folder tree contains only SSH and serial profiles"),
+                VisualRow::Local(profile, _) => VisualRow::Local(profile, indent),
+                _ => unreachable!("the folder tree contains local profiles"),
             }));
         }
         if let Some(groups) = self.groups.get(&parent) {

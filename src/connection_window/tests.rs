@@ -371,6 +371,39 @@ fn local_shell_editor_persists_exact_arguments_and_keeps_cancelled_edits_private
 }
 
 #[test]
+fn local_shell_editor_saves_folder_inheritance_and_keeps_it_on_duplicate() {
+    use super::local::Edit as Local;
+    use crate::session_security::LocalIsolation;
+
+    let directory = Profile::new();
+    let mut store = Store::open(directory.path()).unwrap();
+    let group = store.create_group(None, "Development").unwrap();
+    let mut manager = ConnectionWindow::open(directory.path()).unwrap();
+    let _ = manager.update(Message::Scope(Scope::Group(group.clone())));
+    let _ = manager.update(Message::NewLocal);
+    let _ = manager.update(Message::Local(Local::Name("Build shell".into())));
+    complete_persisted(&mut manager, Message::Save);
+    assert_eq!(manager.store.local_in_group(&group).count(), 1);
+    let id = manager.store.local_in_group(&group).next().unwrap().id;
+    assert_eq!(manager.visible_row_keys(), [RowKey::Local(id)]);
+    assert_eq!(
+        manager.store.local(id).unwrap().isolation,
+        LocalIsolation::Inherit
+    );
+
+    let _ = manager.update(Message::SelectLocal(id));
+    let _ = manager.update(Message::Duplicate);
+    let _ = manager.update(Message::Local(Local::Isolation(LocalIsolation::Process)));
+    complete_persisted(&mut manager, Message::Save);
+    let store = Store::open(directory.path()).unwrap();
+    let levels: Vec<_> = store
+        .local_in_group(&group)
+        .map(|profile| profile.isolation)
+        .collect();
+    assert_eq!(levels, [LocalIsolation::Inherit, LocalIsolation::Process]);
+}
+
+#[test]
 fn initial_terminal_dimensions_save_for_ssh_and_local_profiles() {
     use super::local::Edit as Local;
     use super::terminal_overrides::Edit as Terminal;
@@ -1274,6 +1307,7 @@ fn connection_manager_pointer_drags_accept_local_folders_and_refuse_teamwork_sou
         default_paste_warning: Default::default(),
         minimum_paste_warning: PasteWarningMode::Off,
         isolation: Default::default(),
+        local_isolation_default: Default::default(),
     });
     let renderer = Renderer::new(Font::DEFAULT, 16.0.into());
     let mut tree = Tree::new(view.as_widget());
@@ -1385,6 +1419,7 @@ fn native_workbench_keeps_reference_side_widths_at_default_and_minimum_size() {
             default_paste_warning: Default::default(),
             minimum_paste_warning: PasteWarningMode::Off,
             isolation: Default::default(),
+            local_isolation_default: Default::default(),
         });
         let mut tree = Tree::new(view.as_widget());
         let layout = view.as_widget_mut().layout(
@@ -1436,6 +1471,7 @@ fn long_scope_titles_keep_list_and_map_visible_at_minimum_width() {
             default_paste_warning: Default::default(),
             minimum_paste_warning: PasteWarningMode::Off,
             isolation: Default::default(),
+            local_isolation_default: Default::default(),
         });
         let mut tree = Tree::new(view.as_widget());
         let node = view.as_widget_mut().layout(

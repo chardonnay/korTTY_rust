@@ -523,6 +523,7 @@ impl Workspace {
                         .unwrap_or_default(),
                     self.clipboard.policy.minimum_isolation,
                 ),
+                local_isolation_default: self.default_local_isolation(),
             };
             if editor_owner.is_some() {
                 return Some(manager.window.editor_view(choices).map_or_else(

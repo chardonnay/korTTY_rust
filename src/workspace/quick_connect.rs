@@ -376,6 +376,7 @@ impl Workspace {
         profile: TerminalProfile,
         shell: LocalShell,
         command: Option<&[String]>,
+        isolation: Option<IsolationLevel>,
     ) -> Result<LocalSettings, &'static str> {
         if !self.window_settings.automatic_local_shell_integration() {
             return Err("Automatic setup for local shells is disabled in Settings → Terminal.");
@@ -390,7 +391,7 @@ impl Workspace {
         let mut settings = self
             .local_settings(None)
             .map_err(|_| "Local session settings are unavailable.")?;
-        if settings.isolation == IsolationLevel::Sandbox {
+        if isolation.unwrap_or(settings.isolation) == IsolationLevel::Sandbox {
             return Err("A sandboxed shell uses its own isolated startup environment.");
         }
         validate_shell_integration(shell, command)
@@ -421,7 +422,7 @@ impl Workspace {
         profile: TerminalProfile,
         shell: LocalShell,
     ) -> Result<LocalSettings, &'static str> {
-        self.quick_shell_integration_for_command(profile, shell, None)
+        self.quick_shell_integration_for_command(profile, shell, None, None)
     }
 
     pub(super) fn show_quick_connect(&mut self, owner: window::Id) -> Task<Desktop> {
@@ -1077,11 +1078,23 @@ impl Workspace {
             style.write_terminal(&mut draft.terminal);
             dialog.saving = true;
             dialog.status = None;
+            let source = dialog.selected_local;
             return Task::future(async move {
                 let result = profile::connections_path()
                     .and_then(Store::open)
                     .and_then(|mut store| {
-                        let id = store.save_local(draft)?;
+                        let id = if let Some(source) = source {
+                            if store.local(source).is_none() {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::NotFound,
+                                    "The saved local shell profile no longer exists",
+                                ));
+                            }
+                            let group = store.group_of(source).map(str::to_owned);
+                            store.save_local_in_group(draft, group.as_deref())?
+                        } else {
+                            store.save_local(draft)?
+                        };
                         Ok((store, id))
                     })
                     .map_err(|error| format!("Could not save the shell profile ({error})"));
@@ -1128,18 +1141,28 @@ impl Workspace {
             ),
             Protocol::Local => {
                 let profile = dialog.local_emulation;
-                let view = super::LocalLaunchView::QuickConnect(effect_override, launch_style);
+                let selected = dialog
+                    .selected_local
+                    .zip(dialog.store.as_ref().map(|store| store.path().to_owned()));
+                let view =
+                    super::LocalLaunchView::QuickConnect(effect_override, launch_style, selected);
                 let started = if let Some(local) = dialog.local_profile()
                     && (dialog.selected_local.is_some()
                         || local.command.is_some()
-                        || local.working_directory.is_some())
+                        || local.working_directory.is_some()
+                        || !local.isolation.is_global())
                 {
                     self.store_saved_local_session_in_view(local, font, view)
                 } else {
                     let settings = if dialog.shell_integration {
-                        self.quick_shell_integration_for_command(profile, dialog.local_shell, None)
-                            .map(Some)
-                            .map_err(std::io::Error::other)
+                        self.quick_shell_integration_for_command(
+                            profile,
+                            dialog.local_shell,
+                            None,
+                            None,
+                        )
+                        .map(Some)
+                        .map_err(std::io::Error::other)
                     } else if dialog.local_shell.is_default() {
                         Ok(None)
                     } else {
