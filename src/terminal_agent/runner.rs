@@ -13,6 +13,9 @@ use zeroize::Zeroizing;
 pub(super) const COMMAND_LIMIT: Duration = Duration::from_secs(15 * 60);
 pub(super) const POLL: Duration = Duration::from_millis(35);
 const OUTPUT_LIMIT: usize = 64 * 1024;
+// Lossy UTF-8 can produce three bytes per input byte. Allow both streams
+// and their separator when masking the retained output together.
+pub(crate) const CAPTURED_TEXT_LIMIT: usize = 6 * OUTPUT_LIMIT + 1;
 
 #[derive(Clone, Default)]
 pub(crate) struct Cancel(Arc<AtomicBool>);

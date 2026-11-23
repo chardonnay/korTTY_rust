@@ -5,8 +5,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use async_channel::Receiver;
-
 use super::{
     ConfiguredFileTooLarge, MAX_SOURCES, folder, new_source_file_limit, pdf, read_source_digest,
     scan_source_file, source, text_stream, with_source_file,
@@ -53,7 +51,7 @@ pub(crate) struct Confirmed {
 pub(in crate::ai_manager::local) fn start(
     paths: Vec<PathBuf>,
     file_limit: Option<u64>,
-) -> Result<(Receiver<Result<Arc<Review>, String>>, folder::Cancel), String> {
+) -> Result<folder::ReviewTask<Arc<Review>>, String> {
     if paths.len() > MAX_SOURCES {
         return Err(format!("Select up to {MAX_SOURCES} files per review."));
     }
@@ -70,7 +68,7 @@ pub(in crate::ai_manager::local) fn start(
 
 pub(in crate::ai_manager::local) fn confirm(
     review: Arc<Review>,
-) -> Result<(Receiver<Result<Confirmed, String>>, folder::Cancel), String> {
+) -> Result<folder::ReviewTask<Confirmed>, String> {
     folder::start_review(move |cancel| {
         let mut files = Vec::new();
         for row in &review.rows {
@@ -213,7 +211,7 @@ mod tests {
             .unwrap()
             .review_source_files(&confirmed.paths, confirmed.file_limit)
             .unwrap();
-        assert_eq!(store.sources, [path.clone()]);
+        assert_eq!(store.sources, std::slice::from_ref(&path));
         assert_eq!(store.file_size_limit(&path), Some(64));
     }
 }

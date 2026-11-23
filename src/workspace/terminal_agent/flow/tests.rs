@@ -909,6 +909,7 @@ impl Fixture {
         let id = store
             .save_local(LocalProfile {
                 id: 0,
+                isolation: Default::default(),
                 name: "Local agent fixture".into(),
                 shell: Default::default(),
                 command: None,

@@ -9,9 +9,11 @@ use iced::{Point, Task};
 use crate::connection_store::custom_os_badges::Catalog;
 use crate::connection_store::teamwork;
 use crate::connection_store::{
-    Connection, JavaGroupColor, LocalProfile, Search, SerialProfile, Store, TabColor,
+    Connection, JavaGroupColor, JavaGroupIsolation, LocalProfile, Search, SerialProfile, Store,
+    TabColor,
 };
 use crate::serial_dialog;
+use crate::session_security::{IsolationChoice, IsolationLevel};
 use crate::terminal_effects::Effect;
 
 mod color;
@@ -23,6 +25,7 @@ pub(crate) mod network_map;
 mod os_badge;
 pub(crate) mod overview;
 mod selection;
+mod temporary_ssh_key;
 mod terminal_overrides;
 pub(crate) use terminal_overrides::{ai_profile_choices, theme_choices};
 #[cfg(test)]
@@ -33,6 +36,7 @@ use color::ColorDraft;
 use form::Draft;
 pub use form::Edit;
 use selection::{RowKey, Selection};
+pub use temporary_ssh_key::TemporarySaveReply;
 pub(crate) use view::{HighlightChoices, ViewChoices};
 
 const TEAMWORK_USERNAME_DRAFT_BYTES: usize = 259;
@@ -64,9 +68,12 @@ pub enum Message {
     RenameGroup,
     DeleteGroup,
     EditGroupColor,
+    EditGroupIsolation,
+    GroupIsolation(IsolationChoice),
     GroupColorEnabled(bool),
     GroupColorInput(String),
     PickJavaGroupColor(JavaGroupColor),
+    PickJavaGroupIsolation(JavaGroupIsolation),
     GroupName(String),
     CommitGroup,
     CancelGroup,
@@ -99,6 +106,8 @@ pub enum Message {
     EditSelected,
     Duplicate,
     Edit(Edit),
+    PasteTemporaryKey,
+    TemporaryKeyPasted(u64, bool, crate::ssh_dialog::Password),
     Save,
     CancelEdit,
     Delete,
@@ -111,6 +120,7 @@ pub enum Message {
     ExportConnections,
     ExportOverview,
     Completed(Result<Box<Persisted>, String>),
+    TemporarySaveCompleted(TemporarySaveReply),
     Connect(bool),
     ConnectInNewWindow,
     OpenVault,
@@ -222,6 +232,12 @@ enum FolderDialog {
         original: Option<TabColor>,
         draft: ColorDraft,
         imported: Option<JavaGroupColor>,
+    },
+    Isolation {
+        path: String,
+        original: Option<IsolationLevel>,
+        draft: IsolationChoice,
+        imported: Option<JavaGroupIsolation>,
     },
 }
 
@@ -792,7 +808,9 @@ impl ConnectionWindow {
     }
 
     fn folder_profile_count(&self, path: &str) -> usize {
-        self.store.in_group(path).count() + self.store.serial_in_group(path).count()
+        self.store.in_group(path).count()
+            + self.store.serial_in_group(path).count()
+            + self.store.local_in_group(path).count()
     }
 
     fn visible_connections(&self) -> Vec<&Connection> {
@@ -833,6 +851,12 @@ impl ConnectionWindow {
                 FolderDialog::Create { name, .. } => !name.is_empty(),
                 FolderDialog::Rename { path, name } => path.rsplit('/').next() != Some(name),
                 FolderDialog::Delete { .. } => false,
+                FolderDialog::Isolation {
+                    original,
+                    draft,
+                    imported,
+                    ..
+                } => imported.is_some() || *original != draft.0,
                 FolderDialog::Color {
                     original,
                     draft,
@@ -892,11 +916,14 @@ impl ConnectionWindow {
                     .draft_group
                     .as_deref()
                     .is_some_and(|group| !store.has_group(group))
-        }) || self
-            .local_draft
-            .as_ref()
-            .is_some_and(|draft| self.store.local(draft.id) != store.local(draft.id))
-        {
+        }) || self.local_draft.as_ref().is_some_and(|draft| {
+            self.store.local(draft.id) != store.local(draft.id)
+                || self.store.group_of(draft.id) != store.group_of(draft.id)
+                || self
+                    .draft_group
+                    .as_deref()
+                    .is_some_and(|group| !store.has_group(group))
+        }) {
             self.draft_conflict = true;
             self.notice = Some("This connection changed in another window. Discard the draft and reopen it before saving.".into());
         }
@@ -923,7 +950,11 @@ impl ConnectionWindow {
                 || !self
                     .store
                     .serial_in_group(path)
-                    .eq(store.serial_in_group(path)))
+                    .eq(store.serial_in_group(path))
+                || !self
+                    .store
+                    .local_in_group(path)
+                    .eq(store.local_in_group(path)))
         {
             self.folder = None;
             self.notice =
@@ -935,6 +966,12 @@ impl ConnectionWindow {
             self.folder = None;
             self.notice =
                 Some("The folder's tab color changed. Reopen the editor before saving.".into());
+        }
+        if let Some(FolderDialog::Isolation { path, original, .. }) = &self.folder
+            && (!store.has_group(path) || store.group_isolation(path) != *original)
+        {
+            self.folder = None;
+            self.notice = Some("Folder isolation changed. Open the folder settings again.".into());
         }
         self.store = store;
         self.reconcile_selection();
@@ -1067,7 +1104,9 @@ impl ConnectionWindow {
                     Message::GroupName(_)
                         | Message::GroupColorEnabled(_)
                         | Message::GroupColorInput(_)
+                        | Message::GroupIsolation(_)
                         | Message::PickJavaGroupColor(_)
+                        | Message::PickJavaGroupIsolation(_)
                         | Message::CommitGroup
                         | Message::CancelGroup
                         | Message::Completed(_)
@@ -1275,6 +1314,9 @@ impl ConnectionWindow {
                     } else if let Some(draft) = &mut self.serial_draft {
                         self.draft_group = group;
                         draft.changed = true;
+                    } else if let Some(draft) = &mut self.local_draft {
+                        self.draft_group = group;
+                        draft.changed = true;
                     }
                 }
             }
@@ -1297,6 +1339,9 @@ impl ConnectionWindow {
                 let Some(draft) = &self.draft else {
                     return Task::none();
                 };
+                if self.temporary_save_needs_vault() {
+                    return Task::none();
+                }
                 let Ok(connection) = draft.connection() else {
                     return Task::none();
                 };
@@ -1380,6 +1425,9 @@ impl ConnectionWindow {
                 }
             }
             Message::Serial(message) => return self.update_serial(message),
+            Message::Local(local::Edit::Folder(group)) => {
+                return self.update(Message::DraftGroup(group));
+            }
             Message::Local(edit) => {
                 if let Some(draft) = &mut self.local_draft {
                     draft.update(edit);
@@ -1491,6 +1539,39 @@ impl ConnectionWindow {
                         draft: ColorDraft::new(original, inherited),
                         imported: None,
                     });
+                    self.notice = None;
+                }
+            }
+            Message::EditGroupIsolation if self.can_browse() => {
+                if let Some(path) = self.selection.single_group() {
+                    let original = self.store.group_isolation(path);
+                    self.folder = Some(FolderDialog::Isolation {
+                        path: path.to_owned(),
+                        original,
+                        draft: IsolationChoice(original),
+                        imported: None,
+                    });
+                    self.notice = None;
+                }
+            }
+            Message::GroupIsolation(choice) => {
+                if let Some(FolderDialog::Isolation {
+                    draft, imported, ..
+                }) = &mut self.folder
+                {
+                    *draft = choice;
+                    *imported = None;
+                    self.notice = None;
+                }
+            }
+            Message::PickJavaGroupIsolation(hint) => {
+                if let Some(FolderDialog::Isolation {
+                    draft, imported, ..
+                }) = &mut self.folder
+                    && self.store.java_group_isolation().contains(&hint)
+                {
+                    *draft = IsolationChoice(Some(hint.level));
+                    *imported = Some(hint);
                     self.notice = None;
                 }
             }
@@ -1726,6 +1807,19 @@ impl ConnectionWindow {
                         )?;
                     }
                     (Scope::Group(path), "Folder tab color saved.", None)
+                }
+                FolderDialog::Isolation {
+                    path,
+                    original,
+                    draft,
+                    imported,
+                } => {
+                    if let Some(hint) = imported {
+                        store.adopt_java_group_isolation(&path, original, hint)?;
+                    } else {
+                        store.set_group_isolation(&path, original, draft.0)?;
+                    }
+                    (Scope::Group(path), "Folder isolation saved.", None)
                 }
             };
             Ok(Persisted {

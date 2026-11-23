@@ -9,6 +9,88 @@ use super::*;
 use crate::workspace::{recording_access, ssh_access};
 
 #[test]
+fn default_isolation_applies_to_new_shells_and_preserves_explicit_restores() {
+    let mut workspace = Workspace::default();
+    workspace.security.local.isolation = IsolationLevel::Process;
+    assert_eq!(
+        workspace.local_settings(None).unwrap().isolation,
+        IsolationLevel::Process
+    );
+    workspace.window_settings.default_session_isolation = Some(IsolationLevel::None);
+    assert_eq!(
+        workspace.local_settings(None).unwrap().isolation,
+        IsolationLevel::None
+    );
+
+    workspace.window_settings.default_session_isolation = Some(IsolationLevel::Sandbox);
+    let sandbox = workspace.local_settings(None).unwrap();
+    assert_eq!(sandbox.isolation, IsolationLevel::Sandbox);
+    assert_eq!(
+        sandbox.validate().unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+    let restored = serde_json::from_str::<LocalSettings>("{}").unwrap();
+    assert_eq!(
+        workspace
+            .local_settings(Some(restored.clone()))
+            .unwrap()
+            .isolation,
+        IsolationLevel::None
+    );
+
+    workspace.clipboard.policy.minimum_isolation = IsolationLevel::Process;
+    assert_eq!(
+        workspace.local_settings(Some(restored)).unwrap().isolation,
+        IsolationLevel::Process
+    );
+}
+
+#[test]
+fn local_profile_isolation_preserves_a_restored_sandbox_and_uses_the_managed_minimum() {
+    let fixture = crate::snippets::tests::Profile::new();
+    let directory = fixture.0.join("workspace");
+    std::fs::create_dir(&directory).unwrap();
+    let mut workspace = Workspace::default();
+    let mut local = crate::connection_store::LocalProfile {
+        id: 0,
+        name: "Isolated shell".into(),
+        isolation: LocalIsolation::None,
+        shell: LocalShell::Default,
+        command: None,
+        working_directory: Some(directory.clone()),
+        shell_integration: false,
+        emulation: TerminalProfile::Xterm.term_name().into(),
+        terminal_effect: None,
+        terminal: Default::default(),
+    };
+    workspace.clipboard.policy.minimum_isolation = IsolationLevel::Sandbox;
+    let settings = workspace
+        .local_settings_for_profile(None, &local, None)
+        .unwrap();
+    assert_eq!(settings.isolation, IsolationLevel::Sandbox);
+    let options = settings.launch_options().unwrap();
+    assert_eq!(
+        options.working_directory.as_deref(),
+        Some(directory.as_path())
+    );
+    assert!(options.sandbox.is_some());
+
+    workspace.clipboard.policy.minimum_isolation = IsolationLevel::None;
+    let reopened = workspace
+        .local_settings_for_profile(Some(settings.clone()), &local, None)
+        .unwrap();
+    assert_eq!(reopened.isolation, IsolationLevel::Sandbox);
+    local.working_directory = Some(fixture.0.join("different workspace"));
+    let reopened = workspace
+        .local_settings_for_profile(Some(settings), &local, None)
+        .unwrap();
+    assert_eq!(
+        reopened.launch_options().unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+}
+
+#[test]
 fn incognito_layout_omits_private_panes_and_remaps_selected_tab() {
     let mut workspace = Workspace::default();
     let (regular, _) = workspace.open_window(false);

@@ -10,11 +10,12 @@ use super::java_migration::{CONNECTIONS, SshSource};
 use super::java_secrets::{
     JavaSecrets, keys,
     passwords::{self, Hop},
+    temporary_keys,
 };
 use crate::clipboard_policy::ClipboardPolicy;
 use crate::connection_store::import::{
     JavaConnectionBindings, JavaImportedRoute, JavaLibrarySettings, JavaManagedKeyBinding,
-    JavaPasswordBinding, JavaSourceGroups, JavaTargetReuse,
+    JavaPasswordBinding, JavaSourceGroups, JavaTargetReuse, JavaTemporaryKeyBinding,
 };
 use crate::ssh_key_catalog::{Catalog, ManagedAddition, PreparedManagedAdditions};
 
@@ -44,6 +45,7 @@ pub(super) struct Review {
     pub(super) prepared: Option<Prepared>,
     pub(super) passwords: Option<(usize, usize)>,
     pub(super) keys: Option<(usize, usize)>,
+    pub(super) temporary_keys: Option<(usize, usize)>,
     pub(super) omitted_key_routes: usize,
     pub(super) unused_key_files: usize,
 }
@@ -82,11 +84,20 @@ pub(super) fn prepare(
         .as_ref()
         .map(|catalog| keys::inspect(secrets.as_ref(), catalog, &source.key_files))
         .transpose()?;
+    let temporary_import = secrets
+        .as_ref()
+        .filter(|_| source.has_temporary_keys)
+        .zip(source_connections)
+        .map(|(secrets, connections)| temporary_keys::inspect(secrets, connections))
+        .transpose()?;
     if password.is_some()
         && source.master.is_none()
         && password_import
             .as_ref()
             .is_none_or(|import| import.additions.is_empty())
+        && temporary_import
+            .as_ref()
+            .is_none_or(|import| import.keys.is_empty())
         && key_import.as_ref().is_some_and(|import| {
             import
                 .omissions
@@ -144,6 +155,21 @@ pub(super) fn prepare(
             key: index,
         })
         .collect();
+    let temporary_offset = password_import
+        .as_ref()
+        .map_or(0, |import| import.additions.len());
+    let temporary_bindings: Vec<_> = temporary_import
+        .iter()
+        .flat_map(|import| &import.keys)
+        .enumerate()
+        .map(|(index, key)| JavaTemporaryKeyBinding {
+            source_id: &key.source_id,
+            target: &key.login,
+            jump: key.jump.as_ref(),
+            credential: temporary_offset + index,
+            options: key.options,
+        })
+        .collect();
     let routes = JavaConnectionBindings::review(
         source_connections,
         current.as_deref().map(Vec::as_slice),
@@ -151,12 +177,13 @@ pub(super) fn prepare(
         &key_bindings,
         policy.server_access(),
     )?
+    .with_temporary_keys(&temporary_bindings, policy.server_access())?
     .with_library(library.clone());
     let omitted_passwords = omitted_passwords + routes.omitted();
     let omitted_key_routes = routes.omitted_keys();
     let needed = &routes.needed();
     let reviewed_passwords = password_import.is_some();
-    let (indexes, mut additions): (Vec<_>, Vec<_>) = password_import
+    let (mut indexes, mut additions): (Vec<_>, Vec<_>) = password_import
         .into_iter()
         .flat_map(|import| {
             import
@@ -167,6 +194,19 @@ pub(super) fn prepare(
         })
         .unzip();
     let password_count = additions.len();
+    let temporary_summary = temporary_import.map(|import| {
+        for (index, key) in import.keys.into_iter().enumerate() {
+            let index = temporary_offset + index;
+            if needed.contains(&index) {
+                indexes.push(index);
+                additions.push(key.addition);
+            }
+        }
+        (
+            additions.len() - password_count,
+            import.omitted + routes.omitted_temporary_keys(),
+        )
+    });
     let key_count = keys.len();
     let mut passphrase_indexes = Vec::with_capacity(key_count);
     for key in &mut keys {
@@ -187,7 +227,7 @@ pub(super) fn prepare(
         )
     };
     let sealed_ids = vault.as_ref().map_or(&[][..], |vault| vault.ids.as_slice());
-    let password_ids = indexes
+    let vault_ids = indexes
         .into_iter()
         .zip(sealed_ids.iter().cloned())
         .collect();
@@ -214,8 +254,7 @@ pub(super) fn prepare(
         .map(|(index, identity)| (index, identity.id))
         .collect();
     let (contents, routes, memory_ids, profile_ids, groups) = if needs_route_lineage {
-        let mut import =
-            routes.bind_with_routes(&password_ids, &key_ids, policy.server_access())?;
+        let mut import = routes.bind_with_routes(&vault_ids, &key_ids, policy.server_access())?;
         import.reuse_targets(current.as_deref().map(Vec::as_slice), reuse);
         (
             import.contents,
@@ -226,7 +265,7 @@ pub(super) fn prepare(
         )
     } else {
         (
-            routes.bind(&password_ids, &key_ids)?,
+            routes.bind(&vault_ids, &key_ids)?,
             BTreeMap::new(),
             BTreeMap::new(),
             BTreeMap::new(),
@@ -256,6 +295,7 @@ pub(super) fn prepare(
             keys,
         }),
         passwords: reviewed_passwords.then_some((password_count, omitted_passwords)),
+        temporary_keys: temporary_summary,
         keys: source
             .key_catalog
             .is_some()

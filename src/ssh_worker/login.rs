@@ -67,6 +67,7 @@ fn send_target(out: &mut impl Write, login: LoginRequest) -> io::Result<()> {
         }
         Authentication::VaultPassword(_)
         | Authentication::VaultKey(..)
+        | Authentication::VaultTemporaryKey { .. }
         | Authentication::StoredKey { .. } => Err(invalid()),
     }
 }

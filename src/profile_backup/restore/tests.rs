@@ -22,6 +22,127 @@ const JAVA_ENVIRONMENTS: &[u8] = br##"<environments>
     <colors><color id="PRODUCTION" color="#abc"/><color id="custom-deadbeef" color="#123456"/></colors>
 </environments>"##;
 
+#[test]
+fn java_temporary_keys_restore_only_after_review_for_the_exact_account() {
+    use crate::connection_store::{Auth, Store};
+    use crate::profile_backup::java_temporary_key_fixture as fixture;
+    use kortty_vault::TemporarySshKeyOptions;
+
+    let source = Scratch::new();
+    let java_password = fixture::java_password();
+    let envelope = fixture::envelope();
+    let connections = format!(
+        r#"<connections schemaVersion="2">
+          <connection id="temp-direct">
+            <name>Temporary key</name><host>target.example</host><port>2222</port>
+            <username>tester</username><authMethod>PUBLIC_KEY</authMethod>
+            <privateKeyPath>TEMPORARY:__ENCRYPTED__</privateKeyPath>
+            <temporaryKeyContent>{envelope}</temporaryKeyContent>
+            <temporaryKeyExpirationMinutes>47</temporaryKeyExpirationMinutes>
+            <temporaryKeyPermanent>true</temporaryKeyPermanent>
+            <jumpServer><enabled>true</enabled><host>jump.example</host>
+              <username>jump-user</username></jumpServer>
+          </connection>
+          <connection id="temp-plain">
+            <name>Unsealed</name><host>unsafe.example</host><username>tester</username>
+            <authMethod>PUBLIC_KEY</authMethod><temporaryKeyContent>unsealed</temporaryKeyContent>
+          </connection>
+        </connections>"#
+    );
+    let (path, archive_password) = fixture::archive(&source.0, &connections);
+
+    let inspect = || super::super::inspect_java_password(&path, &archive_password).unwrap();
+    let skipped = Scratch::new();
+    let preview = inspect();
+    assert!(preview.has_java_temporary_keys());
+    super::super::queue_restore_at(&skipped.0, preview, RestoreMode::JavaAdditive).unwrap();
+    drop(ProfileLease::acquire(&skipped.0, || false).unwrap());
+    let store = Store::open(skipped.0.join(CONNECTIONS)).unwrap();
+    assert_eq!(store.connections().len(), 2);
+    assert!(
+        store
+            .connections()
+            .iter()
+            .all(|connection| { !matches!(connection.login.auth, Auth::TemporaryKey { .. }) })
+    );
+
+    let target = Scratch::new();
+    Directory::open(&target.0, false)
+        .unwrap()
+        .private_child("vault", true)
+        .unwrap();
+    let vault_path = crate::profile::vault_path_at(&target.0);
+    let master = crate::vault_window::test_vault_password();
+    let vault = Vault::create(&vault_path, &master[..]).unwrap();
+    let initial_vault = fs::read(&vault_path).unwrap();
+    let mut preview = inspect();
+    let prepare = super::super::prepare_java_credentials;
+    assert!(prepare(&mut preview, Some(&java_password), None, &target.0).is_err());
+    let wrong_password = Secret::new("incorrect Java password".into());
+    assert!(prepare(&mut preview, Some(&wrong_password), Some(&vault), &target.0).is_err());
+    prepare(&mut preview, Some(&java_password), Some(&vault), &target.0).unwrap();
+    assert_eq!(preview.java_temporary_key_summary(), Some((1, 1)));
+    assert_eq!(fs::read(&vault_path).unwrap(), initial_vault);
+    assert!(!target.0.join(CONNECTIONS).exists());
+
+    super::super::queue_restore_at(&target.0, preview, RestoreMode::JavaAdditive).unwrap();
+    let pending = fs::read(target.0.join(PENDING)).unwrap();
+    for secret in [envelope, java_password.as_str(), "BEGIN PRIVATE KEY"] {
+        assert!(
+            !pending
+                .windows(secret.len())
+                .any(|part| part == secret.as_bytes())
+        );
+    }
+    assert_eq!(fs::read(&vault_path).unwrap(), initial_vault);
+    drop(vault);
+    drop(ProfileLease::acquire(&target.0, || false).unwrap());
+
+    let vault = Vault::unlock(&vault_path, &master[..]).unwrap();
+    let store = Store::open(target.0.join(CONNECTIONS)).unwrap();
+    let connection = store
+        .connections()
+        .iter()
+        .find(|entry| entry.name == "Temporary key")
+        .unwrap();
+    let Auth::TemporaryKey {
+        credential: Some(id),
+        minutes: 47,
+        automatic: true,
+    } = &connection.login.auth
+    else {
+        panic!("expected an imported temporary key with the reviewed options");
+    };
+    let key = vault
+        .temporary_ssh_key(id, ("target.example", 2222, "tester"))
+        .unwrap();
+    assert_eq!(
+        key.options,
+        TemporarySshKeyOptions {
+            minutes: 47,
+            automatic: true
+        }
+    );
+    assert!(key.remaining <= std::time::Duration::from_secs(47 * 60));
+    kortty_ssh::validate_private_key(key.private_key.as_bytes(), None).unwrap();
+    for endpoint in [
+        ("target.example", 22, "tester"),
+        ("target.example", 2222, "jump-user"),
+        ("jump.example", 2222, "tester"),
+    ] {
+        assert!(vault.temporary_ssh_key(id, endpoint).is_none());
+    }
+    assert!(matches!(
+        connection.jump.as_ref().unwrap().auth,
+        Auth::Prompt
+    ));
+
+    let mut replay = inspect();
+    prepare(&mut replay, Some(&java_password), Some(&vault), &target.0).unwrap();
+    assert_eq!(replay.java_temporary_key_summary(), Some((0, 2)));
+    assert!(replay.java_credentials.is_none());
+}
+
 struct Scratch(PathBuf);
 
 impl Scratch {
@@ -2931,6 +3052,7 @@ fn java_os_badge_restore_requires_a_local_image_choice_even_when_the_id_exists()
 fn java_connection_library_restore_remaps_only_unambiguous_insertions() {
     use crate::connection_store::{Store, TabColor, import::Preview as ConnectionPreview};
     use crate::connection_window::{ConnectionWindow, Message, Scope};
+    use crate::session_security::IsolationLevel;
     use iced::futures::{StreamExt, executor::block_on};
     use iced_runtime::{Action, task};
     use zip::{AesMode, ZipWriter, write::SimpleFileOptions};
@@ -2955,6 +3077,8 @@ fn java_connection_library_restore_remaps_only_unambiguous_insertions() {
         <connection id="new-shell"><name>Java shell</name><protocol>LOCAL_SHELL</protocol></connection>
     </connections>"#;
     const SETTINGS: &[u8] = br##"<globalSettings>
+        <connectionIsolationDefault>sandbox</connectionIsolationDefault>
+        <temporarySshKeyEnabled>true</temporarySshKeyEnabled>
         <favoriteConnections>
             <connection>new-ssh</connection><connection>already-here</connection><connection>teamwork</connection>
             <connection>duplicate-id</connection><connection>shadow-a</connection><connection>new-serial</connection><connection>new-shell</connection>
@@ -2968,6 +3092,13 @@ fn java_connection_library_restore_remaps_only_unambiguous_insertions() {
             <group path=" Work / Conflict " color="#2a4"/>
             <group path="Orphan" color="#abc"/>
         </connectionGroupColors>
+        <connectionGroupIsolation>
+            <group path="Work" level="sandbox"/>
+            <group path=" Work / Imported " level="sandbox"/>
+            <group path="Work/Conflict" level="none"/>
+            <group path=" Work / Conflict " level="process"/>
+            <group path="Orphan" level="none"/>
+        </connectionGroupIsolation>
     </globalSettings>"##;
     let source = Scratch::new();
     let archive_path = source.0.join("java-library.zip");
@@ -2990,6 +3121,12 @@ fn java_connection_library_restore_remaps_only_unambiguous_insertions() {
         .portable_java_backup()
         .unwrap();
     directory.publish_copy(CONNECTIONS, &initial).unwrap();
+    directory
+        .publish_copy(
+            "window-settings.json",
+            br#"{"default_session_isolation":"process","temporary_ssh_key_enabled":false}"#,
+        )
+        .unwrap();
     let connection_path = local.0.join(CONNECTIONS);
     let mut store = Store::open(connection_path.clone()).unwrap();
     let native_id = store.connections()[0].id;
@@ -3000,6 +3137,9 @@ fn java_connection_library_restore_remaps_only_unambiguous_insertions() {
     );
     store
         .set_group_color("Work", TabColor::parse("#900"))
+        .unwrap();
+    store
+        .set_group_isolation("Work", None, Some(IsolationLevel::Process))
         .unwrap();
     drop(store);
 
@@ -3065,6 +3205,32 @@ fn java_connection_library_restore_remaps_only_unambiguous_insertions() {
     assert_eq!(store.group_color("Work/Imported"), TabColor::parse("#3af"));
     assert_eq!(store.group_color("Work/Conflict"), None);
     assert!(!store.has_group("Orphan"));
+    let settings: serde_json::Value =
+        serde_json::from_slice(&fs::read(local.0.join("window-settings.json")).unwrap()).unwrap();
+    assert_eq!(settings["default_session_isolation"], "process");
+    assert_eq!(settings["temporary_ssh_key_enabled"], false);
+    assert_eq!(settings["java_security"]["default_isolation"], "sandbox");
+    assert_eq!(settings["java_security"]["temporary_ssh_keys"], true);
+    assert_eq!(store.group_isolation("Work"), Some(IsolationLevel::Process));
+    assert_eq!(
+        store.group_isolation("Work/Imported"),
+        Some(IsolationLevel::Sandbox)
+    );
+    assert_eq!(store.group_isolation("Work/Conflict"), None);
+    assert_eq!(
+        store
+            .java_group_isolation()
+            .iter()
+            .filter(|hint| hint.source == "Work/Conflict")
+            .count(),
+        2
+    );
+    let isolation_hint = store
+        .java_group_isolation()
+        .iter()
+        .find(|hint| hint.source == "Orphan")
+        .unwrap()
+        .clone();
     let hints = store.java_group_colors();
     assert_eq!(hints.len(), 4);
     assert_eq!(
@@ -3090,6 +3256,13 @@ fn java_connection_library_restore_remaps_only_unambiguous_insertions() {
     store
         .set_group_color("Work/Imported", TabColor::parse("#098"))
         .unwrap();
+    store
+        .set_group_isolation(
+            "Work/Imported",
+            Some(IsolationLevel::Sandbox),
+            Some(IsolationLevel::Process),
+        )
+        .unwrap();
     drop(store);
 
     let mut editor = ConnectionWindow::open(connection_path.clone()).unwrap();
@@ -3109,6 +3282,24 @@ fn java_connection_library_restore_remaps_only_unambiguous_insertions() {
     let Some(Action::Output(completed @ Message::Completed(Ok(_)))) = block_on(operation.next())
     else {
         panic!("expected a reviewed group color assignment");
+    };
+    let _ = editor.update(completed);
+    let _ = editor.update(Message::SelectGroup("Work".into()));
+    let _ = editor.update(Message::EditGroupIsolation);
+    let _ = editor.update(Message::PickJavaGroupIsolation(isolation_hint.clone()));
+    let _ = editor.update(Message::CancelGroup);
+    assert_eq!(
+        Store::open(connection_path.clone())
+            .unwrap()
+            .group_isolation("Work"),
+        Some(IsolationLevel::Process)
+    );
+    let _ = editor.update(Message::EditGroupIsolation);
+    let _ = editor.update(Message::PickJavaGroupIsolation(isolation_hint.clone()));
+    let mut operation = task::into_stream(editor.update(Message::CommitGroup)).unwrap();
+    let Some(Action::Output(completed @ Message::Completed(Ok(_)))) = block_on(operation.next())
+    else {
+        panic!("expected a reviewed Java folder isolation assignment");
     };
     let _ = editor.update(completed);
     let _ = editor.update(Message::Select(existing));
@@ -3144,10 +3335,22 @@ fn java_connection_library_restore_remaps_only_unambiguous_insertions() {
     assert_eq!(store.group_color("Work/Imported"), TabColor::parse("#098"));
     assert_eq!(store.group_color("Work"), Some(orphan.color));
     assert!(!store.java_group_colors().contains(&orphan));
+    assert_eq!(store.group_isolation("Work"), Some(IsolationLevel::None));
+    assert_eq!(
+        store.group_isolation("Work/Imported"),
+        Some(IsolationLevel::Process)
+    );
+    assert!(!store.java_group_isolation().contains(&isolation_hint));
+    assert!(
+        !store
+            .java_group_isolation()
+            .iter()
+            .any(|hint| hint.source == "Work/Imported")
+    );
 }
 
 #[test]
-fn java_group_colors_restore_from_settings_alone_without_creating_folders() {
+fn java_folder_preferences_restore_from_settings_alone_without_creating_folders() {
     use crate::connection_store::Store;
     use zip::{AesMode, ZipWriter, write::SimpleFileOptions};
 
@@ -3166,6 +3369,7 @@ fn java_group_colors_restore_from_settings_alone_without_creating_folders() {
         .write_all(
             br##"<globalSettings>
         <connectionGroupColors><group path="Old/Empty" color="#abc"/></connectionGroupColors>
+        <connectionGroupIsolation><group path="Old/Empty" level="process"/></connectionGroupIsolation>
     </globalSettings>"##,
         )
         .unwrap();
@@ -3180,6 +3384,10 @@ fn java_group_colors_restore_from_settings_alone_without_creating_folders() {
     assert!(!store.has_group("Old/Empty"));
     assert_eq!(
         store.java_group_colors().iter().next().unwrap().source,
+        "Old/Empty"
+    );
+    assert_eq!(
+        store.java_group_isolation().iter().next().unwrap().source,
         "Old/Empty"
     );
 }
@@ -3902,6 +4110,7 @@ fn save_fixture_connection(root: &Path, host: &str) -> (crate::connection_store:
             }],
             incognito: false,
             isolation: Default::default(),
+            inherit_isolation: false,
             startup: Default::default(),
             logging: Default::default(),
             terminal_effect: None,

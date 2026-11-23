@@ -11,7 +11,9 @@ use iced::widget::{
 };
 use iced::{Alignment, Element, Font, Length, Task};
 
-use super::knowledge::{SourceKey, SourceResult, group_source_results, sync::SourceStatus};
+use super::knowledge::{
+    SourceKey, SourceResult, group_source_results, outcomes, sync::SourceStatus,
+};
 use super::{
     Dialog, Embedding, Index, IndexReview, KnowledgeSourcePicker, Message, SOURCE_REVIEW_PAGE_SIZE,
     SourceKind, State, Store, SyncMode, file_review, folder, folder_review_view, knowledge_options,
@@ -89,14 +91,30 @@ pub(super) struct Results {
     store: Option<(Store, Embedding)>,
     pending: Option<folder::Cancel>,
     rows: Option<Arc<SourceRows>>,
+    outcomes: outcomes::Rows,
 }
 
 impl Results {
+    #[cfg(test)]
+    pub(super) fn restored(
+        &self,
+        source: &SourceKey,
+    ) -> (Option<SourceStatus>, Option<SourceResult>) {
+        (
+            self.outcomes.get(source).copied(),
+            self.rows
+                .as_deref()
+                .and_then(|rows| rows.get(source))
+                .copied(),
+        )
+    }
+
     pub(super) fn reset(&mut self) {
         self.ticket = self.ticket.wrapping_add(1);
         self.store = None;
         self.pending = None;
         self.rows = None;
+        self.outcomes.clear();
     }
 
     pub(super) fn loaded(&mut self, ticket: u64, rows: Arc<SourceRows>) {
@@ -105,7 +123,16 @@ impl Results {
         }
     }
 
-    fn bind(&mut self, state: &State, store: &Store) {
+    fn display_completed(&mut self, review: &IndexReview) {
+        self.outcomes.extend(
+            review
+                .outcomes
+                .iter()
+                .map(|(source, &status)| (source.clone(), status)),
+        );
+    }
+
+    fn bind(&mut self, root: &Path, state: &State, store: &Store) {
         let (endpoint, model, managed_model) = state.embedding_fields(store);
         self.store = Some((
             store.clone(),
@@ -115,9 +142,10 @@ impl Results {
                 managed_model: managed_model.map(str::to_owned),
             },
         ));
+        self.outcomes = outcomes::load(root, state, store).unwrap_or_default();
     }
 
-    fn rows(&self, state: &State, store: &Store) -> Option<&SourceRows> {
+    fn matches(&self, state: &State, store: &Store) -> Option<()> {
         let (indexed, destination) = self.store.as_ref()?;
         let fields = state.embedding_fields(store);
         (*indexed == *store
@@ -127,12 +155,17 @@ impl Results {
                     destination.model.as_str(),
                     destination.managed_model.as_deref(),
                 ))
-            .then_some(())?;
+            .then_some(())
+    }
+
+    fn rows(&self, state: &State, store: &Store) -> Option<&SourceRows> {
+        self.matches(state, store)?;
         self.rows.as_deref()
     }
 
     pub(super) fn replace(
         &mut self,
+        root: &Path,
         state: &State,
         selected: Option<usize>,
         index: &Index,
@@ -140,7 +173,8 @@ impl Results {
     ) {
         self.reset();
         if let Some(store) = selected.and_then(|selected| state.stores.get(selected)) {
-            self.bind(state, store);
+            self.bind(root, state, store);
+            self.display_completed(review);
             let coverage = store.qdrant.as_ref().map(|_| &review.coverage);
             self.rows = Some(Arc::new(group_source_results(
                 store,
@@ -151,6 +185,15 @@ impl Results {
 }
 
 impl Dialog {
+    pub(in crate::ai_manager) fn refresh_source_outcomes(&mut self, state: &State) {
+        if let Some(store) = self.selected.and_then(|id| state.stores.get(id))
+            && self.source_results.matches(state, store).is_some()
+        {
+            self.source_results.outcomes =
+                outcomes::load(&self.profile_dir, state, store).unwrap_or_default();
+        }
+    }
+
     pub(in crate::ai_manager) fn load_source_results(&mut self, state: &State) -> Task<Message> {
         self.source_results.reset();
         let Some(store) = self
@@ -159,7 +202,7 @@ impl Dialog {
         else {
             return Task::none();
         };
-        self.source_results.bind(state, store);
+        self.source_results.bind(&self.profile_dir, state, store);
         let Ok(scope) = state.scope(store, &self.profile_dir) else {
             if state.embedding_fields(store).1.trim().is_empty() {
                 self.source_results.rows =
@@ -168,6 +211,9 @@ impl Dialog {
             return Task::none();
         };
         if let Some(draft) = self.drafts.iter().find(|draft| scope.same_as(&draft.index)) {
+            if let Some(review) = &draft.review {
+                self.source_results.display_completed(review);
+            }
             let coverage = draft
                 .review
                 .as_ref()
@@ -478,14 +524,16 @@ impl Dialog {
                 .active_automatic_sources
                 .as_ref()
                 .filter(|(name, _)| *name == store.name)
-                .and_then(|(_, report)| report.rows(state, store))
-                .or_else(|| {
-                    self.automatic_status
-                        .get(&store.name)?
-                        .sources
-                        .as_ref()?
-                        .rows(state, store)
-                });
+                .and_then(|(_, report)| report.rows(state, store));
+            let saved_outcomes = self
+                .source_results
+                .matches(state, store)
+                .map(|()| &self.source_results.outcomes);
+            let last_automatic = self
+                .automatic_status
+                .get(&store.name)
+                .and_then(|status| status.sources.as_ref())
+                .and_then(|report| report.rows(state, store));
             let work = self
                 .source_work
                 .as_ref()
@@ -519,6 +567,10 @@ impl Dialog {
                             None
                         };
                         let result = results.and_then(|results| results.get(&key));
+                        let saved = saved_outcomes
+                            .and_then(|rows| rows.get(&key))
+                            .copied()
+                            .or_else(|| last_automatic.and_then(|rows| rows.get(&key)).copied());
                         let updated = result
                             .filter(|result| result.indexed_at != 0)
                             .and_then(|result| jiff::Timestamp::from_second(result.indexed_at).ok())
@@ -553,11 +605,13 @@ impl Dialog {
                         };
                         let problems = automatic
                             .and_then(SourceStatus::problems)
+                            .or_else(|| saved.and_then(SourceStatus::problems))
                             .or(reviewed_problems);
                         let status = if !store.source_enabled(kind, path) {
                             "Disabled"
-                        } else if let Some(status) =
-                            manual.or_else(|| automatic.and_then(SourceStatus::label))
+                        } else if let Some(status) = manual
+                            .or_else(|| automatic.and_then(SourceStatus::label))
+                            .or_else(|| saved.and_then(SourceStatus::label))
                         {
                             status
                         } else if problems.is_some_and(|count| count != 0) {
@@ -590,7 +644,7 @@ impl Dialog {
                                     |result| format!("{} / {}", result.files, result.chunks),
                                 ),
                                 if work.is_some_and(|work| work.failed.as_ref() == Some(&key)) {
-                                    (problems.unwrap_or_default() + 1).to_string()
+                                    "1".into()
                                 } else {
                                     problems.map_or_else(|| "—".into(), |count| count.to_string())
                                 },

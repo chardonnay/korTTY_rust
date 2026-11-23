@@ -46,6 +46,7 @@ use super::{
 };
 
 pub(super) use knowledge::folder::supported as knowledge_file_supported;
+pub(super) use knowledge::outcomes;
 use knowledge::qdrant::{VaultKey, require_vault_revision};
 pub(super) use knowledge::retrieval;
 use knowledge::source::SyncMode;
@@ -56,6 +57,7 @@ use knowledge::{
 };
 use knowledge::{file_review, folder};
 use knowledge_inventory::{SourcePhase, SourceWork};
+use knowledge_sync::SourceStatus;
 
 pub(super) fn pick_native_knowledge_sources(
     owner: &dyn iced::window::Window,
@@ -615,6 +617,8 @@ pub(crate) struct IndexReview {
     store: Scope,
     sources: Scope,
     coverage: SourceMask,
+    outcome_warning: bool,
+    outcomes: outcomes::Rows,
 }
 
 impl fmt::Debug for IndexReview {
@@ -1077,21 +1081,18 @@ impl Dialog {
         ticket: &Arc<()>,
         paths: Option<Vec<PathBuf>>,
         can_import: bool,
-    ) -> bool {
+    ) {
         if !self.managed.pending_file_picker(ticket) {
-            return false;
+            return;
         }
         self.managed.finish_file_picker();
         if self.request.is_some() || !can_import || self.managed.has_action() {
-            return false;
+            return;
         }
-        match paths.map(|paths| self.managed.stage_files(paths)) {
-            Some(Ok(true)) => true,
-            Some(Err(problem)) => {
-                self.status = Some(problem.into());
-                false
-            }
-            _ => false,
+        if let Some(paths) = paths
+            && let Err(problem) = self.managed.stage_files(paths)
+        {
+            self.status = Some(problem.into());
         }
     }
 
@@ -1431,6 +1432,14 @@ impl Dialog {
                         .as_ref()
                         .map_or_else(|| scope.enabled_sources(), |review| review.coverage.clone()),
                     vault_key: resolve_reviewed_key(scope, vault, draft.vault_revision.as_ref())?,
+                    completed: draft.review.as_ref().and_then(|review| {
+                        next.stores
+                            .iter()
+                            .find(|store| {
+                                next.scope(store, &self.profile_dir).as_ref() == Ok(scope)
+                            })
+                            .map(|store| (store.clone(), review.outcomes.clone()))
+                    }),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -2563,6 +2572,7 @@ impl Dialog {
                             .map(|draft| (Arc::clone(&draft.index), draft.review.clone()));
                         let rows: BTreeMap<_, _> = reviewed.source_rows(store).collect();
                         let work = SourceWork::new(store, rows.values().cloned(), SourcePhase::Indexing);
+                        let attempted_store = store.clone();
                         let pending = local_ai::start(scope.profile.clone(), move |client| {
                             let authorize = || {
                                 knowledge::check_active(client)?;
@@ -2602,11 +2612,23 @@ impl Dialog {
                             );
                             let (index, summary) = match result {
                                 Ok(result) => result,
-                                Err(message) => match failed_source.and_then(|position| rows.get(&position)) {
-                                    Some(source) => return Ok(Output::SourceIssue(SourceIssue {
-                                        source: source.clone(),
-                                        message,
-                                    })),
+                                Err(message) => match failed_source.and_then(|position| rows.get(&position))
+                                    .or_else(|| rows.values().next().filter(|first| rows.values().all(|row| row == *first))) {
+                                    Some(source) => {
+                                        authorize()?;
+                                        let mut message = message;
+                                        if persistent && outcomes::save(
+                                            &profile_dir, &baseline, &attempted_store,
+                                            &BTreeMap::from([(source.clone(), SourceStatus::Error)]),
+                                        ).is_err() {
+                                            message.push(' ');
+                                            message.push_str(outcomes::SAVE_WARNING);
+                                        }
+                                        return Ok(Output::SourceIssue(SourceIssue {
+                                            source: source.clone(),
+                                            message,
+                                        }));
+                                    }
                                     None => return Err(message),
                                 },
                             };
@@ -2614,10 +2636,20 @@ impl Dialog {
                                 || reviewed.enabled_sources(),
                                 |(base, index)| remote_index::retained_coverage(&scope, &reviewed, base, Some(index)),
                             );
+                            let mut completed: outcomes::Rows = rows.values().map(|source| {
+                                let problems = attempted_store.folders.iter()
+                                    .find(|folder| source.0 == SourceKind::Folder && folder.root == source.1)
+                                    .and_then(|folder| folder.review_problems)
+                                    .unwrap_or_default();
+                                (source.clone(), SourceStatus::Checked { problems })
+                            }).collect();
                             let mut reviewed = reviewed;
                             if let Some(prior) = prior_review {
                                 reviewed.include_previous_reviews(&prior.sources);
                                 coverage = coverage.union(&prior.coverage);
+                                for (source, status) in &prior.outcomes {
+                                    completed.entry(source.clone()).or_insert(*status);
+                                }
                             }
                             let remote_missing = scope.qdrant.is_some()
                                 && previous.as_ref().and_then(|(base, index)| {
@@ -2651,9 +2683,11 @@ impl Dialog {
                                         format!("Could not save the knowledge index ({error}).")
                                     })?.cleanup_warning;
                             }
+                            let outcome_warning = persistent
+                                && outcomes::save(&profile_dir, &baseline, &attempted_store, &completed).is_err();
                             let revision = vault_key.as_deref().map(VaultKey::revision);
                             Ok(Output::Index(Arc::new(index), persistent, summary, cleanup_warning, revision,
-                                Arc::new(IndexReview { store: scope, sources: reviewed, coverage })))
+                                Arc::new(IndexReview { store: scope, sources: reviewed, coverage, outcome_warning, outcomes: completed })))
                         })?;
                         Ok((work, pending))
                     });
@@ -2936,6 +2970,7 @@ impl Dialog {
                         mlx,
                         notice,
                     }) => {
+                        let offer_backend = self.managed.configuring();
                         self.managed.set_active_package(active_package);
                         let (default, status) = match default {
                             Ok(default) => (Some(default), notice),
@@ -2961,6 +2996,9 @@ impl Dialog {
                             None => status,
                         };
                         self.preselect_installed_default(state.default_managed_model.as_deref());
+                        if offer_backend {
+                            self.managed.offer_matching_backend();
+                        }
                         status
                     }
                     Ok(Output::ManagedNotice(notice)) => {
@@ -2992,9 +3030,39 @@ impl Dialog {
                             "The store or selection changed. Review the selected sources again."
                                 .into()
                         } else {
+                            let outcomes = updates
+                                .files
+                                .iter()
+                                .filter(|row| matches!(row.status, file_review::Status::Skipped(_)))
+                                .map(|row| {
+                                    (
+                                        (SourceKind::File, row.path.clone()),
+                                        SourceStatus::Unavailable,
+                                    )
+                                })
+                                .chain(
+                                    updates
+                                        .issues
+                                        .iter()
+                                        .map(|issue| (issue.source.clone(), SourceStatus::Error)),
+                                )
+                                .collect();
+                            let outcome_warning =
+                                state.stores.get(updates.store).is_some_and(|store| {
+                                    outcomes::save(&self.profile_dir, saved, store, &outcomes)
+                                        .is_err()
+                                });
+                            self.refresh_source_outcomes(state);
                             self.source_updates = Some(updates);
                             self.folder_review_page = 0;
-                            "Scan complete. Review the proposed source updates.".into()
+                            if outcome_warning {
+                                format!(
+                                    "Scan complete. Review the proposed source updates. {}",
+                                    outcomes::SAVE_WARNING
+                                )
+                            } else {
+                                "Scan complete. Review the proposed source updates.".into()
+                            }
                         }
                     }
                     Ok(Output::SourceIssue(issue)) => issue.message,
@@ -3024,8 +3092,13 @@ impl Dialog {
                         review,
                     )) => {
                         if persistent {
-                            self.source_results
-                                .replace(state, self.selected, &index, &review);
+                            self.source_results.replace(
+                                &self.profile_dir,
+                                state,
+                                self.selected,
+                                &index,
+                                &review,
+                            );
                         }
                         let mut detail = format!(
                             "{} text passages · files reused {}, indexed {}, removed {}",
@@ -3037,6 +3110,10 @@ impl Dialog {
                         if cleanup_warning {
                             detail
                                 .push_str(". The obsolete Qdrant generation could not be removed");
+                        }
+                        if review.outcome_warning {
+                            detail.push_str(". ");
+                            detail.push_str(outcomes::SAVE_WARNING.trim_end_matches('.'));
                         }
                         self.hits.clear();
                         if persistent && summary.indexed == 0 && summary.removed == 0 {
@@ -3127,7 +3204,7 @@ impl Dialog {
 
     fn start_folder_review(
         &mut self,
-        pending: Result<(folder::ReviewReply, folder::Cancel), String>,
+        pending: Result<folder::ReviewTask<Arc<folder::Review>>, String>,
     ) -> Task<Message> {
         let (reply, cancel) = match pending {
             Ok(pending) => pending,
@@ -3543,7 +3620,7 @@ impl Dialog {
         }
         self.drafts.retain(|draft| !scope.same_as(&draft.index));
         self.source_results
-            .replace(state, self.selected, &index, &review);
+            .replace(&self.profile_dir, state, self.selected, &index, &review);
         self.drafts.push(DraftIndex {
             index,
             vault_revision,
@@ -4779,11 +4856,23 @@ struct StagedIndex {
     scope: Scope,
     sources: SourceMask,
     vault_key: Option<Arc<VaultKey>>,
+    completed: Option<(Store, outcomes::Rows)>,
 }
 
 struct RetiredIndex {
     scope: Scope,
     vault_key: Result<Option<Arc<VaultKey>>, String>,
+}
+
+pub(super) struct SourceCompletions(Vec<(Store, outcomes::Rows)>);
+
+impl SourceCompletions {
+    pub(super) fn save(self, root: &Path, state: &State) -> io::Result<()> {
+        for (store, rows) in self.0 {
+            outcomes::merge(root, state, &store, &rows)?;
+        }
+        Ok(())
+    }
 }
 
 fn resolve_reviewed_key(
@@ -4803,6 +4892,16 @@ fn resolve_reviewed_key(
 }
 
 impl SaveIndexes {
+    pub(super) fn completed_outcomes(&self, ai_enabled: bool) -> SourceCompletions {
+        SourceCompletions(
+            self.staged
+                .iter()
+                .filter(|staged| ai_enabled || staged.scope.qdrant.is_none())
+                .filter_map(|staged| staged.completed.clone())
+                .collect(),
+        )
+    }
+
     #[cfg(test)]
     pub(super) fn commit(
         self,
@@ -5183,13 +5282,16 @@ fn embedding_picker(
     }
 }
 
+const FORM_LABEL_WIDTH: f32 = 175.0;
+const FORM_COLUMN_GAP: f32 = 8.0;
+
 fn field<'a>(
     label: &'static str,
     control: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
-    row![text(label).width(175), control.into()]
+    row![text(label).width(FORM_LABEL_WIDTH), control.into()]
         .align_y(Alignment::Center)
-        .spacing(8)
+        .spacing(FORM_COLUMN_GAP)
         .into()
 }
 
@@ -5406,6 +5508,171 @@ mod tests {
         assert!(!dialog.source_request());
         assert!(dialog.source_updates.is_none());
         assert_eq!(saved, draft);
+    }
+
+    #[test]
+    fn knowledge_page_selects_its_initial_store_before_loading_managed_models() {
+        use crate::ai_manager::{Dialog as Manager, Message as ManagerMessage, Page};
+
+        let profile = crate::snippets::tests::Profile::new();
+        let config = Configuration {
+            local: State {
+                stores: vec![Store::new("Source outcome fixture").unwrap()],
+                ..State::default()
+            },
+            ..Configuration::default()
+        };
+        let mut manager = Manager::new(Arc::new(config), profile.0.clone(), Vec::new(), true, None);
+
+        let _task = manager.update(ManagerMessage::Page(Page::Knowledge));
+
+        assert_eq!(manager.local.selected, Some(0));
+        assert_eq!(
+            manager.local.status.as_deref(),
+            Some("Reading managed models…")
+        );
+    }
+
+    #[test]
+    fn knowledge_source_outcome_reopens_after_a_failed_then_repaired_manual_update() {
+        use iced::futures::{StreamExt as _, executor::block_on};
+        use std::io::Write as _;
+
+        let _exclusive = local_ai::test_support::exclusive_run();
+        let profile = crate::snippets::tests::Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        let failing = root.join("first.txt");
+        let unchanged = root.join("second.txt");
+        std::fs::write(&failing, "First indexed source").unwrap();
+        std::fs::write(&unchanged, "Second indexed source").unwrap();
+        let (server, _) = local_ai::test_support::listener();
+        let endpoint = server.local_addr().unwrap().to_string();
+        let reply = std::thread::spawn(move || {
+            for (inputs, embeddings) in [
+                (
+                    &["First indexed source", "Second indexed source"][..],
+                    &[[1.0, 0.0], [0.0, 1.0]][..],
+                ),
+                (&["First repaired source"][..], &[[1.0, 1.0]][..]),
+            ] {
+                let mut socket = local_ai::test_support::accept(&server);
+                let request: serde_json::Value = serde_json::from_slice(
+                    &local_ai::test_support::wire_request(&mut socket, "POST /api/embed HTTP/1.1"),
+                )
+                .unwrap();
+                assert_eq!(request["input"], serde_json::json!(inputs));
+                let response = serde_json::json!({ "embeddings": embeddings });
+                socket
+                    .get_mut()
+                    .write_all(
+                        local_ai::test_support::fixture_http_response(
+                            "200 OK",
+                            "",
+                            &response.to_string(),
+                        )
+                        .as_bytes(),
+                    )
+                    .unwrap();
+            }
+        });
+        let mut store = Store::new("Source outcome fixture").unwrap();
+        store.add_source(failing.clone()).unwrap();
+        store.add_source(unchanged.clone()).unwrap();
+        store.embedding = Some(Embedding {
+            endpoint,
+            model: "embedding-fixture".into(),
+            managed_model: None,
+        });
+        let baseline = Configuration {
+            local: State {
+                stores: vec![store],
+                ..State::default()
+            },
+            ..Configuration::default()
+        };
+        baseline
+            .save_fixture_at(&root, &Configuration::default())
+            .unwrap();
+        let saved = Configuration::load_fixture_from(&root).unwrap().local;
+        let mut state = saved.clone();
+        let finish = |dialog: &mut Dialog, state: &mut State, task| {
+            let mut stream = iced_runtime::task::into_stream(task).unwrap();
+            let Some(iced_runtime::Action::Output(event)) = block_on(stream.next()) else {
+                panic!("expected a source inventory or index result");
+            };
+            let _ = dialog.update(event, state, &saved, true);
+        };
+        let mut dialog = Dialog::new(root.clone());
+        let _ = dialog.update(Message::SelectStore(0), &mut state, &saved, true);
+        let _ = dialog.update(Message::Consent(true), &mut state, &saved, true);
+        let task = dialog.update(Message::Index { rebuild: false }, &mut state, &saved, true);
+        finish(&mut dialog, &mut state, task);
+        let first = (SourceKind::File, failing.clone());
+        let second = (SourceKind::File, unchanged);
+        let first_index = dialog.source_results.restored(&first).1.unwrap();
+        let second_index = dialog.source_results.restored(&second).1.unwrap();
+        assert!(first_index.indexed_at > 0 && second_index.indexed_at > 0);
+        std::fs::write(&failing, b"Invalid\0text").unwrap();
+        let _ = dialog.update(
+            Message::SelectKnowledgeSource(0, SourceKind::File, failing),
+            &mut state,
+            &saved,
+            true,
+        );
+        let task = dialog.update(Message::Index { rebuild: false }, &mut state, &saved, true);
+        finish(&mut dialog, &mut state, task);
+        assert_eq!(
+            dialog.source_work.as_ref().unwrap().status(&first),
+            Some("Error")
+        );
+        drop(dialog);
+
+        let mut reopened = Dialog::new(root.clone());
+        let _ = reopened.update(Message::SelectStore(0), &mut state, &saved, true);
+        let task = reopened.load_source_results(&state);
+        finish(&mut reopened, &mut state, task);
+        assert_eq!(
+            reopened.source_results.restored(&first),
+            (Some(SourceStatus::Error), Some(first_index))
+        );
+        assert_eq!(SourceStatus::Error.problems(), Some(1));
+        assert_eq!(
+            reopened.source_results.restored(&second),
+            (
+                Some(SourceStatus::Checked { problems: 0 }),
+                Some(second_index)
+            )
+        );
+
+        std::fs::write(&first.1, "First repaired source").unwrap();
+        let _ = reopened.update(
+            Message::SelectKnowledgeSource(0, first.0, first.1.clone()),
+            &mut state,
+            &saved,
+            true,
+        );
+        let _ = reopened.update(Message::Consent(true), &mut state, &saved, true);
+        let task = reopened.update(Message::Index { rebuild: false }, &mut state, &saved, true);
+        finish(&mut reopened, &mut state, task);
+        reply.join().unwrap();
+        drop(reopened);
+
+        let mut recovered = Dialog::new(root);
+        let _ = recovered.update(Message::SelectStore(0), &mut state, &saved, true);
+        let task = recovered.load_source_results(&state);
+        finish(&mut recovered, &mut state, task);
+        let (status, result) = recovered.source_results.restored(&first);
+        assert_eq!(status, Some(SourceStatus::Checked { problems: 0 }));
+        let result = result.unwrap();
+        assert_eq!((result.files, result.chunks), (1, 1));
+        assert!(result.indexed_at >= first_index.indexed_at);
+        assert_eq!(
+            recovered.source_results.restored(&second),
+            (
+                Some(SourceStatus::Checked { problems: 0 }),
+                Some(second_index)
+            )
+        );
     }
 
     #[test]

@@ -5,7 +5,7 @@ use crate::session::{SessionId, Status};
 
 use super::{
     LocalLaunchView, Message, PaneSession, Tab, Workspace,
-    ssh_access::{KeySnapshots, SavedSshProfile},
+    ssh_access::{KeySnapshots, SavedSshProfile, TeamworkLaunch},
 };
 
 #[cfg(test)]
@@ -35,6 +35,7 @@ pub(super) struct PendingReconnect {
     target: ReconnectTarget,
     saved: Option<Box<SavedSshProfile>>,
     key_snapshots: KeySnapshots,
+    teamwork: Option<Box<TeamworkLaunch>>,
     transferring_history: bool,
 }
 
@@ -176,9 +177,14 @@ impl Workspace {
             LocalLaunchView::Existing(grid, appearance),
             strict,
         ) {
-            Ok(candidate) => {
-                self.start_reconnect_worker(owner, target, candidate, None, KeySnapshots::default())
-            }
+            Ok(candidate) => self.start_reconnect_worker(
+                owner,
+                target,
+                candidate,
+                None,
+                KeySnapshots::default(),
+                None,
+            ),
             Err(error) => {
                 self.notice(
                     owner,
@@ -196,6 +202,7 @@ impl Workspace {
         candidate: SessionId,
         saved: Option<Box<SavedSshProfile>>,
         key_snapshots: KeySnapshots,
+        teamwork: Option<TeamworkLaunch>,
     ) -> Task<Message> {
         let Some((_, old)) = self.reconnect_target(owner, target) else {
             self.stop_session(candidate);
@@ -221,6 +228,7 @@ impl Workspace {
                 target,
                 saved,
                 key_snapshots,
+                teamwork: teamwork.map(Box::new),
                 transferring_history: false,
             },
         );
@@ -284,11 +292,22 @@ impl Workspace {
             target,
             saved,
             key_snapshots,
+            teamwork,
             ..
         }) = self.pending_reconnects.remove(&candidate)
         else {
             return Task::none();
         };
+        let teamwork_failure = teamwork.as_ref().and_then(|shared| {
+            match self
+                .sessions
+                .get(&candidate)
+                .and_then(|next| next.ssh.as_ref())
+            {
+                Some(route) => shared.reconnect_stale_reason(self, route),
+                None => Some("The Teamwork SSH route is unavailable. Select it again.".into()),
+            }
+        });
         let Some(next) = self.sessions.get_mut(&candidate) else {
             return Task::none();
         };
@@ -304,7 +323,7 @@ impl Workspace {
             Status::Running if !history_ready => {
                 Some("Could not carry the previous scrollback into the new session.".into())
             }
-            Status::Running => None,
+            Status::Running => teamwork_failure,
             Status::Exited(_) if next.saved_local.is_some() => None,
             Status::Error(error) => Some(format!("Could not reconnect ({error})")),
             _ => Some("The new connection closed before it was ready.".into()),

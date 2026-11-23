@@ -81,14 +81,19 @@ const SANDBOX_BACKEND: &str = "App Sandbox";
 const SANDBOX_BACKEND: &str = "landlock + seccomp";
 
 pub(crate) fn sandbox_available() -> bool {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
+    sandbox_availability().is_ok()
+}
+
+pub(crate) fn sandbox_availability() -> &'static Result<&'static str, String> {
+    static AVAILABLE: OnceLock<Result<&'static str, String>> = OnceLock::new();
+    AVAILABLE.get_or_init(|| {
         #[cfg(target_os = "macos")]
-        return std::env::current_exe()
-            .and_then(|path| MacWorker::check_available(&path))
-            .is_ok();
+        let checked = std::env::current_exe().and_then(|path| MacWorker::check_available(&path));
         #[cfg(not(target_os = "macos"))]
-        WorkerSandbox::check_available().is_ok()
+        let checked = WorkerSandbox::check_available();
+        checked
+            .map(|()| SANDBOX_BACKEND)
+            .map_err(|error| error.to_string())
     })
 }
 
@@ -401,12 +406,19 @@ impl Session {
         prompts: &mut PromptHandler<'_>,
         trust: &TrustStore,
     ) -> Result<Self, ConnectError> {
+        let executable = std::env::current_exe()?;
+        #[cfg(test)]
+        let executable = if std::env::var_os("KORTTY_SSH_TEST_EXE").is_some() {
+            test_executable()
+        } else {
+            executable
+        };
         Self::dial_executable(
             request,
             size,
             sftp,
             cancellation,
-            &std::env::current_exe()?,
+            &executable,
             trust,
             Some(prompts),
         )

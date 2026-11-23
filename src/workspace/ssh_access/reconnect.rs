@@ -5,6 +5,7 @@ use iced::{Task, window};
 use super::{
     FormKey, PendingSsh, SavedSshProfile, Stage, Workspace, WorkspaceMessage, form_message, wrap,
 };
+use crate::connection_store::Auth;
 use crate::session::GridSize;
 use crate::session_security::IsolationLevel;
 use crate::ssh_worker;
@@ -77,6 +78,9 @@ impl Workspace {
         let Some(ssh) = pane.ssh.as_ref() else {
             return Task::none();
         };
+        if !project && let Some(teamwork) = pane.teamwork_ssh.clone() {
+            return self.open_teamwork_ssh(owner, teamwork, false, true, None, Some(target));
+        }
         let incognito = tab.incognito;
         let saved_id = ssh.saved_id();
         let pane_profile = pane.frame.screen.profile;
@@ -130,7 +134,17 @@ impl Workspace {
                 );
                 return Task::none();
             };
-            floor = floor.max(saved.connection.isolation);
+            let isolation = match saved.isolation(self) {
+                Ok(level) => level,
+                Err(error) => {
+                    self.notice(
+                        owner,
+                        format!("Could not resolve session isolation ({error})"),
+                    );
+                    return Task::none();
+                }
+            };
+            floor = floor.max(isolation);
             saved.form(profile, floor)
         } else {
             ssh.form(pane_profile)
@@ -160,7 +174,16 @@ impl Workspace {
                     std::iter::once(&connection.login)
                         .chain(connection.jump.as_ref())
                         .any(|login| {
-                            login.endpoint.validate().is_err() || login.auth.requires_interactive()
+                            let automatic_temporary_key = matches!(
+                                login.auth,
+                                Auth::TemporaryKey {
+                                    credential: Some(_),
+                                    automatic: true,
+                                    ..
+                                }
+                            );
+                            login.endpoint.validate().is_err()
+                                || (login.auth.requires_interactive() && !automatic_temporary_key)
                         })
                 }))
         {

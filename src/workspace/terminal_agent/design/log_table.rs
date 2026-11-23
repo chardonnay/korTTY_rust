@@ -798,11 +798,17 @@ pub(super) fn status_icon_menu<'a>(
 ) -> Element<'a, AgentMessage> {
     let surface = Surface::StatusRun(status);
     run_icon_menu(activity, surface, icon, move |entries| {
-        if activity.live_run.is_some() {
+        if let Some(run) = activity.live_run {
             entries.push(context::Entry::action(
                 "Open activity window",
                 AgentMessage::Focus,
             ));
+            if run.design.history == crate::terminal_agent::design::History::PlanExecution {
+                entries.push(context::Entry::action(
+                    "Collapse activity",
+                    AgentMessage::ActivityPanel(super::activity::Change::ToggleCollapsed),
+                ));
+            }
         }
         if activity.live_run.is_none() || status == Status::Metro {
             entries.push(context::Entry::action(
@@ -817,9 +823,10 @@ pub(super) fn status_icon_menu<'a>(
     })
 }
 
-pub(super) fn timeline_icon_menu<'a>(
+pub(super) fn history_icon_menu<'a>(
     activity: Activity<'a>,
     hide: AgentMessage,
+    hide_label: &'static str,
     icon: impl FnOnce(AgentMessage) -> Element<'a, AgentMessage>,
 ) -> Element<'a, AgentMessage> {
     run_icon_menu(activity, Surface::TimelineRun, icon, move |entries| {
@@ -829,7 +836,7 @@ pub(super) fn timeline_icon_menu<'a>(
                 AgentMessage::Focus,
             ));
         } else {
-            entries.push(context::Entry::action("Hide timeline", hide.clone()));
+            entries.push(context::Entry::action(hide_label, hide.clone()));
         }
     })
 }

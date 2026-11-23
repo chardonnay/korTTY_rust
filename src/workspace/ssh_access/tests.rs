@@ -6,6 +6,8 @@ use crate::ssh_dialog::LoginMessage;
 use crate::workspace::initial_grid;
 
 #[cfg(unix)]
+mod native_isolation_reconnect;
+#[cfg(unix)]
 mod native_registered_key;
 
 const PROFILE: TerminalProfile = TerminalProfile::Vt220;
@@ -288,6 +290,59 @@ fn teamwork_ssh_requires_fresh_authentication_and_keeps_the_source_route_through
     };
     assert!(!form.can_connect());
     assert_eq!(form.target_endpoint(), Some(login));
+}
+
+#[test]
+fn teamwork_reconnect_requires_the_original_shared_route_and_fresh_authentication() {
+    let fixture = TeamworkFixture::new();
+    let catalog = fixture.catalog("shared.example");
+    let selection = fixture.selection(&catalog);
+    let connection = selection.connection();
+    let mut workspace = Workspace::default();
+    workspace.set_teamwork_catalog_for_test(catalog);
+    let (owner, _) = workspace.open_window(false);
+    let source = workspace.store_session(
+        Session::disconnected_ibm(crate::session::IbmKind::Tn3270e),
+        GridSize::default(),
+        FONT,
+    );
+    let pane = workspace.sessions.get_mut(&source).unwrap();
+    pane.ssh = Some(SshTarget {
+        login: connection.login.endpoint.clone(),
+        jump: connection.jump.as_ref().map(|login| login.endpoint.clone()),
+        saved: None,
+        isolation: IsolationLevel::Process,
+    });
+    pane.teamwork_ssh = Some(selection);
+    workspace.add_tab(owner, source);
+    let tab = workspace.windows[&owner].tab().unwrap().id;
+    let target = crate::workspace::reconnect::ReconnectTarget { tab, source };
+
+    let _ = workspace.start_ssh_reconnect(owner, target);
+    let key = workspace.guarded_ssh_form_key(owner);
+    assert!(matches!(key, Some(FormKey::Reconnect(_))));
+    let pending = workspace.pending_ssh(owner).unwrap();
+    let shared = pending.teamwork.as_ref().unwrap();
+    assert_eq!(shared.route.isolation, IsolationLevel::Process);
+    assert_eq!(pending.reconnect.as_ref().unwrap().target, target);
+    let Stage::Form(form) = &pending.stage else {
+        panic!("the reconnected Teamwork route should open a fresh login form");
+    };
+    assert!(!form.can_connect());
+    assert!(workspace.can_paste_pending_temporary_key(owner, key));
+    assert!(!workspace.can_paste_pending_temporary_key(owner, None));
+
+    workspace.set_teamwork_catalog_for_test(fixture.catalog("changed.example"));
+    let _ = workspace.update_ssh(form_message(owner, key, ssh_dialog::Message::Connect));
+    assert!(workspace.pending_ssh(owner).is_none());
+    assert_eq!(
+        workspace.windows[&owner].notice.as_deref(),
+        Some(TEAMWORK_RESELECT)
+    );
+    assert_eq!(
+        workspace.windows[&owner].tab().unwrap().focused_session(),
+        Some(source)
+    );
 }
 
 #[test]
@@ -782,6 +837,48 @@ fn teamwork_temporary_key_uses_managed_clipboard_mode_and_rechecks_teamwork_poli
     );
 }
 
+#[test]
+fn a_quick_temporary_key_can_be_retried_until_the_preference_is_disabled() {
+    let mut workspace = Workspace::default();
+    let (owner, _) = workspace.open_window(false);
+    workspace.window_settings.temporary_ssh_key_enabled = true;
+    let endpoint = LoginTarget {
+        host: "retry.test".into(),
+        port: 22,
+        username: "fixture".into(),
+    };
+    let mut form = SshDialog::with_target(PROFILE, &endpoint, None);
+    form.set_quick_temporary_key_enabled(true);
+    form.update(ssh_dialog::Message::Target(LoginMessage::Authentication(
+        ssh_dialog::Method::TemporaryKey,
+    )));
+    assert!(form.begin_temporary_key_paste(1));
+    form.finish_temporary_key_paste(1, ssh_dialog::Password::new(TEAMWORK_TEST_KEY.into()));
+    let request = form.take_request().unwrap();
+    let retry = RetryLogin::new(&request, None, Default::default());
+    drop(request);
+    let _ = workspace.show_shell_ssh(owner, None, false);
+    workspace.pending_ssh_mut(owner).unwrap().retry = Some(retry);
+    let target = SshTarget::from_imported_route(endpoint, None, IsolationLevel::None).unwrap();
+    let _ = workspace.reopen_ssh_form(owner, target, PROFILE, "Retry fixture".into());
+    assert!(matches!(&workspace.pending_ssh(owner).unwrap().stage,
+        Stage::Form(form) if form.temporary_key_selected() && form.can_connect()));
+
+    let paste = system_temporary_key_paste(
+        request_temporary_key_paste(&mut workspace, owner, None),
+        TEAMWORK_TEST_KEY,
+    );
+    let _ = workspace.update_ssh(paste);
+    assert!(matches!(&workspace.pending_ssh(owner).unwrap().stage,
+        Stage::Form(form) if form.can_connect()));
+
+    workspace.window_settings.temporary_ssh_key_enabled = false;
+    workspace.sync_quick_temporary_key_preference();
+    let pending = workspace.pending_ssh(owner).unwrap();
+    assert!(pending.retry.as_ref().unwrap().temporary_key.is_none());
+    assert!(matches!(&pending.stage, Stage::Form(form) if !form.temporary_key_selected()));
+}
+
 const TEAMWORK_TEST_KEY: &str =
     "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture-only\n-----END OPENSSH PRIVATE KEY-----";
 
@@ -1177,6 +1274,7 @@ fn profile_changes_invalidate_an_open_vault_login() {
         tunnels: Vec::new(),
         incognito: false,
         isolation: IsolationLevel::None,
+        inherit_isolation: false,
         startup: Default::default(),
         logging: Default::default(),
         terminal_effect: None,
@@ -1237,6 +1335,7 @@ fn registered_keys_from_saved_logins_cannot_be_reused_after_reassignment() {
         tunnels: Vec::new(),
         incognito: false,
         isolation: IsolationLevel::None,
+        inherit_isolation: false,
         startup: Default::default(),
         logging: Default::default(),
         terminal_effect: None,
@@ -1954,6 +2053,7 @@ fn reopen_closed_ssh_refreshes_edited_saved_route_without_reusing_typed_password
         tunnels: Vec::new(),
         incognito: false,
         isolation: IsolationLevel::None,
+        inherit_isolation: false,
         startup: ConnectOptions::QUICK,
         logging: Default::default(),
         terminal_effect: None,

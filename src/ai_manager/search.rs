@@ -1,9 +1,12 @@
 //! Search destinations for the AI Manager's existing pages and settings.
 
+use std::borrow::Cow;
+
 use iced::widget::{Id, container};
 use iced::{Element, Length, Task};
 
 use super::{Page, java_models, local::Role, profiles};
+use crate::settings_search::{self, Candidate};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Target {
@@ -19,10 +22,13 @@ impl Target {
         }
     }
 
-    pub(super) fn label(self) -> String {
+    pub(super) fn label(self, hints: &java_models::Hints) -> Cow<'static, str> {
         match self {
             Self::Page(page) => page.title().into(),
-            Self::Setting(setting) => format!("{} · {}", setting.page().title(), setting.title()),
+            Self::Setting(setting @ Setting::ImportedJavaModel(key)) => hints
+                .search_hint(key)
+                .map_or_else(|| setting.title().into(), |hint| hint.label().into()),
+            Self::Setting(setting) => setting.title().into(),
         }
     }
 }
@@ -1588,10 +1594,7 @@ impl ProfileSetting {
     }
 }
 
-pub(super) fn results<'a>(
-    query: &'a str,
-    profile: Option<&'a profiles::Profile>,
-) -> impl Iterator<Item = Target> + 'a {
+pub(super) fn targets(profile: Option<&profiles::Profile>) -> impl Iterator<Item = Target> {
     let targets = [
         Setting::Features,
         Setting::JournalSemanticSearch,
@@ -1643,40 +1646,58 @@ pub(super) fn results<'a>(
             .map(Setting::SkillProvider),
     )
     .chain(Control::ALL.into_iter().map(Setting::Control))
-    .map(Target::Setting)
-    .chain(Page::ALL.into_iter().map(Target::Page));
-    matching(query, targets)
+    .map(Target::Setting);
+    Page::ALL.into_iter().map(Target::Page).chain(targets)
 }
 
 pub(super) fn matching(
     query: &str,
     targets: impl Iterator<Item = Target>,
-) -> impl Iterator<Item = Target> {
-    let query = query.trim().to_lowercase();
-    targets.filter(move |target| {
-        let terms = match target {
-            Target::Page(page) => page.keywords(),
-            Target::Setting(setting) => setting.keywords(),
-        };
-        let haystack = format!("{} {terms}", target.label()).to_lowercase();
-        includes_words(&query, &haystack)
-    })
+    hints: &java_models::Hints,
+) -> std::vec::IntoIter<Target> {
+    if !settings_search::has_query(query) {
+        return Vec::new().into_iter();
+    }
+    let mut targets: Vec<_> = targets.collect();
+    targets.sort_by_key(|target| Page::ALL.iter().position(|page| *page == target.page()));
+    settings_search::rank(
+        query,
+        targets.into_iter().map(|target| {
+            let detail = match target {
+                Target::Page(page) => page.keywords(),
+                Target::Setting(setting) => setting.keywords(),
+            };
+            let identity = match target {
+                Target::Setting(Setting::ImportedJavaModel(key)) => {
+                    hints.search_hint(key).map(|hint| hint.id.as_str())
+                }
+                _ => None,
+            };
+            Candidate {
+                label: target.label(hints),
+                detail,
+                page: target.page().title(),
+                is_page: matches!(target, Target::Page(_)),
+                identity,
+                target,
+            }
+        }),
+    )
 }
 
-pub(super) fn imported_model_results<'a>(
+pub(super) fn imported_models(hints: &java_models::Hints) -> impl Iterator<Item = Target> {
+    hints
+        .iter()
+        .enumerate()
+        .map(|(index, hint)| Target::Setting(Setting::ImportedJavaModel(hint.search_key(index))))
+}
+
+#[cfg(test)]
+pub(super) fn results(
     query: &str,
-    hints: &'a java_models::Hints,
-) -> impl Iterator<Item = Target> + 'a {
-    let query = query.trim().to_lowercase();
-    hints.iter().enumerate().filter_map(move |(index, hint)| {
-        let haystack = format!("local models imported Java model settings {}", hint.label());
-        includes_words(&query, &haystack.to_lowercase())
-            .then(|| Target::Setting(Setting::ImportedJavaModel(hint.search_key(index))))
-    })
-}
-
-fn includes_words(query: &str, haystack: &str) -> bool {
-    !query.is_empty() && query.split_whitespace().all(|word| haystack.contains(word))
+    profile: Option<&profiles::Profile>,
+) -> impl Iterator<Item = Target> {
+    matching(query, targets(profile), &java_models::Hints::default())
 }
 
 pub(super) struct Reveal {
@@ -1929,17 +1950,35 @@ mod tests {
             None,
         );
         let _ = dialog.update(Message::Search("ARCHIVE Model".into()));
-        assert_eq!(dialog.search_results().count(), 2);
+        let targets: Vec<_> = dialog.search_results().collect();
+        assert!(matches!(
+            targets.as_slice(),
+            [
+                Target::Setting(Setting::ImportedJavaModel(_)),
+                Target::Setting(Setting::ImportedJavaModel(_)),
+                ..
+            ]
+        ));
+        assert!(
+            !targets[2..]
+                .iter()
+                .any(|target| matches!(target, Target::Setting(Setting::ImportedJavaModel(_))))
+        );
 
         for kind in [Kind::Gguf, Kind::Mlx] {
             let _ = dialog.update(Message::Search(format!("{} archive-chat", kind.label())));
             let targets = dialog.search_results().collect::<Vec<_>>();
-            let [Target::Setting(Setting::ImportedJavaModel(key))] = targets.as_slice() else {
+            let [Target::Setting(Setting::ImportedJavaModel(key)), ..] = targets.as_slice() else {
                 panic!("expected one imported model result, got {targets:?}");
             };
             let hint = dialog.saved.java_model_hints.search_hint(*key).unwrap();
             assert_eq!(hint.kind(), kind);
             assert_eq!(hint.id, "archive-chat");
+            assert!(
+                !targets[1..]
+                    .iter()
+                    .any(|target| matches!(target, Target::Setting(Setting::ImportedJavaModel(_))))
+            );
 
             let reveal = dialog.update(Message::SearchChoose);
             assert_eq!(dialog.page, Page::LocalModels);
@@ -2087,6 +2126,63 @@ mod tests {
         assert!(
             results("Hugging Face token", None)
                 .any(|target| target == Target::Setting(Setting::Hub(HubSetting::Access)))
+        );
+    }
+
+    #[test]
+    fn ranked_pages_and_punctuation_colliding_model_ids_remain_navigable() {
+        let hints = java_models::import(
+            java_models::Kind::Gguf,
+            br#"<llamaModels><model><id>archive-chat</id><displayName>Archive Model</displayName></model><model><id>archive_chat</id><displayName>Archive Model</displayName></model></llamaModels>"#,
+        )
+        .unwrap()
+        .hints;
+        let mut dialog = Dialog::new(
+            Arc::new(Configuration {
+                java_model_hints: hints,
+                ..Configuration::default()
+            }),
+            PathBuf::new(),
+            Vec::new(),
+            true,
+            None,
+        );
+        let _ = dialog.update(Message::Search("P! ".into()));
+        assert!(dialog.search_results().next().is_none());
+        let _ = dialog.update(Message::Search("PRÓFÎLES!".into()));
+        assert_eq!(
+            dialog.search_results().next(),
+            Some(Target::Page(Page::Profiles))
+        );
+        let _ = dialog.update(Message::SearchChoose);
+        assert_eq!(dialog.page, Page::Profiles);
+        assert!(dialog.search.is_empty());
+
+        let _ = dialog.update(Message::Search("Archive Model".into()));
+        let targets = dialog.search_results().collect::<Vec<_>>();
+        let [
+            Target::Setting(Setting::ImportedJavaModel(first)),
+            Target::Setting(Setting::ImportedJavaModel(second)),
+            ..,
+        ] = targets.as_slice()
+        else {
+            panic!("expected the two distinct model registrations, got {targets:?}");
+        };
+        assert_ne!(first, second);
+        let _ = dialog.update(Message::SearchStep(1));
+        let _ = dialog.update(Message::SearchChoose);
+        assert_eq!(
+            dialog.revealed.setting,
+            Some(Setting::ImportedJavaModel(*second))
+        );
+        assert_eq!(
+            dialog
+                .saved
+                .java_model_hints
+                .search_hint(*second)
+                .unwrap()
+                .id,
+            "archive_chat"
         );
     }
 
@@ -2454,10 +2550,7 @@ mod tests {
         ));
         let mut expected = vec![discard];
         if crate::local_ai::mlx_runtime::supported() {
-            expected.insert(
-                0,
-                Target::Setting(Setting::Hub(HubSetting::DiscardPausedMlx)),
-            );
+            expected.push(Target::Setting(Setting::Hub(HubSetting::DiscardPausedMlx)));
         }
         assert_eq!(dialog.search_results().collect::<Vec<_>>(), expected);
         let _ = dialog.update(Message::Reveal(discard));

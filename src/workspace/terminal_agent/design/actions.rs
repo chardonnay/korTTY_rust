@@ -170,7 +170,10 @@ pub(super) fn step_items(step: &Step, private: bool) -> Vec<Item> {
     {
         choices.push(Item::CopyCommand);
     }
-    if !step.output.is_empty() {
+    if step.captured_output.as_ref().map_or_else(
+        || !step.output.is_empty(),
+        |output| !output.trim().is_empty(),
+    ) {
         choices.push(Item::CopyOutput);
     }
     choices.push(Item::CopyEntry);
@@ -609,11 +612,17 @@ impl Workspace {
         if text.trim().is_empty() {
             return None;
         }
+        let redact: fn(&crate::terminal_logging::Redactor, &str) -> Result<String, String> =
+            if item == Item::CopyOutput {
+                mask::captured_output
+            } else {
+                mask::prompt
+            };
         if let Some(original) = original {
-            text = mask::prompt(original, &text).ok()?;
+            text = redact(original, &text).ok()?;
         }
         let redactor = self.agent_source_redactor(pane).ok()?;
-        let text = mask::prompt(&redactor, &text).ok()?;
+        let text = redact(&redactor, &text).ok()?;
         Some(if item == Item::Snippet {
             PreparedStepAction::Snippet(text)
         } else {
@@ -644,7 +653,10 @@ pub(super) enum PreparedStepAction {
 fn step_text(step: &Step, item: Item) -> String {
     match item {
         Item::CopyCommand => step.command.clone().unwrap_or_default(),
-        Item::CopyOutput => step.output.join("\n"),
+        Item::CopyOutput => step
+            .captured_output
+            .as_deref()
+            .map_or_else(|| step.output.join("\n"), str::to_owned),
         Item::Snippet
             if step
                 .command
@@ -817,10 +829,28 @@ mod tests {
         run.goal = "Inspect the fixture".into();
         run.next(Phase::Thinking, "");
         run.inline_command("printf fixture");
-        run.inline_result(Status::Exited(0), "fixture output", "");
+        let long_line = "frame".repeat(7_000);
+        let private = "late reviewed credential";
+        let start = format!("first output {private}\n{long_line}");
+        let tail = "third\nfourth\nfifth\nsixth\nseventh\neighth\nninth\ntenth";
+        let stderr = "first stderr";
+        run.inline_result(Status::Exited(0), &format!("{start}\n{tail}\n"), stderr);
+        run.inline_command("printf other");
+        run.inline_result(Status::Exited(0), "different step", "");
+        let secrets = crate::terminal_logging::Secrets::default();
+        secrets.add(private);
+        let learned = secrets.seal().unwrap();
+        run.redactor = run.redactor.with_overlay(&learned).unwrap();
+        run.learned_sudo = Some(learned);
         run.next(Phase::Finished, "");
         let step = &run.status_transcript().unwrap().0.steps[0];
         assert_eq!(step_text(step, Item::Snippet), "printf fixture");
+        assert_eq!(step.output.len(), 8);
+        assert!(
+            step.output
+                .iter()
+                .all(|line| !line.starts_with("first output"))
+        );
         let action = Action {
             epoch: run.epoch,
             step: Some(step.id),
@@ -831,7 +861,7 @@ mod tests {
         drop(fixture.send(id, Message::DesignAction(action)));
         assert_eq!(
             fixture.workspace.clipboard.buffer.get().as_deref(),
-            Some("fixture output")
+            Some(format!("first output ***\n{long_line}\n{tail}\n{stderr}").as_str())
         );
         fixture
             .workspace

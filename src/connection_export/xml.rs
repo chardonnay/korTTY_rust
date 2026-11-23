@@ -8,7 +8,6 @@ use crate::connection_store::{
     Auth, AuthMethod, JAVA_ANSI_FIELDS, TerminalOverrides, ThemeOverride, TunnelConfig,
     TunnelTarget, valid_os_badge_reference,
 };
-use crate::session_security::IsolationLevel;
 use crate::terminal_effects::{Selection, Speed};
 use crate::terminal_theme::{CursorStyle, Id, Themes};
 
@@ -74,12 +73,9 @@ pub(super) fn kortty(
             };
             field(&mut xml, "    ", "pasteWarningMode", mode);
         }
-        let isolation = match connection.isolation {
-            IsolationLevel::None => "none",
-            IsolationLevel::Process => "process",
-            IsolationLevel::Sandbox => "sandbox",
-        };
-        field(&mut xml, "    ", "isolationMode", isolation);
+        if let Some(isolation) = connection.isolation_override() {
+            field(&mut xml, "    ", "isolationMode", isolation.id());
+        }
         field(&mut xml, "    ", "incognito", connection.incognito);
         terminal_settings(
             &mut xml,
@@ -132,6 +128,11 @@ pub(super) fn kortty(
         };
         let _ = writeln!(xml, "  <{node}>");
         field(&mut xml, "    ", "name", &profile.name);
+        if let Some(level) = profile.isolation.level() {
+            field(&mut xml, "    ", "isolationMode", level.id());
+        } else if profile.isolation.is_global() {
+            field(&mut xml, "    ", "rustLocalGlobalIsolation", true);
+        }
         terminal_effect(&mut xml, profile.terminal_effect);
         if compatible {
             field(&mut xml, "    ", "protocol", "LOCAL_SHELL");

@@ -32,7 +32,7 @@ const SYSTEM_READ_PATHS: &[&str] = &[
     "/private/etc/passwd",
     "/private/etc/group",
 ];
-const BACKEND: &str = "seatbelt";
+pub(super) const BACKEND: &str = "seatbelt";
 const READY: &[u8] = b"kortty-local-pty-ready-v1\n";
 const ACK: &[u8] = b"kortty-local-pty-start-v1\n";
 
@@ -157,10 +157,7 @@ impl Restrictions {
     }
 }
 
-pub(super) fn prepare(
-    workspace: &Path,
-    profile: &Path,
-) -> io::Result<(Restrictions, SessionDirectory)> {
+pub(super) fn check_available() -> io::Result<libc::uid_t> {
     // SAFETY: these calls return the current process credentials and state.
     let (uid, effective, privileged) =
         unsafe { (libc::getuid(), libc::geteuid(), libc::issetugid()) };
@@ -169,6 +166,29 @@ pub(super) fn prepare(
             "the sandbox requires an unprivileged desktop user",
         ));
     }
+    for path in [SANDBOX_EXEC, SHELL] {
+        let tool = fs::metadata(path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("macOS sandbox system tool {path} is unavailable"),
+            )
+        })?;
+        if !tool.is_file()
+            || tool.uid() != 0
+            || tool.mode() & 0o022 != 0
+            || tool.mode() & 0o111 == 0
+        {
+            return Err(permission("a macOS sandbox system tool is not trusted"));
+        }
+    }
+    Ok(uid)
+}
+
+pub(super) fn prepare(
+    workspace: &Path,
+    profile: &Path,
+) -> io::Result<(Restrictions, SessionDirectory)> {
+    let uid = check_available()?;
     let profile = canonical_protected(profile)?;
     let profile_probe = match profile.metadata() {
         Ok(metadata) if metadata.is_dir() => Some(profile.clone()),
@@ -200,21 +220,6 @@ pub(super) fn prepare(
         return Err(permission(
             "the sandbox workspace must be owned by the current user",
         ));
-    }
-    for path in [SANDBOX_EXEC, SHELL] {
-        let tool = fs::metadata(path).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("macOS sandbox system tool {path} is unavailable"),
-            )
-        })?;
-        if !tool.is_file()
-            || tool.uid() != 0
-            || tool.mode() & 0o022 != 0
-            || tool.mode() & 0o111 == 0
-        {
-            return Err(permission("a macOS sandbox system tool is not trusted"));
-        }
     }
     for root in SYSTEM_PROGRAMS.iter().chain(SYSTEM_READ_PATHS) {
         let system_path = match fs::canonicalize(root) {

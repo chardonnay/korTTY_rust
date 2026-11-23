@@ -20,6 +20,17 @@ struct Material {
 }
 
 impl TemporaryKey {
+    pub(crate) fn from_vault(key: kortty_vault::TemporarySshKey<'_>) -> io::Result<Self> {
+        let deadline = Instant::now()
+            .checked_add(key.remaining)
+            .ok_or_else(|| io::Error::other("Invalid temporary SSH key lifetime."))?;
+        Self::hold(
+            Zeroizing::new(key.private_key.as_bytes().to_vec()),
+            key.options.minutes,
+            deadline,
+        )
+    }
+
     fn new(pasted: Password, minutes: u16) -> io::Result<Self> {
         let text = pasted.as_str().trim();
         if pasted.as_str().len() >= MAX_BYTES
@@ -108,16 +119,19 @@ pub(super) struct Form {
 
 impl Default for Form {
     fn default() -> Self {
+        Self::with_minutes(60)
+    }
+}
+
+impl Form {
+    pub(super) fn with_minutes(minutes: u16) -> Self {
         Self {
-            minutes: "60".into(),
+            minutes: minutes.to_string(),
             key: None,
             pending_paste: None,
             failed_paste: false,
         }
     }
-}
-
-impl Form {
     pub(super) fn set_minutes(&mut self, minutes: String) {
         if minutes.len() <= 4
             && minutes.bytes().all(|byte| byte.is_ascii_digit())

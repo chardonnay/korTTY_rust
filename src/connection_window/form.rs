@@ -11,9 +11,9 @@ use crate::connection_store::custom_os_badges::Catalog;
 use crate::connection_store::{
     Auth, AuthMethod, Connection, MAX_TUNNELS, SavedLogin, TunnelConfig, TunnelRule, TunnelTarget,
 };
-use crate::session_security::IsolationLevel;
+use crate::session_security::{IsolationChoice, IsolationLevel, resolve_isolation};
 use crate::ssh_dialog::{
-    KeepAliveEdit, KeyChoice, LoginTarget, StartupField, StartupFields, normalize_host,
+    KeepAliveEdit, KeyChoice, LoginTarget, Password, StartupField, StartupFields, normalize_host,
 };
 use crate::terminal_effects::{Effect, editor::EffectDraft};
 
@@ -30,7 +30,7 @@ pub enum Edit {
     Tag(String),
     Emulation(TerminalProfile),
     Incognito(bool),
-    Isolation(IsolationLevel),
+    Isolation(IsolationChoice),
     Startup(StartupField, String),
     KeepAlive(KeepAliveEdit),
     Logging(crate::terminal_logging::Edit),
@@ -95,6 +95,9 @@ pub enum LoginEdit {
     KeyPath(String),
     StoredKey(KeyChoice),
     Passphrase(CredentialChoice),
+    TemporaryLifetime(String),
+    TemporaryAutomatic(bool),
+    RemoveTemporaryKey,
 }
 
 #[derive(Clone, Debug)]
@@ -115,6 +118,7 @@ pub enum Method {
     Vault,
     Key,
     StoredKey,
+    TemporaryKey,
     Interactive,
 }
 
@@ -125,6 +129,7 @@ impl fmt::Display for Method {
             Self::Vault => "Vault password",
             Self::Key => "SSH private key",
             Self::StoredKey => "Registered SSH key",
+            Self::TemporaryKey => "Temporary SSH key",
             Self::Interactive => "Keyboard-interactive",
         })
     }
@@ -187,7 +192,7 @@ pub(super) struct Draft {
     tag: String,
     profile: TerminalProfile,
     incognito: bool,
-    isolation: IsolationLevel,
+    isolation: IsolationChoice,
     startup: StartupFields,
     logging: crate::terminal_logging::Form,
     terminal_effect: EffectDraft,
@@ -214,6 +219,27 @@ struct Login {
     key_path: String,
     stored_key: Option<u64>,
     passphrase: String,
+    temporary: TemporaryDraft,
+}
+
+struct TemporaryDraft {
+    credential: Option<String>,
+    minutes: String,
+    automatic: bool,
+    pending: Option<u64>,
+    key: Option<Password>,
+}
+
+impl Default for TemporaryDraft {
+    fn default() -> Self {
+        Self {
+            credential: None,
+            minutes: "60".into(),
+            automatic: false,
+            pending: None,
+            key: None,
+        }
+    }
 }
 
 struct TunnelDraft {
@@ -243,7 +269,7 @@ impl Draft {
             tag: String::new(),
             profile: TerminalProfile::Xterm,
             incognito: false,
-            isolation: IsolationLevel::None,
+            isolation: IsolationChoice::default(),
             startup: StartupFields::new(Default::default()),
             logging: crate::terminal_logging::Form::new(Default::default()),
             terminal_effect: EffectDraft::default(),
@@ -273,7 +299,7 @@ impl Draft {
             tag: connection.tag.clone(),
             profile: connection.profile().unwrap_or(TerminalProfile::Xterm),
             incognito: connection.incognito,
-            isolation: connection.isolation,
+            isolation: IsolationChoice(connection.isolation_override()),
             startup: StartupFields::new(connection.startup),
             logging: crate::terminal_logging::Form::new(connection.logging.clone()),
             terminal_effect: EffectDraft::new(connection.terminal_effect),
@@ -288,8 +314,11 @@ impl Draft {
             } else {
                 connection.window_geometry
             }),
-            login: Login::from_saved(&connection.login),
-            jump: connection.jump.as_ref().map(Login::from_saved),
+            login: Login::from_saved(&connection.login, duplicate),
+            jump: connection
+                .jump
+                .as_ref()
+                .map(|login| Login::from_saved(login, duplicate)),
             tunnels: connection
                 .tunnels
                 .iter()
@@ -297,6 +326,37 @@ impl Draft {
                 .collect(),
             changed: duplicate,
         }
+    }
+
+    pub(super) fn begin_temporary_paste(&mut self, request: u64) -> bool {
+        if self.login.method != Method::TemporaryKey || self.login.endpoint().is_err() {
+            return false;
+        }
+        self.login.temporary.pending = Some(request);
+        true
+    }
+
+    pub(super) fn finish_temporary_paste(&mut self, request: u64, key: Password) -> bool {
+        let draft = &mut self.login.temporary;
+        if draft.pending != Some(request) {
+            return false;
+        }
+        draft.pending = None;
+        let value = key.as_str().trim();
+        if value.is_empty() || value.len() > kortty_vault::MAX_TEMPORARY_SSH_KEY_BYTES {
+            return false;
+        }
+        self.changed = true;
+        draft.key = Some(key);
+        true
+    }
+
+    pub(super) fn pending_temporary_key(&self) -> Option<&Password> {
+        self.login
+            .temporary
+            .key
+            .as_ref()
+            .filter(|_| self.login.method == Method::TemporaryKey)
     }
 
     pub(super) fn os_badge_id(&self) -> Option<&str> {
@@ -407,7 +467,8 @@ impl Draft {
             emulation: self.profile.term_name().into(),
             tunnels,
             incognito: self.incognito,
-            isolation: self.isolation,
+            isolation: self.isolation.0.unwrap_or_default(),
+            inherit_isolation: self.isolation.0.is_none(),
             startup: self.startup.options().map_err(|error| error.to_string())?,
             logging: self.logging.config().map_err(|error| error.to_string())?,
             terminal_effect: self.terminal_effect.selection(),
@@ -426,6 +487,7 @@ impl Draft {
         choices: &ViewChoices<'_>,
         custom_badges: &'a Catalog,
         group: Element<'a, Message>,
+        inherited: Option<(&str, IsolationLevel)>,
     ) -> Element<'a, Message> {
         use crate::workspace::dialog_design;
         use iced::widget::{container, keyed_column, scrollable, space};
@@ -467,18 +529,13 @@ impl Draft {
         .spacing(4);
         let content = match self.page {
             Page::Connection => self.connection_page(choices, custom_badges, group),
-            Page::Settings => self.settings_page(choices),
+            Page::Settings => self.settings_page(choices, inherited),
             Page::Tunnels => self.tunnels_page(),
             Page::JumpHost => column![
                 checkbox(self.jump.is_some())
                     .label("Use a jump host")
                     .on_toggle(|value| Message::Edit(Edit::UseJump(value))),
-                self.jump.as_ref().map(|jump| jump.view(
-                    true,
-                    choices.passwords,
-                    choices.passphrases,
-                    choices.keys,
-                )),
+                self.jump.as_ref().map(|jump| jump.view(true, choices)),
             ]
             .spacing(10)
             .into(),
@@ -523,8 +580,7 @@ impl Draft {
             ]
             .spacing(10)
             .align_y(Alignment::Center),
-            self.login
-                .view(false, choices.passwords, choices.passphrases, choices.keys),
+            self.login.view(false, choices),
             row![
                 text("Tag").width(105),
                 text_input("Tag (optional)", &self.tag)
@@ -550,23 +606,30 @@ impl Draft {
             ]
             .spacing(10)
             .align_y(Alignment::Center),
-            checkbox(self.incognito)
-                .label(if choices.incognito_allowed {
-                    "Incognito session"
-                } else {
-                    "Incognito session · managed policy"
-                })
-                .on_toggle_maybe(
-                    choices
-                        .incognito_allowed
-                        .then_some(|value| Message::Edit(Edit::Incognito(value)))
-                ),
+            self.startup
+                .view(168.0)
+                .map(|(field, value)| Message::Edit(Edit::Startup(field, value))),
+            self.startup
+                .keepalive_view(168.0)
+                .map(|edit| Message::Edit(Edit::KeepAlive(edit))),
         ]
         .spacing(10)
         .into()
     }
 
-    fn settings_page<'a>(&'a self, choices: &ViewChoices<'_>) -> Element<'a, Message> {
+    fn settings_page<'a>(
+        &'a self,
+        choices: &ViewChoices<'_>,
+        inherited: Option<(&str, IsolationLevel)>,
+    ) -> Element<'a, Message> {
+        let (level, source) = resolve_isolation(
+            choices.isolation.0,
+            inherited,
+            self.isolation.0,
+            None,
+            false,
+            choices.isolation.1,
+        );
         let paste_choice = |mode| PasteChoice {
             mode,
             default: choices.default_paste_warning,
@@ -612,23 +675,31 @@ impl Draft {
                     text(format!("Organization minimum · {}", choices.minimum_paste_warning)).size(13)
                 }),
             ].spacing(5),
-            row![
-                text("SSH isolation"),
-                pick_list(
-                    [
-                        IsolationLevel::None,
-                        IsolationLevel::Process,
-                        IsolationLevel::Sandbox
-                    ],
-                    Some(self.isolation),
-                    |value| Message::Edit(Edit::Isolation(value))
+            column![
+                text("Session isolation").size(16),
+                terminal_overrides::isolation_row(
+                    "Isolation",
+                    pick_list(
+                        IsolationChoice::ALL,
+                        Some(self.isolation),
+                        |value| Message::Edit(Edit::Isolation(value))
+                    ).width(Length::Fill),
                 ),
+                text(format!("Effective isolation · {level} · {source}")).size(13),
+                self.terminal.strict_mode_view().map(|edit| Message::Edit(Edit::Terminal(edit))),
+                checkbox(self.incognito)
+                    .label(if choices.incognito_allowed {
+                        "Incognito session"
+                    } else {
+                        "Incognito session · managed policy"
+                    })
+                    .on_toggle_maybe(
+                        choices
+                            .incognito_allowed
+                            .then_some(|value| Message::Edit(Edit::Incognito(value)))
+                    ),
             ]
-            .spacing(8),
-            self.startup
-                .view(135.0)
-                .map(|(field, value)| Message::Edit(Edit::Startup(field, value))),
-            self.startup.keepalive_view(135.0).map(|edit| Message::Edit(Edit::KeepAlive(edit))),
+            .spacing(6),
             self.terminal.view(choices).map(|edit| Message::Edit(Edit::Terminal(edit))),
         ]
         .spacing(8);
@@ -663,29 +734,6 @@ impl Draft {
     }
 }
 
-#[cfg(test)]
-mod page_tests {
-    use super::*;
-
-    #[test]
-    fn switching_pages_preserves_the_draft_without_making_it_dirty() {
-        let mut draft = Draft::new();
-        draft.update(Edit::Page(Page::JumpHost));
-        assert!(!draft.changed);
-        draft.update(Edit::UseJump(true));
-        draft.update(Edit::Login(true, LoginEdit::Host("jump.example".into())));
-        draft.update(Edit::Page(Page::Connection));
-        draft.update(Edit::Name("Build host".into()));
-        draft.update(Edit::Login(false, LoginEdit::Host("build.example".into())));
-        draft.update(Edit::Page(Page::Logging));
-
-        let connection = draft.connection().unwrap();
-        assert_eq!(connection.name, "Build host");
-        assert_eq!(connection.login.endpoint.host, "build.example");
-        assert_eq!(connection.jump.unwrap().endpoint.host, "jump.example");
-    }
-}
-
 impl Login {
     fn new() -> Self {
         Self {
@@ -698,10 +746,11 @@ impl Login {
             key_path: String::new(),
             stored_key: None,
             passphrase: String::new(),
+            temporary: TemporaryDraft::default(),
         }
     }
 
-    fn from_saved(login: &SavedLogin) -> Self {
+    fn from_saved(login: &SavedLogin, duplicate: bool) -> Self {
         let mut form = Self::new();
         form.host = login.endpoint.host.clone();
         form.port = login.endpoint.port.to_string();
@@ -723,6 +772,16 @@ impl Login {
                 form.method = Method::StoredKey;
                 form.stored_key = Some(*id);
             }
+            Auth::TemporaryKey {
+                credential,
+                minutes,
+                automatic,
+            } => {
+                form.method = Method::TemporaryKey;
+                form.temporary.credential = if duplicate { None } else { credential.clone() };
+                form.temporary.minutes = minutes.to_string();
+                form.temporary.automatic = *automatic;
+            }
             Auth::Configured {
                 method,
                 credential,
@@ -742,6 +801,13 @@ impl Login {
     }
 
     fn update(&mut self, edit: LoginEdit) {
+        if matches!(
+            edit,
+            LoginEdit::Host(_) | LoginEdit::Port(_) | LoginEdit::Username(_) | LoginEdit::Method(_)
+        ) {
+            self.temporary.pending = None;
+            self.temporary.key = None;
+        }
         match edit {
             LoginEdit::Host(value) => self.host = bounded(value, 256),
             LoginEdit::Port(value) => self.port = bounded(value, 8),
@@ -762,10 +828,17 @@ impl Login {
             LoginEdit::KeyPath(value) => self.key_path = bounded(value, 4096),
             LoginEdit::StoredKey(key) => self.stored_key = Some(key.id),
             LoginEdit::Passphrase(credential) => self.passphrase = credential.id,
+            LoginEdit::TemporaryLifetime(minutes) => self.temporary.minutes = bounded(minutes, 4),
+            LoginEdit::TemporaryAutomatic(enabled) => self.temporary.automatic = enabled,
+            LoginEdit::RemoveTemporaryKey => {
+                self.temporary.credential = None;
+                self.temporary.key = None;
+                self.temporary.pending = None;
+            }
         }
     }
 
-    fn saved(&self) -> Result<SavedLogin, &'static str> {
+    fn endpoint(&self) -> Result<LoginTarget, &'static str> {
         let endpoint = LoginTarget {
             host: normalize_host(&self.host).map_err(|_| "Enter a hostname or IP address.")?,
             port: port(&self.port).ok_or("Enter a port from 1 to 65535.")?,
@@ -774,6 +847,11 @@ impl Login {
         endpoint
             .validate_saved()
             .map_err(|_| "Enter a valid SSH username.")?;
+        Ok(endpoint)
+    }
+
+    fn saved(&self) -> Result<SavedLogin, &'static str> {
+        let endpoint = self.endpoint()?;
         let auth = match self.method {
             Method::Ask if self.stored_key.is_some() => Auth::Configured {
                 method: AuthMethod::Password,
@@ -814,6 +892,17 @@ impl Login {
                 }
             }
             Method::StoredKey => Auth::StoredKey(self.stored_key.unwrap_or_default()),
+            Method::TemporaryKey => Auth::TemporaryKey {
+                credential: self.temporary.credential.clone(),
+                minutes: self
+                    .temporary
+                    .minutes
+                    .parse()
+                    .ok()
+                    .filter(|minutes| (1..=1440).contains(minutes))
+                    .ok_or("Enter a temporary SSH key lifetime from 1 to 1440 minutes.")?,
+                automatic: self.temporary.automatic,
+            },
         };
         Ok(SavedLogin {
             endpoint,
@@ -822,14 +911,18 @@ impl Login {
         })
     }
 
-    fn view<'a>(
-        &'a self,
-        jump: bool,
-        passwords: &[CredentialChoice],
-        passphrases: &[CredentialChoice],
-        keys: &[KeyChoice],
-    ) -> Element<'a, Message> {
+    fn view<'a>(&'a self, jump: bool, choices: &ViewChoices<'_>) -> Element<'a, Message> {
         let edit = move |edit| Message::Edit(Edit::Login(jump, edit));
+        let mut methods = vec![
+            Method::Ask,
+            Method::Vault,
+            Method::Key,
+            Method::StoredKey,
+            Method::Interactive,
+        ];
+        if (!jump && choices.temporary_keys) || self.method == Method::TemporaryKey {
+            methods.push(Method::TemporaryKey);
+        }
         let mut fields = column![
             row![
                 text_input("Hostname or IP", &self.host)
@@ -841,24 +934,16 @@ impl Login {
                     .on_input(move |value| edit(LoginEdit::Username(value))),
             ]
             .spacing(8),
-            pick_list(
-                [
-                    Method::Ask,
-                    Method::Vault,
-                    Method::Key,
-                    Method::StoredKey,
-                    Method::Interactive
-                ],
-                Some(self.method),
-                move |method| edit(LoginEdit::Method(method))
-            ),
+            pick_list(methods, Some(self.method), move |method| edit(
+                LoginEdit::Method(method)
+            )),
         ]
         .spacing(8);
         match self.method {
             Method::Ask | Method::Interactive => {}
             Method::Vault => {
                 let (choices, selected) =
-                    CredentialChoice::options(passwords, &self.password, false);
+                    CredentialChoice::options(choices.passwords, &self.password, false);
                 fields = fields.push(
                     pick_list(choices, selected, move |choice| {
                         edit(LoginEdit::Password(choice))
@@ -868,7 +953,7 @@ impl Login {
             }
             Method::Key => {
                 let (choices, selected) =
-                    CredentialChoice::options(passphrases, &self.passphrase, true);
+                    CredentialChoice::options(choices.passphrases, &self.passphrase, true);
                 fields = fields
                     .push(
                         text_input("Absolute private key path", &self.key_path)
@@ -881,12 +966,61 @@ impl Login {
             Method::StoredKey => {
                 fields = fields.push(
                     pick_list(
-                        keys.to_vec(),
-                        KeyChoice::selected(keys, self.stored_key),
+                        choices.keys.to_vec(),
+                        KeyChoice::selected(choices.keys, self.stored_key),
                         move |key| edit(LoginEdit::StoredKey(key)),
                     )
                     .placeholder("Select a registered SSH key"),
                 );
+            }
+            Method::TemporaryKey => {
+                let key = &self.temporary;
+                let can_write = choices.temporary_keys && choices.vault_unlocked && !jump;
+                let can_set_options = can_write && (key.credential.is_none() || key.key.is_some());
+                fields = fields
+                    .push(
+                        text(if key.key.is_some() {
+                            "Private key pasted. Save to verify and store it."
+                        } else if key.credential.is_some() {
+                            "Private key saved in the credential vault."
+                        } else {
+                            "Paste a private key for this SSH account."
+                        })
+                        .size(13),
+                    )
+                    .push(
+                        row![
+                            text_input("1–1440", &key.minutes).width(88).on_input_maybe(
+                                can_set_options.then_some(move |minutes| edit(
+                                    LoginEdit::TemporaryLifetime(minutes)
+                                ))
+                            ),
+                            text("minutes"),
+                            button("Paste private key")
+                                .on_press_maybe(can_write.then_some(Message::PasteTemporaryKey)),
+                            button("Remove key").on_press_maybe(
+                                (choices.vault_unlocked
+                                    && (key.credential.is_some() || key.key.is_some()))
+                                .then_some(edit(LoginEdit::RemoveTemporaryKey)),
+                            ),
+                        ]
+                        .spacing(8)
+                        .wrap(),
+                    )
+                    .push(
+                        checkbox(key.automatic)
+                            .label("Select the saved key automatically until it expires")
+                            .on_toggle_maybe(can_set_options.then_some(move |enabled| {
+                                edit(LoginEdit::TemporaryAutomatic(enabled))
+                            })),
+                    );
+                if !choices.vault_unlocked {
+                    fields =
+                        fields.push(button("Open Credential Vault…").on_press(Message::OpenVault));
+                } else if key.credential.is_some() && key.key.is_none() {
+                    fields = fields
+                        .push(text("Paste a replacement to change the key’s lifetime.").size(13));
+                }
             }
         }
         if self.method != Method::Interactive {
@@ -1040,4 +1174,59 @@ fn port(value: &str) -> Option<u16> {
         return None;
     }
     value.parse().ok().filter(|&port| port != 0)
+}
+
+#[cfg(test)]
+mod page_tests {
+    use super::*;
+
+    #[test]
+    fn switching_pages_preserves_the_draft_without_making_it_dirty() {
+        let mut draft = Draft::new();
+        draft.update(Edit::Page(Page::JumpHost));
+        assert!(!draft.changed);
+        draft.update(Edit::UseJump(true));
+        draft.update(Edit::Login(true, LoginEdit::Host("jump.example".into())));
+        draft.update(Edit::Page(Page::Connection));
+        draft.update(Edit::Name("Build host".into()));
+        draft.update(Edit::Login(false, LoginEdit::Host("build.example".into())));
+        draft.update(Edit::Page(Page::Logging));
+
+        let connection = draft.connection().unwrap();
+        assert_eq!(connection.name, "Build host");
+        assert_eq!(connection.login.endpoint.host, "build.example");
+        assert_eq!(connection.jump.unwrap().endpoint.host, "jump.example");
+    }
+
+    #[test]
+    fn temporary_keys_survive_unrelated_edits_but_require_a_new_key_on_duplicate() {
+        let mut draft = Draft::new();
+        draft.update(Edit::Name("Fixture".into()));
+        draft.update(Edit::Login(false, LoginEdit::Host("ssh.example".into())));
+        draft.update(Edit::Login(false, LoginEdit::Method(Method::TemporaryKey)));
+        let mut saved = draft.connection().unwrap();
+        let reference = "a".repeat(32);
+        saved.login.auth = Auth::TemporaryKey {
+            credential: Some(reference.clone()),
+            minutes: 30,
+            automatic: true,
+        };
+
+        let mut edited = Draft::from_profile(&saved, None, false);
+        edited.update(Edit::Tag("Development".into()));
+        assert_eq!(edited.connection().unwrap().login.auth, saved.login.auth);
+
+        let mut duplicate = Draft::from_profile(&saved, None, true);
+        assert!(matches!(
+            duplicate.connection().unwrap().login.auth,
+            Auth::TemporaryKey {
+                credential: None,
+                ..
+            }
+        ));
+        assert!(duplicate.begin_temporary_paste(10));
+        duplicate.update(Edit::Login(false, LoginEdit::Username("other".into())));
+        assert!(!duplicate.finish_temporary_paste(10, Password::new("fixture".into())));
+        assert!(duplicate.pending_temporary_key().is_none());
+    }
 }

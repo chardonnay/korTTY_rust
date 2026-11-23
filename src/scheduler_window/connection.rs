@@ -250,7 +250,7 @@ impl SharedTargets {
                     pin: find_pin(&login.endpoint),
                 })
             });
-            let auth = if entry.connection.incognito || !entry.connection.isolation.is_none() {
+            let auth = if entry.connection.incognito || store.teamwork_requires_isolation(entry) {
                 None
             } else {
                 binding(entry)
@@ -354,7 +354,7 @@ impl SharedTargets {
             let saved = store
                 .get(reference.id)
                 .ok_or("The saved SSH route is unavailable.")?;
-            if saved.incognito || !saved.isolation.is_none() {
+            if saved.incognito || store.connection_requires_isolation(saved) {
                 return Err(
                     "This saved connection requires privacy or isolation unavailable to jobs.",
                 );
@@ -461,7 +461,7 @@ fn local_jump_profile<'a>(store: &'a Store, shared: &SavedLogin) -> Option<&'a C
     let mut matches = store.connections().iter().filter(|profile| {
         profile.jump.is_none()
             && !profile.incognito
-            && profile.isolation.is_none()
+            && !store.connection_requires_isolation(profile)
             && profile.login.endpoint == shared.endpoint
             && profile.login.auth.method() == shared.auth.method()
             && !profile.login.keyboard_interactive

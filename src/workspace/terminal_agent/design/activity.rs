@@ -48,6 +48,7 @@ pub enum Change {
 pub(in crate::workspace::terminal_agent) struct Panel {
     pub(in crate::workspace::terminal_agent) height: f32,
     pub(super) preview: Option<f32>,
+    pub(super) resized: bool,
     pub(in crate::workspace::terminal_agent) collapsed: bool,
     pub(super) keep_collapsed: bool,
     pub(in crate::workspace::terminal_agent) expand_all: bool,
@@ -58,6 +59,7 @@ impl Default for Panel {
         Self {
             height: Height::DEFAULT,
             preview: None,
+            resized: false,
             collapsed: false,
             keep_collapsed: false,
             expand_all: false,
@@ -166,6 +168,7 @@ impl Workspace {
         }
         let height = panel.preview.take()?;
         panel.height = height;
+        panel.resized = true;
         if !run.binding.private()
             && self.window_settings.agent_remember_activity_font == Some(true)
             && self.window_settings.agent_activity_height != Some(height)

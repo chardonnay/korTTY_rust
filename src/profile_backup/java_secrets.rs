@@ -19,6 +19,7 @@ use zeroize::Zeroizing;
 
 pub(in crate::profile_backup) mod keys;
 pub(in crate::profile_backup) mod passwords;
+pub(in crate::profile_backup) mod temporary_keys;
 
 const ITERATIONS: u32 = 310_000;
 const SALT_BYTES: usize = 32;
@@ -30,9 +31,6 @@ const MAX_MASTER_FILE_BYTES: usize = 4096;
 const MAX_XML_NODES: u32 = 32_768;
 #[cfg(test)]
 const MAX_FIELD_BYTES: usize = 64 * 1024;
-#[cfg(test)]
-const MAX_TEMPORARY_KEY_BYTES: usize = 128 * 1024;
-#[cfg(test)]
 const TEMPORARY_KEY_PREFIX: &str = "enc:";
 const JAVA_BASE64: GeneralPurpose = GeneralPurpose::new(
     &STANDARD,
@@ -77,7 +75,6 @@ impl<'a> JavaSecrets<'a> {
         decrypt(envelope, &key)
     }
 
-    #[cfg(test)]
     fn decrypt_temporary_key(&self, encoded: &str) -> io::Result<Secret> {
         let ciphertext = encoded
             .strip_prefix(TEMPORARY_KEY_PREFIX)
@@ -88,7 +85,10 @@ impl<'a> JavaSecrets<'a> {
                 "The Java KorTTY backup has no master.key for its temporary SSH key.",
             )
         })?;
-        decrypt(decode_envelope(ciphertext, MAX_TEMPORARY_KEY_BYTES)?, key)
+        decrypt(
+            decode_envelope(ciphertext, kortty_vault::MAX_TEMPORARY_SSH_KEY_BYTES)?,
+            key,
+        )
     }
 }
 

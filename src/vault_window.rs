@@ -68,6 +68,9 @@ pub enum Message {
     DeleteEntry,
     ConfirmDelete,
     ChangeMaster,
+    ReviewStartupUnlock,
+    RememberStartupUnlock,
+    ForgetStartupUnlock,
     Backup,
     ManageEnvironments,
     Environment(iced::window::Id, environment_access::Message),
@@ -112,6 +115,7 @@ pub enum Kind {
     HuggingFaceToken,
     QdrantApiKey,
     SkillProviderCredential,
+    TemporarySshKey,
     SudoPassword,
     SudoGroupPassword,
     JobWebhookUrl,
@@ -127,6 +131,7 @@ impl Kind {
             Self::HuggingFaceToken => CredentialKind::HuggingFaceToken,
             Self::QdrantApiKey => CredentialKind::QdrantApiKey,
             Self::SkillProviderCredential => CredentialKind::SkillProviderCredential,
+            Self::TemporarySshKey => CredentialKind::TemporarySshKey,
             Self::SudoPassword => CredentialKind::SudoPassword,
             Self::SudoGroupPassword => CredentialKind::SudoGroupPassword,
             Self::JobWebhookUrl => CredentialKind::JobWebhookUrl,
@@ -142,6 +147,7 @@ impl Kind {
             CredentialKind::HuggingFaceToken => Self::HuggingFaceToken,
             CredentialKind::QdrantApiKey => Self::QdrantApiKey,
             CredentialKind::SkillProviderCredential => Self::SkillProviderCredential,
+            CredentialKind::TemporarySshKey => Self::TemporarySshKey,
             CredentialKind::SudoPassword => Self::SudoPassword,
             CredentialKind::SudoGroupPassword => Self::SudoGroupPassword,
             CredentialKind::JobWebhookUrl => Self::JobWebhookUrl,
@@ -153,7 +159,10 @@ impl Kind {
         self.native().is_ssh()
             || matches!(
                 self,
-                Self::SudoPassword | Self::SudoGroupPassword | Self::PasswordCommand
+                Self::SudoPassword
+                    | Self::SudoGroupPassword
+                    | Self::PasswordCommand
+                    | Self::TemporarySshKey
             )
     }
 
@@ -171,6 +180,7 @@ impl fmt::Display for Kind {
             Self::HuggingFaceToken => "Hugging Face access token",
             Self::QdrantApiKey => "Qdrant API key",
             Self::SkillProviderCredential => "External skill provider credential",
+            Self::TemporarySshKey => "Temporary SSH private key",
             Self::SudoPassword => "Scheduler sudo password",
             Self::SudoGroupPassword => "Scheduler group sudo password",
             Self::JobWebhookUrl => "Scheduler webhook URL",
@@ -328,6 +338,7 @@ struct UnlockPrompt {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Operation {
     ChangeMaster,
+    StartupUnlock,
     Backup,
     Delete,
     Restore,
@@ -865,6 +876,26 @@ impl VaultWindow {
         self.busy = false;
     }
 
+    pub(crate) fn temporary_ssh_key(
+        &self,
+        id: &str,
+        endpoint: &LoginTarget,
+        automatic: bool,
+    ) -> Result<crate::ssh_dialog::TemporaryKey, &'static str> {
+        let vault = self.vault.as_ref().ok_or(VAULT_LOCKED)?;
+        let key = vault
+            .temporary_ssh_key(
+                id,
+                (&endpoint.host, endpoint.port, &endpoint.username),
+            )
+            .ok_or("The saved temporary key expired, was removed, or belongs to another SSH target. Paste a new key.")?;
+        if automatic && !key.options.automatic {
+            return Err("Select the saved temporary SSH key before connecting.");
+        }
+        crate::ssh_dialog::TemporaryKey::from_vault(key)
+            .map_err(|_| "Could not load the saved temporary SSH key.")
+    }
+
     pub(crate) fn environment_usage(&self, id: &str) -> Option<usize> {
         Some(
             self.vault
@@ -961,6 +992,46 @@ impl VaultWindow {
             } else {
                 self.master_confirmed(&self.primary)
             }
+    }
+
+    fn try_remembered(&mut self) -> Task<Message> {
+        let path = self.path.clone();
+        self.busy = true;
+        Task::future(async move {
+            let result = Vault::unlock_remembered(path);
+            let status = result
+                .as_ref()
+                .map(|_| "Vault unlocked.")
+                .map_err(ToString::to_string);
+            Message::Completed(Completion(Arc::new(Mutex::new(Some(Finished {
+                vault: result.ok(),
+                status,
+                selected: None,
+                recovery_key_changed: false,
+            })))))
+        })
+    }
+
+    fn forget_startup_unlock(&mut self) -> Task<Message> {
+        const STATUS: &str = "Automatic vault unlock disabled.";
+        if self.is_unlocked() {
+            return self.mutate(false, |vault| {
+                vault.forget_startup_unlock().map(|()| (None, STATUS))
+            });
+        }
+        let path = self.path.clone();
+        self.busy = true;
+        Task::future(async move {
+            let status = Vault::forget_locked_startup_unlock(path)
+                .map(|()| STATUS)
+                .map_err(|error| error.to_string());
+            Message::Completed(Completion(Arc::new(Mutex::new(Some(Finished {
+                vault: None,
+                status,
+                selected: None,
+                recovery_key_changed: false,
+            })))))
+        })
     }
 
     fn save_entry(&mut self, update_secret: Secret) -> Task<Message> {
@@ -1085,7 +1156,10 @@ impl VaultWindow {
             }
             Message::EditSelected if self.draft.is_none() && self.operation.is_none() => {
                 self.revoke_webhook_test();
-                self.draft = self.selected_entry().map(EntryDraft::from_entry);
+                self.draft = self
+                    .selected_entry()
+                    .filter(|entry| entry.kind != CredentialKind::TemporarySshKey)
+                    .map(EntryDraft::from_entry);
             }
             Message::Field(field) => {
                 if let Some(draft) = &mut self.draft {
@@ -1141,9 +1215,30 @@ impl VaultWindow {
                     });
                 }
             }
-            Message::ChangeMaster if self.draft.is_none() && self.operation.is_none() => {
+            Message::ChangeMaster
+                if self.exists && self.draft.is_none() && self.operation.is_none() =>
+            {
                 self.revoke_webhook_test();
                 self.operation = Some(Operation::ChangeMaster);
+            }
+            Message::ReviewStartupUnlock
+                if self.exists && self.draft.is_none() && self.operation.is_none() =>
+            {
+                self.revoke_webhook_test();
+                self.operation = Some(Operation::StartupUnlock);
+            }
+            Message::RememberStartupUnlock
+                if self.is_unlocked() && self.operation == Some(Operation::StartupUnlock) =>
+            {
+                self.operation = None;
+                return self.mutate(false, |vault| {
+                    vault
+                        .remember_startup_unlock()
+                        .map(|()| (None, "Automatic vault unlock enabled on this device."))
+                });
+            }
+            Message::ForgetStartupUnlock if self.draft.is_none() && self.operation.is_none() => {
+                return self.forget_startup_unlock();
             }
             Message::Backup if self.draft.is_none() && self.operation.is_none() => {
                 self.revoke_webhook_test();
@@ -1154,7 +1249,9 @@ impl VaultWindow {
                 self.operation = Some(Operation::Restore);
             }
             Message::BackupPath(value) => self.backup_path = bound(value, 4096),
-            Message::SubmitMaster if self.operation == Some(Operation::ChangeMaster) => {
+            Message::SubmitMaster
+                if self.is_unlocked() && self.operation == Some(Operation::ChangeMaster) =>
+            {
                 if self.primary.is_empty() || !self.master_confirmed(&self.next_master) {
                     return Task::none();
                 }
@@ -1163,9 +1260,16 @@ impl VaultWindow {
                 self.confirm = Secret::default();
                 self.operation = None;
                 return self.mutate(true, move |vault| {
-                    vault
-                        .change_master_password(old.as_bytes(), new.as_bytes())
-                        .map(|()| (None, "Master password changed."))
+                    let changed = vault.change_master_password(old.as_bytes(), new.as_bytes());
+                    let refresh_failed = matches!(changed, Ok(()) | Err(VaultError::Durability(_)))
+                        && vault.refresh_startup_unlock().is_err();
+                    changed.map(|()| {
+                        (None, if refresh_failed {
+                            "Master password changed. Automatic unlock needs attention in Security settings."
+                        } else {
+                            "Master password changed."
+                        })
+                    })
                 });
             }
             Message::SubmitBackup if self.operation == Some(Operation::Backup) => {
@@ -1195,7 +1299,16 @@ impl VaultWindow {
                     self.exists = exists;
                 }
                 if finished.status.is_ok() {
+                    let resume_operation = self.operation.filter(|operation| {
+                        self.vault.is_none()
+                            && matches!(
+                                operation,
+                                Operation::ChangeMaster | Operation::StartupUnlock
+                            )
+                            && finished.vault.is_some()
+                    });
                     self.clear_form();
+                    self.operation = resume_operation;
                 }
                 self.vault = finished.vault;
                 self.sudo_revision = Arc::new(());
@@ -1266,15 +1379,19 @@ impl VaultWindow {
         }
         if let Some(vault) = &self.vault {
             let editing = self.operation.is_some() || self.draft.is_some();
-            let selected = self.selected_entry().is_some() && !editing;
+            let entry = self.selected_entry().filter(|_| !editing);
             contents = contents.push(
                 row![
                     button("New credential")
                         .on_press_maybe((!editing).then_some(Message::NewEntry)),
-                    button("Edit").on_press_maybe(selected.then_some(Message::EditSelected)),
+                    button("Edit").on_press_maybe(
+                        entry
+                            .is_some_and(|entry| entry.kind != CredentialKind::TemporarySshKey)
+                            .then_some(Message::EditSelected)
+                    ),
                     button("Delete")
                         .style(button::danger)
-                        .on_press_maybe(selected.then_some(Message::DeleteEntry)),
+                        .on_press_maybe(entry.is_some().then_some(Message::DeleteEntry)),
                     button("Change master password")
                         .on_press_maybe((!editing).then_some(Message::ChangeMaster)),
                     button("Encrypted backup")
@@ -1352,7 +1469,11 @@ impl VaultWindow {
         }
         contents = contents
             .push(
-                text(if self.exists {
+                text(if self.operation == Some(Operation::ChangeMaster) {
+                    "Unlock the vault to change its master password"
+                } else if self.operation == Some(Operation::StartupUnlock) {
+                    "Unlock the vault to configure automatic unlock"
+                } else if self.exists {
                     "Unlock the vault"
                 } else {
                     "Create a new vault"
@@ -1391,6 +1512,8 @@ impl VaultWindow {
         .spacing(8);
         if !self.exists {
             actions = actions.push(button("Restore encrypted backup").on_press(Message::Restore));
+        } else if self.operation == Some(Operation::StartupUnlock) {
+            actions = actions.push(button("Cancel").on_press(Message::CancelEdit));
         }
         contents.push(actions).into()
     }
@@ -1476,6 +1599,23 @@ impl VaultWindow {
                 .spacing(8)
                 .into();
             }
+            Some(Operation::StartupUnlock) => {
+                return column![
+                    text("Automatically unlock the vault on this device?").size(18),
+                    text(
+                        "kortty will store the vault unlock key in this device’s credential store."
+                    )
+                    .wrapping(text::Wrapping::WordOrGlyph),
+                    row![
+                        button("Enable automatic unlock").on_press(Message::RememberStartupUnlock),
+                        button("Cancel").on_press(Message::CancelEdit),
+                    ]
+                    .spacing(8)
+                    .wrap(),
+                ]
+                .spacing(8)
+                .into();
+            }
             Some(Operation::Backup) => {
                 return column![
                     text_input("Absolute path to a new backup file", &self.backup_path)
@@ -1510,7 +1650,9 @@ impl VaultWindow {
             let kind = Kind::from_native(entry.kind);
             let scope_label = match kind {
                 Kind::SudoGroupPassword => "Connection group",
-                Kind::SudoPassword | Kind::PasswordCommand => "SSH endpoint",
+                Kind::SudoPassword | Kind::PasswordCommand | Kind::TemporarySshKey => {
+                    "SSH endpoint"
+                }
                 _ => "Host pattern",
             };
             let scope = if entry.server_pattern.is_empty() {
@@ -1756,6 +1898,7 @@ impl EntryDraft {
                     }
                     Kind::Password | Kind::KeyPassphrase => !self.secret.is_empty(),
                     Kind::PasswordCommand => !self.password_program.is_empty(),
+                    Kind::TemporarySshKey => false,
                 })
     }
 
@@ -2110,6 +2253,37 @@ mod tests {
                 && input.server_pattern.is_empty()
                 && input.environment.is_empty()
         );
+    }
+
+    #[test]
+    fn password_change_requested_while_locked_opens_after_unlock() {
+        let profile = crate::snippets::tests::Profile::new();
+        let path = profile.0.join("vault.bin");
+        let master = test_vault_password();
+        let wrong = test_vault_password();
+        drop(Vault::create(&path, &master[..]).unwrap());
+        let mut window = VaultWindow::open(path.clone()).unwrap();
+
+        let _ = window.update(Message::ChangeMaster);
+        let _ = window.update(Message::Completed(Completion::unlock_fixture(
+            &path,
+            &wrong[..],
+            false,
+        )));
+        assert!(!window.is_unlocked());
+        assert!(window.operation == Some(Operation::ChangeMaster));
+
+        let _ = window.update(Message::Completed(Completion::unlock_fixture(
+            &path,
+            &master[..],
+            true,
+        )));
+        assert!(window.is_unlocked());
+        assert!(window.operation == Some(Operation::ChangeMaster));
+        assert!(window.primary.is_empty());
+        assert!(window.next_master.is_empty());
+        window.close_form();
+        assert!(window.operation.is_none());
     }
 
     #[test]

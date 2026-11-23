@@ -28,6 +28,7 @@ const WEBHOOK_WITH_SETTINGS: u8 = 6;
 const QDRANT_API_KEY: u8 = 8;
 const SSH_PASSWORD_COMMAND: u8 = 9;
 const SKILL_PROVIDER_CREDENTIAL: u8 = 10;
+const TEMPORARY_SSH_KEY: u8 = 11;
 const SALT_START: usize = MAGIC.len() + 1 + 3 * size_of::<u32>();
 const NONCE_START: usize = SALT_START + SALT_BYTES;
 const HEADER_BYTES: usize = NONCE_START + NONCE_BYTES;
@@ -129,8 +130,15 @@ pub(super) fn authenticate(
 ) -> Result<(Salt, Key, BTreeMap<String, Entry>), Error> {
     let salt = salt(snapshot)?;
     let key = derive_key(master, &salt)?;
-    let entries = decode(&open(snapshot, &key)?)?;
+    let entries = authenticate_key(snapshot, &key)?;
     Ok((salt, key, entries))
+}
+
+pub(super) fn authenticate_key(
+    snapshot: &[u8],
+    key: &Key,
+) -> Result<BTreeMap<String, Entry>, Error> {
+    decode(&open(snapshot, key)?)
 }
 
 pub(super) fn salt(snapshot: &[u8]) -> Result<Salt, Error> {
@@ -204,6 +212,7 @@ pub(super) fn seal<'a>(
             CredentialKind::QdrantApiKey => QDRANT_API_KEY,
             CredentialKind::SshPasswordCommand => SSH_PASSWORD_COMMAND,
             CredentialKind::SkillProviderCredential => SKILL_PROVIDER_CREDENTIAL,
+            CredentialKind::TemporarySshKey => TEMPORARY_SSH_KEY,
         });
         for field in fields(entry) {
             bytes.extend_from_slice(&(field.len() as u32).to_be_bytes());
@@ -268,6 +277,7 @@ fn decode(mut plaintext: &[u8]) -> Result<BTreeMap<String, Entry>, Error> {
             QDRANT_API_KEY => CredentialKind::QdrantApiKey,
             SSH_PASSWORD_COMMAND => CredentialKind::SshPasswordCommand,
             SKILL_PROVIDER_CREDENTIAL => CredentialKind::SkillProviderCredential,
+            TEMPORARY_SSH_KEY => CredentialKind::TemporarySshKey,
             _ => return Err(Error::InvalidFormat),
         };
         let mut entry = Entry {

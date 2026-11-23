@@ -154,8 +154,8 @@ impl Output {
     fn masked(&self, redactor: &Redactor) -> Result<Self, String> {
         // A password learned after an earlier command must be masked before
         // taking a tail or escaping quotes and backslashes for JSON.
-        let stdout = Zeroizing::new(mask::prompt(redactor, &self.stdout)?);
-        let stderr = Zeroizing::new(mask::prompt(redactor, &self.stderr)?);
+        let stdout = Zeroizing::new(mask::captured_output(redactor, &self.stdout)?);
+        let stderr = Zeroizing::new(mask::captured_output(redactor, &self.stderr)?);
         let (stdout, stdout_truncated) = tail(&stdout, self.stdout_truncated);
         let (stderr, stderr_truncated) = tail(&stderr, self.stderr_truncated);
         Ok(Self {

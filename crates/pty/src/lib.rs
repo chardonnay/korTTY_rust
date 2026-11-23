@@ -52,6 +52,31 @@ pub use parent_exit::{ParentExit, ParentGuard};
 #[cfg(unix)]
 pub use platform::limit_pdf_worker;
 pub use platform::{PtyReader, PtyWriter};
+
+/// Checks local terminal sandbox prerequisites. Each launch still verifies its workspace and containment.
+pub fn local_sandbox_backend() -> io::Result<&'static str> {
+    #[cfg(any(windows, target_os = "macos"))]
+    return platform::local_sandbox_backend();
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        target_pointer_width = "64",
+        target_endian = "little",
+    ))]
+    return linux_sandbox::local_sandbox_backend();
+    #[cfg(all(
+        target_os = "linux",
+        not(all(
+            any(target_arch = "x86_64", target_arch = "aarch64"),
+            target_pointer_width = "64",
+            target_endian = "little",
+        )),
+    ))]
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "no OS sandbox is available for this local PTY",
+    ))
+}
 #[cfg(windows)]
 pub use platform::{WINDOWS_LOCAL_SANDBOX_BROKER_ARGUMENT, run_windows_local_sandbox_broker};
 #[cfg(windows)]

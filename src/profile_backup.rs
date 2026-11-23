@@ -17,6 +17,8 @@ mod java_host_pins;
 mod java_migration;
 mod java_scheduler;
 mod java_secrets;
+#[cfg(test)]
+pub(crate) mod java_temporary_key_fixture;
 mod openpgp;
 pub(crate) mod preferences;
 mod restore;
@@ -109,6 +111,17 @@ impl Preview {
 
     pub(crate) fn java_password_summary(&self) -> Option<(usize, usize)> {
         self.java.as_ref()?.password_summary
+    }
+
+    pub(crate) fn has_java_temporary_keys(&self) -> bool {
+        self.java
+            .as_ref()
+            .and_then(|report| report.ssh.as_ref())
+            .is_some_and(|source| source.has_temporary_keys)
+    }
+
+    pub(crate) fn java_temporary_key_summary(&self) -> Option<(usize, usize)> {
+        self.java.as_ref()?.temporary_key_summary
     }
 
     pub(crate) fn has_java_managed_keys(&self) -> bool {
@@ -462,12 +475,19 @@ pub(crate) fn prepare_java_credentials(
             .omissions
             .push("Java SSH passwords were skipped.".into());
     }
+    if source.has_temporary_keys && review.temporary_keys.is_none() {
+        report
+            .omissions
+            .push("Java temporary SSH keys were skipped.".into());
+    }
     report.ssh = None;
     report.password_summary = review.passwords;
     report.key_summary = review.keys;
+    report.temporary_key_summary = review.temporary_keys;
     for (label, summary) in [
         ("SSH passwords", review.passwords),
         ("Managed SSH keys", review.keys),
+        ("Temporary SSH keys", review.temporary_keys),
     ] {
         if let Some((count, _)) = summary.filter(|(count, _)| *count > 0) {
             report.entries.push(format!("{label} ({count})"));

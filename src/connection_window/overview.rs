@@ -281,10 +281,11 @@ impl Entry {
         let security = Fields(vec![
             (
                 "isolationLevel",
-                Value::text(match connection.isolation {
-                    IsolationLevel::None => "none",
-                    IsolationLevel::Process => "process",
-                    IsolationLevel::Sandbox => "sandbox",
+                Value::text(match connection.isolation_override() {
+                    None => "inherit",
+                    Some(IsolationLevel::None) => "none",
+                    Some(IsolationLevel::Process) => "process",
+                    Some(IsolationLevel::Sandbox) => "sandbox",
                 }),
             ),
             ("incognito", Value::Flag(connection.incognito)),

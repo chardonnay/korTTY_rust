@@ -1,5 +1,7 @@
 //! Pure, bounded d03/d17 layout. These values contain no execution authority or terminal position.
 
+use std::sync::Arc;
+
 mod layout;
 pub(crate) use layout::{marker, render};
 
@@ -100,6 +102,7 @@ pub(crate) struct Step {
     pub detail: String,
     pub command: Option<String>,
     pub output: Vec<String>,
+    pub captured_output: Option<Arc<str>>,
     pub exit_code: Option<u32>,
     pub elapsed_ms: Option<u64>,
     pub tokens: Option<u64>,

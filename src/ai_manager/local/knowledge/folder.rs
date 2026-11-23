@@ -158,7 +158,7 @@ impl Drop for Cancel {
     }
 }
 
-pub(in crate::ai_manager::local) type ReviewReply = Receiver<Result<Arc<Review>, String>>;
+pub(in crate::ai_manager::local) type ReviewTask<T> = (Receiver<Result<T, String>>, Cancel);
 
 pub(in crate::ai_manager::local) fn start(
     root: PathBuf,
@@ -166,7 +166,7 @@ pub(in crate::ai_manager::local) fn start(
     available: usize,
     explicit: Vec<PathBuf>,
     options: Options,
-) -> Result<(ReviewReply, Cancel), String> {
+) -> Result<ReviewTask<Arc<Review>>, String> {
     start_review(move |stop| {
         scan(
             root,
@@ -200,7 +200,7 @@ pub(super) fn review_update(
 
 pub(in crate::ai_manager::local) fn start_review<T: Send + 'static>(
     review: impl FnOnce(&AtomicBool) -> Result<T, String> + Send + 'static,
-) -> Result<(Receiver<Result<T, String>>, Cancel), String> {
+) -> Result<ReviewTask<T>, String> {
     let cancel = Arc::new(AtomicBool::new(false));
     let stop = Arc::clone(&cancel);
     let (send, reply) = async_channel::bounded(1);

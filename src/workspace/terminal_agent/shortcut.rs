@@ -628,6 +628,7 @@ while ($null -ne ($line = [Console]::ReadLine())) {
         let saved = store
             .save_local(LocalProfile {
                 id: 0,
+                isolation: Default::default(),
                 name: "Custom Agent shell".into(),
                 shell: Default::default(),
                 command: Some(command.clone()),

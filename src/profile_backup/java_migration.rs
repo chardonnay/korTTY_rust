@@ -36,6 +36,7 @@ pub(super) struct Report {
     pub(super) omissions: Vec<String>,
     pub(super) ssh: Option<SshSource>,
     pub(super) password_summary: Option<(usize, usize)>,
+    pub(super) temporary_key_summary: Option<(usize, usize)>,
     pub(super) key_summary: Option<(usize, usize)>,
     pub(super) host_pins: Option<Arc<kortty_ssh::KnownHostsFile>>,
     pub(super) scheduler: Option<SchedulerSource>,
@@ -58,6 +59,7 @@ pub(super) struct ToolbarSource {
 
 pub(super) struct SshSource {
     pub(super) has_passwords: bool,
+    pub(super) has_temporary_keys: bool,
     pub(super) master: Option<Zeroizing<Vec<u8>>>,
     pub(super) credentials: Option<Zeroizing<Vec<u8>>>,
     pub(super) connections: Option<Arc<Zeroizing<Vec<u8>>>>,
@@ -85,6 +87,7 @@ pub(super) fn convert(
             .collect(),
         ssh: None,
         password_summary: None,
+        temporary_key_summary: None,
         key_summary: None,
         host_pins: None,
         scheduler: None,
@@ -105,6 +108,7 @@ pub(super) fn convert(
         && has_field("credentials.xml", "<encryptedPassword")
         || has_field("connections.xml", "<encryptedPassword");
     let has_keys = content("ssh-keys.xml").is_some();
+    let has_temporary_keys = has_field("connections.xml", "<temporaryKeyContent");
     let connections = content("connections.xml");
     let (snippet_xml, variables_xml) = (content("snippets.xml"), content("snippet-variables.xml"));
     if snippet_xml.is_some() || variables_xml.is_some() {
@@ -290,6 +294,12 @@ pub(super) fn convert(
                     report.entries.push(format!(
                         "Inactive Java Teamwork settings for review ({})",
                         import.teamwork_proposals
+                    ));
+                }
+                if import.security_proposals != 0 {
+                    report.entries.push(format!(
+                        "Inactive Java security preferences for review in Global Settings ({})",
+                        import.security_proposals
                     ));
                 }
                 if import.swarm_journal_proposal {
@@ -854,16 +864,24 @@ pub(super) fn convert(
         }
     }
     let (_, colors) = report.connection_library.counts();
-    if colors != 0 {
+    let isolation = report.connection_library.group_isolation_count();
+    if colors != 0 || isolation != 0 {
         if !snapshot.contains_key(CONNECTIONS) {
             let (bytes, _) = ConnectionPreview::default()
                 .with_java_library(report.connection_library.clone())
                 .portable_java_backup()?;
             snapshot.insert(CONNECTIONS.into(), Zeroizing::new(bytes));
         }
-        report.entries.push(format!(
-            "Java folder colors for new folders or explicit review in Connection Manager ({colors})"
-        ));
+        if colors != 0 {
+            report.entries.push(format!(
+                "Java folder colors for new folders or explicit review in Connection Manager ({colors})"
+            ));
+        }
+        if isolation != 0 {
+            report.entries.push(format!(
+                "Java folder isolation for exact new folders or explicit review in Connection Manager ({isolation})"
+            ));
+        }
     }
 
     let scheduler = content("job-scheduler.xml").and_then(|bytes| {
@@ -1070,7 +1088,7 @@ pub(super) fn convert(
                 }
             }
             MemberKind::Credentials if has_passwords => {}
-            MemberKind::MasterKey if has_passwords || has_keys => {}
+            MemberKind::MasterKey if has_passwords || has_keys || has_temporary_keys => {}
             MemberKind::SshKeyCatalog | MemberKind::SshKeyFile if has_keys => {}
             MemberKind::Project => {
                 let Some(name) = path
@@ -1190,13 +1208,16 @@ pub(super) fn convert(
             teamwork_origins: scheduler_teamwork_origins,
             target_review: None,
         });
-    if has_passwords || has_keys {
-        report
-            .omissions
-            .push("Java temporary SSH keys and password commands are omitted.".into());
+    if has_passwords || has_keys || has_temporary_keys {
+        if has_passwords {
+            report
+                .omissions
+                .push("Java password commands are omitted.".into());
+        }
         let mut take = |name| members.remove(name).map(|member| member.bytes);
         report.ssh = Some(SshSource {
             has_passwords,
+            has_temporary_keys,
             master: take("master.key"),
             credentials: take("credentials.xml"),
             connections,

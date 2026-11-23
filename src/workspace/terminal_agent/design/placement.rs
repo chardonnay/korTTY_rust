@@ -12,6 +12,7 @@ pub(in crate::workspace) enum Slot {
     TopDrawer,
     Bottom,
     PaneBottom,
+    AboveHistory,
     BottomDrawer,
     Left,
     Right,
@@ -132,6 +133,21 @@ pub(in crate::workspace) fn status_slot(status: Status) -> Slot {
     }
 }
 
+pub(super) fn status_relative_to_history(
+    status: Slot,
+    history: History,
+    history_slot: Option<Slot>,
+) -> Slot {
+    match (status, history, history_slot) {
+        (Slot::PaneBottom, History::PlanExecution, Some(Slot::Bottom)) => Slot::AboveHistory,
+        _ => status,
+    }
+}
+
+pub(super) fn plan_sample_height(available: f32) -> f32 {
+    super::fitted_activity_height(available, super::plan_execution::HEIGHT, false)
+}
+
 pub(in crate::workspace) struct DockExtents {
     pub(in crate::workspace) left: f32,
     pub(in crate::workspace) right: f32,
@@ -196,6 +212,11 @@ pub(in crate::workspace) fn compose<'a, M: 'a>(
     let mut center = column![container(terminal).width(Length::Fill).height(Length::Fill)]
         .width(Length::Fill)
         .height(Length::Fill);
+    if status_slot == Slot::AboveHistory
+        && let Some(status) = status.take()
+    {
+        center = center.push(status);
+    }
     let mut right = column![]
         .width(Length::Fill)
         .height(Length::Fill)
@@ -229,7 +250,7 @@ pub(in crate::workspace) fn compose<'a, M: 'a>(
                     .width(Length::Fill)
                     .height(Length::Fill)
             }
-            Slot::Bottom | Slot::BottomDrawer => center = center.push(status),
+            Slot::Bottom | Slot::BottomDrawer | Slot::AboveHistory => center = center.push(status),
             Slot::PaneBottom => pane_bottom = Some(status),
             Slot::Left => {
                 left = Some(match left {
@@ -377,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn metro_reserves_the_full_pane_width_below_a_side_history() {
+    fn metro_spans_the_pane_and_precedes_bottom_plan_history() {
         use iced::advanced::widget::{Id, Operation};
         use iced::{Font, Rectangle, Renderer};
         use iced_runtime::{UserInterface, user_interface::Cache};
@@ -403,40 +424,49 @@ mod tests {
 
         let size = Size::new(600.0, 360.0);
         let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
-        let pane: Element<'_, ()> = compose(
-            space::vertical().height(Length::Fill).into(),
-            Some(
-                container(space::vertical())
-                    .id("test-timeline")
-                    .height(Length::Fill)
-                    .into(),
-            ),
-            Some(
-                container(space::vertical())
-                    .id("test-metro")
-                    .width(Length::Fill)
-                    .height(52)
-                    .into(),
-            ),
-            history_slot(History::Timeline),
-            status_slot(Status::Metro),
-            size,
-            DockExtents {
-                left: 240.0,
-                right: 240.0,
-                bottom: None,
-            },
-        );
-        let mut ui = UserInterface::build(pane, size, Cache::default(), &mut renderer);
-        let mut bounds = Bounds {
-            rail: None,
-            side: None,
-        };
-        ui.operate(&renderer, &mut bounds);
-        let rail = bounds.rail.unwrap();
-        let side = bounds.side.unwrap();
-        assert_eq!(rail.width, size.width);
-        assert_eq!(rail.y + rail.height, size.height);
-        assert_eq!(side.y + side.height, rail.y);
+        for history in [History::Timeline, History::PlanExecution] {
+            let side = history_slot(history);
+            let plan = history == History::PlanExecution;
+            let pane: Element<'_, ()> = compose(
+                space::vertical().height(Length::Fill).into(),
+                Some(
+                    container(space::vertical())
+                        .id("test-timeline")
+                        .height(Length::Fill)
+                        .into(),
+                ),
+                Some(
+                    container(space::vertical())
+                        .id("test-metro")
+                        .width(Length::Fill)
+                        .height(52)
+                        .into(),
+                ),
+                side,
+                status_relative_to_history(status_slot(Status::Metro), history, side),
+                size,
+                DockExtents {
+                    left: 240.0,
+                    right: 240.0,
+                    bottom: plan.then_some(super::super::plan_execution::HEIGHT),
+                },
+            );
+            let mut ui = UserInterface::build(pane, size, Cache::default(), &mut renderer);
+            let mut bounds = Bounds {
+                rail: None,
+                side: None,
+            };
+            ui.operate(&renderer, &mut bounds);
+            let rail = bounds.rail.unwrap();
+            let side = bounds.side.unwrap();
+            assert_eq!(rail.width, size.width);
+            if plan {
+                assert_eq!(rail.y + rail.height, side.y);
+                assert_eq!(side.y + side.height, size.height);
+            } else {
+                assert_eq!(rail.y + rail.height, size.height);
+                assert_eq!(side.y + side.height, rail.y);
+            }
+        }
     }
 }

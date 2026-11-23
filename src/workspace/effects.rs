@@ -616,6 +616,7 @@ mod tests {
         let id = store
             .save_local(LocalProfile {
                 id: 0,
+                isolation: Default::default(),
                 name: "Saved effect fixture".into(),
                 #[cfg(windows)]
                 shell: kortty_pty::LocalShell::CommandPrompt,
@@ -643,7 +644,7 @@ mod tests {
             .store_saved_local_session_in_view(
                 profile.clone(),
                 None,
-                super::super::LocalLaunchView::QuickConnect(Some(None), None),
+                super::super::LocalLaunchView::QuickConnect(Some(None), None, None),
             )
             .unwrap();
         assert!(workspace.pane_effect(cleared).is_none());
@@ -668,6 +669,7 @@ mod tests {
         let id = store
             .save_local(LocalProfile {
                 id: 0,
+                isolation: Default::default(),
                 name: "Appearance fixture".into(),
                 shell: Default::default(),
                 command: None,
@@ -793,6 +795,7 @@ mod tests {
         let local = store
             .save_local(LocalProfile {
                 id: 0,
+                isolation: Default::default(),
                 name: "Theme local".into(),
                 shell: Default::default(),
                 command: None,

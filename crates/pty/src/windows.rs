@@ -65,6 +65,11 @@ mod sandbox;
 mod sandbox_broker;
 pub use sandbox_broker::{WINDOWS_LOCAL_SANDBOX_BROKER_ARGUMENT, run_windows_local_sandbox_broker};
 
+pub(crate) fn local_sandbox_backend() -> io::Result<&'static str> {
+    sandbox::check_available()?;
+    Ok(sandbox::BACKEND)
+}
+
 const PIPE_BUFFER: u32 = 64 * 1024;
 const REAP_TIMEOUT_MS: u32 = 5000;
 

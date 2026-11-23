@@ -121,6 +121,7 @@ pub enum Message {
     ShellIntegration(bool),
     AdHocLocal,
     Ssh(ssh_dialog::Message),
+    TemporaryKeyPasted(u64, bool, ssh_dialog::Password),
     Serial(serial_dialog::Message),
     IbmAddress(String),
     IbmDevice(IbmKind),
@@ -160,6 +161,7 @@ pub(super) struct Dialog {
     ai: AiAssignments,
     ai_edited: bool,
     minimum_isolation: IsolationLevel,
+    default_isolation: IsolationLevel,
     local_shell: LocalShell,
     local_emulation: TerminalProfile,
     local: local::Draft,
@@ -203,6 +205,7 @@ impl Dialog {
             ai: AiAssignments::default(),
             ai_edited: false,
             minimum_isolation,
+            default_isolation: IsolationLevel::None,
             local_shell: LocalShell::default(),
             local_emulation: profile,
             local: local::Draft::default(),
@@ -214,15 +217,23 @@ impl Dialog {
         }
     }
 
-    fn choose(&mut self, id: u64) -> bool {
+    fn choose(&mut self, id: u64, temporary_key_enabled: bool) -> bool {
         let Some(store) = &self.store else {
             return false;
         };
         if let Some(connection) = store.get(id)
             && let Some(profile) = connection.profile()
         {
+            let isolation = store
+                .connection_isolation(
+                    connection,
+                    self.default_isolation,
+                    None,
+                    self.minimum_isolation,
+                )
+                .0;
             self.ssh = SshDialog::from_saved(profile, connection)
-                .with_isolation(IsolationLevel::None, self.minimum_isolation);
+                .with_isolation(isolation, self.minimum_isolation);
             self.selected_ssh = Some((id, connection.incognito));
             self.protocol = Protocol::Ssh;
         } else if let Some(saved) = store.serial(id)
@@ -246,10 +257,16 @@ impl Dialog {
         self.save = false;
         self.name.clear();
         self.status = None;
+        self.set_temporary_key_enabled(temporary_key_enabled);
         self.reset_effect_draft();
         self.reset_ai_draft();
         self.reset_appearance_draft();
         true
+    }
+
+    fn set_temporary_key_enabled(&mut self, enabled: bool) {
+        self.ssh
+            .set_quick_temporary_key_enabled(enabled && self.protocol.is_ssh() && !self.group_tab);
     }
 
     fn selected(&self) -> Option<&Connection> {
@@ -359,6 +376,7 @@ impl Workspace {
         profile: TerminalProfile,
         shell: LocalShell,
         command: Option<&[String]>,
+        isolation: Option<IsolationLevel>,
     ) -> Result<LocalSettings, &'static str> {
         if !self.window_settings.automatic_local_shell_integration() {
             return Err("Automatic setup for local shells is disabled in Settings → Terminal.");
@@ -371,10 +389,9 @@ impl Workspace {
             );
         }
         let mut settings = self
-            .security
-            .local_settings(None, self.clipboard.policy.minimum_isolation)
+            .local_settings(None)
             .map_err(|_| "Local session settings are unavailable.")?;
-        if settings.isolation == IsolationLevel::Sandbox {
+        if isolation.unwrap_or(settings.isolation) == IsolationLevel::Sandbox {
             return Err("A sandboxed shell uses its own isolated startup environment.");
         }
         validate_shell_integration(shell, command)
@@ -405,7 +422,7 @@ impl Workspace {
         profile: TerminalProfile,
         shell: LocalShell,
     ) -> Result<LocalSettings, &'static str> {
-        self.quick_shell_integration_for_command(profile, shell, None)
+        self.quick_shell_integration_for_command(profile, shell, None, None)
     }
 
     pub(super) fn show_quick_connect(&mut self, owner: window::Id) -> Task<Desktop> {
@@ -450,6 +467,15 @@ impl Workspace {
             profile,
             self.clipboard.policy.minimum_isolation,
         );
+        dialog.default_isolation = self
+            .window_settings
+            .default_session_isolation
+            .unwrap_or_default();
+        dialog.ssh = dialog.ssh.with_isolation(
+            dialog.default_isolation,
+            self.clipboard.policy.minimum_isolation,
+        );
+        dialog.set_temporary_key_enabled(self.quick_temporary_key_enabled());
         dialog.effect_default_speed = self
             .window_settings
             .quick_connect_effect_speed
@@ -538,6 +564,20 @@ impl Workspace {
         protocols
     }
 
+    pub(super) fn quick_temporary_key_enabled(&self) -> bool {
+        self.window_settings.temporary_ssh_key_enabled && self.clipboard.policy.problem.is_none()
+    }
+
+    pub(super) fn sync_quick_temporary_key_preference(&mut self) {
+        let enabled = self.quick_temporary_key_enabled();
+        if let Some(dialog) = &mut self.quick_connect {
+            dialog.set_temporary_key_enabled(enabled);
+        }
+        if !enabled {
+            self.discard_quick_temporary_ssh_retries();
+        }
+    }
+
     pub(super) fn update_quick_connect(
         &mut self,
         id: window::Id,
@@ -548,6 +588,8 @@ impl Workspace {
             .as_ref()
             .is_some_and(|dialog| dialog.split.is_some());
         let allowed = self.quick_protocols(split);
+        let temporary_key_enabled = self.quick_temporary_key_enabled();
+        let internal_clipboard = self.clipboard.policy.internal;
         let effects_enabled = self.terminal_effects_enabled();
         let ai = self.ai_configuration();
         let themes = &self.window_settings.themes;
@@ -559,6 +601,7 @@ impl Workspace {
         if dialog.saving && !matches!(message, Message::Saved(_)) {
             return Task::none();
         }
+        dialog.set_temporary_key_enabled(temporary_key_enabled);
         match message {
             Message::Loaded(Ok(store)) => {
                 if dialog.store.is_none() {
@@ -584,11 +627,11 @@ impl Workspace {
                 dialog.status = Some(error);
             }
             Message::Query(query) if query.len() <= 240 => dialog.query = query,
-            Message::Select(connection) if dialog.choose(connection) => {
+            Message::Select(connection) if dialog.choose(connection, temporary_key_enabled) => {
                 return dialog.focus_selected();
             }
             Message::Recent(connection) if split => {
-                if dialog.choose(connection) {
+                if dialog.choose(connection, temporary_key_enabled) {
                     if dialog.can_connect() {
                         return self.quick_submit();
                     }
@@ -605,7 +648,10 @@ impl Workspace {
                     return Task::batch([close, self.open_recent_connection(owner, connection)]);
                 }
             }
-            Message::GroupTab(group) if !split => dialog.group_tab = group,
+            Message::GroupTab(group) if !split => {
+                dialog.group_tab = group;
+                dialog.set_temporary_key_enabled(temporary_key_enabled);
+            }
             Message::Group(group) if !split && dialog.group_members(&group) > 0 => {
                 dialog.group = Some(group)
             }
@@ -619,6 +665,7 @@ impl Workspace {
                     dialog.name.clear();
                 }
                 dialog.protocol = protocol;
+                dialog.set_temporary_key_enabled(temporary_key_enabled);
                 if changed {
                     dialog.reset_effect_draft();
                     dialog.reset_ai_draft();
@@ -789,7 +836,23 @@ impl Workspace {
                 return self.quick_submit();
             }
             Message::Ssh(ssh_dialog::Message::OpenVault) => return self.show_vault(owner),
-            Message::Ssh(message) => dialog.ssh.update(message),
+            Message::Ssh(ssh_dialog::Message::PasteTemporaryKey) => {
+                return self.paste_quick_temporary_key(id);
+            }
+            Message::TemporaryKeyPasted(request, captured_internal, key) => {
+                let key = if captured_internal == internal_clipboard {
+                    key
+                } else {
+                    ssh_dialog::Password::default()
+                };
+                dialog.ssh.finish_temporary_key_paste(request, key);
+            }
+            Message::Ssh(message) => {
+                dialog.ssh.update(message);
+                if dialog.ssh.temporary_key_selected() {
+                    dialog.save = false;
+                }
+            }
             Message::Serial(serial_dialog::Message::Connect)
                 if dialog.protocol == Protocol::Serial =>
             {
@@ -819,7 +882,9 @@ impl Workspace {
                 dialog.ibm.plaintext = false;
             }
             Message::IbmPlaintext(allow) => dialog.ibm.plaintext = allow,
-            Message::SaveConnection(save) => dialog.save = save,
+            Message::SaveConnection(save) if !dialog.ssh.temporary_key_selected() => {
+                dialog.save = save;
+            }
             Message::ConnectionName(name) if name.len() <= 160 => dialog.name = name,
             Message::Reset => {
                 dialog.appearance = appearance::Draft::default();
@@ -843,6 +908,35 @@ impl Workspace {
             _ => {}
         }
         Task::none()
+    }
+
+    fn paste_quick_temporary_key(&mut self, id: window::Id) -> Task<Desktop> {
+        let request = self.allocate();
+        let internal = self.clipboard.policy.internal;
+        let Some(dialog) = &mut self.quick_connect else {
+            return Task::none();
+        };
+        if !dialog.ssh.temporary_key_selected() {
+            return Task::none();
+        }
+        if dialog.ssh.target_endpoint().is_none() {
+            dialog.status = Some("Enter the SSH host and username before pasting a key.".into());
+            return Task::none();
+        }
+        if !dialog.ssh.begin_temporary_key_paste(request) {
+            return Task::none();
+        }
+        dialog.status = None;
+        self.read_clipboard().map(move |value| {
+            wrap(
+                id,
+                Message::TemporaryKeyPasted(
+                    request,
+                    internal,
+                    ssh_dialog::Password::new(value.unwrap_or_default()),
+                ),
+            )
+        })
     }
 
     fn quick_submit(&mut self) -> Task<Desktop> {
@@ -984,11 +1078,23 @@ impl Workspace {
             style.write_terminal(&mut draft.terminal);
             dialog.saving = true;
             dialog.status = None;
+            let source = dialog.selected_local;
             return Task::future(async move {
                 let result = profile::connections_path()
                     .and_then(Store::open)
                     .and_then(|mut store| {
-                        let id = store.save_local(draft)?;
+                        let id = if let Some(source) = source {
+                            if store.local(source).is_none() {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::NotFound,
+                                    "The saved local shell profile no longer exists",
+                                ));
+                            }
+                            let group = store.group_of(source).map(str::to_owned);
+                            store.save_local_in_group(draft, group.as_deref())?
+                        } else {
+                            store.save_local(draft)?
+                        };
                         Ok((store, id))
                     })
                     .map_err(|error| format!("Could not save the shell profile ({error})"));
@@ -1035,18 +1141,28 @@ impl Workspace {
             ),
             Protocol::Local => {
                 let profile = dialog.local_emulation;
-                let view = super::LocalLaunchView::QuickConnect(effect_override, launch_style);
+                let selected = dialog
+                    .selected_local
+                    .zip(dialog.store.as_ref().map(|store| store.path().to_owned()));
+                let view =
+                    super::LocalLaunchView::QuickConnect(effect_override, launch_style, selected);
                 let started = if let Some(local) = dialog.local_profile()
                     && (dialog.selected_local.is_some()
                         || local.command.is_some()
-                        || local.working_directory.is_some())
+                        || local.working_directory.is_some()
+                        || !local.isolation.is_global())
                 {
                     self.store_saved_local_session_in_view(local, font, view)
                 } else {
                     let settings = if dialog.shell_integration {
-                        self.quick_shell_integration_for_command(profile, dialog.local_shell, None)
-                            .map(Some)
-                            .map_err(std::io::Error::other)
+                        self.quick_shell_integration_for_command(
+                            profile,
+                            dialog.local_shell,
+                            None,
+                            None,
+                        )
+                        .map(Some)
+                        .map_err(std::io::Error::other)
                     } else if dialog.local_shell.is_default() {
                         Ok(None)
                     } else {
@@ -1215,10 +1331,18 @@ impl Workspace {
         let Some(profile) = connection.profile() else {
             return Task::none();
         };
-        let form = SshDialog::from_saved(profile, &connection).with_isolation(
-            IsolationLevel::None,
-            self.clipboard.policy.minimum_isolation,
-        );
+        let isolation = match self.saved_launch_isolation(&connection, None, None) {
+            Ok(level) => level,
+            Err(error) => {
+                self.notice(
+                    owner,
+                    format!("Could not resolve session isolation ({error})"),
+                );
+                return Task::none();
+            }
+        };
+        let form = SshDialog::from_saved(profile, &connection)
+            .with_isolation(isolation, self.clipboard.policy.minimum_isolation);
         self.start_quick_ssh(
             owner,
             form,
@@ -1264,6 +1388,115 @@ fn wrap(id: window::Id, message: Message) -> Desktop {
 mod tests {
     use super::*;
     use crate::ssh_dialog::{LoginMessage, Password};
+
+    #[test]
+    fn quick_connect_applies_the_default_to_new_ssh_and_sftp_logins() {
+        let mut workspace = Workspace::default();
+        workspace.window_settings.default_session_isolation = Some(IsolationLevel::Process);
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.show_quick_connect(owner);
+        let id = workspace.quick_connect_for_owner(owner).unwrap();
+        for message in [
+            LoginMessage::Host("isolation.test".into()),
+            LoginMessage::Username("operator".into()),
+            LoginMessage::Password(Password::new("fixture".into())),
+        ] {
+            let _ = workspace
+                .update_quick_connect(id, Message::Ssh(ssh_dialog::Message::Target(message)));
+        }
+        let draft = workspace
+            .quick_connect
+            .as_ref()
+            .unwrap()
+            .ssh
+            .saved_draft("fixture")
+            .unwrap();
+        assert_eq!(draft.isolation, IsolationLevel::Process);
+        let _ = workspace.update_quick_connect(id, Message::Protocol(Protocol::Sftp));
+        let request = workspace
+            .quick_connect
+            .as_mut()
+            .unwrap()
+            .ssh
+            .take_request()
+            .unwrap();
+        assert_eq!(request.isolation, IsolationLevel::Process);
+    }
+
+    #[test]
+    fn quick_temporary_key_follows_the_preference_and_drops_stale_paste_results() {
+        use crate::ssh_dialog::Method;
+        use iced::futures::{StreamExt, executor::block_on};
+        use iced_runtime::{Action, clipboard, task};
+
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.show_quick_connect(owner);
+        let id = workspace.quick_connect_for_owner(owner).unwrap();
+        let select = Message::Ssh(ssh_dialog::Message::Target(LoginMessage::Authentication(
+            Method::TemporaryKey,
+        )));
+        let _ = workspace.update_quick_connect(id, select.clone());
+        assert!(
+            !workspace
+                .quick_connect
+                .as_ref()
+                .unwrap()
+                .ssh
+                .temporary_key_selected()
+        );
+
+        workspace.window_settings.temporary_ssh_key_enabled = true;
+        workspace.sync_quick_temporary_key_preference();
+        let host =
+            |name: &str| Message::Ssh(ssh_dialog::Message::Target(LoginMessage::Host(name.into())));
+        let _ = workspace.update_quick_connect(id, host("first.test"));
+        let _ = workspace.update_quick_connect(
+            id,
+            Message::Ssh(ssh_dialog::Message::Target(LoginMessage::Username(
+                "fixture".into(),
+            ))),
+        );
+        let _ = workspace.update_quick_connect(id, Message::SaveConnection(true));
+        let _ = workspace.update_quick_connect(id, select);
+        let _ = workspace.update_quick_connect(id, Message::SaveConnection(true));
+        assert!(!workspace.quick_connect.as_ref().unwrap().save);
+
+        let clipboard_result = |workspace: &mut Workspace| {
+            let paste = Message::Ssh(ssh_dialog::Message::PasteTemporaryKey);
+            let mut actions = task::into_stream(workspace.update_quick_connect(id, paste)).unwrap();
+            let Some(Action::Clipboard(clipboard::Action::Read { channel, .. })) =
+                block_on(actions.next())
+            else {
+                panic!("expected a clipboard request for the selected temporary-key method");
+            };
+            let key = "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture-only\n-----END OPENSSH PRIVATE KEY-----";
+            assert!(channel.send(Some(key.into())).is_ok());
+            let Some(Action::Output(Desktop::QuickConnect(_, result))) = block_on(actions.next())
+            else {
+                panic!("expected a Quick Connect paste result");
+            };
+            result
+        };
+        let stale = clipboard_result(&mut workspace);
+        let _ = workspace.update_quick_connect(id, host("second.test"));
+        let _ = workspace.update_quick_connect(id, stale);
+        assert!(!workspace.quick_connect.as_ref().unwrap().ssh.can_connect());
+
+        let current = clipboard_result(&mut workspace);
+        let _ = workspace.update_quick_connect(id, current);
+        let ssh = &workspace.quick_connect.as_ref().unwrap().ssh;
+        assert!(ssh.can_connect());
+        assert!(ssh.saved_draft("Fixture").is_err());
+
+        let late = clipboard_result(&mut workspace);
+        workspace.window_settings.temporary_ssh_key_enabled = false;
+        workspace.sync_quick_temporary_key_preference();
+        let _ = workspace.update_quick_connect(id, late);
+        let ssh = &workspace.quick_connect.as_ref().unwrap().ssh;
+        assert!(!ssh.temporary_key_selected());
+        assert!(!ssh.can_connect());
+    }
 
     #[test]
     fn quick_local_shell_setup_respects_the_global_choice_without_disabling_marks() {

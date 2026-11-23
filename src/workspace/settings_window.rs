@@ -9,7 +9,7 @@ use iced::widget::{
 use iced::{Alignment, Color, Element, Length, Padding, Size, Task, window};
 use kortty_ssh::KeepAlive;
 use kortty_terminal::TextEncoding;
-use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
+use kortty_vault::{StartupUnlockState, Vault};
 
 use crate::clipboard_policy::ClipboardPolicy;
 use crate::connection_store::{
@@ -17,11 +17,10 @@ use crate::connection_store::{
 };
 use crate::profile::{self, session::RestoreMode};
 use crate::profile_backup::preferences::Preferences as BackupPreferences;
+use crate::session_security::IsolationLevel;
 use crate::sftp_window::ConflictDefault;
 #[cfg(test)]
 use crate::terminal_agent::design::Preset as AgentDesign;
-#[cfg(test)]
-use crate::terminal_theme::Scheme;
 use crate::terminal_theme::{BoldTextMode, MONOSPACED, installed_families, installed_font};
 use crate::workspace::dialog_placement::{Kind as DialogKind, escape::on_escape};
 use kortty_terminal::ScrollbackConfig;
@@ -47,6 +46,7 @@ const SEARCH_MAX_WIDTH: f32 = 640.0;
 const SEARCH_RESULTS_MAX_HEIGHT: f32 = 380.0;
 const SEARCH_ROW_HEIGHT: f32 = 32.0;
 
+mod agent_design_name;
 mod agent_design_settings;
 mod appearance_settings;
 mod backup;
@@ -78,6 +78,7 @@ pub enum Section {
     Export,
     Window,
     Keyboard,
+    Security,
     Editor,
     SnippetEditor,
     AgentDesign,
@@ -86,7 +87,7 @@ pub enum Section {
 }
 
 impl Section {
-    pub(in crate::workspace) const ALL: [Self; 17] = [
+    pub(in crate::workspace) const ALL: [Self; 18] = [
         Self::Font,
         Self::Colors,
         Self::Themes,
@@ -100,6 +101,7 @@ impl Section {
         Self::Updates,
         Self::Window,
         Self::Keyboard,
+        Self::Security,
         Self::Sftp,
         Self::Editor,
         Self::SnippetEditor,
@@ -120,6 +122,7 @@ impl Section {
             Self::Export => "Export",
             Self::Window => "Window",
             Self::Keyboard => "Keyboard",
+            Self::Security => "Security",
             Self::Editor => "Editor",
             Self::SnippetEditor => "Snippet Editor",
             Self::AgentDesign => "AI Agent Design",
@@ -137,6 +140,34 @@ impl Section {
 
     pub(super) fn guide_chapter(self) -> String {
         format!("Settings · {}", self.label())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SearchTarget {
+    Page(Section),
+    Setting(Setting),
+}
+
+impl SearchTarget {
+    fn candidate(self) -> crate::settings_search::Candidate<'static, Self> {
+        let (label, detail, page, is_page) = match self {
+            Self::Page(section) => (section.label(), "", section.label(), true),
+            Self::Setting(setting) => (
+                setting.label(),
+                setting.keywords(),
+                setting.section().label(),
+                false,
+            ),
+        };
+        crate::settings_search::Candidate {
+            label: label.into(),
+            detail,
+            page,
+            is_page,
+            identity: None,
+            target: self,
+        }
     }
 }
 
@@ -204,6 +235,11 @@ pub enum Setting {
     ExportSnippetCode,
     ToolbarIconSize,
     StartupMasterPassword,
+    ChangeMasterPassword,
+    AutomaticVaultUnlock,
+    TemporarySshKey,
+    DefaultIsolation,
+    SandboxAvailability,
     RememberGeometry,
     RememberDashboard,
     FixedGeometry,
@@ -300,6 +336,11 @@ impl Setting {
         Self::ExportSnippetCode,
         Self::ToolbarIconSize,
         Self::StartupMasterPassword,
+        Self::ChangeMasterPassword,
+        Self::AutomaticVaultUnlock,
+        Self::TemporarySshKey,
+        Self::DefaultIsolation,
+        Self::SandboxAvailability,
         Self::RememberGeometry,
         Self::RememberDashboard,
         Self::FixedGeometry,
@@ -408,6 +449,11 @@ impl Setting {
             Self::ExportSnippetCode => "Include full script in analysis reports by default",
             Self::ToolbarIconSize => "Toolbar icon size",
             Self::StartupMasterPassword => "Require master password at startup",
+            Self::ChangeMasterPassword => "Change master password",
+            Self::AutomaticVaultUnlock => "Automatic vault unlock",
+            Self::TemporarySshKey => "Enable temporary SSH key option",
+            Self::DefaultIsolation => "Default isolation",
+            Self::SandboxAvailability => "Sandbox availability",
             Self::RememberGeometry => "Remember window geometry",
             Self::RememberDashboard => "Remember dashboard state",
             Self::FixedGeometry => "Use fixed window geometry",
@@ -501,8 +547,13 @@ impl Setting {
             | Self::JournalVision
             | Self::JournalAutomaticVision => Section::Logging,
             Self::ExportWatermark | Self::ExportFooter | Self::ExportSnippetCode => Section::Export,
+            Self::StartupMasterPassword
+            | Self::ChangeMasterPassword
+            | Self::AutomaticVaultUnlock
+            | Self::TemporarySshKey
+            | Self::DefaultIsolation
+            | Self::SandboxAvailability => Section::Security,
             Self::ToolbarIconSize
-            | Self::StartupMasterPassword
             | Self::RememberGeometry
             | Self::RememberDashboard
             | Self::FixedGeometry
@@ -646,6 +697,17 @@ impl Setting {
             }
             Self::ToolbarIconSize => "symbol size toolbar button pixels appearance",
             Self::StartupMasterPassword => "vault unlock startup login authentication security",
+            Self::ChangeMasterPassword => "vault rotate credential password security",
+            Self::AutomaticVaultUnlock => {
+                "skip master password prompt remember device keyring startup"
+            }
+            Self::TemporarySshKey => "quick connect sftp paste in memory expires private key",
+            Self::DefaultIsolation => {
+                "session isolation local shell ssh containment separate process managed minimum"
+            }
+            Self::SandboxAvailability => {
+                "session isolation security sandbox backend status local shell ssh"
+            }
             Self::RememberGeometry => "startup normal bounds size position maximized",
             Self::RememberDashboard => "startup show hide dashboard state navigation dock",
             Self::FixedGeometry => "startup width height fixed window position dimensions",
@@ -702,7 +764,7 @@ pub enum Message {
     SearchChoose(window::Id),
     SearchClear(window::Id),
     Escape(window::Id),
-    Reveal(window::Id, Setting),
+    Reveal(window::Id, SearchTarget),
     FontFamily(window::Id, String),
     FontSize(window::Id, u8),
     FontSizeInput(window::Id, String),
@@ -726,6 +788,7 @@ pub enum Message {
     Design(window::Id, Design),
     DesignAnimations(window::Id, bool),
     AgentDesignCatalog(window::Id, agent_design_settings::Edit),
+    AgentDesignName(window::Id, agent_design_name::Action),
     ApplicationUpdates(window::Id, bool),
     ApplicationUpdateInterval(window::Id, u8),
     PasteWarning(window::Id, WarningMode),
@@ -739,6 +802,11 @@ pub enum Message {
         Result<crate::recording_window::preferences::Preferences, String>,
     ),
     Startup(window::Id, startup_settings::Edit),
+    ChangeMasterPassword(window::Id),
+    AutomaticVaultUnlock(window::Id, bool),
+    TemporarySshKey(window::Id, bool),
+    DefaultIsolation(window::Id, IsolationLevel),
+    SandboxAvailability(window::Id, String),
     ToolWindowTabs(window::Id, bool),
     ConnectionColorBorder(window::Id, bool),
     SplitPaneFocusRing(window::Id, bool),
@@ -933,6 +1001,19 @@ impl Draft {
                 current.startup.fixed = edit.startup.fixed;
             }
         }
+        if policy.problem.is_none()
+            && edit.temporary_ssh_key_enabled != before.temporary_ssh_key_enabled
+        {
+            current.temporary_ssh_key_enabled = edit.temporary_ssh_key_enabled;
+        }
+        if policy.problem.is_none()
+            && edit.default_session_isolation != before.default_session_isolation
+            && edit
+                .default_session_isolation
+                .is_some_and(|level| level >= policy.minimum_isolation)
+        {
+            current.default_session_isolation = edit.default_session_isolation;
+        }
         if edit.paste_warning != before.paste_warning {
             current.paste_warning = edit.paste_warning.max(policy.minimum_paste_warning);
         }
@@ -1086,6 +1167,7 @@ struct Dialog {
     standalone_agent_design: bool,
     initial: Draft,
     draft: Draft,
+    sandbox_availability: Option<String>,
     installed_sftp_conflict_policy: SftpConflictPolicy,
     sftp_xml: sftp_settings::java::Exchange,
     initial_highlighting: highlight::Preferences,
@@ -1118,6 +1200,7 @@ struct Dialog {
     snippet_appearance: snippet_editor_settings::Editor,
     themes: theme_settings::Editor,
     agent_design: agent_design_settings::Editor,
+    agent_design_name: Option<agent_design_name::Prompt>,
     backup: backup::Editor,
     logging: logging_settings::Editor,
     export: export_settings::Editor,
@@ -1134,8 +1217,8 @@ impl Dialog {
             || self.themes.exchanging().is_some()
     }
 
-    fn search_results(&self, has_transparency: bool) -> impl Iterator<Item = Setting> {
-        search_matches(&self.search).filter(move |setting| match setting {
+    fn search_results(&self, has_transparency: bool) -> impl Iterator<Item = SearchTarget> {
+        search_targets(&self.search, |setting| match setting {
             Setting::Restore => self.draft.restore.is_some(),
             Setting::Transparency => has_transparency,
             _ => true,
@@ -1184,6 +1267,18 @@ impl Dialog {
             .chain(crate::settings_search::focus_if_present(
                 self.revealed_input.clone(),
             ))
+    }
+
+    fn reveal_search_target(&mut self, target: SearchTarget) -> Task<Desktop> {
+        match target {
+            SearchTarget::Setting(setting) => self.reveal_result(setting),
+            SearchTarget::Page(section) => {
+                self.search.clear();
+                self.search_selection = 0;
+                self.select_section(section);
+                self.reveal_page_start()
+            }
+        }
     }
 
     fn input_target(&self, setting: Setting, editable: bool) -> Option<&widget::Id> {
@@ -1272,16 +1367,17 @@ impl Settings {
     }
 
     pub(super) fn title(&self, id: window::Id) -> Option<&'static str> {
-        self.0
+        let dialog = self.0.as_ref()?;
+        if dialog
+            .agent_design_name
             .as_ref()
-            .filter(|dialog| dialog.id == id)
-            .map(|dialog| {
-                if dialog.standalone_agent_design {
-                    "AI Agent Design"
-                } else {
-                    TITLE
-                }
-            })
+            .is_some_and(|prompt| prompt.id == id)
+            || dialog.id == id && dialog.standalone_agent_design
+        {
+            Some(agent_design_name::TITLE)
+        } else {
+            (dialog.id == id).then_some(TITLE)
+        }
     }
 
     pub(super) fn owner_closed(&mut self, owner: window::Id) -> Option<window::Id> {
@@ -1334,7 +1430,13 @@ impl Workspace {
     }
 
     pub(super) fn close_settings(&mut self, id: window::Id) -> Option<Task<Desktop>> {
+        if let Some(close) = self.close_agent_design_name(id) {
+            return Some(close);
+        }
         let dialog = self.settings.0.as_ref().filter(|dialog| dialog.id == id)?;
+        if let Some(prompt) = &dialog.agent_design_name {
+            return Some(window::gain_focus(prompt.id));
+        }
         if dialog.saving() {
             return Some(Task::none());
         }
@@ -1396,6 +1498,7 @@ impl Workspace {
                     window::gain_focus(
                         self.openpgp_for_source(id)
                             .or_else(|| self.highlight_rules_for_settings(id))
+                            .or_else(|| self.agent_design_name_for(id))
                             .unwrap_or(id),
                     )
                 });
@@ -1409,11 +1512,49 @@ impl Workspace {
                     .map(|dialog| dialog.section.guide_chapter())
                     .map_or_else(Task::none, |chapter| self.show_manual_chapter(&chapter));
             }
+            message
+            @ (Message::ChangeMasterPassword(id) | Message::AutomaticVaultUnlock(id, _)) => {
+                let Some(dialog) = self
+                    .settings
+                    .0
+                    .as_ref()
+                    .filter(|dialog| dialog.id == id && dialog.section == Section::Security)
+                else {
+                    return Task::none();
+                };
+                let action = match message {
+                    Message::AutomaticVaultUnlock(_, true) => {
+                        crate::vault_window::Message::ReviewStartupUnlock
+                    }
+                    Message::AutomaticVaultUnlock(_, false) => {
+                        crate::vault_window::Message::ForgetStartupUnlock
+                    }
+                    _ => crate::vault_window::Message::ChangeMaster,
+                };
+                let opened = self.show_vault(dialog.owner);
+                return match self.vault_id {
+                    Some(vault) => opened.chain(Task::done(Desktop::Vault(vault, action))),
+                    None => opened,
+                };
+            }
+            Message::SandboxAvailability(id, availability) => {
+                if let Some(dialog) = self.settings.dialog_mut(id) {
+                    dialog.sandbox_availability = Some(availability);
+                }
+                return Task::none();
+            }
             Message::Escape(id) => {
                 return self.dismiss_settings(id);
             }
             Message::Cancel(id) => return self.close_settings(id).unwrap_or_else(Task::none),
-            Message::Save(id) => return self.save_settings(id),
+            Message::Save(id) => {
+                return if let Some(prompt) = self.agent_design_name_for(id) {
+                    window::gain_focus(prompt)
+                } else {
+                    self.save_settings(id)
+                };
+            }
+            Message::AgentDesignName(id, edit) => return self.update_agent_design_name(id, edit),
             Message::ToolbarIconSizeSaved(id, result) => {
                 return self.toolbar_icon_size_saved(id, result);
             }
@@ -1476,6 +1617,8 @@ impl Workspace {
             | Message::PasteLineDelay(id, _)
             | Message::ToolbarIconSize(id, _)
             | Message::Startup(id, _)
+            | Message::TemporarySshKey(id, _)
+            | Message::DefaultIsolation(id, _)
             | Message::ToolWindowTabs(id, _)
             | Message::ConnectionColorBorder(id, _)
             | Message::SplitPaneFocusRing(id, _)
@@ -1526,18 +1669,27 @@ impl Workspace {
             | Message::UseJavaSessionRestore(id)
             | Message::KeyBinding(id, _)) => (id, message),
         };
-        let has_transparency =
-            matches!(message, Message::SearchStep(..) | Message::SearchChoose(_))
-                && self
-                    .settings
-                    .0
-                    .as_ref()
-                    .filter(|dialog| dialog.id == id)
-                    .and_then(|dialog| self.windows.get(&dialog.owner))
-                    .and_then(|window| self.transparency_controls(window))
-                    .is_some();
+        let has_transparency = matches!(
+            message,
+            Message::SearchStep(..) | Message::SearchChoose(_) | Message::Reveal(..)
+        ) && self
+            .settings
+            .0
+            .as_ref()
+            .filter(|dialog| dialog.id == id)
+            .and_then(|dialog| self.windows.get(&dialog.owner))
+            .and_then(|window| self.transparency_controls(window))
+            .is_some();
         if let Some(child) = self.highlight_rules_for_settings(id) {
             return window::gain_focus(child);
+        }
+        if let Some(prompt) = self.agent_design_name_for(id)
+            && !matches!(
+                message,
+                Message::AgentDesignCatalog(_, agent_design_settings::Edit::Demo(_))
+            )
+        {
+            return window::gain_focus(prompt);
         }
         let Some(dialog) = self.settings.dialog_mut(id) else {
             return Task::none();
@@ -1580,7 +1732,8 @@ impl Workspace {
                 let choice = dialog
                     .search_results(has_transparency)
                     .nth(dialog.search_selection);
-                return choice.map_or_else(Task::none, |setting| dialog.reveal_result(setting));
+                return choice
+                    .map_or_else(Task::none, |target| dialog.reveal_search_target(target));
             }
             Message::SearchClear(_) => {
                 dialog.search.clear();
@@ -1588,7 +1741,16 @@ impl Workspace {
                 dialog.revealed = None;
                 return widget::operation::focus(dialog.search_input.clone());
             }
-            Message::Reveal(_, setting) => return dialog.reveal_result(setting),
+            Message::Reveal(_, target) => {
+                return if dialog
+                    .search_results(has_transparency)
+                    .any(|result| result == target)
+                {
+                    dialog.reveal_search_target(target)
+                } else {
+                    Task::none()
+                };
+            }
             Message::FontFamily(_, family) if dialog.section == Section::Font => {
                 if installed_font(&family).is_some() {
                     dialog.draft.preferences.set_terminal_font_family(family);
@@ -1745,17 +1907,33 @@ impl Workspace {
                     (size != self.chrome.toolbar_icon_size()).then_some(size);
                 dialog.problem = None;
             }
-            Message::Startup(_, edit) if dialog.section == Section::Window => {
-                if matches!(edit, startup_settings::Edit::MasterPassword(_))
-                    && (self.clipboard.policy.problem.is_some()
-                        || self.clipboard.policy.require_master_password)
-                {
-                    return Task::none();
-                }
+            Message::Startup(_, edit)
+                if match edit {
+                    startup_settings::Edit::MasterPassword(_) => {
+                        dialog.section == Section::Security
+                            && self.clipboard.policy.problem.is_none()
+                            && !self.clipboard.policy.require_master_password
+                    }
+                    _ => dialog.section == Section::Window,
+                } =>
+            {
                 dialog
                     .startup
                     .update(&mut dialog.draft.preferences.startup, edit);
                 dialog.problem = None;
+            }
+            Message::TemporarySshKey(_, enabled)
+                if dialog.section == Section::Security
+                    && self.clipboard.policy.problem.is_none() =>
+            {
+                dialog.draft.preferences.temporary_ssh_key_enabled = enabled;
+            }
+            Message::DefaultIsolation(_, level)
+                if dialog.section == Section::Security
+                    && self.clipboard.policy.problem.is_none()
+                    && level >= self.clipboard.policy.minimum_isolation =>
+            {
+                dialog.draft.preferences.default_session_isolation = Some(level);
             }
             Message::ToolWindowTabs(_, enabled) => {
                 dialog.draft.preferences.open_tool_windows_as_tabs = enabled;
@@ -1984,6 +2162,9 @@ impl Workspace {
                 let standalone = dialog.standalone_agent_design;
                 let preferences = &mut dialog.draft.preferences;
                 match edit {
+                    Edit::PromptName(operation) => {
+                        return self.open_agent_design_name(id, operation);
+                    }
                     Edit::DockPlacement(placement) => {
                         preferences.ai_agent_panel.placement = Some(placement)
                     }
@@ -2173,6 +2354,9 @@ impl Workspace {
             return self.update(focus);
         }
         if let Some(dialog) = &mut self.settings.0 {
+            if let Some(prompt) = &dialog.agent_design_name {
+                return window::gain_focus(prompt.id);
+            }
             let id = dialog.id;
             let reveal = section
                 .filter(|_| !dialog.standalone_agent_design)
@@ -2229,6 +2413,7 @@ impl Workspace {
             standalone_agent_design,
             initial: draft.clone(),
             draft,
+            sandbox_availability: None,
             installed_sftp_conflict_policy: SftpConflictPolicy::load(),
             sftp_xml: sftp_settings::java::Exchange::default(),
             initial_highlighting: highlighting.clone(),
@@ -2261,18 +2446,32 @@ impl Workspace {
             snippet_appearance: snippet_editor_settings::Editor::default(),
             themes: theme_settings::Editor::default(),
             agent_design: agent_design_settings::Editor::default(),
+            agent_design_name: None,
             backup: backup::Editor::default(),
             logging: logging_settings::Editor::default(),
             export: export_settings::Editor::default(),
             quick_select,
             video: video_settings::Editor::new(self.video.preferences()),
         });
-        opened.chain(
+        let reveal = opened.chain(
             self.settings
                 .0
                 .as_ref()
                 .map_or_else(Task::none, Dialog::reveal_tab),
-        )
+        );
+        if standalone_agent_design {
+            reveal
+        } else {
+            Task::batch([
+                reveal,
+                Task::perform(
+                    async { probe_sandbox_availability() },
+                    move |availability| {
+                        Desktop::Settings(Message::SandboxAvailability(id, availability))
+                    },
+                ),
+            ])
+        }
     }
 
     pub(super) fn open_journal_options(&mut self, owner: window::Id) -> Task<Desktop> {
@@ -2810,6 +3009,7 @@ impl Workspace {
             let agent_animations_changed =
                 next.agent_animations() != self.window_settings.agent_animations();
             self.window_settings = next;
+            self.sync_quick_temporary_key_preference();
             if agent_animations_changed {
                 self.refresh_agent_inline_animations();
             }
@@ -2918,11 +3118,24 @@ impl Workspace {
     }
 
     pub(super) fn settings_view(&self, id: window::Id) -> Option<Element<'_, Desktop>> {
-        let dialog = self.settings.0.as_ref().filter(|dialog| dialog.id == id)?;
+        let dialog = self.settings.0.as_ref()?;
+        if let Some(prompt) = dialog
+            .agent_design_name
+            .as_ref()
+            .filter(|prompt| prompt.id == id)
+        {
+            return Some(prompt.view(&dialog.draft.preferences.ai_agent_designs));
+        }
+        if dialog.id != id {
+            return None;
+        }
+        let naming_modal = self
+            .agent_design_name_for(id)
+            .map(|id| Desktop::Settings(Message::Focus(id)));
         if dialog.standalone_agent_design {
             let preferences = &dialog.draft.preferences;
             let content = column![
-                scrollable(dialog.agent_design.view(preferences, id, None))
+                scrollable(dialog.agent_design.view(preferences, id))
                     .id(dialog.page_scroll.clone())
                     .translate_cursor_moves(true)
                     .height(Length::Fill),
@@ -2943,11 +3156,13 @@ impl Workspace {
             .height(Length::Fill)
             .into();
             let content = on_escape(content, Desktop::Settings(Message::Escape(id)));
-            return Some(
-                dialog
-                    .agent_design
-                    .preview_keyboard(content, preferences, id),
-            );
+            let content = dialog
+                .agent_design
+                .preview_keyboard(content, preferences, id);
+            return Some(super::profile_tools::vault_modal::gate(
+                content,
+                naming_modal,
+            ));
         }
         if dialog.saving() {
             return Some(
@@ -3005,13 +3220,14 @@ impl Workspace {
         }
         let search = container(container(input).max_width(SEARCH_MAX_WIDTH)).center_x(Length::Fill);
         let results = matches.peek().is_some().then(|| {
-            let items = column(matches.enumerate().map(|(index, setting)| {
+            let items = column(matches.enumerate().map(|(index, target)| {
+                let candidate = target.candidate();
                 button(
                     row![
-                        text(setting.label())
+                        text(candidate.label)
                             .wrapping(text::Wrapping::None)
                             .width(Length::Fill),
-                        text(setting.section().label()).size(13),
+                        (!candidate.is_page).then(|| text(candidate.page).size(13)),
                     ]
                     .align_y(Alignment::Center)
                     .spacing(10),
@@ -3023,7 +3239,7 @@ impl Workspace {
                 })
                 .height(SEARCH_ROW_HEIGHT)
                 .width(Length::Fill)
-                .on_press(msg(Message::Reveal(id, setting)))
+                .on_press(msg(Message::Reveal(id, target)))
                 .into()
             }))
             .spacing(4)
@@ -3150,6 +3366,7 @@ impl Workspace {
             Section::Logging => self.logging_settings_page(dialog),
             Section::Export => export_settings::view(dialog),
             Section::Window => self.window_settings_page(dialog, transparency),
+            Section::Security => self.security_settings_page(dialog),
             Section::Keyboard => highlighted(
                 dialog,
                 Setting::Shortcuts,
@@ -3170,11 +3387,7 @@ impl Workspace {
                 highlighted(
                     dialog,
                     Setting::AgentDesign,
-                    dialog.agent_design.view(
-                        preferences,
-                        id,
-                        dialog.input_target(Setting::AgentDesign, true),
-                    ),
+                    dialog.agent_design.view(preferences, id),
                 )
             }
             Section::Updates => {
@@ -3313,14 +3526,19 @@ impl Workspace {
         };
         let modal = self
             .highlight_rules_for_settings(id)
-            .map(|id| Desktop::Highlight(highlight::Message::Focus(id)));
+            .map(|id| Desktop::Highlight(highlight::Message::Focus(id)))
+            .or(naming_modal);
         Some(super::profile_tools::vault_modal::gate(content, modal))
     }
 
     fn dismiss_settings(&mut self, id: window::Id) -> Task<Desktop> {
+        if let Some(close) = self.close_agent_design_name(id) {
+            return close;
+        }
         if let Some(child) = self
             .openpgp_for_source(id)
             .or_else(|| self.highlight_rules_for_settings(id))
+            .or_else(|| self.agent_design_name_for(id))
         {
             return window::gain_focus(child);
         }
@@ -3707,6 +3925,170 @@ impl Workspace {
             .into()
     }
 
+    fn security_settings_page(&self, dialog: &Dialog) -> Element<'static, Desktop> {
+        let id = dialog.id;
+        let policy = &self.clipboard.policy;
+        let require_password = policy.require_master_password
+            || dialog.draft.preferences.startup.require_master_password;
+        let password_editable = policy.problem.is_none() && !policy.require_master_password;
+        let minimum = policy.minimum_isolation;
+        let isolation = dialog
+            .draft
+            .preferences
+            .default_session_isolation
+            .unwrap_or_default()
+            .max(minimum);
+        let allowed = IsolationLevel::ALL
+            .into_iter()
+            .filter(|level| *level >= minimum)
+            .collect::<Vec<_>>();
+        let isolation_control: Element<'_, Desktop> =
+            if policy.problem.is_some() || allowed.len() == 1 {
+                text(isolation.to_string()).into()
+            } else {
+                pick_list(allowed, Some(isolation), move |level| {
+                    Desktop::Settings(Message::DefaultIsolation(id, level))
+                })
+                .into()
+            };
+        let imported = dialog.draft.preferences.java_security;
+        let vault_path = profile::vault_path().ok();
+        let vault_exists = vault_path
+            .as_ref()
+            .is_some_and(|path| Vault::exists(path).unwrap_or(false));
+        let startup_unlock = vault_path
+            .as_ref()
+            .and_then(|path| Vault::startup_unlock_state(path).ok());
+        let (automatic_status, automatic_action, enable) = match startup_unlock {
+            Some(StartupUnlockState::Enabled) => (
+                if require_password {
+                    "Enabled on this device. The startup password requirement takes precedence."
+                } else {
+                    "Enabled on this device."
+                },
+                "Disable automatic unlock",
+                false,
+            ),
+            Some(StartupUnlockState::RemovalPending) => (
+                "Disabled. The device credential still needs to be removed.",
+                "Retry credential removal",
+                false,
+            ),
+            Some(StartupUnlockState::Disabled) => (
+                if !vault_exists {
+                    "Create a credential vault before enabling automatic unlock."
+                } else {
+                    "The device’s credential store can unlock your vault when kortty starts."
+                },
+                "Configure automatic unlock…",
+                true,
+            ),
+            None => (
+                "The automatic unlock setting could not be read.",
+                "Configure automatic unlock…",
+                true,
+            ),
+        };
+        let can_set_automatic =
+            startup_unlock.is_some() && (!enable || (vault_exists && password_editable));
+        column![
+            text("Master password").size(18),
+            text("Your master password unlocks the local credential vault.").size(13),
+            highlighted(
+                dialog,
+                Setting::ChangeMasterPassword,
+                dialog_design::secondary_action("Change master password…")
+                    .on_press(Desktop::Settings(Message::ChangeMasterPassword(id))),
+            ),
+            rule::horizontal(1),
+            highlighted(
+                dialog,
+                Setting::StartupMasterPassword,
+                column![
+                    checkbox(require_password)
+                        .label(Setting::StartupMasterPassword.label())
+                        .on_toggle_maybe(password_editable.then_some(move |enabled| {
+                            Desktop::Settings(Message::Startup(
+                                id,
+                                startup_settings::Edit::MasterPassword(enabled),
+                            ))
+                        })),
+                    if policy.require_master_password {
+                        text("Managed by your organization.").size(13)
+                    } else if policy.problem.is_some() {
+                        text("The startup setting is locked until the policy can be read.").size(13)
+                    } else {
+                        text("Takes effect the next time korTTY starts.").size(13)
+                    },
+                ]
+                .spacing(5),
+            ),
+            highlighted(
+                dialog,
+                Setting::AutomaticVaultUnlock,
+                column![
+                    text(Setting::AutomaticVaultUnlock.label()),
+                    text(automatic_status).size(13),
+                    dialog_design::secondary_action(automatic_action).on_press_maybe(
+                        can_set_automatic.then_some(Desktop::Settings(Message::AutomaticVaultUnlock(id, enable)))
+                    ),
+                ]
+                .spacing(5),
+            ),
+            rule::horizontal(1),
+            text("Temporary SSH keys").size(18),
+            text("Use temporary private keys in Quick Connect and saved SSH profiles. Quick Connect keeps the key in memory for its selected lifetime.").size(13),
+            highlighted(
+                dialog,
+                Setting::TemporarySshKey,
+                checkbox(dialog.draft.preferences.temporary_ssh_key_enabled)
+                    .label(Setting::TemporarySshKey.label())
+                    .on_toggle_maybe(policy.problem.is_none().then_some(move |enabled| {
+                        Desktop::Settings(Message::TemporarySshKey(id, enabled))
+                    })),
+            ),
+            imported.temporary_ssh_keys.map(|enabled| {
+                row![
+                    text(if enabled { "Java backup · Enabled" } else { "Java backup · Disabled" }).size(13),
+                    dialog_design::secondary_action("Use Java setting").on_press_maybe(
+                        (policy.problem.is_none() && enabled != dialog.draft.preferences.temporary_ssh_key_enabled)
+                            .then_some(Desktop::Settings(Message::TemporarySshKey(id, enabled)))
+                    ),
+                ].spacing(8).align_y(Alignment::Center)
+            }),
+            rule::horizontal(1),
+            text("Session isolation").size(18),
+            text("Set the default for new local and SSH sessions. Saved profiles and folders can specify their own level in Connection Manager.").size(13),
+            highlighted(
+                dialog,
+                Setting::DefaultIsolation,
+                row![
+                    text(Setting::DefaultIsolation.label()),
+                    isolation_control,
+                ].spacing(8).align_y(Alignment::Center),
+            ),
+            imported.default_isolation.map(|level| {
+                row![
+                    text(if level < minimum {
+                        format!("Java backup · {level} · Below the managed minimum")
+                    } else {
+                        format!("Java backup · {level}")
+                    }).size(13),
+                    dialog_design::secondary_action("Use Java setting").on_press_maybe(
+                        (policy.problem.is_none() && level >= minimum
+                            && dialog.draft.preferences.default_session_isolation != Some(level))
+                            .then_some(Desktop::Settings(Message::DefaultIsolation(id, level)))
+                    ),
+                ].spacing(8).align_y(Alignment::Center)
+            }),
+            (minimum != IsolationLevel::None).then(|| text(format!("Managed minimum · {minimum}")).size(13)),
+            highlighted(dialog, Setting::SandboxAvailability, text(dialog.sandbox_availability.clone().unwrap_or_else(|| "Checking sandbox availability…".into())).size(13)),
+            (isolation == IsolationLevel::Sandbox).then(|| text("Set an absolute sandbox workspace for local shells in Session security.").size(13)),
+        ]
+        .spacing(12)
+        .into()
+    }
+
     fn window_settings_page<'a>(
         &self,
         dialog: &'a Dialog,
@@ -3839,25 +4221,6 @@ impl Workspace {
             )),
             (None, _) => page.push(text("Session recovery is unavailable.").size(14)),
         };
-        let master_password_managed = self.clipboard.policy.require_master_password;
-        let edit_master_password =
-            !master_password_managed && self.clipboard.policy.problem.is_none();
-        page = page.push(highlighted(
-            dialog,
-            Setting::StartupMasterPassword,
-            column![
-                checkbox(master_password_managed || startup.require_master_password)
-                    .label(Setting::StartupMasterPassword.label())
-                    .on_toggle_maybe(edit_master_password.then_some(move |enabled| {
-                        Desktop::Settings(Message::Startup(id, startup_settings::Edit::MasterPassword(enabled)))
-                    })),
-                text(if master_password_managed {
-                    "Managed by your organization."
-                } else {
-                    "Unlock or create the credential vault before opening the workspace. Takes effect at the next start."
-                }).size(13),
-            ].spacing(4),
-        ));
         let output = dialog.draft.preferences.restore_output;
         let managed = self.clipboard.policy.session_restore_output;
         let enabled = managed.unwrap_or(output.enabled);
@@ -4223,6 +4586,20 @@ fn font_settings_page(dialog: &Dialog) -> Element<'_, Desktop> {
     .into()
 }
 
+fn probe_sandbox_availability() -> String {
+    let local = kortty_pty::local_sandbox_backend().map_err(|error| error.to_string());
+    let ssh = crate::ssh_worker::sandbox_availability();
+    let status = |result: &Result<&str, String>| match result {
+        Ok(backend) => format!("available ({backend})"),
+        Err(reason) => format!("unavailable ({reason})"),
+    };
+    format!(
+        "Local shell sandbox: {}\nSSH sandbox: {}",
+        status(&local),
+        status(ssh)
+    )
+}
+
 fn highlighted<'a>(
     dialog: &Dialog,
     setting: Setting,
@@ -4251,29 +4628,34 @@ impl fmt::Display for RestoreChoice {
     }
 }
 
-fn search_matches(query: &str) -> impl Iterator<Item = Setting> {
-    let query = normalized(query);
-    Setting::ALL.iter().copied().filter(move |setting| {
-        let query = query.trim();
-        if query.chars().take(2).count() < 2 {
-            return false;
-        }
-        let target = normalized(&format!(
-            "{} {} {}",
-            setting.label(),
-            setting.section().label(),
-            setting.keywords()
-        ));
-        query.split_whitespace().all(|word| target.contains(word))
-    })
+fn search_targets(
+    query: &str,
+    available: impl Fn(Setting) -> bool,
+) -> std::vec::IntoIter<SearchTarget> {
+    let available = &available;
+    crate::settings_search::rank(
+        query,
+        Section::ALL
+            .into_iter()
+            .flat_map(|section| {
+                std::iter::once(SearchTarget::Page(section)).chain(
+                    Setting::ALL
+                        .iter()
+                        .copied()
+                        .filter(move |setting| setting.section() == section && available(*setting))
+                        .map(SearchTarget::Setting),
+                )
+            })
+            .map(SearchTarget::candidate),
+    )
 }
 
-fn normalized(value: &str) -> String {
-    value
-        .nfkd()
-        .filter(|&ch| !is_combining_mark(ch))
-        .flat_map(char::to_lowercase)
-        .collect()
+#[cfg(test)]
+fn search_matches(query: &str) -> impl Iterator<Item = Setting> {
+    search_targets(query, |_| true).filter_map(|target| match target {
+        SearchTarget::Setting(setting) => Some(setting),
+        SearchTarget::Page(_) => None,
+    })
 }
 
 fn save_preferences(preferences: &WindowSettings) -> std::io::Result<()> {
@@ -4628,11 +5010,11 @@ mod tests {
         );
         assert_eq!(
             search_matches("font zoom").collect::<Vec<_>>(),
-            [Setting::FontSize, Setting::SnippetFontSize]
+            [Setting::SnippetFontSize, Setting::FontSize]
         );
         assert_eq!(
             search_matches("font face").collect::<Vec<_>>(),
-            [Setting::FontFamily, Setting::SnippetFontFamily]
+            [Setting::SnippetFontFamily, Setting::FontFamily]
         );
         assert_eq!(
             search_matches("terminal bracketed").collect::<Vec<_>>(),
@@ -5008,7 +5390,7 @@ mod tests {
         let _ = workspace.update_settings(Message::SearchChoose(id));
         let dialog = workspace.settings.0.as_ref().unwrap();
         assert_eq!(dialog.section, Section::Terminal);
-        assert_eq!(dialog.revealed, Some(Setting::QuickSelectPatterns));
+        assert_eq!(dialog.revealed, Some(Setting::QuickSelectAlphabet));
         assert!(dialog.search.is_empty());
 
         let _ = workspace.update_settings(Message::Search(id, "z".into()));
@@ -5019,6 +5401,265 @@ mod tests {
         assert!(workspace.settings.0.as_ref().unwrap().search.is_empty());
         let _ = workspace.update_settings(Message::Escape(id));
         assert!(workspace.settings.for_owner(owner).is_none());
+    }
+
+    #[test]
+    fn settings_security_search_reveals_master_password_controls_and_respects_policy() {
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.open_settings(owner, Some(Section::Window));
+        let id = workspace.settings.for_owner(owner).unwrap();
+
+        let _ = workspace.update_settings(Message::Search(id, "change master password".into()));
+        let _ = workspace.update_settings(Message::SearchChoose(id));
+        let dialog = workspace.settings.0.as_ref().unwrap();
+        assert_eq!(dialog.section, Section::Security);
+        assert_eq!(dialog.revealed, Some(Setting::ChangeMasterPassword));
+
+        let _ = workspace.update_settings(Message::Search(
+            id,
+            "require master password at startup".into(),
+        ));
+        let _ = workspace.update_settings(Message::SearchChoose(id));
+        assert_eq!(
+            workspace.settings.0.as_ref().unwrap().revealed,
+            Some(Setting::StartupMasterPassword)
+        );
+
+        let _ = workspace.update_settings(Message::Search(id, "automatic vault unlock".into()));
+        let _ = workspace.update_settings(Message::SearchChoose(id));
+        assert_eq!(
+            workspace.settings.0.as_ref().unwrap().revealed,
+            Some(Setting::AutomaticVaultUnlock)
+        );
+
+        let edit = |enabled| Message::Startup(id, startup_settings::Edit::MasterPassword(enabled));
+        let _ = workspace.update_settings(edit(true));
+        assert!(!workspace.window_settings.startup.require_master_password);
+        workspace.clipboard.policy.require_master_password = true;
+        let _ = workspace.update_settings(edit(false));
+        assert!(
+            workspace
+                .settings
+                .0
+                .as_ref()
+                .unwrap()
+                .draft
+                .preferences
+                .startup
+                .require_master_password
+        );
+        workspace.clipboard.policy.require_master_password = false;
+        let _ = workspace.save_settings_to(id, |_| Ok(()));
+        assert!(workspace.window_settings.startup.require_master_password);
+    }
+
+    #[test]
+    fn temporary_ssh_key_preference_is_searchable_and_applies_on_save() {
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.open_settings(owner, Some(Section::Window));
+        let id = workspace.settings.for_owner(owner).unwrap();
+
+        assert!(
+            !WindowSettings::decode(b"{}")
+                .unwrap()
+                .temporary_ssh_key_enabled
+        );
+        let _ = workspace.update_settings(Message::Search(id, "enable temporary ssh key".into()));
+        let _ = workspace.update_settings(Message::SearchChoose(id));
+        let dialog = workspace.settings.0.as_ref().unwrap();
+        assert_eq!(dialog.section, Section::Security);
+        assert_eq!(dialog.revealed, Some(Setting::TemporarySshKey));
+
+        let _ = workspace.update_settings(Message::TemporarySshKey(id, true));
+        assert!(!workspace.window_settings.temporary_ssh_key_enabled);
+        let mut snapshot = Vec::new();
+        let _ = workspace.save_settings_to(id, |settings| {
+            snapshot = serde_json::to_vec(settings)?;
+            Ok(())
+        });
+        assert!(workspace.window_settings.temporary_ssh_key_enabled);
+        assert!(
+            WindowSettings::decode(&snapshot)
+                .unwrap()
+                .temporary_ssh_key_enabled
+        );
+    }
+
+    #[test]
+    fn default_isolation_is_searchable_saved_and_checked_against_current_policy() {
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.open_settings(owner, Some(Section::Window));
+        let id = workspace.settings.for_owner(owner).unwrap();
+        assert_eq!(
+            WindowSettings::decode(b"{}")
+                .unwrap()
+                .default_session_isolation,
+            None
+        );
+
+        let _ = workspace.update_settings(Message::Search(id, "default isolation".into()));
+        let _ = workspace.update_settings(Message::SearchChoose(id));
+        let dialog = workspace.settings.0.as_ref().unwrap();
+        assert_eq!(dialog.section, Section::Security);
+        assert_eq!(dialog.revealed, Some(Setting::DefaultIsolation));
+
+        let _ = workspace.update_settings(Message::DefaultIsolation(id, IsolationLevel::Process));
+        assert_eq!(workspace.window_settings.default_session_isolation, None);
+        let mut snapshot = Vec::new();
+        let _ = workspace.save_settings_to(id, |settings| {
+            snapshot = serde_json::to_vec(settings)?;
+            Ok(())
+        });
+        assert_eq!(
+            WindowSettings::decode(&snapshot)
+                .unwrap()
+                .default_session_isolation,
+            Some(IsolationLevel::Process)
+        );
+
+        let _ = workspace.open_settings(owner, Some(Section::Security));
+        let id = workspace.settings.for_owner(owner).unwrap();
+        let _ = workspace.update_settings(Message::DefaultIsolation(id, IsolationLevel::None));
+        workspace.clipboard.policy.minimum_isolation = IsolationLevel::Process;
+        let _ = workspace.save_settings_to(id, |_| Ok(()));
+        assert_eq!(
+            workspace.window_settings.default_session_isolation,
+            Some(IsolationLevel::Process)
+        );
+    }
+
+    #[test]
+    fn sandbox_availability_reports_both_backends_to_its_settings_window() {
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.open_settings(owner, Some(Section::Security));
+        let id = workspace.settings.for_owner(owner).unwrap();
+        let availability = probe_sandbox_availability();
+        assert!(availability.starts_with("Local shell sandbox: "));
+        assert!(availability.contains("\nSSH sandbox: "));
+        let _ = workspace.update_settings(Message::SandboxAvailability(id, availability.clone()));
+        assert_eq!(
+            workspace
+                .settings
+                .0
+                .as_ref()
+                .unwrap()
+                .sandbox_availability
+                .as_deref(),
+            Some(availability.as_str())
+        );
+        let _ = workspace.update_settings(Message::Cancel(id));
+        let _ = workspace.open_settings(owner, Some(Section::Security));
+        let _ = workspace.update_settings(Message::SandboxAvailability(id, availability));
+        assert!(
+            workspace
+                .settings
+                .0
+                .as_ref()
+                .unwrap()
+                .sandbox_availability
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn java_security_preferences_remain_inactive_until_settings_are_saved() {
+        let local = br#"{"default_session_isolation":"sandbox","temporary_ssh_key_enabled":true}"#;
+        let imported = super::super::backup_data::portable_java_preferences(
+            b"<globalSettings><connectionIsolationDefault>none</connectionIsolationDefault><temporarySshKeyEnabled>false</temporarySshKeyEnabled></globalSettings>",
+            None,
+        ).unwrap();
+        assert_eq!(imported.security_proposals, 2);
+        let merged = super::super::backup_data::merge_java_window_settings(
+            Some(local),
+            &imported.contents.unwrap(),
+            &Default::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let mut workspace = Workspace {
+            window_settings: WindowSettings::decode(&merged).unwrap(),
+            ..Workspace::default()
+        };
+        let proposed = workspace.window_settings.java_security;
+        assert_eq!(proposed.default_isolation, Some(IsolationLevel::None));
+        assert_eq!(proposed.temporary_ssh_keys, Some(false));
+
+        workspace.clipboard.policy.minimum_isolation = IsolationLevel::Process;
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.open_settings(owner, Some(Section::Security));
+        let id = workspace.settings.for_owner(owner).unwrap();
+        let _ = workspace.update_settings(Message::DefaultIsolation(
+            id,
+            proposed.default_isolation.unwrap(),
+        ));
+        let _ = workspace.update_settings(Message::TemporarySshKey(
+            id,
+            proposed.temporary_ssh_keys.unwrap(),
+        ));
+        assert!(workspace.window_settings.temporary_ssh_key_enabled);
+        assert_eq!(
+            workspace
+                .settings
+                .0
+                .as_ref()
+                .unwrap()
+                .draft
+                .preferences
+                .default_session_isolation,
+            Some(IsolationLevel::Sandbox)
+        );
+        let _ = workspace.update_settings(Message::Cancel(id));
+        assert!(workspace.window_settings.temporary_ssh_key_enabled);
+
+        workspace.clipboard.policy.minimum_isolation = IsolationLevel::None;
+        let _ = workspace.open_settings(owner, Some(Section::Security));
+        let id = workspace.settings.for_owner(owner).unwrap();
+        let _ = workspace.update_settings(Message::DefaultIsolation(
+            id,
+            proposed.default_isolation.unwrap(),
+        ));
+        let _ = workspace.update_settings(Message::TemporarySshKey(
+            id,
+            proposed.temporary_ssh_keys.unwrap(),
+        ));
+        let _ = workspace.save_settings_to(id, |_| Ok(()));
+        assert_eq!(
+            workspace.window_settings.default_session_isolation,
+            Some(IsolationLevel::None)
+        );
+        assert!(!workspace.window_settings.temporary_ssh_key_enabled);
+    }
+
+    #[test]
+    fn settings_search_ranks_exact_page_and_opens_it_without_editing_the_draft() {
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.open_settings(owner, Some(Section::Window));
+        let id = workspace.settings.for_owner(owner).unwrap();
+        let preferences = workspace
+            .settings
+            .0
+            .as_ref()
+            .unwrap()
+            .draft
+            .preferences
+            .clone();
+        let _ = workspace.update_settings(Message::Search(id, "Fónt!".into()));
+        let dialog = workspace.settings.0.as_ref().unwrap();
+        assert_eq!(
+            dialog.search_results(false).next(),
+            Some(SearchTarget::Page(Section::Font))
+        );
+        let _ = workspace.update_settings(Message::SearchChoose(id));
+        let dialog = workspace.settings.0.as_ref().unwrap();
+        assert_eq!(dialog.section, Section::Font);
+        assert_eq!(dialog.revealed, None);
+        assert!(dialog.search.is_empty());
+        assert_eq!(dialog.draft.preferences, preferences);
     }
 
     #[test]
@@ -5987,7 +6628,8 @@ mod tests {
 
     #[test]
     fn custom_agent_design_is_edited_previewed_and_saved_through_settings() {
-        use crate::terminal_agent::design::{Approval, Arrangement, History, Status};
+        use crate::terminal_agent::design::{Approval, Arrangement, Catalog, History, Status};
+        use agent_design_name::{Action as NameAction, Operation as NameOperation};
         use agent_design_settings::{Edit, Module};
 
         let mut workspace = Workspace::default();
@@ -5995,10 +6637,49 @@ mod tests {
         let _ = workspace.open_settings(owner, None);
         let id = workspace.settings.0.as_ref().unwrap().id;
         let _ = workspace.update_settings(Message::Section(id, Section::AgentDesign));
+        for (operation, suggested) in [
+            (NameOperation::New, "My combination"),
+            (
+                NameOperation::Duplicate("standard".into()),
+                "Standard (blocks + metro line) 2",
+            ),
+        ] {
+            let _ = workspace
+                .update_settings(Message::AgentDesignCatalog(id, Edit::PromptName(operation)));
+            let child = workspace.agent_design_name_for(id).unwrap();
+            assert_eq!(workspace.placed_dialog_owner(child), Some(id));
+            let dialog = workspace.settings.0.as_ref().unwrap();
+            assert_eq!(dialog.agent_design_name.as_ref().unwrap().name, suggested);
+            assert_eq!(
+                dialog.draft.preferences.ai_agent_designs,
+                Catalog::default()
+            );
+            assert!(workspace.settings_view(child).is_some());
+            let _ = workspace.update_settings(Message::AgentDesignName(
+                child,
+                NameAction::Input("Cancelled".into()),
+            ));
+            let _ = workspace.update_settings(Message::Escape(child));
+            let _ = workspace.update_settings(Message::AgentDesignName(child, NameAction::Submit));
+            assert!(workspace.settings.title(child).is_none());
+            assert_eq!(
+                workspace
+                    .settings
+                    .0
+                    .as_ref()
+                    .unwrap()
+                    .draft
+                    .preferences
+                    .ai_agent_designs,
+                Catalog::default(),
+            );
+        }
         let _ = workspace.update_settings(Message::AgentDesignCatalog(
             id,
-            Edit::Duplicate("floating".into()),
+            Edit::PromptName(NameOperation::Duplicate("floating".into())),
         ));
+        let child = workspace.agent_design_name_for(id).unwrap();
+        let _ = workspace.update_settings(Message::AgentDesignName(child, NameAction::Submit));
         let choice = workspace
             .settings
             .0
@@ -6010,9 +6691,25 @@ mod tests {
             .choices()
             .pop()
             .unwrap();
+        assert_eq!(choice.name, "Floating 2");
+        let _ = workspace.update_settings(Message::AgentDesignCatalog(
+            id,
+            Edit::PromptName(NameOperation::Rename(choice.id.clone())),
+        ));
+        let child = workspace.agent_design_name_for(id).unwrap();
+        let _ = workspace.update_settings(Message::AgentDesignName(
+            child,
+            NameAction::Input(" ".into()),
+        ));
+        let _ = workspace.update_settings(Message::AgentDesignName(child, NameAction::Submit));
+        assert_eq!(workspace.agent_design_name_for(id), Some(child));
+        let _ = workspace.update_settings(Message::AgentDesignName(
+            child,
+            NameAction::Input("Review cards".into()),
+        ));
+        let _ = workspace.update_settings(Message::AgentDesignName(child, NameAction::Submit));
+        assert!(workspace.settings.title(child).is_none());
         for edit in [
-            Edit::Name(choice.id.clone(), "Review cards".into()),
-            Edit::Rename(choice.id.clone()),
             Edit::Module(choice.id.clone(), Module::History(History::StepCards)),
             Edit::Module(choice.id.clone(), Module::Status(Status::Pill)),
             Edit::Module(choice.id.clone(), Module::Approval(Approval::AboveActivity)),

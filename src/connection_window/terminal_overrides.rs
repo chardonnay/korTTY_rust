@@ -1,6 +1,6 @@
 use std::fmt;
 
-use iced::widget::{button, checkbox, column, pick_list, row, text, text_input};
+use iced::widget::{button, checkbox, column, container, pick_list, row, text, text_input};
 use iced::{Element, Length};
 use kortty_terminal::TextEncoding;
 
@@ -238,6 +238,13 @@ impl Draft {
         Ok(options)
     }
 
+    pub(super) fn strict_mode_view(&self) -> Element<'_, Edit> {
+        isolation_row(
+            "Strict terminal mode",
+            strict_terminal_mode(self.options.strict_terminal_mode, Edit::StrictTerminalMode),
+        )
+    }
+
     pub(super) fn view(&self, view: &ViewChoices<'_>) -> Element<'_, Edit> {
         let skills = view.ai_skills;
         let heading = checkbox(self.show)
@@ -372,10 +379,6 @@ impl Draft {
             labeled(
                 "Paste line delay (ms)",
                 text_input("Inherit", &self.paste_line_delay).on_input(Edit::PasteLineDelay)
-            ),
-            labeled(
-                "Strict terminal mode",
-                strict_terminal_mode(self.options.strict_terminal_mode, Edit::StrictTerminalMode)
             ),
             labeled(
                 "AI chat profile",
@@ -679,6 +682,16 @@ impl fmt::Display for AiChoice {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.1)
     }
+}
+
+pub(super) fn isolation_row<'a, Message: 'a>(
+    label: &'static str,
+    control: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    row![text(label).width(160), container(control).width(280)]
+        .align_y(iced::Alignment::Center)
+        .spacing(8)
+        .into()
 }
 
 fn labeled<'a>(label: &'static str, control: impl Into<Element<'a, Edit>>) -> Element<'a, Edit> {

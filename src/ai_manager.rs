@@ -1011,12 +1011,32 @@ impl Configuration {
                 None => root.publish_checked(FILE_NAME, |file| file.write_all(&bytes), authorize),
             }
         };
-        match indexes {
+        let completed = indexes
+            .as_ref()
+            .map(|indexes| indexes.completed_outcomes(self.enabled()));
+        let mut warning = match indexes {
             Some(indexes) => {
                 indexes.commit_checked(write_settings, || root.sync(), client, self.enabled())
             }
             None => write_settings(&|| Ok(())).map(|_| None),
+        }?;
+        let outcomes = (|| -> io::Result<()> {
+            if self.local != current.local {
+                local::outcomes::retain(path, &self.local)?;
+            }
+            if let Some(completed) = completed {
+                completed.save(path, &self.local)?;
+            }
+            Ok(())
+        })();
+        if outcomes.is_err() {
+            let warning = warning.get_or_insert_with(String::new);
+            if !warning.is_empty() {
+                warning.push(' ');
+            }
+            warning.push_str(local::outcomes::SAVE_WARNING);
         }
+        Ok(warning)
     }
 
     fn lock_mutation(
@@ -2498,17 +2518,25 @@ impl Page {
 
     fn keywords(self) -> &'static str {
         match self {
-            Self::General => "enable features timeout agent internet policies global request",
+            Self::General => {
+                "enable features timeout terminal agent triage confirmation security check snippet internet policies global request Tavily Brave Bright Data SearXNG web search"
+            }
             Self::Profiles => {
-                "provider API URL key connection model GGUF llama reasoning vision limits default"
+                "provider API URL key endpoint connection model GGUF llama reasoning vision time limit token limit budget price max output default"
             }
             Self::LocalModels => {
-                "server discovery loopback connection installed model start stop status configure idle remove GGUF Hugging Face"
+                "server discovery loopback connection installed model start stop status configure idle remove GGUF Hugging Face HF download llama.cpp MLX LM Studio"
             }
-            Self::Knowledge => "embedding documents files search retrieval index",
-            Self::Skills => "prompt instructions rules learned learning markdown import export",
-            Self::Memory => "global connection history learned archive restore",
-            Self::LocalPreferences => "preferences default profiles text coding agent journal",
+            Self::Knowledge => "RAG embeddings documents files search retrieval index vector",
+            Self::Skills => {
+                "prompt instructions rules learned learning markdown import export GitHub Anthropic"
+            }
+            Self::Memory => {
+                "global connection history learned archive restore MEMORY.md notes remember context korTTY memory"
+            }
+            Self::LocalPreferences => {
+                "preferences default profiles text coding agent journal Hugging Face HF token"
+            }
         }
     }
 }
@@ -3673,14 +3701,8 @@ impl Dialog {
                     && self.general.features_enabled
                     && self.page == Page::LocalModels
                     && self.search.trim().is_empty();
-                if self
-                    .local
-                    .finish_managed_file_picker(&ticket, paths, can_import)
-                {
-                    return self.open_page(search::Target::Setting(search::Setting::Managed(
-                        search::ManagedSetting::Source,
-                    )));
-                }
+                self.local
+                    .finish_managed_file_picker(&ticket, paths, can_import);
             }
             Message::Local(event)
                 if editable
@@ -3900,19 +3922,17 @@ impl Dialog {
     fn search_results(&self) -> impl Iterator<Item = search::Target> + '_ {
         let wizard = self.profile_wizard_open();
         let editable = self.editable() && self.profile_form_lock().is_none();
-        search::results(&self.search, self.profiles.searchable_profile())
-            .chain(search::imported_model_results(
-                &self.search,
-                &self.saved.java_model_hints,
-            ))
+        let hints = &self.saved.java_model_hints;
+        let candidates = search::targets(self.profiles.searchable_profile())
+            .chain(search::imported_models(hints))
             .filter(move |_| !wizard)
-            .chain(search::matching(
-                &self.search,
+            .chain(
                 self.profiles
                     .wizard_search_settings(editable)
                     .map(search::Target::Setting),
-            ))
-            .filter(|&target| self.search_target_available(target))
+            )
+            .filter(|&target| self.search_target_available(target));
+        search::matching(&self.search, candidates, hints)
     }
 
     fn search_target_available(&self, target: search::Target) -> bool {
@@ -4207,6 +4227,8 @@ impl Dialog {
         {
             return scroll;
         }
+        // Selecting the initial store cancels unfinished work from the previous view.
+        let source_results = self.load_knowledge_source_results();
         let load = match self.page {
             Page::Memory
                 if self.revealed.setting
@@ -4260,7 +4282,7 @@ impl Dialog {
             load,
             self.load_profile_usage(),
             self.refresh_lm_studio_metadata(),
-            self.load_knowledge_source_results(),
+            source_results,
         ])
     }
 
@@ -4272,6 +4294,12 @@ impl Dialog {
                 .map(Message::Local)
         } else {
             Task::none()
+        }
+    }
+
+    pub(crate) fn refresh_knowledge_source_outcomes(&mut self) {
+        if self.page == Page::Knowledge {
+            self.local.refresh_source_outcomes(&self.local_state);
         }
     }
 
@@ -4937,6 +4965,10 @@ impl Dialog {
         self.local.model_configuration_kind()
     }
 
+    pub(crate) fn gguf_configuration_width(&self) -> f32 {
+        self.local.gguf_configuration_width()
+    }
+
     pub(crate) fn model_configuration_view(&self) -> Option<Element<'_, Message>> {
         self.local
             .model_configuration_view(
@@ -5212,7 +5244,7 @@ impl Dialog {
         ]
         .height(Length::Fill);
         let mut pages = stack![pages].height(Length::Fill).width(Length::Fill);
-        if !self.search.trim().is_empty() {
+        if crate::settings_search::has_query(&self.search) {
             let results = container(
                 scrollable(self.search_view())
                     .id(self.search_scroll.clone())
@@ -5482,16 +5514,7 @@ impl Dialog {
         let mut results = column![].spacing(2);
         for (index, target) in matches {
             let selected = index == self.search_selection;
-            let label = match target {
-                search::Target::Setting(search::Setting::ImportedJavaModel(key)) => self
-                    .saved
-                    .java_model_hints
-                    .search_hint(key)
-                    .map(|hint| hint.label())
-                    .unwrap_or_else(|| target.label()),
-                search::Target::Setting(setting) => setting.title().into(),
-                _ => target.label(),
-            };
+            let label = target.label(&self.saved.java_model_hints);
             let result = button(
                 row![
                     text(label)
@@ -6159,7 +6182,9 @@ mod tests {
             .save_against(&root, &Configuration::default())
             .unwrap();
         let mut dialog = Dialog::new(Arc::new(config), root.clone(), Vec::new(), true, None);
-        let _ = dialog.update(Message::Search("mutating confirmation".into()));
+        let _ = dialog.update(Message::Search(
+            "Require approval for mutating Agent command sets".into(),
+        ));
         let _ = dialog.update(Message::SearchChoose);
         assert_eq!(
             dialog.revealed.setting,

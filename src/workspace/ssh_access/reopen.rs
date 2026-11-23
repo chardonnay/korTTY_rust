@@ -106,6 +106,10 @@ impl SavedSshProfile {
             .with_isolation(floor, floor)
             .with_fixed_route()
     }
+
+    pub(super) fn isolation(&self, workspace: &Workspace) -> io::Result<IsolationLevel> {
+        workspace.saved_launch_isolation(&self.connection, Some(&self.path), None)
+    }
 }
 
 impl Workspace {
@@ -228,11 +232,20 @@ impl Workspace {
             );
             return self.finish_reopen_ssh(owner, token, SshOutcome::Unavailable);
         };
-        if let Some(failure) = self.reopen_ssh_sandbox_failure(owner, token, connection.isolation) {
+        let isolation = match saved.isolation(self) {
+            Ok(level) => level,
+            Err(error) => {
+                self.notice(
+                    owner,
+                    format!("Could not resolve session isolation ({error})"),
+                );
+                return self.finish_reopen_ssh(owner, token, SshOutcome::Unavailable);
+            }
+        };
+        if let Some(failure) = self.reopen_ssh_sandbox_failure(owner, token, isolation) {
             return failure;
         }
-        let minimum = self.clipboard.policy.minimum_isolation;
-        let form = saved.form(profile, minimum);
+        let form = saved.form(profile, isolation);
         let form_revision = self.allocate();
         self.launch_quick_ssh(
             owner,

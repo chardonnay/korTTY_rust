@@ -6,6 +6,7 @@ use kortty_pty::{LocalShell, available_local_shells};
 use kortty_terminal::TerminalProfile;
 
 use crate::connection_store::LocalProfile;
+use crate::session_security::{IsolationLevel, LocalIsolation};
 use crate::terminal_effects::{Effect, editor::EffectDraft};
 
 use super::{ConnectionWindow, Message, Persisted, Scope, terminal_overrides};
@@ -16,8 +17,10 @@ const MAX_ARGUMENTS: usize = 127;
 pub enum Edit {
     Name(String),
     Directory(String),
+    Folder(Option<String>),
     Shell(LocalShell),
     Emulation(TerminalProfile),
+    Isolation(LocalIsolation),
     Integration(bool),
     Custom(bool),
     Program(String),
@@ -36,6 +39,7 @@ pub(super) struct Draft {
     directory: String,
     shell: LocalShell,
     emulation: TerminalProfile,
+    isolation: LocalIsolation,
     integration: bool,
     custom: bool,
     program: String,
@@ -53,6 +57,7 @@ impl Draft {
             directory: String::new(),
             shell: LocalShell::default(),
             emulation: TerminalProfile::default(),
+            isolation: LocalIsolation::Inherit,
             integration: false,
             custom: false,
             program: String::new(),
@@ -73,6 +78,7 @@ impl Draft {
                     directory.to_string_lossy().into_owned()
                 });
             draft.shell = profile.shell;
+            draft.isolation = profile.isolation;
             draft.integration = profile.shell_integration;
             draft.terminal = terminal_overrides::Draft::new(&profile.terminal);
             draft.effect = EffectDraft::new(profile.terminal_effect);
@@ -94,6 +100,7 @@ impl Draft {
         });
         let profile = LocalProfile {
             id: self.id,
+            isolation: self.isolation,
             name: self.name.trim().into(),
             shell: if self.custom {
                 LocalShell::Default
@@ -120,6 +127,7 @@ impl Draft {
                 self.integration &= self.integration_support().is_ok();
             }
             Edit::Emulation(emulation) => self.emulation = emulation,
+            Edit::Isolation(isolation) => self.isolation = isolation,
             Edit::Integration(enabled) if !enabled || self.integration_support().is_ok() => {
                 self.integration = enabled;
             }
@@ -166,17 +174,36 @@ impl Draft {
         )
     }
 
-    pub(super) fn view(
-        &self,
+    pub(super) fn view<'a>(
+        &'a self,
         title: &'static str,
         choices: &super::view::ViewChoices<'_>,
-    ) -> Element<'_, Edit> {
+        group: Element<'a, Edit>,
+        inherited: Option<(&str, IsolationLevel)>,
+    ) -> Element<'a, Edit> {
+        let (level, source) = self.isolation.resolve(
+            choices.local_isolation_default,
+            inherited,
+            choices.isolation.1,
+        );
         let mut form = column![
             text(title).size(21),
             text("Name").size(14),
             text_input("Local shell profile name", &self.name).on_input(Edit::Name),
+            group,
             text("Starting directory").size(14),
             text_input("Absolute path (optional)", &self.directory).on_input(Edit::Directory),
+            column![
+                text("Session isolation").size(16),
+                terminal_overrides::isolation_row(
+                    "Isolation",
+                    pick_list(LocalIsolation::ALL, Some(self.isolation), Edit::Isolation)
+                        .width(Length::Fill),
+                ),
+                text(format!("Effective isolation · {level} · {source}")).size(13),
+                self.terminal.strict_mode_view().map(Edit::Terminal),
+            ]
+            .spacing(6),
             text("Terminal emulation").size(14),
             pick_list(TerminalProfile::ALL, Some(self.emulation), Edit::Emulation)
                 .width(Length::Fill),
@@ -231,6 +258,11 @@ impl Draft {
 
 impl ConnectionWindow {
     pub(super) fn begin_local(&mut self, profile: Option<LocalProfile>, duplicate: bool) {
+        self.draft_group = match &profile {
+            Some(profile) => self.store.group_of(profile.id),
+            None => self.active_group(),
+        }
+        .map(str::to_owned);
         self.local_draft = Some(Draft::new(profile, duplicate));
         self.badge_picker = None;
         self.dismiss_tree_context();
@@ -248,10 +280,11 @@ impl ConnectionWindow {
                 return Task::none();
             }
         };
+        let group = self.draft_group.clone();
         self.persist(move |mut store| {
-            let id = store.save_local(profile)?;
+            let id = store.save_local_in_group(profile, group.as_deref())?;
             let mut done = Persisted::saved(store, id);
-            done.scope = Some(Scope::All);
+            done.scope = Some(group.map_or(Scope::All, Scope::Group));
             Ok(done)
         })
     }
@@ -264,6 +297,7 @@ impl ConnectionWindow {
                 Scope::All => true,
                 Scope::Favorites => self.store.is_favorite(profile.id),
                 Scope::Open => self.open_count(profile.id) > 0,
+                Scope::Group(ref path) => self.store.is_in_group(profile.id, path),
                 _ => false,
             })
             .collect();

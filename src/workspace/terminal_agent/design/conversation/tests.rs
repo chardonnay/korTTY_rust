@@ -296,7 +296,16 @@ fn stale_earlier_step_actions_cannot_copy_through_a_replaced_menu_or_stream() {
     let archived = finish(&mut fixture, 1, "First question", "First answer");
     let run = fixture.run_mut(archived);
     let step = run.inline_command("printf fixture").unwrap();
-    run.inline_result(engine::Status::Exited(0), "Retained output", "");
+    let marker = "late archived credential";
+    let long_line = "retained ".repeat(400);
+    let tail = "c\nd\ne\nf\ng\nh\ni\nj";
+    let captured = format!("Retained output {marker}\n{long_line}\n{tail}");
+    run.inline_result(engine::Status::Exited(0), &captured, "archived stderr");
+    run.inline_command("printf fixture");
+    run.inline_result(engine::Status::Exited(0), "different archived step", "");
+    let secrets = crate::terminal_logging::Secrets::default();
+    secrets.add(marker);
+    run.learned_sudo = Some(secrets.seal().unwrap());
     drop(fixture.send(archived, Message::Close));
     let current = finish(&mut fixture, 2, "Second question", "Second answer");
     fixture.workspace.clipboard.policy.internal = true;
@@ -333,6 +342,17 @@ fn stale_earlier_step_actions_cannot_copy_through_a_replaced_menu_or_stream() {
         fixture.workspace.clipboard.buffer.get().as_deref(),
         Some("Fixture clipboard")
     );
+    drop(fixture.send(current, open(surface)));
+    drop(fixture.send(current, action.clone()));
+    assert_eq!(
+        fixture.workspace.clipboard.buffer.get().as_deref(),
+        Some(format!("Retained output ***\n{long_line}\n{tail}\narchived stderr").as_str()),
+    );
+    fixture
+        .workspace
+        .clipboard
+        .buffer
+        .set("Fixture clipboard".into());
     drop(fixture.send(current, open(surface)));
     let session = fixture.session;
     fixture

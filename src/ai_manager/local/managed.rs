@@ -82,6 +82,7 @@ pub(crate) enum Message {
     Stop,
     Test,
     RepairBackend,
+    AcceptBackendOffer,
     Name(String),
     Backend(ModelBackend),
     Context(String),
@@ -153,6 +154,12 @@ impl Column {
 }
 
 enum Action {
+    ConfirmImport,
+    ConfirmBackend {
+        model_name: String,
+        active: PackageBackend,
+        required: PackageBackend,
+    },
     Configure(Configuration),
     ConfirmStart {
         models: Vec<ReviewedModel>,
@@ -246,6 +253,7 @@ impl Configuration {
         active_backend: Option<PackageBackend>,
         reveal: &Reveal,
     ) -> Element<'a, LocalMessage> {
+        use super::model_configuration::gguf_field as field;
         use ManagedSetting::*;
         let number = |setting,
                       value: &'a str,
@@ -275,21 +283,22 @@ impl Configuration {
                         Setting::Managed(Name),
                         enabled,
                         text_input("Name", &self.name)
+                            .size(13)
+                            .padding([7, 5])
+                            .style(dialog_design::form_input)
                             .on_input_maybe(enabled.then_some(|name| Managed(Message::Name(name)))),
                     )
                 ),
             ),
-            field(
-                "GGUF file",
-                text(location)
-                    .size(13)
-                    .wrapping(text::Wrapping::WordOrGlyph)
-            ),
+            field("GGUF file", super::model_configuration::gguf_path(location)),
             reveal.wrap(
                 Setting::Managed(Backend),
                 field("Backend", backend_picker(self.backend, enabled)),
             ),
-            unavailable_backend(self.backend, active_backend).map(|reason| text(reason).size(13)),
+            unavailable_backend(self.backend, active_backend).map(|reason| field(
+                "",
+                text(reason).size(13).wrapping(text::Wrapping::WordOrGlyph)
+            )),
             reveal.wrap(
                 Setting::Managed(Purpose),
                 field(
@@ -314,7 +323,7 @@ impl Configuration {
             reveal.wrap(
                 Setting::Managed(CpuThreads),
                 field(
-                    "CPU threads (0 = auto)",
+                    "CPU threads (0 = Auto)",
                     number(
                         CpuThreads,
                         &self.cpu_threads,
@@ -328,7 +337,7 @@ impl Configuration {
             reveal.wrap(
                 Setting::Managed(GpuLayers),
                 field(
-                    "GPU layers (-1 = auto)",
+                    "GPU layers (-1 = Auto)",
                     number(
                         GpuLayers,
                         &self.gpu_layers,
@@ -366,7 +375,7 @@ impl Configuration {
                 .wrap()
             ),
         ]
-        .spacing(8)
+        .spacing(9)
         .into()
     }
 }
@@ -521,9 +530,9 @@ impl Models {
         self.file_picker = None;
     }
 
-    pub(super) fn stage_files(&mut self, paths: Vec<PathBuf>) -> Result<bool, &'static str> {
-        if paths.is_empty() {
-            return Ok(false);
+    pub(super) fn stage_files(&mut self, paths: Vec<PathBuf>) -> Result<(), &'static str> {
+        if paths.is_empty() || self.has_action() {
+            return Ok(());
         }
         if paths.len() > managed_models::MAX_MODELS {
             return Err("Choose at most 256 GGUF files per import.");
@@ -544,8 +553,79 @@ impl Models {
             .collect();
         self.source.clear();
         self.projector_path.clear();
-        self.import_open = true;
-        Ok(true)
+        self.action = Some(Action::ConfirmImport);
+        Ok(())
+    }
+
+    fn import_review(&self, enabled: bool) -> Element<'_, LocalMessage> {
+        let count = self.picked_files.len();
+        let paired = !self.projector_path.trim().is_empty();
+        let can_copy = enabled
+            && count > 0
+            && (!paired || (count == 1 && self.import_purpose == Purpose::Chat));
+        let can_reference = enabled && count > 0 && !paired;
+        let can_reattach = enabled
+            && count == 1
+            && self.selected.as_ref().is_some_and(|choice| {
+                self.can_reattach && choice.model.projector_bytes.is_some() == paired
+            });
+        let form = column![
+            text(if count == 1 {
+                "Choose how to store the selected GGUF file.".into()
+            } else {
+                format!("Choose how to store the {count} selected GGUF files.")
+            }),
+            self.picked_file_rows(),
+            field(
+                "Import purpose",
+                purpose_picker(self.import_purpose, enabled, Message::ImportPurpose)
+            ),
+            (count == 1).then(|| field(
+                "Vision projector path (optional)",
+                text_input(
+                    "Absolute path to a compatible GGUF projector",
+                    &self.projector_path
+                )
+                .on_input_maybe(enabled.then_some(|path| Managed(Message::ProjectorPath(path))))
+            )),
+            paired.then(|| text("Vision pairs use the Chat purpose and a private copy.").size(13)),
+            (count == 1 && self.can_reattach).then(|| {
+                dialog_design::secondary_action("Reattach to selected model…")
+                    .on_press_maybe(can_reattach.then_some(Managed(Message::AskReattachment)))
+            }),
+        ]
+        .spacing(10);
+        iced::widget::container(
+            column![
+                iced::widget::scrollable(form).height(Length::Fill),
+                row![
+                    iced::widget::space::horizontal().width(Length::Fill),
+                    button("Import private copy")
+                        .on_press_maybe(can_copy.then_some(Managed(Message::Import))),
+                    dialog_design::secondary_action("Register external GGUF")
+                        .on_press_maybe(can_reference.then_some(Managed(Message::Reference))),
+                    dialog_design::secondary_action("Cancel")
+                        .on_press(Managed(Message::CancelAction)),
+                ]
+                .spacing(8)
+                .wrap(),
+            ]
+            .spacing(12),
+        )
+        .padding(16)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+    }
+
+    fn picked_file_rows(&self) -> iced::widget::Column<'_, LocalMessage> {
+        column(self.picked_files.iter().map(|path| {
+            text(super::file_chooser::display_path(path).into_owned())
+                .wrapping(text::Wrapping::WordOrGlyph)
+                .size(13)
+                .into()
+        }))
+        .spacing(4)
     }
 
     fn single_source(&self) -> Option<&Path> {
@@ -653,6 +733,22 @@ impl Models {
         Some((model, model.backend.required_package()?))
     }
 
+    pub(super) fn configuring(&self) -> bool {
+        matches!(self.action, Some(Action::Configure(_)))
+    }
+
+    pub(super) fn offer_matching_backend(&mut self) {
+        if let Some(active) = self.active_backend
+            && let Some((model, required)) = self.backend_repair()
+        {
+            self.action = Some(Action::ConfirmBackend {
+                model_name: model.name.clone(),
+                active,
+                required,
+            });
+        }
+    }
+
     pub(super) fn return_to_model(&mut self, id: &str, profile: &Path) {
         self.selected = self
             .choices
@@ -693,6 +789,10 @@ impl Models {
     }
 
     pub(super) fn dismiss_action(&mut self) {
+        if matches!(self.action, Some(Action::ConfirmImport)) {
+            self.picked_files.clear();
+            self.projector_path.clear();
+        }
         self.action = None;
     }
 
@@ -896,7 +996,7 @@ impl Dialog {
                     .spacing(8)
                     .into(),
                 ),
-                Some(Action::Configure(_) | Action::ConfirmStart { .. } | Action::ConfirmRemoval(_)) => None,
+                Some(Action::Configure(_) | Action::ConfirmImport | Action::ConfirmBackend { .. } | Action::ConfirmStart { .. } | Action::ConfirmRemoval(_)) => None,
                 None => None,
             });
         column![
@@ -940,15 +1040,12 @@ impl Dialog {
             action,
             (models.import_open || models.can_reattach).then(|| column![
             reveal.wrap(Setting::Managed(Target::Source), column![
-                (!models.picked_files.is_empty()).then(|| iced::widget::scrollable(column(
-                    models.picked_files.iter().map(|path| {
-                        text(super::file_chooser::display_path(path).into_owned())
-                            .wrapping(text::Wrapping::WordOrGlyph).size(13).into()
-                    }),
-                )).height(Length::Fixed((models.picked_files.len().min(4) as f32) * 24.0))),
+                (!models.picked_files.is_empty() && !matches!(models.action, Some(Action::ConfirmImport)))
+                    .then(|| iced::widget::scrollable(models.picked_file_rows())
+                        .height(Length::Fixed((models.picked_files.len().min(4) as f32) * 24.0))),
                 field(
                     if models.picked_files.is_empty() { "GGUF model path" } else { "Replace selection with a path" },
-                    reveal.input(Setting::Managed(Target::Source), enabled && models.picked_files.is_empty(),
+                    reveal.input(Setting::Managed(Target::Source), enabled,
                         text_input("Absolute path to the local GGUF", &models.source)
                             .on_input_maybe(enabled.then_some(|path| Managed(Message::Source(path)))))
                 ),
@@ -1152,6 +1249,21 @@ fn import_models(
 }
 
 impl Dialog {
+    fn configured_gguf_path(&self) -> Option<String> {
+        let model = &self.managed.selected.as_ref()?.model;
+        Some(
+            super::file_chooser::display_path(&model.registered_weights_path(&self.profile_dir))
+                .into_owned(),
+        )
+    }
+
+    pub(in crate::ai_manager) fn gguf_configuration_width(&self) -> f32 {
+        self.configured_gguf_path().map_or(
+            super::model_configuration::GGUF_MINIMUM_PREFERRED_WIDTH,
+            |path| super::model_configuration::gguf_preferred_width(&path),
+        )
+    }
+
     pub(in crate::ai_manager) fn model_configuration_kind(
         &self,
     ) -> Option<super::ModelConfigurationKind> {
@@ -1186,24 +1298,25 @@ impl Dialog {
                 let Some(Action::Configure(configuration)) = &self.managed.action else {
                     return None;
                 };
-                let model = &self.managed.selected.as_ref()?.model;
                 let fields = configuration.fields(
-                    model
-                        .registered_weights_path(&self.profile_dir)
-                        .to_string_lossy()
-                        .into_owned(),
+                    self.configured_gguf_path()?,
                     enabled,
                     self.managed.active_backend,
                     reveal,
                 );
                 let save = reveal.action(
                     Setting::Managed(ManagedSetting::Save),
-                    button("Save")
+                    button(text("Save").size(13).center().width(Length::Fill))
+                        .padding([6, 10])
+                        .width(94)
                         .on_press_maybe(enabled.then_some(Managed(Message::SaveConfiguration))),
                 );
                 let cancel = reveal.action(
                     Setting::Managed(ManagedSetting::Cancel),
-                    dialog_design::secondary_action("Cancel")
+                    button(text("Cancel").size(13).center().width(Length::Fill))
+                        .padding([6, 10])
+                        .width(94)
+                        .style(dialog_design::secondary_button)
                         .on_press_maybe((!self.busy()).then_some(Managed(Message::CancelAction))),
                 );
                 Some(super::model_configuration::window(
@@ -1226,6 +1339,8 @@ impl Dialog {
 
     pub(in crate::ai_manager) fn model_review_title(&self) -> Option<&'static str> {
         match self.managed.action {
+            Some(Action::ConfirmImport) => Some("Import GGUF"),
+            Some(Action::ConfirmBackend { .. }) => Some("Matching runtime"),
             Some(Action::ConfirmRemoval(_)) => Some("Remove selected models"),
             Some(Action::ConfirmStart { .. }) => Some("Start selected models"),
             _ => None,
@@ -1243,6 +1358,27 @@ impl Dialog {
         enabled: bool,
     ) -> Option<Element<'_, LocalMessage>> {
         let (description, models, action) = match self.managed.action.as_ref()? {
+            Action::ConfirmImport => return Some(self.managed.import_review(enabled)),
+            Action::ConfirmBackend {
+                model_name,
+                active,
+                required,
+            } => {
+                return Some(iced::widget::container(column![
+                    text(format!("The saved model {model_name} needs a signed {required} runtime. The active runtime uses {active}."))
+                        .wrapping(text::Wrapping::WordOrGlyph),
+                    iced::widget::space::vertical().height(Length::Fill),
+                    row![
+                        iced::widget::space::horizontal().width(Length::Fill),
+                        button("Review matching runtime").on_press_maybe(enabled.then_some(Managed(Message::AcceptBackendOffer))),
+                        dialog_design::secondary_action("Keep current runtime").on_press(Managed(Message::CancelAction)),
+                    ].spacing(8).wrap(),
+                ].spacing(12))
+                .padding(16)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into());
+            }
             Action::ConfirmStart {
                 models,
                 memory_percent,
@@ -1328,7 +1464,10 @@ impl Dialog {
                     |_, _, _| Ok(None),
                 );
             }
-            Message::Import | Message::Reference if !self.managed.has_action() => {
+            Message::Import | Message::Reference
+                if !self.managed.has_action()
+                    || matches!(self.managed.action, Some(Action::ConfirmImport)) =>
+            {
                 let paths = self.managed.single_source().map_or_else(
                     || self.managed.picked_files.clone(),
                     |path| vec![path.to_owned()],
@@ -1350,11 +1489,7 @@ impl Dialog {
                 } else {
                     "Importing the managed GGUF model…"
                 };
-                if !self.managed.picked_files.is_empty() {
-                    self.managed.picked_files.clear();
-                    self.managed.import_open = false;
-                }
-                return self.manage_models(status, true, move |_, registry, cancelled| {
+                let task = self.manage_models(status, true, move |_, registry, cancelled| {
                     import_models(
                         registry,
                         paths,
@@ -1365,8 +1500,17 @@ impl Dialog {
                     )
                     .map(Some)
                 });
+                if self.busy() && matches!(self.managed.action, Some(Action::ConfirmImport)) {
+                    self.managed.dismiss_action();
+                    self.managed.import_open = false;
+                }
+                return task;
             }
-            Message::AskReattachment if self.managed.can_reattach && !self.managed.has_action() => {
+            Message::AskReattachment
+                if self.managed.can_reattach
+                    && (!self.managed.has_action()
+                        || matches!(self.managed.action, Some(Action::ConfirmImport))) =>
+            {
                 let Some(Choice { model, .. }) = &self.managed.selected else {
                     return Task::none();
                 };
@@ -1458,7 +1602,13 @@ impl Dialog {
                     );
                 }
             }
-            Message::RepairBackend => {
+            Message::RepairBackend | Message::AcceptBackendOffer => {
+                if matches!(message, Message::AcceptBackendOffer) {
+                    if !matches!(self.managed.action, Some(Action::ConfirmBackend { .. })) {
+                        return Task::none();
+                    }
+                    self.managed.dismiss_action();
+                }
                 if let Some((model, required)) = self.managed.backend_repair() {
                     self.runtime_removal = None;
                     self.backend_repair = Some(BackendRepair {
@@ -1751,6 +1901,9 @@ fn backend_picker(selected: ModelBackend, enabled: bool) -> Element<'static, Loc
     pick_list(options, Some(selected), |backend| {
         Managed(Message::Backend(backend))
     })
+    .text_size(13)
+    .padding([5, 8])
+    .width(96)
     .dismiss_on_escape()
 }
 
@@ -2133,24 +2286,33 @@ mod tests {
             None,
         );
         manager.page = Page::LocalModels;
-        let pick = manager.update(ManagerMessage::Local(Managed(Message::Browse)));
-        let mut picker = iced_runtime::task::into_stream(pick).unwrap();
-        let Some(iced_runtime::Action::Output(ManagerMessage::Local(
-            LocalMessage::OpenManagedFilePicker(ticket),
-        ))) = block_on(picker.next())
-        else {
-            panic!("expected the native picker request");
-        };
-        let _ = manager.update(ManagerMessage::Local(LocalMessage::ManagedFilesPicked(
-            Arc::new(()),
-            Some(vec![missing.clone()]),
-        )));
-        assert!(manager.local.managed.picked_files.is_empty());
-        let _ = manager.update(ManagerMessage::Local(LocalMessage::ManagedFilesPicked(
-            ticket,
-            Some(vec![second, first.clone(), missing.clone()]),
-        )));
-        assert!(manager.local.managed.import_open);
+        for confirm in [false, true] {
+            let pick = manager.update(ManagerMessage::Local(Managed(Message::Browse)));
+            let mut picker = iced_runtime::task::into_stream(pick).unwrap();
+            let Some(iced_runtime::Action::Output(ManagerMessage::Local(
+                LocalMessage::OpenManagedFilePicker(ticket),
+            ))) = block_on(picker.next())
+            else {
+                panic!("expected the native picker request");
+            };
+            let _ = manager.update(ManagerMessage::Local(LocalMessage::ManagedFilesPicked(
+                Arc::new(()),
+                Some(vec![missing.clone()]),
+            )));
+            assert_eq!(manager.model_review_title(), None);
+            let _ = manager.update(ManagerMessage::Local(LocalMessage::ManagedFilesPicked(
+                ticket,
+                Some(vec![second.clone(), first.clone(), missing.clone()]),
+            )));
+            assert_eq!(manager.model_review_title(), Some("Import GGUF"));
+            assert!(manager.model_review_view().is_some());
+            if !confirm {
+                manager.cancel_model_review();
+                assert_eq!(manager.model_review_title(), None);
+                assert!(manager.local.managed.picked_files.is_empty());
+                assert!(Registry::new(root.clone()).list().unwrap().is_empty());
+            }
+        }
         assert_eq!(manager.local.managed.picked_files, [first, missing]);
         let task = manager.update(ManagerMessage::Local(Managed(Message::Import)));
         let mut results = iced_runtime::task::into_stream(task).unwrap();
@@ -2457,6 +2619,22 @@ mod tests {
         let detached = manager.local.managed.choices[0].clone();
         let _ = manager.update(select_gguf(&detached));
         assert!(manager.local.managed.can_reattach);
+        let picked_source = managed_models::import_source(&root.join(second));
+        manager
+            .local
+            .managed
+            .stage_files(vec![root.join(second)])
+            .unwrap();
+        assert_eq!(manager.model_review_title(), Some("Import GGUF"));
+        let _ = manager.update(ManagerMessage::Local(Managed(Message::AskReattachment)));
+        assert!(matches!(
+            &manager.local.managed.action,
+            Some(Action::Reattach { weights, projector: None }) if *weights == picked_source
+        ));
+        let _ = manager.update(ManagerMessage::Local(Managed(Message::CancelAction)));
+        let _ = manager.update(ManagerMessage::Local(Managed(Message::Source(
+            root.join(second).to_string_lossy().into_owned(),
+        ))));
         assert!(
             iced_runtime::task::into_stream(
                 manager.update(ManagerMessage::Local(Managed(Message::ConfirmReattachment))),
@@ -2556,6 +2734,72 @@ mod tests {
         assert_eq!(
             manager.local.status.as_deref(),
             Some("Removed the installed llama.cpp runtime.")
+        );
+    }
+
+    #[test]
+    fn saving_gguf_settings_offers_the_matching_backend_without_installing_it() {
+        let profile = crate::snippets::tests::Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        let original = model(
+            "0123456789abcdef0123456789abcdef",
+            "Fixture model",
+            Purpose::Chat,
+        );
+        let mut saved = original.clone();
+        saved.backend = if cfg!(target_os = "macos") {
+            ModelBackend::Metal
+        } else {
+            ModelBackend::Vulkan
+        };
+        let required = saved.backend.required_package().unwrap();
+        let mut manager = Manager::new(
+            Arc::new(Configuration::default()),
+            root.clone(),
+            Vec::new(),
+            true,
+            None,
+        );
+        manager.page = Page::LocalModels;
+        let _ = manager.update(loaded(vec![original], &root));
+        let selected = manager.local.managed.choices[0].clone();
+        let _ = manager.update(select_gguf(&selected));
+
+        for accept in [false, true] {
+            let _ = manager.update(ManagerMessage::Local(LocalMessage::RevealManagedSetting(
+                ManagedSetting::Name,
+            )));
+            assert!(manager.model_configuration_kind().is_some());
+            let _ = manager.update(ManagerMessage::Local(LocalMessage::Finished(
+                0,
+                Ok(Output::ManagedModels {
+                    models: vec![saved.clone()],
+                    default: Ok(SavedDefault::Missing),
+                    active_package: Some(("fixture-cpu".into(), PackageBackend::Cpu)),
+                    mlx: None,
+                    notice: "Saved settings.".into(),
+                }),
+            )));
+            assert_eq!(manager.model_review_title(), Some("Matching runtime"));
+            assert!(manager.model_review_view().is_some());
+            assert!(!manager.local.backend_repair_open());
+            let action = if accept {
+                Message::AcceptBackendOffer
+            } else {
+                Message::CancelAction
+            };
+            let _ = manager.update(ManagerMessage::Local(Managed(action)));
+            assert_eq!(manager.model_review_title(), None);
+            assert_eq!(manager.local.backend_repair_open(), accept);
+            assert!(manager.local.request.is_none());
+            assert_eq!(
+                manager.local.managed.selected.as_ref().unwrap().model,
+                saved
+            );
+        }
+        assert_eq!(
+            manager.local.runtime_import().expected_backend,
+            Some(required)
         );
     }
 

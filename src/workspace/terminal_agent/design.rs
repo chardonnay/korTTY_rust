@@ -259,7 +259,9 @@ fn history_panel<'a>(
 ) -> Element<'a, AgentMessage> {
     let (phase, _) = status::phase(run);
     let timeline = run.design.history == History::Timeline;
-    let palette = palette.or_else(|| timeline.then(Palette::default_status));
+    let plan = run.design.history == History::PlanExecution;
+    let plan_header = plan && !run.presentation.step_list_open;
+    let palette = palette.or_else(|| (timeline || plan).then(Palette::default_status));
     let activity = history_with_steps(
         run,
         palette,
@@ -268,7 +270,7 @@ fn history_panel<'a>(
         owner,
         panel_review,
     );
-    let controls = if timeline {
+    let controls = if timeline || plan_header {
         controls_with_menu(run, None, false)
     } else {
         controls(run, owner.0.has_archived_activity(run))
@@ -280,7 +282,7 @@ fn history_panel<'a>(
         container(
             column![
                 if timeline {
-                    status::timeline_header(
+                    Some(status::timeline_header(
                         history::Activity {
                             owner: Some(owner),
                             surface: log_table::Surface::Pane,
@@ -288,16 +290,20 @@ fn history_panel<'a>(
                         },
                         status::Trace::live(run, Instant::now(), reduced_motion),
                         palette,
-                    )
+                    ))
+                } else if plan_header {
+                    None
                 } else {
-                    column![
-                        text(format!("{} · {phase}", run.design.history)).size(13),
-                        text(&run.label)
-                            .size(12)
-                            .style(move |_| text::Style { color: muted }),
-                    ]
-                    .spacing(5)
-                    .into()
+                    Some(
+                        column![
+                            text(format!("{} · {phase}", run.design.history)).size(13),
+                            text(&run.label)
+                                .size(12)
+                                .style(move |_| text::Style { color: muted }),
+                        ]
+                        .spacing(5)
+                        .into(),
+                    )
                 },
                 chooser,
                 body,
@@ -957,11 +963,20 @@ impl Workspace {
             .filter(|_| !run.presentation.dock_hidden);
         let panel_review = self.panel_review(id, run, None);
         let activity = &run.presentation.activity;
-        let bottom_height = fitted_activity_height(
-            bounds.height,
-            activity.preview.unwrap_or(activity.height),
-            activity.collapsed,
-        );
+        let plan_bottom =
+            history_position == Some(Slot::Bottom) && run.design.history == History::PlanExecution;
+        let default_plan_height = plan_bottom
+            && !activity.resized
+            && activity.height == Height::DEFAULT
+            && (self.window_settings.agent_remember_activity_font != Some(true)
+                || self.window_settings.agent_activity_height.is_none());
+        let expanded_height = activity.preview.unwrap_or(if default_plan_height {
+            plan_execution::HEIGHT
+        } else {
+            activity.height
+        });
+        let bottom_height =
+            fitted_activity_height(bounds.height, expanded_height, activity.collapsed);
         let nominal_width =
             placement::history_width(run.design.history, bounds.width, cell.width * 40.0);
         let side_width = run
@@ -998,7 +1013,9 @@ impl Workspace {
                         .height(horizontal_divider::WIDTH),
                     );
                 }
-                panel = panel.push(header);
+                if !plan_bottom || activity.collapsed || run.presentation.step_list_open {
+                    panel = panel.push(header);
+                }
                 if !activity.collapsed {
                     panel = panel.push(
                         history_panel(
@@ -1121,7 +1138,11 @@ impl Workspace {
             history,
             status,
             history_position,
-            status_position,
+            placement::status_relative_to_history(
+                status_position,
+                run.design.history,
+                history_position,
+            ),
             bounds,
             DockExtents {
                 left: side_width,

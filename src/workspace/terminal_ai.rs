@@ -3810,6 +3810,7 @@ mod tests {
         let id = store
             .save_local(LocalProfile {
                 id: 0,
+                isolation: Default::default(),
                 name: "Saved shell".into(),
                 shell: Default::default(),
                 command: None,
@@ -4735,6 +4736,7 @@ mod tests {
         let mut store = Store::open(scratch.0.join("connections.json")).unwrap();
         let local = |name: &str, skill| LocalProfile {
             id: 0,
+            isolation: Default::default(),
             name: name.into(),
             shell: Default::default(),
             command: None,
@@ -6269,6 +6271,7 @@ mod tests {
         let id = store
             .save_local(LocalProfile {
                 id: 0,
+                isolation: Default::default(),
                 name: "Build shell".into(),
                 shell: Default::default(),
                 command: None,
@@ -6283,6 +6286,7 @@ mod tests {
         let other = store
             .save_local(LocalProfile {
                 id: 0,
+                isolation: Default::default(),
                 name: "Lint shell".into(),
                 ..local.clone()
             })

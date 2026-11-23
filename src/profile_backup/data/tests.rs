@@ -240,6 +240,7 @@ fn portable_projections_keep_definitions_and_revoke_device_history_and_approvals
             }],
             incognito: false,
             isolation: Default::default(),
+            inherit_isolation: false,
             startup: Default::default(),
             logging: Default::default(),
             terminal_effect: None,

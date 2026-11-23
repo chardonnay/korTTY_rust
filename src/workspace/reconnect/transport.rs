@@ -292,7 +292,14 @@ impl Workspace {
                     pane.saved_serial = saved;
                     pane.serial_use_pending = usage_pending;
                 }
-                self.start_reconnect_worker(owner, target, candidate, None, Default::default())
+                self.start_reconnect_worker(
+                    owner,
+                    target,
+                    candidate,
+                    None,
+                    Default::default(),
+                    None,
+                )
             }
             Err(error) => {
                 self.notice(

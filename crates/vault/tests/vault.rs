@@ -16,6 +16,55 @@ const WRONG: &[u8] = b"wrong test master password only";
 const TEST_SECRET: &str = "test-only ssh secret ä";
 
 #[test]
+fn temporary_ssh_keys_are_encrypted_and_bound_to_the_reviewed_account_and_endpoint() {
+    use kortty_vault::TemporarySshKeyOptions;
+
+    const KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture-only-payload\n-----END OPENSSH PRIVATE KEY-----";
+    let directory = Directory::new();
+    let path = directory.0.join("vault");
+    let mut vault = Vault::create(&path, MASTER).unwrap();
+    let target = ("::1", 2222, "reviewer");
+    let key = vault
+        .save_temporary_ssh_key(
+            "Temporary fixture".into(),
+            target,
+            TemporarySshKeyOptions {
+                minutes: 1,
+                automatic: true,
+            },
+            Secret::new(KEY.into()),
+        )
+        .unwrap();
+    assert!(vault.secret(&key).is_none());
+    assert_eq!(
+        vault.get(&key).unwrap().kind,
+        CredentialKind::TemporarySshKey
+    );
+    assert!(
+        !fs::read(&path)
+            .unwrap()
+            .windows(KEY.len())
+            .any(|bytes| bytes == KEY.as_bytes())
+    );
+    let before = vault.temporary_ssh_key(&key, target).unwrap().remaining;
+    drop(vault);
+
+    let mut vault = Vault::unlock(&path, MASTER).unwrap();
+    let reopened = vault.temporary_ssh_key(&key, target).unwrap();
+    assert_eq!(reopened.private_key.trim(), KEY);
+    assert!(reopened.remaining < before);
+    for wrong in [
+        ("::2", 2222, "reviewer"),
+        ("::1", 22, "reviewer"),
+        ("::1", 2222, "operator"),
+    ] {
+        assert!(vault.temporary_ssh_key(&key, wrong).is_none());
+    }
+    assert!(vault.delete(&key).unwrap());
+    assert!(vault.temporary_ssh_key(&key, target).is_none());
+}
+
+#[test]
 fn skill_provider_credential_stays_typed_and_encrypted_after_reopen() {
     let directory = Directory::new();
     let path = directory.0.join("vault");

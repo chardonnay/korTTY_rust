@@ -56,8 +56,13 @@ struct Station<'a> {
 }
 
 impl<'a> Station<'a> {
-    fn step(step: &'a Step) -> Option<Self> {
+    fn step(step: &'a Step, phase: &str) -> Option<Self> {
         let label = match step.kind {
+            Kind::Thinking
+                if step.state == StepState::Running && phase == super::REPAIRING_PHASE =>
+            {
+                phase.into()
+            }
             Kind::Thinking => "Analysis".into(),
             Kind::Action | Kind::Error => {
                 command_label(step.command.as_deref().unwrap_or(&step.title))
@@ -106,7 +111,11 @@ fn short_text(value: &str, limit: usize) -> String {
 }
 
 fn stations<'a>(trace: &Trace<'a>, phase: &'a str, cancelled: bool) -> Vec<Station<'a>> {
-    let mut stations: Vec<_> = trace.steps.iter().filter_map(Station::step).collect();
+    let mut stations: Vec<_> = trace
+        .steps
+        .iter()
+        .filter_map(|step| Station::step(step, phase))
+        .collect();
     for station in &mut stations {
         if (station.mark == Mark::Attention && !trace.waiting)
             || (!trace.active && station.mark.current())

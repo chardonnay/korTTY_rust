@@ -44,6 +44,7 @@ fn connection() -> Connection {
         emulation: TerminalProfile::Xterm.term_name().into(),
         incognito: false,
         isolation: IsolationLevel::None,
+        inherit_isolation: false,
         startup: Default::default(),
         logging: Default::default(),
         terminal_effect: None,
@@ -583,6 +584,91 @@ fn group_tab_color_inheritance_follows_rename_and_delete_atomically() {
     assert_eq!(reopened.group_color(&moved), None);
     assert_eq!(reopened.group_color(&neighbor), Some(red));
     assert!(reopened.get(id).is_none());
+}
+
+#[test]
+fn connection_isolation_keeps_legacy_none_distinct_from_nearest_folder_inheritance() {
+    use crate::session_security::IsolationSource;
+
+    let directory = TestDir::new();
+    let mut store = directory.store();
+    let parent = store.create_group(None, "Production").unwrap();
+    let child = store.create_group(Some(&parent), "Database").unwrap();
+    let legacy = store.save_in_group(connection(), Some(&child)).unwrap();
+    let mut inherited = connection();
+    inherited.name = "Inherited database".into();
+    inherited.inherit_isolation = true;
+    let inherited = store.save_in_group(inherited, Some(&child)).unwrap();
+    store
+        .set_group_isolation(&parent, None, Some(IsolationLevel::Sandbox))
+        .unwrap();
+    store
+        .set_group_isolation(&child, None, Some(IsolationLevel::Process))
+        .unwrap();
+    let renamed = store.rename_group(&parent, "Live").unwrap();
+    let child = format!("{renamed}/Database");
+    let mut store = directory.store();
+    let resolve = |store: &Store, id, request, minimum| {
+        let (level, source) = store.connection_isolation(
+            store.get(id).unwrap(),
+            IsolationLevel::Sandbox,
+            request,
+            minimum,
+        );
+        (level, source.to_string())
+    };
+    assert_eq!(
+        resolve(&store, legacy, None, IsolationLevel::None),
+        (
+            IsolationLevel::None,
+            IsolationSource::Connection.to_string()
+        )
+    );
+    assert_eq!(
+        resolve(&store, inherited, None, IsolationLevel::None),
+        (
+            IsolationLevel::Process,
+            IsolationSource::Folder(&child).to_string()
+        )
+    );
+    assert_eq!(
+        resolve(
+            &store,
+            inherited,
+            Some(IsolationLevel::None),
+            IsolationLevel::None
+        ),
+        (IsolationLevel::None, IsolationSource::Request.to_string())
+    );
+    assert_eq!(
+        resolve(
+            &store,
+            inherited,
+            Some(IsolationLevel::None),
+            IsolationLevel::Sandbox
+        ),
+        (
+            IsolationLevel::Sandbox,
+            IsolationSource::Managed.to_string()
+        )
+    );
+    assert!(
+        store
+            .set_group_isolation(&child, None, Some(IsolationLevel::None))
+            .is_err()
+    );
+    store
+        .set_group_isolation(&child, Some(IsolationLevel::Process), None)
+        .unwrap();
+    assert_eq!(
+        resolve(&store, inherited, None, IsolationLevel::None),
+        (
+            IsolationLevel::Sandbox,
+            IsolationSource::Folder(&renamed).to_string()
+        )
+    );
+    store.delete_group(&renamed).unwrap();
+    assert_eq!(store.group_isolation(&renamed), None);
 }
 
 #[test]

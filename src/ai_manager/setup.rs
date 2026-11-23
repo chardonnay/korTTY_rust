@@ -35,7 +35,7 @@ pub(crate) enum Message {
     Recommend(Role, Arc<Recommendation>),
     Accept(bool),
     Retry,
-    Done(u64, Result<Reply, String>),
+    Done(u64, Box<Result<Reply, String>>),
     Progress(u64, Progress),
 }
 
@@ -234,7 +234,7 @@ impl Wizard {
             }
             Message::Done(ticket, reply) if self.matches(ticket) => {
                 let pending = self.pending.take().expect("matching setup worker");
-                let reply = pending.validate(reply);
+                let reply = pending.validate(*reply);
                 drop(pending);
                 self.progress = None;
                 let stopping = std::mem::take(&mut self.stopping);

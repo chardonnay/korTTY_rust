@@ -27,7 +27,12 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 mod envelope;
+mod startup_unlock;
 mod storage;
+mod temporary_ssh_key;
+
+pub use startup_unlock::StartupUnlockState;
+pub use temporary_ssh_key::{MAX_TEMPORARY_SSH_KEY_BYTES, TemporarySshKey, TemporarySshKeyOptions};
 
 pub const MIN_MASTER_PASSWORD_BYTES: usize = 12;
 pub const MAX_MASTER_PASSWORD_BYTES: usize = 1024;
@@ -76,6 +81,7 @@ pub enum Error {
     InvalidInput(&'static str),
     Limit,
     Crypto,
+    StartupCredentialUnavailable,
     /// The operation was published, but syncing the destination directory failed.
     Durability(io::Error),
     Io(io::Error),
@@ -96,6 +102,8 @@ impl fmt::Display for Error {
             Self::InvalidInput(message) => formatter.write_str(message),
             Self::Limit => formatter.write_str("the vault exceeds its size or resource limit"),
             Self::Crypto => formatter.write_str("could not derive or use the vault encryption key"),
+            Self::StartupCredentialUnavailable => formatter
+                .write_str("could not use the device credential store for automatic vault unlock"),
             Self::Durability(error) => {
                 write!(formatter, "vault saved, but directory sync failed: {error}")
             }
@@ -132,6 +140,7 @@ pub enum CredentialKind {
     QdrantApiKey,
     SshPasswordCommand,
     SkillProviderCredential,
+    TemporarySshKey,
 }
 
 impl CredentialKind {
@@ -473,7 +482,10 @@ impl Vault {
 
     /// Borrows a secret for immediate use. The vault retains ownership of the buffer.
     pub fn secret(&self, id: &str) -> Option<&str> {
-        self.entries.get(id).map(|entry| entry.secret.as_str())
+        self.entries
+            .get(id)
+            .filter(|entry| entry.metadata.kind != CredentialKind::TemporarySshKey)
+            .map(|entry| entry.secret.as_str())
     }
 
     /// Borrows a password explicitly stored for encrypting archives.
@@ -627,6 +639,11 @@ impl Vault {
 
     /// Stores a credential and returns its stable ID after publication.
     pub fn save(&mut self, input: CredentialInput, secret: Secret) -> Result<String, Error> {
+        if input.kind == CredentialKind::TemporarySshKey {
+            return Err(Error::InvalidInput(
+                "save temporary SSH private keys through the connection editor",
+            ));
+        }
         let webhook = input
             .id
             .as_deref()
@@ -848,6 +865,8 @@ fn validate_entry(entry: &Entry) -> Result<(), Error> {
                 "sudo passwords require an exact account and endpoint or group, and a single-line secret of at most 1024 bytes",
             ));
         }
+    } else if metadata.kind == CredentialKind::TemporarySshKey {
+        temporary_ssh_key::validate(entry)?;
     } else if metadata.kind == CredentialKind::SshPasswordCommand {
         if metadata.username.is_empty()
             || metadata.username.trim() != metadata.username

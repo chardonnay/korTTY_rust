@@ -2,6 +2,7 @@ use std::cell::OnceCell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_channel::Receiver;
@@ -115,6 +116,14 @@ mod ssh_keys_ui;
 mod tab_context;
 mod tab_drag;
 mod tab_titles;
+
+pub(crate) fn installed_default_isolation() -> std::io::Result<IsolationLevel> {
+    match tab_titles::WindowSettings::read(&crate::profile::window_settings_path()?) {
+        Ok(settings) => Ok(settings.default_session_isolation.unwrap_or_default()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(IsolationLevel::None),
+        Err(error) => Err(error),
+    }
+}
 pub(crate) use tab_titles::{analysis_content_limit_at, analysis_history_limit_at};
 mod tab_watch;
 mod teamwork_auth;
@@ -685,6 +694,7 @@ struct PaneSession {
     strict_escapes: bool,
     saved_strict_escapes: bool,
     teamwork_terminal_input: Option<ssh_access::TeamworkTerminalInput>,
+    teamwork_ssh: Option<ssh_access::TeamworkSelection>,
     local_security: Option<LocalSettings>,
     saved_local: Option<crate::connection_store::LocalProfile>,
     local_use_pending: bool,
@@ -724,6 +734,7 @@ enum LocalLaunchView {
     QuickConnect(
         Option<Option<crate::terminal_effects::Selection>>,
         Option<crate::connection_store::TerminalAppearance>,
+        Option<(u64, PathBuf)>,
     ),
     Existing(GridSize, Option<Appearance>),
 }
@@ -3617,25 +3628,23 @@ impl Workspace {
                 "Managed policy could not be applied. Sessions are locked.",
             ));
         }
-        let mut settings = self
-            .security
-            .local_settings(saved, self.clipboard.policy.minimum_isolation)?;
-        if let Some(local) = &local {
-            local.validate()?;
+        let settings = if let Some(local) = &local {
             profile = local.profile().ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "Unsupported local terminal emulation",
                 )
             })?;
-            settings.saved_profile = (local.id != 0).then_some(local.id);
-            settings.shell = local.shell;
-            settings.command.clone_from(&local.command);
-            settings
-                .working_directory
-                .clone_from(&local.working_directory);
-            settings.shell_integration = local.shell_integration;
-        }
+            let quick_source = match &view {
+                LocalLaunchView::QuickConnect(_, _, Some((id, path))) => {
+                    Some((*id, path.as_path()))
+                }
+                _ => None,
+            };
+            self.local_settings_for_profile(saved, local, quick_source)?
+        } else {
+            self.local_settings(saved)?
+        };
         let mut options = settings.launch_options()?;
         options.shell_integration = settings.shell_integration
             && settings.isolation != IsolationLevel::Sandbox
@@ -3653,7 +3662,7 @@ impl Workspace {
                 None,
                 None,
             ),
-            LocalLaunchView::QuickConnect(effect, style) => (
+            LocalLaunchView::QuickConnect(effect, style, _) => (
                 self.configured_initial_grid(profile, terminal, InitialTerminalSize::default()),
                 None,
                 effect,
@@ -3767,6 +3776,7 @@ impl Workspace {
                 strict_escapes: false,
                 saved_strict_escapes: false,
                 teamwork_terminal_input: None,
+                teamwork_ssh: None,
                 local_security: None,
                 saved_local: None,
                 journal_config: Default::default(),
@@ -4301,7 +4311,14 @@ impl Workspace {
             self.sync_pane_appearance(session);
         }
         if let Some(target) = reconnect {
-            return self.start_reconnect_worker(window, target, session, None, Default::default());
+            return self.start_reconnect_worker(
+                window,
+                target,
+                session,
+                None,
+                Default::default(),
+                None,
+            );
         } else if let Some((index, pane, old)) = replacement {
             if let Some(tab) = self
                 .windows
@@ -7508,6 +7525,7 @@ mod tests {
         };
         let local = LocalProfile {
             id: 1,
+            isolation: Default::default(),
             name: "Startup color query".into(),
             shell: LocalShell::default(),
             command: Some(vec![

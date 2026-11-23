@@ -13,6 +13,9 @@ use crate::connection_store::teamwork;
 use crate::connection_store::{
     Auth, Connection, JavaGroupColor, LocalProfile, SerialProfile, Store,
 };
+use crate::session_security::{
+    IsolationChoice, IsolationLevel, IsolationSource, resolve_isolation,
+};
 use crate::ssh_dialog::KeyChoice;
 use crate::terminal_agent::design::Choice as AgentDesignChoice;
 use crate::terminal_effects::Effect;
@@ -36,6 +39,8 @@ pub(crate) struct ViewChoices<'a> {
     pub(crate) passwords: &'a [CredentialChoice],
     pub(crate) passphrases: &'a [CredentialChoice],
     pub(crate) keys: &'a [KeyChoice],
+    pub(crate) temporary_keys: bool,
+    pub(crate) vault_unlocked: bool,
     pub(crate) ai_profiles: &'a [(Option<u64>, ProfileRef, String)],
     pub(crate) java_ai_profiles: &'a [(crate::ai_manager::JavaProfileSource, ProfileRef, String)],
     pub(crate) ai_skills: &'a [(u64, String)],
@@ -48,6 +53,8 @@ pub(crate) struct ViewChoices<'a> {
     pub(crate) terminal_effects: Option<&'a [Effect]>,
     pub(crate) default_paste_warning: PasteWarningMode,
     pub(crate) minimum_paste_warning: PasteWarningMode,
+    pub(crate) isolation: (IsolationLevel, IsolationLevel),
+    pub(crate) local_isolation_default: IsolationLevel,
 }
 
 #[derive(Default)]
@@ -361,14 +368,25 @@ impl ConnectionWindow {
         } else if self.busy {
             text("Updating connection profiles…").into()
         } else if let Some(draft) = &self.local_draft {
-            draft.view(title, &choices).map(Message::Local)
+            let inherited = self
+                .draft_group
+                .as_deref()
+                .and_then(|path| self.store.inherited_group_isolation(path));
+            draft
+                .view(
+                    title,
+                    &choices,
+                    self.editor_group_picker(super::local::Edit::Folder),
+                    inherited,
+                )
+                .map(Message::Local)
         } else if let Some(draft) = &self.serial_draft {
             column![
                 text(title).size(21),
                 text_input("Name (defaults to port and speed)", &draft.name)
                     .on_input(Message::SerialName),
                 text_input("Tag", &draft.tag).on_input(Message::SerialTag),
-                self.editor_group_picker(),
+                self.editor_group_picker(Message::DraftGroup),
                 draft.form.editor_fields().map(Message::Serial),
                 row![
                     text("Paste line delay (ms)"),
@@ -412,7 +430,16 @@ impl ConnectionWindow {
             .into()
         } else {
             let draft = self.draft.as_ref()?;
-            draft.view(&choices, &self.custom_badges, self.editor_group_picker())
+            let inherited = self
+                .draft_group
+                .as_deref()
+                .and_then(|path| self.store.inherited_group_isolation(path));
+            draft.view(
+                &choices,
+                &self.custom_badges,
+                self.editor_group_picker(Message::DraftGroup),
+                inherited,
+            )
         };
         let form: Element<'_, Message> =
             if self.draft.is_some() && !self.confirming_close && !self.busy {
@@ -993,7 +1020,7 @@ impl ConnectionWindow {
                     self.connection_row(connection, indent)
                 }
                 VisualRow::Serial(profile, indent) => self.serial_row(profile, indent),
-                VisualRow::Local(profile) => self.local_row(profile),
+                VisualRow::Local(profile, indent) => self.local_row(profile, indent),
                 VisualRow::Shared(entry) => {
                     if self.scope != Scope::Recent && shared_group != Some(&entry.group) {
                         list = list.push(heading(teamwork::group_title(&entry.group)));
@@ -1195,11 +1222,11 @@ impl ConnectionWindow {
         } else if let Some(prompt) = self.tree_context_prompt() {
             prompt
         } else if let Some(dialog) = &self.folder {
-            folder_dialog(dialog, &self.store)
+            folder_dialog(dialog, &self.store, choices.isolation)
         } else if let Some(path) = self.selection.single_group() {
             self.group_inspector(path)
         } else if let Some(connection) = self.single_connection() {
-            self.connection_inspector(connection, choices.keys)
+            self.connection_inspector(connection, choices)
         } else if let Some(entry) = self.selected_shared() {
             let endpoint = &entry.connection.login.endpoint;
             let blocked = entry.connection.blocked_server(&self.server_access);
@@ -1239,6 +1266,15 @@ impl ConnectionWindow {
             .spacing(10)
             .into()
         } else if let Some(profile) = self.single_local() {
+            let folder = self
+                .store
+                .group_of(profile.id)
+                .and_then(|path| self.store.inherited_group_isolation(path));
+            let (isolation, source) = profile.isolation.resolve(
+                choices.local_isolation_default,
+                folder,
+                choices.isolation.1,
+            );
             let program = profile
                 .command
                 .as_ref()
@@ -1258,6 +1294,7 @@ impl ConnectionWindow {
                     "Emulation",
                     profile.profile().unwrap_or_default().to_string()
                 ),
+                fact("Isolation", format!("{isolation} · {source}")),
                 favorite_tool(self.store.is_favorite(profile.id), self.can_browse()),
                 self.java_favorite_review(profile.id),
             ]
@@ -1352,7 +1389,10 @@ impl ConnectionWindow {
         self.tree_context_view(&key, base)
     }
 
-    fn editor_group_picker(&self) -> Element<'_, Message> {
+    fn editor_group_picker<Msg: Clone + 'static>(
+        &self,
+        edit: fn(Option<String>) -> Msg,
+    ) -> Element<'_, Msg> {
         let options: Vec<_> = std::iter::once(GroupChoice(None))
             .chain(
                 self.store
@@ -1363,9 +1403,9 @@ impl ConnectionWindow {
         let selected = GroupChoice(self.draft_group.clone());
         row![
             text("Folder").size(14),
-            pick_list(options, Some(selected), |choice: GroupChoice| {
-                Message::DraftGroup(choice.0)
-            })
+            pick_list(options, Some(selected), move |choice: GroupChoice| edit(
+                choice.0
+            ))
             .width(Length::Fill),
         ]
         .spacing(8)
@@ -1421,11 +1461,11 @@ impl ConnectionWindow {
         self.tree_context_view(&key, base)
     }
 
-    fn local_row<'a>(&'a self, profile: &'a LocalProfile) -> Element<'a, Message> {
+    fn local_row<'a>(&'a self, profile: &'a LocalProfile, indent: usize) -> Element<'a, Message> {
         let key = RowKey::Local(profile.id);
         let open = self.open_count(profile.id);
         let line = row![
-            space::horizontal().width(10),
+            space::horizontal().width((10 + indent * 20) as u32),
             tile(Icon::Tab, 20, 29),
             column![
                 text(&profile.name).size(15).wrapping(text::Wrapping::None),
@@ -1472,6 +1512,19 @@ impl ConnectionWindow {
             ]
             .spacing(6),
             heading("FOLDER"),
+            row![
+                fact(
+                    "Session isolation",
+                    self.store.inherited_group_isolation(path).map_or_else(
+                        || "Global Settings".into(),
+                        |(source, level)| format!("{level} · Folder {source}")
+                    )
+                ),
+                button("Edit isolation…")
+                    .style(button::secondary)
+                    .on_press(Message::EditGroupIsolation),
+            ]
+            .spacing(8),
             self.store
                 .inherited_group_color(path)
                 .map(|(source, color)| {
@@ -1503,8 +1556,9 @@ impl ConnectionWindow {
     fn connection_inspector<'a>(
         &'a self,
         entry: &'a Connection,
-        keys: &[crate::ssh_dialog::KeyChoice],
+        choices: &ViewChoices<'_>,
     ) -> Element<'a, Message> {
+        let keys = choices.keys;
         let browsing = self.can_browse();
         let blocked = entry.blocked_server(&self.server_access);
         let connect = browsing && blocked.is_none();
@@ -1522,6 +1576,7 @@ impl ConnectionWindow {
             Auth::KeyboardInteractive => "Keyboard-interactive",
             Auth::VaultPassword(_) => "Vault password",
             Auth::KeyFile { .. } => "SSH private key",
+            Auth::TemporaryKey { .. } => "Temporary SSH key",
             Auth::StoredKey(id) => keys
                 .iter()
                 .find(|key| key.id == *id)
@@ -1543,6 +1598,9 @@ impl ConnectionWindow {
         }
         .to_owned();
         let favorite = self.store.is_favorite(entry.id);
+        let (isolation, source) =
+            self.store
+                .connection_isolation(entry, choices.isolation.0, None, choices.isolation.1);
         let mut route = row![text("This computer").size(13), text("→").size(13)].spacing(7);
         if let Some(jump) = &entry.jump {
             route = route
@@ -1622,7 +1680,7 @@ impl ConnectionWindow {
             heading("ROUTE"),
             route.wrap(),
             heading("SECURITY"),
-            fact("Isolation", entry.isolation.to_string()),
+            fact("Isolation", format!("{isolation} · {source}")),
             fact("Host key", "Verify before authentication"),
         ]
         .spacing(10);
@@ -1721,7 +1779,11 @@ impl std::fmt::Display for GroupChoice {
     }
 }
 
-fn folder_dialog<'a>(dialog: &'a FolderDialog, store: &'a Store) -> Element<'a, Message> {
+fn folder_dialog<'a>(
+    dialog: &'a FolderDialog,
+    store: &'a Store,
+    isolation: (IsolationLevel, IsolationLevel),
+) -> Element<'a, Message> {
     let (title, hint, name, action) = match dialog {
         FolderDialog::Create { parent, name } => (
             "New folder",
@@ -1750,6 +1812,52 @@ fn folder_dialog<'a>(dialog: &'a FolderDialog, store: &'a Store) -> Element<'a, 
             ..
         } => {
             return folder_color_dialog(path, draft, imported.as_ref(), store);
+        }
+        FolderDialog::Isolation {
+            path,
+            draft,
+            imported,
+            ..
+        } => {
+            let inherited = path
+                .rsplit_once('/')
+                .and_then(|(parent, _)| store.inherited_group_isolation(parent));
+            let (level, source) =
+                resolve_isolation(isolation.0, inherited, draft.0, None, false, isolation.1);
+            let source = match source {
+                IsolationSource::Connection => "This folder".into(),
+                source => source.to_string(),
+            };
+            return column![
+                text("Folder session isolation").size(22),
+                text(path),
+                pick_list(IsolationChoice::ALL, Some(*draft), Message::GroupIsolation),
+                text(format!("Effective isolation · {level} · {source}")).size(13),
+                (!store.java_group_isolation().is_empty()).then(|| column![
+                    text("Isolation from a Java backup").size(14),
+                    pick_list(
+                        store
+                            .java_group_isolation()
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                        imported.clone(),
+                        Message::PickJavaGroupIsolation
+                    )
+                    .placeholder("Choose an imported folder setting"),
+                    text("Save applies the selected level to this folder.").size(13),
+                ]
+                .spacing(5)),
+                row![
+                    button("Cancel")
+                        .style(button::secondary)
+                        .on_press(Message::CancelGroup),
+                    button("Save").on_press(Message::CommitGroup),
+                ]
+                .spacing(8),
+            ]
+            .spacing(10)
+            .into();
         }
     };
     let mut contents = column![text(title).size(22)].spacing(10);
@@ -2029,6 +2137,8 @@ fn teamwork_auth_picker_displays_missing_references_without_offering_them() {
         name: "Team key".into(),
     }];
     let choices = ViewChoices {
+        temporary_keys: false,
+        vault_unlocked: false,
         passwords: &passwords,
         passphrases: &[],
         keys: &keys,
@@ -2044,6 +2154,8 @@ fn teamwork_auth_picker_displays_missing_references_without_offering_them() {
         terminal_effects: None,
         default_paste_warning: PasteWarningMode::default(),
         minimum_paste_warning: PasteWarningMode::Off,
+        isolation: Default::default(),
+        local_isolation_default: Default::default(),
     };
     for draft in [
         DefaultAuth::Password {

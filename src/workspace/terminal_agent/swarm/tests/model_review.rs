@@ -413,6 +413,7 @@ fn live_swarm_reviews_exact_masked_requests_and_scopes_pins_to_each_member() {
         let id = store
             .save_local(LocalProfile {
                 id: 0,
+                isolation: Default::default(),
                 name: format!("Swarm connection {skill}"),
                 shell: Default::default(),
                 command: None,

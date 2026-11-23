@@ -117,13 +117,22 @@ impl Restrictions {
     }
 }
 
+fn local_prerequisites() -> io::Result<(libc::uid_t, bool)> {
+    let uid = unprivileged_user()?;
+    check_landlock_abi()?;
+    Ok((uid, flatpak::installed_namespace()?))
+}
+
+pub(crate) fn local_sandbox_backend() -> io::Result<&'static str> {
+    local_prerequisites()?;
+    Ok("landlock")
+}
+
 pub(crate) fn prepare(
     workspace: &Path,
     profile: &Path,
 ) -> io::Result<(Restrictions, SessionDirectory)> {
-    let uid = unprivileged_user()?;
-    check_landlock_abi()?;
-    let in_flatpak = flatpak::installed_namespace()?;
+    let (uid, in_flatpak) = local_prerequisites()?;
     let profile = canonical_protected_path(profile, false)?;
     let protected = protected_paths(&profile, uid)?;
     let workspace = fs::canonicalize(workspace)?;

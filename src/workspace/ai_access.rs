@@ -525,7 +525,7 @@ impl Workspace {
             match kind {
                 ModelConfigurationKind::Gguf => (
                     DialogKind::GgufModelConfiguration,
-                    668.0,
+                    dialog.gguf_configuration_width(),
                     Size::new(460.0, 314.0),
                 ),
                 ModelConfigurationKind::Mlx => (
@@ -1000,7 +1000,7 @@ fn child_height(dialog: &Dialog) -> Option<f32> {
         .runtime_review_height()
         .or_else(|| {
             dialog.model_configuration_kind().map(|kind| match kind {
-                ModelConfigurationKind::Gguf => 425.0,
+                ModelConfigurationKind::Gguf => 403.0,
                 ModelConfigurationKind::Mlx => 248.0,
             })
         })
@@ -1036,6 +1036,7 @@ mod tests {
             store
                 .save_local(LocalProfile {
                     id: 0,
+                    isolation: Default::default(),
                     name: name.to_owned(),
                     shell: Default::default(),
                     command: None,

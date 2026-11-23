@@ -200,7 +200,7 @@ impl Workspace {
                     ]
                     .spacing(7),
                 ));
-                if dialog.protocol == Protocol::Ssh {
+                if dialog.protocol == Protocol::Ssh && !dialog.ssh.temporary_key_selected() {
                     body = body.push(labeled(
                         "",
                         checkbox(dialog.save)

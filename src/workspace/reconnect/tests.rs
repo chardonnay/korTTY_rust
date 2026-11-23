@@ -191,7 +191,8 @@ fn transferring_a_tab_cancels_its_hidden_reconnect_candidate() {
     let candidate = workspace
         .store_local_session(TerminalProfile::Xterm, Some(18), None)
         .unwrap();
-    let _ = workspace.start_reconnect_worker(from, target, candidate, None, Default::default());
+    let _ =
+        workspace.start_reconnect_worker(from, target, candidate, None, Default::default(), None);
     let _ = workspace.transfer(from, Some(to), target.tab);
     let _ = workspace.update(Message::ReconnectHistoryReady(candidate, true));
     assert!(workspace.pending_reconnects.is_empty());
@@ -222,8 +223,14 @@ fn reconnect_worker_replaces_only_the_targeted_secondary_pane() {
     let candidate = workspace
         .store_local_session(TerminalProfile::Xterm, Some(14), None)
         .unwrap();
-    let _ =
-        workspace.start_reconnect_worker(owner, target, candidate, None, KeySnapshots::default());
+    let _ = workspace.start_reconnect_worker(
+        owner,
+        target,
+        candidate,
+        None,
+        KeySnapshots::default(),
+        None,
+    );
     workspace.wait_for_test_reconnect(candidate);
     let tab = workspace.windows[&owner].tab().unwrap();
     assert_eq!(tab.primary, primary);

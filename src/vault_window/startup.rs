@@ -1,4 +1,4 @@
-//! Vault authentication for the managed startup gate.
+//! Vault authentication for the startup gate.
 
 use super::*;
 
@@ -7,6 +7,7 @@ pub(crate) struct StartupPassword {
     input: iced::widget::Id,
     managed: bool,
     cancelled: bool,
+    remembered: bool,
     recovery_key_changed: bool,
 }
 
@@ -24,12 +25,22 @@ impl StartupPassword {
             input: iced::widget::Id::unique(),
             managed,
             cancelled: false,
+            remembered: false,
             recovery_key_changed: false,
         })
     }
 
     pub(crate) fn input(&self) -> iced::widget::Id {
         self.input.clone()
+    }
+
+    pub(crate) fn try_remembered(&mut self) -> Task<Message> {
+        self.remembered = true;
+        self.vault.try_remembered()
+    }
+
+    pub(crate) fn used_remembered(&self) -> bool {
+        self.remembered
     }
 
     pub(crate) fn update(&mut self, message: Message) -> StartupResult {
@@ -52,6 +63,12 @@ impl StartupPassword {
                 } else if self.vault.is_unlocked() {
                     StartupResult::Ready
                 } else {
+                    if self.remembered {
+                        self.remembered = false;
+                        self.vault.status = Some(
+                            "Automatic unlock was unavailable. Enter your master password.".into(),
+                        );
+                    }
                     StartupResult::Focus
                 }
             }
@@ -82,7 +99,7 @@ impl StartupPassword {
             text(if self.managed {
                 "Your organization requires a master password at startup."
             } else {
-                "Your startup settings require a master password."
+                "kortty needs access to your credential vault."
             })
             .wrapping(text::Wrapping::WordOrGlyph),
         ]
@@ -92,7 +109,9 @@ impl StartupPassword {
         if self.cancelled {
             contents = contents.push(text("Cancelling…"));
         } else if vault.busy() {
-            contents = contents.push(text(if vault.exists {
+            contents = contents.push(text(if self.remembered {
+                "Checking the device credential store…"
+            } else if vault.exists {
                 "Unlocking…"
             } else {
                 "Creating vault…"
@@ -215,6 +234,34 @@ mod tests {
         ));
         let (vault, recovery_key_changed) = prompt.into_unlocked();
         assert!(vault.is_unlocked() && !recovery_key_changed);
+    }
+
+    #[test]
+    fn failed_remembered_unlock_leaves_the_typed_password_gate_active() {
+        let profile = crate::snippets::tests::Profile::new();
+        let path = profile.0.join("test-vault.bin");
+        drop(Vault::create(&path, MASTER.as_bytes()).unwrap());
+        let mut prompt = StartupPassword::open(path.clone(), false).unwrap();
+        let task = prompt.try_remembered();
+        assert!(matches!(
+            prompt.update(complete(task)),
+            StartupResult::Focus
+        ));
+        assert!(!prompt.used_remembered());
+        assert!(
+            prompt
+                .vault
+                .status
+                .as_deref()
+                .is_some_and(|status| status.contains("Enter your master password"))
+        );
+        primary(&mut prompt, MASTER);
+        let task = submit(&mut prompt);
+        assert!(matches!(
+            prompt.update(complete(task)),
+            StartupResult::Ready
+        ));
+        assert!(!prompt.used_remembered());
     }
 
     #[test]

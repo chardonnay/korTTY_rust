@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use iced::widget::{button, column, scrollable, text};
 use iced::{Element, Event, Size, Subscription, Task, Theme, event, keyboard, window};
+use kortty_vault::{StartupUnlockState, Vault};
 
 use crate::clipboard_policy::ClipboardPolicy;
 use crate::local_ai::policy_models::{StartupPreparation, prepare_on_startup};
@@ -31,6 +32,12 @@ struct Running {
     _model_preparation: Option<StartupPreparation>,
 }
 
+struct UnlockedVault {
+    vault: VaultWindow,
+    remembered: bool,
+    recovery_key_changed: bool,
+}
+
 enum Permission<'a> {
     Ready,
     PasswordRequired { managed: bool },
@@ -51,36 +58,60 @@ fn permission(policy: &ClipboardPolicy, personal: bool, unlocked: bool) -> Permi
 
 impl Application {
     pub(crate) fn boot(root: PathBuf) -> (Self, Task<Message>) {
-        Self::start(root, ClipboardPolicy::load(), None, None, false)
+        Self::start(root, ClipboardPolicy::load(), None, None)
     }
 
     fn start(
         root: PathBuf,
         policy: ClipboardPolicy,
         previous_window: Option<window::Id>,
-        vault: Option<VaultWindow>,
-        recovery_key_changed: bool,
+        unlocked: Option<UnlockedVault>,
     ) -> (Self, Task<Message>) {
+        let personal = Workspace::startup_password_requested(&root);
+        let vault_path = profile::vault_path_at(&root);
+        let password_required = policy.require_master_password || personal;
+        let unlocked = unlocked.filter(|result| !result.remembered || !password_required);
+        let remembered = unlocked.is_none()
+            && policy.problem.is_none()
+            && !password_required
+            && Vault::exists(&vault_path).unwrap_or(false)
+            && matches!(
+                Vault::startup_unlock_state(&vault_path),
+                Ok(StartupUnlockState::Enabled)
+            );
         match permission(
             &policy,
-            Workspace::startup_password_requested(&root),
-            vault.as_ref().is_some_and(VaultWindow::is_unlocked),
+            personal || remembered,
+            unlocked
+                .as_ref()
+                .is_some_and(|result| result.vault.is_unlocked()),
         ) {
             Permission::PolicyUnavailable(problem) => Self::failed(
                 previous_window,
                 format!("Could not apply the installed policy ({problem})."),
             ),
             Permission::PasswordRequired { managed } => {
-                match StartupPassword::open(profile::vault_path_at(&root), managed) {
-                    Ok(prompt) => {
-                        let (window, opened) = startup_window();
+                match StartupPassword::open(vault_path, managed) {
+                    Ok(mut prompt) => {
+                        let (window, opened) =
+                            previous_window.map_or_else(startup_window, |id| (id, Task::done(id)));
+                        let opened = opened.map(|id| Message::Vault(id, VaultMessage::FocusUnlock));
+                        let task = if remembered {
+                            opened.chain(
+                                prompt
+                                    .try_remembered()
+                                    .map(move |message| Message::Vault(window, message)),
+                            )
+                        } else {
+                            opened
+                        };
                         (
                             Self(State::Locked(Box::new(Locked {
                                 root,
                                 window,
                                 prompt,
                             }))),
-                            opened.map(|id| Message::Vault(id, VaultMessage::FocusUnlock)),
+                            task,
                         )
                     }
                     Err(error) => Self::failed(
@@ -90,7 +121,9 @@ impl Application {
                 }
             }
             Permission::Ready => {
-                if recovery_key_changed
+                if unlocked
+                    .as_ref()
+                    .is_some_and(|result| result.recovery_key_changed)
                     && let Err(error) = profile::session::Store::purge_saved_output(&root)
                 {
                     eprintln!("kortty: could not clear output from the previous vault ({error})");
@@ -98,7 +131,8 @@ impl Application {
                 #[cfg(target_os = "macos")]
                 kortty_macos::initialize_desktop_notifications();
                 let model_preparation = prepare_on_startup(root, &policy);
-                let (workspace, task) = Workspace::boot(policy, vault);
+                let (workspace, task) =
+                    Workspace::boot(policy, unlocked.map(|result| result.vault));
                 let task = match previous_window {
                     Some(window) => Task::batch([task, window::close(window)]),
                     None => task,
@@ -165,13 +199,17 @@ impl Application {
                 let State::Locked(gate) = std::mem::replace(&mut self.0, State::Stopped) else {
                     unreachable!("only the password prompt can finish authentication")
                 };
+                let remembered = gate.prompt.used_remembered();
                 let (vault, recovery_key_changed) = gate.prompt.into_unlocked();
                 let (ready, task) = Self::start(
                     gate.root,
                     ClipboardPolicy::load(),
                     Some(id),
-                    Some(vault),
-                    recovery_key_changed,
+                    Some(UnlockedVault {
+                        vault,
+                        remembered,
+                        recovery_key_changed,
+                    }),
                 );
                 *self = ready;
                 task
@@ -277,8 +315,7 @@ mod tests {
             permission(&required(), false, true),
             Permission::Ready
         ));
-        let (mut application, _) =
-            Application::start(profile.0.clone(), required(), None, None, false);
+        let (mut application, _) = Application::start(profile.0.clone(), required(), None, None);
         let State::Locked(gate) = &application.0 else {
             panic!("managed startup must wait for the vault");
         };
@@ -298,8 +335,7 @@ mod tests {
             permission(&unavailable, false, true),
             Permission::PolicyUnavailable(_)
         ));
-        let (application, _) =
-            Application::start(profile.0.clone(), unavailable, None, None, false);
+        let (application, _) = Application::start(profile.0.clone(), unavailable, None, None);
         assert!(matches!(application.0, State::Failed { .. }));
 
         profile::save_new_atomic(
@@ -307,14 +343,48 @@ mod tests {
             br#"{"startup":{"require_master_password":true}}"#,
         )
         .unwrap();
-        let (application, _) = Application::start(
-            profile.0.clone(),
-            ClipboardPolicy::default(),
-            None,
-            None,
-            false,
-        );
+        let (application, _) =
+            Application::start(profile.0.clone(), ClipboardPolicy::default(), None, None);
         assert!(matches!(application.0, State::Locked(_)));
+    }
+
+    #[test]
+    fn automatic_unlock_respects_both_personal_and_managed_password_requirements() {
+        let profile = crate::snippets::tests::Profile::new();
+        let path = profile::vault_path_at(&profile.0);
+        let master = crate::vault_window::test_vault_password();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        drop(Vault::create(&path, &master[..]).unwrap());
+        std::fs::write(path.with_extension("bin.startup-unlock"), b"enabled-v1").unwrap();
+        let start = |policy| Application::start(profile.0.clone(), policy, None, None).0;
+        let mut automatic = start(ClipboardPolicy::default());
+        let State::Locked(gate) = &automatic.0 else {
+            panic!("the workspace must wait for automatic authentication");
+        };
+        assert!(gate.prompt.used_remembered());
+        let existing_window = gate.window;
+        let managed = start(ClipboardPolicy {
+            require_master_password: true,
+            ..ClipboardPolicy::default()
+        });
+        assert!(matches!(managed.0, State::Locked(gate) if !gate.prompt.used_remembered()));
+
+        profile::save_new_atomic(
+            &profile.0.join("window-settings.json"),
+            br#"{"startup":{"require_master_password":true}}"#,
+        )
+        .unwrap();
+        let personal = start(ClipboardPolicy::default());
+        assert!(matches!(personal.0, State::Locked(gate) if !gate.prompt.used_remembered()));
+        let completed = crate::vault_window::Completion::unlock_fixture(&path, &master[..], true);
+        let _ = automatic.update(Message::Vault(
+            existing_window,
+            VaultMessage::Completed(completed),
+        ));
+        assert!(matches!(
+            automatic.0,
+            State::Locked(gate) if gate.window == existing_window && !gate.prompt.used_remembered()
+        ));
     }
 
     #[test]
@@ -325,7 +395,7 @@ mod tests {
             require_master_password: true,
             ..ClipboardPolicy::default()
         };
-        let (application, _) = Application::start(profile.0.clone(), policy, None, None, false);
+        let (application, _) = Application::start(profile.0.clone(), policy, None, None);
         assert!(matches!(
             application.0,
             State::Failed { error, .. } if error.starts_with("Could not open the required vault")

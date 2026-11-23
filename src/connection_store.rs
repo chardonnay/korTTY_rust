@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::clipboard_policy::PasteWarningMode;
 use crate::profile;
 use crate::session::{SerialConnection, SerialParity, SerialStopBits};
-use crate::session_security::IsolationLevel;
+use crate::session_security::{IsolationLevel, IsolationSource, resolve_isolation};
 use crate::ssh_dialog::{LoginTarget, normalize_host, unsafe_text};
 use crate::ssh_tunnel::Destination;
 use crate::terminal_effects::Selection;
@@ -20,7 +20,7 @@ mod color;
 pub(crate) mod custom_os_badges;
 pub(crate) mod import;
 mod library;
-pub(crate) use library::JavaGroupColor;
+pub(crate) use library::{JavaGroupColor, JavaGroupIsolation};
 mod local;
 mod os_badge;
 mod terminal;
@@ -63,6 +63,8 @@ pub struct Connection {
     pub incognito: bool,
     #[serde(default, skip_serializing_if = "IsolationLevel::is_none")]
     pub isolation: IsolationLevel,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) inherit_isolation: bool,
     #[serde(
         default,
         with = "startup_options",
@@ -284,6 +286,13 @@ pub enum Auth {
         passphrase: Option<String>,
     },
     StoredKey(u64),
+    TemporaryKey {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        credential: Option<String>,
+        minutes: u16,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        automatic: bool,
+    },
     Configured {
         method: AuthMethod,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -317,7 +326,9 @@ impl Auth {
         match self {
             Self::Prompt | Self::VaultPassword(_) => AuthMethod::Password,
             Self::KeyboardInteractive => AuthMethod::KeyboardInteractive,
-            Self::KeyFile { .. } | Self::StoredKey(_) => AuthMethod::PublicKey,
+            Self::KeyFile { .. } | Self::StoredKey(_) | Self::TemporaryKey { .. } => {
+                AuthMethod::PublicKey
+            }
             Self::Configured { method, .. } => *method,
         }
     }
@@ -347,6 +358,7 @@ impl Auth {
                 ..
             } => ActiveAuth::KeyboardInteractive,
             Self::Configured { .. } => ActiveAuth::Prompt,
+            Self::TemporaryKey { .. } => ActiveAuth::Prompt,
         }
     }
 
@@ -375,6 +387,13 @@ impl Auth {
 
     pub(crate) fn has_vault_reference(&self) -> bool {
         self.credential_reference().is_some()
+            || matches!(
+                self,
+                Self::TemporaryKey {
+                    credential: Some(_),
+                    ..
+                }
+            )
             || matches!(
                 self,
                 Self::KeyFile {
@@ -417,6 +436,20 @@ pub struct TunnelPlan {
 }
 
 impl Connection {
+    pub(crate) fn isolation_override(&self) -> Option<IsolationLevel> {
+        (!self.inherit_isolation).then_some(self.isolation)
+    }
+
+    pub(crate) fn requires_isolated_launch(&self) -> bool {
+        if let Some(level) = self.isolation_override() {
+            return !level.is_none();
+        }
+        profile::connections_path()
+            .and_then(Store::open)
+            .map_or(true, |store| {
+                store.get(self.id) != Some(self) || store.connection_requires_isolation(self)
+            })
+    }
     pub(crate) fn blocked_server<'a>(
         &'a self,
         policy: &crate::clipboard_policy::ServerAccess,
@@ -460,6 +493,11 @@ impl Connection {
     }
 
     pub fn validate(&self) -> io::Result<()> {
+        if self.inherit_isolation && !self.isolation.is_none() {
+            return Err(invalid(
+                "an inherited isolation choice cannot specify a level",
+            ));
+        }
         if !valid_text(&self.name, 160, false)
             || !valid_text(&self.tag, 96, true)
             || self.profile().is_none()
@@ -499,6 +537,20 @@ impl SavedLogin {
             Auth::VaultPassword(id) => validate_credential_id(id)?,
             Auth::StoredKey(0) => return Err(invalid("invalid registered SSH key ID")),
             Auth::StoredKey(_) => {}
+            Auth::TemporaryKey {
+                credential,
+                minutes,
+                ..
+            } => {
+                if !(1..=1440).contains(minutes) || self.endpoint.username.is_empty() {
+                    return Err(invalid(
+                        "temporary SSH keys require an account and a lifetime from 1 to 1440 minutes",
+                    ));
+                }
+                if let Some(id) = credential {
+                    validate_credential_id(id)?;
+                }
+            }
             Auth::KeyFile { path, passphrase } => {
                 if !path.is_absolute()
                     || !path
@@ -777,6 +829,125 @@ impl Store {
 
     pub(crate) fn group_color(&self, path: &str) -> Option<TabColor> {
         self.document.library.group_colors.get(path).copied()
+    }
+
+    pub(crate) fn group_isolation(&self, path: &str) -> Option<IsolationLevel> {
+        self.document.library.group_isolation.get(path).copied()
+    }
+
+    pub(crate) fn inherited_group_isolation(
+        &self,
+        mut path: &str,
+    ) -> Option<(&str, IsolationLevel)> {
+        loop {
+            if let Some((source, level)) = self.document.library.group_isolation.get_key_value(path)
+            {
+                return Some((source, *level));
+            }
+            path = path.rsplit_once('/')?.0;
+        }
+    }
+
+    pub(crate) fn connection_isolation(
+        &self,
+        connection: &Connection,
+        default: IsolationLevel,
+        request: Option<IsolationLevel>,
+        minimum: IsolationLevel,
+    ) -> (IsolationLevel, IsolationSource<'_>) {
+        resolve_isolation(
+            default,
+            self.group_of(connection.id)
+                .and_then(|path| self.inherited_group_isolation(path)),
+            connection.isolation_override(),
+            request,
+            false,
+            minimum,
+        )
+    }
+
+    pub(crate) fn connection_requires_isolation(&self, connection: &Connection) -> bool {
+        connection.isolation_override().map_or_else(
+            || {
+                crate::workspace::installed_default_isolation().map_or(true, |default| {
+                    !self
+                        .connection_isolation(connection, default, None, IsolationLevel::None)
+                        .0
+                        .is_none()
+                })
+            },
+            |level| !level.is_none(),
+        )
+    }
+
+    pub(crate) fn teamwork_requires_isolation(&self, entry: &teamwork::Entry) -> bool {
+        crate::workspace::installed_default_isolation().map_or(true, |default| {
+            !resolve_isolation(
+                default,
+                self.inherited_group_isolation(&entry.group),
+                entry.connection.isolation_override(),
+                None,
+                true,
+                IsolationLevel::None,
+            )
+            .0
+            .is_none()
+        })
+    }
+
+    pub(crate) fn set_group_isolation(
+        &mut self,
+        path: &str,
+        original: Option<IsolationLevel>,
+        level: Option<IsolationLevel>,
+    ) -> io::Result<()> {
+        self.save_group_isolation(path, original, level, None)
+    }
+
+    pub(crate) fn java_group_isolation(&self) -> &BTreeSet<JavaGroupIsolation> {
+        &self.document.library.java_group_isolation
+    }
+
+    pub(crate) fn adopt_java_group_isolation(
+        &mut self,
+        path: &str,
+        original: Option<IsolationLevel>,
+        hint: JavaGroupIsolation,
+    ) -> io::Result<()> {
+        self.save_group_isolation(path, original, Some(hint.level), Some(hint))
+    }
+
+    fn save_group_isolation(
+        &mut self,
+        path: &str,
+        original: Option<IsolationLevel>,
+        level: Option<IsolationLevel>,
+        hint: Option<JavaGroupIsolation>,
+    ) -> io::Result<()> {
+        let mut candidate = self.document.clone();
+        candidate.library.require_group(Some(path))?;
+        if self.group_isolation(path) != original {
+            return Err(invalid(
+                "Folder isolation changed. Open the folder settings again.",
+            ));
+        }
+        if let Some(hint) = hint {
+            if !candidate.library.java_group_isolation.remove(&hint) {
+                return Err(invalid(
+                    "The imported Java folder isolation choice is no longer available.",
+                ));
+            }
+            candidate.library.reviewed_java_group_isolation.insert(hint);
+        }
+        if let Some(level) = level {
+            candidate
+                .library
+                .group_isolation
+                .insert(path.to_owned(), level);
+        } else {
+            candidate.library.group_isolation.remove(path);
+        }
+        self.commit(candidate)
     }
 
     pub(crate) fn java_group_colors(&self) -> &BTreeSet<JavaGroupColor> {
@@ -1084,6 +1255,9 @@ impl Store {
             .retain(|entry| !ids.contains(&entry.id));
         candidate
             .serial_profiles
+            .retain(|entry| !ids.contains(&entry.id));
+        candidate
+            .local_profiles
             .retain(|entry| !ids.contains(&entry.id));
         candidate.approvals.retain(|id, _| !ids.contains(id));
         self.commit(candidate)

@@ -44,10 +44,15 @@ impl Workspace {
         options: CreateOptions,
     ) -> Result<(Option<u64>, Task<WorkspaceMessage>), Fault> {
         self.control_saved_server(&connection)?;
-        let floor = options
-            .isolation
-            .unwrap_or(connection.isolation)
-            .max(self.clipboard.policy.minimum_isolation);
+        let floor = self
+            .saved_launch_isolation(&connection, Some(&store_path), options.isolation)
+            .map_err(|error| {
+                Fault::new(
+                    ErrorCode::Unavailable,
+                    "Could not resolve session isolation",
+                )
+                .with("detail", serde_json::json!(error.to_string()))
+            })?;
         self.allow_control_ssh(floor, options.incognito || connection.incognito)?;
         let launch = ControlLaunch {
             options,
@@ -69,13 +74,17 @@ impl Workspace {
         options: CreateOptions,
     ) -> Result<(Option<u64>, Task<WorkspaceMessage>), Fault> {
         self.control_saved_server(&selection.connection)?;
-        let floor = selection
-            .connection
-            .isolation
-            .max(options.isolation.unwrap_or_default())
-            .max(self.clipboard.policy.minimum_isolation);
+        let floor = self
+            .teamwork_launch_isolation(&selection, options.isolation)
+            .map_err(|error| {
+                Fault::new(
+                    ErrorCode::Unavailable,
+                    "Could not resolve Teamwork isolation",
+                )
+                .with("detail", serde_json::json!(error.to_string()))
+            })?;
         self.allow_control_ssh(floor, options.incognito || selection.connection.incognito)?;
-        let focus = self.open_teamwork_ssh(owner, selection, false, true, Some(options));
+        let focus = self.open_teamwork_ssh(owner, selection, false, true, Some(options), None);
         self.start_control_ssh(owner, focus)
     }
 
@@ -347,6 +356,7 @@ mod tests {
                 tunnels: Vec::new(),
                 incognito: false,
                 isolation: IsolationLevel::Process,
+                inherit_isolation: false,
                 startup: Default::default(),
                 logging: Default::default(),
                 terminal_effect: None,

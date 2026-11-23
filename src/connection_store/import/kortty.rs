@@ -191,7 +191,15 @@ pub(super) fn parse(root: Node<'_, '_>, source: Source) -> io::Result<Preview> {
                     .is_ok_and(|jump| jump.is_none_or(reusable_target_auth));
             profile.java_memory_id = declared_id.map(str::to_owned);
             if declared_id.is_some() {
-                profile.java_route = declared_route(entry, &profile.connection).ok().flatten();
+                profile.java_route = declared_route(entry, &profile.connection, false)
+                    .ok()
+                    .flatten();
+                if source == Source::CredentialReview {
+                    profile.java_temporary_key_route =
+                        declared_route(entry, &profile.connection, true)
+                            .ok()
+                            .flatten();
+                }
                 if key_reference && source_id.is_some() && profile.java_route.is_some() {
                     profile.java_key_id = binding_field(entry, "sshKeyId")
                         .ok()
@@ -221,6 +229,7 @@ pub(super) fn parse(root: Node<'_, '_>, source: Source) -> io::Result<Preview> {
                 .is_some_and(|id| duplicate_ids.contains(id))
             {
                 entry.java_route = None;
+                entry.java_temporary_key_route = None;
             }
             clear_duplicate_favorite(&mut entry.java_favorite_id, &duplicate_ids);
         }
@@ -307,6 +316,7 @@ fn shared_backup_route(
 fn declared_route(
     node: Node<'_, '_>,
     connection: &super::Connection,
+    temporary: bool,
 ) -> io::Result<Option<(LoginTarget, Option<LoginTarget>)>> {
     if !matches!(
         binding_field(node, "connectionSource")?.map(str::trim),
@@ -314,7 +324,7 @@ fn declared_route(
     ) || !matches!(
         binding_field(node, "protocol")?.map(str::trim),
         None | Some("SSH_TCP")
-    ) || temporary_identity(node)?
+    ) || temporary_identity(node)? != temporary
     {
         return Ok(None);
     }
@@ -414,6 +424,14 @@ fn local_profile(
         });
     let profile = LocalProfile {
         id: 0,
+        isolation: match (
+            boolean(node, "rustLocalGlobalIsolation")?,
+            isolation_mode(node)?,
+        ) {
+            (true, None) => crate::session_security::LocalIsolation::Global,
+            (true, Some(_)) => return Err(invalid("conflicting local shell isolation settings")),
+            (false, level) => crate::session_security::LocalIsolation::from_override(level),
+        },
         name,
         shell,
         command,
@@ -657,11 +675,10 @@ pub(super) fn connection(
         Some("always") => Some(PasteWarningMode::Always),
         _ => None,
     };
-    if let Some(value) = raw_scalar(node, "isolationMode")?
-        && !value.trim().is_empty()
-    {
-        connection.isolation = IsolationLevel::from_id(value.trim())
-            .ok_or_else(|| invalid("unknown isolation level in kortty connection XML"))?;
+    if let Some(level) = isolation_mode(node)? {
+        connection.isolation = level;
+    } else {
+        connection.inherit_isolation = true;
     }
     connection.incognito = boolean(node, "incognito")?;
     connection.terminal_effect = terminal_effect(node)?;
@@ -677,6 +694,16 @@ pub(super) fn connection(
     entry.has_password = has_embedded_password(node);
     entry.jump_has_password = jump_has_password;
     Ok((entry, skipped))
+}
+
+fn isolation_mode(node: Node<'_, '_>) -> io::Result<Option<IsolationLevel>> {
+    raw_scalar(node, "isolationMode")?
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            IsolationLevel::from_id(value.trim())
+                .ok_or_else(|| invalid("unknown isolation level in kortty connection XML"))
+        })
+        .transpose()
 }
 
 fn rsync_folder(node: Node<'_, '_>, id: &str) -> io::Result<Option<String>> {

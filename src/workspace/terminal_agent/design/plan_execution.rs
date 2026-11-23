@@ -2,30 +2,55 @@
 
 use std::time::{Duration, Instant};
 
-use iced::widget::{button, canvas, column, progress_bar, row, scrollable, text};
+use iced::widget::{
+    button, canvas, column, container, pane_grid, progress_bar, row, scrollable, text,
+};
 use iced::{Alignment, Element, Font, Length, Point, Rectangle, Renderer, Theme, mouse};
 
 use crate::terminal_agent::design::inline::{self, Kind, Role, Step, StepState, Transcript};
 
 use super::{
-    AgentMessage, Presentation, Run, command_review,
+    AgentMessage, Message, Palette, Presentation, Run, command_review,
     history::{self, Activity},
     log_table::{self, Row},
     status,
 };
 
 const OUTPUT_LINES: usize = 5;
+pub(super) const HEIGHT: f32 = 152.0;
+const PLAN_RATIO: f32 = 0.42;
 const PROGRESS_DURATION: Duration = Duration::from_millis(360);
 const CHECK_DURATION: Duration = Duration::from_millis(320);
 
-#[derive(Default)]
 pub(super) struct Progress {
     target: f32,
     transition: Option<(f32, Instant)>,
     checks: Vec<(u64, Instant)>,
+    columns: pane_grid::State<bool>,
+}
+
+impl Default for Progress {
+    fn default() -> Self {
+        use pane_grid::Configuration::{Pane, Split};
+        Self {
+            target: 0.0,
+            transition: None,
+            checks: Vec::new(),
+            columns: pane_grid::State::with_configuration(Split {
+                axis: pane_grid::Axis::Vertical,
+                ratio: PLAN_RATIO,
+                a: Box::new(Pane(true)),
+                b: Box::new(Pane(false)),
+            }),
+        }
+    }
 }
 
 impl Progress {
+    pub(super) fn resize(&mut self, event: pane_grid::ResizeEvent) {
+        self.columns.resize(event.split, event.ratio);
+    }
+
     pub(super) fn sync(&mut self, transcript: &Transcript, finished: bool, now: Instant) {
         let target = if finished {
             1.0
@@ -113,9 +138,12 @@ pub(super) fn refresh_interval(
     }
 }
 
-pub(super) fn view(activity: Activity<'_>, reduced_motion: bool) -> Element<'_, AgentMessage> {
+pub(super) fn view(
+    activity: Activity<'_>,
+    palette: Option<Palette>,
+    reduced_motion: bool,
+) -> Element<'_, AgentMessage> {
     let now = Instant::now();
-    let size = activity.activity_font;
     let trace = activity.transcript;
     let restored = activity.live_run.is_some_and(|run| run.reopened_history);
     let active = activity.live_run.map_or_else(
@@ -131,22 +159,82 @@ pub(super) fn view(activity: Activity<'_>, reduced_motion: bool) -> Element<'_, 
         || trace.is_some_and(|trace| trace.prompt.is_some()),
         Run::awaiting_input,
     );
-    let goal = trace.map_or(activity.goal, |trace| &trace.goal);
-    let mut steps = column![text("Goal").size(size + 1.0), text(goal).size(size)].spacing(5);
+    let selected = activity.presentation.selection(activity.activity.len());
+    let progress = if restored {
+        1.0
+    } else {
+        activity
+            .presentation
+            .plan_progress
+            .value(now, reduced_motion)
+    };
+    let trace = match activity.live_run {
+        Some(run) if activity.surface == log_table::Surface::Pane => {
+            Some(status::Trace::live(run, now, reduced_motion))
+        }
+        None => trace.zip(activity.started).map(|(transcript, start)| {
+            status::Trace::sample(transcript, start, now, reduced_motion)
+        }),
+        _ => None,
+    };
+    let columns = pane_grid(
+        &activity.presentation.plan_progress.columns,
+        |_, plan, _| {
+            let body = if *plan {
+                checklist(
+                    activity,
+                    now,
+                    spinning,
+                    active && !waiting,
+                    reduced_motion || restored,
+                )
+            } else {
+                execution(activity, selected, now, spinning, active)
+            };
+            pane_grid::Content::new(
+                scrollable(container(body).padding([2, 5]).width(Length::Fill))
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+            )
+        },
+    )
+    .spacing(6)
+    .min_size(70)
+    .on_resize(6, |event| AgentMessage::Design(Message::ResizePlan(event)));
+    column![
+        progress_bar(0.0..=1.0, progress).girth(3),
+        trace.map(|trace| status::plan_header(activity, trace, palette)),
+        columns,
+    ]
+    .spacing(3)
+    .height(Length::Fill)
+    .into()
+}
+
+fn checklist(
+    activity: Activity<'_>,
+    now: Instant,
+    spinning: bool,
+    awaiting_next: bool,
+    still: bool,
+) -> Element<'_, AgentMessage> {
+    let size = activity.activity_font;
+    let mut steps = column![text("Plan").size(size).font(Font {
+        weight: iced::font::Weight::Bold,
+        ..Font::DEFAULT
+    })]
+    .spacing(3);
     if let Some(plan) = activity.plan {
         steps = steps.push(text(plan).size(activity.plan_font));
     }
-    steps = steps.push(text("Activity").size(size + 1.0));
-    let selected = activity.presentation.selection(activity.activity.len());
-    if let Some(trace) = trace.filter(|trace| !trace.steps.is_empty()) {
+    if let Some(trace) = activity.transcript.filter(|trace| !trace.steps.is_empty()) {
         for (index, step) in trace.steps.iter().enumerate() {
             let symbol = inline::marker(step, spinner(activity, step, now, spinning));
             let mark: Element<'_, AgentMessage> = if has_check(step) {
-                let fraction = activity.presentation.plan_progress.check(
-                    step.id,
-                    now,
-                    reduced_motion || restored,
-                );
+                let fraction = activity
+                    .presentation
+                    .plan_progress
+                    .check(step.id, now, still);
                 canvas(CheckMark(fraction)).width(16).height(16).into()
             } else {
                 text(symbol.text)
@@ -156,41 +244,51 @@ pub(super) fn view(activity: Activity<'_>, reduced_motion: bool) -> Element<'_, 
                     .into()
             };
             let title = step.command.as_deref().unwrap_or(&step.title);
-            let label = format!(
-                "{}  {}",
-                index + 1,
-                history::summary(&inline::clean(title, false))
-            );
-            let item = row![mark, text(label).size(size - 1.0)]
-                .align_y(Alignment::Center)
-                .spacing(5);
+            let label = history::summary(&inline::clean(title, false));
+            let item = row![
+                mark,
+                container(text(label).size(size - 1.0).wrapping(text::Wrapping::None))
+                    .width(Length::Fill)
+                    .clip(true)
+            ]
+            .align_y(Alignment::Center)
+            .spacing(5);
             let surface = activity.surface.activity_entry(index);
             steps = steps.push(step_menu(activity, step, surface, item.into()));
         }
     } else {
+        let selected = activity.presentation.selection(activity.activity.len());
         for (index, entry) in activity.activity.iter().enumerate() {
             steps = steps.push(
                 activity.entry_menu(
                     index,
-                    button(
-                        text(format!("{}  {}", index + 1, history::summary(entry)))
-                            .size(size - 1.0),
-                    )
-                    .on_press(history::select(activity, index))
-                    .style(if index == selected {
-                        button::primary
-                    } else {
-                        button::text
-                    }),
+                    button(text(history::summary(entry)).size(size - 1.0))
+                        .on_press(history::select(activity, index))
+                        .style(if index == selected {
+                            button::primary
+                        } else {
+                            button::text
+                        }),
                 ),
             );
         }
     }
-    if active && !waiting {
-        steps = steps.push(text("○  Next step").size(size - 1.0));
+    if awaiting_next {
+        steps = steps.push(text("○  next step …").size(size - 1.0));
     }
+    steps.into()
+}
 
-    let execution = command_review::card(activity).unwrap_or_else(|| {
+fn execution(
+    activity: Activity<'_>,
+    selected: usize,
+    now: Instant,
+    spinning: bool,
+    active: bool,
+) -> Element<'_, AgentMessage> {
+    let trace = activity.transcript;
+    let size = activity.activity_font;
+    command_review::card(activity).unwrap_or_else(|| {
         if !active
             && let Some(answer) = trace
                 .map(|trace| trace.final_answer.trim())
@@ -217,30 +315,7 @@ pub(super) fn view(activity: Activity<'_>, reduced_motion: bool) -> Element<'_, 
         )
         .size(size)
         .into()
-    });
-    let progress = if restored {
-        1.0
-    } else {
-        activity
-            .presentation
-            .plan_progress
-            .value(now, reduced_motion)
-    };
-    column![
-        progress_bar(0.0..=1.0, progress).girth(3),
-        row![
-            scrollable(steps)
-                .height(Length::Fill)
-                .width(Length::FillPortion(2)),
-            scrollable(execution)
-                .height(Length::Fill)
-                .width(Length::FillPortion(3)),
-        ]
-        .spacing(10),
-    ]
-    .spacing(4)
-    .height(Length::Fill)
-    .into()
+    })
 }
 
 struct CheckMark(f32);

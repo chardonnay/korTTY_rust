@@ -138,6 +138,7 @@ pub(crate) enum Message {
         super::actions::Item,
     ),
     LogTable(super::log_table::Message),
+    ResizePlan(iced::widget::pane_grid::ResizeEvent),
     ToggleStepList,
     BrowseCards(usize),
     ScrollCards {
@@ -403,6 +404,7 @@ impl Presentation {
                 self.dismiss_drawer();
                 self.status_visibility.hide();
             }
+            Message::ResizePlan(event) => self.plan_progress.resize(event),
             Message::HideTimelineSample => {
                 self.close_status_run_menu();
                 self.set_dock_hidden(true);

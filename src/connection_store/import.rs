@@ -26,9 +26,9 @@ mod xml;
 
 pub(crate) use java_bindings::{
     JavaConnectionBindings, JavaImportedRoute, JavaManagedKeyBinding, JavaPasswordBinding,
-    JavaSchedulerSource, JavaSourceGroups, JavaTargetReuse, check_java_connection_routes,
-    check_java_imported_routes, existing_java_profile_matches, java_connection_candidate,
-    prepare_java_connection_import_with_library,
+    JavaSchedulerSource, JavaSourceGroups, JavaTargetReuse, JavaTemporaryKeyBinding,
+    check_java_connection_routes, check_java_imported_routes, existing_java_profile_matches,
+    java_connection_candidate, prepare_java_connection_import_with_library,
 };
 pub(crate) use java_library::JavaLibrarySettings;
 pub(crate) use kortty::normalize_java_group_path;
@@ -74,6 +74,7 @@ struct ImportedProfile {
     java_memory_id: Option<String>,
     java_key_id: Option<String>,
     java_route: Option<(LoginTarget, Option<LoginTarget>)>,
+    java_temporary_key_route: Option<(LoginTarget, Option<LoginTarget>)>,
     java_rsync_folder: Option<String>,
     group: String,
     badge: Option<String>,
@@ -108,6 +109,7 @@ impl ImportedProfile {
             java_memory_id: None,
             java_key_id: None,
             java_route: None,
+            java_temporary_key_route: None,
             java_rsync_folder: None,
             group,
             badge: None,
@@ -422,6 +424,7 @@ impl Preview {
             )
         }) {
             previous.java_route = None;
+            previous.java_temporary_key_route = None;
             previous.java_key_id = None;
             previous.java_favorite_id = None;
             self.duplicates += 1;
@@ -667,6 +670,7 @@ fn ssh_profile(
         tunnels,
         incognito: false,
         isolation: Default::default(),
+        inherit_isolation: false,
         startup: Default::default(),
         logging: Default::default(),
         terminal_effect: None,

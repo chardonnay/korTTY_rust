@@ -173,6 +173,7 @@ impl Workspace {
             self.ai_manager.config = saved;
             self.invalidate_snippet_apply_requests();
         }
+        let has_source_report = report.sources.is_some();
         if running.cancel.is_some() || report.changed {
             self.knowledge_sync_status(
                 running.store,
@@ -183,6 +184,9 @@ impl Workspace {
             );
         } else {
             self.refresh_knowledge_sync_view();
+        }
+        if has_source_report && let Some((_, dialog)) = &mut self.ai_manager.surface {
+            dialog.refresh_knowledge_source_outcomes();
         }
         if report.changed {
             self.invalidate_snippet_knowledge();

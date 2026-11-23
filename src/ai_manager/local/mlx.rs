@@ -160,12 +160,7 @@ impl State {
                 .get(&choice.id)
                 .copied()
                 .unwrap_or(runtime_package::ModelStatus::Stopped);
-            Row::mlx(
-                &choice.id,
-                &choice.name,
-                choice.idle_minutes,
-                status.to_string(),
-            )
+            Row::mlx(choice, status.to_string())
         })
     }
 

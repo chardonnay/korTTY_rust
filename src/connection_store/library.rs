@@ -3,6 +3,8 @@ use std::io;
 
 use serde::{Deserialize, Serialize};
 
+use crate::session_security::IsolationLevel;
+
 use super::{
     Connection, TabColor, invalid,
     teamwork::{Favorites, HiddenEntries},
@@ -14,6 +16,7 @@ const MAX_GROUPS: usize = 512;
 const MAX_GROUP_DEPTH: usize = 8;
 pub(crate) const MAX_GROUP_PATH_BYTES: usize = 512;
 const MAX_JAVA_GROUP_COLORS: usize = 1024;
+const MAX_JAVA_GROUP_ISOLATION: usize = 1024;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,6 +31,19 @@ impl std::fmt::Display for JavaGroupColor {
     }
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct JavaGroupIsolation {
+    pub(crate) source: String,
+    pub(crate) level: IsolationLevel,
+}
+
+impl std::fmt::Display for JavaGroupIsolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} · {}", self.source, self.level)
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct Library {
@@ -35,6 +51,12 @@ pub(super) struct Library {
     pub groups: BTreeSet<String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub group_colors: BTreeMap<String, TabColor>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub group_isolation: BTreeMap<String, IsolationLevel>,
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    pub java_group_isolation: BTreeSet<JavaGroupIsolation>,
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    pub reviewed_java_group_isolation: BTreeSet<JavaGroupIsolation>,
     #[serde(skip_serializing_if = "BTreeSet::is_empty")]
     pub java_group_colors: BTreeSet<JavaGroupColor>,
     #[serde(skip_serializing_if = "BTreeSet::is_empty")]
@@ -93,9 +115,34 @@ impl Library {
             || self.reviewed_java_favorites != original.reviewed_java_favorites
     }
 
+    pub(super) fn java_isolation_changed(&self, original: &Self) -> bool {
+        self.group_isolation != original.group_isolation
+            || self.java_group_isolation != original.java_group_isolation
+            || self.reviewed_java_group_isolation != original.reviewed_java_group_isolation
+    }
+
+    pub(super) fn stage_java_group_isolation(&mut self, hint: &JavaGroupIsolation) {
+        if self.reviewed_java_group_isolation.contains(hint)
+            || self.java_group_isolation.len() + self.reviewed_java_group_isolation.len()
+                >= MAX_JAVA_GROUP_ISOLATION
+                && !self.java_group_isolation.contains(hint)
+        {
+            return;
+        }
+        if self.group_isolation.get(&hint.source) == Some(&hint.level) {
+            self.java_group_isolation.remove(hint);
+            self.reviewed_java_group_isolation.insert(hint.clone());
+        } else {
+            self.java_group_isolation.insert(hint.clone());
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.groups.is_empty()
             && self.group_colors.is_empty()
+            && self.group_isolation.is_empty()
+            && self.java_group_isolation.is_empty()
+            && self.reviewed_java_group_isolation.is_empty()
             && self.java_group_colors.is_empty()
             && self.reviewed_java_group_colors.is_empty()
             && self.membership.is_empty()
@@ -122,6 +169,20 @@ impl Library {
                 .group_colors
                 .keys()
                 .any(|path| !self.groups.contains(path))
+            || self
+                .group_isolation
+                .keys()
+                .any(|path| !self.groups.contains(path))
+            || self.java_group_isolation.len() + self.reviewed_java_group_isolation.len()
+                > MAX_JAVA_GROUP_ISOLATION
+            || !self
+                .java_group_isolation
+                .is_disjoint(&self.reviewed_java_group_isolation)
+            || self
+                .java_group_isolation
+                .iter()
+                .chain(&self.reviewed_java_group_isolation)
+                .any(|hint| !valid_path(&hint.source))
             || self.java_group_colors.len() + self.reviewed_java_group_colors.len()
                 > MAX_JAVA_GROUP_COLORS
             || !self
@@ -208,16 +269,8 @@ impl Library {
                 *group = format!("{new_path}{suffix}");
             }
         }
-        self.group_colors = std::mem::take(&mut self.group_colors)
-            .into_iter()
-            .map(|(group, color)| {
-                let group = match group_suffix(&group, path) {
-                    Some(suffix) => format!("{new_path}{suffix}"),
-                    None => group,
-                };
-                (group, color)
-            })
-            .collect();
+        rename_folder_keys(&mut self.group_colors, path, &new_path);
+        rename_folder_keys(&mut self.group_isolation, path, &new_path);
         Ok(new_path)
     }
 
@@ -232,6 +285,8 @@ impl Library {
         self.groups
             .retain(|group| group_suffix(group, path).is_none());
         self.group_colors
+            .retain(|group, _| group_suffix(group, path).is_none());
+        self.group_isolation
             .retain(|group, _| group_suffix(group, path).is_none());
         self.remove_connections(&ids);
         Ok(ids)
@@ -272,6 +327,19 @@ impl Library {
         self.used_at.retain(|id, _| self.recent.contains(id));
         true
     }
+}
+
+fn rename_folder_keys<T>(values: &mut BTreeMap<String, T>, old: &str, new: &str) {
+    *values = std::mem::take(values)
+        .into_iter()
+        .map(|(path, value)| {
+            let path = match group_suffix(&path, old) {
+                Some(suffix) => format!("{new}{suffix}"),
+                None => path,
+            };
+            (path, value)
+        })
+        .collect();
 }
 
 pub(crate) fn group_suffix<'a>(path: &'a str, group: &str) -> Option<&'a str> {

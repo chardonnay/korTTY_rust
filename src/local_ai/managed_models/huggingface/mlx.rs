@@ -28,6 +28,8 @@ const REVIEW_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) struct PackageReview {
     pub(crate) repository: Repository,
     pub(crate) revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) published_at: Option<String>,
     pub(crate) files: Vec<Artifact>,
     pub(crate) bytes: u64,
 }
@@ -168,6 +170,8 @@ impl Hub {
         Ok(PackageReview {
             repository,
             revision,
+            published_at: super::publication_timestamp(wire.created_at.as_ref())
+                .map(|date| date.to_string()),
             files,
             bytes,
         })
@@ -208,6 +212,7 @@ mod tests {
             let review = Arc::new(PackageReview {
                 repository,
                 revision: revision.clone(),
+                published_at: Some("2025-02-01T12:00:00Z".into()),
                 files,
                 bytes,
             });
@@ -258,6 +263,7 @@ mod tests {
                     panic!("The complete fixture was not installed");
                 };
                 assert_eq!(model.name, "example/model");
+                assert_eq!(model.published_at.as_deref(), Some("2025-02-01T12:00:00Z"));
                 assert_eq!(registry.list().unwrap(), [model]);
                 assert!(!cleanup_warning);
                 assert!(!sync_warning);
@@ -298,6 +304,7 @@ mod tests {
         let review = Arc::new(PackageReview {
             repository: Repository::parse("example/model").unwrap(),
             revision: revision.clone(),
+            published_at: None,
             files,
             bytes,
         });
@@ -406,6 +413,7 @@ mod tests {
         let review = Arc::new(PackageReview {
             repository: Repository::parse("example/model").unwrap(),
             revision: revision.clone(),
+            published_at: None,
             bytes: files.iter().map(Artifact::size).sum(),
             files,
         });

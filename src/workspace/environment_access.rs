@@ -463,6 +463,7 @@ mod tests {
             tunnels: Vec::new(),
             incognito: false,
             isolation: IsolationLevel::None,
+            inherit_isolation: false,
             startup: Default::default(),
             logging: Default::default(),
             terminal_effect: None,

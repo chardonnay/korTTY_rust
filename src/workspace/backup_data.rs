@@ -59,6 +59,8 @@ type RawFields = BTreeMap<String, Box<RawValue>>;
 #[derive(Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 struct JavaDisplayPreferences {
+    #[serde(skip_serializing_if = "JavaSecurityPreferences::is_empty")]
+    java_security: JavaSecurityPreferences,
     #[serde(skip_serializing_if = "appearance::Preferences::is_default")]
     appearance: appearance::Preferences,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -687,11 +689,42 @@ impl JavaDisplayPreferences {
         fields.remove("ascii_art_java");
         fields.remove("java_backup_defaults");
         fields.remove("java_session_restore");
+        fields.remove("java_security");
         Ok(fields)
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub(super) struct JavaSecurityPreferences {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) default_isolation: Option<crate::session_security::IsolationLevel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) temporary_ssh_keys: Option<bool>,
+}
+
+impl JavaSecurityPreferences {
+    pub(super) fn is_empty(&self) -> bool {
+        self.count() == 0
+    }
+
+    fn count(&self) -> usize {
+        usize::from(self.default_isolation.is_some())
+            + usize::from(self.temporary_ssh_keys.is_some())
+    }
+
+    fn read(root: Node<'_, '_>, omitted: &mut usize) -> Self {
+        Self {
+            default_isolation: preference(root, "connectionIsolationDefault", omitted, |value| {
+                crate::session_security::IsolationLevel::from_id(&value.to_ascii_lowercase())
+            }),
+            temporary_ssh_keys: preference(root, "temporarySshKeyEnabled", omitted, java_flag),
+        }
+    }
+}
+
 pub(crate) struct JavaPreferences {
+    pub(crate) security_proposals: usize,
     pub(crate) teamwork_proposals: usize,
     pub(crate) scheduler_teamwork_origins:
         std::collections::BTreeMap<String, crate::connection_store::teamwork::Origin>,
@@ -1061,6 +1094,7 @@ pub(crate) fn portable_java_preferences(
         }),
     };
     let java_session_restore = session_recovery::Preferences::read(root, &mut omitted);
+    let java_security = JavaSecurityPreferences::read(root, &mut omitted);
     let agent_activity_font_size =
         preference(root, "terminalAgentPanelFontSize", &mut omitted, |value| {
             super::terminal_agent::font::View::Activity.read_java(value)
@@ -1100,6 +1134,7 @@ pub(crate) fn portable_java_preferences(
     );
     let mut flag = |name| preference(root, name, &mut omitted, java_flag);
     let display = JavaDisplayPreferences {
+        java_security,
         java_session_restore,
         appearance,
         journal_live_log_height,
@@ -1442,6 +1477,7 @@ pub(crate) fn portable_java_preferences(
         && !swarm_journal_proposal
         && session_restore_preferences == 0
         && workflow_header_defaults == 0
+        && java_security.is_empty()
     {
         None
     } else {
@@ -1460,6 +1496,7 @@ pub(crate) fn portable_java_preferences(
         Some(contents)
     };
     Ok(JavaPreferences {
+        security_proposals: java_security.count(),
         teamwork_proposals,
         scheduler_teamwork_origins,
         swarm_journal_proposal,
@@ -1837,6 +1874,8 @@ pub(crate) fn merge_java_window_settings(
             "java_session_restore",
             &display.java_session_restore,
         )?;
+    let security_added = !display.java_security.is_empty()
+        && merge_unset_section(&mut fields, "java_security", &display.java_security)?;
     let appearance_added = !display.appearance.is_default()
         && merge_unset_section(&mut fields, "appearance", &display.appearance)?;
     let diagram_appearance_added = !display.snippet_diagram_appearance.is_empty()
@@ -1948,6 +1987,7 @@ pub(crate) fn merge_java_window_settings(
         && !ascii_art_added
         && !backup_added
         && !recovery_added
+        && !security_added
         && !appearance_added
         && !diagram_appearance_added
         && !snippet_hardening_added

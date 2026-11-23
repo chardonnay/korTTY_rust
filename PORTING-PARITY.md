@@ -16,6 +16,25 @@ open until a result is recorded for the tested revision and environment. Both
 Mosh modes are out of scope. The editor has a reduced native scope with structure
 navigation for classes, functions, variables, and placeholders.
 
+## November 23 full native workspace tests
+
+All three native ARM64 hosts passed workspace formatting and strict Clippy
+for all targets on [PR #35](https://github.com/chardonnay/korTTY_rust/pull/35)
+at `ab5b101e`. The regular workspace suite reported the following results.
+Each test counts once, including tests that start a child copy of themselves.
+
+| Platform | Passed | Failed | Ignored by default |
+| --- | ---: | ---: | ---: |
+| Windows ARM64 | 4,804 | 0 | 100 |
+| macOS on Apple Silicon | 4,909 | 0 | 226 |
+| Fedora ARM64 | 4,953 | 0 | 290 |
+
+The Windows Credential Manager round trip also passed. On Apple Silicon,
+four opt-in tests covered the saved-key editor, SSH and SFTP with saved
+and Java-imported keys, and project reconnect after vault unlock and key
+expiry. The [release gates](PORTING-PLAN.md#native-acceptance-and-release-gates)
+track package, desktop and independent SSH acceptance separately.
+
 ## November 23 dialog parity review
 
 Rust implementation `aaa8d037` in [PR #34](https://github.com/chardonnay/korTTY_rust/pull/34)
@@ -25,27 +44,37 @@ Windows ARM64 desktop checks.
 - **Agent designs.** Activating another module on Standard or Classic already
   creates a custom design. The standalone editor saves the change. A fresh Rust
   process restored the custom default, delay and reduced animations. Java
-  names an automatic copy after its preset, for example `Standard 2`, and opens
-  a name dialog for New, Duplicate and Rename. Rust generates `Custom design N`
-  and renames inline. [Java editor](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignPluginManagerDialog.java)
+  appends ` 2` to the preset's full display name and opens a name dialog
+  for New, Duplicate and Rename. New opens with `My combination` selected.
+  Duplicate selects the proposed name based on the current design. Rust
+  generated `Custom design N` and renamed inline at that checkpoint. The
+  [naming update](#november-23-agent-design-naming) adds the owned prompts.
+  [Java editor](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignPluginManagerDialog.java)
   · [Rust editor](src/workspace/settings_window/agent_design_settings.rs)
   · [Rust catalog](src/terminal_agent/design/custom.rs)
 - **Plan and execution.** At 1,202 by 694 pixels, Java placed Metro above the
   bottom history and Rust placed it below. Java gives the prompt and run
   controls one header above the Plan checklist and execution column. Its
-  divider starts at 42% and can be dragged. The shared Rust layout puts Metro
-  below the composed pane, and the Rust presenter uses Goal and Activity
-  headings and fixed column proportions. [Java panel](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignPlanExecution.java)
+  divider starts at 42% and can be dragged. At this checkpoint the shared
+  Rust layout put Metro below the composed pane and used Goal and Activity
+  headings and fixed column proportions. The later
+  [layout update](#november-23-plan-and-execution-layout) addresses these
+  differences. [Java panel](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignPlanExecution.java)
   · [Rust placement](src/workspace/terminal_agent/design/placement.rs)
   · [Rust panel](src/workspace/terminal_agent/design/plan_execution.rs)
 - **Local models.** Both GGUF and MLX have owned Configure windows. The
   GGUF desktop comparison confirmed field order, cancellation and a saved
-  context size and idle timeout. The same long path wrapped in Rust. Java
+  context size and idle timeout. The same long path wrapped in Rust at that
+  checkpoint. The [Configure sizing update](#november-23-gguf-configure-sizing)
+  measures the model path before opening. Java
   prompts for copy or reference after the file picker and offers a matching
   runtime when a saved GGUF model requires a different backend. Rust
-  embeds import review and offers runtime repair separately. Java stores the
-  Hub publication date for MLX, while Rust's MLX inventory row supplies no
-  date. MLX Configure and the mixed inventory still need Apple Silicon
+  embedded import review and offered runtime repair separately at that
+  checkpoint. The [GGUF update](#november-23-gguf-import-and-backend-review)
+  adds the owned prompts. Java stores the
+  Hub publication date for MLX. At this checkpoint Rust's MLX inventory row
+  supplied no date. The later [MLX update](#november-23-mlx-publication-date-on-apple-silicon)
+  adds that metadata. MLX Configure and the mixed inventory need Apple Silicon
   desktop acceptance. [Java model manager](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/LocalModelManagerPane.java)
   · [Rust window routing](src/workspace/ai_access.rs)
   · [Rust GGUF actions](src/ai_manager/local/managed.rs)
@@ -54,14 +83,18 @@ Windows ARM64 desktop checks.
   and last successful index time for each source. Rust reads successful
   index counts and timestamps from snapshots and retains reviewed folder
   issues. A subsequent failed update can appear in the running manager.
-  Restoring that outcome after restart is the remaining persistence task.
+  Restoring that outcome after restart was the remaining persistence task
+  at this checkpoint. The [source outcome update](#november-23-knowledge-source-outcomes)
+  adds that recovery.
   [Java source configuration](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/rag/RagConfigurationManager.java)
   · [Rust source inventory](src/ai_manager/local/knowledge_inventory.rs)
 
-Two November 22 findings still apply at `aaa8d037`. The step menu copies
-the eight-line preview with at most 320 characters per line. Settings
-requires two characters and AI Manager accepts one. Both filter entries in
-enumeration order. The [matcher and clipboard comparison](#november-22-design-editing-command-output-and-settings-search)
+At `aaa8d037`, the step menu copied the eight-line preview with at most
+320 characters per line. The [step-copy update](#november-23-complete-masked-step-copy)
+uses the retained output. At that checkpoint Settings required two
+characters and AI Manager accepted one. Both filtered entries in
+enumeration order. The [search update](#november-23-settings-search-matching)
+applies the tagged ranking to both dialogs. The [matcher and clipboard comparison](#november-22-design-editing-command-output-and-settings-search)
 links the Java behavior and the corresponding Rust paths.
 
 The last recorded model-configuration check used the Java Windows x64
@@ -74,6 +107,767 @@ the [release matrix](PORTING-PLAN.md#native-acceptance-and-release-gates).
 The checkout's `target/verification/` directory holds the desktop record
 `20261123-model-config-windows-arm64-desktop.md` and its test log
 `20261123-model-config-windows-arm64-tests.log`.
+
+## November 23 Settings Security
+
+The Java v2.26.0 Security page groups the master password, temporary SSH
+keys and session isolation. The native Security tab now groups credential
+rotation and the managed startup requirement. The startup control uses
+the existing draft, Save and policy checks. **Change master password…**
+opens the existing Credential Vault workflow. For an existing locked
+vault, a successful unlock opens the change form and failed authentication
+keeps the request at the unlock step.
+
+The Windows desktop comparison used fresh private profiles and the
+Normal theme. The released Java x64 reference under emulation and native
+Windows ARM64 Rust both opened Settings at 1,122 by 1,112 pixels.
+The change action appeared before the startup checkbox in both versions.
+Rust search revealed and highlighted each action with Enter. The desktop
+comparison covered navigation and presentation. The native tests exercise
+the policy, draft and credential workflow. Windows ARM64 passed 95 Settings
+tests, 10 Vault tests and the manual link coverage check. The Vault
+regression checks a rejected password, a successful unlock and a cleared
+password form ready for the requested rotation.
+
+The remaining Java controls at this checkpoint were startup auto-unlock,
+the global temporary key switch, default isolation and sandbox availability.
+The [temporary SSH key checkpoint](#november-23-quick-connect-temporary-ssh-keys)
+records the subsequent Quick Connect work. Compare headings, help and
+warning presentation again when the remaining controls are added.
+[Tagged Java Settings](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SettingsDialog.java)
+· [Rust Settings](src/workspace/settings_window.rs)
+· [Credential Vault](src/vault_window.rs)
+· [Windows Settings tests](target/verification/20261123-security-settings-windows-tests.log)
+· [Windows Vault and manual tests](target/verification/20261123-security-settings-windows-vault-and-guide-tests.log)
+
+## November 23 Quick Connect temporary SSH keys
+
+Java v2.26.0 gates the temporary-key fields in Quick Connect and the
+connection editor behind the Security setting. Rust now saves the same
+opt-in for Quick Connect SSH and SFTP. The first paste uses a 15-minute
+lifetime by default. Users select or edit the destination before pasting.
+Changing the destination, method or lifetime invalidates any in-progress
+paste and clears the old key. Saved connections keep their own identifiers
+while a temporary authentication applies to the interactive attempt.
+
+A failed connection can reopen with its current in-memory key and accept a
+fresh paste after expiry. Turning off the option discards Quick Connect
+form and retry keys. Teamwork continues to use its separately configured
+temporary-key method. The native Save connection control applies to the
+other authentication methods. The
+[saved temporary-key checkpoint](#november-23-native-saved-temporary-ssh-keys)
+covers the separate editor workflow. The
+[backup security checkpoint](#november-23-java-backup-security-settings)
+records the later adoption of the global preference.
+
+The native Windows ARM64 development build passed. The Settings desktop
+opened the Security page from its search result and displayed the saved
+opt-in. The native suites passed 96 Settings tests, 13 Quick Connect tests
+and 35 SSH access tests. The focused temporary-key suite also verified
+expiry and memory wiping. The new routing tests use synthetic key text
+and verify stale paste rejection, retry retention and disposal on disable.
+A live SSH and SFTP login with a disposable key remains a native acceptance
+check.
+[Tagged Java Quick Connect](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/QuickConnectDialog.java)
+· [Rust Quick Connect](src/workspace/quick_connect.rs)
+· [Rust retry handling](src/workspace/ssh_access.rs)
+· [Windows regressions](target/verification/20261123-temporary-ssh-key-windows-regressions.log)
+
+## November 23 Session isolation source audit
+
+Java v2.26.0 starts at None on a fresh installation. With a personally saved
+connection, an explicit per-connection choice takes precedence over the
+nearest configured folder, then the global default. An explicit session
+request takes the place of the connection's choice. A Teamwork connection
+uses the strongest of the global, folder and connection or request levels.
+The organization's minimum can raise the result in all cases. Java keeps
+the source of the effective choice for display. The Security page builds
+its selector from the permitted levels and probes sandbox availability
+asynchronously.
+
+At the PR #35 audit checkpoint Rust had per-session isolation, saved
+levels and the managed minimum. Blank Quick Connect SSH started at None
+subject to that minimum. The existing SSH sandbox probe ran outside Global
+Settings. The migration needs to distinguish explicit None from
+inheritance. Older Rust records can omit a None value, so tests must cover
+those records before changing how they resolve.
+[Tagged Java resolver](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/isolation/IsolationSettings.java)
+· [Tagged Java Settings](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SettingsDialog.java)
+· [Rust isolation levels](src/session_security.rs)
+· [Rust Quick Connect](src/workspace/quick_connect.rs)
+· [Rust SSH availability](src/ssh_worker.rs)
+
+## November 23 Global session isolation
+
+Global Settings → Security saves a default for new local shells, ad hoc
+SSH and SFTP, including Quick Connect and the incognito SSH form. The
+Teamwork SSH form and Control API also include the global choice in their
+launch minimum. Existing personal SSH connection settings and restored
+local session levels retain their precedence. Legacy local settings apply
+until a global choice is saved. Managed minimums apply at launch, and an
+isolated local shell still requires a reviewed absolute workspace.
+
+The Security page checks the local PTY and SSH worker backends separately
+on the application executor. The local check reuses Windows PSEC platform
+queries, macOS Seatbelt prerequisites and Linux Landlock prerequisites.
+The SSH result uses the worker's existing platform check. The native launch
+paths still verify individual sandboxed processes and workspaces.
+
+Windows ARM64 passed the application all-target check with `dialog-preview`
+and 97 selected application cases. The cases include saved defaults, policy
+changes, stale availability results, old local session records and new
+Quick Connect SSH and SFTP logins. The native Windows PSEC and LPAC worker
+harnesses also passed. Apple Silicon passed the native Seatbelt test for
+the local shell and its descendants against the revised PTY component.
+The Mac run used a private checkout with the three changed Apple-platform
+PTY source files applied to the published PR snapshot. The Linux x86-64
+PTY all-target cross-check passed. [Windows application check](target/verification/20261123-isolation-default-windows-check.log)
+· [Windows native tests](target/verification/20261123-isolation-default-windows-tests.log)
+· [Apple Silicon Seatbelt test](target/verification/20261123-isolation-default-apple-silicon-seatbelt.log)
+· [Linux compilation](target/verification/20261123-isolation-default-linux-cross-check.log)
+
+The [connection isolation update](#november-23-connection-and-folder-isolation)
+adds SSH inheritance and Teamwork request precedence. [Rust Security page](src/workspace/settings_window.rs)
+· [Local launch resolution](src/workspace/session_security.rs)
+· [Local sandbox prerequisites](crates/pty/src/lib.rs)
+
+## November 23 Connection and folder isolation
+
+The Connection Manager stores the local folder choice with its path. A
+folder rename moves the choices for its descendants and deletion removes
+them. Saving a stale edit checks the current folder value. A saved SSH
+profile can choose Inherit or a specific level, including None. Old Rust
+records with an omitted level keep their established explicit None. The
+editor displays the effective level and its source for the current draft's
+folder, including the managed minimum where it raises the level.
+
+Interactive saved SSH and SFTP, Quick Connect, the saved SSH tab Control API,
+and saved SSH reopen and reconnect use the resolver. On personal routes an
+explicit request or connection choice takes precedence over the nearest
+configured folder and the global default. Teamwork takes the strongest of
+the local global default, local folder selection and shared choice or
+explicit session request. The managed minimum applies in both cases. Routes
+reviewed for unattended execution continue to require an eligible unisolated
+transport. The Java-format connection XML importer and exporter distinguish
+an omitted isolation mode from explicit None.
+
+The final native Apple Silicon run passed 213 Scheduler cases and 12
+isolation-related cases. The selections overlap. Coverage includes a
+profile round trip, stale folder edit rejection, rename and deletion,
+explicit request precedence and enforcement of the managed minimum. The
+Scheduler run verifies locally bound Teamwork credentials and jump profiles
+after the effective shared route has been checked.
+[Apple Silicon tests](target/verification/20261123-isolation-inheritance-apple-silicon-final.log)
+
+The final Windows ARM64 regression passed 396 selected application tests,
+including 214 Scheduler cases, with two ignored. Both Teamwork regressions
+passed after the executor kept the shared route's resolved level when
+constructing its temporary login. The application all-target check passed
+with `dialog-preview`. [Windows native tests](target/verification/20261123-isolation-inheritance-windows-final-tests.log)
+· [Windows application check](target/verification/20261123-isolation-inheritance-windows-verified-check.log)
+
+The [local shell update](#november-23-local-shell-profile-isolation) adds
+saved local-shell overrides. The [backup security update](#november-23-java-backup-security-settings)
+adds migration of the Java global and folder preferences. Native desktop
+comparison and live SSH acceptance remain open.
+[Connection Manager editor](src/connection_window/form.rs)
+· [Folder and connection storage](src/connection_store.rs)
+· [Isolation resolver](src/session_security.rs)
+· [Interactive SSH launch](src/workspace/ssh_access.rs)
+
+## November 23 Local shell profile isolation
+
+The Connection Manager stores a local shell's isolation choice and folder
+assignment. New profiles can inherit the nearest folder's choice, then the
+global default. Existing Rust profiles with the original format continue
+to follow the global local-shell default. An explicit level includes None,
+and the managed minimum applies to every launch. The editor and Quick
+Connect display the effective level and its source.
+
+Local profiles appear in the same folder tree as SSH and serial profiles.
+Duplicating a profile keeps its folder until the user chooses a different
+one. Folder deletion includes its assigned local profiles in the existing
+confirmation. Quick Connect can launch a modified copy without saving it
+or dropping its folder's isolation rule. A sandboxed profile can use its
+explicit absolute starting directory as the workspace. The launch still
+checks the stored path and the platform sandbox. Reopening a previously
+sandboxed shell preserves its recorded isolation and workspace.
+
+The Java-compatible and Rust-specific local connection XML forms retain
+their isolation choice and folder. Tagged Java XML without an explicit
+level inherits. Native exports record the distinction when a profile
+follows Global Settings directly. The [backup security checkpoint](#november-23-java-backup-security-settings)
+covers the separate global and folder preferences.
+[Local profile storage](src/connection_store/local.rs)
+· [Local editor](src/connection_window/local.rs)
+· [Launch and restore settings](src/workspace/session_security.rs)
+
+Apple Silicon passed 16 local-shell cases, four local-profile cases and 31
+Connection Manager cases. The overlapping selections include native PTY
+launches from the Manager and Quick Connect, retained restored sandbox
+settings and the local-profile XML round trip. The sandbox workspace check
+exercises launch options. Desktop comparison and a sandboxed launch through
+the installed application's GUI remain open.
+[Apple Silicon tests](target/verification/20261123-local-profile-isolation-apple-silicon.log)
+
+Windows ARM64 passed 332 selected tests with one ignored, including 152
+profile backup tests and native local-shell launches through the Manager and
+Quick Connect. The final application all-target check passed with
+`dialog-preview`. [Windows tests](target/verification/20261123-local-profile-isolation-windows-tests.log)
+· [Windows application check](target/verification/20261123-local-profile-isolation-windows-verified-check.log)
+
+## November 23 Java backup security settings
+
+The tagged Java settings store the global isolation level and temporary SSH
+key opt-in as `connectionIsolationDefault` and `temporarySshKeyEnabled`.
+Rust stages these as separate Security page proposals. An omitted field
+leaves no proposal. Explicit None and false remain selectable values.
+Use Java setting changes the current draft, and Save applies the change.
+Cancel preserves the current native values. Managed policy can block an
+isolation proposal below its minimum. Adopting the temporary-key option
+changes availability in Quick Connect and imports no key material.
+
+Java stores folder choices as `connectionGroupIsolation` entries with a
+path and level. An unambiguous level is applied when the restore creates
+that exact folder. Choices for existing, missing or ambiguous folders
+remain available for review in the Connection Manager. The dialog shows
+the Java path and level before Save. Restore keeps existing native choices,
+and replay preserves subsequent edits and prior reviews.
+[Tagged Java settings](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/model/GlobalSettings.java)
+· [Rust security preferences](src/workspace/backup_data.rs)
+· [Folder mapping](src/connection_store/import/options.rs)
+· [Settings review](src/workspace/settings_window.rs)
+· [Folder review](src/connection_window/view.rs)
+
+The native Apple Silicon build passed three focused tests. They cover the
+full connection-library restore and replay, a settings-only backup with
+no new folders, and the global Security draft, managed floor, Cancel and
+Save. [Apple Silicon tests](target/verification/20261123-java-security-restore-apple-silicon.log)
+
+The native Windows ARM64 application all-target check passed with
+`dialog-preview`. The native test build passed 373 selected cases with one
+ignored. The selections cover profile backup, Connection Manager storage
+and editing, global Settings and workspace backup preferences.
+[Windows application check](target/verification/20261123-java-security-restore-windows-check.log)
+· [Windows native tests](target/verification/20261123-java-security-restore-windows-tests.log)
+
+The [Windows isolation review](#november-23-windows-isolation-dialogs-and-launches)
+records the native desktop comparison and sandbox launch evidence. The
+[Apple Silicon reconnect checkpoint](#november-23-saved-and-teamwork-ssh-reconnect)
+covers live inherited SSH and Teamwork over direct OpenSSH. The
+interactive SSH and SFTP temporary-key routes still need live login checks
+with disposable keys. Complete the desktop Save and restart check for
+eligible imported Security and folder choices.
+
+## November 23 Java credential workflow review
+
+In Java v2.26.0, the optional startup setting stores an obfuscated master
+password in a local file. The Settings dialog refreshes it after rotation
+and clears it when the setting is disabled. A stale or invalid remembered
+password falls back to a prompt. Java's fresh-profile bootstrap supplies
+its own default password. Rust had the startup prompt and master-password
+rotation at this checkpoint. The
+[native auto-unlock update](#november-23-native-vault-startup-unlock)
+adds an explicit device-local opt-in for an existing vault.
+[Java Settings](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SettingsDialog.java)
+· [Java master password manager](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/security/MasterPasswordManager.java)
+· [Rust startup gate](src/startup.rs)
+· [Rust Credential Vault](src/vault_window.rs)
+
+The tagged Java saved-connection editor exposes a temporary SSH key,
+an expiry from 1 to 1,440 minutes with a default of 60, and a permanent
+option. Java encrypts the stored key and preserves its ciphertext if
+an unrelated edit is saved while the vault is locked. Its connection
+authentication asks for a fresh key when the saved key is expired or
+still held by the locked vault. Session snapshots omit the temporary
+material. The private connection XML carries the encrypted key, configured
+lifetime and permanent option. It carries no original expiry timestamp.
+Rust Quick Connect
+already holds temporary keys for the lifetime of an interactive SSH or
+SFTP attempt, including a retry. The later
+[saved temporary-key update](#november-23-native-saved-temporary-ssh-keys)
+adds encrypted credential custody to the Rust editor.
+[Java connection editor](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ConnectionEditDialog.java)
+· [Java XML repository](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/persistence/XMLConnectionRepository.java)
+· [Java authentication resolver](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ConnectionAuthResolver.java)
+· [Rust Quick Connect](src/workspace/quick_connect.rs)
+
+## November 23 Native saved temporary SSH keys
+
+The Security opt-in exposes **Temporary SSH key** in the saved SSH
+connection editor. With the vault unlocked, the editor accepts a pasted
+private key, a lifetime from 1 to 1,440 minutes, and optional automatic
+selection in the login form. Saving validates the private key with the
+native SSH parser, creates a vault entry bound to the exact login account
+and endpoint, and writes its reference into the connection profile.
+A replacement starts a new lifetime. Removing or replacing a reference
+cleans up the unused credential after saving the profile.
+
+An unrelated edit preserves the existing reference while the vault is
+locked. A duplicate starts with no saved key. The live SSH and SFTP login
+forms resolve the reference against the current profile and the unlocked
+vault, including on reconnect. Automatic selection lasts only until
+expiry. An expired key requires a new key, and a credential cannot be used
+for another username, host, or port. The key and lifetime are authenticated
+inside the vault.
+[Vault credential](crates/vault/src/temporary_ssh_key.rs)
+· [Editor save](src/connection_window/temporary_ssh_key.rs)
+· [Login form](src/ssh_dialog.rs)
+· [Route and credential checks](src/workspace/ssh_access.rs)
+
+Apple Silicon passed ten application tests, including changes to the
+login account, explicit key selection, preserving a saved reference on
+an unrelated edit, and dropping it on duplication. The separate editor
+fixture generated two disposable OpenSSH keys and verified saving,
+reopening, replacing, and removing the vault reference. The first Windows
+vault run exposed unbracketed IPv6 endpoint formatting. The native vault
+fixture checks IPv6 binding, restart, and rejection of a different host,
+port, or username. Windows ARM64 passed all 15 vault tests, strict vault
+Clippy and the all-target application check with the dialog preview
+feature. A separate Apple Silicon fixture used the saved-key path against
+a pinned loopback OpenSSH server. It rejected the locked vault, opened
+the terminal, and downloaded the exact SFTP fixture bytes after unlocking.
+[Apple Silicon application, editor and OpenSSH tests](target/verification/20261123-saved-temporary-ssh-macos-final.log)
+· [Windows vault suite](target/verification/20261123-saved-temporary-ssh-windows-vault-final.log)
+· [Windows application check](target/verification/20261123-saved-temporary-ssh-windows-check-final.log)
+
+Native desktop coverage of the editor and reconnect flow and verification
+through the isolated SSH worker remain open. The following checkpoint
+adds reviewed Java backup restore.
+
+## November 23 Java temporary SSH key restore
+
+Review SSH Credentials uses the Java master password and the unlocked
+native vault. The preview reports which encrypted temporary keys can be
+adopted and how many were omitted. It checks source identity, login
+account, destination and any declared jump host before binding the key to
+an eligible new saved profile. Conflicting local profiles take precedence.
+The supported lifetime and automatic selection are retained. The lifetime
+starts at review because Java stores the configured duration without an
+original expiry timestamp. Merge on Restart publishes the sealed vault
+and the reviewed connection catalogue through the existing restore
+transaction. That transaction rechecks the current server policy before
+initial publication.
+[Java temporary key reader](src/profile_backup/java_secrets/temporary_keys.rs)
+· [Route binding](src/connection_store/import/java_bindings.rs)
+· [Restore transaction](src/profile_backup/restore.rs)
+
+Apple Silicon passed 159 profile-backup tests with two ignored and 30
+connection-import tests. The encrypted Java fixture verifies a skipped
+review, locked or incorrect credentials, omission of unsealed input,
+installation after restart, account and port isolation, the declared
+jump route, and replay without renewing the key. Windows ARM64 passed the
+all-target application check with `dialog-preview`, 15 vault tests with
+one ignored, and strict vault Clippy.
+[Apple Silicon backup and import tests](target/verification/20261123-java-temporary-key-macos.log)
+· [Windows application check](target/verification/20261123-java-temporary-key-windows-check.log)
+· [Windows vault tests](target/verification/20261123-java-temporary-key-windows-vault.log)
+· [Windows vault Clippy](target/verification/20261123-java-temporary-key-windows-vault-clippy.log)
+
+A subsequent Apple Silicon fixture reviewed the Java archive, applied it
+through startup restore, reopened the encrypted vault and passed both
+SSH terminal and SFTP authentication against pinned loopback OpenSSH.
+OpenSSH reported the fingerprint of the imported key for both logins.
+The SFTP test checked the exact downloaded bytes, and the same fixture
+covered refusal while the vault was locked. The existing saved-key
+control passed in the same run. Keep the test under the Mac user's
+private temporary directory for OpenSSH's file checks. Windows ARM64
+passed the updated all-target check. The interactive desktop review
+remains open.
+[Apple Silicon OpenSSH tests](target/verification/20261123-java-temporary-key-wire-macos-private.log)
+· [Windows application check](target/verification/20261123-java-temporary-key-wire-windows-check.log)
+
+Java's non-interactive tab restore consults the saved profile and can use
+a registered, valid temporary key. Tabs that need input are deferred for
+interactive resolution. The Java Scheduler remote session can also use
+temporary key contents and makes an owner-only key file for an external
+SSH process when required. The Rust Scheduler currently treats temporary
+keys as interactive credentials. Its rsync bridge uses the existing
+native SSH transport. The remaining Scheduler work is to bind eligible
+temporary keys to the reviewed job and route and verify the resulting
+native SSH and rsync runs.
+[Java tab restore](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/TabRestoreTriage.java)
+· [Java Scheduler remote session](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/jobscheduler/JobSchedulerRemoteSession.java)
+· [Rust Scheduler authentication](src/job_executor/connection.rs)
+· [Rust rsync transport](src/job_executor/rsync.rs)
+
+## November 23 Project reconnect with temporary SSH keys
+
+The project reconnect queue uses the current saved profile matching the
+restored pane's route. It can launch automatically when the profile
+selects its saved temporary key automatically. The existing SSH login
+path checks the security setting, vault state, key lifetime and exact
+account and endpoint. While the vault is locked, the queue leaves the
+pane offline and retries after unlock. Expired credentials and profiles
+that require a user selection remain available for sign-in review.
+Project snapshots retain the route and saved profile identity.
+[Project reconnect](src/workspace/ssh_access/reconnect.rs)
+· [Project attention](src/workspace/project_access/attention.rs)
+
+The native Apple Silicon fixture imported a Java temporary key with a
+one-minute lifetime and restored a disconnected project pane. It verified
+deferral for manual selection, a disabled security option and a locked
+vault. Unlock retried the pane through the normal project queue, replaced
+the disconnected session in the same tab and authenticated to pinned
+OpenSSH with the expected public-key fingerprint. After the original
+lifetime elapsed, a new project pane stayed offline and reported the
+expired key. The saved layout contained the route and profile identity.
+The same build passed 15 project tests and both temporary-key SSH and
+SFTP fixtures. Windows ARM64 passed the all-target application check with
+`dialog-preview`. The interactive attention bar and a native jump-host
+reconnect still need acceptance.
+[Apple Silicon project and SSH tests](target/verification/20261123-project-temporary-key-macos-final.log)
+· [Windows application check](target/verification/20261123-project-temporary-key-windows-final-check.log)
+
+## November 23 Native vault startup unlock
+
+The Security page opens the Credential Vault to authorize automatic
+unlock for an existing profile. The vault stores only its derived key and
+generation salt in Windows Credential Manager with local-machine
+persistence, macOS Keychain, or the Linux Secret Service with an encrypted
+D-Bus session. Flatpak uses the application-specific Secret portal.
+The profile sidecar stores the opt-in or pending-removal state. The
+profile archive carries the normal encrypted snapshot of the vault.
+[Vault custody](crates/vault/src/startup_unlock.rs)
+· [Archive file list](src/profile_backup/data.rs)
+· [XDG Secret portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.Secret.html)
+
+Startup opens the workspace after authenticating the encrypted snapshot.
+An unavailable credential store, unavailable key, or changed vault
+generation falls back to the typed password prompt. Managed and personal
+startup password requirements take precedence. The application checks both
+again before starting the workspace after an automatic unlock. Password
+rotation refreshes the native key. Disabling first records revocation
+locally, then deletes the device credential. Security offers a retry if
+the store is unavailable during removal. New profiles retain the normal
+vault setup.
+[Startup gate](src/startup.rs)
+· [Security controls](src/workspace/settings_window.rs)
+· [Settings guide](src/workspace/settings_window/guide.md#settings--security)
+
+Windows ARM64 passed 13 vault tests and strict vault Clippy. The native
+Credential Manager round trip reopened the vault in a new process after
+password rotation and verified removal. The native application test
+binary linked with LLVM passed 23 startup tests and the focused Security
+search test. On Fedora 44 ARM64, a private
+container session with GNOME Keyring passed 15 vault tests and the same
+native round trip. The vault suite also covered rejecting an old key
+and keeping automatic unlock disabled after failed removal. Apple Silicon
+passed 15 vault tests and 24 selected startup tests, with two ignored
+application cases. The startup suite checks a password setting that takes
+effect during automatic authentication.
+[Windows Credential Manager fixture](target/verification/20261123-vault-startup-windows-native-store-final.log)
+· [Windows startup suite](target/verification/20261123-vault-startup-windows-app-final.log)
+· [Windows Security search test](target/verification/20261123-vault-startup-windows-settings.log)
+· [Fedora Secret Service fixture](target/verification/20261123-vault-startup-fedora-container.log)
+· [Apple Silicon vault suite](target/verification/20261123-vault-startup-macos-final.log)
+· [Apple Silicon startup suite](target/verification/20261123-vault-startup-macos-policy.log)
+
+The remaining acceptance covers a live Security-to-restart flow on the
+native desktops, signed macOS Keychain access in an interactive session,
+and the installed Flatpak portal. The native Keychain fixture could not
+write its test item because the Apple Silicon SSH account has no default
+keychain.
+
+## November 23 Windows isolation dialogs and launches
+
+The private Windows ARM64 desktop comparison used the released Java
+v2.26.0 x64 application under emulation and native Rust. Java places the
+isolation selector, strict terminal mode and incognito controls together
+under Terminal Settings. Rust groups the corresponding SSH controls there
+and puts timeout, retry and keepalive controls in Connection. The local
+editor places strict terminal mode alongside its isolation choice. The
+native recheck verified the aligned controls in both editors at their
+standard window size.
+
+The Connection Manager inspector previously showed the raw SSH field,
+which displayed None for a saved profile that inherited its folder's
+sandbox. It now uses the saved SSH resolver. Both the SSH and local-shell
+inspectors show the effective level and its source. The folder editor
+shows the level its current draft would apply, including a managed minimum.
+The desktop fixture showed an explicit folder level alongside the separate
+Java import selector.
+[Connection Manager views](src/connection_window/view.rs)
+· [SSH editor](src/connection_window/form.rs)
+· [Local editor](src/connection_window/local.rs)
+
+The native Security page reported `windows-psec` for local shells and
+`LPAC + Job` for SSH. It showed Own process as the managed minimum, marked
+the imported Java None proposal as below that minimum and disabled its
+adoption. The separate temporary-key proposal remained available. Java's
+release reported its sandbox backend as unavailable on this Windows host.
+[Windows Security fixture log](target/verification/20261123-isolation-desktop-windows-dialog-review.log)
+· [Final Windows dialog fixture log](target/verification/20261123-isolation-desktop-windows-final-dialog-review.log)
+
+The native Rust application and console worker reopened a saved local
+profile from a private recovery snapshot in two cases. The first inherited
+Sandbox from its folder. In the second, the installed fixture policy
+required Sandbox for a profile with an explicit None selection. In both
+cases the running shell wrote to its workspace and was denied a read of a
+synthetic file in the private application profile.
+[Windows sandbox launch evidence](target/verification/20261123-isolation-desktop-windows-sandbox-launch.log)
+
+The final native development build and all-target application check
+passed with `dialog-preview`.
+[Windows build](target/verification/20261123-isolation-desktop-windows-verified-build.log)
+· [Windows all-target check](target/verification/20261123-isolation-desktop-windows-verified-check.log)
+
+Remaining acceptance includes a fresh saved-profile desktop launch,
+the other desktop SSH and Teamwork checks, backend-unavailable editor
+feedback and the macOS and Linux desktop comparisons.
+
+## November 23 Saved and Teamwork SSH reconnect
+
+A terminal opened from the Teamwork catalog retains the reviewed
+selection. Manual reconnect stages a new Teamwork login for the same
+endpoint, username and jump route. It applies the current local
+authentication preference, checks the shared source and managed policy,
+and takes the strongest of the
+previous session level and the current Teamwork isolation rule. The
+original tab and scrollback remain available while the replacement starts.
+The app compares the source, credential choice and isolation rule again
+before publishing the replacement pane. The saved-selection reference
+lives in the active session. Project and workspace restore use their own
+route records.
+
+The native OpenSSH fixture pins its generated host key before connecting.
+It drives the application login and reconnect tasks for both route types,
+including a personal folder that changes from None to Own process and a
+Teamwork folder that relaxes while the first Own process session is open.
+It checks which transport completed the dial and reads terminal output
+over the replacement connection. The Windows model regression changes
+the Teamwork source during review and checks that the original pane stays
+in place.
+[SSH reconnect entry point](src/workspace/ssh_access/reconnect.rs)
+· [Replacement checks](src/workspace/reconnect.rs)
+· [Native OpenSSH fixture](src/workspace/ssh_access/tests/native_isolation_reconnect.rs)
+
+The native Apple Silicon wire test passed four authenticated SSH dials
+across the two routes. The personal reconnect raised isolation from None
+to Own process. The Teamwork reconnect retained Own process after the
+folder rule was removed. Both routes replaced their original panes in
+place. The model test also passed on Apple Silicon. The Windows ARM64
+test build passed 36 selected SSH, reconnect and folder-isolation cases.
+The Apple Silicon test drives the native application tasks over a direct
+loopback route. Live desktop navigation and the jump-host wire route still
+need their own checks.
+[Apple Silicon OpenSSH and model tests](target/verification/20261123-teamwork-reconnect-apple-silicon-verified.log)
+· [Windows ARM64 regressions](target/verification/20261123-teamwork-reconnect-windows-final-tests.log)
+
+## November 23 Plan and execution layout
+
+The shared terminal and preview layout places Metro before the bottom
+Plan and execution panel while retaining the full-width Metro bar beneath
+a side timeline. The panel has a prompt and run header, a checklist and
+an execution column. The default bottom panel is 152 logical pixels high.
+The divider starts at 42% and supports dragging between independently
+scrollable columns.
+
+Private automatic launches compared Java v2.26.0 x64 under emulation
+and native Rust on the same Windows ARM64 host. The standard dialogs
+both captured at 1,202 by 694 pixels. Rust showed the prompt header and
+Plan checklist beneath Metro. Dragging the divider after highlighting it
+reflowed the answer in the narrower execution column. The compact Rust
+dialog captured at 942 by 512 pixels. Scrolling exposed the whole panel
+with Close still visible. Side timeline retained the full-width bar.
+The divider highlight, panel colors and text spacing still differ from
+Java. The native Rust executable had PE machine `0xAA64` and SHA-256
+`535503DA10D56BD83E10E0078CE68B9C8CF0ACC00AAB57BDBC9DE66C7619353E`.
+
+Apple Silicon passed four targeted plan tests. The drag fixture verifies
+that a native resize event changes the split and that the presenter still
+shows the latest typed command output and final answer. Windows ARM64
+passed 151 focused cases, including that drag fixture, the shared Metro
+positions and bound history-panel approvals. The wider Windows selection
+also found a prior Timeline assertion for the old running label. The test
+now checks the displayed elapsed time and output line count. The final
+source passed Windows ARM64 `cargo check --tests` and nine focused tests
+on Apple Silicon, including the corrected Timeline case. A run in the
+live desktop terminal with a reviewed command remains open.
+[Apple Silicon regression record](target/verification/20261123-mlx-publication-and-plan-macos.log)
+· [Apple Silicon final retest](target/verification/20261123-mlx-publication-and-plan-macos-final.log)
+· [Windows ARM64 regression record](target/verification/20261123-plan-execution-windows-retest.log)
+
+## November 23 MLX publication date on Apple Silicon
+
+Hugging Face MLX review now captures the repository publication time and
+retains it in the download checkpoint. Registration stores the optional
+date with the verified model. The installed inventory uses the same date
+format and sort as GGUF. Old model manifests and paused downloads without
+the field remain readable.
+
+Native macOS ARM64 passed 33 MLX tests, with five ignored. The local Hub
+fixture verified a downloaded model's publication timestamp after the
+registry reloaded it. A separate mixed-inventory test passed and sorted
+the dated MLX model, older GGUF model and undated model in that order.
+The dated and undated rows still need a desktop comparison after restart.
+[Native test record](target/verification/20261123-mlx-publication-and-plan-macos.log)
+
+## November 23 Agent Design naming
+
+New, Duplicate and Rename open an owned dialog and select the initial
+name. New proposes `My combination`. Duplicate and an automatic copy
+of a built-in use the full preset name with a numeric suffix starting
+at ` 2`. Rename keeps the design ID. Cancel leaves the catalog intact.
+The standalone editor saves accepted changes immediately. Global Settings
+keeps them in its draft until Save.
+
+The initial Windows ARM64 comparison confirmed the selected New and
+Duplicate proposals, Escape and a saved duplicate. The Rust prompt was
+taller than Java's. The height constraint was corrected afterward.
+The compact prompt and renamed preset after restart still need native
+desktop checks. The first Apple Silicon run passed 33 naming and related
+dialog tests, including draft behavior, cancellation and stale actions.
+[Rust name prompt](src/workspace/settings_window/agent_design_name.rs)
+· [Apple Silicon log](target/verification/20261123-agent-design-naming-macos-final.log)
+
+## November 23 GGUF import and backend review
+
+The native file picker opens an owned review of the selected GGUF paths.
+It reconciles selected shards of the same model, preserves the model purpose
+and optional projector controls, and offers private copies or external
+references. Eligible detached models retain their reattachment path.
+Cancel discards the staged selection. A saved Configure draft that requires
+a different backend from the installed runtime offers to open the existing
+signed-runtime review or keep the current runtime. Installation requires
+the separate review. Windows paths in the model review use their normal
+display form while registration retains the canonical source.
+
+The focused Apple Silicon run passed 64 tests serially, including picker
+cancellation, batch import, split-model reattachment and both replies to
+the runtime offer. Two tests in the earlier parallel run hit the shared
+managed-model operation lock. Windows ARM64 verified the native picker and
+both storage choices in the owned review with two independent synthetic
+GGUF files. The private copy had the same SHA-256 as its source and no
+external reference. The external registration retained the selected path
+and had no private model file. Cancel closed the review with the same
+three registrations. Verify split-model reattachment and both runtime
+responses on the native desktops, and repeat the two storage choices on
+the remaining platforms where supported.
+[Rust GGUF actions](src/ai_manager/local/managed.rs)
+· [Apple Silicon serial retest](target/verification/20261123-gguf-import-review-macos-current.log)
+
+## November 23 Knowledge source outcomes
+
+The source inventory loads each source's last completed outcome and problem
+count from private profile metadata. Counts and timestamps for published
+passages still come from the index. A source error or an unavailable file
+can therefore appear alongside its last successful index. Successful updates
+replace the outcome for the reviewed sources. An interrupted batch leaves
+the other rows intact. Source and embedding changes invalidate the affected
+outcomes. Existing profiles without this metadata continue to show their
+index counts and timestamps.
+
+Apple Silicon passed 99 focused tests with six ignored. The manual update
+test indexes two sources, fails a later update, then opens a new Manager
+and verifies the error, problem count, both saved timestamps and the
+other row. Automatic sync also restores an unavailable source, preserving
+its published passages. A changed source limit cleared the affected
+outcome and preserved the other source's stored problem count.
+
+The Windows ARM64 desktop initialized two indexed synthetic files through
+a loopback embedding service. The manual **Update now** review reported
+the first file missing. The background refresh independently detected the
+second missing file. Both rows showed Unavailable, one problem, and the
+original 1 / 1 file and chunk counts. A separate application process
+opened the same profile with automatic embedding paused. It showed both
+saved outcomes and the original Last indexed values. The index and the
+outcome file kept their SHA-256 digests across that restart, and the
+loopback service received no requests during either failure or restoration.
+
+Restoring the automatic file with new content triggered one embedding
+request. Its row returned to Ready with no problems and a new Last indexed
+time. The manual row kept its saved state and original timestamp. Once its
+file returned, the desktop review listed one ready file and none skipped.
+The native manual fixture indexed a repaired source and opened a fresh
+Manager to verify the saved result and the unchanged sibling. The first
+desktop run exposed a premature cancellation of model inventory loading.
+Selecting the initial Knowledge Store now precedes starting that inventory
+request. The corrected Windows build opened the page and loaded its
+inventory without the cancellation message. The Windows ARM64 AI Manager
+suite passed 411 tests with ten ignored, including the page-open regression
+and the manual failure and recovery fixture. Complete desktop manual
+indexing after repair and repeat the restart checks on the other platforms.
+[Source outcome store](src/ai_manager/local/knowledge/outcomes.rs)
+· [Source inventory](src/ai_manager/local/knowledge_inventory.rs)
+· [Apple Silicon focused tests](target/verification/20261123-source-outcomes-macos-final.log)
+· [Windows ARM64 AI Manager tests](target/verification/20261123-knowledge-source-restart-windows-final-tests.log)
+
+## November 23 Complete masked step copy
+
+The selected command step now retains its masked stdout and stderr for
+the **Copy output** action. The inline preview keeps its eight-line,
+320-character-per-line limit. Copying from an earlier run uses the
+retained output of that step and still checks the current run binding,
+clipboard policy and credential mask. The separate capture limit for each
+stream still applies. The app tests exercise live and retained steps with
+different outputs, both streams, a line longer than 32 KiB, and an
+additional credential mask. The wider test selection also found that
+Metro showed the ongoing response repair as generic analysis. Its active
+station now shows the repair status. The final Apple Silicon selection
+passed all 125 tests, and the Windows ARM64 all-target compilation check
+passed. The native system clipboard exercise remains open.
+[Step action](src/workspace/terminal_agent/design/actions.rs)
+· [Captured and preview output](src/workspace/terminal_agent/inline_history.rs)
+· [Apple Silicon focused tests](target/verification/20261123-step-output-macos-final.log)
+
+## November 23 Settings search matching
+
+Settings and AI Manager share the tagged Java ranking. The matcher folds
+German spellings and accents, treats punctuation as word separators, and
+requires two normalized UTF-16 code units. All query words must occur in
+the label, its search aliases or the page. A page name alone does not
+qualify its controls. Exact and prefix matches rank above other label
+matches. Equal scores follow dialog order. Repeated settings on the same
+page collapse before the 40-result limit. Distinct imported registrations
+keep their identities when punctuation folds their labels to the same text.
+
+Settings has page results as well as control results. Choosing a control
+uses the existing navigation, scrolling and focus paths. AI Manager filters
+its candidates for the active wizard, provider and policy before ranking.
+Apple Silicon passed 506 focused tests with 12 ignored, including the
+tagged matcher cases, page navigation, keyboard focus, provider filtering
+and distinct model IDs. Windows ARM64 passed the all-target compilation
+check for the matcher.
+The remaining native acceptance covers the visual results and the inventory
+of searchable controls on the other tagged pages.
+In the Windows ARM64 AI Manager, typing `Lócal Módels!` ranked the Local
+Models page first. Enter opened the page and cleared the search.
+[Rust matcher](src/settings_search.rs)
+· [Tagged Java matcher](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SettingsSearchMatcher.java)
+· [Apple Silicon focused tests](target/verification/20261123-settings-ranking-macos-final.log)
+
+## November 23 GGUF Configure sizing
+
+Java sizes the Configure grid to its path label. Rust now measures the
+displayed model path at the same font size used in the form and requests
+enough width for one line. A narrower monitor or remembered size lets
+the path wrap while the form scrolls above the fixed footer.
+
+The Windows desktop comparison used the same synthetic registration path
+in Java v2.26.0 x64 under emulation and native Windows ARM64 Rust. The first
+Rust run measured 1,672 by 457 pixels. With the compact label column,
+joined spinner arrows and aligned header and footer, the Normal-theme
+Rust window measured 1,621 by 435 pixels beside Java's 1,604 by 435. The
+editable column began at pixel 153 in Rust and pixel 152 in Java. Both
+showed the complete path on one line. The title bar and focused-field
+highlight retain native styling.
+
+At a remembered 622 by 362 pixels Rust wrapped the same path, kept the
+footer visible and scrolled the lower fields into view. The context stepper
+changed 4,608 to 5,120 tokens and Save persisted the value in the private
+test registry. An earlier compact run disabled the idle spinner with Never
+and retained the original 10-minute setting after Cancel.
+
+Apple Silicon passed 52 focused tests, including one-line layout at the
+preferred width and wrapping at the narrower width. The Windows ARM64
+all-target compilation check and native development build passed.
+The final Windows ARM64 development build passed. The serial AI Manager
+local suite passed 141 tests with six ignored, including a renderer test for
+the joined spinner arrows, long-path wrapping and the GGUF review fixtures.
+[Rust configuration sizing](src/ai_manager/local/model_configuration.rs)
+· [Apple Silicon focused tests](target/verification/20261123-gguf-configure-sizing-macos.log)
+· [Windows ARM64 local-model tests](target/verification/20261123-gguf-configure-styling-windows-final-tests.log)
 
 ## November 22 AI Manager and Agent Design on Windows ARM64
 

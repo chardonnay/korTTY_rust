@@ -48,7 +48,7 @@ impl Route {
             let local = local
                 .filter(|local| ConnectionRef::from(*local) == reference)
                 .ok_or(CHANGED)?;
-            if local.incognito || !local.isolation.is_none() {
+            if local.incognito || local.requires_isolated_launch() {
                 return Err(
                     "This saved connection requires privacy or isolation unavailable to jobs."
                         .into(),
@@ -82,7 +82,7 @@ impl Route {
             if &saved.login != login || &saved.jump != jump {
                 return Err(CHANGED);
             }
-            if saved.incognito || !saved.isolation.is_none() {
+            if saved.incognito || store.connection_requires_isolation(saved) {
                 return Err(
                     "This saved connection requires privacy or isolation unavailable to jobs.",
                 );

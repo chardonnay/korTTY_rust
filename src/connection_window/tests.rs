@@ -53,6 +53,7 @@ fn connection(name: &str, tag: &str) -> Connection {
         tunnels: Vec::new(),
         incognito: false,
         isolation: IsolationLevel::None,
+        inherit_isolation: false,
         startup: Default::default(),
         logging: Default::default(),
         terminal_effect: None,
@@ -367,6 +368,39 @@ fn local_shell_editor_persists_exact_arguments_and_keeps_cancelled_edits_private
     let _ = manager.update(Message::Delete);
     complete_persisted(&mut manager, Message::ConfirmDelete(true));
     assert!(Store::open(directory.path()).unwrap().local(id).is_none());
+}
+
+#[test]
+fn local_shell_editor_saves_folder_inheritance_and_keeps_it_on_duplicate() {
+    use super::local::Edit as Local;
+    use crate::session_security::LocalIsolation;
+
+    let directory = Profile::new();
+    let mut store = Store::open(directory.path()).unwrap();
+    let group = store.create_group(None, "Development").unwrap();
+    let mut manager = ConnectionWindow::open(directory.path()).unwrap();
+    let _ = manager.update(Message::Scope(Scope::Group(group.clone())));
+    let _ = manager.update(Message::NewLocal);
+    let _ = manager.update(Message::Local(Local::Name("Build shell".into())));
+    complete_persisted(&mut manager, Message::Save);
+    assert_eq!(manager.store.local_in_group(&group).count(), 1);
+    let id = manager.store.local_in_group(&group).next().unwrap().id;
+    assert_eq!(manager.visible_row_keys(), [RowKey::Local(id)]);
+    assert_eq!(
+        manager.store.local(id).unwrap().isolation,
+        LocalIsolation::Inherit
+    );
+
+    let _ = manager.update(Message::SelectLocal(id));
+    let _ = manager.update(Message::Duplicate);
+    let _ = manager.update(Message::Local(Local::Isolation(LocalIsolation::Process)));
+    complete_persisted(&mut manager, Message::Save);
+    let store = Store::open(directory.path()).unwrap();
+    let levels: Vec<_> = store
+        .local_in_group(&group)
+        .map(|profile| profile.isolation)
+        .collect();
+    assert_eq!(levels, [LocalIsolation::Inherit, LocalIsolation::Process]);
 }
 
 #[test]
@@ -1257,6 +1291,8 @@ fn connection_manager_pointer_drags_accept_local_folders_and_refuse_teamwork_sou
     let row_index = |key: &RowKey| keys.iter().position(|row| row == key).unwrap();
     let themes = crate::terminal_theme::Themes::default();
     let mut view = manager.view(ViewChoices {
+        temporary_keys: false,
+        vault_unlocked: false,
         journal_max_parts: None,
         serial_allowed: true,
         passwords: &[],
@@ -1272,6 +1308,8 @@ fn connection_manager_pointer_drags_accept_local_folders_and_refuse_teamwork_sou
         terminal_effects: Some(&Effect::ALL),
         default_paste_warning: Default::default(),
         minimum_paste_warning: PasteWarningMode::Off,
+        isolation: Default::default(),
+        local_isolation_default: Default::default(),
     });
     let renderer = Renderer::new(Font::DEFAULT, 16.0.into());
     let mut tree = Tree::new(view.as_widget());
@@ -1367,6 +1405,8 @@ fn native_workbench_keeps_reference_side_widths_at_default_and_minimum_size() {
     let renderer = Renderer::new(Font::DEFAULT, 16.0.into());
     for width in [1240.0, 940.0] {
         let mut view = window.view(ViewChoices {
+            temporary_keys: false,
+            vault_unlocked: false,
             journal_max_parts: None,
             serial_allowed: true,
             passwords: &[],
@@ -1382,6 +1422,8 @@ fn native_workbench_keeps_reference_side_widths_at_default_and_minimum_size() {
             terminal_effects: Some(&Effect::ALL),
             default_paste_warning: Default::default(),
             minimum_paste_warning: PasteWarningMode::Off,
+            isolation: Default::default(),
+            local_isolation_default: Default::default(),
         });
         let mut tree = Tree::new(view.as_widget());
         let layout = view.as_widget_mut().layout(
@@ -1417,6 +1459,8 @@ fn long_scope_titles_keep_list_and_map_visible_at_minimum_width() {
     let renderer = Renderer::new(Font::DEFAULT, 16.0.into());
     let switch_widths = |window: &ConnectionWindow| {
         let mut view = window.view(ViewChoices {
+            temporary_keys: false,
+            vault_unlocked: false,
             journal_max_parts: None,
             serial_allowed: true,
             passwords: &[],
@@ -1432,6 +1476,8 @@ fn long_scope_titles_keep_list_and_map_visible_at_minimum_width() {
             terminal_effects: Some(&Effect::ALL),
             default_paste_warning: Default::default(),
             minimum_paste_warning: PasteWarningMode::Off,
+            isolation: Default::default(),
+            local_isolation_default: Default::default(),
         });
         let mut tree = Tree::new(view.as_widget());
         let node = view.as_widget_mut().layout(

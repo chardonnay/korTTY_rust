@@ -33,6 +33,14 @@ impl IsolationLevel {
             _ => None,
         }
     }
+
+    pub(crate) fn id(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Process => "process",
+            Self::Sandbox => "sandbox",
+        }
+    }
 }
 
 impl fmt::Display for IsolationLevel {
@@ -43,6 +51,142 @@ impl fmt::Display for IsolationLevel {
             Self::Sandbox => "Own process + sandbox",
         })
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct IsolationChoice(pub(crate) Option<IsolationLevel>);
+
+impl IsolationChoice {
+    pub(crate) const ALL: [Self; 4] = [
+        Self(None),
+        Self(Some(IsolationLevel::None)),
+        Self(Some(IsolationLevel::Process)),
+        Self(Some(IsolationLevel::Sandbox)),
+    ];
+}
+
+impl fmt::Display for IsolationChoice {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(level) => level.fmt(formatter),
+            None => formatter.write_str("Inherit"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LocalIsolation {
+    #[default]
+    Global,
+    Inherit,
+    None,
+    Process,
+    Sandbox,
+}
+
+impl LocalIsolation {
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Inherit,
+        Self::None,
+        Self::Process,
+        Self::Sandbox,
+        Self::Global,
+    ];
+
+    pub(crate) fn is_global(&self) -> bool {
+        *self == Self::Global
+    }
+
+    pub(crate) fn from_override(level: Option<IsolationLevel>) -> Self {
+        match level {
+            None => Self::Inherit,
+            Some(IsolationLevel::None) => Self::None,
+            Some(IsolationLevel::Process) => Self::Process,
+            Some(IsolationLevel::Sandbox) => Self::Sandbox,
+        }
+    }
+
+    pub(crate) fn level(self) -> Option<IsolationLevel> {
+        match self {
+            Self::Global | Self::Inherit => None,
+            Self::None => Some(IsolationLevel::None),
+            Self::Process => Some(IsolationLevel::Process),
+            Self::Sandbox => Some(IsolationLevel::Sandbox),
+        }
+    }
+
+    pub(crate) fn resolve(
+        self,
+        default: IsolationLevel,
+        folder: Option<(&str, IsolationLevel)>,
+        minimum: IsolationLevel,
+    ) -> (IsolationLevel, IsolationSource<'_>) {
+        let folder = if self == Self::Inherit { folder } else { None };
+        resolve_isolation(default, folder, self.level(), None, false, minimum)
+    }
+}
+
+impl fmt::Display for LocalIsolation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_global() {
+            return formatter.write_str("Global Settings");
+        }
+        IsolationChoice(self.level()).fmt(formatter)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IsolationSource<'a> {
+    Settings,
+    Folder(&'a str),
+    Connection,
+    Request,
+    Managed,
+}
+
+impl fmt::Display for IsolationSource<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Settings => formatter.write_str("Global Settings"),
+            Self::Folder(path) => write!(formatter, "Folder {path}"),
+            Self::Connection => formatter.write_str("Connection"),
+            Self::Request => formatter.write_str("Session request"),
+            Self::Managed => formatter.write_str("Managed minimum"),
+        }
+    }
+}
+
+pub(crate) fn resolve_isolation<'a>(
+    default: IsolationLevel,
+    folder: Option<(&'a str, IsolationLevel)>,
+    connection: Option<IsolationLevel>,
+    request: Option<IsolationLevel>,
+    teamwork: bool,
+    minimum: IsolationLevel,
+) -> (IsolationLevel, IsolationSource<'a>) {
+    let mut resolved = (default, IsolationSource::Settings);
+    if let Some((path, level)) = folder
+        && (!teamwork || level > resolved.0)
+    {
+        resolved = (level, IsolationSource::Folder(path));
+    }
+    if let Some(level) = request.or(connection)
+        && (!teamwork || level > resolved.0)
+    {
+        resolved = (
+            level,
+            if request.is_some() {
+                IsolationSource::Request
+            } else {
+                IsolationSource::Connection
+            },
+        );
+    }
+    if minimum > resolved.0 {
+        resolved = (minimum, IsolationSource::Managed);
+    }
+    resolved
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -131,6 +275,72 @@ fn invalid(message: &'static str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_isolation_distinguishes_legacy_defaults_folder_inheritance_and_explicit_none() {
+        let folder = Some(("Development", IsolationLevel::Sandbox));
+        let default = IsolationLevel::Process;
+        assert_eq!(
+            LocalIsolation::default().resolve(default, folder, IsolationLevel::None),
+            (default, IsolationSource::Settings)
+        );
+        assert_eq!(
+            LocalIsolation::Inherit.resolve(default, folder, IsolationLevel::None),
+            (
+                IsolationLevel::Sandbox,
+                IsolationSource::Folder("Development")
+            )
+        );
+        assert_eq!(
+            LocalIsolation::None.resolve(default, folder, IsolationLevel::None),
+            (IsolationLevel::None, IsolationSource::Connection)
+        );
+        assert_eq!(
+            LocalIsolation::None.resolve(default, folder, IsolationLevel::Process),
+            (IsolationLevel::Process, IsolationSource::Managed)
+        );
+    }
+
+    #[test]
+    fn teamwork_isolation_resolves_request_in_place_of_the_shared_connection_choice() {
+        let inherited = Some(("Production", IsolationLevel::Process));
+        assert_eq!(
+            resolve_isolation(
+                IsolationLevel::None,
+                inherited,
+                Some(IsolationLevel::Sandbox),
+                None,
+                true,
+                IsolationLevel::None
+            ),
+            (IsolationLevel::Sandbox, IsolationSource::Connection)
+        );
+        assert_eq!(
+            resolve_isolation(
+                IsolationLevel::None,
+                inherited,
+                Some(IsolationLevel::Sandbox),
+                Some(IsolationLevel::None),
+                true,
+                IsolationLevel::None
+            ),
+            (
+                IsolationLevel::Process,
+                IsolationSource::Folder("Production")
+            )
+        );
+        assert_eq!(
+            resolve_isolation(
+                IsolationLevel::Sandbox,
+                inherited,
+                Some(IsolationLevel::None),
+                Some(IsolationLevel::None),
+                true,
+                IsolationLevel::None
+            ),
+            (IsolationLevel::Sandbox, IsolationSource::Settings)
+        );
+    }
 
     #[test]
     fn restored_local_integration_keeps_only_the_explicit_wrapper_choice() {

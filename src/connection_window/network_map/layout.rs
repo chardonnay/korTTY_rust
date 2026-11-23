@@ -185,14 +185,14 @@ pub(crate) fn capture(window: &ConnectionWindow, tunnels: bool) -> Topology {
                 );
                 continue;
             }
-            VisualRow::Local(profile) => {
+            VisualRow::Local(profile, _) => {
                 add_saved(
                     node(
                         NodeKind::Saved(RowKey::Local(profile.id)),
                         profile.display_name(),
                         "Local shell".into(),
                     ),
-                    GroupKey::Local(None),
+                    GroupKey::Local(window.store.group_of(profile.id)),
                 );
                 continue;
             }
@@ -469,6 +469,7 @@ mod tests {
             tunnels: Vec::new(),
             incognito: false,
             isolation: Default::default(),
+            inherit_isolation: false,
             startup: Default::default(),
             logging: Default::default(),
             terminal_effect: None,

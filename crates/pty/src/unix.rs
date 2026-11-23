@@ -22,6 +22,12 @@ mod job_processes;
 #[cfg(target_os = "macos")]
 #[path = "unix/macos_sandbox.rs"]
 mod macos_sandbox;
+
+#[cfg(target_os = "macos")]
+pub(crate) fn local_sandbox_backend() -> io::Result<&'static str> {
+    macos_sandbox::check_available()?;
+    Ok(macos_sandbox::BACKEND)
+}
 #[path = "unix/shell_directory.rs"]
 mod shell_directory;
 

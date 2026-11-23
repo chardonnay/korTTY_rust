@@ -16,39 +16,57 @@ pub(in crate::workspace) fn streaming(redactor: &Redactor, input: &str) -> Resul
 }
 
 pub(crate) fn prompt(redactor: &Redactor, input: &str) -> Result<String, String> {
-    redact(redactor, input, false).map(|(text, _)| text)
+    redact(redactor, input, Mode::Prompt).map(|(text, _)| text)
+}
+
+pub(in crate::workspace) fn captured_output(
+    redactor: &Redactor,
+    input: &str,
+) -> Result<String, String> {
+    redact(redactor, input, Mode::CapturedOutput).map(|(text, _)| text)
 }
 
 pub(in crate::workspace) fn prompt_counted(
     redactor: &Redactor,
     input: &str,
 ) -> Result<(String, usize), String> {
-    redact(redactor, input, true)
+    redact(redactor, input, Mode::Counted)
 }
 
-fn redact(redactor: &Redactor, input: &str, counted: bool) -> Result<(String, usize), String> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Prompt,
+    CapturedOutput,
+    Counted,
+}
+
+fn redact(redactor: &Redactor, input: &str, mode: Mode) -> Result<(String, usize), String> {
     let mut value = Zeroizing::new(input.replace("\r\n", "\n").replace('\r', "\n"));
     value.retain(crate::session_journal::is_display_character);
     let failure = || "The input could not be safely masked. Shorten it and try again.".to_owned();
     let deadline = Instant::now() + Duration::from_millis(100);
-    let (masked, mut count) = if counted {
-        redactor.outbound_text(&value, deadline)
-    } else {
-        redactor
+    let (masked, mut count) = match mode {
+        Mode::Counted => redactor.outbound_text(&value, deadline),
+        Mode::CapturedOutput => redactor
+            .captured_command_text(&value, deadline)
+            .map(|value| (value, 0)),
+        Mode::Prompt => redactor
             .journal_text(&value, deadline)
-            .map(|value| (value, 0))
+            .map(|value| (value, 0)),
     }
     .ok_or_else(failure)?;
     value = masked;
     for (matcher, replacement) in MASKS.iter() {
-        if counted {
+        if mode == Mode::Counted {
             count += matcher.find_iter(&value).count();
         }
         if let std::borrow::Cow::Owned(masked) = matcher.replace_all(&value, *replacement) {
             *value = masked;
         }
     }
-    if redactor.contains_known_secret(&value) {
+    if redactor.contains_known_secret(&value)
+        || mode == Mode::CapturedOutput && value.len() > crate::terminal_agent::CAPTURED_TEXT_LIMIT
+    {
         return Err(failure());
     }
     Ok((std::mem::take(&mut *value), count))

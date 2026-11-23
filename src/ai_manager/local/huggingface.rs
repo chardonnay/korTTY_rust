@@ -1267,6 +1267,7 @@ mod tests {
         let review = Arc::new(MlxPackageReview {
             repository,
             revision: "a".repeat(40),
+            published_at: None,
             files: Vec::new(),
             bytes: 123,
         });

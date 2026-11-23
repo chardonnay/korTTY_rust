@@ -38,6 +38,7 @@ pub(in crate::workspace) enum Kind {
     SavedChats,
     AsciiArt,
     GlobalSettings,
+    AgentDesignName,
     QuickConnect,
     TerminalLink,
     ConnectionManager,
@@ -119,6 +120,7 @@ impl Kind {
             Self::SavedChats => "saved-chats",
             Self::AsciiArt => "ascii-art",
             Self::GlobalSettings => "global-settings",
+            Self::AgentDesignName => "agent-design-name",
             Self::QuickConnect => "quick-connect",
             Self::TerminalLink => "terminal-link",
             Self::ConnectionManager => "connection-manager",
@@ -818,10 +820,11 @@ impl Workspace {
         });
         if let Some(saved) = saved {
             settings.size.width = saved.width;
-            // These heights follow the Advanced section or number of reviewed sources.
+            // These dialogs size their content independently of their remembered position.
             if !matches!(
                 kind,
-                Kind::KnowledgeStoreSettings
+                Kind::AgentDesignName
+                    | Kind::KnowledgeStoreSettings
                     | Kind::KnowledgeSourceRemoval
                     | Kind::KnowledgeSourceAdvanced
             ) {
