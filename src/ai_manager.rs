@@ -1011,12 +1011,32 @@ impl Configuration {
                 None => root.publish_checked(FILE_NAME, |file| file.write_all(&bytes), authorize),
             }
         };
-        match indexes {
+        let completed = indexes
+            .as_ref()
+            .map(|indexes| indexes.completed_outcomes(self.enabled()));
+        let mut warning = match indexes {
             Some(indexes) => {
                 indexes.commit_checked(write_settings, || root.sync(), client, self.enabled())
             }
             None => write_settings(&|| Ok(())).map(|_| None),
+        }?;
+        let outcomes = (|| -> io::Result<()> {
+            if self.local != current.local {
+                local::outcomes::retain(path, &self.local)?;
+            }
+            if let Some(completed) = completed {
+                completed.save(path, &self.local)?;
+            }
+            Ok(())
+        })();
+        if outcomes.is_err() {
+            let warning = warning.get_or_insert_with(String::new);
+            if !warning.is_empty() {
+                warning.push(' ');
+            }
+            warning.push_str(local::outcomes::SAVE_WARNING);
         }
+        Ok(warning)
     }
 
     fn lock_mutation(
@@ -4266,6 +4286,12 @@ impl Dialog {
                 .map(Message::Local)
         } else {
             Task::none()
+        }
+    }
+
+    pub(crate) fn refresh_knowledge_source_outcomes(&mut self) {
+        if self.page == Page::Knowledge {
+            self.local.refresh_source_outcomes(&self.local_state);
         }
     }
 

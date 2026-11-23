@@ -62,7 +62,9 @@ Windows ARM64 desktop checks.
   and last successful index time for each source. Rust reads successful
   index counts and timestamps from snapshots and retains reviewed folder
   issues. A subsequent failed update can appear in the running manager.
-  Restoring that outcome after restart is the remaining persistence task.
+  Restoring that outcome after restart was the remaining persistence task
+  at this checkpoint. The [source outcome update](#november-23-knowledge-source-outcomes)
+  adds that recovery.
   [Java source configuration](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/rag/RagConfigurationManager.java)
   · [Rust source inventory](src/ai_manager/local/knowledge_inventory.rs)
 
@@ -170,6 +172,29 @@ both import choices, both runtime responses, and the Configure width and
 long-path layout against Java.
 [Rust GGUF actions](src/ai_manager/local/managed.rs)
 · [Apple Silicon serial retest](target/verification/20261123-gguf-import-review-macos-current.log)
+
+## November 23 Knowledge source outcomes
+
+The source inventory loads each source's last completed outcome and problem
+count from private profile metadata. Counts and timestamps for published
+passages still come from the index. A source error or an unavailable file
+can therefore appear alongside its last successful index. Successful updates
+replace the outcome for the reviewed sources. An interrupted batch leaves
+the other rows intact. Source and embedding changes invalidate the affected
+outcomes. Existing profiles without this metadata continue to show their
+index counts and timestamps.
+
+Apple Silicon passed 99 focused tests with six ignored. The manual update
+test indexes two sources, fails a later update, then opens a new Manager
+and verifies the error, problem count, both saved timestamps and the
+other row. Automatic sync also restores an unavailable source, preserving
+its published passages. A changed source limit cleared the affected
+outcome and preserved the other source's stored problem count.
+The remaining desktop check covers manual and automatic failures across
+a process restart, followed by a successful update of the affected source.
+[Source outcome store](src/ai_manager/local/knowledge/outcomes.rs)
+· [Source inventory](src/ai_manager/local/knowledge_inventory.rs)
+· [Apple Silicon focused tests](target/verification/20261123-source-outcomes-macos-final.log)
 
 ## November 22 AI Manager and Agent Design on Windows ARM64
 

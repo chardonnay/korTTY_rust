@@ -23,6 +23,7 @@ use super::ProfileRef;
 pub(super) mod file_review;
 pub(super) mod folder;
 mod hnsw;
+pub(in crate::ai_manager) mod outcomes;
 pub(super) mod qdrant;
 pub(super) mod remote_index;
 pub(in crate::ai_manager) mod retrieval;

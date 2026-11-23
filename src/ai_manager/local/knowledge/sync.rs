@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use serde::{Deserialize, Serialize};
+
 use crate::ai_manager::Configuration;
 use crate::local_ai::{self, Client};
 use crate::private_files::FileStamp;
@@ -16,7 +18,7 @@ use super::super::{RetiredIndex, SaveIndexes, StagedIndex, State};
 use super::source::SyncMode;
 use super::{
     Cache, Embedding, Index, Scope, SourceKey, SourceKind, Store, UpdateSummary, check_active,
-    folder, qdrant, remote_index,
+    folder, outcomes, qdrant, remote_index,
 };
 
 pub(crate) struct Cancel {
@@ -57,18 +59,27 @@ pub(crate) struct Status {
     pub(crate) sources: Option<Arc<SourceReport>>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(in crate::ai_manager::local) enum SourceStatus {
+    #[serde(skip)]
     Scanning,
+    #[serde(skip)]
     Indexing,
-    Checked { problems: usize },
+    Checked {
+        problems: usize,
+    },
     Unavailable,
     ReviewRequired,
     Error,
+    #[serde(skip)]
     Interrupted,
 }
 
 impl SourceStatus {
+    pub(super) fn completed(self) -> bool {
+        !matches!(self, Self::Scanning | Self::Indexing | Self::Interrupted)
+    }
+
     pub(in crate::ai_manager::local) fn label(self) -> Option<&'static str> {
         match self {
             Self::Scanning => Some("Scanning…"),
@@ -166,6 +177,21 @@ impl Report {
             changed: false,
             sources: None,
         }
+    }
+
+    fn with_sources(
+        mut self,
+        root: &Path,
+        state: &State,
+        store: &Store,
+        rows: SourceStatuses,
+    ) -> Self {
+        if outcomes::save(root, state, store, &rows).is_err() {
+            self.status.push(' ');
+            self.status.push_str(outcomes::SAVE_WARNING);
+        }
+        self.sources = Some(SourceReport::new(state, store, rows));
+        self
     }
 }
 
@@ -332,12 +358,9 @@ fn reconcile(
             saved: None,
             status: status(UpdateSummary::default(), &source_statuses),
             changed: false,
-            sources: Some(SourceReport::new(
-                &baseline.local,
-                original,
-                source_statuses,
-            )),
-        });
+            sources: None,
+        }
+        .with_sources(root, &baseline.local, original, source_statuses));
     }
     let indexing = source_statuses
         .iter()
@@ -376,13 +399,12 @@ fn reconcile(
             {
                 source_statuses.insert(key, SourceStatus::Error);
             }
-            let mut report = Report::failed(error);
-            report.sources = Some(SourceReport::new(
+            return Ok(Report::failed(error).with_sources(
+                root,
                 &baseline.local,
                 original,
                 source_statuses,
             ));
-            return Ok(report);
         }
     };
     let coverage = remote_index::retained_coverage(
@@ -410,6 +432,7 @@ fn reconcile(
                 scope,
                 sources: coverage,
                 vault_key: vault_key.clone(),
+                completed: None,
             }],
             retired: previous_scope
                 .qdrant
@@ -478,17 +501,19 @@ fn reconcile(
         status.push_str(&warning);
     }
     let current = saved.as_deref().unwrap_or(&baseline);
-    let sources = SourceReport::new(
+    let sources = Report {
+        saved: None,
+        status,
+        changed: changed_manifest || changed_index,
+        sources: None,
+    }
+    .with_sources(
+        root,
         &current.local,
         &current.local.stores[position],
         source_statuses,
     );
-    Ok(Report {
-        saved,
-        status,
-        changed: changed_manifest || changed_index,
-        sources: Some(sources),
-    })
+    Ok(Report { saved, ..sources })
 }
 
 fn collect(
@@ -733,6 +758,11 @@ mod tests {
         edited.set_file_sync(automatic.clone(), SyncMode::Manual);
         assert!(report.rows(&baseline.local, &edited).is_none());
         assert_eq!(cache.load(&scope).unwrap().sources, refreshed.sources);
+        let reopened = Configuration::load_fixture_from(&root).unwrap();
+        let saved = outcomes::load(&root, &reopened.local, &reopened.local.stores[0]).unwrap();
+        assert_eq!(saved.get(&source), Some(&SourceStatus::Unavailable));
+        assert_eq!(saved.len(), 1);
+        assert_eq!(cache.load(&scope).unwrap().indexed_at, refreshed.indexed_at);
 
         fs::remove_file(&automatic).unwrap();
         let pending = start(Arc::clone(&baseline), 0, None)
