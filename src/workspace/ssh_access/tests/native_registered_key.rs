@@ -277,8 +277,6 @@ fn wait_for_frame(
 #[test]
 #[ignore = "requires a private OpenSSH fixture"]
 fn openssh_saved_temporary_key_authenticates_terminal_and_sftp() {
-    use std::io::Read;
-
     let peer = OpenSshFixture::new();
     let root = peer.directory().canonicalize().unwrap();
     let client = root.join("client");
@@ -324,16 +322,61 @@ fn openssh_saved_temporary_key_authenticates_terminal_and_sftp() {
         window_geometry: None,
         terminal: Default::default(),
     };
+    assert_temporary_key_authenticates(&peer, &saved, vault_path, vault);
+}
+
+#[test]
+#[ignore = "requires a private OpenSSH fixture"]
+fn openssh_java_imported_temporary_key_authenticates_terminal_and_sftp() {
+    use crate::profile_backup::java_temporary_key_fixture;
+
+    const MASTER: &[u8] = b"Java temporary SSH wire fixture master";
+    let peer = OpenSshFixture::new();
+    let root = peer.directory().canonicalize().unwrap();
+    let client = root.join("client");
+    let endpoint = peer.request(client.clone()).target.endpoint;
+    let profile = TempDirectory::new("java-temporary-ssh-profile");
+    let profile = profile.0.canonicalize().unwrap();
+    let saved = java_temporary_key_fixture::restore(&profile, &endpoint, MASTER);
+    assert!(matches!(
+        saved.login.auth,
+        Auth::TemporaryKey {
+            credential: Some(_),
+            minutes: 10,
+            automatic: true
+        }
+    ));
+    fs::write(
+        root.join("client.pub"),
+        java_temporary_key_fixture::PUBLIC_KEY,
+    )
+    .unwrap();
+    fs::remove_file(client).unwrap();
+
+    let vault_path = crate::profile::vault_path_at(&profile);
+    let vault = Vault::unlock(&vault_path, MASTER).unwrap();
+    assert_temporary_key_authenticates(&peer, &saved, vault_path, vault);
+}
+
+fn assert_temporary_key_authenticates(
+    peer: &OpenSshFixture,
+    saved: &Connection,
+    vault_path: PathBuf,
+    vault: Vault,
+) {
+    use std::io::Read;
+
+    let root = peer.directory().canonicalize().unwrap();
     let mut desktop = Workspace::default();
     desktop.window_settings.temporary_ssh_key_enabled = true;
     let request = || {
-        SshDialog::from_saved(TerminalProfile::Xterm, &saved)
+        SshDialog::from_saved(TerminalProfile::Xterm, saved)
             .take_request()
             .unwrap()
     };
-    assert!(saved_credentials_match(&request(), Some(&saved), None));
+    assert!(saved_credentials_match(&request(), Some(saved), None));
     assert!(matches!(
-        desktop.resolve_ssh_logins(&mut request(), Some(&saved)),
+        desktop.resolve_ssh_logins(&mut request(), Some(saved)),
         Err("Unlock the vault before connecting.")
     ));
     desktop.vault = Some(VaultWindow::with_unlocked_fixture(vault_path, vault));
@@ -348,6 +391,10 @@ fn openssh_saved_temporary_key_authenticates_terminal_and_sftp() {
         secrets: None,
     };
     let trust = peer.pinned_trust();
+    let authorized = fs::read_to_string(root.join("client.pub")).unwrap();
+    let fingerprint = HostKey::from_openssh(authorized.trim())
+        .unwrap()
+        .fingerprint();
     let remote_file = root.join("temporary-sftp.bin");
     let contents = b"\0temporary-key SFTP fixture\xff";
     fs::write(&remote_file, contents).unwrap();
@@ -363,16 +410,24 @@ fn openssh_saved_temporary_key_authenticates_terminal_and_sftp() {
         let server = peer.serve_with_extra("host", &command);
         let mut request = request();
         desktop
-            .resolve_ssh_logins(&mut request, Some(&saved))
+            .resolve_ssh_logins(&mut request, Some(saved))
             .unwrap();
-        let mut connected = dial_direct(
+        let mut connected = match dial_direct(
             request,
             sftp,
             &prompt,
             trust.clone(),
             ssh_size(initial_grid(TerminalProfile::Xterm)),
-        )
-        .unwrap();
+        ) {
+            Ok(connected) => connected,
+            Err(error) => {
+                let log = server.join().unwrap().stderr;
+                panic!(
+                    "OpenSSH fixture failed: {error}\n{}",
+                    String::from_utf8_lossy(&log)
+                );
+            }
+        };
         if sftp {
             let mut sftp = Sftp::new(
                 connected.take_reader().unwrap(),
@@ -394,9 +449,9 @@ fn openssh_saved_temporary_key_authenticates_terminal_and_sftp() {
             assert!(String::from_utf8_lossy(&output).contains("temporary-key-terminal"));
             connected.close().unwrap();
         }
-        assert!(
-            String::from_utf8_lossy(&server.join().unwrap().stderr).contains("Accepted publickey")
-        );
+        let log = server.join().unwrap().stderr;
+        let log = String::from_utf8_lossy(&log);
+        assert!(log.contains("Accepted publickey") && log.contains(&fingerprint));
     }
     assert!(messages.is_empty());
 }

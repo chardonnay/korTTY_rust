@@ -439,23 +439,38 @@ review, locked or incorrect credentials, omission of unsealed input,
 installation after restart, account and port isolation, the declared
 jump route, and replay without renewing the key. Windows ARM64 passed the
 all-target application check with `dialog-preview`, 15 vault tests with
-one ignored, and strict vault Clippy. The interactive desktop review
-and sign-in with an imported key remain open.
+one ignored, and strict vault Clippy.
 [Apple Silicon backup and import tests](target/verification/20261123-java-temporary-key-macos.log)
 · [Windows application check](target/verification/20261123-java-temporary-key-windows-check.log)
 · [Windows vault tests](target/verification/20261123-java-temporary-key-windows-vault.log)
 · [Windows vault Clippy](target/verification/20261123-java-temporary-key-windows-vault-clippy.log)
+
+A subsequent Apple Silicon fixture reviewed the Java archive, applied it
+through startup restore, reopened the encrypted vault and passed both
+SSH terminal and SFTP authentication against pinned loopback OpenSSH.
+OpenSSH reported the fingerprint of the imported key for both logins.
+The SFTP test checked the exact downloaded bytes, and the same fixture
+covered refusal while the vault was locked. The existing saved-key
+control passed in the same run. Keep the test under the Mac user's
+private temporary directory for OpenSSH's file checks. Windows ARM64
+passed the updated all-target check. The interactive desktop review
+remains open.
+[Apple Silicon OpenSSH tests](target/verification/20261123-java-temporary-key-wire-macos-private.log)
+· [Windows application check](target/verification/20261123-java-temporary-key-wire-windows-check.log)
 
 Java's non-interactive tab restore consults the saved profile and can use
 a registered, valid temporary key. Tabs that need input are deferred for
 interactive resolution. The Java Scheduler remote session can also use
 temporary key contents and makes an owner-only key file for an external
 SSH process when required. The Rust Scheduler currently treats temporary
-keys as interactive credentials. Cover these routes separately from
-backup restore, including explicit authority, expiry and cleanup.
+keys as interactive credentials. Rust project restore also defers all
+temporary-key profiles to the sign-in review. Cover these routes
+separately from backup restore, including automatic selection, explicit
+authority, expiry and cleanup.
 [Java tab restore](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/TabRestoreTriage.java)
 · [Java Scheduler remote session](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/jobscheduler/JobSchedulerRemoteSession.java)
 · [Rust Scheduler authentication](src/job_executor/connection.rs)
+· [Rust project reconnect](src/workspace/ssh_access/reconnect.rs)
 
 ## November 23 Native vault startup unlock
 

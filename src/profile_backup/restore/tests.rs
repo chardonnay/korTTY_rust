@@ -25,17 +25,12 @@ const JAVA_ENVIRONMENTS: &[u8] = br##"<environments>
 #[test]
 fn java_temporary_keys_restore_only_after_review_for_the_exact_account() {
     use crate::connection_store::{Auth, Store};
+    use crate::profile_backup::java_temporary_key_fixture as fixture;
     use kortty_vault::TemporarySshKeyOptions;
-    use zip::{AesMode, ZipWriter, write::SimpleFileOptions};
 
     let source = Scratch::new();
-    let path = source.0.join("java-temporary.zip");
-    let archive_password = Secret::new("fixture archive password".into());
-    let java_password = Secret::new("päss🔑例".into());
-    let envelope = include_str!("../java_secrets/fixtures/envelopes.txt")
-        .lines()
-        .nth(2)
-        .unwrap();
+    let java_password = fixture::java_password();
+    let envelope = fixture::envelope();
     let connections = format!(
         r#"<connections schemaVersion="2">
           <connection id="temp-direct">
@@ -54,20 +49,7 @@ fn java_temporary_keys_restore_only_after_review_for_the_exact_account() {
           </connection>
         </connections>"#
     );
-    let mut zip = ZipWriter::new(File::create(&path).unwrap());
-    let options = SimpleFileOptions::default()
-        .with_aes_encryption_bytes(AesMode::Aes256, archive_password.as_bytes());
-    for (name, bytes) in [
-        ("connections.xml", connections.as_bytes()),
-        (
-            "master.key",
-            include_bytes!("../java_secrets/fixtures/master.properties").as_slice(),
-        ),
-    ] {
-        zip.start_file(name, options).unwrap();
-        zip.write_all(bytes).unwrap();
-    }
-    zip.finish().unwrap();
+    let (path, archive_password) = fixture::archive(&source.0, &connections);
 
     let inspect = || super::super::inspect_java_password(&path, &archive_password).unwrap();
     let skipped = Scratch::new();

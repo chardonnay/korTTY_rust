@@ -17,6 +17,8 @@ mod java_host_pins;
 mod java_migration;
 mod java_scheduler;
 mod java_secrets;
+#[cfg(test)]
+pub(crate) mod java_temporary_key_fixture;
 mod openpgp;
 pub(crate) mod preferences;
 mod restore;
