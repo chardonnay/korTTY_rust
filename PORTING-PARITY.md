@@ -331,15 +331,64 @@ and editing, global Settings and workspace backup preferences.
 [Windows application check](target/verification/20261123-java-security-restore-windows-check.log)
 · [Windows native tests](target/verification/20261123-java-security-restore-windows-tests.log)
 
-Compare the restored Security and Connection Manager review controls on
-native desktops. Check live inherited SSH and local sandbox launches and
-the interactive SSH and SFTP temporary-key routes with disposable keys.
+The [Windows isolation review](#november-23-windows-isolation-dialogs-and-launches)
+records the native desktop comparison and sandbox launch evidence.
+Check live inherited SSH and the interactive SSH and SFTP temporary-key
+routes with disposable keys.
 Startup auto-unlock and encrypted temporary keys in the saved-connection
 editor remain open. The tagged Settings dialog updates its remembered
 unlock credential after a master password change and clears it when the
 user disables auto-unlock. Include those transitions and the managed
 startup requirement in native acceptance.
 [Tagged Java Settings dialog](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SettingsDialog.java)
+
+## November 23 Windows isolation dialogs and launches
+
+The private Windows ARM64 desktop comparison used the released Java
+v2.26.0 x64 application under emulation and native Rust. Java places the
+isolation selector, strict terminal mode and incognito controls together
+under Terminal Settings. Rust groups the corresponding SSH controls there
+and puts timeout, retry and keepalive controls in Connection. The local
+editor places strict terminal mode alongside its isolation choice. The
+native recheck verified the aligned controls in both editors at their
+standard window size.
+
+The Connection Manager inspector previously showed the raw SSH field,
+which displayed None for a saved profile that inherited its folder's
+sandbox. It now uses the saved SSH resolver. Both the SSH and local-shell
+inspectors show the effective level and its source. The folder editor
+shows the level its current draft would apply, including a managed minimum.
+The desktop fixture showed an explicit folder level alongside the separate
+Java import selector.
+[Connection Manager views](src/connection_window/view.rs)
+· [SSH editor](src/connection_window/form.rs)
+· [Local editor](src/connection_window/local.rs)
+
+The native Security page reported `windows-psec` for local shells and
+`LPAC + Job` for SSH. It showed Own process as the managed minimum, marked
+the imported Java None proposal as below that minimum and disabled its
+adoption. The separate temporary-key proposal remained available. Java's
+release reported its sandbox backend as unavailable on this Windows host.
+[Windows Security fixture log](target/verification/20261123-isolation-desktop-windows-dialog-review.log)
+· [Final Windows dialog fixture log](target/verification/20261123-isolation-desktop-windows-final-dialog-review.log)
+
+The native Rust application and console worker reopened a saved local
+profile from a private recovery snapshot in two cases. The first inherited
+Sandbox from its folder. In the second, the installed fixture policy
+required Sandbox for a profile with an explicit None selection. In both
+cases the running shell wrote to its workspace and was denied a read of a
+synthetic file in the private application profile.
+[Windows sandbox launch evidence](target/verification/20261123-isolation-desktop-windows-sandbox-launch.log)
+
+The final native development build and all-target application check
+passed with `dialog-preview`.
+[Windows build](target/verification/20261123-isolation-desktop-windows-verified-build.log)
+· [Windows all-target check](target/verification/20261123-isolation-desktop-windows-verified-check.log)
+
+Remaining acceptance includes a fresh saved-profile desktop launch,
+inherited live SSH and Teamwork reconnect, backend-unavailable editor
+feedback and the macOS and Linux desktop comparisons. The separate Java
+startup auto-unlock and saved temporary-key workflows remain open.
 
 ## November 23 Plan and execution layout
 

@@ -193,12 +193,17 @@ impl Draft {
             group,
             text("Starting directory").size(14),
             text_input("Absolute path (optional)", &self.directory).on_input(Edit::Directory),
-            row![
-                text("Session isolation"),
-                pick_list(LocalIsolation::ALL, Some(self.isolation), Edit::Isolation)
+            column![
+                text("Session isolation").size(16),
+                terminal_overrides::isolation_row(
+                    "Isolation",
+                    pick_list(LocalIsolation::ALL, Some(self.isolation), Edit::Isolation)
+                        .width(Length::Fill),
+                ),
+                text(format!("Effective isolation · {level} · {source}")).size(13),
+                self.terminal.strict_mode_view().map(Edit::Terminal),
             ]
-            .spacing(8),
-            text(format!("Effective isolation · {level} · {source}")).size(13),
+            .spacing(6),
             text("Terminal emulation").size(14),
             pick_list(TerminalProfile::ALL, Some(self.emulation), Edit::Emulation)
                 .width(Length::Fill),

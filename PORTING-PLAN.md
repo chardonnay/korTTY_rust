@@ -49,7 +49,10 @@ folders. It stages other folder levels, the global default and the
 temporary-key option for explicit review in the native editors.
 [Connection isolation checkpoint](PORTING-PARITY.md#november-23-connection-and-folder-isolation)
 · [Java backup security checkpoint](PORTING-PARITY.md#november-23-java-backup-security-settings)
-The remaining desktop checks are in the [dialog backlog](#gui-dialog-design-parity).
+The Windows ARM64 comparison verified effective isolation in the profile
+inspectors and the managed Security display. Native application recovery
+reopened a saved local profile in the sandbox under both folder inheritance
+and an installed minimum. [Windows isolation checks](PORTING-PARITY.md#november-23-windows-isolation-dialogs-and-launches)
 
 Start with the [confirmed implementation work](#confirmed-implementation-work).
 Other open areas include the remaining Settings pages and connection editor
@@ -1202,11 +1205,13 @@ not been identified.
 
 ## Implementation order
 
-Verify the [session isolation and migration controls](PORTING-PARITY.md#november-23-java-backup-security-settings)
-in the native Security page and folder, SSH and local-shell editors against
-Java. Exercise saved SSH and Teamwork against a verified host, reconnect an
-inherited route and launch a saved local profile in the native desktop
-sandbox. Check unavailable backends and the managed minimum at launch.
+Continue the [native session isolation checks](PORTING-PARITY.md#november-23-windows-isolation-dialogs-and-launches)
+with the macOS and Linux Security page and folder, SSH and local-shell
+editors. Exercise saved SSH and Teamwork against a verified host and
+reconnect an inherited route. Launch a new saved local profile in the
+desktop sandbox and check the editor feedback for an unavailable backend.
+Windows ARM64 recovery already exercised folder inheritance and the
+managed minimum in running local sessions.
 Continue the [dialog design comparison](#gui-dialog-design-parity) with
 the remaining Settings and AI Manager pages. Repeat the verified Windows
 Knowledge Store restart and recovery paths on the other native desktops.

@@ -3995,7 +3995,7 @@ impl Workspace {
             }),
             rule::horizontal(1),
             text("Session isolation").size(18),
-            text("Choose the default for new local and SSH sessions. Saved SSH connections can specify their own level.").size(13),
+            text("Set the default for new local and SSH sessions. Saved profiles and folders can specify their own level in Connection Manager.").size(13),
             highlighted(
                 dialog,
                 Setting::DefaultIsolation,
@@ -4006,7 +4006,11 @@ impl Workspace {
             ),
             imported.default_isolation.map(|level| {
                 row![
-                    text(format!("Java backup · {level}")).size(13),
+                    text(if level < minimum {
+                        format!("Java backup · {level} · Below the managed minimum")
+                    } else {
+                        format!("Java backup · {level}")
+                    }).size(13),
                     dialog_design::secondary_action("Use Java setting").on_press_maybe(
                         (policy.problem.is_none() && level >= minimum
                             && dialog.draft.preferences.default_session_isolation != Some(level))

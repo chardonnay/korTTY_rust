@@ -552,17 +552,12 @@ impl Draft {
             ]
             .spacing(10)
             .align_y(Alignment::Center),
-            checkbox(self.incognito)
-                .label(if choices.incognito_allowed {
-                    "Incognito session"
-                } else {
-                    "Incognito session · managed policy"
-                })
-                .on_toggle_maybe(
-                    choices
-                        .incognito_allowed
-                        .then_some(|value| Message::Edit(Edit::Incognito(value)))
-                ),
+            self.startup
+                .view(168.0)
+                .map(|(field, value)| Message::Edit(Edit::Startup(field, value))),
+            self.startup
+                .keepalive_view(168.0)
+                .map(|edit| Message::Edit(Edit::KeepAlive(edit))),
         ]
         .spacing(10)
         .into()
@@ -626,20 +621,31 @@ impl Draft {
                     text(format!("Organization minimum · {}", choices.minimum_paste_warning)).size(13)
                 }),
             ].spacing(5),
-            row![
-                text("SSH isolation"),
-                pick_list(
-                    IsolationChoice::ALL,
-                    Some(self.isolation),
-                    |value| Message::Edit(Edit::Isolation(value))
+            column![
+                text("Session isolation").size(16),
+                terminal_overrides::isolation_row(
+                    "Isolation",
+                    pick_list(
+                        IsolationChoice::ALL,
+                        Some(self.isolation),
+                        |value| Message::Edit(Edit::Isolation(value))
+                    ).width(Length::Fill),
                 ),
+                text(format!("Effective isolation · {level} · {source}")).size(13),
+                self.terminal.strict_mode_view().map(|edit| Message::Edit(Edit::Terminal(edit))),
+                checkbox(self.incognito)
+                    .label(if choices.incognito_allowed {
+                        "Incognito session"
+                    } else {
+                        "Incognito session · managed policy"
+                    })
+                    .on_toggle_maybe(
+                        choices
+                            .incognito_allowed
+                            .then_some(|value| Message::Edit(Edit::Incognito(value)))
+                    ),
             ]
-            .spacing(8),
-            text(format!("Effective isolation · {level} · {source}")).size(13),
-            self.startup
-                .view(135.0)
-                .map(|(field, value)| Message::Edit(Edit::Startup(field, value))),
-            self.startup.keepalive_view(135.0).map(|edit| Message::Edit(Edit::KeepAlive(edit))),
+            .spacing(6),
             self.terminal.view(choices).map(|edit| Message::Edit(Edit::Terminal(edit))),
         ]
         .spacing(8);

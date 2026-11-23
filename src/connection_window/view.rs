@@ -13,7 +13,9 @@ use crate::connection_store::teamwork;
 use crate::connection_store::{
     Auth, Connection, JavaGroupColor, LocalProfile, SerialProfile, Store,
 };
-use crate::session_security::{IsolationChoice, IsolationLevel};
+use crate::session_security::{
+    IsolationChoice, IsolationLevel, IsolationSource, resolve_isolation,
+};
 use crate::ssh_dialog::KeyChoice;
 use crate::terminal_agent::design::Choice as AgentDesignChoice;
 use crate::terminal_effects::Effect;
@@ -1218,11 +1220,11 @@ impl ConnectionWindow {
         } else if let Some(prompt) = self.tree_context_prompt() {
             prompt
         } else if let Some(dialog) = &self.folder {
-            folder_dialog(dialog, &self.store)
+            folder_dialog(dialog, &self.store, choices.isolation)
         } else if let Some(path) = self.selection.single_group() {
             self.group_inspector(path)
         } else if let Some(connection) = self.single_connection() {
-            self.connection_inspector(connection, choices.keys)
+            self.connection_inspector(connection, choices)
         } else if let Some(entry) = self.selected_shared() {
             let endpoint = &entry.connection.login.endpoint;
             let blocked = entry.connection.blocked_server(&self.server_access);
@@ -1262,6 +1264,15 @@ impl ConnectionWindow {
             .spacing(10)
             .into()
         } else if let Some(profile) = self.single_local() {
+            let folder = self
+                .store
+                .group_of(profile.id)
+                .and_then(|path| self.store.inherited_group_isolation(path));
+            let (isolation, source) = profile.isolation.resolve(
+                choices.local_isolation_default,
+                folder,
+                choices.isolation.1,
+            );
             let program = profile
                 .command
                 .as_ref()
@@ -1281,6 +1292,7 @@ impl ConnectionWindow {
                     "Emulation",
                     profile.profile().unwrap_or_default().to_string()
                 ),
+                fact("Isolation", format!("{isolation} · {source}")),
                 favorite_tool(self.store.is_favorite(profile.id), self.can_browse()),
                 self.java_favorite_review(profile.id),
             ]
@@ -1542,8 +1554,9 @@ impl ConnectionWindow {
     fn connection_inspector<'a>(
         &'a self,
         entry: &'a Connection,
-        keys: &[crate::ssh_dialog::KeyChoice],
+        choices: &ViewChoices<'_>,
     ) -> Element<'a, Message> {
+        let keys = choices.keys;
         let browsing = self.can_browse();
         let blocked = entry.blocked_server(&self.server_access);
         let connect = browsing && blocked.is_none();
@@ -1582,6 +1595,9 @@ impl ConnectionWindow {
         }
         .to_owned();
         let favorite = self.store.is_favorite(entry.id);
+        let (isolation, source) =
+            self.store
+                .connection_isolation(entry, choices.isolation.0, None, choices.isolation.1);
         let mut route = row![text("This computer").size(13), text("→").size(13)].spacing(7);
         if let Some(jump) = &entry.jump {
             route = route
@@ -1661,7 +1677,7 @@ impl ConnectionWindow {
             heading("ROUTE"),
             route.wrap(),
             heading("SECURITY"),
-            fact("Isolation", entry.isolation.to_string()),
+            fact("Isolation", format!("{isolation} · {source}")),
             fact("Host key", "Verify before authentication"),
         ]
         .spacing(10);
@@ -1760,7 +1776,11 @@ impl std::fmt::Display for GroupChoice {
     }
 }
 
-fn folder_dialog<'a>(dialog: &'a FolderDialog, store: &'a Store) -> Element<'a, Message> {
+fn folder_dialog<'a>(
+    dialog: &'a FolderDialog,
+    store: &'a Store,
+    isolation: (IsolationLevel, IsolationLevel),
+) -> Element<'a, Message> {
     let (title, hint, name, action) = match dialog {
         FolderDialog::Create { parent, name } => (
             "New folder",
@@ -1799,15 +1819,17 @@ fn folder_dialog<'a>(dialog: &'a FolderDialog, store: &'a Store) -> Element<'a, 
             let inherited = path
                 .rsplit_once('/')
                 .and_then(|(parent, _)| store.inherited_group_isolation(parent));
-            let source = inherited.map_or_else(
-                || "Global Settings".into(),
-                |(folder, level)| format!("{level} · Folder {folder}"),
-            );
+            let (level, source) =
+                resolve_isolation(isolation.0, inherited, draft.0, None, false, isolation.1);
+            let source = match source {
+                IsolationSource::Connection => "This folder".into(),
+                source => source.to_string(),
+            };
             return column![
                 text("Folder session isolation").size(22),
                 text(path),
                 pick_list(IsolationChoice::ALL, Some(*draft), Message::GroupIsolation),
-                text(format!("Inherited from {source}.")),
+                text(format!("Effective isolation · {level} · {source}")).size(13),
                 (!store.java_group_isolation().is_empty()).then(|| column![
                     text("Isolation from a Java backup").size(14),
                     pick_list(
