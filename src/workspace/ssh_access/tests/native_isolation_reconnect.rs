@@ -190,7 +190,6 @@ fn openssh_project_reconnect_checks_saved_temporary_key() {
     use crate::vault_window::VaultWindow;
     use kortty_vault::Vault;
 
-    const MASTER: &[u8] = b"fixture project temporary SSH master";
     let Some(root) = fixture_profile(PROJECT_TEMPORARY_KEY_TEST) else {
         return;
     };
@@ -205,7 +204,8 @@ fn openssh_project_reconnect_checks_saved_temporary_key() {
     let host = Endpoint::new(&endpoint.host, endpoint.port).unwrap();
     trust_store().unwrap().remember(&host, &host_key).unwrap();
 
-    let saved = fixture::restore(&root, &endpoint, MASTER, 1);
+    let master = crate::vault_window::test_vault_password();
+    let saved = fixture::restore(&root, &endpoint, &master[..], 1);
     let Auth::TemporaryKey {
         credential: Some(id),
         minutes: 1,
@@ -215,7 +215,7 @@ fn openssh_project_reconnect_checks_saved_temporary_key() {
         panic!("expected an automatic temporary key from the reviewed Java archive");
     };
     let vault_path = crate::profile::vault_path().unwrap();
-    let vault = Vault::unlock(&vault_path, MASTER).unwrap();
+    let vault = Vault::unlock(&vault_path, &master[..]).unwrap();
     let key = vault
         .temporary_ssh_key(id, (&endpoint.host, endpoint.port, &endpoint.username))
         .unwrap();

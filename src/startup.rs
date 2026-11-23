@@ -352,9 +352,9 @@ mod tests {
     fn automatic_unlock_respects_both_personal_and_managed_password_requirements() {
         let profile = crate::snippets::tests::Profile::new();
         let path = profile::vault_path_at(&profile.0);
-        const MASTER: &[u8] = b"fixture master password only";
+        let master = crate::vault_window::test_vault_password();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        drop(Vault::create(&path, MASTER).unwrap());
+        drop(Vault::create(&path, &master[..]).unwrap());
         std::fs::write(path.with_extension("bin.startup-unlock"), b"enabled-v1").unwrap();
         let start = |policy| Application::start(profile.0.clone(), policy, None, None).0;
         let mut automatic = start(ClipboardPolicy::default());
@@ -376,7 +376,7 @@ mod tests {
         .unwrap();
         let personal = start(ClipboardPolicy::default());
         assert!(matches!(personal.0, State::Locked(gate) if !gate.prompt.used_remembered()));
-        let completed = crate::vault_window::Completion::unlock_fixture(&path, MASTER, true);
+        let completed = crate::vault_window::Completion::unlock_fixture(&path, &master[..], true);
         let _ = automatic.update(Message::Vault(
             existing_window,
             VaultMessage::Completed(completed),

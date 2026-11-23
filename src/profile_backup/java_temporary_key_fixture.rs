@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+use base64::prelude::{BASE64_STANDARD, Engine as _};
 use kortty_vault::Secret;
 use zip::{AesMode, ZipWriter, write::SimpleFileOptions};
 
@@ -21,7 +22,8 @@ pub(super) fn java_password() -> Secret {
 
 pub(super) fn archive(root: &Path, connections: &str) -> (PathBuf, Secret) {
     let path = root.join("java-temporary.zip");
-    let archive_password = Secret::new("fixture archive password".into());
+    let archive_password =
+        Secret::new(BASE64_STANDARD.encode(&crate::vault_window::test_vault_password()[..]));
     let mut zip = ZipWriter::new(File::create(&path).unwrap());
     let options = SimpleFileOptions::default()
         .with_aes_encryption_bytes(AesMode::Aes256, archive_password.as_bytes());

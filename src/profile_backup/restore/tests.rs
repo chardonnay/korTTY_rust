@@ -72,8 +72,8 @@ fn java_temporary_keys_restore_only_after_review_for_the_exact_account() {
         .private_child("vault", true)
         .unwrap();
     let vault_path = crate::profile::vault_path_at(&target.0);
-    let master = b"fixture destination master password";
-    let vault = Vault::create(&vault_path, master).unwrap();
+    let master = crate::vault_window::test_vault_password();
+    let vault = Vault::create(&vault_path, &master[..]).unwrap();
     let initial_vault = fs::read(&vault_path).unwrap();
     let mut preview = inspect();
     let prepare = super::super::prepare_java_credentials;
@@ -98,7 +98,7 @@ fn java_temporary_keys_restore_only_after_review_for_the_exact_account() {
     drop(vault);
     drop(ProfileLease::acquire(&target.0, || false).unwrap());
 
-    let vault = Vault::unlock(&vault_path, master).unwrap();
+    let vault = Vault::unlock(&vault_path, &master[..]).unwrap();
     let store = Store::open(target.0.join(CONNECTIONS)).unwrap();
     let connection = store
         .connections()

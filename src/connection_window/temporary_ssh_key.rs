@@ -199,8 +199,8 @@ mod tests {
         let profile = crate::snippets::tests::Profile::new();
         let vault_path = profile.0.join("vault.bin");
         let store_path = profile.0.join("connections.json");
-        let master = b"temporary key fixture password";
-        let mut vault = Vault::create(&vault_path, master).unwrap();
+        let master = crate::vault_window::test_vault_password();
+        let mut vault = Vault::create(&vault_path, &master[..]).unwrap();
         let store = Store::open(store_path.clone()).unwrap();
         let mut draft = Draft::new();
         draft.update(Edit::Name("Temporary fixture".into()));
@@ -226,7 +226,7 @@ mod tests {
         );
         drop(vault);
 
-        let mut vault = Vault::unlock(&vault_path, master).unwrap();
+        let mut vault = Vault::unlock(&vault_path, &master[..]).unwrap();
         let target = ("host.example", 22, "root");
         let live = vault.temporary_ssh_key(&first, target).unwrap();
         assert!(live.options.automatic);

@@ -282,7 +282,8 @@ fn openssh_saved_temporary_key_authenticates_terminal_and_sftp() {
     let client = root.join("client");
     let endpoint = peer.request(client.clone()).target.endpoint;
     let vault_path = root.join("temporary-vault.bin");
-    let mut vault = Vault::create(&vault_path, b"temporary SSH wire fixture master").unwrap();
+    let master = crate::vault_window::test_vault_password();
+    let mut vault = Vault::create(&vault_path, &master[..]).unwrap();
     let credential = vault
         .save_temporary_ssh_key(
             "OpenSSH temporary fixture".into(),
@@ -330,14 +331,14 @@ fn openssh_saved_temporary_key_authenticates_terminal_and_sftp() {
 fn openssh_java_imported_temporary_key_authenticates_terminal_and_sftp() {
     use crate::profile_backup::java_temporary_key_fixture;
 
-    const MASTER: &[u8] = b"Java temporary SSH wire fixture master";
+    let master = crate::vault_window::test_vault_password();
     let peer = OpenSshFixture::new();
     let root = peer.directory().canonicalize().unwrap();
     let client = root.join("client");
     let endpoint = peer.request(client.clone()).target.endpoint;
     let profile = TempDirectory::new("java-temporary-ssh-profile");
     let profile = profile.0.canonicalize().unwrap();
-    let saved = java_temporary_key_fixture::restore(&profile, &endpoint, MASTER, 10);
+    let saved = java_temporary_key_fixture::restore(&profile, &endpoint, &master[..], 10);
     assert!(matches!(
         saved.login.auth,
         Auth::TemporaryKey {
@@ -354,7 +355,7 @@ fn openssh_java_imported_temporary_key_authenticates_terminal_and_sftp() {
     fs::remove_file(client).unwrap();
 
     let vault_path = crate::profile::vault_path_at(&profile);
-    let vault = Vault::unlock(&vault_path, MASTER).unwrap();
+    let vault = Vault::unlock(&vault_path, &master[..]).unwrap();
     assert_temporary_key_authenticates(&peer, &saved, vault_path, vault);
 }
 

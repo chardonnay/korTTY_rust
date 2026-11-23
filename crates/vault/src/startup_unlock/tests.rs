@@ -2,9 +2,6 @@ use std::path::PathBuf;
 
 use super::*;
 
-const MASTER: &[u8] = b"fixture master password only";
-const ROTATED: &[u8] = b"fixture rotated password only";
-
 struct Directory(PathBuf);
 
 impl Directory {
@@ -32,7 +29,9 @@ impl Drop for Directory {
 fn remembered_key_authenticates_the_snapshot_and_cannot_unlock_after_rotation() {
     let directory = Directory::create();
     let path = directory.0.join("vault.bin");
-    let mut vault = Vault::create(&path, MASTER).unwrap();
+    let master = crate::random::<32>().unwrap();
+    let rotated = crate::random::<32>().unwrap();
+    let mut vault = Vault::create(&path, &master).unwrap();
     assert_eq!(
         Vault::startup_unlock_state(&path).unwrap(),
         StartupUnlockState::Disabled
@@ -79,14 +78,14 @@ fn remembered_key_authenticates_the_snapshot_and_cannot_unlock_after_rotation() 
     ));
     let mut vault = unlock(&path, |_| Ok(saved.clone())).unwrap();
     assert_eq!(vault.secret(&id), Some("fixture-only credential"));
-    vault.change_master_password(MASTER, ROTATED).unwrap();
+    vault.change_master_password(&master, &rotated).unwrap();
     drop(vault);
     assert!(matches!(
         unlock(&path, |_| Ok(saved)),
         Err(Error::Authentication)
     ));
 
-    let vault = Vault::unlock(&path, ROTATED).unwrap();
+    let vault = Vault::unlock(&path, &rotated).unwrap();
     let mut refreshed = Record::default();
     let expected_account = account(&vault.path);
     vault
@@ -107,7 +106,7 @@ fn remembered_key_authenticates_the_snapshot_and_cannot_unlock_after_rotation() 
 fn unavailable_store_and_failed_removal_leave_automatic_unlock_disabled() {
     let directory = Directory::create();
     let path = directory.0.join("vault.bin");
-    let vault = Vault::create(&path, MASTER).unwrap();
+    let vault = Vault::create(&path, &crate::random::<32>().unwrap()).unwrap();
     assert!(matches!(
         vault.remember_with(|_, _| Err(Error::StartupCredentialUnavailable)),
         Err(Error::StartupCredentialUnavailable)
@@ -156,13 +155,15 @@ fn native_credential_store_round_trip() {
 
     let directory = Directory::create();
     let path = directory.0.join("vault.bin");
-    let vault = Vault::create(&path, MASTER).unwrap();
+    let master = crate::random::<32>().unwrap();
+    let rotated = crate::random::<32>().unwrap();
+    let vault = Vault::create(&path, &master).unwrap();
     let cleanup = RemoveCredential(account(&vault.path));
     vault.remember_startup_unlock().unwrap();
     drop(vault);
 
     let mut vault = Vault::unlock_remembered(&path).unwrap();
-    vault.change_master_password(MASTER, ROTATED).unwrap();
+    vault.change_master_password(&master, &rotated).unwrap();
     vault.refresh_startup_unlock().unwrap();
     drop(vault);
     let reopened = std::process::Command::new(std::env::current_exe().unwrap())
@@ -188,5 +189,5 @@ fn native_credential_store_round_trip() {
         Vault::unlock_remembered(&path),
         Err(Error::NotFound)
     ));
-    drop(Vault::unlock(&path, ROTATED).unwrap());
+    drop(Vault::unlock(&path, &rotated).unwrap());
 }
