@@ -27,7 +27,10 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 mod envelope;
+mod startup_unlock;
 mod storage;
+
+pub use startup_unlock::StartupUnlockState;
 
 pub const MIN_MASTER_PASSWORD_BYTES: usize = 12;
 pub const MAX_MASTER_PASSWORD_BYTES: usize = 1024;
@@ -76,6 +79,7 @@ pub enum Error {
     InvalidInput(&'static str),
     Limit,
     Crypto,
+    StartupCredentialUnavailable,
     /// The operation was published, but syncing the destination directory failed.
     Durability(io::Error),
     Io(io::Error),
@@ -96,6 +100,8 @@ impl fmt::Display for Error {
             Self::InvalidInput(message) => formatter.write_str(message),
             Self::Limit => formatter.write_str("the vault exceeds its size or resource limit"),
             Self::Crypto => formatter.write_str("could not derive or use the vault encryption key"),
+            Self::StartupCredentialUnavailable => formatter
+                .write_str("could not use the device credential store for automatic vault unlock"),
             Self::Durability(error) => {
                 write!(formatter, "vault saved, but directory sync failed: {error}")
             }

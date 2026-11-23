@@ -49,6 +49,10 @@ pub(super) fn lock(path: &Path) -> Result<Lock, Error> {
 }
 
 pub(super) fn read(path: &Path) -> Result<Vec<u8>, Error> {
+    read_bounded(path, MAX_FILE_BYTES)
+}
+
+pub(super) fn read_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>, Error> {
     if !exists(path)? {
         return Err(Error::NotFound);
     }
@@ -57,13 +61,12 @@ pub(super) fn read(path: &Path) -> Result<Vec<u8>, Error> {
     if !regular(&metadata) {
         return Err(Error::InvalidFormat);
     }
-    if metadata.len() > MAX_FILE_BYTES as u64 {
+    if metadata.len() > max_bytes as u64 {
         return Err(Error::Limit);
     }
     let mut bytes = Vec::new();
-    file.take(MAX_FILE_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_FILE_BYTES {
+    file.take(max_bytes as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
         return Err(Error::Limit);
     }
     Ok(bytes)
@@ -144,7 +147,7 @@ fn create_temporary(path: &Path) -> Result<(Temporary, File), Error> {
     Err(Error::AlreadyExists)
 }
 
-fn sidecar(path: &Path, suffix: &str) -> Result<PathBuf, Error> {
+pub(super) fn sidecar(path: &Path, suffix: &str) -> Result<PathBuf, Error> {
     let mut name = OsString::from(
         path.file_name()
             .ok_or(Error::InvalidInput("vault path requires a file name"))?,

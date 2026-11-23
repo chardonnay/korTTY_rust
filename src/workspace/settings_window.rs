@@ -9,6 +9,7 @@ use iced::widget::{
 use iced::{Alignment, Color, Element, Length, Padding, Size, Task, window};
 use kortty_ssh::KeepAlive;
 use kortty_terminal::TextEncoding;
+use kortty_vault::{StartupUnlockState, Vault};
 
 use crate::clipboard_policy::ClipboardPolicy;
 use crate::connection_store::{
@@ -235,6 +236,7 @@ pub enum Setting {
     ToolbarIconSize,
     StartupMasterPassword,
     ChangeMasterPassword,
+    AutomaticVaultUnlock,
     TemporarySshKey,
     DefaultIsolation,
     SandboxAvailability,
@@ -335,6 +337,7 @@ impl Setting {
         Self::ToolbarIconSize,
         Self::StartupMasterPassword,
         Self::ChangeMasterPassword,
+        Self::AutomaticVaultUnlock,
         Self::TemporarySshKey,
         Self::DefaultIsolation,
         Self::SandboxAvailability,
@@ -447,6 +450,7 @@ impl Setting {
             Self::ToolbarIconSize => "Toolbar icon size",
             Self::StartupMasterPassword => "Require master password at startup",
             Self::ChangeMasterPassword => "Change master password",
+            Self::AutomaticVaultUnlock => "Automatic vault unlock",
             Self::TemporarySshKey => "Enable temporary SSH key option",
             Self::DefaultIsolation => "Default isolation",
             Self::SandboxAvailability => "Sandbox availability",
@@ -545,6 +549,7 @@ impl Setting {
             Self::ExportWatermark | Self::ExportFooter | Self::ExportSnippetCode => Section::Export,
             Self::StartupMasterPassword
             | Self::ChangeMasterPassword
+            | Self::AutomaticVaultUnlock
             | Self::TemporarySshKey
             | Self::DefaultIsolation
             | Self::SandboxAvailability => Section::Security,
@@ -693,6 +698,9 @@ impl Setting {
             Self::ToolbarIconSize => "symbol size toolbar button pixels appearance",
             Self::StartupMasterPassword => "vault unlock startup login authentication security",
             Self::ChangeMasterPassword => "vault rotate credential password security",
+            Self::AutomaticVaultUnlock => {
+                "skip master password prompt remember device keyring startup"
+            }
             Self::TemporarySshKey => "quick connect sftp paste in memory expires private key",
             Self::DefaultIsolation => {
                 "session isolation local shell ssh containment separate process managed minimum"
@@ -795,6 +803,7 @@ pub enum Message {
     ),
     Startup(window::Id, startup_settings::Edit),
     ChangeMasterPassword(window::Id),
+    AutomaticVaultUnlock(window::Id, bool),
     TemporarySshKey(window::Id, bool),
     DefaultIsolation(window::Id, IsolationLevel),
     SandboxAvailability(window::Id, String),
@@ -1503,7 +1512,8 @@ impl Workspace {
                     .map(|dialog| dialog.section.guide_chapter())
                     .map_or_else(Task::none, |chapter| self.show_manual_chapter(&chapter));
             }
-            Message::ChangeMasterPassword(id) => {
+            message
+            @ (Message::ChangeMasterPassword(id) | Message::AutomaticVaultUnlock(id, _)) => {
                 let Some(dialog) = self
                     .settings
                     .0
@@ -1512,12 +1522,18 @@ impl Workspace {
                 else {
                     return Task::none();
                 };
+                let action = match message {
+                    Message::AutomaticVaultUnlock(_, true) => {
+                        crate::vault_window::Message::ReviewStartupUnlock
+                    }
+                    Message::AutomaticVaultUnlock(_, false) => {
+                        crate::vault_window::Message::ForgetStartupUnlock
+                    }
+                    _ => crate::vault_window::Message::ChangeMaster,
+                };
                 let opened = self.show_vault(dialog.owner);
                 return match self.vault_id {
-                    Some(vault) => opened.chain(Task::done(Desktop::Vault(
-                        vault,
-                        crate::vault_window::Message::ChangeMaster,
-                    ))),
+                    Some(vault) => opened.chain(Task::done(Desktop::Vault(vault, action))),
                     None => opened,
                 };
             }
@@ -3936,6 +3952,45 @@ impl Workspace {
                 .into()
             };
         let imported = dialog.draft.preferences.java_security;
+        let vault_path = profile::vault_path().ok();
+        let vault_exists = vault_path
+            .as_ref()
+            .is_some_and(|path| Vault::exists(path).unwrap_or(false));
+        let startup_unlock = vault_path
+            .as_ref()
+            .and_then(|path| Vault::startup_unlock_state(path).ok());
+        let (automatic_status, automatic_action, enable) = match startup_unlock {
+            Some(StartupUnlockState::Enabled) => (
+                if require_password {
+                    "Enabled on this device. The startup password requirement takes precedence."
+                } else {
+                    "Enabled on this device."
+                },
+                "Disable automatic unlock",
+                false,
+            ),
+            Some(StartupUnlockState::RemovalPending) => (
+                "Disabled. The device credential still needs to be removed.",
+                "Retry credential removal",
+                false,
+            ),
+            Some(StartupUnlockState::Disabled) => (
+                if !vault_exists {
+                    "Create a credential vault before enabling automatic unlock."
+                } else {
+                    "The device’s credential store can unlock your vault when kortty starts."
+                },
+                "Configure automatic unlock…",
+                true,
+            ),
+            None => (
+                "The automatic unlock setting could not be read.",
+                "Configure automatic unlock…",
+                true,
+            ),
+        };
+        let can_set_automatic =
+            startup_unlock.is_some() && (!enable || (vault_exists && password_editable));
         column![
             text("Master password").size(18),
             text("Your master password unlocks the local credential vault.").size(13),
@@ -3965,10 +4020,18 @@ impl Workspace {
                     } else {
                         text("Takes effect the next time korTTY starts.").size(13)
                     },
-                    (!require_password).then(|| text(
-                        "Unlock the vault manually when you need saved credentials."
-                    )
-                    .size(13)),
+                ]
+                .spacing(5),
+            ),
+            highlighted(
+                dialog,
+                Setting::AutomaticVaultUnlock,
+                column![
+                    text(Setting::AutomaticVaultUnlock.label()),
+                    text(automatic_status).size(13),
+                    dialog_design::secondary_action(automatic_action).on_press_maybe(
+                        can_set_automatic.then_some(Desktop::Settings(Message::AutomaticVaultUnlock(id, enable)))
+                    ),
                 ]
                 .spacing(5),
             ),
@@ -5361,6 +5424,13 @@ mod tests {
         assert_eq!(
             workspace.settings.0.as_ref().unwrap().revealed,
             Some(Setting::StartupMasterPassword)
+        );
+
+        let _ = workspace.update_settings(Message::Search(id, "automatic vault unlock".into()));
+        let _ = workspace.update_settings(Message::SearchChoose(id));
+        assert_eq!(
+            workspace.settings.0.as_ref().unwrap().revealed,
+            Some(Setting::AutomaticVaultUnlock)
         );
 
         let edit = |enabled| Message::Startup(id, startup_settings::Edit::MasterPassword(enabled));

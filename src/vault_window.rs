@@ -68,6 +68,9 @@ pub enum Message {
     DeleteEntry,
     ConfirmDelete,
     ChangeMaster,
+    ReviewStartupUnlock,
+    RememberStartupUnlock,
+    ForgetStartupUnlock,
     Backup,
     ManageEnvironments,
     Environment(iced::window::Id, environment_access::Message),
@@ -328,6 +331,7 @@ struct UnlockPrompt {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Operation {
     ChangeMaster,
+    StartupUnlock,
     Backup,
     Delete,
     Restore,
@@ -963,6 +967,46 @@ impl VaultWindow {
             }
     }
 
+    fn try_remembered(&mut self) -> Task<Message> {
+        let path = self.path.clone();
+        self.busy = true;
+        Task::future(async move {
+            let result = Vault::unlock_remembered(path);
+            let status = result
+                .as_ref()
+                .map(|_| "Vault unlocked.")
+                .map_err(ToString::to_string);
+            Message::Completed(Completion(Arc::new(Mutex::new(Some(Finished {
+                vault: result.ok(),
+                status,
+                selected: None,
+                recovery_key_changed: false,
+            })))))
+        })
+    }
+
+    fn forget_startup_unlock(&mut self) -> Task<Message> {
+        const STATUS: &str = "Automatic vault unlock disabled.";
+        if self.is_unlocked() {
+            return self.mutate(false, |vault| {
+                vault.forget_startup_unlock().map(|()| (None, STATUS))
+            });
+        }
+        let path = self.path.clone();
+        self.busy = true;
+        Task::future(async move {
+            let status = Vault::forget_locked_startup_unlock(path)
+                .map(|()| STATUS)
+                .map_err(|error| error.to_string());
+            Message::Completed(Completion(Arc::new(Mutex::new(Some(Finished {
+                vault: None,
+                status,
+                selected: None,
+                recovery_key_changed: false,
+            })))))
+        })
+    }
+
     fn save_entry(&mut self, update_secret: Secret) -> Task<Message> {
         let Some(draft) = self.draft.as_ref() else {
             return Task::none();
@@ -1147,6 +1191,25 @@ impl VaultWindow {
                 self.revoke_webhook_test();
                 self.operation = Some(Operation::ChangeMaster);
             }
+            Message::ReviewStartupUnlock
+                if self.exists && self.draft.is_none() && self.operation.is_none() =>
+            {
+                self.revoke_webhook_test();
+                self.operation = Some(Operation::StartupUnlock);
+            }
+            Message::RememberStartupUnlock
+                if self.is_unlocked() && self.operation == Some(Operation::StartupUnlock) =>
+            {
+                self.operation = None;
+                return self.mutate(false, |vault| {
+                    vault
+                        .remember_startup_unlock()
+                        .map(|()| (None, "Automatic vault unlock enabled on this device."))
+                });
+            }
+            Message::ForgetStartupUnlock if self.draft.is_none() && self.operation.is_none() => {
+                return self.forget_startup_unlock();
+            }
             Message::Backup if self.draft.is_none() && self.operation.is_none() => {
                 self.revoke_webhook_test();
                 self.operation = Some(Operation::Backup);
@@ -1167,9 +1230,16 @@ impl VaultWindow {
                 self.confirm = Secret::default();
                 self.operation = None;
                 return self.mutate(true, move |vault| {
-                    vault
-                        .change_master_password(old.as_bytes(), new.as_bytes())
-                        .map(|()| (None, "Master password changed."))
+                    let changed = vault.change_master_password(old.as_bytes(), new.as_bytes());
+                    let refresh_failed = matches!(changed, Ok(()) | Err(VaultError::Durability(_)))
+                        && vault.refresh_startup_unlock().is_err();
+                    changed.map(|()| {
+                        (None, if refresh_failed {
+                            "Master password changed. Automatic unlock needs attention in Security settings."
+                        } else {
+                            "Master password changed."
+                        })
+                    })
                 });
             }
             Message::SubmitBackup if self.operation == Some(Operation::Backup) => {
@@ -1199,13 +1269,16 @@ impl VaultWindow {
                     self.exists = exists;
                 }
                 if finished.status.is_ok() {
-                    let resume_password_change = self.vault.is_none()
-                        && self.operation == Some(Operation::ChangeMaster)
-                        && finished.vault.is_some();
+                    let resume_operation = self.operation.filter(|operation| {
+                        self.vault.is_none()
+                            && matches!(
+                                operation,
+                                Operation::ChangeMaster | Operation::StartupUnlock
+                            )
+                            && finished.vault.is_some()
+                    });
                     self.clear_form();
-                    if resume_password_change {
-                        self.operation = Some(Operation::ChangeMaster);
-                    }
+                    self.operation = resume_operation;
                 }
                 self.vault = finished.vault;
                 self.sudo_revision = Arc::new(());
@@ -1364,6 +1437,8 @@ impl VaultWindow {
             .push(
                 text(if self.operation == Some(Operation::ChangeMaster) {
                     "Unlock the vault to change its master password"
+                } else if self.operation == Some(Operation::StartupUnlock) {
+                    "Unlock the vault to configure automatic unlock"
                 } else if self.exists {
                     "Unlock the vault"
                 } else {
@@ -1403,6 +1478,8 @@ impl VaultWindow {
         .spacing(8);
         if !self.exists {
             actions = actions.push(button("Restore encrypted backup").on_press(Message::Restore));
+        } else if self.operation == Some(Operation::StartupUnlock) {
+            actions = actions.push(button("Cancel").on_press(Message::CancelEdit));
         }
         contents.push(actions).into()
     }
@@ -1484,6 +1561,23 @@ impl VaultWindow {
                         button("Cancel").on_press(Message::CancelEdit)
                     ]
                     .spacing(8),
+                ]
+                .spacing(8)
+                .into();
+            }
+            Some(Operation::StartupUnlock) => {
+                return column![
+                    text("Automatically unlock the vault on this device?").size(18),
+                    text(
+                        "kortty will store the vault unlock key in this device’s credential store."
+                    )
+                    .wrapping(text::Wrapping::WordOrGlyph),
+                    row![
+                        button("Enable automatic unlock").on_press(Message::RememberStartupUnlock),
+                        button("Cancel").on_press(Message::CancelEdit),
+                    ]
+                    .spacing(8)
+                    .wrap(),
                 ]
                 .spacing(8)
                 .into();

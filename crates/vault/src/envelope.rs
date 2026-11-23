@@ -129,8 +129,15 @@ pub(super) fn authenticate(
 ) -> Result<(Salt, Key, BTreeMap<String, Entry>), Error> {
     let salt = salt(snapshot)?;
     let key = derive_key(master, &salt)?;
-    let entries = decode(&open(snapshot, &key)?)?;
+    let entries = authenticate_key(snapshot, &key)?;
     Ok((salt, key, entries))
+}
+
+pub(super) fn authenticate_key(
+    snapshot: &[u8],
+    key: &Key,
+) -> Result<BTreeMap<String, Entry>, Error> {
+    decode(&open(snapshot, key)?)
 }
 
 pub(super) fn salt(snapshot: &[u8]) -> Result<Salt, Error> {

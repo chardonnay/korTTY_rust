@@ -1027,6 +1027,14 @@ impl Workspace {
         let message = match message {
             VaultMessage::FocusUnlock => return self.focus_vault_unlock(id),
             VaultMessage::ManageEnvironments => return self.show_environment(id),
+            VaultMessage::ReviewStartupUnlock | VaultMessage::RememberStartupUnlock
+                if self.exiting
+                    || self.scheduler_draining
+                    || self.clipboard.policy.require_master_password
+                    || self.clipboard.policy.problem.is_some() =>
+            {
+                return Task::none();
+            }
             VaultMessage::Environment(dialog, message) => {
                 return self.update_environment(dialog, message);
             }

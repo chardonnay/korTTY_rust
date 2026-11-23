@@ -345,11 +345,10 @@ In Java v2.26.0, the optional startup setting stores an obfuscated master
 password in a local file. The Settings dialog refreshes it after rotation
 and clears it when the setting is disabled. A stale or invalid remembered
 password falls back to a prompt. Java's fresh-profile bootstrap supplies
-its own default password. Rust currently has the startup prompt and
-master-password rotation. The open Rust feature is explicit auto-unlock
-for an existing vault using protected device-local storage. Verify
-normal vault setup on a fresh profile, password rotation, manual fallback,
-disabling and precedence of the managed startup requirement.
+its own default password. Rust had the startup prompt and master-password
+rotation at this checkpoint. The
+[native auto-unlock update](#november-23-native-vault-startup-unlock)
+adds an explicit device-local opt-in for an existing vault.
 [Java Settings](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SettingsDialog.java)
 · [Java master password manager](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/security/MasterPasswordManager.java)
 · [Rust startup gate](src/startup.rs)
@@ -358,14 +357,68 @@ disabling and precedence of the managed startup requirement.
 The tagged Java saved-connection editor exposes a temporary SSH key,
 an expiry from 1 to 1,440 minutes with a default of 60, and a permanent
 option. Java encrypts the stored key and preserves its ciphertext if
-an unrelated edit is saved while the vault is locked. Rust Quick Connect
+an unrelated edit is saved while the vault is locked. Its connection
+authentication asks for a fresh key when the saved key is expired or
+still held by the locked vault. Session snapshots omit the temporary
+material. Rust Quick Connect
 already holds temporary keys for the lifetime of an interactive SSH or
 SFTP attempt, including a retry. Saving encrypted temporary keys in the
 Rust connection editor is still open. The native acceptance checklist
 includes expiry, removal, restart, and preservation on locked edits.
 [Java connection editor](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ConnectionEditDialog.java)
 · [Java XML repository](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/persistence/XMLConnectionRepository.java)
+· [Java authentication resolver](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ConnectionAuthResolver.java)
 · [Rust Quick Connect](src/workspace/quick_connect.rs)
+
+## November 23 Native vault startup unlock
+
+The Security page opens the Credential Vault to authorize automatic
+unlock for an existing profile. The vault stores only its derived key and
+generation salt in Windows Credential Manager with local-machine
+persistence, macOS Keychain, or the Linux Secret Service with an encrypted
+D-Bus session. Flatpak uses the application-specific Secret portal.
+The profile sidecar stores the opt-in or pending-removal state. The
+profile archive carries the normal encrypted snapshot of the vault.
+[Vault custody](crates/vault/src/startup_unlock.rs)
+· [Archive file list](src/profile_backup/data.rs)
+· [XDG Secret portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.Secret.html)
+
+Startup opens the workspace after authenticating the encrypted snapshot.
+An unavailable credential store, unavailable key, or changed vault
+generation falls back to the typed password prompt. Managed and personal
+startup password requirements take precedence. The application checks both
+again before starting the workspace after an automatic unlock. Password
+rotation refreshes the native key. Disabling first records revocation
+locally, then deletes the device credential. Security offers a retry if
+the store is unavailable during removal. New profiles retain the normal
+vault setup.
+[Startup gate](src/startup.rs)
+· [Security controls](src/workspace/settings_window.rs)
+· [Settings guide](src/workspace/settings_window/guide.md#settings--security)
+
+Windows ARM64 passed 13 vault tests and strict vault Clippy. The native
+Credential Manager round trip reopened the vault in a new process after
+password rotation and verified removal. The native application test
+binary linked with LLVM passed 23 startup tests and the focused Security
+search test. On Fedora 44 ARM64, a private
+container session with GNOME Keyring passed 15 vault tests and the same
+native round trip. The vault suite also covered rejecting an old key
+and keeping automatic unlock disabled after failed removal. Apple Silicon
+passed 15 vault tests and 24 selected startup tests, with two ignored
+application cases. The startup suite checks a password setting that takes
+effect during automatic authentication.
+[Windows Credential Manager fixture](target/verification/20261123-vault-startup-windows-native-store-final.log)
+· [Windows startup suite](target/verification/20261123-vault-startup-windows-app-final.log)
+· [Windows Security search test](target/verification/20261123-vault-startup-windows-settings.log)
+· [Fedora Secret Service fixture](target/verification/20261123-vault-startup-fedora-container.log)
+· [Apple Silicon vault suite](target/verification/20261123-vault-startup-macos-final.log)
+· [Apple Silicon startup suite](target/verification/20261123-vault-startup-macos-policy.log)
+
+The remaining acceptance covers a live Security-to-restart flow on the
+native desktops, signed macOS Keychain access in an interactive session,
+and the installed Flatpak portal. The native Keychain fixture could not
+write its test item because the Apple Silicon SSH account has no default
+keychain.
 
 ## November 23 Windows isolation dialogs and launches
 
@@ -412,8 +465,8 @@ passed with `dialog-preview`.
 
 Remaining acceptance includes a fresh saved-profile desktop launch,
 the other desktop SSH and Teamwork checks, backend-unavailable editor
-feedback and the macOS and Linux desktop comparisons. The separate Java
-startup auto-unlock and saved temporary-key workflows remain open.
+feedback and the macOS and Linux desktop comparisons. Encrypted saved
+temporary keys remain in the implementation backlog.
 
 ## November 23 Saved and Teamwork SSH reconnect
 
