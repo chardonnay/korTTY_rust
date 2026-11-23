@@ -10,9 +10,10 @@ the porting worktree.
 ## Current result and actionable backlog
 
 **Java v2.26.0 parity remains partial.** [PR #35](https://github.com/chardonnay/korTTY_rust/pull/35)
-includes the device-local vault unlock checkpoint (`fe110de1`) and the
-saved temporary SSH key checkpoint (`cff7d8e7`). It builds on the PR #34
-merge at `10e4ee78`. The Java reference is tag `v2.26.0` at `b235d91f2035`.
+includes device-local vault unlock (`fe110de1`), saved temporary SSH keys
+(`cff7d8e7`), reviewed Java key import (`08567961`) and automatic project
+reconnect with eligible keys (`b046b261`). It builds on the PR #34 merge
+at `10e4ee78`. The Java reference is tag `v2.26.0` at `b235d91f2035`.
 Windows ARM64 desktop checks cover the Settings frame and Font and Window
 pages, the Connection Manager and selected SSH editor tabs, and specific
 AI Manager and Agent Design workflows. The standalone Agent Design editor
@@ -38,10 +39,17 @@ return to the typed password prompt. The temporary-key switch enables
 both Quick Connect and encrypted temporary credentials in the saved SSH
 editor. Java backup review can seal supported temporary keys for exact new
 saved profiles. The imported lifetime starts at credential review.
-Security also provides the global session
-isolation default and shows the native local-shell and SSH sandbox
-prerequisites. New local shells, ad hoc SSH and SFTP, and Teamwork SSH use
-the default subject to their applicable managed limits.
+The Apple Silicon tests authenticated SSH and SFTP with an imported key.
+They also exercised automatic project reconnect after vault unlock and
+deferral after expiry. Scheduled SSH and rsync still require their own
+reviewed credential binding.
+[Import verification](PORTING-PARITY.md#november-23-java-temporary-ssh-key-restore)
+· [Project reconnect verification](PORTING-PARITY.md#november-23-project-reconnect-with-temporary-ssh-keys)
+
+Security also provides the global session isolation default and shows the
+native local-shell and SSH sandbox prerequisites. New local shells, ad hoc
+SSH and SFTP, and Teamwork SSH use the default subject to their applicable
+managed limits.
 
 The Connection Manager now stores session isolation on folders and offers
 inheritance as a separate SSH profile choice. The editor shows the effective
@@ -1230,13 +1238,13 @@ not been identified.
 
 ## Implementation order
 
-Exercise [Java temporary-key backup review](PORTING-PARITY.md#november-23-java-temporary-ssh-key-restore)
-and [project reconnect](PORTING-PARITY.md#november-23-project-reconnect-with-temporary-ssh-keys)
-on the native desktops. Continue the [Scheduler credential work](#confirmed-implementation-work).
-Continue native
-desktop acceptance for [vault auto-unlock](PORTING-PARITY.md#november-23-native-vault-startup-unlock)
-and exercise the [saved key](PORTING-PARITY.md#november-23-native-saved-temporary-ssh-keys)
-and Quick Connect workflows with disposable keys.
+Implement [reviewed temporary credentials for Scheduler SSH and rsync](#confirmed-implementation-work)
+for the saved target and any jump host. Exercise the separate native
+desktop workflows for [Java backup review](PORTING-PARITY.md#november-23-java-temporary-ssh-key-restore),
+[project reconnect](PORTING-PARITY.md#november-23-project-reconnect-with-temporary-ssh-keys)
+and [vault auto-unlock](PORTING-PARITY.md#november-23-native-vault-startup-unlock).
+Use disposable keys for the [saved-key editor](PORTING-PARITY.md#november-23-native-saved-temporary-ssh-keys)
+and Quick Connect checks.
 
 Continue the [native session isolation checks](PORTING-PARITY.md#november-23-windows-isolation-dialogs-and-launches)
 with the macOS and Linux Security page and folder, SSH and local-shell
