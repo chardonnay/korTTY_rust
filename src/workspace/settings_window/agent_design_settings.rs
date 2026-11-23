@@ -20,7 +20,7 @@ use crate::workspace::terminal_agent::design::{
     AUTO_HIDE_SECONDS, DockPlacement, DockPreferences, SampleLogKey,
 };
 
-use super::{Desktop, Message};
+use super::{Desktop, Message, agent_design_name::Operation as NameOperation};
 
 mod module_table;
 mod preview;
@@ -39,11 +39,8 @@ pub(crate) enum Edit {
     FocusPreview(bool),
     Select(String),
     Default(String),
-    Duplicate(String),
-    BeginRename(String),
-    CancelRename,
-    Name(String, String),
-    Rename(String),
+    PromptName(NameOperation),
+    ApplyName(NameOperation, String),
     Remove(String),
     ConfirmRemove(String, bool),
     Module(String, Module),
@@ -190,7 +187,6 @@ impl std::fmt::Display for Module {
 #[derive(Default)]
 pub(super) struct Editor {
     selected: Option<String>,
-    name: Option<String>,
     removing: Option<String>,
     notice: &'static str,
     demo: preview::Demo,
@@ -280,7 +276,6 @@ impl Editor {
         match edit {
             Edit::Select(id) if catalog.layout(&id).is_some() => {
                 self.selected = Some(id);
-                self.name = None;
                 self.removing = None;
                 self.notice = "";
                 self.preview_module = None;
@@ -293,42 +288,22 @@ impl Editor {
                     *preset = Preset::Standard;
                 }
             }
-            Edit::Duplicate(id) => {
-                if let Some(choice) = catalog.duplicate(&id) {
+            Edit::ApplyName(operation, name) => {
+                let copy = match operation {
+                    NameOperation::New => catalog.duplicate_as(Preset::Standard.id(), &name),
+                    NameOperation::Duplicate(id) => catalog.duplicate_as(&id, &name),
+                    NameOperation::Rename(id) => {
+                        if self.selected(catalog, *preset) == id && catalog.rename(&id, &name) {
+                            self.notice = "Design renamed.";
+                        }
+                        None
+                    }
+                };
+                if let Some(choice) = copy {
                     self.selected = Some(choice.id);
-                    self.name = None;
                     self.removing = None;
                     self.notice = "";
                     self.preview_module = None;
-                }
-            }
-            Edit::BeginRename(id)
-                if self.selected(catalog, *preset) == id && Preset::from_id(&id).is_none() =>
-            {
-                self.name = catalog
-                    .choices()
-                    .into_iter()
-                    .find(|choice| choice.id == id)
-                    .map(|choice| choice.name);
-                self.removing = None;
-            }
-            Edit::CancelRename => self.name = None,
-            Edit::Name(id, name) if self.selected(catalog, *preset) == id => {
-                self.selected = Some(id);
-                self.name = Some(
-                    name[..name.floor_char_boundary(crate::terminal_agent::design::MAX_NAME_BYTES)]
-                        .to_owned(),
-                );
-                self.notice = "";
-            }
-            Edit::Rename(id) if self.selected(catalog, *preset) == id => {
-                if let Some(name) = &self.name {
-                    if catalog.rename(&id, name) {
-                        self.name = None;
-                        self.notice = "Design renamed.";
-                    } else {
-                        self.notice = "Enter a unique design name without control characters.";
-                    }
                 }
             }
             Edit::Remove(id)
@@ -342,7 +317,6 @@ impl Editor {
                 if confirmed {
                     catalog.remove(&id);
                     self.selected = None;
-                    self.name = None;
                     self.preview_module = None;
                     self.notice = "Design removed. Connections that used it will use the default.";
                 }
@@ -386,7 +360,6 @@ impl Editor {
         &'a self,
         preferences: &'a WindowSettings,
         id: window::Id,
-        target: Option<&iced::widget::Id>,
     ) -> Element<'a, Desktop> {
         let msg = move |edit| Desktop::Settings(Message::AgentDesignCatalog(id, edit));
         let catalog = &preferences.ai_agent_designs;
@@ -399,8 +372,8 @@ impl Editor {
         let is_default = catalog.default_id(preset) == selected;
         let default_id = catalog.default_id(preset);
         for choice in &mut choices {
-            if choice.id == Preset::Standard.id() {
-                choice.name = "Standard (blocks + metro line)".into();
+            if let Some(preset) = Preset::from_id(&choice.id) {
+                choice.name = preset.combination_name().into();
             }
             if choice.id == default_id {
                 choice.name.insert_str(0, "★ ");
@@ -426,17 +399,17 @@ impl Editor {
                 "New",
                 catalog
                     .can_duplicate()
-                    .then(|| msg(Edit::Duplicate(Preset::Standard.id().into())))
+                    .then(|| msg(Edit::PromptName(NameOperation::New)))
             ),
             option(
                 "Duplicate",
                 catalog
                     .can_duplicate()
-                    .then(|| msg(Edit::Duplicate(selected.into())))
+                    .then(|| msg(Edit::PromptName(NameOperation::Duplicate(selected.into()))))
             ),
             option(
                 "Rename",
-                custom.then(|| msg(Edit::BeginRename(selected.into())))
+                custom.then(|| msg(Edit::PromptName(NameOperation::Rename(selected.into()))))
             ),
             option("Delete", custom.then(|| msg(Edit::Remove(selected.into())))),
             option(
@@ -455,21 +428,6 @@ impl Editor {
             (false, false) => "Changing a built-in creates a copy.",
             (false, true) => "",
         };
-        let rename = self.name.as_deref().filter(|_| custom).map(|name| {
-            row![
-                crate::settings_search::mark_input(
-                    text_input("Design name", name)
-                        .on_input(move |name| msg(Edit::Name(selected.into(), name)))
-                        .on_submit(msg(Edit::Rename(selected.into()))),
-                    target,
-                )
-                .width(260),
-                option("Rename", Some(msg(Edit::Rename(selected.into())))),
-                option("Cancel", Some(msg(Edit::CancelRename))),
-            ]
-            .spacing(8)
-            .wrap()
-        });
         let remove = self
             .removing
             .as_deref()
@@ -634,7 +592,6 @@ impl Editor {
             text("Pick how agent runs are shown in the terminal: one design per role. The preview plays a sample run.").size(13),
             toolbar,
             text(state).size(13).style(text::secondary),
-            rename,
             remove,
             (!self.notice.is_empty()).then(|| text(self.notice).size(13)),
             center,
@@ -802,6 +759,10 @@ mod tests {
         let selected = editor.selected(&catalog, preset);
         assert_ne!(selected, "standard");
         assert_eq!(
+            catalog.choices().last().unwrap().name,
+            "Standard (blocks + metro line) 2"
+        );
+        assert_eq!(
             catalog.layout(selected),
             Some(Layout {
                 status: Status::Orbit,
@@ -817,7 +778,14 @@ mod tests {
         let mut catalog = Catalog::default();
         let mut preset = Preset::Standard;
         let mut editor = Editor::default();
-        editor.update(&mut catalog, &mut preset, Edit::Duplicate("classic".into()));
+        editor.update(
+            &mut catalog,
+            &mut preset,
+            Edit::ApplyName(
+                NameOperation::Duplicate("classic".into()),
+                "Classic 2".into(),
+            ),
+        );
         let selected = editor.selected(&catalog, preset).to_owned();
         editor.update(&mut catalog, &mut preset, Edit::Default(selected.clone()));
 

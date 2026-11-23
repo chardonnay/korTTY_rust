@@ -1077,21 +1077,18 @@ impl Dialog {
         ticket: &Arc<()>,
         paths: Option<Vec<PathBuf>>,
         can_import: bool,
-    ) -> bool {
+    ) {
         if !self.managed.pending_file_picker(ticket) {
-            return false;
+            return;
         }
         self.managed.finish_file_picker();
         if self.request.is_some() || !can_import || self.managed.has_action() {
-            return false;
+            return;
         }
-        match paths.map(|paths| self.managed.stage_files(paths)) {
-            Some(Ok(true)) => true,
-            Some(Err(problem)) => {
-                self.status = Some(problem.into());
-                false
-            }
-            _ => false,
+        if let Some(paths) = paths
+            && let Err(problem) = self.managed.stage_files(paths)
+        {
+            self.status = Some(problem.into());
         }
     }
 
@@ -2936,6 +2933,7 @@ impl Dialog {
                         mlx,
                         notice,
                     }) => {
+                        let offer_backend = self.managed.configuring();
                         self.managed.set_active_package(active_package);
                         let (default, status) = match default {
                             Ok(default) => (Some(default), notice),
@@ -2961,6 +2959,9 @@ impl Dialog {
                             None => status,
                         };
                         self.preselect_installed_default(state.default_managed_model.as_deref());
+                        if offer_backend {
+                            self.managed.offer_matching_backend();
+                        }
                         status
                     }
                     Ok(Output::ManagedNotice(notice)) => {

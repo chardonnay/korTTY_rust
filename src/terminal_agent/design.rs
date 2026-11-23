@@ -43,6 +43,14 @@ impl Preset {
         }
     }
 
+    pub(crate) fn combination_name(self) -> &'static str {
+        match self {
+            Self::Standard => "Standard (blocks + metro line)",
+            Self::Classic => "Classic",
+            Self::Floating => "Floating",
+        }
+    }
+
     pub(crate) fn is_default(&self) -> bool {
         *self == Self::default()
     }

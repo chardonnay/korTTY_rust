@@ -376,25 +376,40 @@ impl Catalog {
     }
 
     pub(crate) fn duplicate(&mut self, id: &str) -> Option<Choice> {
+        let name = self.copy_name(id)?;
+        self.duplicate_as(id, &name)
+    }
+
+    pub(crate) fn copy_name(&self, id: &str) -> Option<String> {
+        let source = match Preset::from_id(id) {
+            Some(preset) => preset.combination_name(),
+            None => &self.designs.iter().find(|design| design.id == id)?.name,
+        };
+        (2..=MAX_DESIGNS + 2).find_map(|number| {
+            let suffix = format!(" {number}");
+            let end = source.floor_char_boundary(MAX_NAME_BYTES - suffix.len());
+            let name = format!("{}{suffix}", source[..end].trim_end());
+            self.available_name(&name, None).then_some(name)
+        })
+    }
+
+    pub(crate) fn duplicate_as(&mut self, id: &str, name: &str) -> Option<Choice> {
         let layout = self.layout(id)?;
-        if !self.can_duplicate() {
+        let name = name.trim();
+        if !self.can_duplicate() || !self.available_name(name, None) {
             return None;
         }
-        let mut number = self.last_id;
-        let (id, name) = loop {
-            number = number.checked_add(1)?;
-            let name = format!("Custom design {number}");
-            if self.available_name(&name, None) {
-                break (format!("custom-{number}"), name);
-            }
-        };
-        self.last_id = number;
+        self.last_id += 1;
+        let id = format!("custom-{}", self.last_id);
         self.designs.push(Combination {
             id: id.clone(),
-            name: name.clone(),
+            name: name.to_owned(),
             layout,
         });
-        Some(Choice { id, name })
+        Some(Choice {
+            id,
+            name: name.to_owned(),
+        })
     }
 
     pub(crate) fn rename(&mut self, id: &str, name: &str) -> bool {
@@ -422,7 +437,7 @@ impl Catalog {
         }
     }
 
-    fn available_name(&self, name: &str, except: Option<&str>) -> bool {
+    pub(crate) fn available_name(&self, name: &str, except: Option<&str>) -> bool {
         if name.is_empty()
             || name.len() > MAX_NAME_BYTES
             || name.chars().any(|character| {

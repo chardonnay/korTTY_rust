@@ -3673,14 +3673,8 @@ impl Dialog {
                     && self.general.features_enabled
                     && self.page == Page::LocalModels
                     && self.search.trim().is_empty();
-                if self
-                    .local
-                    .finish_managed_file_picker(&ticket, paths, can_import)
-                {
-                    return self.open_page(search::Target::Setting(search::Setting::Managed(
-                        search::ManagedSetting::Source,
-                    )));
-                }
+                self.local
+                    .finish_managed_file_picker(&ticket, paths, can_import);
             }
             Message::Local(event)
                 if editable

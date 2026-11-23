@@ -28,7 +28,9 @@ Windows ARM64 desktop checks.
   appends ` 2` to the preset's full display name and opens a name dialog
   for New, Duplicate and Rename. New opens with `My combination` selected.
   Duplicate selects the proposed name based on the current design. Rust
-  generates `Custom design N` and renames inline. [Java editor](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignPluginManagerDialog.java)
+  generated `Custom design N` and renamed inline at that checkpoint. The
+  [naming update](#november-23-agent-design-naming) adds the owned prompts.
+  [Java editor](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignPluginManagerDialog.java)
   · [Rust editor](src/workspace/settings_window/agent_design_settings.rs)
   · [Rust catalog](src/terminal_agent/design/custom.rs)
 - **Plan and execution.** At 1,202 by 694 pixels, Java placed Metro above the
@@ -46,7 +48,9 @@ Windows ARM64 desktop checks.
   context size and idle timeout. The same long path wrapped in Rust. Java
   prompts for copy or reference after the file picker and offers a matching
   runtime when a saved GGUF model requires a different backend. Rust
-  embeds import review and offers runtime repair separately. Java stores the
+  embedded import review and offered runtime repair separately at that
+  checkpoint. The [GGUF update](#november-23-gguf-import-and-backend-review)
+  adds the owned prompts. Java stores the
   Hub publication date for MLX. At this checkpoint Rust's MLX inventory row
   supplied no date. The later [MLX update](#november-23-mlx-publication-date-on-apple-silicon)
   adds that metadata. MLX Configure and the mixed inventory need Apple Silicon
@@ -127,6 +131,45 @@ registry reloaded it. A separate mixed-inventory test passed and sorted
 the dated MLX model, older GGUF model and undated model in that order.
 The dated and undated rows still need a desktop comparison after restart.
 [Native test record](target/verification/20261123-mlx-publication-and-plan-macos.log)
+
+## November 23 Agent Design naming
+
+New, Duplicate and Rename open an owned dialog and select the initial
+name. New proposes `My combination`. Duplicate and an automatic copy
+of a built-in use the full preset name with a numeric suffix starting
+at ` 2`. Rename keeps the design ID. Cancel leaves the catalog intact.
+The standalone editor saves accepted changes immediately. Global Settings
+keeps them in its draft until Save.
+
+The initial Windows ARM64 comparison confirmed the selected New and
+Duplicate proposals, Escape and a saved duplicate. The Rust prompt was
+taller than Java's. The height constraint was corrected afterward.
+The compact prompt and renamed preset after restart still need native
+desktop checks. The first Apple Silicon run passed 33 naming and related
+dialog tests, including draft behavior, cancellation and stale actions.
+[Rust name prompt](src/workspace/settings_window/agent_design_name.rs)
+· [Apple Silicon log](target/verification/20261123-agent-design-naming-macos-final.log)
+
+## November 23 GGUF import and backend review
+
+The native file picker opens an owned review of the selected GGUF paths.
+It reconciles selected shards of the same model, preserves the model purpose
+and optional projector controls, and offers private copies or external
+references. Eligible detached models retain their reattachment path.
+Cancel discards the staged selection. A saved Configure draft that requires
+a different backend from the installed runtime offers to open the existing
+signed-runtime review or keep the current runtime. Installation requires
+the separate review. Windows paths in the model review use their normal
+display form while registration retains the canonical source.
+
+The focused Apple Silicon run passed 64 tests serially, including picker
+cancellation, batch import, split-model reattachment and both replies to
+the runtime offer. Two tests in the earlier parallel run hit the shared
+managed-model operation lock. Native desktop acceptance remains open for
+both import choices, both runtime responses, and the Configure width and
+long-path layout against Java.
+[Rust GGUF actions](src/ai_manager/local/managed.rs)
+· [Apple Silicon serial retest](target/verification/20261123-gguf-import-review-macos-current.log)
 
 ## November 22 AI Manager and Agent Design on Windows ARM64
 

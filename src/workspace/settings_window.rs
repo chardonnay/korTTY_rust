@@ -20,8 +20,6 @@ use crate::profile_backup::preferences::Preferences as BackupPreferences;
 use crate::sftp_window::ConflictDefault;
 #[cfg(test)]
 use crate::terminal_agent::design::Preset as AgentDesign;
-#[cfg(test)]
-use crate::terminal_theme::Scheme;
 use crate::terminal_theme::{BoldTextMode, MONOSPACED, installed_families, installed_font};
 use crate::workspace::dialog_placement::{Kind as DialogKind, escape::on_escape};
 use kortty_terminal::ScrollbackConfig;
@@ -47,6 +45,7 @@ const SEARCH_MAX_WIDTH: f32 = 640.0;
 const SEARCH_RESULTS_MAX_HEIGHT: f32 = 380.0;
 const SEARCH_ROW_HEIGHT: f32 = 32.0;
 
+mod agent_design_name;
 mod agent_design_settings;
 mod appearance_settings;
 mod backup;
@@ -726,6 +725,7 @@ pub enum Message {
     Design(window::Id, Design),
     DesignAnimations(window::Id, bool),
     AgentDesignCatalog(window::Id, agent_design_settings::Edit),
+    AgentDesignName(window::Id, agent_design_name::Action),
     ApplicationUpdates(window::Id, bool),
     ApplicationUpdateInterval(window::Id, u8),
     PasteWarning(window::Id, WarningMode),
@@ -1118,6 +1118,7 @@ struct Dialog {
     snippet_appearance: snippet_editor_settings::Editor,
     themes: theme_settings::Editor,
     agent_design: agent_design_settings::Editor,
+    agent_design_name: Option<agent_design_name::Prompt>,
     backup: backup::Editor,
     logging: logging_settings::Editor,
     export: export_settings::Editor,
@@ -1272,16 +1273,17 @@ impl Settings {
     }
 
     pub(super) fn title(&self, id: window::Id) -> Option<&'static str> {
-        self.0
+        let dialog = self.0.as_ref()?;
+        if dialog
+            .agent_design_name
             .as_ref()
-            .filter(|dialog| dialog.id == id)
-            .map(|dialog| {
-                if dialog.standalone_agent_design {
-                    "AI Agent Design"
-                } else {
-                    TITLE
-                }
-            })
+            .is_some_and(|prompt| prompt.id == id)
+            || dialog.id == id && dialog.standalone_agent_design
+        {
+            Some(agent_design_name::TITLE)
+        } else {
+            (dialog.id == id).then_some(TITLE)
+        }
     }
 
     pub(super) fn owner_closed(&mut self, owner: window::Id) -> Option<window::Id> {
@@ -1334,7 +1336,13 @@ impl Workspace {
     }
 
     pub(super) fn close_settings(&mut self, id: window::Id) -> Option<Task<Desktop>> {
+        if let Some(close) = self.close_agent_design_name(id) {
+            return Some(close);
+        }
         let dialog = self.settings.0.as_ref().filter(|dialog| dialog.id == id)?;
+        if let Some(prompt) = &dialog.agent_design_name {
+            return Some(window::gain_focus(prompt.id));
+        }
         if dialog.saving() {
             return Some(Task::none());
         }
@@ -1396,6 +1404,7 @@ impl Workspace {
                     window::gain_focus(
                         self.openpgp_for_source(id)
                             .or_else(|| self.highlight_rules_for_settings(id))
+                            .or_else(|| self.agent_design_name_for(id))
                             .unwrap_or(id),
                     )
                 });
@@ -1413,7 +1422,14 @@ impl Workspace {
                 return self.dismiss_settings(id);
             }
             Message::Cancel(id) => return self.close_settings(id).unwrap_or_else(Task::none),
-            Message::Save(id) => return self.save_settings(id),
+            Message::Save(id) => {
+                return if let Some(prompt) = self.agent_design_name_for(id) {
+                    window::gain_focus(prompt)
+                } else {
+                    self.save_settings(id)
+                };
+            }
+            Message::AgentDesignName(id, edit) => return self.update_agent_design_name(id, edit),
             Message::ToolbarIconSizeSaved(id, result) => {
                 return self.toolbar_icon_size_saved(id, result);
             }
@@ -1538,6 +1554,14 @@ impl Workspace {
                     .is_some();
         if let Some(child) = self.highlight_rules_for_settings(id) {
             return window::gain_focus(child);
+        }
+        if let Some(prompt) = self.agent_design_name_for(id)
+            && !matches!(
+                message,
+                Message::AgentDesignCatalog(_, agent_design_settings::Edit::Demo(_))
+            )
+        {
+            return window::gain_focus(prompt);
         }
         let Some(dialog) = self.settings.dialog_mut(id) else {
             return Task::none();
@@ -1984,6 +2008,9 @@ impl Workspace {
                 let standalone = dialog.standalone_agent_design;
                 let preferences = &mut dialog.draft.preferences;
                 match edit {
+                    Edit::PromptName(operation) => {
+                        return self.open_agent_design_name(id, operation);
+                    }
                     Edit::DockPlacement(placement) => {
                         preferences.ai_agent_panel.placement = Some(placement)
                     }
@@ -2173,6 +2200,9 @@ impl Workspace {
             return self.update(focus);
         }
         if let Some(dialog) = &mut self.settings.0 {
+            if let Some(prompt) = &dialog.agent_design_name {
+                return window::gain_focus(prompt.id);
+            }
             let id = dialog.id;
             let reveal = section
                 .filter(|_| !dialog.standalone_agent_design)
@@ -2261,6 +2291,7 @@ impl Workspace {
             snippet_appearance: snippet_editor_settings::Editor::default(),
             themes: theme_settings::Editor::default(),
             agent_design: agent_design_settings::Editor::default(),
+            agent_design_name: None,
             backup: backup::Editor::default(),
             logging: logging_settings::Editor::default(),
             export: export_settings::Editor::default(),
@@ -2918,11 +2949,24 @@ impl Workspace {
     }
 
     pub(super) fn settings_view(&self, id: window::Id) -> Option<Element<'_, Desktop>> {
-        let dialog = self.settings.0.as_ref().filter(|dialog| dialog.id == id)?;
+        let dialog = self.settings.0.as_ref()?;
+        if let Some(prompt) = dialog
+            .agent_design_name
+            .as_ref()
+            .filter(|prompt| prompt.id == id)
+        {
+            return Some(prompt.view(&dialog.draft.preferences.ai_agent_designs));
+        }
+        if dialog.id != id {
+            return None;
+        }
+        let naming_modal = self
+            .agent_design_name_for(id)
+            .map(|id| Desktop::Settings(Message::Focus(id)));
         if dialog.standalone_agent_design {
             let preferences = &dialog.draft.preferences;
             let content = column![
-                scrollable(dialog.agent_design.view(preferences, id, None))
+                scrollable(dialog.agent_design.view(preferences, id))
                     .id(dialog.page_scroll.clone())
                     .translate_cursor_moves(true)
                     .height(Length::Fill),
@@ -2943,11 +2987,13 @@ impl Workspace {
             .height(Length::Fill)
             .into();
             let content = on_escape(content, Desktop::Settings(Message::Escape(id)));
-            return Some(
-                dialog
-                    .agent_design
-                    .preview_keyboard(content, preferences, id),
-            );
+            let content = dialog
+                .agent_design
+                .preview_keyboard(content, preferences, id);
+            return Some(super::profile_tools::vault_modal::gate(
+                content,
+                naming_modal,
+            ));
         }
         if dialog.saving() {
             return Some(
@@ -3170,11 +3216,7 @@ impl Workspace {
                 highlighted(
                     dialog,
                     Setting::AgentDesign,
-                    dialog.agent_design.view(
-                        preferences,
-                        id,
-                        dialog.input_target(Setting::AgentDesign, true),
-                    ),
+                    dialog.agent_design.view(preferences, id),
                 )
             }
             Section::Updates => {
@@ -3313,14 +3355,19 @@ impl Workspace {
         };
         let modal = self
             .highlight_rules_for_settings(id)
-            .map(|id| Desktop::Highlight(highlight::Message::Focus(id)));
+            .map(|id| Desktop::Highlight(highlight::Message::Focus(id)))
+            .or(naming_modal);
         Some(super::profile_tools::vault_modal::gate(content, modal))
     }
 
     fn dismiss_settings(&mut self, id: window::Id) -> Task<Desktop> {
+        if let Some(close) = self.close_agent_design_name(id) {
+            return close;
+        }
         if let Some(child) = self
             .openpgp_for_source(id)
             .or_else(|| self.highlight_rules_for_settings(id))
+            .or_else(|| self.agent_design_name_for(id))
         {
             return window::gain_focus(child);
         }
@@ -5987,7 +6034,8 @@ mod tests {
 
     #[test]
     fn custom_agent_design_is_edited_previewed_and_saved_through_settings() {
-        use crate::terminal_agent::design::{Approval, Arrangement, History, Status};
+        use crate::terminal_agent::design::{Approval, Arrangement, Catalog, History, Status};
+        use agent_design_name::{Action as NameAction, Operation as NameOperation};
         use agent_design_settings::{Edit, Module};
 
         let mut workspace = Workspace::default();
@@ -5995,10 +6043,49 @@ mod tests {
         let _ = workspace.open_settings(owner, None);
         let id = workspace.settings.0.as_ref().unwrap().id;
         let _ = workspace.update_settings(Message::Section(id, Section::AgentDesign));
+        for (operation, suggested) in [
+            (NameOperation::New, "My combination"),
+            (
+                NameOperation::Duplicate("standard".into()),
+                "Standard (blocks + metro line) 2",
+            ),
+        ] {
+            let _ = workspace
+                .update_settings(Message::AgentDesignCatalog(id, Edit::PromptName(operation)));
+            let child = workspace.agent_design_name_for(id).unwrap();
+            assert_eq!(workspace.placed_dialog_owner(child), Some(id));
+            let dialog = workspace.settings.0.as_ref().unwrap();
+            assert_eq!(dialog.agent_design_name.as_ref().unwrap().name, suggested);
+            assert_eq!(
+                dialog.draft.preferences.ai_agent_designs,
+                Catalog::default()
+            );
+            assert!(workspace.settings_view(child).is_some());
+            let _ = workspace.update_settings(Message::AgentDesignName(
+                child,
+                NameAction::Input("Cancelled".into()),
+            ));
+            let _ = workspace.update_settings(Message::Escape(child));
+            let _ = workspace.update_settings(Message::AgentDesignName(child, NameAction::Submit));
+            assert!(workspace.settings.title(child).is_none());
+            assert_eq!(
+                workspace
+                    .settings
+                    .0
+                    .as_ref()
+                    .unwrap()
+                    .draft
+                    .preferences
+                    .ai_agent_designs,
+                Catalog::default(),
+            );
+        }
         let _ = workspace.update_settings(Message::AgentDesignCatalog(
             id,
-            Edit::Duplicate("floating".into()),
+            Edit::PromptName(NameOperation::Duplicate("floating".into())),
         ));
+        let child = workspace.agent_design_name_for(id).unwrap();
+        let _ = workspace.update_settings(Message::AgentDesignName(child, NameAction::Submit));
         let choice = workspace
             .settings
             .0
@@ -6010,9 +6097,25 @@ mod tests {
             .choices()
             .pop()
             .unwrap();
+        assert_eq!(choice.name, "Floating 2");
+        let _ = workspace.update_settings(Message::AgentDesignCatalog(
+            id,
+            Edit::PromptName(NameOperation::Rename(choice.id.clone())),
+        ));
+        let child = workspace.agent_design_name_for(id).unwrap();
+        let _ = workspace.update_settings(Message::AgentDesignName(
+            child,
+            NameAction::Input(" ".into()),
+        ));
+        let _ = workspace.update_settings(Message::AgentDesignName(child, NameAction::Submit));
+        assert_eq!(workspace.agent_design_name_for(id), Some(child));
+        let _ = workspace.update_settings(Message::AgentDesignName(
+            child,
+            NameAction::Input("Review cards".into()),
+        ));
+        let _ = workspace.update_settings(Message::AgentDesignName(child, NameAction::Submit));
+        assert!(workspace.settings.title(child).is_none());
         for edit in [
-            Edit::Name(choice.id.clone(), "Review cards".into()),
-            Edit::Rename(choice.id.clone()),
             Edit::Module(choice.id.clone(), Module::History(History::StepCards)),
             Edit::Module(choice.id.clone(), Module::Status(Status::Pill)),
             Edit::Module(choice.id.clone(), Module::Approval(Approval::AboveActivity)),
