@@ -347,6 +347,8 @@ pub(super) fn drawer_uses_typed_list(status: Status) -> bool {
     )
 }
 
+const REPAIRING_PHASE: &str = "Repairing response";
+
 pub(super) fn phase(run: &Run) -> (&'static str, usize) {
     if run.cancel.requested() && run.phase.working() {
         return ("Cancelling", 2);
@@ -355,7 +357,7 @@ pub(super) fn phase(run: &Run) -> (&'static str, usize) {
         return ("Paused", 2);
     }
     if run.phase.deciding() && run.presentation.model_usage.repairing(run.epoch) {
-        return ("Repairing response", 2);
+        return (REPAIRING_PHASE, 2);
     }
     match run.phase {
         Phase::Setup | Phase::Directory | Phase::SavedPreflight => ("Setup", 0),

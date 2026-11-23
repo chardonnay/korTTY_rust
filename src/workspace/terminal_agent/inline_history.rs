@@ -1,6 +1,9 @@
 //! Typed, masked activity for inline history and reviewed Chat follow-up.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{Duration, Instant, SystemTime};
 
 use iced::{Task, keyboard, window};
@@ -57,6 +60,9 @@ impl History {
             for line in &mut step.output {
                 redact(line)?;
             }
+            if let Some(output) = &mut step.captured_output {
+                *output = mask::captured_output(redactor, output)?.into();
+            }
         }
         Ok(())
     }
@@ -105,6 +111,7 @@ impl History {
             detail,
             command,
             output: Vec::new(),
+            captured_output: None,
             exit_code: None,
             elapsed_ms: None,
             tokens: None,
@@ -137,8 +144,18 @@ impl History {
         if let engine::Status::Exited(code) = status {
             step.exit_code = Some(code);
         }
-        // Keep the tail of bounded command output. Every string has already
-        // passed the run redactor.
+        // Both streams have already passed the run redactor. Keep the
+        // captured text for copying and a short tail for inline rendering.
+        if !stdout.is_empty() || !stderr.is_empty() {
+            let mut captured = String::with_capacity(stdout.len() + stderr.len() + 1);
+            for (position, line) in stdout.lines().chain(stderr.lines()).enumerate() {
+                if position != 0 {
+                    captured.push('\n');
+                }
+                captured.push_str(line);
+            }
+            step.captured_output = Some(Arc::from(captured));
+        }
         step.output = stdout
             .lines()
             .chain(stderr.lines())

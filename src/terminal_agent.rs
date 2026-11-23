@@ -20,7 +20,7 @@ pub(crate) use decision::requires_confirmation_by_shape;
 pub(crate) use decision::{Action, Command, Decision, Elevation, MAX_QUESTIONS, MAX_TURNS, Risk};
 pub(crate) use directory::{LocalDirectory, valid_label as valid_target_label};
 pub(crate) use local::Shell;
-pub(crate) use runner::{Cancel, Outcome, Status};
+pub(crate) use runner::{CAPTURED_TEXT_LIMIT, Cancel, Outcome, Status};
 pub(crate) use ssh::password;
 pub(crate) use ssh::{direct as capture_ssh_lease, remote_command as wrap_ssh_command};
 

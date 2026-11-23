@@ -68,8 +68,9 @@ Windows ARM64 desktop checks.
   [Java source configuration](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/rag/RagConfigurationManager.java)
   · [Rust source inventory](src/ai_manager/local/knowledge_inventory.rs)
 
-Two November 22 findings still apply at `aaa8d037`. The step menu copies
-the eight-line preview with at most 320 characters per line. Settings
+At `aaa8d037`, the step menu copied the eight-line preview with at most
+320 characters per line. The [step-copy update](#november-23-complete-masked-step-copy)
+uses the retained output. Settings
 requires two characters and AI Manager accepts one. Both filter entries in
 enumeration order. The [matcher and clipboard comparison](#november-22-design-editing-command-output-and-settings-search)
 links the Java behavior and the corresponding Rust paths.
@@ -189,12 +190,31 @@ test indexes two sources, fails a later update, then opens a new Manager
 and verifies the error, problem count, both saved timestamps and the
 other row. Automatic sync also restores an unavailable source, preserving
 its published passages. A changed source limit cleared the affected
-outcome and preserved the other source's stored problem count.
+outcome and preserved the other source's stored problem count. The Windows
+ARM64 all-target compilation check passed.
 The remaining desktop check covers manual and automatic failures across
 a process restart, followed by a successful update of the affected source.
 [Source outcome store](src/ai_manager/local/knowledge/outcomes.rs)
 · [Source inventory](src/ai_manager/local/knowledge_inventory.rs)
 · [Apple Silicon focused tests](target/verification/20261123-source-outcomes-macos-final.log)
+
+## November 23 Complete masked step copy
+
+The selected command step now retains its masked stdout and stderr for
+the **Copy output** action. The inline preview keeps its eight-line,
+320-character-per-line limit. Copying from an earlier run uses the
+retained output of that step and still checks the current run binding,
+clipboard policy and credential mask. The separate capture limit for each
+stream still applies. The app tests exercise live and retained steps with
+different outputs, both streams, a line longer than 32 KiB, and an
+additional credential mask. The wider test selection also found that
+Metro showed the ongoing response repair as generic analysis. Its active
+station now shows the repair status. The final Apple Silicon selection
+passed all 125 tests, and the Windows ARM64 all-target compilation check
+passed. The native system clipboard exercise remains open.
+[Step action](src/workspace/terminal_agent/design/actions.rs)
+· [Captured and preview output](src/workspace/terminal_agent/inline_history.rs)
+· [Apple Silicon focused tests](target/verification/20261123-step-output-macos-final.log)
 
 ## November 22 AI Manager and Agent Design on Windows ARM64
 

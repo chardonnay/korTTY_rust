@@ -288,6 +288,20 @@ impl Redactor {
             .map(|(text, _)| text)
     }
 
+    pub(crate) fn captured_command_text(
+        &self,
+        input: &str,
+        deadline: Instant,
+    ) -> Option<Zeroizing<String>> {
+        self.redacted_text(
+            input,
+            deadline,
+            true,
+            crate::terminal_agent::CAPTURED_TEXT_LIMIT,
+        )
+        .map(|(text, _)| text)
+    }
+
     pub(crate) fn journal_output_text(
         &self,
         input: &str,

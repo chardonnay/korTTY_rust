@@ -1241,8 +1241,8 @@ impl Run {
     }
 
     fn record_result(&mut self, outcome: &Outcome) -> Result<(), String> {
-        let stdout = mask::prompt(&self.redactor, &outcome.stdout.text())?;
-        let stderr = mask::prompt(&self.redactor, &outcome.stderr.text())?;
+        let stdout = mask::captured_output(&self.redactor, &outcome.stdout.text())?;
+        let stderr = mask::captured_output(&self.redactor, &outcome.stderr.text())?;
         let step = self.inline_result(outcome.status, &stdout, &stderr);
         let status = match outcome.status {
             engine::Status::Exited(code) => format!("Exit status {code}"),
