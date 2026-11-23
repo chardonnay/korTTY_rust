@@ -44,6 +44,7 @@ pub(crate) fn restore(
     root: &Path,
     endpoint: &crate::ssh_dialog::LoginTarget,
     native_password: &[u8],
+    minutes: u16,
 ) -> crate::connection_store::Connection {
     use super::{ProfileLease, RestoreMode};
     use crate::connection_store::Store;
@@ -61,7 +62,7 @@ pub(crate) fn restore(
           <username>{username}</username><authMethod>PUBLIC_KEY</authMethod>
           <privateKeyPath>TEMPORARY:__ENCRYPTED__</privateKeyPath>
           <temporaryKeyContent>{envelope}</temporaryKeyContent>
-          <temporaryKeyExpirationMinutes>10</temporaryKeyExpirationMinutes>
+          <temporaryKeyExpirationMinutes>{minutes}</temporaryKeyExpirationMinutes>
           <temporaryKeyPermanent>true</temporaryKeyPermanent>
         </connection></connections>"#,
         host = text(&endpoint.host),

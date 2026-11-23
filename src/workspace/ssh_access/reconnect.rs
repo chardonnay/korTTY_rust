@@ -5,6 +5,7 @@ use iced::{Task, window};
 use super::{
     FormKey, PendingSsh, SavedSshProfile, Stage, Workspace, WorkspaceMessage, form_message, wrap,
 };
+use crate::connection_store::Auth;
 use crate::session::GridSize;
 use crate::session_security::IsolationLevel;
 use crate::ssh_worker;
@@ -173,7 +174,16 @@ impl Workspace {
                     std::iter::once(&connection.login)
                         .chain(connection.jump.as_ref())
                         .any(|login| {
-                            login.endpoint.validate().is_err() || login.auth.requires_interactive()
+                            let automatic_temporary_key = matches!(
+                                login.auth,
+                                Auth::TemporaryKey {
+                                    credential: Some(_),
+                                    automatic: true,
+                                    ..
+                                }
+                            );
+                            login.endpoint.validate().is_err()
+                                || (login.auth.requires_interactive() && !automatic_temporary_key)
                         })
                 }))
         {

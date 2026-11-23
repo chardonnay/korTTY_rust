@@ -1825,6 +1825,7 @@ impl Workspace {
             })
         {
             self.discard_quick_temporary_ssh_retries();
+            self.defer_project_ssh_dial(window, super::project_access::WaitReason::SignIn);
             self.notice(window, "The temporary SSH key option is disabled.".into());
             return Task::none();
         }

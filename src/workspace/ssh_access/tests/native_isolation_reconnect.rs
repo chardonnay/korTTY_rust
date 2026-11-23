@@ -15,15 +15,14 @@ use super::*;
 
 const HOME_MARKER: &str = "KORTTY_ISOLATION_RECONNECT_TEST_HOME";
 const TEST: &str = "workspace::ssh_access::tests::native_isolation_reconnect::openssh_reconnect_keeps_saved_and_teamwork_isolation";
+const PROJECT_TEMPORARY_KEY_TEST: &str = "workspace::ssh_access::tests::native_isolation_reconnect::openssh_project_reconnect_checks_saved_temporary_key";
 
-#[test]
-#[ignore = "requires OpenSSH and KORTTY_SSH_TEST_EXE pointing to the built app"]
-fn openssh_reconnect_keeps_saved_and_teamwork_isolation() {
+fn fixture_profile(test: &str) -> Option<PathBuf> {
     let Some(home) = std::env::var_os(HOME_MARKER).map(PathBuf::from) else {
         let scratch = TempDirectory::new("isolation-reconnect-home");
         let home = scratch.0.canonicalize().unwrap();
         let run = Command::new(std::env::current_exe().unwrap())
-            .args(["--ignored", "--exact", TEST, "--nocapture"])
+            .args(["--ignored", "--exact", test, "--nocapture"])
             .env(HOME_MARKER, &home)
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", &home)
@@ -35,7 +34,7 @@ fn openssh_reconnect_keeps_saved_and_teamwork_isolation() {
             "{stdout}\n{}",
             String::from_utf8_lossy(&run.stderr)
         );
-        return;
+        return None;
     };
     let root = crate::profile::root().unwrap();
     assert!(
@@ -46,6 +45,15 @@ fn openssh_reconnect_keeps_saved_and_teamwork_isolation() {
             && !root.exists(),
         "reconnect fixture requires a fresh private profile"
     );
+    Some(root)
+}
+
+#[test]
+#[ignore = "requires OpenSSH and KORTTY_SSH_TEST_EXE pointing to the built app"]
+fn openssh_reconnect_keeps_saved_and_teamwork_isolation() {
+    let Some(root) = fixture_profile(TEST) else {
+        return;
+    };
     let peer = OpenSshFixture::new();
     let client = peer.directory().join("client");
     let endpoint = peer.request(client.clone()).target.endpoint;
@@ -173,6 +181,180 @@ fn openssh_reconnect_keeps_saved_and_teamwork_isolation() {
             assert!(String::from_utf8_lossy(&log.stderr).contains("Accepted publickey"));
         }
     }
+}
+
+#[test]
+#[ignore = "requires a private OpenSSH fixture and observes a one-minute key expiry"]
+fn openssh_project_reconnect_checks_saved_temporary_key() {
+    use crate::profile_backup::java_temporary_key_fixture as fixture;
+    use crate::vault_window::VaultWindow;
+    use kortty_vault::Vault;
+
+    const MASTER: &[u8] = b"fixture project temporary SSH master";
+    let Some(root) = fixture_profile(PROJECT_TEMPORARY_KEY_TEST) else {
+        return;
+    };
+    crate::private_files::Directory::open(&root, true).unwrap();
+    let peer = OpenSshFixture::new();
+    let client_key = peer.directory().join("client");
+    let endpoint = peer.request(client_key.clone()).target.endpoint;
+    fs::write(peer.directory().join("client.pub"), fixture::PUBLIC_KEY).unwrap();
+    fs::remove_file(client_key).unwrap();
+    let key_line = fs::read_to_string(peer.directory().join("host.pub")).unwrap();
+    let host_key = HostKey::from_openssh(key_line.trim()).unwrap();
+    let host = Endpoint::new(&endpoint.host, endpoint.port).unwrap();
+    trust_store().unwrap().remember(&host, &host_key).unwrap();
+
+    let saved = fixture::restore(&root, &endpoint, MASTER, 1);
+    let Auth::TemporaryKey {
+        credential: Some(id),
+        minutes: 1,
+        automatic: true,
+    } = &saved.login.auth
+    else {
+        panic!("expected an automatic temporary key from the reviewed Java archive");
+    };
+    let vault_path = crate::profile::vault_path().unwrap();
+    let vault = Vault::unlock(&vault_path, MASTER).unwrap();
+    let key = vault
+        .temporary_ssh_key(id, (&endpoint.host, endpoint.port, &endpoint.username))
+        .unwrap();
+    let expires = Instant::now() + key.remaining + Duration::from_millis(100);
+
+    let mut store = Store::open(crate::profile::connections_path().unwrap()).unwrap();
+    let mut manual = saved.clone();
+    manual.login.auth = Auth::TemporaryKey {
+        credential: Some(id.clone()),
+        minutes: 1,
+        automatic: false,
+    };
+    store.save(manual).unwrap();
+    let mut workspace = Workspace::default();
+    workspace.window_settings.temporary_ssh_key_enabled = true;
+    workspace.vault = Some(VaultWindow::open(vault_path.clone()).unwrap());
+    let (owner, target) = restored_project_pane(&mut workspace, &saved);
+    assert_eq!(
+        workspace.start_project_ssh_reconnect(owner, target).units(),
+        0
+    );
+    assert!(
+        workspace.windows[&owner]
+            .notice
+            .as_deref()
+            .unwrap()
+            .contains("Sign in")
+    );
+    assert!(workspace.project_attention_bar(owner).is_some());
+    assert!(workspace.pending_ssh(owner).is_none());
+
+    store.save(saved.clone()).unwrap();
+    workspace.window_settings.temporary_ssh_key_enabled = false;
+    assert_eq!(
+        workspace.start_project_ssh_reconnect(owner, target).units(),
+        0
+    );
+    assert!(
+        workspace.windows[&owner]
+            .notice
+            .as_deref()
+            .unwrap()
+            .contains("option is disabled")
+    );
+    workspace.window_settings.temporary_ssh_key_enabled = true;
+
+    assert_eq!(
+        workspace.start_project_ssh_reconnect(owner, target).units(),
+        0
+    );
+    assert_eq!(
+        workspace.windows[&owner].notice.as_deref(),
+        Some(crate::vault_window::VAULT_LOCKED),
+    );
+    assert!(workspace.pending_ssh(owner).is_none());
+    let snapshot = serde_json::to_string(&workspace.capture_layout().unwrap()).unwrap();
+    assert!(!snapshot.contains(id));
+    assert!(!snapshot.contains("PRIVATE KEY"));
+
+    let fixture_shell = peer.directory().join("project-fixture-shell");
+    fs::write(
+        &fixture_shell,
+        "printf 'isolation-wire-ready\n'\nIFS= read -r line\n",
+    )
+    .unwrap();
+    let shell = fixture_shell.to_str().unwrap().replace('\'', "'\\''");
+    let server = peer.serve_with_extra(
+        "host",
+        &format!("PermitUserRC no\nForceCommand /bin/sh '{shell}'\n"),
+    );
+    workspace.vault = Some(VaultWindow::with_unlocked_fixture(vault_path, vault));
+    let dial = workspace.advance_project_reconnects();
+    finish_wire_attempt(&mut workspace, owner, dial, IsolationLevel::None);
+    if let Some(candidate) = workspace.pending_reconnects.keys().next().copied() {
+        workspace.wait_for_test_reconnect(candidate);
+    }
+    let tab = workspace.windows[&owner].tab().unwrap();
+    let replacement = tab.focused_session().unwrap();
+    assert_eq!(tab.id, target.tab);
+    assert_ne!(replacement, target.source);
+    wait_for_output(&workspace.sessions[&replacement].session);
+    assert!(workspace.project_attention_bar(owner).is_none());
+    workspace.stop_session(replacement);
+    for shutdown in std::mem::take(&mut workspace.pending_shutdown) {
+        let _ = shutdown.recv_blocking();
+    }
+    let log = server.join().unwrap().stderr;
+    let fingerprint = HostKey::from_openssh(fixture::PUBLIC_KEY.trim())
+        .unwrap()
+        .fingerprint();
+    let log = String::from_utf8_lossy(&log);
+    assert!(log.contains("Accepted publickey") && log.contains(&fingerprint));
+
+    let (owner, target) = restored_project_pane(&mut workspace, &saved);
+    thread::sleep(expires.saturating_duration_since(Instant::now()));
+    assert_eq!(
+        workspace.start_project_ssh_reconnect(owner, target).units(),
+        0
+    );
+    assert!(
+        workspace.windows[&owner]
+            .notice
+            .as_deref()
+            .unwrap()
+            .contains("expired")
+    );
+    assert!(workspace.project_attention_bar(owner).is_some());
+    assert_eq!(
+        workspace.sessions[&target.source].session.frame().status,
+        Status::Disconnected
+    );
+    assert!(workspace.pending_ssh(owner).is_none());
+}
+
+fn restored_project_pane(
+    workspace: &mut Workspace,
+    saved: &Connection,
+) -> (window::Id, ReconnectTarget) {
+    let (owner, _) = workspace.open_window(false);
+    let layout = crate::profile::PaneLayout::Ssh {
+        font: FONT,
+        focused: true,
+        term: saved.emulation.clone(),
+        target: SshTarget {
+            login: saved.login.endpoint.clone(),
+            jump: saved.jump.as_ref().map(|login| login.endpoint.clone()),
+            saved: Some(saved.id),
+            isolation: IsolationLevel::None,
+        },
+        initial_size: Default::default(),
+    };
+    let mut focused = None;
+    let _ = workspace
+        .restore_pane(&layout, &mut Vec::new(), &mut focused, None)
+        .unwrap();
+    let source = focused.unwrap();
+    workspace.add_tab(owner, source);
+    let tab = workspace.windows[&owner].tab().unwrap().id;
+    (owner, ReconnectTarget { tab, source })
 }
 
 fn catalog(directory: &Path, endpoint: &LoginTarget) -> teamwork::Catalog {

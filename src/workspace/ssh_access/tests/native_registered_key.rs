@@ -337,7 +337,7 @@ fn openssh_java_imported_temporary_key_authenticates_terminal_and_sftp() {
     let endpoint = peer.request(client.clone()).target.endpoint;
     let profile = TempDirectory::new("java-temporary-ssh-profile");
     let profile = profile.0.canonicalize().unwrap();
-    let saved = java_temporary_key_fixture::restore(&profile, &endpoint, MASTER);
+    let saved = java_temporary_key_fixture::restore(&profile, &endpoint, MASTER, 10);
     assert!(matches!(
         saved.login.auth,
         Auth::TemporaryKey {

@@ -463,14 +463,42 @@ a registered, valid temporary key. Tabs that need input are deferred for
 interactive resolution. The Java Scheduler remote session can also use
 temporary key contents and makes an owner-only key file for an external
 SSH process when required. The Rust Scheduler currently treats temporary
-keys as interactive credentials. Rust project restore also defers all
-temporary-key profiles to the sign-in review. Cover these routes
-separately from backup restore, including automatic selection, explicit
-authority, expiry and cleanup.
+keys as interactive credentials. Its rsync bridge uses the existing
+native SSH transport. The remaining Scheduler work is to bind eligible
+temporary keys to the reviewed job and route and verify the resulting
+native SSH and rsync runs.
 [Java tab restore](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/TabRestoreTriage.java)
 · [Java Scheduler remote session](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/jobscheduler/JobSchedulerRemoteSession.java)
 · [Rust Scheduler authentication](src/job_executor/connection.rs)
-· [Rust project reconnect](src/workspace/ssh_access/reconnect.rs)
+· [Rust rsync transport](src/job_executor/rsync.rs)
+
+## November 23 Project reconnect with temporary SSH keys
+
+The project reconnect queue uses the current saved profile matching the
+restored pane's route. It can launch automatically when the profile
+selects its saved temporary key automatically. The existing SSH login
+path checks the security setting, vault state, key lifetime and exact
+account and endpoint. While the vault is locked, the queue leaves the
+pane offline and retries after unlock. Expired credentials and profiles
+that require a user selection remain available for sign-in review.
+Project snapshots retain the route and saved profile identity.
+[Project reconnect](src/workspace/ssh_access/reconnect.rs)
+· [Project attention](src/workspace/project_access/attention.rs)
+
+The native Apple Silicon fixture imported a Java temporary key with a
+one-minute lifetime and restored a disconnected project pane. It verified
+deferral for manual selection, a disabled security option and a locked
+vault. Unlock retried the pane through the normal project queue, replaced
+the disconnected session in the same tab and authenticated to pinned
+OpenSSH with the expected public-key fingerprint. After the original
+lifetime elapsed, a new project pane stayed offline and reported the
+expired key. The saved layout contained the route and profile identity.
+The same build passed 15 project tests and both temporary-key SSH and
+SFTP fixtures. Windows ARM64 passed the all-target application check with
+`dialog-preview`. The interactive attention bar and a native jump-host
+reconnect still need acceptance.
+[Apple Silicon project and SSH tests](target/verification/20261123-project-temporary-key-macos-final.log)
+· [Windows application check](target/verification/20261123-project-temporary-key-windows-final-check.log)
 
 ## November 23 Native vault startup unlock
 
