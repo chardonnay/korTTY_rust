@@ -466,7 +466,7 @@ impl Editor {
                     last_role = module.role();
                     let choose = checkbox(active).size(17).on_toggle_maybe(
                         (!active && (custom || catalog.can_duplicate()))
-                            .then(|| move |_| msg(Edit::Module(selected.into(), module))),
+                            .then_some(move |_| msg(Edit::Module(selected.into(), module))),
                     );
                     let preview = button(module_row(
                         role,
@@ -718,6 +718,18 @@ pub(super) fn reveal_module(id: window::Id, module: Module) -> Task<Desktop> {
     )
 }
 
+pub(super) fn focus_preview(id: window::Id, page: Id, backwards: bool) -> Task<Desktop> {
+    use crate::workspace::coding_agents::roster_scroll::reveal_focused;
+
+    let root = preview_focus_scope(id);
+    let action = if backwards {
+        iced_runtime::Action::widget(scope(root.clone(), focusable::focus_previous()))
+    } else {
+        iced_runtime::Action::widget(scope(root.clone(), focusable::focus_next()))
+    };
+    iced_runtime::task::effect(action).chain(reveal_focused(root, page))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -809,16 +821,4 @@ mod tests {
         assert_eq!(catalog.default_id(preset), Preset::Standard.id());
         assert_eq!(editor.selected(&catalog, preset), Preset::Standard.id());
     }
-}
-
-pub(super) fn focus_preview(id: window::Id, page: Id, backwards: bool) -> Task<Desktop> {
-    use crate::workspace::coding_agents::roster_scroll::reveal_focused;
-
-    let root = preview_focus_scope(id);
-    let action = if backwards {
-        iced_runtime::Action::widget(scope(root.clone(), focusable::focus_previous()))
-    } else {
-        iced_runtime::Action::widget(scope(root.clone(), focusable::focus_next()))
-    };
-    iced_runtime::task::effect(action).chain(reveal_focused(root, page))
 }

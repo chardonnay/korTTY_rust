@@ -205,7 +205,7 @@ pub(super) fn file_size_help(path: &Path) -> String {
 
 pub(super) fn format_advanced_limit(bytes: u64) -> String {
     let mib = MIB as u64;
-    if bytes % mib == 0 {
+    if bytes.is_multiple_of(mib) {
         (bytes / mib).to_string()
     } else {
         format!("{bytes} B")

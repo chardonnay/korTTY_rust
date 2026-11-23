@@ -3204,7 +3204,7 @@ impl Dialog {
 
     fn start_folder_review(
         &mut self,
-        pending: Result<(folder::ReviewReply, folder::Cancel), String>,
+        pending: Result<folder::ReviewTask<Arc<folder::Review>>, String>,
     ) -> Task<Message> {
         let (reply, cancel) = match pending {
             Ok(pending) => pending,

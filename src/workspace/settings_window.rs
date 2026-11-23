@@ -5580,8 +5580,10 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let mut workspace = Workspace::default();
-        workspace.window_settings = WindowSettings::decode(&merged).unwrap();
+        let mut workspace = Workspace {
+            window_settings: WindowSettings::decode(&merged).unwrap(),
+            ..Workspace::default()
+        };
         let proposed = workspace.window_settings.java_security;
         assert_eq!(proposed.default_isolation, Some(IsolationLevel::None));
         assert_eq!(proposed.temporary_ssh_keys, Some(false));

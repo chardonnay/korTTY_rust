@@ -482,7 +482,7 @@ impl Store {
     pub(super) fn folder_review(
         &self,
         root: PathBuf,
-    ) -> Result<(folder::ReviewReply, folder::Cancel), String> {
+    ) -> Result<folder::ReviewTask<Arc<folder::Review>>, String> {
         let options = self
             .folders
             .iter()
@@ -496,7 +496,7 @@ impl Store {
         &self,
         root: PathBuf,
         mut options: source::Options,
-    ) -> Result<(folder::ReviewReply, folder::Cancel), String> {
+    ) -> Result<folder::ReviewTask<Arc<folder::Review>>, String> {
         options.validate()?;
         let existing = self.folder_index(&root)?;
         if existing.is_none() && options.max_file_bytes.is_none() {
@@ -558,13 +558,7 @@ impl Store {
         &self,
         store: usize,
         selection: &BTreeSet<SourceKey>,
-    ) -> Result<
-        (
-            async_channel::Receiver<Result<Arc<SourceUpdates>, String>>,
-            folder::Cancel,
-        ),
-        String,
-    > {
+    ) -> Result<folder::ReviewTask<Arc<SourceUpdates>>, String> {
         self.validate()?;
         if !self.has_sources_for_update(selection) {
             return Err("Choose an enabled file or folder to review.".into());

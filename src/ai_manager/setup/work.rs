@@ -301,7 +301,7 @@ impl Wizard {
                     .unwrap_or_else(|_| Err("The setup worker stopped.".into()))
                     .map(map)
             },
-            move |result| Message::Done(ticket, result),
+            move |result| Message::Done(ticket, Box::new(result)),
         );
         (ticket, task)
     }

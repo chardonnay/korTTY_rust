@@ -3321,7 +3321,7 @@ fn saved_credentials_match(
                 matches!(expected, Some(Auth::KeyFile { path: key, passphrase: Some(reference) }) if path == key && id == reference)
             }
             Input::VaultTemporaryKey { id, .. } => {
-                matches!(saved, Some(saved) if &saved.endpoint == &login.endpoint
+                matches!(saved, Some(saved) if saved.endpoint == login.endpoint
                     && matches!(expected, Some(Auth::TemporaryKey { credential: Some(key), .. }) if key == id))
             }
             Input::StoredKey { id, explicit } => {

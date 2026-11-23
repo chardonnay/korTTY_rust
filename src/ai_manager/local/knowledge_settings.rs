@@ -603,28 +603,42 @@ impl Dialog {
                 .style(dialog_design::form_input)
                 .on_input_maybe(can_rename.then_some(move |name| action(Action::Name(name)))),
         );
+        let bind_role =
+            |role, setting, label: &'static str, current: Option<&super::ProfileRef>| {
+                let expected = state.profile(role);
+                let profile =
+                    expected.and_then(|reference| profiles.resolve_profile_reference(reference));
+                let binding = profile.and_then(|id| profiles.profile_reference(id));
+                let selected = profile.is_some()
+                    && current.and_then(|reference| profiles.resolve_profile_reference(reference))
+                        == profile;
+                let on_toggle = expected.cloned().zip(binding).filter(|_| can_edit).map(
+                    |(expected_role, binding)| {
+                        move |enabled: bool| Message::BindKnowledgeProfile {
+                            store: index,
+                            role,
+                            expected_role: expected_role.clone(),
+                            binding: enabled.then(|| binding.clone()),
+                        }
+                    },
+                );
+                reveal.action(
+                    Setting::Knowledge(setting),
+                    checkbox(selected).label(label).on_toggle_maybe(on_toggle),
+                )
+            };
         let roles = row![
             bind_role(
-                state,
-                profiles,
-                index,
                 Role::Text,
                 TerminalChatProfile,
                 "Text",
-                store.text_profile.as_ref(),
-                can_edit,
-                reveal
+                store.text_profile.as_ref()
             ),
             bind_role(
-                state,
-                profiles,
-                index,
                 Role::Coding,
                 CodeAnalysisProfile,
                 "Coding",
-                store.coding_profile.as_ref(),
-                can_edit,
-                reveal
+                store.coding_profile.as_ref()
             ),
             reveal.action(
                 Setting::Knowledge(AgentKnowledge),
@@ -704,41 +718,6 @@ impl Dialog {
             .into(),
         )
     }
-}
-
-fn bind_role<'a>(
-    state: &State,
-    profiles: &Catalog,
-    store: usize,
-    role: Role,
-    setting: KnowledgeSetting,
-    label: &'static str,
-    current: Option<&super::ProfileRef>,
-    can_edit: bool,
-    reveal: &Reveal,
-) -> Element<'a, Message> {
-    let expected = state.profile(role);
-    let profile = expected.and_then(|reference| profiles.resolve_profile_reference(reference));
-    let binding = profile.and_then(|id| profiles.profile_reference(id));
-    let selected = profile.is_some()
-        && current.and_then(|reference| profiles.resolve_profile_reference(reference)) == profile;
-    let on_toggle =
-        expected
-            .cloned()
-            .zip(binding)
-            .filter(|_| can_edit)
-            .map(|(expected_role, binding)| {
-                move |enabled: bool| Message::BindKnowledgeProfile {
-                    store,
-                    role,
-                    expected_role: expected_role.clone(),
-                    binding: enabled.then(|| binding.clone()),
-                }
-            });
-    reveal.action(
-        Setting::Knowledge(setting),
-        checkbox(selected).label(label).on_toggle_maybe(on_toggle),
-    )
 }
 
 pub(super) fn settings_field<'a>(

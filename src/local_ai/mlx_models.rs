@@ -1019,7 +1019,7 @@ mod tests {
             registry.remove_reviewed(&original).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
-        assert_eq!(registry.list().unwrap(), [changed.clone()]);
+        assert_eq!(registry.list().unwrap(), std::slice::from_ref(&changed));
         registry.remove_reviewed(&changed).unwrap();
         assert!(registry.list().unwrap().is_empty());
     }

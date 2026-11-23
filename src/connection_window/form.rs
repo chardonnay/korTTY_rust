@@ -734,61 +734,6 @@ impl Draft {
     }
 }
 
-#[cfg(test)]
-mod page_tests {
-    use super::*;
-
-    #[test]
-    fn switching_pages_preserves_the_draft_without_making_it_dirty() {
-        let mut draft = Draft::new();
-        draft.update(Edit::Page(Page::JumpHost));
-        assert!(!draft.changed);
-        draft.update(Edit::UseJump(true));
-        draft.update(Edit::Login(true, LoginEdit::Host("jump.example".into())));
-        draft.update(Edit::Page(Page::Connection));
-        draft.update(Edit::Name("Build host".into()));
-        draft.update(Edit::Login(false, LoginEdit::Host("build.example".into())));
-        draft.update(Edit::Page(Page::Logging));
-
-        let connection = draft.connection().unwrap();
-        assert_eq!(connection.name, "Build host");
-        assert_eq!(connection.login.endpoint.host, "build.example");
-        assert_eq!(connection.jump.unwrap().endpoint.host, "jump.example");
-    }
-
-    #[test]
-    fn temporary_keys_survive_unrelated_edits_but_require_a_new_key_on_duplicate() {
-        let mut draft = Draft::new();
-        draft.update(Edit::Name("Fixture".into()));
-        draft.update(Edit::Login(false, LoginEdit::Host("ssh.example".into())));
-        draft.update(Edit::Login(false, LoginEdit::Method(Method::TemporaryKey)));
-        let mut saved = draft.connection().unwrap();
-        let reference = "a".repeat(32);
-        saved.login.auth = Auth::TemporaryKey {
-            credential: Some(reference.clone()),
-            minutes: 30,
-            automatic: true,
-        };
-
-        let mut edited = Draft::from_profile(&saved, None, false);
-        edited.update(Edit::Tag("Development".into()));
-        assert_eq!(edited.connection().unwrap().login.auth, saved.login.auth);
-
-        let mut duplicate = Draft::from_profile(&saved, None, true);
-        assert!(matches!(
-            duplicate.connection().unwrap().login.auth,
-            Auth::TemporaryKey {
-                credential: None,
-                ..
-            }
-        ));
-        assert!(duplicate.begin_temporary_paste(10));
-        duplicate.update(Edit::Login(false, LoginEdit::Username("other".into())));
-        assert!(!duplicate.finish_temporary_paste(10, Password::new("fixture".into())));
-        assert!(duplicate.pending_temporary_key().is_none());
-    }
-}
-
 impl Login {
     fn new() -> Self {
         Self {
@@ -1229,4 +1174,59 @@ fn port(value: &str) -> Option<u16> {
         return None;
     }
     value.parse().ok().filter(|&port| port != 0)
+}
+
+#[cfg(test)]
+mod page_tests {
+    use super::*;
+
+    #[test]
+    fn switching_pages_preserves_the_draft_without_making_it_dirty() {
+        let mut draft = Draft::new();
+        draft.update(Edit::Page(Page::JumpHost));
+        assert!(!draft.changed);
+        draft.update(Edit::UseJump(true));
+        draft.update(Edit::Login(true, LoginEdit::Host("jump.example".into())));
+        draft.update(Edit::Page(Page::Connection));
+        draft.update(Edit::Name("Build host".into()));
+        draft.update(Edit::Login(false, LoginEdit::Host("build.example".into())));
+        draft.update(Edit::Page(Page::Logging));
+
+        let connection = draft.connection().unwrap();
+        assert_eq!(connection.name, "Build host");
+        assert_eq!(connection.login.endpoint.host, "build.example");
+        assert_eq!(connection.jump.unwrap().endpoint.host, "jump.example");
+    }
+
+    #[test]
+    fn temporary_keys_survive_unrelated_edits_but_require_a_new_key_on_duplicate() {
+        let mut draft = Draft::new();
+        draft.update(Edit::Name("Fixture".into()));
+        draft.update(Edit::Login(false, LoginEdit::Host("ssh.example".into())));
+        draft.update(Edit::Login(false, LoginEdit::Method(Method::TemporaryKey)));
+        let mut saved = draft.connection().unwrap();
+        let reference = "a".repeat(32);
+        saved.login.auth = Auth::TemporaryKey {
+            credential: Some(reference.clone()),
+            minutes: 30,
+            automatic: true,
+        };
+
+        let mut edited = Draft::from_profile(&saved, None, false);
+        edited.update(Edit::Tag("Development".into()));
+        assert_eq!(edited.connection().unwrap().login.auth, saved.login.auth);
+
+        let mut duplicate = Draft::from_profile(&saved, None, true);
+        assert!(matches!(
+            duplicate.connection().unwrap().login.auth,
+            Auth::TemporaryKey {
+                credential: None,
+                ..
+            }
+        ));
+        assert!(duplicate.begin_temporary_paste(10));
+        duplicate.update(Edit::Login(false, LoginEdit::Username("other".into())));
+        assert!(!duplicate.finish_temporary_paste(10, Password::new("fixture".into())));
+        assert!(duplicate.pending_temporary_key().is_none());
+    }
 }
