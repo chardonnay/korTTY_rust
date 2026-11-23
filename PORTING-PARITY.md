@@ -171,11 +171,14 @@ display form while registration retains the canonical source.
 The focused Apple Silicon run passed 64 tests serially, including picker
 cancellation, batch import, split-model reattachment and both replies to
 the runtime offer. Two tests in the earlier parallel run hit the shared
-managed-model operation lock. Windows ARM64 opened the file picker and
-the owned import review for the long-path fixture. Both storage choices
-were visible. The Configure sizing comparison used a model registered
-through manual path entry. Complete the storage choices from the owned
-review and both runtime responses in native desktops.
+managed-model operation lock. Windows ARM64 verified the native picker and
+both storage choices in the owned review with two independent synthetic
+GGUF files. The private copy had the same SHA-256 as its source and no
+external reference. The external registration retained the selected path
+and had no private model file. Cancel closed the review with the same
+three registrations. Verify split-model reattachment and both runtime
+responses on the native desktops, and repeat the two storage choices on
+the remaining platforms where supported.
 [Rust GGUF actions](src/ai_manager/local/managed.rs)
 · [Apple Silicon serial retest](target/verification/20261123-gguf-import-review-macos-current.log)
 
@@ -255,19 +258,29 @@ enough width for one line. A narrower monitor or remembered size lets
 the path wrap while the form scrolls above the fixed footer.
 
 The Windows desktop comparison used the same synthetic registration path
-in Java v2.26.0 x64 under emulation and native Windows ARM64 Rust. Configure
-opened at 1,604 by 435 pixels in Java and 1,672 by 457 pixels in Rust.
-Both showed the complete path on one line. Rust's label column is wider
-and the spacing above the footer differs. At a remembered 622 by 362 pixels,
-Rust wrapped the path, kept Save and Cancel visible, and allowed scrolling
-to the unload settings. Saving the changed context stepper persisted 4,608
-tokens for the fixture's external registration.
+in Java v2.26.0 x64 under emulation and native Windows ARM64 Rust. The first
+Rust run measured 1,672 by 457 pixels. With the compact label column,
+joined spinner arrows and aligned header and footer, the Normal-theme
+Rust window measured 1,621 by 435 pixels beside Java's 1,604 by 435. The
+editable column began at pixel 153 in Rust and pixel 152 in Java. Both
+showed the complete path on one line. The title bar and focused-field
+highlight retain native styling.
+
+At a remembered 622 by 362 pixels Rust wrapped the same path, kept the
+footer visible and scrolled the lower fields into view. The context stepper
+changed 4,608 to 5,120 tokens and Save persisted the value in the private
+test registry. An earlier compact run disabled the idle spinner with Never
+and retained the original 10-minute setting after Cancel.
 
 Apple Silicon passed 52 focused tests, including one-line layout at the
 preferred width and wrapping at the narrower width. The Windows ARM64
 all-target compilation check and native development build passed.
+The final Windows ARM64 development build passed. The serial AI Manager
+local suite passed 141 tests with six ignored, including a renderer test for
+the joined spinner arrows, long-path wrapping and the GGUF review fixtures.
 [Rust configuration sizing](src/ai_manager/local/model_configuration.rs)
 · [Apple Silicon focused tests](target/verification/20261123-gguf-configure-sizing-macos.log)
+· [Windows ARM64 local-model tests](target/verification/20261123-gguf-configure-styling-windows-final-tests.log)
 
 ## November 22 AI Manager and Agent Design on Windows ARM64
 

@@ -253,6 +253,7 @@ impl Configuration {
         active_backend: Option<PackageBackend>,
         reveal: &Reveal,
     ) -> Element<'a, LocalMessage> {
+        use super::model_configuration::gguf_field as field;
         use ManagedSetting::*;
         let number = |setting,
                       value: &'a str,
@@ -282,6 +283,9 @@ impl Configuration {
                         Setting::Managed(Name),
                         enabled,
                         text_input("Name", &self.name)
+                            .size(13)
+                            .padding([7, 5])
+                            .style(dialog_design::form_input)
                             .on_input_maybe(enabled.then_some(|name| Managed(Message::Name(name)))),
                     )
                 ),
@@ -291,7 +295,10 @@ impl Configuration {
                 Setting::Managed(Backend),
                 field("Backend", backend_picker(self.backend, enabled)),
             ),
-            unavailable_backend(self.backend, active_backend).map(|reason| text(reason).size(13)),
+            unavailable_backend(self.backend, active_backend).map(|reason| field(
+                "",
+                text(reason).size(13).wrapping(text::Wrapping::WordOrGlyph)
+            )),
             reveal.wrap(
                 Setting::Managed(Purpose),
                 field(
@@ -316,7 +323,7 @@ impl Configuration {
             reveal.wrap(
                 Setting::Managed(CpuThreads),
                 field(
-                    "CPU threads (0 = auto)",
+                    "CPU threads (0 = Auto)",
                     number(
                         CpuThreads,
                         &self.cpu_threads,
@@ -330,7 +337,7 @@ impl Configuration {
             reveal.wrap(
                 Setting::Managed(GpuLayers),
                 field(
-                    "GPU layers (-1 = auto)",
+                    "GPU layers (-1 = Auto)",
                     number(
                         GpuLayers,
                         &self.gpu_layers,
@@ -368,7 +375,7 @@ impl Configuration {
                 .wrap()
             ),
         ]
-        .spacing(8)
+        .spacing(9)
         .into()
     }
 }
@@ -1299,12 +1306,17 @@ impl Dialog {
                 );
                 let save = reveal.action(
                     Setting::Managed(ManagedSetting::Save),
-                    button("Save")
+                    button(text("Save").size(13).center().width(Length::Fill))
+                        .padding([6, 10])
+                        .width(94)
                         .on_press_maybe(enabled.then_some(Managed(Message::SaveConfiguration))),
                 );
                 let cancel = reveal.action(
                     Setting::Managed(ManagedSetting::Cancel),
-                    dialog_design::secondary_action("Cancel")
+                    button(text("Cancel").size(13).center().width(Length::Fill))
+                        .padding([6, 10])
+                        .width(94)
+                        .style(dialog_design::secondary_button)
                         .on_press_maybe((!self.busy()).then_some(Managed(Message::CancelAction))),
                 );
                 Some(super::model_configuration::window(
@@ -1889,6 +1901,9 @@ fn backend_picker(selected: ModelBackend, enabled: bool) -> Element<'static, Loc
     pick_list(options, Some(selected), |backend| {
         Managed(Message::Backend(backend))
     })
+    .text_size(13)
+    .padding([5, 8])
+    .width(96)
     .dismiss_on_escape()
 }
 

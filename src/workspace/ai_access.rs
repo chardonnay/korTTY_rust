@@ -1000,7 +1000,7 @@ fn child_height(dialog: &Dialog) -> Option<f32> {
         .runtime_review_height()
         .or_else(|| {
             dialog.model_configuration_kind().map(|kind| match kind {
-                ModelConfigurationKind::Gguf => 425.0,
+                ModelConfigurationKind::Gguf => 403.0,
                 ModelConfigurationKind::Mlx => 248.0,
             })
         })
