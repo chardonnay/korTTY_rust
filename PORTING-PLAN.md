@@ -9,11 +9,38 @@ the porting worktree.
 
 ## Current result and actionable backlog
 
-**Java v2.26.0 parity remains partial.** [PR #35](https://github.com/chardonnay/korTTY_rust/pull/35)
+**Java v2.26.0 parity remains partial.** On November 24 the tagged Java
+reference was `b235d91f2035`, Rust `origin/main` was `91de908a`
+(PR #35), and the porting branch had 39 further commits through
+`b1a2ed68`. The SFTP Settings changes are also present in the worktree
+and await visual acceptance. The [last full three-platform test run](PORTING-PARITY.md#november-23-full-native-workspace-tests)
+covers `ab5b101e`. Later results cover the features named in each record.
+
+### Next milestones in priority order
+
+| Order | Deliverable | Completion check |
+| --- | --- | --- |
+| **1** | **Finish Settings → SFTP on Windows ARM64 (D4/V2).** Compare the running Rust page with Java at the same size, theme and scale. Add the two missing Settings entries for the external editor and the Scheduler rsync executable in their Java positions. Connect them to the existing native program reviews. | Both entries are discoverable from an unopened page. Check keyboard focus, Cancel, Save and reopen. Compare the disabled timeout and managed parallel-transfer limit in both applications. Verify that choosing an executable still requires the applicable approval before use. Record the paired views and results. [SFTP Settings evidence](PORTING-PARITY.md#november-24-sftp-settings-layout-and-search) |
+| **2** | **Finish the primary dialogs (D2/D4/A2/B4/Q1).** Start with Security, the Connection Manager and its SSH editor, Quick Connect and the Scheduler route picker. Continue with Settings and AI Manager search, model dialogs and the Agent Design chooser. | Replace a target or jump-host key, reopen the job, reselect the route and renew its rsync approval. Check locked-vault and expired-key feedback. For each changed dialog, compare normal and compact sizes, keyboard navigation, owner focus and Save/Cancel with Java. [Dialog inventory](#gui-dialog-design-parity) · [Scheduled key verification](PORTING-PARITY.md#scheduled-ssh-and-rsync-with-temporary-keys) |
+| **3** | **Make Java data migration predictable (M1/P1).** Start with a tagged backup containing connections and folders, credential references, and Scheduler jobs. Resolve the remaining settings, conflicting identities and action options against the importer. | Restore into both a fresh profile and one with colliding records. Reopen after restart and verify stable identities, preserved local choices, visible omissions and disabled imported jobs until review. Record a disposition for each remaining field or option. [Field and identity audit](#remaining-field-and-identity-audit) |
+| **4** | **Finish file transfers and Scheduler execution (T2–T4/Q1/Q2).** Exercise deployed OpenSSH and sudo for recurring transfers, recovery and route changes. Then implement the requested Agent/Swarm scheduling extension for live Teamwork connections and groups using the existing shared-route checks. | Verify bytes and receiver identity after first creation, repeat firing, interruption and renewed approval. For the extension, run an approved shared target and group, then change membership or a pin and verify the old approval is refused. Java's Scheduler uses locally configured connections. [Transfer contracts](#file-operation-contracts-to-preserve) · [Teamwork scope](#implemented-workflows-awaiting-acceptance-and-requested-extensions) |
+| **5** | **Close the remaining functional and native desktop cases (V1–V5).** Start with configured AI providers, signed GGUF/MLX runtimes and knowledge-store recovery. Finish remaining dialog comparisons, editor and diagram workflows, notification activation, window and pane movement, journal viewing, recording playback and terminal checks. | Record each workflow on the applicable native desktop. Identify the pane activated by a coding-agent notification, reopen persisted data, check exports, and complete the software comparisons for all 21 emulations. Track Wayland and X11 separately. [Native acceptance matrix](#native-acceptance-and-release-gates) |
+| **6** | **Qualify one release candidate (U4/V6/V7).** After fixes and security findings have a disposition, use one source revision for the local native suites and distributable packages. | Record formatting, strict Clippy, full tests and release builds by target. Verify checksums, installation, upgrade, removal, packaged sandboxing, signatures, macOS notarization, stapling and Gatekeeper. Record same-host startup, idle memory and p95 input latency. [Release gates](#native-acceptance-and-release-gates) |
+
+**Start the external work alongside milestone 1.** Refresh the locked SSH
+and OpenPGP dependency audit and arrange the independent SSH review. Obtain
+native Windows x64 and Intel macOS coverage, and line up configured AI
+providers and signed runtimes for their respective checks. Record any
+unavailable prerequisite against its gate and continue the next runnable
+case. Real IBM/HP systems and physical serial equipment remain user-deferred.
+
+### Implementation baseline
+
+[PR #35](https://github.com/chardonnay/korTTY_rust/pull/35)
 includes device-local vault unlock (`fe110de1`), saved temporary SSH keys
 (`cff7d8e7`), reviewed Java key import (`08567961`) and automatic project
 reconnect with eligible keys (`b046b261`). It builds on the PR #34 merge
-at `10e4ee78`. The Java reference is tag `v2.26.0` at `b235d91f2035`.
+at `10e4ee78`.
 Windows ARM64 desktop checks cover the Settings frame and Font and Window
 pages, the Connection Manager and selected SSH editor tabs, and specific
 AI Manager and Agent Design workflows. The standalone Agent Design editor
@@ -74,24 +101,17 @@ place. Windows ARM64 passed 36 focused regressions. The desktop reconnect
 flow and the jump-host wire path are still open.
 [SSH reconnect checks](PORTING-PARITY.md#november-23-saved-and-teamwork-ssh-reconnect)
 
-Start with the [confirmed implementation work](#confirmed-implementation-work).
-Other open areas include the remaining Settings pages and connection editor
-tabs, [Java backup field and identity mappings](#remaining-field-and-identity-audit),
-and the [Teamwork Agent/Swarm Scheduler extension](#implemented-workflows-awaiting-acceptance-and-requested-extensions).
-The [implementation order](#implementation-order)
-also covers provider, transfer and editor workflows. The [native and release
-gates](#native-acceptance-and-release-gates) track platform acceptance, the
-independent SSH review and release-candidate verification.
-The [November 19 audit](PORTING-PARITY.md#november-19-java-release-source-comparison)
+The [work package notes](#implementation-order) link the implementation,
+native checks and product decisions behind the milestones. The
+[November 19 audit](PORTING-PARITY.md#november-19-java-release-source-comparison)
 records the broader comparison with the tagged Java release.
 
 ### Confirmed implementation work
 
 | Area | Remaining change | Completion check |
 | --- | --- | --- |
-| D4 · Searchable controls | Compare the remaining Java Settings and AI Manager pages, subpages and labeled controls with the Rust search inventory. The [Knowledge Stores toolbar](PORTING-PARITY.md#november-24-knowledge-stores-toolbar-search), [Local Models runtime and GGUF import controls](PORTING-PARITY.md#november-24-local-models-toolbar-search), and [Appearance controls](PORTING-PARITY.md#november-24-appearance-inventory) have independent search targets. | Verify that controls on a page that has never been opened are discoverable, and that navigation reveals the exact control with the current page state and policy. |
-| D4 · Settings section navigation | The [Settings section menu](PORTING-PARITY.md#november-24-settings-section-overflow) appears when the tab labels exceed the available width at the current application font scale. It lists every Rust section in tab order and marks the active section. [Keyboard navigation](PORTING-PARITY.md#november-24-settings-section-keyboard-navigation) reaches the trigger, reveals highlighted options and closes the menu before Settings handles Escape. | Compare the styling with Java and exercise the menu with keyboard and pointer on the remaining native desktops. |
-| Appearance preferences | [Chat color profile](PORTING-PARITY.md#november-24-appearance-inventory) is available in Settings and the AI Chat toolbar. [UI font size](PORTING-PARITY.md#november-24-application-font-scale) and Match display resolution are searchable in Settings. Java backup import preserves the application and guide scales independently. | Verify the theme-following and fixed profiles in running AI Chat and Swarm views, including when a chat is already open. Compare manual and automatic UI font scale at multiple native display scales with Java, including popups and the terminal, editor and chat font boundaries. |
+| D4 · SFTP executable settings | The tagged SFTP page places the external-editor command after Transfers and the rsync executable after ZIP creation. Rust offers program selection during file editing and job review. Add the corresponding Settings controls with searchable labels and route their choices through those workflows. | Verify the initial values, Cancel and persistence across restart. Exercise external editing and a reviewed rsync job with the selected programs. Changing the choice must trigger the applicable review. [Tagged Settings dialog](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SettingsDialog.java#L2464-L2540) · [Rust Settings page](src/workspace/settings_window/sftp_settings.rs) · [External editor](src/sftp_window/external_edit.rs) · [Rsync job](src/scheduler_window/rsync.rs) |
+| D4 · Searchable controls | Compare the remaining Java Settings and AI Manager pages, subpages and labeled controls with the Rust search inventory. The [Knowledge Stores toolbar](PORTING-PARITY.md#november-24-knowledge-stores-toolbar-search), [Local Models runtime and GGUF import controls](PORTING-PARITY.md#november-24-local-models-toolbar-search), [Appearance controls](PORTING-PARITY.md#november-24-appearance-inventory), and [SFTP settings](PORTING-PARITY.md#november-24-sftp-settings-layout-and-search) have independent search targets. | Verify that controls on a page that has never been opened are discoverable, and that navigation reveals the exact control with the current page state and policy. |
 
 The [November 23 review](PORTING-PARITY.md#november-23-dialog-parity-review)
 records the dialog differences. The [November 22 comparison](PORTING-PARITY.md#november-22-design-editing-command-output-and-settings-search)
@@ -137,6 +157,15 @@ full strip exceeds the available width. Java has 21 sections. The first
 Security comparison covered the master-password group and both search
 results. Control styling and deeper Settings pages still need visual
 work. [Desktop comparison](PORTING-PARITY.md#november-22-java-dialog-design-on-windows-arm64)
+
+The SFTP worktree changes implement editable timeout, parallel-transfer and
+ZIP compression controls and search targets. The Windows ARM64 and Apple
+Silicon logs each report 108 focused tests passed. The tagged Windows x64
+Java dialog was rendered on the Windows ARM64 host. A paired view of the
+running Rust page is still outstanding there. Capture it before closing
+the Windows comparison, then repeat on macOS and Linux. Milestone 1 also
+covers the missing executable settings.
+[SFTP Settings evidence](PORTING-PARITY.md#november-24-sftp-settings-layout-and-search)
 
 Resources exposes a JVM launch profile and its heap limit. Rust already
 detects physical memory for local-model recommendations and provides a
@@ -480,8 +509,9 @@ sample.
 
 For standalone Windows previews, build the development application with
 `cargo rustc --locked -p kortty --bin kortty --features dialog-preview -- -C linker=rust-lld`.
-Run `scripts/preview-windows-dialog.ps1` with `-Dialog settings`,
-`connections`, `ai-manager`, `agent-design` or `agent-design-compact`.
+Run `scripts/preview-windows-dialog.ps1` with `-Dialog settings-sftp` to
+open the SFTP page directly. The other selectors are `settings`,
+`connections`, `quick-connect`, `ai-manager`, `agent-design` and `agent-design-compact`.
 The compact variant opens Agent Design at its 940 by 480 minimum client size.
 Each run creates a private
 Normal-theme profile and opens the requested dialog through the application's
@@ -504,6 +534,8 @@ feature is opt-in and its startup command is available in debug builds.
 
 | Area | Implemented in Rust | Remaining verification |
 | --- | --- | --- |
+| D4 · Settings section navigation | The [Settings section menu](PORTING-PARITY.md#november-24-settings-section-overflow) appears when the tab labels exceed the available width at the current application font scale. It lists every Rust section in tab order and marks the active section. [Keyboard navigation](PORTING-PARITY.md#november-24-settings-section-keyboard-navigation) reaches the trigger, reveals highlighted options and closes the menu before Settings handles Escape. | Compare the styling with Java and exercise the menu with keyboard and pointer on the remaining native desktops. |
+| Appearance preferences | [Chat color profile](PORTING-PARITY.md#november-24-appearance-inventory) is available in Settings and the AI Chat toolbar. [UI font size](PORTING-PARITY.md#november-24-application-font-scale) and Match display resolution are searchable in Settings. Java backup import preserves the application and guide scales independently. | Verify the theme-following and fixed profiles in running AI Chat and Swarm views, including when a chat is already open. Compare manual and automatic UI font scale at multiple native display scales with Java, including popups and the terminal, editor and chat font boundaries. |
 | D4/P1 · Vault startup | An explicit profile opt-in stores the current derived vault key in the protected device credential store. Startup authenticates the vault, falls back to the password prompt on failure, and checks both managed and personal password requirements. Native credential-store fixtures on Windows ARM64 and Fedora ARM64 verified rotation, reopen and removal. Apple Silicon passed the vault and startup suites. | Exercise Security through an actual restart on each native desktop. Include interactive Keychain access with a signed macOS app, the installed Flatpak Secret portal and a managed startup policy set after opting in. [Startup unlock checkpoint](PORTING-PARITY.md#november-23-native-vault-startup-unlock) |
 | D2/P1 · Session isolation and reconnect | Effective isolation appears in the folder and connection editors. Windows ARM64 verified saved local-shell recovery with inherited and managed Sandbox choices. The native Apple Silicon fixture verified saved SSH and Teamwork reconnect over pinned direct OpenSSH. | Exercise a fresh local launch, unavailable sandbox feedback, desktop reconnect and a live jump-host reconnect. Repeat the applicable desktop checks on macOS and Linux. [Windows desktop checks](PORTING-PARITY.md#november-23-windows-isolation-dialogs-and-launches) · [OpenSSH reconnect checks](PORTING-PARITY.md#november-23-saved-and-teamwork-ssh-reconnect) |
 | D2/D4 · Quick Connect temporary keys | The saved Security opt-in enables in-memory temporary authentication for interactive SSH and SFTP, with destination validation, expiry and retry. | Use a disposable key for a live SSH and SFTP login, retry after expiry, and disable the option while a form or retry holds a key. [Quick Connect checkpoint](PORTING-PARITY.md#november-23-quick-connect-temporary-ssh-keys) |
@@ -625,10 +657,10 @@ The following work requires native acceptance or a scope decision.
   obtain independent external SSH review, build and verify one fixed source
   snapshot per target, and measure startup, idle memory and p95 input latency.
   An existing test count or notarization does not cover subsequent source edits.
-- **Product decisions** cover the import and unattended use rules for saved
-  temporary keys, automatic web requests using later command output, and round-wide
-  approval of future commands across Swarm targets. An explicit grant for one
-  run or one target already exists. Larger or dynamic Swarms, incognito scope,
+- **Product decisions** cover automatic web requests using later command
+  output and round-wide approval of future commands across Swarm targets.
+  An explicit grant for one run or one target already exists.
+  Larger or dynamic Swarms, incognito scope,
   optional telemetry and third-party effects also need decisions. Review
   additional language coverage against the agreed reduced-editor scope.
 - **Explicit scope/deferments:** both Mosh modes are excluded; application
@@ -762,8 +794,10 @@ Fedora verified Spotlight, Orbit, Minimap, the toast badge, and managed
 Chat denial under X11 and native Wayland. Windows ARM64 verified
 Copy answer from Spotlight and Continue in AI Chat from the terminal
 footer. A2 tracks the rest of the Windows matrix and the macOS workflow.
-The design editor, step output and shared settings-search behavior have
-[specific implementation gaps](#confirmed-implementation-work).
+The design editor supports owned naming prompts, and the step menu copies
+the full retained masked output. Both have [outstanding desktop checks](#implemented-features-with-outstanding-checks).
+Settings and AI Manager share the Java matching rules. Remaining control
+coverage is tracked in the [search inventory](#confirmed-implementation-work).
 [Terminal handoff comparison](PORTING-PARITY.md#november-21-terminal-run-chat-handoff).
 
 - **S1 — Editor tools.** Native Lua highlighting, completion, and LuaJIT
@@ -930,8 +964,9 @@ The design editor, step output and shared settings-search behavior have
   encrypted backup/startup replay coverage. A later historical checkpoint passed
   3,320. Native desktop review and cross-host acceptance remain open. M1 tracks
   remaining fields, action options and shared target identities. The
-  [credential backlog](#confirmed-implementation-work) tracks persisted
-  temporary keys and their migration separately.
+  [Java temporary-key restore](PORTING-PARITY.md#november-23-java-temporary-ssh-key-restore)
+  already binds reviewed credentials to eligible new profiles. Native
+  restore review and expiry feedback remain open.
 
 The Rust packager stages ZIP archives for Windows and macOS and a TAR.GZ for
 Linux. The optional `--linux-zip` flag emits a portable Linux ZIP and checksum
@@ -1045,11 +1080,12 @@ The broader release audit also confirmed these workflow differences:
   executable and arguments, reviewed SSH pins and one approval per launch.
   Java also supports free-form shell commands. Define any additional shell,
   Java credential migration or unattended support before implementing it.
-  Optional startup unlock is implemented and awaits the remaining native
-  checks. Reviewed Java temporary-key restore is implemented. The
-  [implementation backlog](#confirmed-implementation-work) tracks
-  unattended use. The backup review, saved-connection editor and login
-  forms have their own acceptance checks.
+  Optional startup unlock and reviewed Java temporary-key restore are
+  implemented. Eligible saved local SSH profiles support unattended
+  temporary keys for Scheduler and rsync, including a distinct jump-host
+  key. Native key replacement and route reselection remain open.
+  [Scheduled key checks](PORTING-PARITY.md#scheduled-ssh-and-rsync-with-temporary-keys)
+  · [Backup review and login checks](#implemented-features-with-outstanding-checks)
 - **D5/A4 — Coding-agent indicators.** Native badges exist on macOS and
   Windows. Linux emits a persistent LauncherEntry D-Bus counter with an
   installed desktop entry. The native bus and count lifecycle have a
@@ -1330,6 +1366,11 @@ not been identified.
 - Platform TLS for HTTPS AI was approved. The bounded RustCrypto `cmov`
   exception was also approved for the corrected SSH RSA implementation.
   Neither is a pending authorization or an unimplemented RSA feature.
+- Reviewed Java temporary-key import and unattended use on eligible saved
+  local SSH routes are implemented. Scheduled Agent and Swarm jobs require
+  other authentication. The requested Teamwork extension concerns target
+  selection and route-bound approval. [Scheduler validation](src/scheduler_window.rs)
+  · [Target and jump-host key binding](src/scheduler_window/connection.rs)
 - Real IBM/HP and physical serial tests are **deferred by the user**.
   Keep them visible under V4 without blocking independent software work.
 - Optional providers, MLX, external editors, rsync and video encoders remain
@@ -1351,42 +1392,18 @@ not been identified.
 
 ## Implementation order
 
-Exercise the native Scheduler review and replacement flow for
-[temporary SSH keys](PORTING-PARITY.md#scheduled-ssh-and-rsync-with-temporary-keys).
-Continue the searchable-control inventory for Settings and AI Manager.
-Exercise the separate native desktop workflows for
-[Java backup review](PORTING-PARITY.md#november-23-java-temporary-ssh-key-restore),
-[project reconnect](PORTING-PARITY.md#november-23-project-reconnect-with-temporary-ssh-keys)
-and [vault auto-unlock](PORTING-PARITY.md#november-23-native-vault-startup-unlock).
-Use disposable keys for the [saved-key editor](PORTING-PARITY.md#november-23-native-saved-temporary-ssh-keys)
-and Quick Connect checks.
+Use the [next milestones in priority order](#next-milestones-in-priority-order)
+to select work. The notes below give the detailed cases for those milestones.
 
-Continue the [native session isolation checks](PORTING-PARITY.md#november-23-windows-isolation-dialogs-and-launches)
-with the macOS and Linux Security page and folder, SSH and local-shell
-editors. Launch a new saved local profile in the desktop sandbox and
-check the editor feedback for an unavailable backend.
-Windows ARM64 recovery already exercised folder inheritance and the
-managed minimum in running local sessions.
-Use the [saved and Teamwork reconnect checkpoint](PORTING-PARITY.md#november-23-saved-and-teamwork-ssh-reconnect)
-for the pinned live OpenSSH coverage on Apple Silicon. Exercise the visible
-SSH and Teamwork reconnect flow on the native desktops and add a live
-jump-host test.
-Continue the [dialog design comparison](#gui-dialog-design-parity) with
-the remaining Settings and AI Manager pages. Repeat the verified Windows
-Knowledge Store restart and recovery paths on the other native desktops.
-Compare the remaining searchable controls and complete the native checks
-for both settings searches, Agent step copying, Agent naming and GGUF,
-and live terminal acceptance for Plan and execution. Continue from the
-Windows Font, Window and SSH editor comparisons when reviewing the remaining
-Settings and connection pages. Scheduler, SFTP and the other dialogs still
-need their own Java comparisons.
-Continue the unresolved portable restore mappings and the requested
-shared Teamwork Agent/Swarm extension. Run native acceptance for the
-existing connection-folder gestures, Scheduler picker, SFTP partial-file
-cleanup, comparisons, transfer recovery and snippet workflows.
-The six work packages below cover compatibility decisions, platform
-acceptance and release preparation. The independent SSH review under V6
-can proceed alongside implementation.
+For the Security, connection and Scheduler walkthrough, use disposable
+credentials. Cover a fresh sandboxed local launch, unavailable-backend
+feedback, vault unlock, and reconnect of the original pane through a jump
+host. The earlier Apple Silicon reconnect used direct OpenSSH. The later
+two-hop test verified scheduled authentication and a Fedora rsync transfer.
+Each route has its own acceptance evidence.
+[Isolation](PORTING-PARITY.md#november-23-windows-isolation-dialogs-and-launches)
+· [Saved and Teamwork reconnect](PORTING-PARITY.md#november-23-saved-and-teamwork-ssh-reconnect)
+· [Scheduler and rsync](PORTING-PARITY.md#scheduled-ssh-and-rsync-with-temporary-keys)
 
 **F1 — Implemented and verified Journal HTTPS credential binding.**
 Questions and summaries now pass the captured credential into the HTTPS
@@ -1437,7 +1454,7 @@ and the [shared directory](PORTING-PARITY.md#scheduler-rsync-groups-sharing-miss
 and [direct file](PORTING-PARITY.md#scheduler-direct-rsync-files-with-missing-local-parents)
 checkpoints.
 
-1. **Close AI provider compatibility and acceptance, B1/B4/B8.** Verify the implemented
+- **AI provider compatibility and acceptance (B1/B4/B8).** Verify the implemented
    Manual and omitted-mode LM Studio migration and reviewed loopback HTTPS
    MCP. Preserve the passed Apple Silicon signed-MLX reasoning checks and
    complete the remaining native Windows GGUF/runtime cases. Cover AI Manager
@@ -1458,7 +1475,7 @@ checkpoints.
    compatibility retries before response generation. One configured deadline
    governs the initial request and its retries. Verify the behavior against a
    configured gateway and model that reject the original mode or output limit.
-2. **Complete data migration and knowledge acceptance, M1/B6.** Convert the
+- **Data migration and knowledge acceptance (M1/B6).** Convert the
    remaining non-secret Java stores with review and restart replay. Check
    the outstanding options and target bindings for the 15 recognized Java
    Scheduler action kinds. Imported jobs stay disabled pending review. Keep external
@@ -1492,7 +1509,7 @@ checkpoints.
    statistics, retries and failure codes restore as read-only run evidence.
    Verify the native file editor and
    snippet profile routing with configured providers and connection overrides.
-3. **Complete file and Scheduler variants, T2/T3/T4/Q1/Q2.** Verify reviewed
+- **File and Scheduler variants (T2/T3/T4/Q1/Q2).** Verify reviewed
    folder-wide SFTP part cleanup on native desktops. Verify searchable multi-selection of
    Scheduler targets in the native job editor. Verify reviewed
    rsync creation and replacement on the remaining native desktop routes.
@@ -1612,19 +1629,19 @@ checkpoints.
    rule. Fedora verified the pinned client fixture and separately exercised
    real sudo and PAM in a disposable namespace.
    Verify macOS Finder drag-out independently of the replacement work.
-4. **Close the bounded scope audits.** Record explicit decisions for remaining
-   vault/key persistence, approval/automatic-web behavior, Swarm capacity,
+- **Remaining scope decisions.** Record decisions for password-command
+   adoption and unattended use, automatic web requests, Swarm capacity,
    remaining language coverage in the existing completion lists, other
    reduced-editor differences and optional telemetry/plugins. Verify the
    existing opt-in inline AI suggestions with a configured provider. Derive
    any new implementation from a named pinned Java action. Do not infer a missing
    terminal opcode, SSH algorithm or editor language from a historical summary.
-5. **Complete native workflow acceptance, D/A/B/S/J/T/P/R and V1–V5.** Cover
+- **Native workflow acceptance (D/A/B/S/J/T/P/R and V1–V5).** Cover
    configured providers, signed local runtimes, shell opt-ins, window behavior,
    notification activation, current policy enforcement, restored data, SFTP
    and real authorized sudo. Obtain the missing Windows x64/macOS Intel
    evidence and finish native Wayland/X11 cases. Hardware stays deferred.
-6. **Complete distribution and release gates, U1/U4/V6/V7.** Resolve active
+- **Distribution and release (U1/U4/V6/V7).** Resolve active
    security findings and obtain independent SSH review. Verify Flatpak local
    isolation on x86-64 and build current fixed-snapshot packages in the
    implemented formats. Repeat native tests and
@@ -1640,7 +1657,7 @@ checkpoints.
 | D1 | Acceptance. Saved local-shell program/arguments/directory and launch routes preserve the integration opt-in. Supported custom Bash/Zsh/Fish startup flags and qualifying Windows executable paths use private startup wrappers. PowerShell/CMD presets are supported. Java `shellIntegrationAutoInject` is imported/exported and the legacy native flag remains readable. Supported default-shell Java project routes preserve the opt-in and validate the saved catalogue identity. Fedora ARM64 verified Flatpak Bash, Zsh and Fish host startup and required Landlock sessions inside the runtime. R `src/connection_store/local.rs`, `src/connection_window/local.rs`, `src/profile/projects/java/routes.rs`, `crates/pty/src/flatpak.rs`. | Verify native launch/edit/restart, live Java exchange, PowerShell 7 and Zsh/Fish startup on the remaining native platforms. J `core/LocalShellTtyConnector.java`, `shellintegration/ShellIntegrationInjection.java`. Preserve exact-argument native extensions. The Java portable project format covers the subset without machine-local command, directory or Teamwork identities. |
 | D2 | Implementation, acceptance and bounded audit. Saved SSH, local shell and serial settings support inherited paste line delay and strict terminal overrides, including Java connection XML. HP2392 paste uses its existing line handling. Themes, independent appearance/scrollback/PTY dimensions, keepalive, project split presentation, local image backgrounds and remote hosted tool restoration also exist. J `model/ConnectionSettings.java`, `ui/ConnectionEditDialog.java`. R `src/connection_store/terminal.rs`, `src/connection_window/terminal_overrides.rs`, `src/workspace/paste_protection.rs`. | Verify tree/sidebar drag-to-folder and successive Undo shared by the list and map. [Folder move parity](PORTING-PARITY.md#november-20-connection-manager-folder-moves) Verify native editing, launch, reconnect, paste routing, Java exchange, and the theme/project/sizing/authentication workflows. The user-deferred HP and physical serial acceptance remains in V4. Verify standalone saved SSH window geometry, private Java XML import, and portable omission. |
 | D3 | Acceptance + bounded audit. Named highlight sets, per-connection selection, bounded network matchers, rule editor/preview, interchange, notification and reviewed snippet triggers exist. R `src/terminal_highlight.rs`, `src/workspace/highlight.rs`. | Native pinned-set acceptance under changing output, palette, policy and snippet authority. Java XML and backup rules use a bounded Java syntax translator shared with Quick Select and Journal markers. A bounded matcher supports lookarounds, backreferences, atomic groups and possessive quantifiers. Audit remaining Java syntax and test visible behavior on native desktops. Do not reimplement the existing set picker or master controls. |
-| D4 | Implementation + acceptance. Native lifecycle, placement, menu routing, hosted/detached tools and Settings/AI Manager keyboard guards exist. Selected Windows ARM64 default-selection, dirty-close and tab-label behavior is verified. Quick Select opens files in native Windows PowerShell/CMD panes. macOS has a separate status item for New Window and Quit and App Nap activity scopes for recent terminal I/O, running jobs and active AI requests. | Align both dialogs with the tagged search matcher and inventory the remaining reachable labeled controls. [Search comparison](PORTING-PARITY.md#november-22-design-editing-command-output-and-settings-search) Verify saved, manual and logger-discovered log folders on native desktops. Verify the status item with zero windows and observe App Nap activity on a packaged Mac build. Complete V1/V2 across native desktops. Cover fresh-profile size, footer reachability, preferred geometry, toolbar overflow, keyboard traversal, owner modality, dirty close and search focus in both hosted and detached forms. |
+| D4 | Implementation + acceptance. Native lifecycle, placement, menu routing, hosted/detached tools and Settings/AI Manager keyboard guards exist. Selected Windows ARM64 default-selection, dirty-close and tab-label behavior is verified. Quick Select opens files in native Windows PowerShell/CMD panes. macOS has a separate status item for New Window and Quit and App Nap activity scopes for recent terminal I/O, running jobs and active AI requests. | Both dialogs use the tagged search matcher. Finish the inventory and exact-control navigation for the remaining reachable labels. [Search implementation](PORTING-PARITY.md#november-23-settings-search-matching) Verify saved, manual and logger-discovered log folders on native desktops. Verify the status item with zero windows and observe App Nap activity on a packaged Mac build. Complete V1/V2 across native desktops. Cover fresh-profile size, footer reachability, preferred geometry, toolbar overflow, keyboard traversal, owner modality, dirty close and search focus in both hosted and detached forms. |
 | D5 | Acceptance. General BEL/OSC, shell, highlighting, Chat, Agent/Swarm and Scheduler notifications exist. Windows OSC 777 click routing to the original inactive split was measured. The Linux LauncherEntry backend emits on a persistent D-Bus name and the portable archive stages a matching desktop entry and icon. | Verify the Linux counter on a supporting launcher and complete native sudo/password waits, moved/closed/stale targets, suppression/coalescing and revocation. Complete macOS and Linux delivery/activation under V3. |
 
 Quick Connect and the saved local-shell editor offer detected Windows
@@ -2966,8 +2983,8 @@ search coverage.
   launch. Native fixtures cover restore and replay of these settings.
   Windows ARM64 verified the managed display and the blocked below-minimum
   proposal. Verify Save and restart for eligible proposals on the native
-  desktops. The encrypted key material has a separate
-  [custody task](#confirmed-implementation-work).
+  desktops. Credential review can seal supported key material for an
+  eligible new profile during [Java temporary-key restore](PORTING-PARITY.md#november-23-java-temporary-ssh-key-restore).
   [Java backup security checkpoint](PORTING-PARITY.md#november-23-java-backup-security-settings)
 - Java restore maps `maxBackupCount` and `autoBackupInterval`. At desktop
   startup these values initialize absent native backup settings. Existing
@@ -3135,7 +3152,8 @@ search coverage.
   files are re-read at firing, and Git sources use the last synchronized
   catalog. Hidden routes and changed routes, membership or pins block the
   saved selection. Eligible scoped vault passwords take precedence over
-  registered keys. Temporary keys remain interactive.
+  registered keys. Teamwork temporary keys remain interactive. Scheduled
+  local profiles use the [saved target and jump-host key bindings](PORTING-PARITY.md#scheduled-ssh-and-rsync-with-temporary-keys).
   Commands, scripts, snippets and SFTP operations including folder sync use
   the new target resolution. For a shared jump host, save one direct local
   SSH profile with the same host, port, username and authentication method.
@@ -3823,18 +3841,17 @@ SSH connection. See the [Wayland checkpoint](PORTING-PARITY.md#incoming-wayland-
 
 The V6 follow-up traces the remaining private operations to Sunset's SSH
 NIST ECDSA adapters and rPGP's RSA decryption and ECDH/X448 operations.
-The 2026-11-15 lockfile and offline dependency-tree recheck still finds
+The 2026-11-15 lockfile and offline dependency-tree check found
 `crypto-bigint 0.5.5`,
 `elliptic-curve 0.13.8` and OpenPGP `pgp 0.21.0` with `rsa 0.9.10`.
-The advisories were rechecked on 2026-11-15. Patched versions are
+The advisory check on 2026-11-15 identified the fixed versions as
 `crypto-bigint >=0.7.6` and `rsa >=0.10.0`. SSH's separate `rsa 0.10.0`
 provider is already corrected.
 [Bigint advisory](https://rustsec.org/advisories/RUSTSEC-2026-0387.html),
 [RSA advisory](https://rustsec.org/advisories/RUSTSEC-2023-0071.html).
-This source review does not establish practical exploitability or replace a
-new full dependency audit. The upstream
-[RustCrypto migration](https://github.com/rpgp/rpgp/pull/573) remains open
-at this review. The published rPGP 0.21.1 manifest still uses RSA 0.9.10
+At that review, the upstream
+[RustCrypto migration](https://github.com/rpgp/rpgp/pull/573) was open.
+The published rPGP 0.21.1 manifest uses RSA 0.9.10
 and the same elliptic-curve generation.
 [rPGP 0.21.1 dependency manifest](https://github.com/rpgp/rpgp/blob/v0.21.1/Cargo.toml)
 Evaluate the NIST curve migration separately against the existing
@@ -3845,13 +3862,13 @@ new provider.
 The previously recorded Windows ARM64 dependency tree confirms the affected NIST
 generation is active through Sunset even when inspecting `kortty-ssh` alone.
 OpenPGP and the application's direct RSA dependency select `rsa 0.9.10`
-in that record. The 2026-11-18 local lockfile inspection still contains
+in that record. The 2026-11-24 inspection of [Cargo.lock](Cargo.lock) confirmed
 `crypto-bigint 0.5.5`, `elliptic-curve 0.13.8`, `pgp 0.21.0` and `rsa 0.9.10`,
-alongside the newer SSH RSA dependencies. Upstream status and advisories
-were not refreshed in this documentation reconciliation. Repeat the current
-audit before selecting remediation; these records are not an independent review.
+alongside the newer SSH RSA dependencies. Refresh the advisory database
+and inspect the dependency paths for each target before choosing a fix.
+The independent external SSH review remains open.
 
-The current SSH-only dependency tree resolves the old private NIST operations
+The recorded SSH-only dependency tree resolved the old private NIST operations
 through Sunset's `ecdsa_portable` and `p256_portable`, `p384_portable` and
 `p521_portable` adapters. The active `ssh-key` ECDSA feature parses key
 representations. The stable RustCrypto curve generation reaches patched

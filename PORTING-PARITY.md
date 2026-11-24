@@ -1322,6 +1322,30 @@ entry into the owned editor and adds the tab color selector.
 [Font and presentation controls](src/connection_window/terminal_overrides/ssh_style.rs)
 · [Color picker](src/connection_window/color_picker.rs)
 
+## November 24 SFTP settings layout and search
+
+The SFTP Settings page follows the Java ordering for inactivity,
+transfers, and ZIP creation. Timeout, parallel transfers, and ZIP
+compression use editable steppers and validate their effective ranges.
+The timeout stays visible while disabled and remembers its value if
+re-enabled in the draft. A managed limit caps the allowed parallel count
+and disables the field at a cap of one. Timeout, retaining a cancelled
+transfer's partial file, ZIP path, and ZIP compression have separate
+search targets. The external editor executable and rsync executable
+continue to use the native file and job approval workflows.
+
+Windows ARM64 and Apple Silicon each passed 108 focused tests. The tests
+cover discovery from an unopened page, the specific search target,
+timeout draft retention, invalid-range handling, and live policy caps.
+Apple Silicon also passed strict Clippy. The Windows x64 Java v2.26.0
+portable reference ran under Windows ARM64 emulation. Its archive
+matched the published SHA-256, and a JavaFX scene snapshot confirmed
+the Settings layout and visible disabled timeout.
+[SFTP Settings](src/workspace/settings_window/sftp_settings.rs)
+· [Settings search inventory](src/workspace/settings_window.rs)
+· [Windows ARM64 test log](target/verification/20261124-sftp-settings-windows-arm64.log)
+· [Apple Silicon test log](target/verification/20261124-sftp-settings-macos-arm64.log)
+
 ## November 24 Quick Connect terminal logging
 
 The SSH Terminal log section shows the directory, format, and gzip

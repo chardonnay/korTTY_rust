@@ -196,9 +196,12 @@ pub enum Setting {
     RemoteSidebar,
     SftpParallel,
     SftpResume,
+    SftpKeepPartial,
     SftpConflictDefault,
     SftpArchive,
+    SftpArchiveCompression,
     SftpIdle,
+    SftpIdleMinutes,
     InitialTerminalSize,
     SerialDefaultEncoding,
     SshDefaultEncoding,
@@ -303,9 +306,12 @@ impl Setting {
         Self::RemoteSidebar,
         Self::SftpParallel,
         Self::SftpResume,
+        Self::SftpKeepPartial,
         Self::SftpConflictDefault,
         Self::SftpArchive,
+        Self::SftpArchiveCompression,
         Self::SftpIdle,
+        Self::SftpIdleMinutes,
         Self::InitialTerminalSize,
         Self::SerialDefaultEncoding,
         Self::SshDefaultEncoding,
@@ -415,10 +421,13 @@ impl Setting {
             Self::CommandTimestamps => "Show command timestamps",
             Self::RemoteSidebar => "Remote files sidebar",
             Self::SftpParallel => "Parallel file transfers",
-            Self::SftpResume => "Resume partial transfers",
+            Self::SftpResume => "Resume interrupted transfers",
+            Self::SftpKeepPartial => "Keep the partial file when a transfer is cancelled",
             Self::SftpConflictDefault => "Default transfer conflict action",
-            Self::SftpArchive => "Archive defaults",
-            Self::SftpIdle => "Close SFTP after inactivity",
+            Self::SftpArchive => "Default ZIP path",
+            Self::SftpArchiveCompression => "Default ZIP compression (0–9)",
+            Self::SftpIdle => "Auto-close SFTP tabs after inactivity",
+            Self::SftpIdleMinutes => "SFTP timeout (minutes)",
             Self::InitialTerminalSize => "Initial terminal size",
             Self::SerialDefaultEncoding => "Default serial character encoding",
             Self::SshDefaultEncoding => "Default SSH character encoding",
@@ -522,9 +531,12 @@ impl Setting {
             Self::ApplicationUpdates | Self::ApplicationUpdateInterval => Section::Updates,
             Self::SftpParallel
             | Self::SftpResume
+            | Self::SftpKeepPartial
             | Self::SftpConflictDefault
             | Self::SftpArchive
-            | Self::SftpIdle => Section::Sftp,
+            | Self::SftpArchiveCompression
+            | Self::SftpIdle
+            | Self::SftpIdleMinutes => Section::Sftp,
             Self::PasteWarning
             | Self::LargePasteWarning
             | Self::PasteLineDelay
@@ -637,12 +649,15 @@ impl Setting {
             Self::SftpParallel => {
                 "sftp simultaneous parallel uploads downloads transfer queue channels"
             }
-            Self::SftpResume => "sftp resume interrupted partial cancel upload download",
+            Self::SftpResume => "sftp resume interrupted partial upload download",
+            Self::SftpKeepPartial => "sftp transfer partial cancellation cancel keep retain",
             Self::SftpConflictDefault => {
                 "sftp default conflict ask skip overwrite replace existing files"
             }
-            Self::SftpArchive => "sftp archive remote destination path zip compression level",
-            Self::SftpIdle => "sftp idle auto close inactive timeout minutes",
+            Self::SftpArchive => "sftp archive remote destination directory path zip",
+            Self::SftpArchiveCompression => "sftp archive compression level zip",
+            Self::SftpIdle => "sftp idle auto close inactive enable",
+            Self::SftpIdleMinutes => "sftp auto close timeout duration minutes",
             Self::InitialTerminalSize => {
                 "initial terminal grid dimensions columns rows pty shell ssh"
             }
@@ -850,15 +865,13 @@ pub enum Message {
     AutomaticLocalShellIntegration(window::Id, bool),
     CommandTimestamps(window::Id, bool),
     RemoteSidebar(window::Id, RemoteSidebarPosition),
-    SftpParallel(window::Id, u8),
+    SftpNumber(window::Id, sftp_settings::Number, String),
     SftpResume(window::Id, bool),
     SftpKeepPartial(window::Id, bool),
     SftpXml(window::Id, sftp_settings::java::Action),
     SftpConflictDefault(window::Id, ConflictDefault),
     SftpArchiveDirectory(window::Id, String),
-    SftpArchiveLevel(window::Id, u8),
     SftpIdleEnabled(window::Id, bool),
-    SftpIdleMinutes(window::Id, u16),
     TerminalColumns(window::Id, String),
     TerminalRows(window::Id, String),
     SerialDefaultEncoding(window::Id, TextEncoding),
@@ -1212,6 +1225,7 @@ struct Dialog {
     draft: Draft,
     sandbox_availability: Option<String>,
     installed_sftp_conflict_policy: SftpConflictPolicy,
+    sftp_numbers: sftp_settings::Numbers,
     sftp_xml: sftp_settings::java::Exchange,
     initial_highlighting: highlight::Preferences,
     highlighting: highlight::Preferences,
@@ -1397,6 +1411,14 @@ impl Dialog {
             return Some(self.reveal(setting));
         }
         None
+    }
+
+    fn reveal_invalid_sftp_number(&mut self, policy: SftpConflictPolicy) -> Option<Task<Desktop>> {
+        let setting = self
+            .sftp_numbers
+            .first_problem(&self.draft.preferences, policy)?;
+        self.problem = None;
+        Some(self.reveal_result(setting))
     }
 }
 
@@ -1692,15 +1714,13 @@ impl Workspace {
             | Message::AutomaticLocalShellIntegration(id, _)
             | Message::CommandTimestamps(id, _)
             | Message::RemoteSidebar(id, _)
-            | Message::SftpParallel(id, _)
+            | Message::SftpNumber(id, _, _)
             | Message::SftpResume(id, _)
             | Message::SftpKeepPartial(id, _)
             | Message::SftpXml(id, _)
             | Message::SftpConflictDefault(id, _)
             | Message::SftpArchiveDirectory(id, _)
-            | Message::SftpArchiveLevel(id, _)
             | Message::SftpIdleEnabled(id, _)
-            | Message::SftpIdleMinutes(id, _)
             | Message::TerminalColumns(id, _)
             | Message::TerminalRows(id, _)
             | Message::SerialDefaultEncoding(id, _)
@@ -2054,17 +2074,14 @@ impl Workspace {
             Message::RemoteSidebar(_, position) => {
                 dialog.draft.preferences.remote_sidebar_position = position;
             }
-            Message::SftpParallel(_, parallel) if dialog.section == Section::Sftp => {
+            Message::SftpNumber(_, number, input) if dialog.section == Section::Sftp => {
                 dialog.installed_sftp_conflict_policy = SftpConflictPolicy::load();
                 let policy = dialog
                     .installed_sftp_conflict_policy
                     .restrict(&self.clipboard.policy);
-                if policy.transfer_allowed
-                    && policy.parallel_cap > 1
-                    && (1..=policy.parallel_cap).contains(&parallel)
-                {
-                    dialog.draft.preferences.sftp_parallel_transfers = parallel;
-                }
+                dialog
+                    .sftp_numbers
+                    .update(&mut dialog.draft.preferences, policy, number, input);
             }
             Message::SftpResume(_, enabled) if dialog.section == Section::Sftp => {
                 dialog.installed_sftp_conflict_policy = SftpConflictPolicy::load();
@@ -2102,6 +2119,7 @@ impl Workspace {
                     if policy.parallel_cap > 1 {
                         preferences.sftp_parallel_transfers =
                             imported.parallel.min(policy.parallel_cap);
+                        dialog.sftp_numbers.clear(sftp_settings::Number::Parallel);
                     }
                     preferences.sftp_resume_partial_transfers = imported.resume;
                     preferences.sftp_keep_partial_on_cancel = imported.keep;
@@ -2110,6 +2128,9 @@ impl Workspace {
                     }
                     if let Some(level) = imported.archive_level {
                         preferences.sftp_archive.level = level;
+                        dialog
+                            .sftp_numbers
+                            .clear(sftp_settings::Number::Compression);
                     }
                 }
                 return task.map(move |action| Desktop::Settings(Message::SftpXml(id, action)));
@@ -2125,25 +2146,14 @@ impl Workspace {
                 }
             }
             Message::SftpIdleEnabled(_, enabled) if dialog.section == Section::Sftp => {
-                dialog.draft.preferences.sftp_idle_minutes =
-                    enabled.then_some(dialog.draft.preferences.sftp_idle_minutes.unwrap_or(10));
+                dialog
+                    .sftp_numbers
+                    .set_idle_enabled(&mut dialog.draft.preferences, enabled);
             }
             Message::SftpArchiveDirectory(_, path)
                 if dialog.section == Section::Sftp && path.len() <= 4096 =>
             {
                 dialog.draft.preferences.sftp_archive.remote_directory = path;
-            }
-            Message::SftpArchiveLevel(_, level)
-                if dialog.section == Section::Sftp && level <= 9 =>
-            {
-                dialog.draft.preferences.sftp_archive.level = level;
-            }
-            Message::SftpIdleMinutes(_, minutes)
-                if dialog.section == Section::Sftp
-                    && dialog.draft.preferences.sftp_idle_minutes.is_some()
-                    && (1..=profile::RemoteProjectTool::MAX_IDLE_MINUTES).contains(&minutes) =>
-            {
-                dialog.draft.preferences.sftp_idle_minutes = Some(minutes);
             }
             Message::TerminalColumns(_, value) if dialog.section == Section::Terminal => {
                 update_grid_dimension(
@@ -2512,6 +2522,7 @@ impl Workspace {
             draft,
             sandbox_availability: None,
             installed_sftp_conflict_policy: SftpConflictPolicy::load(),
+            sftp_numbers: sftp_settings::Numbers::default(),
             sftp_xml: sftp_settings::java::Exchange::default(),
             initial_highlighting: highlighting.clone(),
             highlighting,
@@ -2558,6 +2569,27 @@ impl Workspace {
                 .as_ref()
                 .map_or_else(Task::none, Dialog::reveal_tab),
         );
+        #[cfg(all(debug_assertions, feature = "dialog-preview"))]
+        let reveal = if section == Some(Section::Sftp) {
+            if let Some(path) = std::env::var_os("KORTTY_SFTP_FIXTURE_FRAME") {
+                reveal.chain(window::screenshot(id).then(move |frame| {
+                    if let Err(error) = image::save_buffer(
+                        &path,
+                        &frame.rgba,
+                        frame.size.width,
+                        frame.size.height,
+                        image::ColorType::Rgba8,
+                    ) {
+                        eprintln!("could not save SFTP fixture frame: {error}");
+                    }
+                    Task::none()
+                }))
+            } else {
+                reveal
+            }
+        } else {
+            reveal
+        };
         if standalone_agent_design {
             reveal
         } else {
@@ -2601,6 +2633,13 @@ impl Workspace {
             return Task::none();
         };
         if let Some(reveal) = dialog.reveal_invalid_input() {
+            return reveal;
+        }
+        dialog.installed_sftp_conflict_policy = SftpConflictPolicy::load();
+        let policy = dialog
+            .installed_sftp_conflict_policy
+            .restrict(&self.clipboard.policy);
+        if let Some(reveal) = dialog.reveal_invalid_sftp_number(policy) {
             return reveal;
         }
         if dialog.logging.browsing() || dialog.backup.browsing() {
@@ -2822,6 +2861,9 @@ impl Workspace {
             .installed_sftp_conflict_policy
             .restrict(&self.clipboard.policy);
         if let Some(reveal) = dialog.reveal_invalid_input() {
+            return reveal;
+        }
+        if let Some(reveal) = dialog.reveal_invalid_sftp_number(sftp_conflict_policy) {
             return reveal;
         }
         if dialog.themes.editing() {

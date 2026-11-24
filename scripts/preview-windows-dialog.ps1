@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('settings', 'connections', 'quick-connect', 'ai-manager', 'agent-design', 'agent-design-compact')]
+    [ValidateSet('settings', 'settings-sftp', 'connections', 'quick-connect', 'ai-manager', 'agent-design', 'agent-design-compact')]
     [string] $Dialog,
     [ValidateRange(30, 3600)]
     [int] $LifetimeSeconds = 600

@@ -1086,6 +1086,9 @@ impl Workspace {
             Ok("settings") => task.chain(Task::done(Message::Settings(
                 settings_window::Message::Open(id),
             ))),
+            Ok("settings-sftp") => task.chain(Task::done(Message::Settings(
+                settings_window::Message::OpenAt(id, settings_window::Section::Sftp),
+            ))),
             Ok("connections") => task.chain(Task::done(Message::OpenConnections(id))),
             Ok("quick-connect") => task.chain(Task::done(Message::Chrome(
                 chrome::Message::Invoke(id, chrome::Action::QuickConnect),
