@@ -596,7 +596,7 @@ impl Draft {
             Page::JumpHost => self.jump_page(choices),
             Page::Logging => self
                 .logging
-                .editor_view(!self.incognito, choices.logging_policy)
+                .editor_view(!self.incognito, choices.logging_policy, &self.name)
                 .map(|action| match action {
                     crate::terminal_logging::EditorAction::Edit(edit) => {
                         Message::Edit(Edit::Logging(edit))

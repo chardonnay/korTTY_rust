@@ -16,6 +16,7 @@ use super::capture::{Record, Shutdown};
 use super::{Config, Format, MAX_LOG_BYTES};
 
 const COMPRESSION_QUEUE: usize = 2;
+const MAX_SEQUENCE: u16 = 999;
 
 pub(super) fn run(
     profile: &Path,
@@ -56,12 +57,13 @@ pub(super) fn run(
         };
         let mut writer = LogWriter {
             config,
+            slug: super::slug(metadata.get("connection").map_or("", String::as_str)),
             metadata,
             format,
             folder,
             open: None,
             day: None,
-            base: String::new(),
+            sequence: 1,
             part: 0,
             timezone,
             shutdown,
@@ -109,7 +111,8 @@ struct LogWriter<'a> {
     folder: &'a Folder,
     open: Option<Active>,
     day: Option<Date>,
-    base: String,
+    slug: String,
+    sequence: u16,
     part: u32,
     timezone: TimeZone,
     shutdown: &'a Shutdown,
@@ -140,8 +143,7 @@ impl LogWriter<'_> {
             write_entry(&mut line, self.format, &record.fields, 0)?;
         }
         if self.open.is_none() {
-            if self.base.is_empty() || rotate_daily {
-                self.base = fresh_base(&at)?;
+            if self.part == 0 || rotate_daily {
                 self.day = Some(at.date());
                 self.part = 1;
             } else {
@@ -150,8 +152,7 @@ impl LogWriter<'_> {
                     .checked_add(1)
                     .ok_or_else(|| io::Error::other("Logfile part limit reached"))?;
             }
-            let filename = super::filename(&self.base, self.part, self.config.format);
-            self.open = Some(self.folder.begin(&filename, self.format, &self.metadata)?);
+            self.open = Some(self.open_part(at.datetime())?);
             if rotate_daily && self.folder.retention {
                 self.folder.sweep(at.date(), || self.shutdown.started());
             }
@@ -165,6 +166,21 @@ impl LogWriter<'_> {
         open.bytes += line.len() as u64;
         open.lines += 1;
         Ok(())
+    }
+
+    fn open_part(&mut self, stamp: jiff::civil::DateTime) -> io::Result<Active> {
+        for sequence in self.sequence..=MAX_SEQUENCE {
+            let filename =
+                super::filename(&self.slug, stamp, self.part, sequence, self.config.format);
+            if let Some(active) = self.folder.begin(&filename, self.format, &self.metadata)? {
+                self.sequence = sequence;
+                return Ok(active);
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "No free terminal logfile name in the session sequence range",
+        ))
     }
 
     fn close(&mut self, complete: bool) -> io::Result<()> {
@@ -402,40 +418,84 @@ impl Folder {
             .create_read_write_file(std::ffi::OsStr::new(name))
     }
 
+    fn name_exists(&self, name: &str) -> io::Result<bool> {
+        #[cfg(unix)]
+        let entry: io::Result<()> =
+            rustix::fs::statat(&self.handle, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+                .map(|_| ())
+                .map_err(Into::into);
+        #[cfg(windows)]
+        let entry = self
+            .handle
+            .open_entry_metadata(std::ffi::OsStr::new(name))
+            .map(|_| ());
+        match entry {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     fn begin(
         &self,
         filename: &str,
         format: DocumentFormat,
         metadata: &Fields,
-    ) -> io::Result<Active> {
+    ) -> io::Result<Option<Active>> {
+        let marker_name = format!(".{filename}.lock");
+        let archive_name = super::compressed_filename(filename);
+        if self.name_exists(&marker_name)? || self.name_exists(&archive_name)? {
+            return Ok(None);
+        }
         let mut header = Vec::new();
         write_header(&mut header, format, metadata)?;
-        let marker_name = format!(".{filename}.lock");
+        // Java also claims the plain name first. The sidecar must only be
+        // created once this writer owns that name.
+        let file = match self.create_file(filename) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(None),
+            Err(error) => return Err(error),
+        };
         #[cfg(unix)]
-        let marker = self.create_file(&marker_name)?;
+        let marker = self.create_file(&marker_name);
         #[cfg(windows)]
         let marker = self
             .handle
-            .create_shared_lock_file(std::ffi::OsStr::new(&marker_name))?;
-        let open = || -> io::Result<_> {
-            lock_marker(&marker)?;
-            let mut writer = BufWriter::new(self.create_file(filename)?);
-            writer.write_all(&header)?;
-            writer.flush()?;
-            Ok(writer)
+            .create_shared_lock_file(std::ffi::OsStr::new(&marker_name));
+        let marker = match marker {
+            Ok(marker) => marker,
+            Err(error) => {
+                let result = if error.kind() == io::ErrorKind::AlreadyExists {
+                    Ok(None)
+                } else {
+                    Err(error)
+                };
+                return combine_errors(result, self.remove(filename, file));
+            }
         };
-        let writer = match open() {
-            Ok(writer) => writer,
-            Err(error) => return combine_errors(Err(error), self.remove(&marker_name, marker)),
-        };
-        Ok(Active {
+        // A previous writer can publish its archive and release the plain name
+        // between the first check and exclusive creation of the plain file.
+        let archived = lock_marker(&marker).and_then(|()| self.name_exists(&archive_name));
+        if !matches!(archived, Ok(false)) {
+            let cleanup = combine_errors(
+                self.remove(filename, file),
+                self.remove(&marker_name, marker),
+            );
+            return combine_errors(archived.map(|_| None), cleanup);
+        }
+        let mut writer = BufWriter::new(file);
+        if let Err(error) = writer.write_all(&header).and_then(|()| writer.flush()) {
+            drop(writer);
+            return combine_errors(Err(error), self.remove(&marker_name, marker));
+        }
+        Ok(Some(Active {
             writer,
             filename: filename.into(),
             marker,
             marker_name,
             bytes: header.len() as u64,
             lines: 0,
-        })
+        }))
     }
 
     fn compress_closed(
@@ -619,20 +679,124 @@ fn file_identity(file: &File) -> io::Result<(u64, u64)> {
 #[cfg(windows)]
 use kortty_files::tree::file_identity;
 
-fn fresh_base(at: &jiff::Zoned) -> io::Result<String> {
-    let mut nonce = [0; 4];
-    getrandom::fill(&mut nonce).map_err(io::Error::other)?;
-    let sequence = u32::from_le_bytes(nonce) % 1_000_000_000 + 1;
-    Ok(format!(
-        "{}-ssh_{sequence}",
-        at.strftime("%Y-%m-%d-%H-%M-%S")
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::snippets::tests::Profile;
+
+    #[test]
+    fn concurrent_sessions_skip_an_existing_archive_and_claim_distinct_sequences() {
+        let profile = Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        let folder = Folder::open(&root, &Config::default()).unwrap();
+        let at: jiff::Timestamp = "2025-01-02T10:00:00Z".parse().unwrap();
+        let stamp = at
+            .to_zoned(TimeZone::system())
+            .strftime("%Y-%m-%d-%H-%M-%S")
+            .to_string();
+        let archived = folder.path.join(format!("{stamp}-Edge_west_2_1.log.gz"));
+        fs::write(&archived, b"existing archive").unwrap();
+        let simultaneous = std::sync::Barrier::new(3);
+        thread::scope(|threads| {
+            for line in ["session alpha", "session beta", "session gamma"] {
+                let (send, records) = async_channel::bounded(1);
+                send.send_blocking(Record {
+                    at,
+                    fields: Fields::from([("line".into(), line.into())]),
+                })
+                .unwrap();
+                let root = &root;
+                let simultaneous = &simultaneous;
+                threads.spawn(move || {
+                    simultaneous.wait();
+                    drop(send);
+                    run(
+                        root,
+                        Config {
+                            compress: false,
+                            ..Config::default()
+                        },
+                        Fields::from([("connection".into(), "Edge / west__2".into())]),
+                        records,
+                        &Shutdown::default(),
+                    )
+                    .unwrap();
+                });
+            }
+        });
+        let logs: String = (2..=4)
+            .map(|sequence| {
+                fs::read_to_string(
+                    folder
+                        .path
+                        .join(format!("{stamp}-Edge_west_2_{sequence}.log")),
+                )
+                .unwrap()
+            })
+            .collect();
+        for line in ["session alpha", "session beta", "session gamma"] {
+            assert_eq!(logs.matches(line).count(), 1);
+        }
+        assert_eq!(fs::read(archived).unwrap(), b"existing archive");
+        assert_eq!(fs::read_dir(&folder.path).unwrap().count(), 4);
+    }
+
+    #[test]
+    fn rotated_parts_use_their_own_timestamps_and_keep_the_claimed_sequence() {
+        let profile = Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        let folder = Folder::open(&root, &Config::default()).unwrap();
+        let times = [
+            "2025-01-02T10:00:00Z",
+            "2025-01-02T10:01:00Z",
+            "2025-01-04T10:00:00Z",
+        ]
+        .map(|time| time.parse::<jiff::Timestamp>().unwrap());
+        let [first, second, next_day] = times.map(|at| {
+            at.to_zoned(TimeZone::system())
+                .strftime("%Y-%m-%d-%H-%M-%S")
+                .to_string()
+        });
+        let existing = folder.path.join(format!("{first}-Edge_1.log"));
+        fs::write(&existing, b"existing logfile").unwrap();
+        let (send, records) = async_channel::bounded(3);
+        for (at, line) in times
+            .into_iter()
+            .zip(["first part", "size roll", "daily roll"])
+        {
+            send.send_blocking(Record {
+                at,
+                fields: Fields::from([("line".into(), line.into())]),
+            })
+            .unwrap();
+        }
+        drop(send);
+        run(
+            &root,
+            Config {
+                max_mib: 0, // Force size rotation without generating large test records.
+                compress: false,
+                ..Config::default()
+            },
+            Fields::from([("connection".into(), "Edge".into())]),
+            records,
+            &Shutdown::default(),
+        )
+        .unwrap();
+        for (name, line) in [
+            (format!("{first}-Edge_2.log"), "first part"),
+            (format!("{second}-Edge_2.p2.log"), "size roll"),
+            (format!("{next_day}-Edge_2.log"), "daily roll"),
+        ] {
+            assert!(
+                fs::read_to_string(folder.path.join(name))
+                    .unwrap()
+                    .contains(line)
+            );
+        }
+        assert_eq!(fs::read(existing).unwrap(), b"existing logfile");
+        assert_eq!(fs::read_dir(&folder.path).unwrap().count(), 4);
+    }
 
     #[test]
     #[ignore = "Writes a 1,000 MiB part and exercises native rotation, compression and paging"]
@@ -820,7 +984,8 @@ mod tests {
         assert!(
             folder
                 .begin(name, DocumentFormat::Text, &Fields::new())
-                .is_err()
+                .unwrap()
+                .is_none()
         );
         assert!(!folder.path.join(name).exists());
         folder.remove(&marker_name, marker).unwrap();
@@ -828,7 +993,8 @@ mod tests {
         assert!(
             folder
                 .begin(name, DocumentFormat::Text, &Fields::new())
-                .is_err()
+                .unwrap()
+                .is_none()
         );
         assert!(!marker_path.exists());
         assert_eq!(fs::read(folder.path.join(name)).unwrap(), b"other logfile");
@@ -836,6 +1002,7 @@ mod tests {
 
         let active = folder
             .begin(name, DocumentFormat::Text, &Fields::new())
+            .unwrap()
             .unwrap();
         let source = LocalSource::open(&folder.path.join(name)).unwrap();
         assert!(source.sibling_exists_or_uncertain(std::ffi::OsStr::new(&marker_name)));

@@ -1322,6 +1322,32 @@ entry into the owned editor and adds the tab color selector.
 [Font and presentation controls](src/connection_window/terminal_overrides/ssh_style.rs)
 · [Color picker](src/connection_window/color_picker.rs)
 
+## November 24 terminal logfile naming
+
+New terminal logs use the sanitized connection name, local timestamp,
+and a sequence from 1 through 999. The writer uses the name from redacted
+capture metadata. Parallel writers claim distinct slots through exclusive
+file creation. A lock sidecar, existing plain log, or gzip archive occupies
+its slot. Later parts use the local time of the record that opens each part
+and keep the most recently claimed sequence when the slot is available.
+Daily rotation resets the part number. Older Rust names and Java filenames
+remain readable, and retention still checks Rust's archive ownership marker.
+
+The saved SSH editor uses the same sanitizer and filename format with the
+draft connection name, local time, part one, and sequence one. The preview
+updates with the text, XML, or JSON format and the gzip setting.
+
+Windows ARM64 passed 51 focused tests and Apple Silicon passed 56. Both
+platforms passed the separate 1,000 MiB rotation, gzip, and viewer fixture.
+The focused tests cover concurrent allocation around an existing archive,
+preservation of an existing plain logfile, fresh timestamps after size
+rotation, and part reset at the next day. Apple Silicon passed strict
+Clippy. A live desktop walkthrough of the revised preview remains open.
+[Terminal writer](src/terminal_logging/writer.rs)
+· [Connection editor preview](src/terminal_logging/editor.rs)
+· [Windows ARM64 test log](target/verification/20261124-terminal-log-names-windows-arm64-final.log)
+· [Apple Silicon test log](target/verification/20261124-terminal-log-names-macos-arm64-final.log)
+
 ## November 24 terminal logfile size limit
 
 The connection editor and writer accept log sizes up to 1,000 MiB. A

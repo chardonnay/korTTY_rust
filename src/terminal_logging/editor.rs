@@ -97,6 +97,7 @@ impl Form {
         &self,
         eligible: bool,
         managed: ManagedFields,
+        connection_name: &str,
     ) -> Element<'_, Action> {
         let enabled = eligible && self.config.enabled;
         let browse = (enabled && self.editor.picker.is_none()).then_some(Action::Browse);
@@ -137,7 +138,8 @@ impl Form {
             )),
             field(
                 "Example filename",
-                text(self.filename_preview()).font(Font::MONOSPACE).size(13).style(text::secondary),
+                text(self.filename_preview(connection_name, jiff::Zoned::now().datetime()))
+                    .font(Font::MONOSPACE).size(13).style(text::secondary),
             ),
             field("Maximum file size", quantity(
                 &self.size,
@@ -241,8 +243,14 @@ impl Form {
         )
     }
 
-    fn filename_preview(&self) -> String {
-        let name = filename("2026-01-15-09-30-00-ssh_1", 1, self.config.format);
+    fn filename_preview(&self, connection_name: &str, stamp: jiff::civil::DateTime) -> String {
+        let name = filename(
+            &super::slug(connection_name),
+            stamp,
+            1,
+            1,
+            self.config.format,
+        );
         if self.config.compress {
             super::compressed_filename(&name)
         } else {
@@ -366,17 +374,22 @@ mod tests {
     #[test]
     fn previews_each_writer_extension_and_archive_suffix() {
         let mut form = Form::new(Default::default());
+        let stamp = "2026-01-15T09:30:00".parse().unwrap();
+        let connection = " Edge / west__2 ";
         for (format, extension) in [
             (Format::Text, "log"),
             (Format::Xml, "xml"),
             (Format::Json, "json"),
         ] {
             form.update(Edit::Format(format));
-            let example = format!("2026-01-15-09-30-00-ssh_1.{extension}");
+            let example = format!("2026-01-15-09-30-00-Edge_west_2_1.{extension}");
             form.update(Edit::Compress(false));
-            assert_eq!(form.filename_preview(), example);
+            assert_eq!(form.filename_preview(connection, stamp), example);
             form.update(Edit::Compress(true));
-            assert_eq!(form.filename_preview(), format!("{example}.gz"));
+            assert_eq!(
+                form.filename_preview(connection, stamp),
+                format!("{example}.gz")
+            );
         }
     }
 

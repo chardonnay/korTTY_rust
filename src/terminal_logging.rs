@@ -138,16 +138,39 @@ fn valid_folder(path: &Path) -> bool {
     path.is_absolute() && !path.components().any(|part| part == Component::ParentDir)
 }
 
-fn filename(base: &str, part: u32, format: Format) -> String {
+fn slug(connection: &str) -> String {
+    let mut sanitized = String::new();
+    for character in connection.chars() {
+        if character.is_ascii_alphanumeric() || matches!(character, '.' | '-') {
+            sanitized.push(character);
+        } else if !sanitized.is_empty() && !sanitized.ends_with('_') {
+            sanitized.push('_');
+        }
+    }
+    let sanitized = sanitized.trim_end_matches('_').trim_start_matches('.');
+    if sanitized.is_empty() {
+        return "terminal".into();
+    }
+    sanitized[..sanitized.len().min(64)].into()
+}
+
+fn filename(
+    slug: &str,
+    stamp: jiff::civil::DateTime,
+    part: u32,
+    sequence: u16,
+    format: Format,
+) -> String {
+    let stamp = stamp.strftime("%Y-%m-%d-%H-%M-%S");
     let extension = match format {
         Format::Text => "log",
         Format::Xml => "xml",
         Format::Json => "json",
     };
     if part <= 1 {
-        format!("{base}.{extension}")
+        format!("{stamp}-{slug}_{sequence}.{extension}")
     } else {
-        format!("{base}.p{part}.{extension}")
+        format!("{stamp}-{slug}_{sequence}.p{part}.{extension}")
     }
 }
 

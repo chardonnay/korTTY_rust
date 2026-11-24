@@ -225,9 +225,11 @@ gzip publication. The viewer indexes plain logs and streams compressed
 images into a private temporary file. The compatibility test exercises
 rotation, cancelled compression, plain and gzip viewing, and export at the
 limit.
-Java log names include the sanitized connection name. Rust names use a
-session identifier. Align new names and their preview while retaining
-support for reading and rotating existing logs.
+The [terminal logfile naming update](PORTING-PARITY.md#november-24-terminal-logfile-naming)
+applies the Java connection-name, timestamp, sequence, and part conventions
+to the writer and the connection editor's preview. The viewer continues to
+recognize existing Rust and Java filenames. Verify the revised preview with
+saved connections on native desktops.
 The [terminal logging XML update](PORTING-PARITY.md#november-24-java-terminal-logging-xml)
 maps the Java `logConfig` record during direct import and portable Java backup
 restore. A request to enable logging and a Java path are stored for explicit
