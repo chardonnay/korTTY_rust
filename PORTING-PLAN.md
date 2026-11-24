@@ -163,11 +163,14 @@ journal translation actions operate on user content.
 The Connection Manager adopts the Java toolbar order, places Undo in the
 Folder group and groups Connect and Close at the right. The SSH editor
 organizes its existing form into Connection, Terminal Settings, SSH Tunnels,
-Jump Server, Terminal Logging and Window Geometry. The Java Journal and AI
-tabs, the Manager's separate Teamwork sidebar group, form alignment and
-narrower-window checks remain open. The Windows desktop check covered
-the three-pane Manager, its Map view,
-opening the editor and navigating between editor tabs.
+Jump Server, Terminal Logging, Journal, Window Geometry and AI. The
+[Journal and AI tabs](PORTING-PARITY.md#november-24-ssh-editor-journal-and-ai-tabs)
+use the existing saved connection options. The connection memory shortcut
+and the Java overflow menu still need implementation. Compare the journal
+limits and enforced policy behavior with Java. The Manager's separate
+Teamwork sidebar group and editor form alignment remain open. The earlier
+Windows desktop check covered the three-pane Manager, its Map view, opening
+the editor and navigating between editor tabs.
 
 The AI Manager now uses the Java window size, a search overlay, underlined
 primary tabs and General subpages. The profile form retains its four

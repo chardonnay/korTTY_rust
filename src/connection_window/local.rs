@@ -251,7 +251,7 @@ impl Draft {
                 .push(text("Terminal Effect").size(16))
                 .push(self.effect.view(effects, Edit::Effect, Edit::EffectSpeed));
         }
-        form.push(self.terminal.view(choices).map(Edit::Terminal))
+        form.push(self.terminal.view(choices, true).map(Edit::Terminal))
             .into()
     }
 }

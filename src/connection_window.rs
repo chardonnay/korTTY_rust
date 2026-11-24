@@ -35,6 +35,7 @@ mod view;
 use color::ColorDraft;
 use form::Draft;
 pub use form::Edit;
+pub(crate) use journal_settings::Policy as JournalEditorPolicy;
 use selection::{RowKey, Selection};
 pub use temporary_ssh_key::TemporarySaveReply;
 pub(crate) use view::{HighlightChoices, ViewChoices};

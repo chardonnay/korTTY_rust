@@ -1104,6 +1104,95 @@ fn connection_tab_color_draft_validates_saves_and_can_be_removed() {
 }
 
 #[test]
+fn ssh_editor_journal_and_ai_tabs_keep_their_drafts_when_terminal_defaults_are_restored() {
+    use iced::advanced::{Layout, layout, widget::Tree};
+    use iced::{Font, Renderer, Size};
+    use terminal_overrides::Edit as Terminal;
+
+    let profile = Profile::new();
+    let mut store = Store::open(profile.path()).unwrap();
+    let mut saved = connection("Build host", "");
+    saved.terminal.font_size = Some(22);
+    saved.terminal.ai_skills = vec![17, 19];
+    let id = store.save(saved).unwrap();
+    let mut window = ConnectionWindow::open(profile.path()).unwrap();
+    let _ = window.update(Message::EditSelected);
+
+    let themes = crate::terminal_theme::Themes::default();
+    let mut view = window
+        .editor_view(ViewChoices {
+            passwords: &[],
+            passphrases: &[],
+            keys: &[],
+            temporary_keys: false,
+            vault_unlocked: false,
+            ai_profiles: &[],
+            java_ai_profiles: &[],
+            ai_skills: &[(17, "Release check".into())],
+            ai_agent_designs: &[],
+            highlighting: HighlightChoices::default(),
+            themes: &themes,
+            journal_policy: JournalEditorPolicy::default(),
+            incognito_allowed: true,
+            serial_allowed: true,
+            terminal_effects: None,
+            default_paste_warning: Default::default(),
+            minimum_paste_warning: PasteWarningMode::Off,
+            isolation: Default::default(),
+            local_isolation_default: Default::default(),
+        })
+        .unwrap();
+    let compact = Size::new(640.0, 430.0);
+    let renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+    let mut tree = Tree::new(view.as_widget());
+    let node = view.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &layout::Limits::new(Size::ZERO, compact),
+    );
+    let root = Layout::new(&node);
+    let form = root.children().next().unwrap().children().next().unwrap();
+    let tabs: Vec<_> = form
+        .children()
+        .nth(1)
+        .unwrap()
+        .children()
+        .map(|tab| tab.bounds())
+        .collect();
+    assert_eq!(tabs.len(), 8);
+    assert!(tabs.iter().all(|tab| tab.x + tab.width <= compact.width));
+    let footer = root.children().nth(2).unwrap().bounds();
+    assert!(footer.height > 0.0 && footer.y + footer.height <= compact.height);
+    drop(view);
+
+    let _ = window.update(Message::Edit(Edit::Page(form::Page::Ai)));
+    let _ = window.update(Message::Edit(Edit::Terminal(Terminal::AiSkillSearch(
+        "release".into(),
+    ))));
+    assert!(!window.draft.as_ref().unwrap().changed);
+    for edit in [
+        Edit::Terminal(Terminal::AiAgentDisabled(true)),
+        Edit::Page(form::Page::Journal),
+        Edit::Terminal(Terminal::Journal(journal_settings::Edit::Auto(true))),
+        Edit::Terminal(Terminal::Journal(journal_settings::Edit::Interval(
+            "45".into(),
+        ))),
+        Edit::Page(form::Page::Settings),
+        Edit::Terminal(Terminal::ResetTerminal),
+    ] {
+        let _ = window.update(Message::Edit(edit));
+    }
+    complete_persisted(&mut window, Message::Save);
+    let reopened = Store::open(profile.path()).unwrap();
+    let terminal = &reopened.get(id).unwrap().terminal;
+    assert!(terminal.font_size.is_none());
+    assert!(terminal.ai_agent_disabled);
+    assert_eq!(terminal.ai_skills, [17, 19]);
+    assert!(terminal.journal.auto_start);
+    assert_eq!(terminal.journal.summary_interval_minutes, 45);
+}
+
+#[test]
 fn connection_paste_warning_round_trips_explicit_and_inherited_values() {
     let profile = Profile::new();
     let mut store = Store::open(profile.path()).unwrap();
@@ -1293,7 +1382,7 @@ fn connection_manager_pointer_drags_accept_local_folders_and_refuse_teamwork_sou
     let mut view = manager.view(ViewChoices {
         temporary_keys: false,
         vault_unlocked: false,
-        journal_max_parts: None,
+        journal_policy: JournalEditorPolicy::default(),
         serial_allowed: true,
         passwords: &[],
         passphrases: &[],
@@ -1407,7 +1496,7 @@ fn native_workbench_keeps_reference_side_widths_at_default_and_minimum_size() {
         let mut view = window.view(ViewChoices {
             temporary_keys: false,
             vault_unlocked: false,
-            journal_max_parts: None,
+            journal_policy: JournalEditorPolicy::default(),
             serial_allowed: true,
             passwords: &[],
             passphrases: &[],
@@ -1461,7 +1550,7 @@ fn long_scope_titles_keep_list_and_map_visible_at_minimum_width() {
         let mut view = window.view(ViewChoices {
             temporary_keys: false,
             vault_unlocked: false,
-            journal_max_parts: None,
+            journal_policy: JournalEditorPolicy::default(),
             serial_allowed: true,
             passwords: &[],
             passphrases: &[],

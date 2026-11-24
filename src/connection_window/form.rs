@@ -59,17 +59,21 @@ pub enum Page {
     Tunnels,
     JumpHost,
     Logging,
+    Journal,
     WindowGeometry,
+    Ai,
 }
 
 impl Page {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 8] = [
         Self::Connection,
         Self::Settings,
         Self::Tunnels,
         Self::JumpHost,
         Self::Logging,
+        Self::Journal,
         Self::WindowGeometry,
+        Self::Ai,
     ];
 
     fn label(self) -> &'static str {
@@ -79,7 +83,9 @@ impl Page {
             Self::Tunnels => "SSH Tunnels",
             Self::JumpHost => "Jump Server",
             Self::Logging => "Terminal Logging",
+            Self::Journal => "Journal",
             Self::WindowGeometry => "Window Geometry",
+            Self::Ai => "AI",
         }
     }
 }
@@ -543,10 +549,18 @@ impl Draft {
                 .logging
                 .view(!self.incognito, true)
                 .map(|edit| Message::Edit(Edit::Logging(edit))),
+            Page::Journal => self
+                .terminal
+                .journal_view(choices)
+                .map(|edit| Message::Edit(Edit::Terminal(edit))),
             Page::WindowGeometry => self
                 .window_geometry
                 .view()
                 .map(|edit| Message::Edit(Edit::WindowGeometry(edit))),
+            Page::Ai => self
+                .terminal
+                .ai_view(choices, true)
+                .map(|edit| Message::Edit(Edit::Terminal(edit))),
         };
         let page = container(
             scrollable(container(content).width(Length::Fill).padding(20))
@@ -556,7 +570,7 @@ impl Draft {
         .style(dialog_design::page);
         column![
             arrows,
-            tabs,
+            tabs.wrap(),
             keyed_column![(self.page, page)].height(Length::Fill),
             self.connection().err().map(|error| text(error).size(13)),
         ]
@@ -700,7 +714,7 @@ impl Draft {
                     ),
             ]
             .spacing(6),
-            self.terminal.view(choices).map(|edit| Message::Edit(Edit::Terminal(edit))),
+            self.terminal.view(choices, false).map(|edit| Message::Edit(Edit::Terminal(edit))),
         ]
         .spacing(8);
         if let Some(effects) = choices.terminal_effects {

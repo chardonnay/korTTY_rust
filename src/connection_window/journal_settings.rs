@@ -1,5 +1,5 @@
-use iced::Element;
-use iced::widget::{checkbox, column, text, text_input};
+use iced::widget::{checkbox, column, row, rule, text, text_input};
+use iced::{Alignment, Element, Length};
 
 use crate::session_journal::{
     ConnectionConfig, MAX_CONNECTION_JOURNAL_PARTS, MAX_PART_MIB, MAX_SUMMARY_MINUTES,
@@ -13,6 +13,23 @@ pub enum Edit {
     Interval(String),
     PartSize(String),
     Parts(String),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Policy {
+    pub(crate) allowed: bool,
+    pub(crate) summaries_allowed: bool,
+    pub(crate) max_parts: Option<u16>,
+}
+
+impl Default for Policy {
+    fn default() -> Self {
+        Self {
+            allowed: true,
+            summaries_allowed: true,
+            max_parts: None,
+        }
+    }
 }
 
 pub(super) struct Draft {
@@ -69,36 +86,64 @@ impl Draft {
         })
     }
 
-    pub(super) fn view(&self, managed_max: Option<u16>) -> Element<'_, Edit> {
-        let clamp = move |value: String| match (value.parse::<u16>(), managed_max) {
+    pub(super) fn view(&self, policy: Policy) -> Element<'_, Edit> {
+        let clamp = move |value: String| match (value.parse::<u16>(), policy.max_parts) {
             (Ok(parts), Some(cap)) if parts > cap => cap.to_string(),
             _ => value,
         };
         let parts = clamp(self.parts.clone());
-        let label = managed_max.map_or_else(
+        let label = policy.max_parts.map_or_else(
             || "Maximum capture-log parts".into(),
             |cap| format!("Maximum capture-log parts (managed limit {cap})"),
         );
+        let summaries_allowed = policy.allowed && policy.summaries_allowed;
+        let interval_editable = summaries_allowed && self.settings.ai_summaries;
+        let field = |label: String, input| {
+            row![text(label).width(Length::Fill), input]
+                .spacing(10)
+                .align_y(Alignment::Center)
+        };
         column![
-            text("Session journal").size(16),
             checkbox(self.settings.auto_start)
                 .label("Start a journal on connect")
-                .on_toggle(Edit::Auto),
+                .on_toggle_maybe(policy.allowed.then_some(Edit::Auto)),
+            rule::horizontal(1),
             checkbox(self.settings.capture_input)
                 .label("Capture typed commands at recognized shell prompts")
-                .on_toggle(Edit::Input),
-            text("Typed command capture starts at the next recognized shell-integration prompt."),
-            checkbox(self.settings.ai_summaries)
+                .on_toggle_maybe(policy.allowed.then_some(Edit::Input)),
+            checkbox(summaries_allowed && self.settings.ai_summaries)
                 .label("Allow AI summaries")
-                .on_toggle(Edit::Summaries),
-            text("Summary interval in minutes (0 uses the global default)"),
-            text_input("0", &self.interval).on_input(Edit::Interval),
-            text("Capture-log part size in MiB"),
-            text_input("25", &self.part_size).on_input(Edit::PartSize),
-            text(label),
-            text_input("20", &parts).on_input(move |value| Edit::Parts(clamp(value))),
+                .on_toggle_maybe(summaries_allowed.then_some(Edit::Summaries)),
+            field(
+                "Summary interval in minutes (0 uses the global default)".into(),
+                text_input("0", &self.interval)
+                    .on_input_maybe(interval_editable.then_some(Edit::Interval))
+                    .width(110)
+            ),
+            field(
+                "Capture-log part size in MiB".into(),
+                text_input("25", &self.part_size)
+                    .on_input_maybe(policy.allowed.then_some(Edit::PartSize))
+                    .width(110)
+            ),
+            field(
+                label,
+                text_input("20", &parts)
+                    .on_input_maybe(
+                        policy
+                            .allowed
+                            .then_some(move |value| Edit::Parts(clamp(value)))
+                    )
+                    .width(110)
+            ),
+            text("Typed command capture starts at the next recognized shell-integration prompt.")
+                .size(13)
+                .style(text::secondary),
+            (!policy.allowed).then(|| text("Journal capture is disabled by policy.").size(13)),
+            (policy.allowed && !policy.summaries_allowed)
+                .then(|| text("Journal AI summaries are disabled by policy.").size(13)),
         ]
-        .spacing(5)
+        .spacing(10)
         .into()
     }
 }

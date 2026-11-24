@@ -502,11 +502,17 @@ impl Workspace {
                 ai_agent_designs: &ai_agent_designs,
                 highlighting: self.highlight.connection_choices(),
                 themes: &self.window_settings.themes,
-                journal_max_parts: self
-                    .clipboard
-                    .policy
-                    .terminal_logging
-                    .journal_max_log_parts(),
+                journal_policy: connection_window::JournalEditorPolicy {
+                    allowed: self.journal_allowed(),
+                    summaries_allowed: crate::session_journal::topic_ai_settings::allowed(
+                        &self.clipboard.policy,
+                    ),
+                    max_parts: self
+                        .clipboard
+                        .policy
+                        .terminal_logging
+                        .journal_max_log_parts(),
+                },
                 passwords: &passwords,
                 passphrases: &passphrases,
                 keys: &self.ssh_key_choices,

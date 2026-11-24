@@ -1063,6 +1063,49 @@ opened Snippet Editor. Returning to Font showed the same unsaved
 15-point value. Shift+Tab closed the reopened menu and focused search.
 [Windows ARM64 preview build](target/verification/20261124-settings-menu-keyboard-windows-preview.log)
 
+## November 24 SSH editor Journal and AI tabs
+
+The saved SSH editor has eight tabs in the order of the tagged Java
+editor. Journal sits between Terminal Logging and Window Geometry.
+AI follows Window Geometry and displays the saved provider profile,
+the agent execution override, the design and skill assignments.
+Filtering skills by their displayed names preserves the existing
+assignments. Unavailable assignments remain visible and removable
+when their labels match the filter. The tab strip wraps on a narrow
+window and the form scrolls above the fixed footer.
+
+The Journal tab edits the existing capture and rotation settings.
+The applicable policy controls editability and displays the managed
+part count. The summary interval is editable when AI summaries are
+allowed and enabled for the connection. Capture preferences are
+available for manually started journals. Restoring global terminal
+defaults preserves the Journal and AI drafts and requires the normal
+connection Save.
+
+Apple Silicon and Windows ARM64 each passed 129 connection editor,
+store and manager tests, with two ignored. Apple Silicon also passed
+strict application and test-target Clippy. The focused regression
+checked all eight tab bounds and the footer at the minimum window size,
+then saved and reopened a profile after changing Journal and AI options
+and resetting only terminal overrides.
+[Apple Silicon verification](target/verification/20261124-connection-editor-tabs-macos-native.log)
+· [Windows ARM64 verification](target/verification/20261124-connection-editor-tabs-windows.log)
+
+The 642 by 462 pixel Windows ARM64 preview showed all eight tabs,
+including Journal and AI, with Save and Cancel visible in both pages.
+Searching for Ansible reduced the skills list to that entry. Cancel
+returned directly to the Connection Manager after the search. Windows
+also passed the two opt-in tests for Teamwork Git over loopback and
+temporary-key replacement in the vault.
+[Windows ARM64 preview build](target/verification/20261124-connection-editor-tabs-windows-preview.log)
+· [Windows ARM64 opt-in tests](target/verification/20261124-connection-editor-tabs-windows-opt-in.log)
+
+The Java connection-memory shortcut and the single-row overflow
+navigation remain open, along with the comparison of journal limits
+and enforced policy behavior.
+[Tagged Java editor](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ConnectionEditDialog.java)
+· [Rust editor](src/connection_window/form.rs)
+
 ## November 23 GGUF Configure sizing
 
 Java sizes the Configure grid to its path label. Rust now measures the

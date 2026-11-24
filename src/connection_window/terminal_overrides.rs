@@ -14,6 +14,7 @@ use crate::terminal_theme::{BoldTextMode, CursorStyle, Rgb, Themes};
 pub enum Edit {
     Show(bool),
     Reset,
+    ResetTerminal,
     Theme(Option<ThemeOverride>),
     FontFamily(String),
     FontSize(String),
@@ -35,6 +36,7 @@ pub enum Edit {
     DismissJavaAiProfile,
     AiAgentDisabled(bool),
     AiAgentDesign(Option<String>),
+    AiSkillSearch(String),
     AiSkill(u64, bool),
     HighlightSet(String),
     Journal(journal_settings::Edit),
@@ -52,6 +54,7 @@ pub(super) struct Draft {
     paste_line_delay: String,
     colors: [String; 20],
     journal: journal_settings::Draft,
+    ai_skill_search: String,
 }
 
 impl Draft {
@@ -68,6 +71,7 @@ impl Draft {
             show: !options.is_default(),
             options: options.clone(),
             journal: journal_settings::Draft::new(options.journal),
+            ai_skill_search: String::new(),
             font: options.font_family.clone().unwrap_or_default(),
             size: options
                 .font_size
@@ -109,6 +113,22 @@ impl Draft {
                 *self = Self::new(&TerminalOverrides::default());
                 self.options.java_ai_profile_dismissed = dismissed;
                 self.show = true;
+            }
+            Edit::ResetTerminal => {
+                let options = &self.options;
+                let mut reset = Self::new(&TerminalOverrides {
+                    ai_profile: options.ai_profile.clone(),
+                    java_ai_profile: options.java_ai_profile.clone(),
+                    java_ai_profile_dismissed: options.java_ai_profile_dismissed,
+                    ai_agent_disabled: options.ai_agent_disabled,
+                    ai_agent_design: options.ai_agent_design.clone(),
+                    ai_skills: options.ai_skills.clone(),
+                    ..TerminalOverrides::default()
+                });
+                std::mem::swap(&mut reset.journal, &mut self.journal);
+                std::mem::swap(&mut reset.ai_skill_search, &mut self.ai_skill_search);
+                reset.show = true;
+                *self = reset;
             }
             Edit::Theme(value) => self.options.theme = value,
             Edit::FontFamily(value) => self.font = value.chars().take(160).collect(),
@@ -162,6 +182,10 @@ impl Draft {
                     return false;
                 }
                 self.options.ai_agent_design = value;
+            }
+            Edit::AiSkillSearch(value) => {
+                self.ai_skill_search = value.chars().take(160).collect();
+                return false;
             }
             Edit::AiSkill(id, enabled) => {
                 self.options.ai_skills.retain(|value| *value != id);
@@ -245,14 +269,16 @@ impl Draft {
         )
     }
 
-    pub(super) fn view(&self, view: &ViewChoices<'_>) -> Element<'_, Edit> {
+    pub(super) fn journal_view(&self, view: &ViewChoices<'_>) -> Element<'_, Edit> {
+        self.journal.view(view.journal_policy).map(Edit::Journal)
+    }
+
+    pub(super) fn ai_view(
+        &self,
+        view: &ViewChoices<'_>,
+        lock_disabled_design: bool,
+    ) -> Element<'_, Edit> {
         let skills = view.ai_skills;
-        let heading = checkbox(self.show)
-            .label("Show terminal overrides")
-            .on_toggle(Edit::Show);
-        if !self.show {
-            return heading.into();
-        }
         let (ai_choices, selected) =
             ai_profile_choices(view.ai_profiles, self.options.ai_profile.as_ref());
         let java_ai_profile = self.options.java_ai_profile.as_ref().map(|hint| {
@@ -305,6 +331,81 @@ impl Draft {
                 designs.push(unavailable.clone());
                 Some(unavailable)
             });
+        let design: Element<'_, Edit> = if lock_disabled_design && self.options.ai_agent_disabled {
+            text(selected_design.map_or_else(|| "Use default".into(), |choice| choice.name))
+                .style(text::secondary)
+                .into()
+        } else {
+            pick_list(designs, selected_design, |choice| {
+                Edit::AiAgentDesign((!choice.id.is_empty()).then_some(choice.id))
+            })
+            .width(Length::Fill)
+            .into()
+        };
+        let mut choices = column![
+            labeled(
+                "AI chat profile",
+                pick_list(ai_choices, Some(selected), |choice| Edit::AiProfile(
+                    choice.0
+                ))
+                .width(Length::Fill)
+            ),
+            java_ai_profile,
+            checkbox(self.options.ai_agent_disabled)
+                .label("Disable terminal AI agent execution for this connection")
+                .on_toggle(Edit::AiAgentDisabled),
+            labeled("AI agent design", design),
+            text("Assigned AI skills").size(14),
+        ]
+        .spacing(8);
+        if skills.is_empty() && self.options.ai_skills.is_empty() {
+            return choices
+                .push(text("No skills available").style(text::secondary))
+                .into();
+        }
+        let query = self.ai_skill_search.trim().to_lowercase();
+        let matches = |name: &str| name.to_lowercase().contains(&query);
+        choices = choices.push(
+            text_input("Find skills", &self.ai_skill_search)
+                .on_input(Edit::AiSkillSearch)
+                .width(Length::Fill),
+        );
+        let mut skill_rows: Vec<Element<'_, Edit>> = Vec::new();
+        for (id, name) in skills.iter().filter(|(_, name)| matches(name)) {
+            let id = *id;
+            skill_rows.push(
+                checkbox(self.options.ai_skills.contains(&id))
+                    .label(name.clone())
+                    .on_toggle(move |enabled| Edit::AiSkill(id, enabled))
+                    .into(),
+            );
+        }
+        for &id in &self.options.ai_skills {
+            if !skills.iter().any(|(available, _)| *available == id) {
+                let label = format!("Unavailable skill {id}");
+                if matches(&label) {
+                    skill_rows.push(
+                        checkbox(true)
+                            .label(label)
+                            .on_toggle(move |enabled| Edit::AiSkill(id, enabled))
+                            .into(),
+                    );
+                }
+            }
+        }
+        if skill_rows.is_empty() {
+            skill_rows.push(text("No matching skills").style(text::secondary).into());
+        }
+        choices.push(column(skill_rows).spacing(5)).into()
+    }
+
+    pub(super) fn view(&self, view: &ViewChoices<'_>, combined: bool) -> Element<'_, Edit> {
+        let heading = checkbox(self.show)
+            .label("Show terminal overrides")
+            .on_toggle(Edit::Show);
+        if !self.show {
+            return heading.into();
+        }
         let highlighting = highlight_picker(
             &view.highlighting,
             self.options.highlight_set.as_deref(),
@@ -312,7 +413,9 @@ impl Draft {
         );
         let (themes, selected_theme) = theme_choices(view.themes, self.options.theme.as_ref());
         let mut choices = column![
-            self.journal.view(view.journal_max_parts).map(Edit::Journal),
+            combined.then(
+                || column![text("Session journal").size(16), self.journal_view(view)].spacing(8)
+            ),
             labeled("Keyword highlighting", highlighting),
             labeled(
                 "Theme",
@@ -380,45 +483,10 @@ impl Draft {
                 "Paste line delay (ms)",
                 text_input("Inherit", &self.paste_line_delay).on_input(Edit::PasteLineDelay)
             ),
-            labeled(
-                "AI chat profile",
-                pick_list(ai_choices, Some(selected), |choice| Edit::AiProfile(
-                    choice.0
-                ))
-                .width(Length::Fill)
-            ),
-            java_ai_profile,
-            checkbox(self.options.ai_agent_disabled)
-                .label("Disable terminal AI agent execution for this connection")
-                .on_toggle(Edit::AiAgentDisabled),
-            labeled(
-                "AI agent design",
-                pick_list(designs, selected_design, |choice| {
-                    Edit::AiAgentDesign((!choice.id.is_empty()).then_some(choice.id))
-                })
-                .width(Length::Fill)
-            ),
         ]
         .spacing(6);
-        if !skills.is_empty() || !self.options.ai_skills.is_empty() {
-            choices = choices.push(text("Assigned AI skills").size(14));
-            for (id, name) in skills {
-                let id = *id;
-                choices = choices.push(
-                    checkbox(self.options.ai_skills.contains(&id))
-                        .label(name.clone())
-                        .on_toggle(move |enabled| Edit::AiSkill(id, enabled)),
-                );
-            }
-            for &id in &self.options.ai_skills {
-                if !skills.iter().any(|(available, _)| *available == id) {
-                    choices = choices.push(
-                        checkbox(true)
-                            .label(format!("Unavailable skill {id}"))
-                            .on_toggle(move |enabled| Edit::AiSkill(id, enabled)),
-                    );
-                }
-            }
+        if combined {
+            choices = choices.push(self.ai_view(view, false));
         }
         let labels = ["Foreground", "Background", "Cursor", "Selection"]
             .into_iter()
@@ -432,7 +500,12 @@ impl Draft {
                         .on_input(move |value| Edit::Color(index, value)),
                 ))
             });
-        let header = row![heading, button("Use global defaults").on_press(Edit::Reset)]
+        let reset = if combined {
+            button("Use global defaults").on_press(Edit::Reset)
+        } else {
+            button("Use global terminal defaults").on_press(Edit::ResetTerminal)
+        };
+        let header = row![heading, reset]
             .spacing(8)
             .align_y(iced::Alignment::Center);
         column![header, text("Clear a field or select Inherit to follow the current default. Initial size applies when opening a terminal. Text encoding applies to new sessions and reconnects.").size(12), choices, fields]

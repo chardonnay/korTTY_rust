@@ -47,7 +47,7 @@ pub(crate) struct ViewChoices<'a> {
     pub(crate) ai_agent_designs: &'a [AgentDesignChoice],
     pub(crate) highlighting: HighlightChoices<'a>,
     pub(crate) themes: &'a Themes,
-    pub(crate) journal_max_parts: Option<u16>,
+    pub(crate) journal_policy: super::JournalEditorPolicy,
     pub(crate) incognito_allowed: bool,
     pub(crate) serial_allowed: bool,
     pub(crate) terminal_effects: Option<&'a [Effect]>,
@@ -404,10 +404,14 @@ impl ConnectionWindow {
                 ]
                 .spacing(8)
                 .align_y(iced::Alignment::Center),
-                draft
-                    .journal
-                    .view(choices.journal_max_parts)
-                    .map(Message::SerialJournal),
+                column![
+                    text("Session journal").size(16),
+                    draft
+                        .journal
+                        .view(choices.journal_policy)
+                        .map(Message::SerialJournal),
+                ]
+                .spacing(8),
                 row![
                     text("Keyword highlighting"),
                     super::terminal_overrides::highlight_picker(
@@ -2148,7 +2152,7 @@ fn teamwork_auth_picker_displays_missing_references_without_offering_them() {
         ai_agent_designs: &[],
         highlighting: HighlightChoices::default(),
         themes: &Themes::default(),
-        journal_max_parts: None,
+        journal_policy: super::JournalEditorPolicy::default(),
         incognito_allowed: true,
         serial_allowed: true,
         terminal_effects: None,
