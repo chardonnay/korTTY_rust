@@ -214,11 +214,15 @@ walkthrough on macOS and Linux.
 The [Terminal Logging page](PORTING-PARITY.md#november-24-ssh-terminal-logging-editor)
 keeps the disabled fields visible, offers an owned folder chooser, and
 previews the Rust writer's filename. Compare the layout and the chooser's
-select and cancel behavior on macOS and Linux and verify changing the
-folder on Windows. Windows ARM64 confirmed the chooser's starting folder,
-cancellation and selection of the existing directory. Bring the same
-directory chooser and disabled-field layout to the compact Quick Connect
-section.
+select and cancel behavior on macOS and Linux. Windows ARM64 confirmed
+the chooser's starting folder, cancellation, and adoption of a different
+directory in the connection draft. The
+[Quick Connect terminal logging section](PORTING-PARITY.md#november-24-quick-connect-terminal-logging)
+uses the same owned chooser and shows the directory, format, and gzip
+settings while logging is disabled. Windows ARM64 verified both the
+disabled controls and a saved profile's enabled values, cancellation,
+and selection of a different directory. Compare this compact section
+and the native chooser on macOS and Linux desktops.
 The [1,000 MiB terminal logfile update](PORTING-PARITY.md#november-24-terminal-logfile-size-limit)
 matches the Java size range. Rotated files are closed before background
 gzip publication. The viewer indexes plain logs and streams compressed
@@ -228,8 +232,9 @@ limit.
 The [terminal logfile naming update](PORTING-PARITY.md#november-24-terminal-logfile-naming)
 applies the Java connection-name, timestamp, sequence, and part conventions
 to the writer and the connection editor's preview. The viewer continues to
-recognize existing Rust and Java filenames. Verify the revised preview with
-saved connections on native desktops.
+recognize existing Rust and Java filenames. Windows ARM64 verified the
+revised preview with a saved connection and a live format change. Repeat
+that preview walkthrough on macOS and Linux desktops.
 The [terminal logging XML update](PORTING-PARITY.md#november-24-java-terminal-logging-xml)
 maps the Java `logConfig` record during direct import and portable Java backup
 restore. A request to enable logging and a Java path are stored for explicit

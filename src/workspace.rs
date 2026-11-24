@@ -1087,6 +1087,9 @@ impl Workspace {
                 settings_window::Message::Open(id),
             ))),
             Ok("connections") => task.chain(Task::done(Message::OpenConnections(id))),
+            Ok("quick-connect") => task.chain(Task::done(Message::Chrome(
+                chrome::Message::Invoke(id, chrome::Action::QuickConnect),
+            ))),
             Ok("agent-design" | "agent-design-compact") => {
                 task.chain(Task::done(Message::Settings(
                     settings_window::Message::OpenAt(id, settings_window::Section::AgentDesign),

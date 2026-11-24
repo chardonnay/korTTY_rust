@@ -942,17 +942,11 @@ impl Workspace {
             else {
                 return Task::none();
             };
-            return window::run(editor, move |owner| {
-                crate::terminal_logging::pick_folder(owner, directory)
-            })
-            .then(move |picker| {
-                let ticket = ticket.clone();
-                Task::perform(picker, move |path| {
-                    Message::ConnectionEditor(
-                        editor,
-                        Profile::TerminalLogFolderPicked(ticket, path),
-                    )
-                })
+            return crate::terminal_logging::pick_folder(editor, directory).map(move |path| {
+                Message::ConnectionEditor(
+                    editor,
+                    Profile::TerminalLogFolderPicked(ticket.clone(), path),
+                )
             });
         }
         if let Profile::Edit(Edit::Logging(edit)) = &message

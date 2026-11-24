@@ -1322,6 +1322,35 @@ entry into the owned editor and adds the tab color selector.
 [Font and presentation controls](src/connection_window/terminal_overrides/ssh_style.rs)
 · [Color picker](src/connection_window/color_picker.rs)
 
+## November 24 Quick Connect terminal logging
+
+The SSH Terminal log section shows the directory, format, and gzip
+setting in a compact grid even when logging is off. Selecting a saved
+connection shows its stored values. The owned native directory picker
+edits the current connection draft. Cancel preserves the previous path.
+Picker results carry a draft ticket, and switching profiles, protocols,
+or the group tab invalidates the old ticket. Incognito profiles and
+incognito terminal splits cannot edit these controls.
+
+Windows ARM64 and Apple Silicon each passed 118 focused tests, with two
+opt-in tests omitted. The Quick Connect test checks the chooser's owner,
+disabled state, cancellation, adoption of a different directory, and
+rejection of a stale result. Apple Silicon also passed strict Clippy.
+
+On the Windows ARM64 desktop, the blank draft showed the disabled
+directory, format, and compression controls. Selecting a private saved
+SSH profile loaded its active directory, JSON format, and gzip setting.
+The native chooser started in the configured directory. After cancelling,
+reopening it still showed that directory. Selecting a different directory
+and reopening it showed the new location. The saved SSH editor also
+accepted a different directory and opened there on its next invocation.
+The saved test fixture's checksum stayed the same after the walkthrough.
+No SSH connection was opened.
+[Quick Connect view](src/workspace/quick_connect/view.rs)
+· [Chooser and shared controls](src/terminal_logging/editor.rs)
+· [Windows ARM64 test log](target/verification/20261124-quick-terminal-log-windows-arm64-final.log)
+· [Apple Silicon test log](target/verification/20261124-quick-terminal-log-macos-arm64-final.log)
+
 ## November 24 terminal logfile naming
 
 New terminal logs use the sanitized connection name, local timestamp,
@@ -1342,7 +1371,10 @@ platforms passed the separate 1,000 MiB rotation, gzip, and viewer fixture.
 The focused tests cover concurrent allocation around an existing archive,
 preservation of an existing plain logfile, fresh timestamps after size
 rotation, and part reset at the next day. Apple Silicon passed strict
-Clippy. A live desktop walkthrough of the revised preview remains open.
+Clippy. The Windows ARM64 desktop showed the sanitized `Edge_West_2_1`
+portion for the saved `Edge / West_2` profile and changed the extension
+from `.json.gz` to `.xml.gz` when the format changed. Desktop checks
+remain open on macOS and Linux.
 [Terminal writer](src/terminal_logging/writer.rs)
 · [Connection editor preview](src/terminal_logging/editor.rs)
 · [Windows ARM64 test log](target/verification/20261124-terminal-log-names-windows-arm64-final.log)

@@ -1,9 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use iced::futures::future::BoxFuture;
 use iced::widget::{Id, button, checkbox, column, pick_list, row, rule, space, text, text_input};
-use iced::{Alignment, Element, Font};
+use iced::{Alignment, Element, Font, Task, window};
 
 use crate::workspace::dialog_design::{self, keyboard_table, number_input};
 
@@ -81,6 +80,10 @@ impl Form {
             .then(|| Edit::Folder(path.to_owned()))
     }
 
+    pub(crate) fn cancel_folder_picker(&mut self) {
+        self.editor.picker = None;
+    }
+
     pub(crate) fn accepts_editor_edit(&self, eligible: bool, edit: &Edit) -> bool {
         eligible
             && (self.config.enabled
@@ -100,7 +103,6 @@ impl Form {
         connection_name: &str,
     ) -> Element<'_, Action> {
         let enabled = eligible && self.config.enabled;
-        let browse = (enabled && self.editor.picker.is_none()).then_some(Action::Browse);
         let include_username = managed
             .include_username
             .unwrap_or(self.config.include_username);
@@ -109,33 +111,8 @@ impl Form {
             check("Enable terminal logging", enabled, eligible.then_some(Edit::Enabled)),
             self.java_review_view(eligible),
             rule::horizontal(1),
-            field(
-                "Log directory",
-                row![
-                    text_input("Default folder in the application profile", &self.config.folder)
-                        .width(300)
-                        .on_input_maybe(enabled.then_some(|path| Action::Edit(Edit::Folder(path))))
-                        .style(dialog_design::form_input),
-                    keyboard_table::action(
-                        button("Browse…")
-                            .style(dialog_design::secondary_button)
-                            .on_press_maybe(browse.clone())
-                            .into(),
-                        browse,
-                        true,
-                    ),
-                ]
-                .spacing(8)
-                .align_y(Alignment::Center),
-            ),
-            field("Format", picker(
-                self.config.format,
-                [Format::Text, Format::Xml, Format::Json],
-                Edit::Format,
-                enabled,
-                self.editor.format.clone(),
-                200.0,
-            )),
+            field("Log directory", self.folder_control(enabled)),
+            field("Format", self.format_control(enabled)),
             field(
                 "Example filename",
                 text(self.filename_preview(connection_name, jiff::Zoned::now().datetime()))
@@ -180,6 +157,64 @@ impl Form {
         ]
         .spacing(10)
         .into()
+    }
+
+    pub(crate) fn compact_editor_view(
+        &self,
+        eligible: bool,
+        label_width: f32,
+    ) -> Element<'_, Action> {
+        let enabled = eligible && self.config.enabled;
+        column![
+            check("Enable terminal logging", enabled, eligible.then_some(Edit::Enabled)),
+            labeled("Log directory", self.folder_control(enabled), label_width),
+            labeled("Format", self.format_control(enabled), label_width),
+            row![space::horizontal().width(label_width), check(
+                "Compress closed logs (gzip)", self.config.compress, enabled.then_some(Edit::Compress),
+            )].spacing(8).align_y(Alignment::Center),
+            (enabled.then(|| self.config().err()).flatten())
+                .map(|error| text(error.to_string()).size(13)),
+            (!eligible).then(|| text("Terminal logging is unavailable for this session.").size(13)),
+            text("Known SSH credentials and managed patterns are masked. Treat other terminal output as sensitive.")
+                .size(13).style(text::secondary),
+        ]
+        .spacing(8)
+        .into()
+    }
+
+    fn folder_control(&self, enabled: bool) -> Element<'_, Action> {
+        let browse = (enabled && self.editor.picker.is_none()).then_some(Action::Browse);
+        row![
+            text_input(
+                "Default folder in the application profile",
+                &self.config.folder
+            )
+            .width(300)
+            .on_input_maybe(enabled.then_some(|path| Action::Edit(Edit::Folder(path))))
+            .style(dialog_design::form_input),
+            keyboard_table::action(
+                button("Browse…")
+                    .style(dialog_design::secondary_button)
+                    .on_press_maybe(browse.clone())
+                    .into(),
+                browse,
+                true,
+            ),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .into()
+    }
+
+    fn format_control(&self, enabled: bool) -> Element<'_, Action> {
+        picker(
+            self.config.format,
+            [Format::Text, Format::Xml, Format::Json],
+            Edit::Format,
+            enabled,
+            self.editor.format.clone(),
+            200.0,
+        )
     }
 
     fn java_review_view(&self, eligible: bool) -> Option<Element<'_, Action>> {
@@ -271,7 +306,15 @@ fn review_action(label: &'static str, edit: Option<Edit>) -> Element<'static, Ac
 }
 
 fn field<'a>(label: &'static str, control: impl Into<Element<'a, Action>>) -> Element<'a, Action> {
-    row![text(label).size(14).width(LABEL_WIDTH), control.into()]
+    labeled(label, control.into(), LABEL_WIDTH)
+}
+
+fn labeled<'a>(
+    label: &'static str,
+    control: Element<'a, Action>,
+    width: f32,
+) -> Element<'a, Action> {
+    row![text(label).size(14).width(width), control]
         .align_y(Alignment::Center)
         .spacing(8)
         .into()
@@ -355,16 +398,16 @@ fn picker<'a, T: Copy + Eq + std::fmt::Display + 'a>(
     }
 }
 
-pub(crate) fn pick_folder(
-    owner: &dyn iced::window::Window,
-    directory: PathBuf,
-) -> BoxFuture<'static, Option<PathBuf>> {
-    let dialog = rfd::AsyncFileDialog::new()
-        .set_parent(owner)
-        .set_title("Choose terminal log directory")
-        .set_directory(directory)
-        .pick_folder();
-    Box::pin(async move { dialog.await.map(|folder| folder.path().to_owned()) })
+pub(crate) fn pick_folder(owner: window::Id, directory: PathBuf) -> Task<Option<PathBuf>> {
+    window::run(owner, move |owner| {
+        rfd::AsyncFileDialog::new()
+            .set_parent(owner)
+            .set_title("Choose terminal log directory")
+            .set_directory(directory)
+            .pick_folder()
+    })
+    .then(Task::future)
+    .map(|folder| folder.map(|folder| folder.path().to_owned()))
 }
 
 #[cfg(test)]

@@ -589,8 +589,12 @@ impl SshDialog {
         self.logging.config()
     }
 
-    pub(crate) fn logging_view(&self, eligible: bool) -> Element<'_, Message> {
-        self.logging.view(eligible).map(Message::Logging)
+    pub(crate) fn logging_form(&self) -> &crate::terminal_logging::Form {
+        &self.logging
+    }
+
+    pub(crate) fn logging_form_mut(&mut self) -> &mut crate::terminal_logging::Form {
+        &mut self.logging
     }
 
     pub(crate) fn with_isolation(
@@ -829,7 +833,7 @@ impl SshDialog {
         }
         content = content.push(self.options_view(INLINE_LABEL_WIDTH, keys));
         if !sftp {
-            content = content.push(self.logging_view(logging_allowed));
+            content = content.push(self.logging.view(logging_allowed).map(Message::Logging));
         }
         let mut controls = row![
             button("Connect").on_press_maybe(can_connect.then_some(Message::Connect)),
