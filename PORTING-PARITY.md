@@ -964,16 +964,49 @@ running AI Chat and Swarm views remains open.
 [Apple Silicon chat color checks](target/verification/20261124-chat-color-profiles-macos-verified.log)
 · [Windows ARM64 chat color checks](target/verification/20261124-chat-color-profiles-windows-final.log)
 
-Application font scale remains open. Java has a manual range of 80–160%.
-Automatic mode uses the primary display's logical height to choose
-100%, 110%, 125% or 140%. The application-scale path leaves terminal,
-editor and AI chat font sizes independent. The Rust Java backup adapter currently uses a
-legacy manual UI font scale only as a fallback for Snippet Editor zoom.
 [Tagged Java Appearance page](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SettingsDialog.java)
 · [Tagged Java index](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SettingsSearchBar.java)
 · [Tagged Java chat palettes](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ChatColorProfileSupport.java)
-· [Tagged Java UI font scaling](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/UiFontScaleSupport.java)
 · [Rust Appearance page](src/workspace/settings_window/appearance_settings.rs)
+
+## November 24 Application font scale
+
+Settings → Appearance offers UI font size from 80% through 160% in
+five-point steps. Match display resolution uses the primary monitor's
+OS logical height to choose 100%, 110%, 125% or 140%. When the display
+backend cannot identify a primary monitor, Rust uses the window's
+monitor. An unavailable display size uses 100%. Automatic mode keeps
+the saved manual value for the next switch back.
+
+The application scale recalculates standard text, editor controls and
+popup menu layout in logical pixels. The terminal cells, source editor
+content, AI Chat and Agent activity have separate font scopes. Guide
+content continues to use its own zoom. Settings commits both scale
+preferences on Save. Java backup import maps the UI and guide fields
+to separate preferences and preserves fields already set in Rust.
+[Tagged Java UI font scaling](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/UiFontScaleSupport.java)
+· [Rust application text scope](src/workspace/ui_font_scale.rs)
+
+Windows ARM64 passed 57 focused tests before the visual layout
+adjustments. Apple Silicon repeated those 57 tests and strict Clippy
+for all application targets after the adjustments. The tests covered
+the imported preferences, Save and Cancel, search and the automatic
+thresholds. Iced layout checks exercised 80%, 100% and 160% for labels,
+inputs and closed drop-downs, with a separate fixed-size text scope.
+[Apple Silicon UI font scale checks](target/verification/20261124-ui-font-scale-macos-layout.log)
+· [Windows ARM64 UI font scale checks](target/verification/20261124-ui-font-scale-windows-final.log)
+
+The Windows ARM64 standalone Settings preview compared 100% and 160%
+in isolated profiles. The corrected 160% layout showed the full
+selected chat profile, accepted Ocean from its scaled drop-down and
+matched the 100% terminal font sample at the same 14-point terminal
+setting. Match display resolution showed 125% on the test display and
+disabled the stepper. Switching back revealed 160% again. Save closed
+Settings and wrote automatic mode, the retained 160% manual value and
+the Ocean profile to the private preview profile. This check covered
+one Windows display. The Java comparison and other native display
+configurations remain open.
+[Windows ARM64 standalone preview build](target/verification/20261124-ui-font-scale-windows-preview-final.log)
 
 ## November 23 GGUF Configure sizing
 

@@ -1352,8 +1352,10 @@ where
                     Element::from(
                         container(checkbox(*done).size(settings.text_size))
                             .center_y(
-                                text::LineHeight::default()
-                                    .to_absolute(settings.text_size),
+                                iced_tiny_skia::font_scale::line_height(
+                                    text::LineHeight::default(),
+                                    settings.text_size,
+                                ),
                             ),
                     )
                 }

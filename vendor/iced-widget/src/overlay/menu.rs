@@ -394,7 +394,7 @@ where
         let text_size =
             self.text_size.unwrap_or_else(|| renderer.default_size());
 
-        let text_line_height = self.text_line_height.to_absolute(text_size);
+        let text_line_height = iced_tiny_skia::font_scale::line_height(self.text_line_height, text_size);
 
         let size = {
             let intrinsic = Size::new(
@@ -441,7 +441,7 @@ where
                         .unwrap_or_else(|| renderer.default_size());
 
                     let option_height =
-                        f32::from(self.text_line_height.to_absolute(text_size))
+                        f32::from(iced_tiny_skia::font_scale::line_height(self.text_line_height, text_size))
                             + self.padding.y();
 
                     let new_hovered_option =
@@ -472,7 +472,7 @@ where
                         .unwrap_or_else(|| renderer.default_size());
 
                     let option_height =
-                        f32::from(self.text_line_height.to_absolute(text_size))
+                        f32::from(iced_tiny_skia::font_scale::line_height(self.text_line_height, text_size))
                             + self.padding.y();
 
                     *self.hovered_option =
@@ -540,7 +540,7 @@ where
         let text_size =
             self.text_size.unwrap_or_else(|| renderer.default_size());
         let option_height =
-            f32::from(self.text_line_height.to_absolute(text_size))
+            f32::from(iced_tiny_skia::font_scale::line_height(self.text_line_height, text_size))
                 + self.padding.y();
 
         let offset = viewport.y - bounds.y;

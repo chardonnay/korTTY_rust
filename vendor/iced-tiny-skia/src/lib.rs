@@ -5,6 +5,7 @@ pub mod window;
 mod clip_mask;
 mod editor_caret;
 mod engine;
+pub mod font_scale;
 mod layer;
 mod primitive;
 mod rect_fill;
@@ -38,7 +39,6 @@ use crate::core::{
 use crate::engine::Engine;
 use crate::graphics::Viewport;
 use crate::graphics::compositor;
-use crate::graphics::text::{Editor, Paragraph};
 
 /// A [`tiny-skia`] graphics renderer for [`iced`].
 ///
@@ -258,8 +258,8 @@ impl core::Renderer for Renderer {
 
 impl core::text::Renderer for Renderer {
     type Font = Font;
-    type Paragraph = Paragraph;
-    type Editor = Editor;
+    type Paragraph = font_scale::Paragraph;
+    type Editor = font_scale::Editor;
 
     const ICON_FONT: Font = Font::with_name("Iced-Icons");
     const CHECKMARK_ICON: char = '\u{f00c}';
@@ -288,7 +288,7 @@ impl core::text::Renderer for Renderer {
         let (layer, transformation) = self.layers.current_mut();
 
         layer.draw_paragraph(
-            text,
+            &text.0,
             position,
             color,
             clip_bounds,
@@ -305,13 +305,13 @@ impl core::text::Renderer for Renderer {
     ) {
         let color = match self.editor_caret.as_mut() {
             Some(scope) if color == TextEditorCaret::VALUE_COLOR => {
-                scope.record_text(editor, position)
+                scope.record_text(&editor.0, position)
             }
             _ => color,
         };
         let (layer, transformation) = self.layers.current_mut();
         layer.draw_editor(
-            editor,
+            &editor.0,
             position,
             color,
             clip_bounds,
@@ -327,7 +327,13 @@ impl core::text::Renderer for Renderer {
         clip_bounds: Rectangle,
     ) {
         let (layer, transformation) = self.layers.current_mut();
-        layer.draw_text(text, position, color, clip_bounds, transformation);
+        layer.draw_text(
+            font_scale::text(text),
+            position,
+            color,
+            clip_bounds,
+            transformation,
+        );
     }
 }
 

@@ -306,7 +306,9 @@ where
         let font = self.font.unwrap_or_else(|| renderer.default_font());
         let text_size = self.size.unwrap_or_else(|| renderer.default_size());
         let padding = self.padding.fit(Size::ZERO, limits.max());
-        let height = self.line_height.to_absolute(text_size);
+        let height = iced_tiny_skia::font_scale::line_height(
+            self.line_height, text_size,
+        );
 
         let limits = limits.width(self.width).shrink(padding);
         let text_bounds = limits.resolve(self.width, height, Size::ZERO);

@@ -1135,8 +1135,8 @@ impl Workspace {
         };
         let terminal = compose(
             terminal,
-            history,
-            status,
+            history.map(crate::workspace::ui_font_scale::unscaled),
+            status.map(crate::workspace::ui_font_scale::unscaled),
             history_position,
             placement::status_relative_to_history(
                 status_position,

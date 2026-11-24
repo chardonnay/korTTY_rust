@@ -459,10 +459,12 @@ impl Workspace {
             toolbar,
             row![
                 scrollable(contents).width(180).height(Length::Fill),
-                scrollable(container(body).width(Length::Fill).padding([4, 12]))
-                    .id(reader.scroll.clone())
-                    .height(Length::Fill)
-                    .width(Length::Fill),
+                scrollable(crate::workspace::ui_font_scale::unscaled(
+                    container(body).width(Length::Fill).padding([4, 12]).into(),
+                ))
+                .id(reader.scroll.clone())
+                .height(Length::Fill)
+                .width(Length::Fill),
             ]
             .spacing(12)
             .height(Length::Fill)

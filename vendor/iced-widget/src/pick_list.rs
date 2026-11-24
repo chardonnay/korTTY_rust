@@ -381,7 +381,7 @@ where
             content: "",
             bounds: Size::new(
                 f32::INFINITY,
-                self.text_line_height.to_absolute(text_size).into(),
+                iced_tiny_skia::font_scale::line_height(self.text_line_height, text_size).into(),
             ),
             size: text_size,
             line_height: self.text_line_height,
@@ -429,7 +429,7 @@ where
         let size = {
             let intrinsic = Size::new(
                 max_width + text_size.0 + self.padding.left,
-                f32::from(self.text_line_height.to_absolute(text_size)),
+                f32::from(iced_tiny_skia::font_scale::line_height(self.text_line_height, text_size)),
             );
 
             limits
@@ -662,7 +662,7 @@ where
                     font,
                     bounds: Size::new(
                         bounds.width,
-                        f32::from(line_height.to_absolute(size)),
+                        f32::from(iced_tiny_skia::font_scale::line_height(line_height, size)),
                     ),
                     align_x: text::Alignment::Right,
                     align_y: alignment::Vertical::Center,
@@ -692,7 +692,7 @@ where
                     font,
                     bounds: Size::new(
                         bounds.width - self.padding.x(),
-                        f32::from(self.text_line_height.to_absolute(text_size)),
+                        f32::from(iced_tiny_skia::font_scale::line_height(self.text_line_height, text_size)),
                     ),
                     align_x: text::Alignment::Default,
                     align_y: alignment::Vertical::Center,

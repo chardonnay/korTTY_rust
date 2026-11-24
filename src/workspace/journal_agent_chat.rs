@@ -563,20 +563,23 @@ impl Workspace {
                 ]
                 .spacing(8),
                 ResultZoom::controls(tab.font_size).map(move |zoom| Message::Zoom(id, zoom)),
-                text_editor(&tab.content)
-                    .size(f32::from(tab.font_size))
-                    .on_action(move |action| Message::Select(id, action))
-                    .key_binding(
-                        move |key| match text_editor::Binding::from_key_press(key)? {
-                            text_editor::Binding::Copy | text_editor::Binding::Cut => {
-                                Some(text_editor::Binding::Custom(Message::Copy(id)))
+                super::ui_font_scale::unscaled(
+                    text_editor(&tab.content)
+                        .size(f32::from(tab.font_size))
+                        .on_action(move |action| Message::Select(id, action))
+                        .key_binding(
+                            move |key| match text_editor::Binding::from_key_press(key)? {
+                                text_editor::Binding::Copy | text_editor::Binding::Cut => {
+                                    Some(text_editor::Binding::Custom(Message::Copy(id)))
+                                }
+                                text_editor::Binding::Paste => None,
+                                binding => Some(binding),
                             }
-                            text_editor::Binding::Paste => None,
-                            binding => Some(binding),
-                        }
-                    )
-                    .wrapping(text::Wrapping::WordOrGlyph)
-                    .height(Length::Fill),
+                        )
+                        .wrapping(text::Wrapping::WordOrGlyph)
+                        .height(Length::Fill)
+                        .into()
+                ),
             ]
         } else {
             column![

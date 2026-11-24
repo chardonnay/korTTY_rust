@@ -2362,12 +2362,12 @@ impl Workspace {
             );
         }
         let palette = self.chat_palette();
-        Some(
+        Some(super::ui_font_scale::unscaled(
             palette.wrap(
                 chat.view(self, id, palette)
                     .map(move |message| Desktop::TerminalAi(id, message)),
             ),
-        )
+        ))
     }
 
     fn save_chat_color_profile(

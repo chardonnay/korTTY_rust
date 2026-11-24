@@ -208,6 +208,9 @@ pub enum Action {
     /// Get the logical dimensions of the monitor containing the window with the given [`Id`].
     GetMonitorSize(Id, oneshot::Sender<Option<Size>>),
 
+    /// Get the primary monitor size in OS logical pixels.
+    GetPrimaryMonitorSize(Id, oneshot::Sender<Option<Size>>),
+
     /// Set whether the system can automatically organize windows into tabs.
     ///
     /// See <https://developer.apple.com/documentation/appkit/nswindow/1646657-allowsautomaticwindowtabbing>
@@ -557,6 +560,12 @@ pub fn disable_mouse_passthrough<Message>(id: Id) -> Task<Message> {
 /// Gets the logical dimensions of the monitor containing the window with the given [`Id`].
 pub fn monitor_size(id: Id) -> Task<Option<Size>> {
     task::oneshot(move |channel| crate::Action::Window(Action::GetMonitorSize(id, channel)))
+}
+
+/// Gets the primary display dimensions in OS logical pixels, using the
+/// window's display when the platform does not identify a primary display.
+pub fn primary_monitor_size(id: Id) -> Task<Option<Size>> {
+    task::oneshot(move |channel| crate::Action::Window(Action::GetPrimaryMonitorSize(id, channel)))
 }
 
 /// Sets whether the system can automatically organize windows into tabs.

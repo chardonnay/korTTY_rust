@@ -153,6 +153,7 @@ mod terminal_text_drop;
 mod tool_tabs;
 mod transparency;
 mod tunnel_access;
+pub(crate) mod ui_font_scale;
 #[cfg(target_os = "linux")]
 mod wayland_file_drop;
 mod window_lifecycle;
@@ -419,6 +420,7 @@ pub enum Message {
     Notice(window::Id, String),
     Quit,
     ExitReady,
+    UiDisplaySize(Option<Size>),
     Noop,
     Highlight(highlight::Message),
 }
@@ -426,6 +428,7 @@ pub enum Message {
 #[derive(Default)]
 pub struct Workspace {
     highlight: highlight::State,
+    ui_display_size: Option<Size>,
     application_updates: application_updates::State,
     app_logging: crate::app_logging::Runtime,
     bell: bell::Bell,
@@ -1676,6 +1679,10 @@ impl Workspace {
             return Task::none();
         }
         match message {
+            Message::UiDisplaySize(size) => {
+                self.ui_display_size = size;
+                return Task::none();
+            }
             Message::Chrome(message) => return self.update_chrome(message),
             Message::Palette(id, message) => return self.update_palette(id, message),
             Message::Dashboard(id, message) => return self.update_dashboard(id, message),
@@ -2937,7 +2944,8 @@ impl Workspace {
         );
         (
             id,
-            task.then(move |id| window_lifecycle::restore_native_position(id, placement.position)),
+            task.then(move |id| window_lifecycle::restore_native_position(id, placement.position))
+                .chain(iced_runtime::window::primary_monitor_size(id).map(Message::UiDisplaySize)),
         )
     }
 
@@ -6354,7 +6362,13 @@ impl Workspace {
             .or_else(|| self.window_owner_dialog(id))
             .map(|(_, focus)| focus);
         let element = profile_tools::vault_modal::gate(element, modal);
-        profile_tools::vault_modal::view(element, self.vault_unlock_modal(id))
+        let element = profile_tools::vault_modal::view(element, self.vault_unlock_modal(id));
+        let scale = if self.current_vault_unlock() == Some(id) {
+            1.0
+        } else {
+            ui_font_scale::ratio(self.window_settings.appearance, self.ui_display_size)
+        };
+        ui_font_scale::scope(element, scale)
     }
 
     fn view_window(&self, id: window::Id) -> Element<'_, Message> {
@@ -7150,7 +7164,7 @@ impl Workspace {
                         .window_settings
                         .terminal_scrollbar_visible(window.fullscreen()))
                 .then(|| terminal_view::Scrollbar::new(&terminal));
-                let view = terminal_view::view(terminal);
+                let view = ui_font_scale::unscaled(terminal_view::view(terminal));
                 let view = if let Some(effect) = effect {
                     iced::widget::stack![
                         view,

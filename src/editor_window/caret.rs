@@ -160,7 +160,7 @@ pub(crate) fn view_decorated<'a, H: Highlighter, Message: 'a>(
             ..appearance.style(&content_theme, status)
         });
     let padding = editor.content_padding();
-    Element::new(CaretEditor {
+    crate::workspace::ui_font_scale::unscaled(Element::new(CaretEditor {
         editor: editor.into(),
         padding,
         gutter,
@@ -188,7 +188,7 @@ pub(crate) fn view_decorated<'a, H: Highlighter, Message: 'a>(
             fallback_cell_width: cell_width_ratio(appearance.font) * f32::from(font_size),
             use_widget_x: word_wrap == Some(false),
         },
-    })
+    }))
 }
 
 fn horizontal_metrics(

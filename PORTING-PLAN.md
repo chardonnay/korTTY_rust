@@ -90,7 +90,7 @@ records the broader comparison with the tagged Java release.
 | Area | Remaining change | Completion check |
 | --- | --- | --- |
 | D4 · Searchable controls | Compare the remaining Java Settings and AI Manager pages, subpages and labeled controls with the Rust search inventory. The [Knowledge Stores toolbar](PORTING-PARITY.md#november-24-knowledge-stores-toolbar-search), [Local Models runtime and GGUF import controls](PORTING-PARITY.md#november-24-local-models-toolbar-search), and [Appearance controls](PORTING-PARITY.md#november-24-appearance-inventory) have independent search targets. | Verify that controls on a page that has never been opened are discoverable, and that navigation reveals the exact control with the current page state and policy. |
-| Appearance preferences | The [Chat color profile](PORTING-PARITY.md#november-24-appearance-inventory) is available in Settings and the AI Chat toolbar, applies to AI Chat and Swarm, and imports from Java backups. Port the tagged manual and automatic application font scale with an independent scope for terminal, editor and chat font settings. Migrate the Java scale and add search targets for both modes. | Verify the theme-following and fixed profiles in running AI Chat and Swarm views, including when a chat is already open. Check automatic and manual application font scale on native desktops with different display scales. Verify Java backup import, restart persistence and Cancel for the scale. |
+| Appearance preferences | [Chat color profile](PORTING-PARITY.md#november-24-appearance-inventory) is available in Settings and the AI Chat toolbar. [UI font size](PORTING-PARITY.md#november-24-application-font-scale) and Match display resolution are searchable in Settings. Java backup import preserves the application and guide scales independently. | Verify the theme-following and fixed profiles in running AI Chat and Swarm views, including when a chat is already open. Compare manual and automatic UI font scale at multiple native display scales with Java, including popups and the terminal, editor and chat font boundaries. |
 
 The [November 23 review](PORTING-PARITY.md#november-23-dialog-parity-review)
 records the dialog differences. The [November 22 comparison](PORTING-PARITY.md#november-22-design-editing-command-output-and-settings-search)
@@ -3542,10 +3542,9 @@ design importer accepts all 17 pinned Java IDs and their enum spellings.
 The design and animation flags fill separate unset native choices. A
 saved choice of Normal or enabled animations survives restore.
 Verify their appearance after restart on native desktops.
-Java's `guideFontScalePercent` takes
-precedence over the older fallback from manual UI font scale. It uses the
-same 70–250% limits as the native reader and fills only an unset native
-zoom. The general Java UI font scale is a separate preference.
+Java's `guideFontScalePercent` uses the same 70–250% limits as the native
+reader and fills only an unset native zoom. The general Java UI font
+scale imports into the separate Appearance preferences.
 
 Java `recentProjectPaths` and `openRecentClearedAt` fill an unset native
 Open Recent preference. Compatible absolute `.kortty` paths retain their

@@ -210,6 +210,10 @@ pub(super) struct Preferences {
     pub(super) animations: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) chat_color_profile: Option<super::chat_appearance::Profile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) ui_font_scale_percent: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) ui_font_scale_auto: Option<bool>,
 }
 
 fn read_design_id<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Design>, D::Error> {

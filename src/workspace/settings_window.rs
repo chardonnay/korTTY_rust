@@ -181,6 +181,8 @@ pub enum Setting {
     PreviousAppDesign,
     NextAppDesign,
     DesignAnimations,
+    UiFontScale,
+    UiFontScaleAuto,
     ChatColorProfile,
     PasteWarning,
     LargePasteWarning,
@@ -286,6 +288,8 @@ impl Setting {
         Self::PreviousAppDesign,
         Self::NextAppDesign,
         Self::DesignAnimations,
+        Self::UiFontScale,
+        Self::UiFontScaleAuto,
         Self::ChatColorProfile,
         Self::PasteWarning,
         Self::LargePasteWarning,
@@ -391,6 +395,8 @@ impl Setting {
             Self::PreviousAppDesign => "Previous design",
             Self::NextAppDesign => "Next design",
             Self::DesignAnimations => "Enable design animations",
+            Self::UiFontScale => "UI font size",
+            Self::UiFontScaleAuto => "Match display resolution",
             Self::ChatColorProfile => "Chat color profile",
             Self::PasteWarning => "Warn about line breaks and control characters",
             Self::LargePasteWarning => "Warn about pastes larger than",
@@ -508,6 +514,8 @@ impl Setting {
             | Self::PreviousAppDesign
             | Self::NextAppDesign
             | Self::DesignAnimations
+            | Self::UiFontScale
+            | Self::UiFontScaleAuto
             | Self::ChatColorProfile => Section::Appearance,
             Self::AgentDesign => Section::AgentDesign,
             Self::ApplicationUpdates | Self::ApplicationUpdateInterval => Section::Updates,
@@ -611,6 +619,8 @@ impl Setting {
             Self::PreviousAppDesign => "previous app design",
             Self::NextAppDesign => "next app design",
             Self::DesignAnimations => "animation reduced motion transitions",
+            Self::UiFontScale => "application chrome menus labels manual text scaling percentage",
+            Self::UiFontScaleAuto => "automatic UI font size primary monitor DPI HiDPI",
             Self::ChatColorProfile => "AI Chat Swarm palette theme",
             Self::PasteWarning => {
                 "paste safety protection multiline bracketed escape bidi confirmation"
@@ -807,6 +817,8 @@ pub enum Message {
     Theme(window::Id, theme_settings::Edit),
     Design(window::Id, Design),
     DesignAnimations(window::Id, bool),
+    UiFontScaleStep(window::Id, bool),
+    UiFontScaleAuto(window::Id, bool),
     ChatColorProfile(window::Id, super::chat_appearance::Profile),
     AgentDesignCatalog(window::Id, agent_design_settings::Edit),
     AgentDesignName(window::Id, agent_design_name::Action),
@@ -929,6 +941,12 @@ impl Draft {
         }
         if edit.appearance.animations != before.appearance.animations {
             current.appearance.animations = edit.appearance.animations;
+        }
+        if edit.appearance.ui_font_scale_percent != before.appearance.ui_font_scale_percent {
+            current.appearance.ui_font_scale_percent = edit.appearance.ui_font_scale_percent;
+        }
+        if edit.appearance.ui_font_scale_auto != before.appearance.ui_font_scale_auto {
+            current.appearance.ui_font_scale_auto = edit.appearance.ui_font_scale_auto;
         }
         if edit.appearance.chat_color_profile != before.appearance.chat_color_profile {
             current.appearance.chat_color_profile = edit.appearance.chat_color_profile;
@@ -1633,6 +1651,8 @@ impl Workspace {
             | Message::Export(id, _)
             | Message::Design(id, _)
             | Message::DesignAnimations(id, _)
+            | Message::UiFontScaleStep(id, _)
+            | Message::UiFontScaleAuto(id, _)
             | Message::ChatColorProfile(id, _)
             | Message::AgentDesignCatalog(id, _)
             | Message::ApplicationUpdates(id, _)
@@ -1832,6 +1852,28 @@ impl Workspace {
             Message::DesignAnimations(_, enabled) if dialog.section == Section::Appearance => {
                 dialog.draft.preferences.appearance.animations = Some(enabled);
                 dialog.problem = None;
+            }
+            Message::UiFontScaleStep(_, larger)
+                if dialog.section == Section::Appearance
+                    && !dialog
+                        .draft
+                        .preferences
+                        .appearance
+                        .ui_font_scale_auto
+                        .unwrap_or(false) =>
+            {
+                let appearance = &mut dialog.draft.preferences.appearance;
+                appearance.ui_font_scale_percent =
+                    Some(super::ui_font_scale::step(*appearance, larger));
+                dialog.problem = None;
+            }
+            Message::UiFontScaleAuto(_, auto) if dialog.section == Section::Appearance => {
+                dialog.draft.preferences.appearance.ui_font_scale_auto = Some(auto);
+                dialog.problem = None;
+                if auto {
+                    return iced_runtime::window::primary_monitor_size(dialog.owner)
+                        .map(Desktop::UiDisplaySize);
+                }
             }
             Message::ChatColorProfile(_, profile) if dialog.section == Section::Appearance => {
                 dialog.draft.preferences.appearance.chat_color_profile = Some(profile);
@@ -2423,7 +2465,14 @@ impl Workspace {
                 size: if standalone_agent_design {
                     agent_design_size
                 } else {
-                    Size::new(1120.0, 1080.0)
+                    super::ui_font_scale::dialog_size(
+                        Size::new(1120.0, 1080.0),
+                        super::ui_font_scale::ratio(
+                            self.window_settings.appearance,
+                            self.ui_display_size,
+                        ),
+                        self.ui_display_size,
+                    )
                 },
                 min_size: Some(if standalone_agent_design {
                     agent_design_minimum
@@ -3353,8 +3402,10 @@ impl Workspace {
                 scrollable::Scrollbar::new().width(4).scroller_width(4),
             ))
             .width(Length::Fill);
+        let ui_scale =
+            super::ui_font_scale::ratio(self.window_settings.appearance, self.ui_display_size);
         let page = match dialog.section {
-            Section::Font => font_settings_page(dialog),
+            Section::Font => font_settings_page(dialog, ui_scale),
             Section::Colors => highlighted(
                 dialog,
                 Setting::Colors,
@@ -3378,7 +3429,9 @@ impl Workspace {
                     )
                     .map(move |edit| msg(Message::Theme(id, edit))),
             ),
-            Section::Appearance => appearance_settings::view(dialog),
+            Section::Appearance => {
+                appearance_settings::view(dialog, self.ui_display_size, ui_scale)
+            }
             Section::Terminal => self.terminal_settings_page(dialog),
             Section::Sftp => self.sftp_settings_page(dialog),
             Section::Messaging => messaging_settings_page(
@@ -4505,7 +4558,7 @@ fn messaging_settings_page(
     .into()
 }
 
-fn font_settings_page(dialog: &Dialog) -> Element<'_, Desktop> {
+fn font_settings_page(dialog: &Dialog, ui_scale: f32) -> Element<'_, Desktop> {
     let id = dialog.id;
     let preferences = &dialog.draft.preferences;
     let family = preferences
@@ -4521,7 +4574,7 @@ fn font_settings_page(dialog: &Dialog) -> Element<'_, Desktop> {
                 .size(10)
                 .line_height(iced::widget::text::LineHeight::Absolute(13.0.into())),
         )
-        .width(24)
+        .width(24.0 * ui_scale)
         .padding([0, 4])
         .style(button::secondary)
         .on_press_maybe(message)
@@ -4531,13 +4584,13 @@ fn font_settings_page(dialog: &Dialog) -> Element<'_, Desktop> {
             dialog,
             Setting::FontFamily,
             row![
-                text("Font Family:").size(13).width(70),
+                text("Font Family:").size(13).width(70.0 * ui_scale),
                 pick_list(
                     installed_families(),
                     Some(family.to_owned()),
                     move |value| { Desktop::Settings(Message::FontFamily(id, value)) }
                 )
-                .width(200)
+                .width(200.0 * ui_scale)
                 .text_size(13),
             ]
             .spacing(10)
@@ -4549,7 +4602,7 @@ fn font_settings_page(dialog: &Dialog) -> Element<'_, Desktop> {
             dialog,
             Setting::FontSize,
             row![
-                text("Font Size:").size(13).width(70),
+                text("Font Size:").size(13).width(70.0 * ui_scale),
                 row![
                     dialog.reveal_input(
                         Setting::FontSize,
@@ -4558,7 +4611,7 @@ fn font_settings_page(dialog: &Dialog) -> Element<'_, Desktop> {
                             "8–72",
                             dialog.font_size_input.as_deref().unwrap_or(&formatted_size)
                         )
-                        .width(56)
+                        .width(56.0 * ui_scale)
                         .size(13)
                         .on_input(move |value| Desktop::Settings(Message::FontSizeInput(
                             id, value
@@ -4589,13 +4642,14 @@ fn font_settings_page(dialog: &Dialog) -> Element<'_, Desktop> {
                 .size(13)
                 .style(text::danger)),
         row![
-            text("Preview:").size(13).width(70),
-            container(
+            text("Preview:").size(13).width(70.0 * ui_scale),
+            container(super::ui_font_scale::unscaled(
                 text("AaBbCcDdEe 0123456789")
                     .font(font.unwrap_or(iced::Font::MONOSPACE))
                     .size(f32::from(size))
                     .color(Color::WHITE)
-            )
+                    .into()
+            ))
             .padding(10)
             .style(|_| container::Style::default().background(Color::from_rgb8(30, 30, 30))),
         ]
@@ -4829,6 +4883,73 @@ mod tests {
         }
         assert_eq!(workspace.window_settings.terminal_appearance(), terminal);
         assert_eq!(workspace.editor_content_theme(), editor);
+    }
+
+    #[test]
+    fn ui_font_scale_settings_preserve_the_manual_draft_and_persist_only_on_save() {
+        let mut workspace = Workspace {
+            ui_display_size: Some(Size::new(3840.0, 2160.0)),
+            ..Workspace::default()
+        };
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.open_settings(owner, Some(Section::Appearance));
+        let id = workspace.settings.for_owner(owner).unwrap();
+        let _ = workspace.update_settings(Message::UiFontScaleStep(id, true));
+        let _ = workspace.update_settings(Message::UiFontScaleAuto(id, true));
+        let _ = workspace.update_settings(Message::UiFontScaleStep(id, true));
+        let preferences = workspace
+            .settings
+            .0
+            .as_ref()
+            .unwrap()
+            .draft
+            .preferences
+            .appearance;
+        assert_eq!(preferences.ui_font_scale_percent, Some(105));
+        assert_eq!(
+            super::super::ui_font_scale::effective(preferences, workspace.ui_display_size),
+            125
+        );
+        let _ = workspace.update_settings(Message::Cancel(id));
+        assert_eq!(
+            workspace.window_settings.appearance.ui_font_scale_percent,
+            None
+        );
+        assert_eq!(
+            workspace.window_settings.appearance.ui_font_scale_auto,
+            None
+        );
+
+        let _ = workspace.open_settings(owner, Some(Section::Font));
+        let id = workspace.settings.for_owner(owner).unwrap();
+        for (query, setting) in [
+            ("UI font size", Setting::UiFontScale),
+            ("Match display resolution", Setting::UiFontScaleAuto),
+        ] {
+            let _ = workspace.update_settings(Message::Search(id, query.into()));
+            let _ = workspace.update_settings(Message::SearchChoose(id));
+            assert_eq!(
+                workspace.settings.0.as_ref().unwrap().revealed,
+                Some(setting)
+            );
+        }
+        let _ = workspace.update_settings(Message::UiFontScaleStep(id, false));
+        let _ = workspace.update_settings(Message::UiFontScaleAuto(id, true));
+        let _ = workspace.save_settings_to(id, |settings| {
+            let encoded = serde_json::to_vec(settings)?;
+            let restored: WindowSettings = serde_json::from_slice(&encoded)?;
+            assert_eq!(restored.appearance.ui_font_scale_percent, Some(95));
+            assert_eq!(restored.appearance.ui_font_scale_auto, Some(true));
+            Ok(())
+        });
+        assert_eq!(
+            workspace.window_settings.appearance.ui_font_scale_percent,
+            Some(95)
+        );
+        assert_eq!(
+            workspace.window_settings.appearance.ui_font_scale_auto,
+            Some(true)
+        );
     }
 
     #[test]

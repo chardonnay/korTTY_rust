@@ -866,13 +866,13 @@ impl Workspace {
         let view = if let Some(dialog) = state.workflows.get(&id) {
             dialog.view().map(Message::Workflow)
         } else if let Some(run_id) = state.pip_run_for_window(id) {
-            return Some(design::pip::detached_view(
+            return Some(super::ui_font_scale::unscaled(design::pip::detached_view(
                 state,
                 run_id,
                 palette,
                 reduced_motion,
                 self.panel_review(run_id, &state.runs[&run_id], Some(id)),
-            ));
+            )));
         } else if state.swarms.contains_key(&id) {
             let chat_palette = self.chat_palette();
             return state
@@ -884,7 +884,9 @@ impl Workspace {
                     self.swarm_web_available(id),
                     || self.automation_summary_providers(),
                 )
-                .map(|view| chat_palette.wrap(view.map(Message::Swarm)));
+                .map(|view| {
+                    super::ui_font_scale::unscaled(chat_palette.wrap(view.map(Message::Swarm)))
+                });
         } else {
             state.runs.get(&id).filter(|run| !run.swarm)?.view(
                 palette,
@@ -893,16 +895,18 @@ impl Workspace {
                 (state, id),
             )
         };
-        Some(if let Some(palette) = palette {
-            palette::panel(
-                Some(palette),
-                container(view)
-                    .width(iced::Length::Fill)
-                    .height(iced::Length::Fill),
-            )
-        } else {
-            view
-        })
+        Some(super::ui_font_scale::unscaled(
+            if let Some(palette) = palette {
+                palette::panel(
+                    Some(palette),
+                    container(view)
+                        .width(iced::Length::Fill)
+                        .height(iced::Length::Fill),
+                )
+            } else {
+                view
+            },
+        ))
     }
     fn agent_window_palette(&self, id: window::Id) -> Option<palette::Palette> {
         let theme = self

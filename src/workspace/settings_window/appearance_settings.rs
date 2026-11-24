@@ -1,16 +1,19 @@
 use iced::widget::{button, checkbox, column, container, pick_list, row, space, text, tooltip};
-use iced::{Alignment, Border, Element, Font, Length};
+use iced::{Alignment, Border, Element, Font, Length, Size};
 
 use crate::terminal_theme::Scheme;
 
 use super::super::appearance::{Design, Preferences};
 use super::super::chat_appearance::Profile;
+use super::super::ui_font_scale;
 use super::{Desktop, Dialog, Message, Setting, highlight_setting, highlighted};
 
-pub(super) fn view(dialog: &Dialog) -> Element<'_, Desktop> {
+pub(super) fn view(dialog: &Dialog, display: Option<Size>, ui_scale: f32) -> Element<'_, Desktop> {
     let id = dialog.id;
     let preferences = dialog.draft.preferences.appearance;
     let design = preferences.design();
+    let automatic_font_scale = preferences.ui_font_scale_auto.unwrap_or(false);
+    let font_percent = ui_font_scale::effective(preferences, display);
     let select = move |selected| Desktop::Settings(Message::Design(id, selected));
     let step = |setting: Setting, forward, arrow| {
         highlight_setting(
@@ -33,7 +36,7 @@ pub(super) fn view(dialog: &Dialog) -> Element<'_, Desktop> {
             container(
                 row![
                     text(Setting::AppDesign.label()),
-                    pick_list(Design::ALL, Some(design), select).width(220),
+                    pick_list(Design::ALL, Some(design), select).width(220.0 * ui_scale),
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center)
@@ -43,7 +46,8 @@ pub(super) fn view(dialog: &Dialog) -> Element<'_, Desktop> {
         step(Setting::PreviousAppDesign, false, "◀"),
         step(Setting::NextAppDesign, true, "▶"),
     ]
-    .align_y(Alignment::Center);
+    .align_y(Alignment::Center)
+    .wrap();
     column![
         controls,
         highlighted(
@@ -55,19 +59,43 @@ pub(super) fn view(dialog: &Dialog) -> Element<'_, Desktop> {
         ),
         highlighted(
             dialog,
+            Setting::UiFontScale,
+            row![
+                text(Setting::UiFontScale.label()),
+                button("−").style(button::secondary).on_press_maybe(
+                    (!automatic_font_scale && font_percent > ui_font_scale::MIN_PERCENT)
+                        .then_some(Desktop::Settings(Message::UiFontScaleStep(id, false))),
+                ),
+                text(format!("{font_percent}%")),
+                button("+").style(button::secondary).on_press_maybe(
+                    (!automatic_font_scale && font_percent < ui_font_scale::MAX_PERCENT)
+                        .then_some(Desktop::Settings(Message::UiFontScaleStep(id, true))),
+                ),
+            ].spacing(8).align_y(Alignment::Center),
+        ),
+        highlighted(
+            dialog,
+            Setting::UiFontScaleAuto,
+            checkbox(automatic_font_scale).label(Setting::UiFontScaleAuto.label())
+                .on_toggle(move |enabled| Desktop::Settings(Message::UiFontScaleAuto(id, enabled))),
+        ),
+        container(text("Scales menus, dialogs and labels. Terminal, editor and AI chat keep their own font sizes.")
+            .size(13).width(460)).padding([0, 4]),
+        highlighted(
+            dialog,
             Setting::ChatColorProfile,
             row![
                 text(Setting::ChatColorProfile.label()),
                 pick_list(Profile::ALL, Some(preferences.chat_color_profile.unwrap_or_default()), move |profile| {
                     Desktop::Settings(Message::ChatColorProfile(id, profile))
-                }).width(220),
-            ].spacing(8).align_y(Alignment::Center),
+                }).width(220.0 * ui_scale),
+            ].spacing(8).align_y(Alignment::Center).wrap(),
         ),
         container(column![
             text("Applies to app windows and dialogs. Terminal sessions and editor content keep their own color settings.")
                 .size(13).width(460),
             text("Preview").size(14),
-            preview(preferences),
+            ui_font_scale::unscaled(preview(preferences)),
         ].spacing(14)).padding([0, 4]),
     ].spacing(14).into()
 }
