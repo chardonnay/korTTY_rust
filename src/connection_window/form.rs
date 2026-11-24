@@ -195,6 +195,9 @@ impl fmt::Display for PasteChoice {
 pub(super) struct Draft {
     page: Page,
     tab_menu: iced::widget::Id,
+    ai_focus_scope: iced::widget::Id,
+    ai_page_scope: iced::widget::Id,
+    ai_page_scroll: iced::widget::Id,
     id: u64,
     name: String,
     tag: String,
@@ -273,6 +276,9 @@ impl Draft {
         Self {
             page: Page::default(),
             tab_menu: iced::widget::Id::unique(),
+            ai_focus_scope: iced::widget::Id::unique(),
+            ai_page_scope: iced::widget::Id::unique(),
+            ai_page_scroll: iced::widget::Id::unique(),
             id: 0,
             name: String::new(),
             tag: String::new(),
@@ -300,6 +306,9 @@ impl Draft {
         Self {
             page: Page::default(),
             tab_menu: iced::widget::Id::unique(),
+            ai_focus_scope: iced::widget::Id::unique(),
+            ai_page_scope: iced::widget::Id::unique(),
+            ai_page_scroll: iced::widget::Id::unique(),
             id: if duplicate { 0 } else { connection.id },
             name: if duplicate {
                 format!("{} (copy)", connection.name)
@@ -531,12 +540,16 @@ impl Draft {
                 .ai_view(choices, Some(self.id))
                 .map(|edit| Message::Edit(Edit::Terminal(edit))),
         };
-        let page = container(
-            scrollable(container(content).width(Length::Fill).padding(20))
-                .height(Length::Fill)
-                .width(Length::Fill),
-        )
-        .style(dialog_design::page);
+        let mut scroll = scrollable(container(content).width(Length::Fill).padding(20))
+            .height(Length::Fill)
+            .width(Length::Fill);
+        if self.page == Page::Ai {
+            scroll = scroll.id(self.ai_page_scroll.clone());
+        }
+        let mut page = container(scroll).style(dialog_design::page);
+        if self.page == Page::Ai {
+            page = page.id(self.ai_page_scope.clone());
+        }
         column![
             tabs::arrows(self.page),
             tabs::view(self.page, self.tab_menu.clone()),
@@ -553,7 +566,44 @@ impl Draft {
         key: &iced::keyboard::Key,
         modifiers: iced::keyboard::Modifiers,
     ) -> Option<Message> {
+        use iced::keyboard::{Key, Modifiers, key::Named};
+        if self.page == Page::Ai
+            && *key == Key::Named(Named::Tab)
+            && (modifiers - Modifiers::SHIFT).is_empty()
+        {
+            return Some(Message::FocusEditor(modifiers.shift()));
+        }
         tabs::shortcut(self.page, key, modifiers)
+    }
+
+    pub(super) fn ai_focus_scope(&self) -> Option<iced::widget::Id> {
+        (self.page == Page::Ai).then(|| self.ai_focus_scope.clone())
+    }
+
+    pub(super) fn focus_editor(&self, backwards: bool) -> iced::Task<Message> {
+        use iced::advanced::widget::operation::{focusable, scope};
+        use iced_runtime::{Action, task};
+
+        let Some(root) = self.ai_focus_scope() else {
+            return iced::Task::none();
+        };
+        let move_focus = if backwards {
+            Action::widget(scope(root, focusable::focus_previous()))
+        } else {
+            Action::widget(scope(root, focusable::focus_next()))
+        };
+        task::effect(move_focus).chain(crate::workspace::dialog_design::scroll::reveal_focused(
+            self.ai_page_scope.clone(),
+            self.ai_page_scroll.clone(),
+        ))
+    }
+
+    pub(super) fn reveal_ai_skill(&self, id: u64) -> iced::Task<Message> {
+        if self.page == Page::Ai {
+            self.terminal.reveal_ai_skill(id)
+        } else {
+            iced::Task::none()
+        }
     }
 
     fn connection_page<'a>(

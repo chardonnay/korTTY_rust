@@ -1266,6 +1266,154 @@ fn ssh_editor_journal_and_ai_tabs_keep_their_drafts_when_terminal_defaults_are_r
 }
 
 #[test]
+fn ssh_editor_ai_tab_moves_focus_and_assigns_skills_with_the_keyboard() {
+    use crate::settings_search::test_input;
+    use crate::terminal_agent::design::Choice;
+    use iced::keyboard::{Key, key::Named};
+    use iced::{Element, Font, Renderer, Size, Theme};
+    use iced_runtime::{UserInterface, user_interface::Cache};
+    use terminal_overrides::Edit as Terminal;
+
+    let profile = Profile::new();
+    let mut saved = connection("Keyboard fixture", "");
+    saved.terminal.ai_skills = (9000..9020).collect();
+    let id = Store::open(profile.path()).unwrap().save(saved).unwrap();
+    let mut window = ConnectionWindow::open(profile.path()).unwrap();
+    let _ = window.update(Message::EditSelected);
+    let _ = window.update(Message::Edit(Edit::Page(form::Page::Ai)));
+    let themes = crate::terminal_theme::Themes::default();
+    let designs = [
+        Choice {
+            id: String::new(),
+            name: "Default".into(),
+        },
+        Choice {
+            id: "standard".into(),
+            name: "Standard".into(),
+        },
+    ];
+    fn view<'a>(
+        window: &'a ConnectionWindow,
+        themes: &crate::terminal_theme::Themes,
+        designs: &[Choice],
+    ) -> Element<'a, Message, Theme, Renderer> {
+        window
+            .editor_view(ViewChoices {
+                passwords: &[],
+                passphrases: &[],
+                keys: &[],
+                temporary_keys: false,
+                vault_unlocked: false,
+                ai_profiles: &[],
+                java_ai_profiles: &[],
+                ai_skills: &[],
+                ai_agent_designs: designs,
+                highlighting: HighlightChoices::default(),
+                themes,
+                journal_policy: JournalEditorPolicy::default(),
+                incognito_allowed: true,
+                serial_allowed: true,
+                terminal_effects: None,
+                default_paste_warning: Default::default(),
+                minimum_paste_warning: PasteWarningMode::Off,
+                isolation: Default::default(),
+                local_isolation_default: Default::default(),
+            })
+            .unwrap()
+    }
+    let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+    let compact = Size::new(900.0, 410.0);
+    let mut cache = Cache::default();
+    for _ in 0..4 {
+        let mut interface = UserInterface::build(
+            view(&window, &themes, &designs),
+            compact,
+            cache,
+            &mut renderer,
+        );
+        let events = test_input::press(&mut interface, &mut renderer, Key::Named(Named::Tab), None);
+        assert!(matches!(events.as_slice(), [Message::FocusEditor(false)]));
+        let focus = window.draft.as_ref().unwrap().focus_editor(false);
+        test_input::apply(&mut interface, &renderer, focus);
+        cache = interface.into_cache();
+    }
+    let mut interface = UserInterface::build(
+        view(&window, &themes, &designs),
+        compact,
+        cache,
+        &mut renderer,
+    );
+    let named =
+        |interface: &mut UserInterface<'_, Message, Theme, Renderer>,
+         renderer: &mut Renderer,
+         key| { test_input::press(interface, renderer, Key::Named(key), None) };
+    assert!(named(&mut interface, &mut renderer, Named::Enter).is_empty());
+    assert!(named(&mut interface, &mut renderer, Named::End).is_empty());
+    assert!(matches!(
+        named(&mut interface, &mut renderer, Named::Enter).as_slice(),
+        [Message::Edit(Edit::Terminal(Terminal::AiAgentDesign(Some(design))))] if design == "standard"
+    ));
+    for _ in 0..2 {
+        assert!(matches!(
+            named(&mut interface, &mut renderer, Named::Tab).as_slice(),
+            [Message::FocusEditor(false)]
+        ));
+        let focus = window.draft.as_ref().unwrap().focus_editor(false);
+        test_input::apply(&mut interface, &renderer, focus);
+    }
+    let mut navigate = named(&mut interface, &mut renderer, Named::End);
+    assert!(matches!(
+        navigate.as_slice(),
+        [Message::Edit(Edit::Terminal(Terminal::AiSkillNavigate(
+            9019
+        )))]
+    ));
+    let cache = interface.into_cache();
+    let reveal = window.update(navigate.remove(0));
+    assert!(!window.draft.as_ref().unwrap().changed);
+
+    let mut interface = UserInterface::build(
+        view(&window, &themes, &designs),
+        compact,
+        cache,
+        &mut renderer,
+    );
+    test_input::apply(&mut interface, &renderer, reveal);
+    let mut assignment = named(&mut interface, &mut renderer, Named::Space);
+    assert!(matches!(
+        assignment.as_slice(),
+        [Message::Edit(Edit::Terminal(Terminal::AiSkill(
+            9019, false
+        )))]
+    ));
+    let cache = interface.into_cache();
+    let _ = window.update(assignment.remove(0));
+    let mut interface = UserInterface::build(
+        view(&window, &themes, &designs),
+        compact,
+        cache,
+        &mut renderer,
+    );
+    assert!(matches!(
+        named(&mut interface, &mut renderer, Named::Tab).as_slice(),
+        [Message::FocusEditor(false)]
+    ));
+    let focus = window.draft.as_ref().unwrap().focus_editor(false);
+    test_input::apply(&mut interface, &renderer, focus);
+    assert!(matches!(
+        named(&mut interface, &mut renderer, Named::Enter).as_slice(),
+        [Message::Save]
+    ));
+    drop(interface);
+    complete_persisted(&mut window, Message::Save);
+    let reopened = Store::open(profile.path()).unwrap();
+    assert_eq!(
+        reopened.get(id).unwrap().terminal.ai_skills,
+        (9000..9019).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn connection_paste_warning_round_trips_explicit_and_inherited_values() {
     let profile = Profile::new();
     let mut store = Store::open(profile.path()).unwrap();

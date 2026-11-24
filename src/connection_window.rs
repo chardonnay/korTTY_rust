@@ -107,6 +107,7 @@ pub enum Message {
     EditSelected,
     Duplicate,
     Edit(Edit),
+    FocusEditor(bool),
     PasteTemporaryKey,
     TemporaryKeyPasted(u64, bool, crate::ssh_dialog::Password),
     Save,
@@ -1308,6 +1309,19 @@ impl ConnectionWindow {
                 }
             }
             Message::Edit(Edit::OsBadge(Some(ref id))) if !self.valid_os_badge(Some(id)) => {}
+            Message::FocusEditor(backwards) => {
+                if let Some(draft) = &self.draft {
+                    return draft.focus_editor(backwards);
+                }
+            }
+            Message::Edit(Edit::Terminal(terminal_overrides::Edit::AiSkillNavigate(id))) => {
+                if let Some(draft) = &mut self.draft {
+                    draft.update(Edit::Terminal(terminal_overrides::Edit::AiSkillNavigate(
+                        id,
+                    )));
+                    return draft.reveal_ai_skill(id);
+                }
+            }
             Message::Edit(edit) => {
                 if let Some(draft) = &mut self.draft {
                     draft.update(edit);

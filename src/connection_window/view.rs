@@ -457,6 +457,7 @@ impl ConnectionWindow {
                     .into()
             };
         let mut body = column![form].height(Length::Fill);
+        let ai_focus_scope = self.draft.as_ref().and_then(|draft| draft.ai_focus_scope());
         if !self.confirming_close && !self.busy {
             let valid = if let Some(draft) = &self.local_draft {
                 draft.profile().is_ok()
@@ -467,21 +468,28 @@ impl ConnectionWindow {
                     .as_ref()
                     .is_some_and(|draft| draft.connection().is_ok())
             };
+            let save_action = (!self.draft_conflict && valid).then_some(Message::Save);
+            let save = button("Save").on_press_maybe(save_action.clone());
+            let cancel = button(if self.draft.as_ref().is_some_and(|draft| draft.changed) {
+                "Discard draft"
+            } else {
+                "Cancel"
+            })
+            .style(button::secondary)
+            .on_press(Message::CancelEdit);
+            let (save, cancel) = if ai_focus_scope.is_some() {
+                use crate::workspace::dialog_design::keyboard_table::action;
+                (
+                    action(save.into(), save_action, true),
+                    action(cancel.into(), Some(Message::CancelEdit), true),
+                )
+            } else {
+                (save.into(), cancel.into())
+            };
             body = body.push(rule::horizontal(1)).push(
-                row![
-                    space::horizontal(),
-                    button("Save")
-                        .on_press_maybe((!self.draft_conflict && valid).then_some(Message::Save)),
-                    button(if self.draft.as_ref().is_some_and(|draft| draft.changed) {
-                        "Discard draft"
-                    } else {
-                        "Cancel"
-                    })
-                    .style(button::secondary)
-                    .on_press(Message::CancelEdit),
-                ]
-                .spacing(8)
-                .padding([8, 16]),
+                row![space::horizontal(), save, cancel]
+                    .spacing(8)
+                    .padding([8, 16]),
             );
         }
         if let Some(notice) = &self.notice {
@@ -489,7 +497,11 @@ impl ConnectionWindow {
                 .push(rule::horizontal(1))
                 .push(container(text(notice).size(13)).padding([8, 16]));
         }
-        let body = body.into();
+        let body = if let Some(root) = ai_focus_scope {
+            container(body).id(root).height(Length::Fill).into()
+        } else {
+            body.into()
+        };
         Some(
             if let Some(draft) = self
                 .draft

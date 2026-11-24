@@ -11,6 +11,7 @@ use iced_tiny_skia::font_scale::Paragraph;
 
 pub(crate) use super::dialog_placement::escape::on_key_press;
 pub(crate) mod keyboard_table;
+pub(crate) mod scroll;
 
 pub(crate) const TAB_LABEL_SIZE: f32 = 13.0;
 

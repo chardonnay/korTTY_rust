@@ -1178,6 +1178,37 @@ covers enforced policy behavior. Rotation limits remain in the porting plan.
 [Tagged Java editor](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ConnectionEditDialog.java)
 · [Rust editor](src/connection_window/form.rs)
 
+## November 24 SSH connection AI keyboard
+
+The AI page accepts Tab and Shift+Tab between available controls,
+including the profile and design pickers, execution checkbox, connection
+memory action, skill filter and list, and editor footer. A disabled
+design stays visible and the tab order skips it. The connection memory
+button uses the secondary action style.
+
+Up, Down, Home and End move the skill cursor and reveal its row. Space
+changes the assignment. Moving the cursor or filtering the list leaves
+the saved selections and the draft's dirty flag unchanged. The list
+uses one focus stop for all visible skills and preserves the existing
+Ctrl+Tab and Ctrl+Page Up or Down editor shortcuts.
+[SSH editor](src/connection_window/form.rs)
+· [Skill list](src/connection_window/terminal_overrides/skills.rs)
+
+The Windows ARM64 desktop preview selected a local profile and the
+Classic design by keyboard. It revealed both ends of a 21-row skill
+list and assigned a skill with Space. The saved profile retained
+both previous assignments, including the unavailable one. The
+read-only design was skipped in both directions, and Ctrl+Page Up
+still opened Window Geometry from the focused skill filter.
+[Windows ARM64 desktop verification](target/verification/20261124-connection-ai-keyboard-windows-desktop.log)
+
+Windows ARM64 and Apple Silicon each passed 48 focused tests. Apple
+Silicon also passed strict Clippy. The widget regression uses a compact
+editor and checks focus, selection without a draft edit, and persistence
+after a keyboard assignment.
+[Windows ARM64 verification](target/verification/20261124-connection-ai-keyboard-windows-tests.log)
+· [Apple Silicon verification](target/verification/20261124-connection-ai-keyboard-macos-native.log)
+
 ## November 24 Memory from the SSH editor
 
 The AI tab opens Connection memory as a modeless child of the editor.

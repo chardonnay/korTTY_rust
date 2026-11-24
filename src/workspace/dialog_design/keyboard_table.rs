@@ -3,7 +3,7 @@
 use iced::advanced::renderer::Renderer as _;
 use iced::advanced::widget::{Operation, Tree, operation::Focusable, tree};
 use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, overlay, renderer};
-use iced::keyboard::{self, Key};
+use iced::keyboard::{self, Key, key::Named};
 use iced::{
     Color, Element, Event, Length, Rectangle, Renderer, Size, Theme, Vector, mouse, window,
 };
@@ -18,6 +18,25 @@ pub(crate) fn view<'a, Message: 'a>(
     on_key: impl Fn(&Key, keyboard::Modifiers, bool) -> TableKey<Message> + 'a,
 ) -> Element<'a, Message> {
     Element::new(Table { content, on_key })
+}
+
+pub(crate) fn action<'a, Message: Clone + 'a>(
+    content: Element<'a, Message>,
+    message: Option<Message>,
+    accept_enter: bool,
+) -> Element<'a, Message> {
+    let Some(message) = message else {
+        return content;
+    };
+    view(content, move |key, modifiers, repeat| {
+        if modifiers.is_empty()
+            && (*key == Key::Named(Named::Space)
+                || accept_enter && *key == Key::Named(Named::Enter))
+        {
+            return TableKey::Handled((!repeat).then(|| message.clone()));
+        }
+        TableKey::Ignored
+    })
 }
 
 struct Table<'a, Message, OnKey> {
