@@ -334,6 +334,124 @@ fn journal_export_html_bundle_is_always_an_archive_with_unique_per_journal_paths
 }
 
 #[test]
+fn managed_large_rotation_is_readable_replaceable_exportable_and_deletable() {
+    use crate::session_journal::{LogFormat, capture, deletion::Deletion, open_document, replace};
+
+    const PARTS: u32 = 8_193;
+    const ID: &str = "00000000-0000-4000-8000-000000000001";
+    let fixture = Fixture::new();
+    fixture.seed(ID, "Managed rotated capture");
+    let directory = fixture.root.join(format!("journal-{ID}"));
+    fs::rename(fixture.root.join(ID), &directory).unwrap();
+    let xml = directory.join("journal.xml");
+    let updated = fs::read_to_string(&xml)
+        .unwrap()
+        .replace("</meta>", &format!("<logParts>{PARTS}</logParts></meta>"));
+    fs::write(&xml, updated).unwrap();
+    for number in 1..=PARTS {
+        let mut contents = format!(
+            "{{\"type\":\"meta\",\"formatVersion\":1,\"journalId\":\"{ID}\",\"part\":{number}}}\n"
+        );
+        if number == PARTS {
+            contents.push_str(concat!(
+                "{\"seq\":1,\"t\":\"2026-11-06T10:00:01Z\",\"k\":\"out\",",
+                "\"x\":\"last-rotation-original\"}\n",
+            ));
+        }
+        contents.push_str("{\"type\":\"end\"}\n");
+        fs::write(directory.join(LogFormat::Json.part_name(number)), contents).unwrap();
+    }
+
+    let live = capture::capture_live_tail(
+        &directory,
+        LogFormat::Json,
+        &capture::LiveArchives::default(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(live.records[0].text, "last-rotation-original");
+
+    let page = capture::capture_page(&directory, None, None, None).unwrap();
+    assert!(page.status.notice().is_none());
+    assert_eq!(page.records[0].text, "last-rotation-original");
+    let capture_file = open_document(&directory).unwrap();
+    let mut budget = capture::MAX_CAPTURE_BYTES;
+    let matched = capture::content_match(
+        &capture_file,
+        ID,
+        PARTS,
+        "last-rotation-original",
+        &mut budget,
+        &|| false,
+    )
+    .unwrap();
+    assert!(matched.found && !matched.partial);
+    drop(capture_file);
+
+    let journal = Directory::open(&directory, false).unwrap();
+    let source =
+        crate::session_journal::viewer::Source::from_open_directory(&directory, ID, &journal)
+            .unwrap();
+    drop(journal);
+    let rule = replace::Rule::compile(
+        "last-rotation-original",
+        "last-rotation-reviewed",
+        false,
+        false,
+    )
+    .unwrap();
+    let reviewed = replace::preview(&source, rule, true, false, || false).unwrap();
+    assert_eq!(reviewed.counts().records, 1);
+    assert_eq!(replace::apply(&reviewed).unwrap().counts.records, 1);
+
+    let report = publish(
+        &fixture.destination("rotated.zip"),
+        1,
+        [fixture.input_for(ID, Format::HtmlBundle)],
+        Request {
+            format: Format::HtmlBundle,
+            options: &Options::default(),
+            protection: &Protection::None,
+            links_allowed: false,
+            topic_ai: None,
+        },
+        &|| false,
+    )
+    .unwrap();
+    assert_eq!(report.incomplete_capture_journals, 0);
+    let mut archive = ZipArchive::new(fs::File::open(report.path).unwrap()).unwrap();
+    assert_eq!(
+        archive
+            .file_names()
+            .map(Result::unwrap)
+            .filter(|name| name.starts_with("session-log"))
+            .count(),
+        PARTS as usize
+    );
+    let mut final_part = String::new();
+    archive
+        .by_name(&LogFormat::Json.part_name(PARTS))
+        .unwrap()
+        .read_to_string(&mut final_part)
+        .unwrap();
+    assert!(final_part.contains("last-rotation-reviewed"));
+
+    let row = catalog(&fixture.root).unwrap().journals.pop().unwrap();
+    let root = std::sync::Arc::new(Directory::open(&fixture.root, false).unwrap());
+    Deletion::prepare(
+        root,
+        &fixture.root,
+        &directory,
+        ID,
+        &row.deletion_identity.unwrap(),
+    )
+    .unwrap()
+    .delete()
+    .unwrap();
+    assert!(!directory.exists());
+}
+
+#[test]
 fn large_java_rotation_part_is_searchable_replaceable_and_exportable() {
     use crate::session_journal::{capture, open_document, replace};
 

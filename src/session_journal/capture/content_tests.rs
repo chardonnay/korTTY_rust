@@ -6,7 +6,10 @@ use flate2::write::GzEncoder;
 use ruzstd::encoding::{CompressionLevel, compress_to_vec};
 
 use super::live_tests::{ID, Scratch, header, record};
-use super::{MAX_LINE_BYTES, MAX_PAGE_RECORDS, content_match, open_document};
+use super::{
+    Format, MAX_LINE_BYTES, MAX_PAGE_RECORDS, MAX_PARTS, content_match, discover_parts,
+    open_document,
+};
 
 const TIME: &str = "2026-10-01T01:02:03Z";
 const END: &str = "{\"type\":\"end\"}\n";
@@ -149,6 +152,23 @@ fn content_search_recovers_from_missing_parts_and_overlong_lines() {
     .unwrap();
     let source = open_document(&fixture.journal).unwrap();
     let result = content_match(&source, ID, 3, "needle", &mut (1 << 20), &|| false).unwrap();
+    assert!(result.found && result.partial);
+}
+
+#[test]
+fn journal_rotation_discovers_a_sparse_part_at_the_java_integer_limit() {
+    let fixture = Scratch::new();
+    fs::write(
+        fixture.journal.join(Format::Json.part_name(MAX_PARTS)),
+        format!("{}{}{END}", header(MAX_PARTS), record(1, "out", "needle")),
+    )
+    .unwrap();
+    let source = open_document(&fixture.journal).unwrap();
+    let (parts, status) = discover_parts(&source, MAX_PARTS, &|| false).unwrap();
+    assert_eq!(parts.len(), 1);
+    assert_eq!(status.missing_parts, MAX_PARTS as usize - 1);
+    assert!(!status.limited);
+    let result = content_match(&source, ID, MAX_PARTS, "needle", &mut 2048, &|| false).unwrap();
     assert!(result.found && result.partial);
 }
 

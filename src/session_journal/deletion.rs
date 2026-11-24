@@ -214,7 +214,7 @@ impl Deletion {
             lock.require_current(&stage.path.join(&self.name))?;
             self.validate_document(&directory)?;
             let mut remaining = MAX_ENTRIES;
-            let mut entries = inventory(&directory, MAX_DEPTH, &mut remaining)?;
+            let mut entries = inventory(&directory, MAX_DEPTH, &mut remaining, true)?;
             // Preserve the journal's identifying document if an earlier removal fails.
             entries.sort_by_key(|entry| (is_lock(&entry.name), entry.name == OsStr::new(DOCUMENT)));
             self.require_root()?;
@@ -321,32 +321,36 @@ fn inventory(
     directory: &Directory,
     depth: usize,
     remaining: &mut usize,
+    journal_root: bool,
 ) -> io::Result<Vec<TreeEntry>> {
-    let names = directory.names(*remaining)?;
-    *remaining -= names.len();
-    names
-        .into_iter()
-        .map(|name| {
-            let (identity, is_directory) = directory.deletion_entry(&name)?;
-            let children = if is_directory {
-                let depth = depth.checked_sub(1).ok_or_else(|| {
-                    invalid("Journal directory nesting exceeds the deletion limit")
-                })?;
-                let child = directory.deletion_child(&name)?;
-                if child.identity()? != identity {
-                    return Err(invalid("Journal entry changed during deletion preparation"));
-                }
-                Some(inventory(&child, depth, remaining)?)
-            } else {
-                None
-            };
-            Ok(TreeEntry {
-                name,
-                identity,
-                children,
-            })
-        })
-        .collect()
+    let mut entries = Vec::new();
+    directory.visit_names(|name| {
+        let (identity, is_directory) = directory.deletion_entry(&name)?;
+        if !(journal_root && !is_directory && super::capture::is_part_name(&name)) {
+            *remaining = remaining.checked_sub(1).ok_or_else(|| {
+                invalid("Journal directory exceeds the deletion file count limit")
+            })?;
+        }
+        let children = if is_directory {
+            let depth = depth
+                .checked_sub(1)
+                .ok_or_else(|| invalid("Journal directory nesting exceeds the deletion limit"))?;
+            let child = directory.deletion_child(&name)?;
+            if child.identity()? != identity {
+                return Err(invalid("Journal entry changed during deletion preparation"));
+            }
+            Some(inventory(&child, depth, remaining, false)?)
+        } else {
+            None
+        };
+        entries.push(TreeEntry {
+            name,
+            identity,
+            children,
+        });
+        Ok(())
+    })?;
+    Ok(entries)
 }
 
 fn purge(directory: &Directory, entries: &[TreeEntry]) -> io::Result<()> {

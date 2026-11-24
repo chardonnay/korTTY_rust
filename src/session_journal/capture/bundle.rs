@@ -121,7 +121,7 @@ pub(in crate::session_journal) fn export(
     {
         return Ok(Exported::default());
     }
-    let (parts, status) = discover_parts(source, declared_parts)?;
+    let (parts, status) = discover_parts(source, declared_parts, cancelled)?;
     if status.limited {
         return Err(invalid(
             "Journal capture discovery exceeds the bundle limit",

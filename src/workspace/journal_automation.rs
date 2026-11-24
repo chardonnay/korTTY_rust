@@ -67,7 +67,7 @@ struct Active {
 struct Scope {
     root: PathBuf,
     format: LogFormat,
-    max_parts: Option<u16>,
+    max_parts: Option<u32>,
     caps: Caps,
     user_delete: bool,
     summarize: bool,

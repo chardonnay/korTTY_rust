@@ -1250,8 +1250,8 @@ passes, and archive publication with encryption.
 ## November 24 Java journal rotation limits
 
 The connection editor and XML import support 1,000 MiB per capture part
-and the Java editor's regular ceiling of 500 parts. The managed policy
-can set a different limit within the native reader's 1,000-part bound.
+and the Java editor's regular ceiling of 500 parts. This checkpoint used
+a 1,000-part ceiling for the reader and managed policy.
 The capture reader allows the writer's retained tail and compression
 overhead above the configured size. Search, replacement and HTML export
 use corresponding cumulative byte limits with bounded buffers. The Java
@@ -1273,7 +1273,33 @@ gzip part, then checks that record in the published HTML ZIP. The OpenPGP
 test decrypts the streamed ZIP and verifies that a recipient changed before
 publication leaves no export.
 [Apple Silicon verification](target/verification/20261124-journal-rotation-macos-final.log)
-· [Windows ARM64 verification](target/verification/20261124-journal-rotation-windows-verified.log)
+· [Current Windows ARM64 retest](#november-24-managed-journal-rotation-range)
+
+## November 24 Managed journal rotation range
+
+Java v2.26.0 accepts managed `max-log-parts` values from 1 through
+2,147,483,647. Rust now preserves that range in managed policies, saved
+connection settings, Java XML and the native writers for interactive and
+automation journals. The ordinary editor ceiling remains 500 parts.
+[Tagged Java policy loader](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/policy/PolicyLoader.java)
+· [Native configuration](src/session_journal/connection.rs)
+
+The reader, search, replacement and HTML ZIP export discover actual files
+across the full range. Automation storage measurement and confirmed
+deletion accept high part counts while retaining their limits for other
+directory entries. A sparse maximum-numbered part exercises missing-file
+reporting. An 8,193-part journal exercises the live tail, viewer, search,
+reviewed replacement, complete ZIP export and deletion.
+[Native reader](src/session_journal/capture.rs)
+· [Large rotation test](src/session_journal/export_output/tests.rs)
+
+Apple Silicon passed 82 focused tests and strict Clippy for the
+application and test targets. Windows ARM64 passed 80 application tests
+and all 27 file-library tests. The 8,193-part journal and sparse-limit
+tests passed on both platforms.
+[Apple Silicon verification](target/verification/20261124-managed-journal-rotation-macos.log)
+· [Windows ARM64 verification](target/verification/20261124-managed-journal-rotation-windows.log)
+· [Windows file-library verification](target/verification/20261124-managed-journal-rotation-windows-files.log)
 
 ## November 24 SSH journal reconnect
 

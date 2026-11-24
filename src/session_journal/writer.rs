@@ -181,7 +181,7 @@ impl Capture {
         config.validate()?;
         let limits = Limits {
             part_bytes: config.part_bytes(),
-            parts: u32::from(config.max_log_parts),
+            parts: config.max_log_parts,
         };
         Self::start_with_limits_and_rules(root, metadata, limits, rules, automation)
     }

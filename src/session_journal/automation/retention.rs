@@ -558,21 +558,24 @@ fn storage_bytes(source: &Source) -> io::Result<u64> {
 }
 
 fn measure(directory: &Directory) -> io::Result<u64> {
-    let names = directory.names(MAX_FILES + 1)?;
-    if names.len() > MAX_FILES {
-        return Err(invalid("Automation journal exceeds its file limit"));
-    }
+    let mut remaining = MAX_FILES;
     let mut total = 0_u64;
-    for name in names {
+    directory.visit_names(|name| {
+        if !super::super::capture::is_part_name(&name) {
+            remaining = remaining
+                .checked_sub(1)
+                .ok_or_else(|| invalid("Automation journal exceeds its file limit"))?;
+        }
         let Some(name) = name.to_str() else {
-            continue;
+            return Ok(());
         };
         if name == "journal.xml" || name.starts_with("session-log") || name.ends_with(".png") {
             let file = directory.open_file(name)?;
             crate::private_files::require_single_link(&file)?;
             total = total.saturating_add(file.metadata()?.len());
         }
-    }
+        Ok(())
+    })?;
     Ok(total)
 }
 

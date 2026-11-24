@@ -21,7 +21,7 @@ pub(crate) struct Policy {
     pub(crate) allowed: bool,
     pub(crate) required: bool,
     pub(crate) summaries_allowed: bool,
-    pub(crate) max_parts: Option<u16>,
+    pub(crate) max_parts: Option<u32>,
 }
 
 impl Default for Policy {
@@ -59,7 +59,7 @@ impl Draft {
             Edit::Summaries(enabled) => self.settings.ai_summaries = enabled,
             Edit::Interval(value) => self.interval = value.chars().take(4).collect(),
             Edit::PartSize(value) => self.part_size = value.chars().take(4).collect(),
-            Edit::Parts(value) => self.parts = value.chars().take(4).collect(),
+            Edit::Parts(value) => self.parts = value.chars().take(11).collect(),
         }
     }
 
@@ -79,19 +79,22 @@ impl Draft {
                 "summary interval minutes",
             )?,
             max_log_size_mib: number(&self.part_size, 1, MAX_PART_MIB, "journal part size in MiB")?,
-            max_log_parts: number(
-                &self.parts,
-                1,
-                MAX_CONNECTION_JOURNAL_PARTS,
-                "maximum journal parts",
-            )?,
+            max_log_parts: self
+                .parts
+                .trim()
+                .parse::<u32>()
+                .ok()
+                .filter(|parts| (1..=MAX_CONNECTION_JOURNAL_PARTS).contains(parts))
+                .ok_or_else(|| {
+                    format!("Enter maximum journal parts from 1 to {MAX_CONNECTION_JOURNAL_PARTS}.")
+                })?,
             ..self.settings
         })
     }
 
     pub(super) fn view(&self, policy: Policy) -> Element<'_, Edit> {
         let part_limit = policy.max_parts.unwrap_or(DEFAULT_PART_LIMIT);
-        let clamp = move |value: String| match value.parse::<u16>() {
+        let clamp = move |value: String| match value.trim().parse::<u32>() {
             Ok(parts) if parts > part_limit => part_limit.to_string(),
             _ => value,
         };
@@ -163,10 +166,13 @@ mod tests {
     fn journal_rotation_editor_keeps_java_sized_values() {
         let mut draft = Draft::new(ConnectionConfig::default());
         draft.update(Edit::PartSize("1000".into()));
-        draft.update(Edit::Parts("500".into()));
+        draft.update(Edit::Parts("2147483647".into()));
         let config = draft.value().unwrap();
         assert_eq!(config.max_log_size_mib, 1000);
-        assert_eq!(config.max_log_parts, 500);
+        assert_eq!(config.max_log_parts, MAX_CONNECTION_JOURNAL_PARTS);
+        draft.update(Edit::Parts("2147483648".into()));
+        assert!(draft.value().is_err());
+        draft.update(Edit::Parts("500".into()));
         draft.update(Edit::PartSize("1001".into()));
         assert!(draft.value().is_err());
     }

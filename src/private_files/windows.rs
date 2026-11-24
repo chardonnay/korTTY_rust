@@ -150,6 +150,13 @@ impl Directory {
         self.0.names(limit)
     }
 
+    pub(crate) fn visit_names(
+        &self,
+        visit: impl FnMut(OsString) -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.0.visit_names(visit)
+    }
+
     /// Reads the hidden attribute through a no-follow child handle.
     pub(crate) fn is_hidden_child(&self, name: &str) -> io::Result<bool> {
         use std::os::windows::fs::MetadataExt as _;

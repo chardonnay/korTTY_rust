@@ -94,8 +94,12 @@ impl PartReview {
 }
 
 impl CaptureReview {
-    fn require_inventory(&self, directory: &Directory) -> io::Result<()> {
-        let parts = inventory(directory, self.declared)?;
+    fn require_current(
+        &self,
+        directory: &Directory,
+        cancelled: &dyn Fn() -> bool,
+    ) -> io::Result<()> {
+        let parts = inventory(directory, self.declared, cancelled)?;
         if !parts
             .iter()
             .map(|part| part.name())
@@ -103,12 +107,8 @@ impl CaptureReview {
         {
             return Err(changed());
         }
-        Ok(())
-    }
-
-    fn require_current(&self, directory: &Directory) -> io::Result<()> {
-        self.require_inventory(directory)?;
         for part in &self.parts {
+            check_cancelled(cancelled)?;
             require_file(directory, &part.name, &part.stamp)?;
         }
         Ok(())
@@ -138,7 +138,7 @@ pub(crate) fn preview(
             let meta = child(document.root_element(), "meta")
                 .ok_or_else(|| invalid("Missing session journal metadata"))?;
             let declared = number(meta, "logParts")?.unwrap_or(0);
-            let parts = inventory(&directory, declared)?;
+            let parts = inventory(&directory, declared, &cancelled)?;
             let mut budget = MAX_CAPTURE_IO;
             let mut reviewed = Vec::with_capacity(parts.len());
             let request = Request {
@@ -163,7 +163,7 @@ pub(crate) fn preview(
                 parts: reviewed,
             };
             check_cancelled(&cancelled)?;
-            capture.require_current(&directory)?;
+            capture.require_current(&directory, &cancelled)?;
             Some(capture)
         } else {
             None
@@ -180,7 +180,7 @@ pub(crate) fn preview(
     })
 }
 
-fn check_cancelled(cancelled: &impl Fn() -> bool) -> io::Result<()> {
+fn check_cancelled(cancelled: &dyn Fn() -> bool) -> io::Result<()> {
     if cancelled() {
         return Err(io::ErrorKind::Interrupted.into());
     }
@@ -207,7 +207,7 @@ pub(crate) fn apply(preview: &Preview) -> io::Result<Outcome> {
         return Err(changed());
     }
     if let Some(capture) = &preview.capture {
-        capture.require_current(directory)?;
+        capture.require_current(directory, &|| false)?;
     }
     if preview.counts() == Counts::default() {
         return Ok(Outcome::default());
@@ -240,7 +240,7 @@ pub(crate) fn apply(preview: &Preview) -> io::Result<Outcome> {
     stage.require_ready()?;
     require_source()?;
     if let Some(capture) = &preview.capture {
-        capture.require_current(directory)?;
+        capture.require_current(directory, &|| false)?;
     }
     stage.publish(require_source)
 }
@@ -252,7 +252,7 @@ fn stage_capture(
     rule: &Rule,
 ) -> io::Result<()> {
     let journal = stage.journal;
-    let parts = inventory(journal, capture.declared)?;
+    let parts = inventory(journal, capture.declared, &|| false)?;
     if !parts
         .iter()
         .map(|part| part.name())

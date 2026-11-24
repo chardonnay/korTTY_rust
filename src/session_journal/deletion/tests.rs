@@ -188,7 +188,7 @@ fn journal_deletion_bounds_the_tree_before_removing_entries() {
     fs::create_dir_all(&deep).unwrap();
     fs::write(deep.join("keep"), b"deep data").unwrap();
     let plan = prepare(&root, &directory, "deep");
-    assert!(inventory(&plan.current_directory().unwrap(), MAX_DEPTH, &mut 1).is_err());
+    assert!(inventory(&plan.current_directory().unwrap(), MAX_DEPTH, &mut 1, true).is_err());
     let error = plan.delete().unwrap_err();
     assert!(error.to_string().contains("nesting"), "{error}");
     assert!(deep.join("keep").is_file(), "{error}");
@@ -284,7 +284,7 @@ fn journal_deletion_refuses_a_nested_directory_replaced_after_inventory() {
     fs::write(nested.join("original"), b"original").unwrap();
     let plan = prepare(&root, &directory, "same");
     let opened = plan.current_directory().unwrap();
-    let mut entries = inventory(&opened, MAX_DEPTH, &mut 3).unwrap();
+    let mut entries = inventory(&opened, MAX_DEPTH, &mut 3, true).unwrap();
     entries.sort_by_key(|entry| entry.name == OsStr::new(DOCUMENT));
     let original = fixture.0.join("detached");
     fs::rename(&nested, &original).unwrap();

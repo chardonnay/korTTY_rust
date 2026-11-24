@@ -500,9 +500,21 @@ impl Directory {
 
     /// Lists a bounded number of names from the open directory handle.
     pub fn names(&self, limit: usize) -> io::Result<Vec<OsString>> {
+        let mut names = Vec::new();
+        self.visit_names(|name| {
+            if names.len() == limit {
+                return Err(io::Error::other("SFTP folder entry limit exceeded"));
+            }
+            names.push(name);
+            Ok(())
+        })?;
+        Ok(names)
+    }
+
+    /// Visits names from the open directory handle without buffering the directory.
+    pub fn visit_names(&self, mut visit: impl FnMut(OsString) -> io::Result<()>) -> io::Result<()> {
         let mut buffer = [0_u64; 1024];
         let mut class = FileIdBothDirectoryRestartInfo;
-        let mut names = Vec::new();
         loop {
             // SAFETY: the directory and aligned writable buffer remain live.
             let result = unsafe {
@@ -515,11 +527,11 @@ impl Directory {
             };
             if let Err(error) = ok(result) {
                 if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
-                    return Ok(names);
+                    return Ok(());
                 }
                 return Err(error);
             }
-            append_names(&buffer, &mut names, limit)?;
+            visit_name_buffer(&buffer, &mut visit)?;
             class = FileIdBothDirectoryInfo;
         }
     }
@@ -825,7 +837,10 @@ fn mark_for_removal(file: &File) -> io::Result<()> {
     })
 }
 
-fn append_names(buffer: &[u64], names: &mut Vec<OsString>, limit: usize) -> io::Result<()> {
+fn visit_name_buffer(
+    buffer: &[u64],
+    visit: &mut impl FnMut(OsString) -> io::Result<()>,
+) -> io::Result<()> {
     const HEADER: usize = offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
     let mut offset = 0;
     let length = size_of_val(buffer);
@@ -861,10 +876,7 @@ fn append_names(buffer: &[u64], names: &mut Vec<OsString>, limit: usize) -> io::
             )
         };
         if !matches!(name, [46] | [46, 46]) {
-            if names.len() == limit {
-                return Err(io::Error::other("SFTP folder entry limit exceeded"));
-            }
-            names.push(OsString::from_wide(name));
+            visit(OsString::from_wide(name))?;
         }
         if next == 0 {
             return Ok(());

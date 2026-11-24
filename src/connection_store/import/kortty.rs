@@ -1075,11 +1075,14 @@ mod journal_rotation_tests {
     fn journal_rotation_import_accepts_the_java_editor_limits() {
         let xml = roxmltree::Document::parse(
             "<settings><sessionJournalConfig><maxLogSizeMB>1000</maxLogSizeMB>\
-             <maxLogParts>500</maxLogParts></sessionJournalConfig></settings>",
+             <maxLogParts>2147483647</maxLogParts></sessionJournalConfig></settings>",
         )
         .unwrap();
         let config = journal_config(xml.root_element()).unwrap();
         assert_eq!(config.max_log_size_mib, 1000);
-        assert_eq!(config.max_log_parts, 500);
+        assert_eq!(
+            config.max_log_parts,
+            crate::session_journal::MAX_CONNECTION_JOURNAL_PARTS
+        );
     }
 }

@@ -21,7 +21,7 @@ pub(crate) struct Policy {
     directory_mode: Option<DirectoryMode>,
     journal_directory: Option<PathBuf>,
     journal_log_format: Option<LogFormat>,
-    journal_max_log_parts: Option<u16>,
+    journal_max_log_parts: Option<u32>,
     journal_enforced: bool,
     journal_clickable_links_denied: bool,
     journal_rename_denied: bool,
@@ -96,7 +96,7 @@ impl Policy {
         self.journal_log_format
     }
 
-    pub(crate) fn journal_max_log_parts(&self) -> Option<u16> {
+    pub(crate) fn journal_max_log_parts(&self) -> Option<u32> {
         self.journal_max_log_parts
     }
 
@@ -220,13 +220,15 @@ impl Policy {
                     .map(|value| value as u32),
             });
             if let Some(value) = journal.get("max-log-parts") {
-                let value = value
+                let cap = value
                     .as_integer()
-                    .filter(|value| *value >= 1)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .filter(|value| (1..=MAX_CONNECTION_JOURNAL_PARTS).contains(value))
                     .ok_or_else(|| {
-                        invalid("Managed session journal max-log-parts must be a positive integer")
+                        invalid(
+                            "Managed session journal max-log-parts must be a positive 32-bit integer",
+                        )
                     })?;
-                let cap = value.min(i64::from(MAX_CONNECTION_JOURNAL_PARTS)) as u16;
                 self.journal_max_log_parts = Some(
                     self.journal_max_log_parts
                         .map_or(cap, |current| current.min(cap)),
@@ -505,15 +507,15 @@ mod tests {
             assert_eq!(policy.journal_max_log_parts(), Some(3));
         }
         let mut policy = Policy::default();
-        policy.read_rule(rule("750").as_table())?;
-        assert_eq!(policy.journal_max_log_parts(), Some(750));
+        policy.read_rule(rule("100001").as_table())?;
+        assert_eq!(policy.journal_max_log_parts(), Some(100_001));
         let mut policy = Policy::default();
-        policy.read_rule(rule("9223372036854775807").as_table())?;
+        policy.read_rule(rule("2147483647").as_table())?;
         assert_eq!(
             policy.journal_max_log_parts(),
             Some(MAX_CONNECTION_JOURNAL_PARTS)
         );
-        for invalid in ["0", "-1", "1.5", "'3'", "true", "[]"] {
+        for invalid in ["0", "-1", "1.5", "'3'", "true", "[]", "2147483648"] {
             assert!(
                 Policy::default()
                     .read_rule(rule(invalid).as_table())

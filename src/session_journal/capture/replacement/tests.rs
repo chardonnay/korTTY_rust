@@ -88,7 +88,7 @@ fn capture_replacement_preserves_nine_format_and_codec_combinations() {
             let path = scratch.journal.join(&name);
             let original = encode_fixture(suffix, input.as_bytes());
             fs::write(&path, &original).unwrap();
-            let parts = inventory(&directory, 1).unwrap();
+            let parts = inventory(&directory, 1, &|| false).unwrap();
             assert_eq!(parts.len(), 1);
             let part = &parts[0];
             assert_eq!(part.name(), name);
@@ -132,20 +132,20 @@ fn capture_replacement_preserves_nine_format_and_codec_combinations() {
 fn capture_replacement_requires_unambiguous_complete_part_inventory() {
     let scratch = Scratch::new();
     let directory = Directory::open(&scratch.journal, false).unwrap();
-    assert!(inventory(&directory, 0).unwrap().is_empty());
-    assert!(inventory(&directory, 1).is_err());
+    assert!(inventory(&directory, 0, &|| false).unwrap().is_empty());
+    assert!(inventory(&directory, 1, &|| false).is_err());
 
     let first = scratch.journal.join("session-log.json");
     let second = scratch.journal.join("session-log-2.xml.zst");
     fs::write(&second, b"").unwrap();
-    assert!(inventory(&directory, 0).is_err());
+    assert!(inventory(&directory, 0, &|| false).is_err());
     fs::write(&first, b"").unwrap();
-    let parts = inventory(&directory, 1).unwrap();
+    let parts = inventory(&directory, 1, &|| false).unwrap();
     assert_eq!(
         parts.iter().map(Part::name).collect::<Vec<_>>(),
         ["session-log.json", "session-log-2.xml.zst"]
     );
-    assert!(inventory(&directory, 3).is_err());
+    assert!(inventory(&directory, 3, &|| false).is_err());
 
     for unexpected in [
         "session-log.xml.gz",
@@ -154,7 +154,7 @@ fn capture_replacement_requires_unambiguous_complete_part_inventory() {
     ] {
         let path = scratch.journal.join(unexpected);
         fs::write(&path, b"").unwrap();
-        assert!(inventory(&directory, 2).is_err(), "{unexpected}");
+        assert!(inventory(&directory, 2, &|| false).is_err(), "{unexpected}");
         fs::remove_file(path).unwrap();
     }
 }
@@ -166,7 +166,7 @@ fn capture_replacement_read_rejects_hardlinks_and_an_inventory_file_replacement(
     let path = scratch.journal.join("session-log.json");
     let other = scratch.journal.join("other.json");
     fs::write(&path, b"original").unwrap();
-    let parts = inventory(&directory, 1).unwrap();
+    let parts = inventory(&directory, 1, &|| false).unwrap();
     let rule = Rule::compile("original", "updated", false, false).unwrap();
     fs::hard_link(&path, &other).unwrap();
     let mut budget = BUDGET;
@@ -197,7 +197,7 @@ fn capture_replacement_preview_allows_an_open_part_but_rejects_corrupt_or_oversi
         header(1)
     );
     fs::write(&path, &open).unwrap();
-    let parts = inventory(&directory, 1).unwrap();
+    let parts = inventory(&directory, 1, &|| false).unwrap();
     let part = &parts[0];
     let mut budget = BUDGET;
     assert_eq!(
@@ -271,7 +271,7 @@ fn capture_replacement_rejects_inconsistent_yaml_and_corrupt_compressed_data() {
             .join(format!("session-log.{extension}{suffix}"));
         fs::write(&path, &raw).unwrap();
         let mut budget = BUDGET;
-        let parts = inventory(&directory, 1).unwrap();
+        let parts = inventory(&directory, 1, &|| false).unwrap();
         let part = &parts[0];
         assert!(
             part.preview(&directory, &mut budget, &request(&rule), true)
@@ -289,7 +289,7 @@ fn capture_replacement_bounds_the_encoded_stage_independently_of_input() {
     let original = encode_fixture(".gz", input.as_bytes());
     let path = scratch.journal.join("session-log.json.gz");
     fs::write(&path, &original).unwrap();
-    let parts = inventory(&directory, 1).unwrap();
+    let parts = inventory(&directory, 1, &|| false).unwrap();
     let rule = Rule::compile("secret", "replacement", false, false).unwrap();
     let mut budget = BUDGET;
     let error = parts[0]

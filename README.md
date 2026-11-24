@@ -275,8 +275,8 @@ mirrored input, password prompts and partial commands already in progress
 are excluded. The setting defaults to off when the profile or imported
 Java XML omits it.
 Capture-log parts can be up to 1,000 MiB each. The profile editor offers up
-to 500 parts by default. A managed policy can set the part count limit
-within the native reader's 1,000-part bound.
+to 500 parts by default. A managed policy can set a part count limit up to
+2,147,483,647, matching the Java policy range.
 
 An administrator can set `[rule.session-journal] enforced = true` to start
 the journal automatically and lock the stop action on supported terminal

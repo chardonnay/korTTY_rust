@@ -412,6 +412,7 @@ fn java_journal_input_xml_preserves_explicit_choices_and_defaults_omissions_to_o
         let mut connection = fixture();
         connection.terminal.journal.auto_start = true;
         connection.terminal.journal.capture_input = capture.unwrap_or(false);
+        connection.terminal.journal.max_log_parts = 100_001;
         let data = encode_profiles(
             Format::Kortty,
             &[Entry {
@@ -442,6 +443,7 @@ fn java_journal_input_xml_preserves_explicit_choices_and_defaults_omissions_to_o
         let store = Store::open(profile_path).unwrap();
         let imported = &store.connections()[0];
         assert!(imported.terminal.journal.auto_start);
+        assert_eq!(imported.terminal.journal.max_log_parts, 100_001);
         assert_eq!(
             imported.terminal.journal.capture_input,
             capture.unwrap_or(false)
@@ -459,7 +461,9 @@ fn java_journal_input_xml_preserves_explicit_choices_and_defaults_omissions_to_o
             None,
         )
         .unwrap();
-        assert!(str::from_utf8(&exported).unwrap().contains(&field));
+        let xml = str::from_utf8(&exported).unwrap();
+        assert!(xml.contains(&field));
+        assert!(xml.contains("<maxLogParts>100001</maxLogParts>"));
     }
 }
 

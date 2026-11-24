@@ -14,6 +14,7 @@ use crate::logfile_window::zstandard;
 use crate::private_files::EntryIdentity;
 use crate::sftp_window::LocalSource;
 
+use super::connection::MAX_PARTS;
 use super::{
     LogFormat as Format, display_text, invalid, open_document, parse_xml, scalar_text,
     screenshot_reference,
@@ -30,8 +31,6 @@ pub(super) mod retrieval;
 use live_archive::ArchiveReader;
 pub(super) use live_archive::{LiveArchive, LiveArchives};
 
-const MAX_PARTS: u32 = super::connection::MAX_PARTS as u32;
-const MAX_DIRECTORY_NAMES: usize = 4096;
 const MAX_PART_BYTES: u64 = super::connection::MAX_STORED_PART_BYTES;
 pub(super) const MAX_CAPTURE_BYTES: u64 = MAX_PARTS as u64 * MAX_PART_BYTES;
 // The Java writer uses zstd-jni setLong(27), even for small closed parts.
@@ -362,14 +361,23 @@ fn newest_live_part(
     archives: &LiveArchives,
 ) -> io::Result<u32> {
     // The writer creates contiguous parts and registers archives before removing their plain files.
-    let (mut low, mut high) = (1, MAX_PARTS + 1);
+    let exists = |number| match source.open_sibling(OsStr::new(&format.part_name(number))) {
+        Ok(_) => Ok(true),
+        Err(_) if archives.get(number).is_some() => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    };
+    let (mut low, mut high) = (1_u32, 2_u32);
+    while high <= MAX_PARTS && exists(high)? {
+        low = high;
+        high = (high * 2).min(MAX_PARTS + 1);
+    }
     while high - low > 1 {
         let middle = low + (high - low) / 2;
-        match source.open_sibling(OsStr::new(&format.part_name(middle))) {
-            Ok(_) => low = middle,
-            Err(_) if archives.get(middle).is_some() => low = middle,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => high = middle,
-            Err(error) => return Err(error),
+        if exists(middle)? {
+            low = middle;
+        } else {
+            high = middle;
         }
     }
     Ok(low)
@@ -625,47 +633,56 @@ impl Part {
     }
 }
 
+pub(super) fn is_part_name(name: &OsStr) -> bool {
+    name.to_str()
+        .and_then(|name| Part::parse(name.to_owned()))
+        .is_some_and(|part| part.number <= MAX_PARTS)
+}
+
 #[cfg(unix)]
-fn part_names(source: &LocalSource) -> io::Result<Vec<OsString>> {
+fn visit_names(
+    source: &LocalSource,
+    mut visit: impl FnMut(OsString) -> io::Result<()>,
+) -> io::Result<()> {
     use rustix::fs::Dir;
     use std::os::unix::ffi::OsStringExt as _;
 
-    let mut names = Vec::new();
     for entry in Dir::read_from(source.parent_file())? {
         let entry = entry?;
         let name = entry.file_name().to_bytes();
         if !matches!(name, b"." | b"..") {
-            names.push(OsString::from_vec(name.to_vec()));
-            if names.len() > MAX_DIRECTORY_NAMES {
-                break;
-            }
+            visit(OsString::from_vec(name.to_vec()))?;
         }
     }
-    Ok(names)
+    Ok(())
 }
 
 #[cfg(windows)]
-fn part_names(source: &LocalSource) -> io::Result<Vec<OsString>> {
-    source.parent_directory().names(MAX_DIRECTORY_NAMES + 1)
+fn visit_names(
+    source: &LocalSource,
+    visit: impl FnMut(OsString) -> io::Result<()>,
+) -> io::Result<()> {
+    source.parent_directory().visit_names(visit)
 }
 
 fn discover_parts(
     source: &LocalSource,
     declared_parts: u32,
+    cancelled: &dyn Fn() -> bool,
 ) -> io::Result<(BTreeMap<u32, Part>, CaptureStatus)> {
-    let names = part_names(source)?;
     let mut status = CaptureStatus {
-        limited: declared_parts > MAX_PARTS || names.len() > MAX_DIRECTORY_NAMES,
+        limited: declared_parts > MAX_PARTS,
         ..CaptureStatus::default()
     };
     let mut parts = BTreeMap::<u32, Part>::new();
-    for name in names.into_iter().take(MAX_DIRECTORY_NAMES) {
+    visit_names(source, |name| {
+        check_content_cancel(cancelled)?;
         let Some(part) = name.into_string().ok().and_then(Part::parse) else {
-            continue;
+            return Ok(());
         };
         if part.number > MAX_PARTS {
             status.limited = true;
-            continue;
+            return Ok(());
         }
         // Follow the pinned Java reader's format and compression probe order.
         if parts.get(&part.number).is_none_or(|current| {
@@ -673,7 +690,8 @@ fn discover_parts(
         }) {
             parts.insert(part.number, part);
         }
-    }
+        Ok(())
+    })?;
     let observed = parts.last_key_value().map_or(0, |(&part, _)| part);
     let expected = declared_parts.min(MAX_PARTS).max(observed);
     status.missing_parts = expected as usize - parts.len();
@@ -710,7 +728,7 @@ pub(super) fn capture_page_in(
     if query.is_some_and(|query| query.len() > MAX_QUERY_BYTES) {
         return Err(invalid("Session journal query exceeds the size limit"));
     }
-    let (parts, status) = discover_parts(source, declared_parts)?;
+    let (parts, status) = discover_parts(source, declared_parts, &|| false)?;
     let mut scan = Scan {
         range,
         query: query
@@ -719,9 +737,8 @@ pub(super) fn capture_page_in(
         ..Scan::default()
     };
     scan.page.status = status;
-    for part in parts.values() {
+    for (_, part) in parts.range(after.map_or(1, |cursor| cursor.part)..) {
         let resume = match after {
-            Some(cursor) if part.number < cursor.part => continue,
             Some(cursor) if part.number == cursor.part => cursor.line,
             _ => 0,
         };
@@ -759,7 +776,7 @@ pub(super) fn content_match(
             partial: false,
         });
     }
-    let (parts, mut status) = discover_parts(source, declared_parts)?;
+    let (parts, mut status) = discover_parts(source, declared_parts, cancelled)?;
     let mut found = false;
     for part in parts.values() {
         check_content_cancel(cancelled)?;

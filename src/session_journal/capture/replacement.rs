@@ -15,9 +15,8 @@ use crate::private_files::{Directory, EntryIdentity, FileStamp};
 use super::super::metadata::{require_single_link, xml_character};
 use super::super::replace::rule::Rule;
 use super::{
-    CaptureStatus, CaptureText, Compression, ContentReader, Format, MAX_DIRECTORY_NAMES,
-    MAX_LINE_BYTES, MAX_PART_BYTES, MAX_PARTS, PartEnvelope, PartLine, check_content_cancel,
-    invalid, parse_xml, zstandard,
+    CaptureStatus, CaptureText, Compression, ContentReader, Format, MAX_LINE_BYTES, MAX_PART_BYTES,
+    MAX_PARTS, PartEnvelope, PartLine, check_content_cancel, invalid, parse_xml, zstandard,
 };
 
 pub(in crate::session_journal) struct Part {
@@ -35,20 +34,22 @@ pub(in crate::session_journal) struct Request<'a> {
 pub(in crate::session_journal) fn inventory(
     directory: &Directory,
     declared: u32,
+    cancelled: &dyn Fn() -> bool,
 ) -> io::Result<Vec<Part>> {
     if declared > MAX_PARTS {
         return Err(invalid("Session journal capture exceeds the part limit"));
     }
     let mut parts = BTreeMap::new();
     let volume = directory.identity()?.0;
-    for name in directory.names(MAX_DIRECTORY_NAMES)? {
+    directory.visit_names(|name| {
+        check_content_cancel(cancelled)?;
         const PREFIX: &[u8] = b"session-log";
         if !name
             .as_encoded_bytes()
             .get(..PREFIX.len())
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(PREFIX))
         {
-            continue;
+            return Ok(());
         }
         let format = name
             .into_string()
@@ -68,7 +69,8 @@ pub(in crate::session_journal) fn inventory(
         {
             return Err(invalid("Duplicate session journal capture part"));
         }
-    }
+        Ok(())
+    })?;
     let expected = declared.max(parts.last_key_value().map_or(0, |(&number, _)| number));
     if parts.len() != expected as usize {
         return Err(invalid("Missing session journal capture part"));
