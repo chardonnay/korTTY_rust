@@ -1097,6 +1097,43 @@ Searching for Ansible reduced the skills list to that entry. Cancel
 returned directly to the Connection Manager after the search. Windows
 also passed the two opt-in tests for Teamwork Git over loopback and
 temporary-key replacement in the vault.
+
+## November 24 SSH journal editor desktop comparison
+
+The Journal page follows the Java layout with an enable switch, a
+separator, two options and three aligned editable spinners. The
+summary interval follows the AI summaries switch. The dependent controls
+are disabled when automatic capture is off. A managed requirement locks
+the enable switch on and shows the applied rotation ceiling. Capture
+choices remain available to manually started journals when saved after
+clearing automatic capture. Invalid numeric drafts return to the saved
+values when automatic capture is cleared.
+[Journal editor](src/connection_window/journal_settings.rs)
+
+The Windows comparison used the actual Java v2.26.0 connection dialog
+from the released x86-64 ZIP under emulation and native ARM64 Rust.
+The dedicated Java fixture opened the Journal tab directly in an isolated
+profile. Rust uses a wider input column to show all ten digits at the
+managed ceiling and retains its 1,440-minute summary range. The final
+normal-theme comparison displayed values 0, 25 and 500 in both editors.
+The three inputs began at approximately 308 pixels in Java and 303 in
+Rust. The fixture windows measured 1,114 by 1,336 and 862 by 722 pixels
+respectively.
+[Tagged Java connection editor](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ConnectionEditDialog.java)
+
+The disabled profile showed inactive capture controls. In the managed
+profile the stepper increased 2,147,483,646 to 2,147,483,647 and Save
+persisted the change. After the private application restarted, the
+editor showed the exact saved value, the disabled increment at the
+ceiling and the locked enable switch. The stored typed input and
+automatic start preferences remained off, with automatic start applied
+by the installation policy.
+[Windows ARM64 preview build](target/verification/20261124-journal-editor-windows-build-verified.log)
+
+Windows ARM64 and Apple Silicon each passed 40 focused tests. Apple
+Silicon also passed strict Clippy for the application and test targets.
+[Apple Silicon verification](target/verification/20261124-journal-editor-macos-verified.log)
+· [Windows ARM64 verification](target/verification/20261124-journal-editor-windows-verified.log)
 [Windows ARM64 preview build](target/verification/20261124-connection-editor-tabs-windows-preview.log)
 · [Windows ARM64 opt-in tests](target/verification/20261124-connection-editor-tabs-windows-opt-in.log)
 
