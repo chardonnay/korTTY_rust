@@ -185,9 +185,20 @@ jump host have the same port stepper and separate username rows. The
 [SSH editor controls update](PORTING-PARITY.md#november-24-ssh-editor-keyboard-and-disabled-jump-host)
 adds timeout and retry steppers, a disabled Jump Server form and keyboard
 traversal for Connection and Jump Server. Apple Silicon passed the focused
-regressions and strict Clippy. The Windows ARM64 preview build passed, and
-the desktop walkthrough remains open after a Windows Graphics Capture
-failure. Continue with the remaining form layout and native comparisons.
+regressions and strict Clippy. Windows ARM64 passed the focused regressions
+and preview build. The desktop walkthrough remains open after a Windows
+Graphics Capture failure.
+The [Window Geometry page](PORTING-PARITY.md#november-24-ssh-editor-window-geometry)
+now groups size and position steppers and keeps disabled controls visible.
+Compare both geometry states and keyboard traversal on the native desktops.
+The tagged [Java connection editor](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ConnectionEditDialog.java)
+shows the effective global values in Terminal Settings when the connection
+does not use its own values. Switching back within the dialog restores the
+connection draft. Bring the Rust presentation and draft behavior into line
+while preserving per-field inheritance on existing profiles. SSH Tunnels
+still needs the list with an aggregate enable switch and owned add and edit
+dialogs. Terminal Logging still needs the visible disabled grid, folder
+chooser and a filename preview linked to the selected format and compression.
 The [managed Journal requirement](PORTING-PARITY.md#november-24-managed-session-journal)
 locks the SSH editor's autostart control and starts capture on eligible
 terminal streams. A native Apple Silicon OpenSSH test covered automatic

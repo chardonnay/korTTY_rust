@@ -1,9 +1,12 @@
 use std::ops::RangeInclusive;
 
-use iced::Element;
-use iced::widget::{checkbox, column, row, text, text_input};
+use iced::widget::{checkbox, column, row, rule, space, text, text_input};
+use iced::{Alignment, Element};
 
 use crate::connection_store::WindowGeometry;
+use crate::workspace::dialog_design::{keyboard_table, number_input};
+
+const LABEL_WIDTH: f32 = 128.0;
 
 #[derive(Clone, Debug)]
 pub enum Edit {
@@ -21,8 +24,6 @@ pub enum Field {
 }
 
 impl Field {
-    const ALL: [Self; 4] = [Self::Width, Self::Height, Self::X, Self::Y];
-
     fn label(self) -> &'static str {
         match self {
             Self::Width => "Width",
@@ -106,26 +107,129 @@ impl Draft {
     }
 
     pub(super) fn view(&self) -> Element<'_, Edit> {
-        let fields = Field::ALL.into_iter().map(|field| {
-            column![
-                text(field.label()).size(13),
-                text_input(field.label(), &self.fields[field as usize])
-                    .width(100)
-                    .on_input(move |value| Edit::Value(field, value)),
-            ]
-            .spacing(4)
-            .into()
-        });
+        let custom = checkbox(self.custom)
+            .label("Use specific window geometry for this connection")
+            .on_toggle(Edit::Custom);
+        let maximize = self.custom.then_some(Edit::Maximized(!self.maximized));
+        let maximized = checkbox(self.maximized)
+            .label("Open window maximized")
+            .on_toggle_maybe(self.custom.then_some(Edit::Maximized));
         column![
-            checkbox(self.custom)
-                .label("Use custom geometry in a new window")
-                .on_toggle(Edit::Custom),
-            self.custom.then(|| row(fields).spacing(8).wrap()),
-            self.custom.then(|| checkbox(self.maximized)
-                .label("Open maximized")
-                .on_toggle(Edit::Maximized)),
+            keyboard_table::action(custom.into(), Some(Edit::Custom(!self.custom)), false),
+            text(
+                "These settings apply when the connection opens in a separate terminal window.\nGlobal window settings apply when this option is off."
+            )
+            .size(13)
+            .style(text::secondary),
+            rule::horizontal(1),
+            row![
+                text("Window size").width(LABEL_WIDTH),
+                self.stepper(Field::Width, "Width", ""),
+                self.stepper(Field::Height, "Height", "px"),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center)
+            .wrap(),
+            row![
+                text("Window position").width(LABEL_WIDTH),
+                self.stepper(Field::X, "X", ""),
+                self.stepper(Field::Y, "Y", "px"),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center)
+            .wrap(),
+            row![
+                space::horizontal().width(LABEL_WIDTH),
+                keyboard_table::action(maximized.into(), maximize, false),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center)
+            .wrap(),
         ]
-        .spacing(7)
+        .spacing(12)
         .into()
+    }
+
+    fn stepper(&self, field: Field, label: &'static str, unit: &'static str) -> Element<'_, Edit> {
+        let value = &self.fields[field as usize];
+        let bounds = field.bounds();
+        let edit = self
+            .custom
+            .then_some(move |value| Edit::Value(field, value));
+        row![
+            text(label).size(13),
+            number_input(
+                text_input(field.label(), value).on_input_maybe(edit),
+                value,
+                i64::from(*bounds.start())..=i64::from(*bounds.end()),
+                1,
+                edit,
+                74.0,
+            ),
+            (!unit.is_empty()).then(|| text(unit).size(13)),
+        ]
+        .spacing(5)
+        .align_y(Alignment::Center)
+        .into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keyboard_steps_geometry_within_bounds_and_preserves_the_disabled_draft() {
+        use iced::advanced::widget::operation::focusable;
+        use iced::keyboard::{Key, key::Named};
+        use iced::{Font, Renderer, Size};
+        use iced_runtime::{Action, UserInterface, task, user_interface::Cache};
+
+        use crate::settings_search::test_input;
+
+        let mut draft = Draft::new(Some(WindowGeometry {
+            width: 4000,
+            height: 300,
+            maximized: true,
+            ..WindowGeometry::default()
+        }));
+        let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+        {
+            let mut interface = UserInterface::build(
+                draft.view(),
+                Size::new(720.0, 300.0),
+                Cache::default(),
+                &mut renderer,
+            );
+            for _ in 0..2 {
+                test_input::apply(
+                    &mut interface,
+                    &renderer,
+                    task::effect(Action::widget(focusable::focus_next())),
+                );
+            }
+            let press = |interface: &mut _, renderer: &mut _, key| {
+                test_input::press(interface, renderer, Key::Named(key), None)
+            };
+            assert!(press(&mut interface, &mut renderer, Named::ArrowUp).is_empty());
+            assert!(matches!(
+                press(&mut interface, &mut renderer, Named::ArrowDown).as_slice(),
+                [Edit::Value(Field::Width, width)] if width == "3999"
+            ));
+            test_input::apply(
+                &mut interface,
+                &renderer,
+                task::effect(Action::widget(focusable::focus_next())),
+            );
+            assert!(press(&mut interface, &mut renderer, Named::ArrowDown).is_empty());
+        }
+        assert!(draft.update(Edit::Custom(false)));
+        assert!(!draft.update(Edit::Value(Field::Width, "500".into())));
+        assert!(!draft.update(Edit::Maximized(false)));
+        assert_eq!(draft.value().unwrap(), None);
+        assert!(draft.update(Edit::Custom(true)));
+        let geometry = draft.value().unwrap().unwrap();
+        assert_eq!(geometry.width, 4000);
+        assert!(geometry.maximized);
     }
 }

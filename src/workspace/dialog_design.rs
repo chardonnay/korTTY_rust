@@ -197,11 +197,11 @@ pub(crate) fn number_input<'a, Message: Clone + 'a>(
     value: &str,
     bounds: RangeInclusive<i64>,
     step: i64,
-    on_step: Option<fn(String) -> Message>,
+    on_step: Option<impl Fn(String) -> Message>,
     input_width: f32,
 ) -> Element<'a, Message> {
     let adjustment = |delta: i64| {
-        let update = on_step?;
+        let update = on_step.as_ref()?;
         let value: i64 = value.trim().parse().ok()?;
         if !bounds.contains(&value) {
             return None;

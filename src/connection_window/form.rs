@@ -72,7 +72,10 @@ pub enum Page {
 
 impl Page {
     fn keyboard_navigation(self) -> bool {
-        matches!(self, Self::Connection | Self::JumpHost | Self::Ai)
+        matches!(
+            self,
+            Self::Connection | Self::JumpHost | Self::WindowGeometry | Self::Ai
+        )
     }
 
     const ALL: [Self; 8] = [

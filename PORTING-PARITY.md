@@ -1268,12 +1268,30 @@ configuration, and the focus transition from the disabled Jump Server
 toggle to Save.
 [Apple Silicon verification](target/verification/20261124-ssh-editor-keyboard-macos-retest.log)
 
-The native Windows ARM64 preview build passed and opened a private
-Connection Manager. Windows Graphics Capture reported
+Windows ARM64 passed the same 56 focused tests. The native preview build
+passed and opened a private Connection Manager. Windows Graphics Capture reported
 `DXGI_ERROR_DEVICE_REMOVED` when capturing the private window. The
 desktop comparison and keyboard walkthrough remain open.
-[Windows ARM64 build](target/verification/20261124-ssh-editor-keyboard-windows-build-retest.log)
+[Windows ARM64 tests](target/verification/20261124-ssh-editor-keyboard-windows-tests-native.log)
+· [Windows ARM64 build](target/verification/20261124-ssh-editor-keyboard-windows-build-retest.log)
 · [Desktop check](target/verification/20261124-ssh-editor-keyboard-windows-desktop.md)
+
+## November 24 SSH editor window geometry
+
+The Window Geometry page follows the tagged Java form's size, position
+and maximized rows. Width, height, X and Y have editable steppers with
+the saved profile's existing limits. The values stay visible when
+custom geometry is off. The inputs and maximized toggle are disabled
+and skipped in keyboard traversal. Re-enabling custom geometry before
+saving brings back the current draft. The help explains that the
+settings apply when a connection opens in a separate window.
+[Geometry form](src/connection_window/form/geometry.rs)
+
+Apple Silicon passed 51 focused tests and strict Clippy. The geometry
+regression exercises the upper width and lower height limits with the
+arrow keys, ignores edits while custom geometry is off, and verifies
+that re-enabling it restores the entered size and maximized setting.
+[Apple Silicon verification](target/verification/20261124-window-geometry-macos-native.log)
 
 ## November 24 Connection Manager Teamwork tree
 
