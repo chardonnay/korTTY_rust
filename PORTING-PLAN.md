@@ -180,9 +180,12 @@ on the native desktops at the same font scale as the Java reference.
 Resolve the Journal rotation difference. The Java editor allows 1,000 MiB
 per part and 500 parts by default. Rust limits these to 120 MiB and 64
 parts. Update the editor and Java XML limits together with the writer and
-reader. Move capture replacement and filtered bundle export away from
-whole-part buffers before raising the byte limit. Verify rotated plain and
-compressed journals and preserve cancellation and file identity checks.
+reader. [Capture replacement streams log parts into its verified private
+stage](PORTING-PARITY.md#november-24-streaming-journal-replacement). Stream
+filtered and unfiltered HTML bundle members into the private ZIP stage,
+then align the raw, decoded, staged, and archive byte budgets. Verify
+rotated plain and compressed journals and preserve cancellation and file
+identity checks.
 The Manager's separate
 Teamwork sidebar group and editor form alignment remain open. The earlier
 Windows desktop check covered the three-pane Manager, its Map view, opening

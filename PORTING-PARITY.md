@@ -1197,6 +1197,30 @@ The desktop comparison of the revised strip remains open.
 [Tagged Java navigation](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/TabPaneArrowNavigation.java)
 · [Rust SSH editor navigation](src/connection_window/form/tabs.rs)
 
+## November 24 streaming journal replacement
+
+The replacement preview reads the source one bounded record at a time.
+Apply streams changed records through the existing plain, gzip or Zstandard
+codec into the private replacement stage. Preview stores each part's
+physical record count and file stamp. Apply checks both, validates the
+directory inventory, and publishes staged files using the existing
+identity and durability checks. Parts with zero changes stay on the
+preview path. Metadata edits are published last.
+
+Streaming removes the whole-part buffers from this operation. The
+rotation limits still depend on streaming HTML bundle export and updating
+the associated I/O budgets.
+[Log-part replacement](src/session_journal/capture/replacement.rs)
+· [Replacement publication](src/session_journal/replace.rs)
+
+Windows ARM64 and Apple Silicon each passed 20 focused tests. Apple
+Silicon also passed strict application and test-target Clippy. The cases
+cover all nine format and codec combinations, the independent input and
+output budgets, malformed records, cancellation, file identity changes,
+and a failed private stage.
+[Apple Silicon verification](target/verification/20261124-journal-replacement-streaming-macos-native.log)
+· [Windows ARM64 verification](target/verification/20261124-journal-replacement-streaming-windows.log)
+
 ## November 23 GGUF Configure sizing
 
 Java sizes the Configure grid to its path label. Rust now measures the

@@ -2,11 +2,12 @@
 
 use std::ffi::OsStr;
 use std::fmt;
-use std::io;
+use std::fs::File;
+use std::io::{self, Write};
 
 use crate::private_files::{Directory, EntryIdentity, FileStamp, nonce};
 
-use super::capture::replacement::{Mode, inventory};
+use super::capture::replacement::{Request, inventory};
 use super::entry_edit::lock_source;
 use super::metadata::require_single_link;
 use super::viewer::Source;
@@ -77,6 +78,16 @@ struct CaptureReview {
 struct PartReview {
     name: String,
     stamp: FileStamp,
+    records: usize,
+}
+
+impl PartReview {
+    fn confirm(&self, stamp: FileStamp, records: u64) -> io::Result<()> {
+        if stamp != self.stamp || record_count(records)? != self.records {
+            return Err(changed());
+        }
+        Ok(())
+    }
 }
 
 impl CaptureReview {
@@ -127,18 +138,21 @@ pub(crate) fn preview(
             let parts = inventory(&directory, declared)?;
             let mut budget = MAX_CAPTURE_IO;
             let mut reviewed = Vec::with_capacity(parts.len());
+            let request = Request {
+                journal_id: source.id(),
+                rule: &rule,
+                cancelled: &cancelled,
+            };
             for (index, part) in parts.iter().enumerate() {
-                check_cancelled(&cancelled)?;
-                let (stamp, raw) = part.read(&directory, &mut budget)?;
-                let mode = Mode::Preview {
-                    allow_open: live && index + 1 == parts.len(),
-                };
-                let (records, _) =
-                    part.rewrite(&raw, source.id(), &rule, mode, &mut budget, &cancelled)?;
-                counts.records += record_count(records)?;
+                let allow_open = live && index + 1 == parts.len();
+                let (stamp, records) =
+                    part.preview(&directory, &mut budget, &request, allow_open)?;
+                let records = record_count(records)?;
+                counts.records += records;
                 reviewed.push(PartReview {
                     name: part.name().into(),
                     stamp,
+                    records,
                 });
             }
             let capture = CaptureReview {
@@ -234,7 +248,8 @@ fn stage_capture(
     source: &Source,
     rule: &Rule,
 ) -> io::Result<()> {
-    let parts = inventory(stage.journal, capture.declared)?;
+    let journal = stage.journal;
+    let parts = inventory(journal, capture.declared)?;
     if !parts
         .iter()
         .map(|part| part.name())
@@ -243,23 +258,27 @@ fn stage_capture(
         return Err(changed());
     }
     let mut budget = MAX_CAPTURE_IO;
+    let request = Request {
+        journal_id: source.id(),
+        rule,
+        cancelled: &|| false,
+    };
     for (part, reviewed) in parts.into_iter().zip(&capture.parts) {
-        let (stamp, raw) = part.read(stage.journal, &mut budget)?;
-        if stamp != reviewed.stamp {
-            return Err(changed());
-        }
-        let (records, rewritten) =
-            part.rewrite(&raw, source.id(), rule, Mode::Rewrite, &mut budget, &|| {
-                false
-            })?;
-        if let Some(rewritten) = rewritten {
-            stage.write(
+        if reviewed.records == 0 {
+            let (stamp, records) = part.preview(journal, &mut budget, &request, false)?;
+            reviewed.confirm(stamp, records)?;
+        } else {
+            stage.write_with(
                 part.name(),
-                &rewritten,
-                stamp,
+                reviewed.stamp.clone(),
                 Counts {
                     fields: 0,
-                    records: record_count(records)?,
+                    records: reviewed.records,
+                },
+                |output, limit| {
+                    let (stamp, records) =
+                        part.rewrite(journal, &mut budget, &request, output, limit)?;
+                    reviewed.confirm(stamp, records)
                 },
             )?;
         }
@@ -336,11 +355,30 @@ impl<'a> Stage<'a> {
         original: FileStamp,
         counts: Counts,
     ) -> io::Result<()> {
-        self.bytes_left = self
-            .bytes_left
-            .checked_sub(bytes.len() as u64)
-            .ok_or_else(|| invalid("Session journal replacement exceeds its staging size limit"))?;
-        self.directory.publish_copy(name, bytes)?;
+        self.write_with(name, original, counts, |file, limit| {
+            if bytes.len() as u64 > limit {
+                return Err(staging_limit());
+            }
+            file.write_all(bytes)
+        })
+    }
+
+    fn write_with(
+        &mut self,
+        name: &str,
+        original: FileStamp,
+        counts: Counts,
+        write: impl FnOnce(&mut File, u64) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let mut written = 0;
+        self.directory.publish_with(name, |file| {
+            write(file, self.bytes_left)?;
+            written = file.metadata()?.len();
+            if written > self.bytes_left {
+                return Err(staging_limit());
+            }
+            Ok(())
+        })?;
         let staged = self
             .directory
             .open_private_file(name)
@@ -358,6 +396,7 @@ impl<'a> Stage<'a> {
             staged,
             counts,
         });
+        self.bytes_left -= written;
         Ok(())
     }
 
@@ -438,6 +477,10 @@ impl<'a> Stage<'a> {
         }
         error.map_or(Ok(()), Err)
     }
+}
+
+fn staging_limit() -> io::Error {
+    invalid("Session journal replacement exceeds its staging size limit")
 }
 
 impl Drop for Stage<'_> {
