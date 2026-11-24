@@ -350,7 +350,15 @@ pub(crate) struct JournalAttachment {
 pub(crate) enum JournalAttachStart {
     Seeded,
     Live,
-    Reconnected,
+    Connected(JournalIsolation),
+    Reconnected(JournalIsolation),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum JournalIsolation {
+    None,
+    Process,
+    Sandboxed(&'static str),
 }
 
 impl JournalAttachment {
@@ -1222,6 +1230,24 @@ impl Session {
             .sandbox_backend
             .lock()
             .unwrap_or_else(|error| error.into_inner())
+    }
+
+    pub(crate) fn journal_isolation(&self, local_process: bool) -> JournalIsolation {
+        if let Some(backend) = self.sandbox_backend() {
+            JournalIsolation::Sandboxed(backend)
+        } else if local_process
+            || matches!(
+                &self.backend,
+                Backend::Stream {
+                    exec: Some(crate::ssh_connection::ExecOpener::Worker(_)),
+                    ..
+                }
+            )
+        {
+            JournalIsolation::Process
+        } else {
+            JournalIsolation::None
+        }
     }
 
     /// Reads the authoritative terminal without changing the displayed viewport.

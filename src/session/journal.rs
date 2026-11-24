@@ -19,7 +19,7 @@ use crate::session_journal::{
 };
 use crate::terminal_logging::{Policy, RedactionSecrets, Redactor};
 
-use super::JournalAttachStart;
+use super::{JournalAttachStart, JournalIsolation};
 
 const SEED_BUDGET: Duration = Duration::from_millis(32);
 const OUTPUT_BUDGET: Duration = Duration::from_millis(8);
@@ -176,15 +176,30 @@ impl Actor {
                     })?;
                 }
             }
-            JournalAttachStart::Reconnected => sink
-                .try_write(
-                    RecordKind::SystemNote,
-                    Zeroizing::new("session reconnected".into()),
-                    false,
-                )
-                .map_err(|_| {
-                    io::Error::other("Could not queue the session journal reconnect marker.")
-                })?,
+            JournalAttachStart::Connected(isolation)
+            | JournalAttachStart::Reconnected(isolation) => {
+                if matches!(start, JournalAttachStart::Reconnected(_)) {
+                    sink.try_write(
+                        RecordKind::SystemNote,
+                        Zeroizing::new("session reconnected".into()),
+                        false,
+                    )
+                    .map_err(|_| {
+                        io::Error::other("Could not queue the session journal reconnect marker.")
+                    })?;
+                }
+                let note = match isolation {
+                    JournalIsolation::None => "isolation: none".into(),
+                    JournalIsolation::Process => "isolation: process".into(),
+                    JournalIsolation::Sandboxed(backend) => {
+                        format!("isolation: sandboxed ({backend})")
+                    }
+                };
+                sink.try_write(RecordKind::SystemNote, Zeroizing::new(note), false)
+                    .map_err(|_| {
+                        io::Error::other("Could not queue the session journal isolation status.")
+                    })?;
+            }
             JournalAttachStart::Live => {}
         }
         terminal.set_journal_observer(Some(journal_output_observer(

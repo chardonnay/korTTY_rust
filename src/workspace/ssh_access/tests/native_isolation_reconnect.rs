@@ -185,7 +185,7 @@ fn openssh_reconnect_keeps_saved_and_teamwork_isolation() {
 }
 
 #[test]
-#[ignore = "requires a private OpenSSH fixture"]
+#[ignore = "requires OpenSSH and KORTTY_SSH_TEST_EXE pointing to the built app"]
 fn openssh_incognito_terminal_enforces_masked_journal() {
     use crate::session_journal::{CaptureKind, Status, viewer};
     use crate::workspace::journal_capture_access::Message as Journal;
@@ -234,7 +234,7 @@ fn openssh_incognito_terminal_enforces_masked_journal() {
             terminal: Default::default(),
         })
         .unwrap();
-    let saved = store.get(id).unwrap().clone();
+    let mut saved = store.get(id).unwrap().clone();
     assert!(!saved.terminal.journal.auto_start);
 
     let script = peer.directory().join("journal-fixture-shell");
@@ -257,7 +257,7 @@ fn openssh_incognito_terminal_enforces_masked_journal() {
     workspace.window_settings.session_journal.directory =
         root.join("journals").display().to_string();
     let (owner, _) = workspace.open_window(false);
-    let _ = workspace.show_saved_ssh(owner, saved, false);
+    let _ = workspace.show_saved_ssh(owner, saved.clone(), false);
     let dial = workspace.connect_ssh(owner);
     finish_wire_attempt(&mut workspace, owner, dial, IsolationLevel::None);
 
@@ -320,6 +320,9 @@ fn openssh_incognito_terminal_enforces_masked_journal() {
     assert_eq!(capture.status(), Status::Recording);
     assert!(!capture.done().is_closed());
 
+    saved.isolation = IsolationLevel::Process;
+    let mut store = Store::open(crate::profile::connections_path().unwrap()).unwrap();
+    assert_eq!(store.save(saved).unwrap(), id);
     let next = peer.serve_with_extra("host", &force_shell);
     let dial = workspace.start_ssh_reconnect(
         owner,
@@ -328,7 +331,7 @@ fn openssh_incognito_terminal_enforces_masked_journal() {
             source,
         },
     );
-    finish_wire_attempt(&mut workspace, owner, dial, IsolationLevel::None);
+    finish_wire_attempt(&mut workspace, owner, dial, IsolationLevel::Process);
     let attach = if let Some(candidate) = workspace.pending_reconnects.keys().next().copied() {
         workspace.complete_test_reconnect(candidate)
     } else {
@@ -374,11 +377,19 @@ fn openssh_incognito_terminal_enforces_masked_journal() {
         "MASKED_SSH_FIXTURE_OUTPUT before-reconnect",
     );
     let reconnected = find(CaptureKind::Note, "session reconnected");
+    let initial_isolation = find(CaptureKind::Note, "isolation: none");
+    let next_isolation = find(CaptureKind::Note, "isolation: process");
     let after = find(
         CaptureKind::Output,
         "MASKED_SSH_FIXTURE_OUTPUT after-reconnect",
     );
-    assert!(before < reconnected && reconnected < after, "{page:?}");
+    assert!(
+        initial_isolation < before
+            && before < reconnected
+            && reconnected < next_isolation
+            && next_isolation < after,
+        "{page:?}"
+    );
     assert!(
         page.records.iter().all(|record| matches!(
             record.kind,

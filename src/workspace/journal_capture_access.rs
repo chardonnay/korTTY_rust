@@ -857,9 +857,17 @@ impl Workspace {
         };
         let sink = capture.sink();
         let generation = pane.stream_generation;
+        let isolation = || {
+            let local_process = pane.local_security.as_ref().is_some_and(|settings| {
+                settings.isolation == crate::session_security::IsolationLevel::Process
+            });
+            pane.session.journal_isolation(local_process)
+        };
         let start = if entry.ssh.is_some_and(|ssh| ssh.reconnected) {
-            JournalAttachStart::Reconnected
-        } else if original.is_some() && entry.automatic.is_none() {
+            JournalAttachStart::Reconnected(isolation())
+        } else if entry.automatic.is_some() {
+            JournalAttachStart::Connected(isolation())
+        } else if original.is_some() {
             JournalAttachStart::Seeded
         } else {
             JournalAttachStart::Live
@@ -2109,10 +2117,16 @@ mod tests {
         let (owner, _) = workspace.open_window(false);
         workspace.window_settings.session_journal.directory =
             scratch.0.join("journals").to_str().unwrap().into();
-        let grid = crate::session::GridSize::default();
-        let shell =
-            crate::session::Session::start(grid, kortty_terminal::TerminalProfile::Xterm).unwrap();
-        let session = workspace.store_session(shell, grid, 14);
+        let session = workspace
+            .start_session_with_policy(
+                owner,
+                kortty_terminal::TerminalProfile::Xterm,
+                Some(crate::session_security::LocalSettings {
+                    isolation: crate::session_security::IsolationLevel::Process,
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
         workspace.add_tab(owner, session);
         let pane = workspace.sessions.get_mut(&session).unwrap();
         wait(|| {
@@ -2184,6 +2198,17 @@ mod tests {
         };
         wait(|| done.is_closed());
         let _ = workspace.update_journal_capture(Message::Finalized(tab, run));
+        let page = ViewerSource::capture(&capture)
+            .capture_page(None, None, None)
+            .unwrap();
+        assert_eq!(
+            page.records
+                .iter()
+                .filter(|record| record.kind == crate::session_journal::CaptureKind::Note)
+                .map(|record| record.text.as_str())
+                .collect::<Vec<_>>(),
+            ["isolation: process"]
+        );
         assert!(
             workspace
                 .journal_agent_capture(session, generation)
@@ -2278,7 +2303,9 @@ mod tests {
                 page.records.iter().all(|record| {
                     !record.text.contains("MANAGED_JOURNAL_PRIVATE_MARKER")
                         && (!incognito
-                            || record.kind == crate::session_journal::CaptureKind::Output)
+                            || record.kind == crate::session_journal::CaptureKind::Output
+                            || (record.kind == crate::session_journal::CaptureKind::Note
+                                && record.text == "isolation: none"))
                 }),
                 "{page:?}"
             );

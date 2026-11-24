@@ -30,7 +30,7 @@ fn reconnect_marker_precedes_live_output_without_seeding_history() {
             1,
             capture.sink(),
             Policy::default(),
-            JournalAttachStart::Reconnected,
+            JournalAttachStart::Reconnected(JournalIsolation::Sandboxed("test-sandbox")),
             false,
         )
         .unwrap();
@@ -48,6 +48,7 @@ fn reconnect_marker_precedes_live_output_without_seeding_history() {
         records,
         [
             (CaptureKind::Note, "session reconnected"),
+            (CaptureKind::Note, "isolation: sandboxed (test-sandbox)"),
             (CaptureKind::Output, "new live output"),
         ]
     );

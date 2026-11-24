@@ -1303,6 +1303,38 @@ routes are tracked in J1.
 · [Windows ARM64 verification](target/verification/20261124-journal-ssh-reconnect-windows-verified.log)
 · [Windows ARM64 journal actor checks](target/verification/20261124-journal-ssh-reconnect-windows-actor.log)
 
+## November 24 Journal isolation status
+
+The automatic capture writes the effective isolation when the terminal
+starts. On SSH reconnect, the journal writes `session reconnected` and
+then the replacement stream's isolation before receiving its live output.
+A seeded manual SSH recording receives the isolation entry on its next
+successful SSH reconnect, following Java v2.26.0.
+
+The status is `isolation: none`, `isolation: process`, or
+`isolation: sandboxed (<backend>)`. A verified sandbox supplies its own
+backend ID. An isolated SSH stream is identified by its active worker
+transport. A local shell uses its launched process mode and the backend
+reported by the PTY. The isolation entry contains only this status and
+the backend ID.
+[Tagged Java journal](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/core/SessionJournalSession.java)
+· [Rust terminal actor](src/session/journal.rs)
+· [Native OpenSSH reconnect test](src/workspace/ssh_access/tests/native_isolation_reconnect.rs)
+
+Apple Silicon passed strict application and test-target Clippy, the
+application build, 33 focused regressions, and two private OpenSSH tests.
+The incognito test upgrades the saved route from direct SSH to process
+isolation and verifies the order of both isolation records, the reconnect
+entry and the masked output. The other OpenSSH test checks the saved and
+Teamwork reconnect routes.
+[Apple Silicon verification](target/verification/20261124-journal-isolation-macos-native.log)
+
+Windows ARM64 passed 28 focused regressions, including a launched local
+shell with process isolation and a terminal actor test for the sandbox
+backend label. Verify the label in journals produced by native sandboxed
+sessions as part of desktop acceptance.
+[Windows ARM64 verification](target/verification/20261124-journal-isolation-windows.log)
+
 ## November 23 GGUF Configure sizing
 
 Java sizes the Configure grid to its path label. Rust now measures the
