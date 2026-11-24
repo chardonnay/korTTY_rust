@@ -24,15 +24,29 @@ impl ColorDraft {
         self.enabled = enabled;
     }
 
+    pub(super) fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub(super) fn picker_color(&self) -> crate::terminal_theme::Rgb {
+        TabColor::parse(&self.input)
+            .unwrap_or(TabColor::PRESETS[0].0)
+            .rgb()
+    }
+
     pub(super) fn set_input(&mut self, input: String) -> bool {
         if !self.enabled {
             return false;
         }
-        self.input = if input.len() <= 32 {
+        let input = if input.len() <= 32 {
             input
         } else {
             String::new()
         };
+        if self.input == input {
+            return false;
+        }
+        self.input = input;
         true
     }
 

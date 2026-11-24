@@ -17,6 +17,8 @@ use crate::session_security::{IsolationChoice, IsolationLevel};
 use crate::terminal_effects::Effect;
 
 mod color;
+mod color_picker;
+pub(crate) mod custom_color;
 mod folder_moves;
 mod form;
 mod journal_settings;
@@ -160,6 +162,13 @@ pub(crate) struct OpenCounts {
 }
 
 impl Message {
+    pub(crate) fn opens_custom_color(&self) -> bool {
+        matches!(
+            self,
+            Self::Edit(Edit::ColorPicker(color_picker::Edit::Custom))
+        )
+    }
+
     pub(crate) fn opens_connection_memory(&self) -> bool {
         matches!(
             self,
@@ -408,6 +417,27 @@ pub(crate) struct OverviewSources<'a> {
 }
 
 impl ConnectionWindow {
+    pub(crate) fn begin_custom_color(&mut self) -> Option<custom_color::Editor> {
+        if self.busy || self.confirming_close {
+            return None;
+        }
+        self.draft.as_mut()?.begin_custom_color()
+    }
+
+    pub(crate) fn finish_custom_color(
+        &mut self,
+        editor: &custom_color::Editor,
+        apply: bool,
+        remember: bool,
+    ) -> Task<Message> {
+        if self.busy || self.confirming_close {
+            return Task::none();
+        }
+        self.draft.as_mut().map_or_else(Task::none, |draft| {
+            draft.finish_custom_color(editor, apply, remember)
+        })
+    }
+
     pub(crate) fn begin_tunnel_editor(&self, request: tunnels::Request) -> Option<tunnels::Editor> {
         if self.busy || self.confirming_close {
             return None;
@@ -1424,9 +1454,7 @@ impl ConnectionWindow {
             Message::Edit(edit) => {
                 if let Some(draft) = &mut self.draft {
                     let focus = match &edit {
-                        Edit::Terminal(terminal_overrides::Edit::SshColor(edit)) => {
-                            draft.style_color_focus(edit)
-                        }
+                        Edit::ColorPicker(edit) => draft.style_color_focus(edit),
                         _ => Task::none(),
                     };
                     draft.update(edit);

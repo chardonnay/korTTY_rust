@@ -368,6 +368,7 @@ pub enum Message {
     Connections(window::Id, crate::connection_window::Message),
     ConnectionEditor(window::Id, crate::connection_window::Message),
     ConnectionTunnelEditor(window::Id, crate::connection_window::tunnels::Event),
+    ConnectionColorEditor(window::Id, crate::connection_window::custom_color::Event),
     FocusConnectionEditor(window::Id),
     ConnectionCatalogReloaded(u64, Option<crate::connection_store::Store>),
     ConnectionOverview(window::Id, profile_tools::connection_overview::Event),
@@ -1200,6 +1201,9 @@ impl Workspace {
         }
         if let Some(title) = self.tunnel_editor_title(id) {
             return title.into();
+        }
+        if self.color_editor_manager(id).is_some() {
+            return "Custom Colors".into();
         }
         if let Some(title) = self.connection_memory_title(id) {
             return title;
@@ -2671,9 +2675,15 @@ impl Workspace {
             Message::ConnectionTunnelEditor(id, event) => {
                 return self.update_tunnel_editor(id, event);
             }
+            Message::ConnectionColorEditor(id, event) => {
+                return self.update_color_editor(id, event);
+            }
             Message::FocusConnectionEditor(id) => {
                 if self.connection_editor_manager(id).is_some() {
-                    return window::gain_focus(self.tunnel_for_connection_editor(id).unwrap_or(id));
+                    return window::gain_focus(
+                        self.connection_editor_child(id)
+                            .map_or(id, |(child, _)| child),
+                    );
                 }
             }
             Message::ConnectionCatalogReloaded(revision, store) => {

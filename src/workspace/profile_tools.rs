@@ -22,6 +22,7 @@ use super::{
     window_lifecycle,
 };
 
+mod color_editor;
 #[cfg(test)]
 mod connection_manager_tests;
 pub(super) mod connection_overview;
@@ -47,6 +48,7 @@ pub(super) struct ConnectionManager {
     editor: Option<window::Id>,
     editor_closing: bool,
     tunnel: Option<tunnel_editor::Window>,
+    color_editor: Option<color_editor::Window>,
 }
 
 impl ConnectionManager {
@@ -60,6 +62,7 @@ impl ConnectionManager {
             editor: None,
             editor_closing: false,
             tunnel: None,
+            color_editor: None,
         }
     }
 }
@@ -165,6 +168,13 @@ impl Workspace {
                 .tunnel = None;
             return Some(Task::none());
         }
+        if let Some(manager) = self.color_editor_manager(id) {
+            self.connection_managers
+                .get_mut(&manager)
+                .expect("current manager")
+                .color_editor = None;
+            return Some(Task::none());
+        }
         if let Some(owner) = self.connection_editor_manager(id) {
             let manager = self
                 .connection_managers
@@ -173,6 +183,7 @@ impl Workspace {
             manager.editor = None;
             manager.editor_closing = false;
             let tunnel = manager.tunnel.take();
+            let colors = manager.color_editor.take();
             let focus = if manager.closing || self.exiting {
                 Task::none()
             } else {
@@ -180,7 +191,9 @@ impl Workspace {
             };
             let close =
                 tunnel.map_or_else(Task::none, |tunnel| self.close_placed_dialog(tunnel.id));
-            return Some(Task::batch([focus, close]));
+            let close_colors =
+                colors.map_or_else(Task::none, |colors| self.close_placed_dialog(colors.id));
+            return Some(Task::batch([focus, close, close_colors]));
         }
         let manager = self.connection_managers.remove(&id)?;
         if self.quit_waiting_profile == Some(id) || self.should_exit_after_window_close() {
@@ -262,8 +275,8 @@ impl Workspace {
 
     pub(super) fn close_connection_editor(&mut self, editor: window::Id) -> Option<Task<Message>> {
         let id = self.connection_editor_manager(editor)?;
-        if let Some(tunnel) = self.tunnel_for_connection_editor(editor) {
-            return Some(window::gain_focus(tunnel));
+        if let Some((child, _)) = self.connection_editor_child(editor) {
+            return Some(window::gain_focus(child));
         }
         if let Some(memory) = self.connection_memory_for_editor(editor) {
             return Some(window::gain_focus(memory));
@@ -435,6 +448,7 @@ impl Workspace {
         self.connection_managers.contains_key(&id)
             || self.connection_editor_manager(id).is_some()
             || self.tunnel_editor_manager(id).is_some()
+            || self.color_editor_manager(id).is_some()
             || self.connection_memory.contains_key(&id)
             || self.teamwork_restore.contains_key(&id)
             || self.vault_id == Some(id)
@@ -449,7 +463,10 @@ impl Workspace {
         }
         self.connection_managers[&owner]
             .editor
-            .map(|id| (id, Message::FocusConnectionEditor(id)))
+            .map(|id| {
+                self.connection_editor_child(id)
+                    .unwrap_or((id, Message::FocusConnectionEditor(id)))
+            })
             .or_else(|| {
                 self.connection_overview_for_owner(owner)
                     .map(|id| (id, connection_overview::focus(id)))
@@ -487,6 +504,9 @@ impl Workspace {
     pub(super) fn profile_tool_view(&self, id: window::Id) -> Option<Element<'_, Message>> {
         if let Some(tunnel) = self.tunnel_editor_view(id) {
             return Some(tunnel);
+        }
+        if let Some(colors) = self.color_editor_view(id) {
+            return Some(colors);
         }
         if self.connection_memory.contains_key(&id) {
             return self.connection_memory_view(id);
@@ -581,9 +601,7 @@ impl Workspace {
                     || iced::widget::text("Closing…").into(),
                     |content| content.map(move |message| Message::ConnectionEditor(id, message)),
                 );
-                let modal = self.tunnel_for_connection_editor(id).map(|child| {
-                    Message::ConnectionTunnelEditor(child, connection_window::tunnels::Event::Focus)
-                });
+                let modal = self.connection_editor_child(id).map(|(_, focus)| focus);
                 return Some(vault_modal::gate(content, modal));
             }
             let content = manager
@@ -902,10 +920,13 @@ impl Workspace {
             return Task::none();
         };
         use connection_window::{Edit, Message as Profile};
-        if let Some(tunnel) = self.tunnel_for_connection_editor(editor)
+        if let Some((child, _)) = self.connection_editor_child(editor)
             && !matches!(message, Profile::TerminalLogFolderPicked(..))
         {
-            return window::gain_focus(tunnel);
+            return window::gain_focus(child);
+        }
+        if message.opens_custom_color() {
+            return self.open_color_editor(id, editor);
         }
         if message.opens_connection_memory() {
             return self.open_connection_memory(id, editor);
@@ -1345,12 +1366,14 @@ impl Workspace {
 
     pub(super) fn request_profile_quit(&mut self) -> Option<Task<Message>> {
         self.quit_waiting_profile = None;
-        if let Some(tunnel) = self
-            .connection_managers
-            .values()
-            .find_map(|manager| manager.tunnel.as_ref().map(|tunnel| tunnel.id))
-        {
-            return Some(self.defer_profile_quit(tunnel, true));
+        if let Some(child) = self.connection_managers.values().find_map(|manager| {
+            manager
+                .tunnel
+                .as_ref()
+                .map(|tunnel| tunnel.id)
+                .or_else(|| manager.color_editor.as_ref().map(|colors| colors.id))
+        }) {
+            return Some(self.defer_profile_quit(child, true));
         }
         if let Some((id, busy)) = self.connection_memory_needing_attention() {
             if busy {
@@ -1439,6 +1462,9 @@ impl Workspace {
     pub(super) fn close_profile_tool(&mut self, id: window::Id, discard: bool) -> Task<Message> {
         if self.tunnel_editor_manager(id).is_some() {
             return self.update_tunnel_editor(id, connection_window::tunnels::Event::Cancel);
+        }
+        if self.color_editor_manager(id).is_some() {
+            return self.update_color_editor(id, connection_window::custom_color::Event::Cancel);
         }
         if self.connection_memory.contains_key(&id) {
             return self

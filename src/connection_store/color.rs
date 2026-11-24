@@ -42,6 +42,10 @@ impl TabColor {
     pub(crate) fn color(self) -> Color {
         Color::from_rgb8(self.0, self.1, self.2)
     }
+
+    pub(crate) const fn rgb(self) -> crate::terminal_theme::Rgb {
+        crate::terminal_theme::Rgb::from_bytes([self.0, self.1, self.2])
+    }
 }
 
 impl TryFrom<String> for TabColor {

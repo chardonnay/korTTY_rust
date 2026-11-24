@@ -1154,6 +1154,9 @@ fn custom_symbol_resolves_in_manager_and_overview_and_keeps_dormant_reference() 
 
 #[test]
 fn connection_tab_color_draft_validates_saves_and_can_be_removed() {
+    use super::color_picker::{Edit as Picker, Target};
+    use crate::terminal_theme::Rgb;
+
     let profile = Profile::new();
     let mut store = Store::open(profile.path()).unwrap();
     let id = store.save(connection("Operations", "")).unwrap();
@@ -1164,10 +1167,23 @@ fn connection_tab_color_draft_validates_saves_and_can_be_removed() {
     );
     let mut window = ConnectionWindow::open(profile.path()).unwrap();
     let _ = window.update(Message::EditSelected);
+    let _ = window.update(Message::Edit(Edit::Page(form::Page::Settings)));
+    let picker = |action| Message::Edit(Edit::ColorPicker(action));
+    let _ = window.update(picker(Picker::Open(Target::Tab, None)));
+    let _ = window.update(picker(Picker::Select(Some(Rgb::from_hex(0x112233)))));
+    assert!(
+        window
+            .draft
+            .as_ref()
+            .unwrap()
+            .connection()
+            .unwrap()
+            .tab_color
+            .is_none()
+    );
     let _ = window.update(Message::Edit(Edit::UseTabColor(true)));
-    let _ = window.update(Message::Edit(Edit::TabColor("#abcd".into())));
-    assert!(window.draft.as_ref().unwrap().connection().is_err());
-    let _ = window.update(Message::Edit(Edit::TabColor(" #Abc ".into())));
+    let _ = window.update(picker(Picker::Open(Target::Tab, None)));
+    let _ = window.update(picker(Picker::Select(Some(Rgb::from_hex(0xAABBCC)))));
     let draft = window.draft.as_ref().unwrap().connection().unwrap();
     assert_eq!(draft.tab_color.unwrap().to_string(), "#AABBCC");
     let _ = window.update(Message::CancelEdit);
@@ -2157,8 +2173,9 @@ fn saved_ssh_terminal_settings_switches_sources_without_losing_the_editor_draft(
 
 #[test]
 fn saved_ssh_color_picker_keeps_unapplied_values_out_of_the_connection() {
+    use super::color_picker::{Edit as Picker, Target};
+    use super::custom_color::{Change, Mode};
     use crate::terminal_theme::Rgb;
-    use terminal_overrides::color_picker::{Edit as Picker, Target};
 
     let mut saved = connection("SSH colors", "");
     let original = Rgb::from_hex(0xC0FFEE);
@@ -2166,24 +2183,24 @@ fn saved_ssh_color_picker_keeps_unapplied_values_out_of_the_connection() {
     saved.terminal.foreground = Some(original);
     saved.terminal.background = Some(Rgb::from_hex(0x010203));
     let mut draft = form::Draft::from_profile(&saved, None, false);
-    let edit = |picker| Edit::Terminal(terminal_overrides::Edit::SshColor(picker));
+    draft.update(Edit::Page(form::Page::Settings));
+    let edit = Edit::ColorPicker;
 
-    draft.update(edit(Picker::Open(Target::Foreground, None)));
-    draft.update(edit(Picker::Input("#12".into())));
-    draft.update(edit(Picker::Apply));
+    draft.update(edit(Picker::Open(Target::Foreground, Some(original))));
+    let mut editor = draft.begin_custom_color().unwrap();
+    editor.update(Change::Mode(Mode::Web));
+    editor.update(Change::Hex("#12".into()));
+    drop(draft.finish_custom_color(&editor, true, false));
     assert_eq!(
         draft.connection().unwrap().terminal.foreground,
         Some(original)
     );
     assert!(!draft.changed);
-    draft.update(edit(Picker::Input(custom.to_string())));
-    draft.update(edit(Picker::Close));
-    draft.update(edit(Picker::Apply));
+    editor.update(Change::Hex(custom.to_string()));
+    drop(draft.finish_custom_color(&editor, false, false));
     assert!(!draft.changed);
 
-    draft.update(edit(Picker::Open(Target::Foreground, None)));
-    draft.update(edit(Picker::Input(custom.to_string())));
-    draft.update(edit(Picker::Apply));
+    drop(draft.finish_custom_color(&editor, true, true));
     assert!(draft.changed);
     assert_eq!(
         draft.connection().unwrap().terminal.foreground,

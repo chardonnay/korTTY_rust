@@ -9,8 +9,11 @@ use crate::profile::{MAX_TERMINAL_FONT, MIN_TERMINAL_FONT};
 use crate::terminal_theme::{BoldTextMode, CursorStyle, Rgb, Scheme, Themes, installed_families};
 use crate::workspace::dialog_design::{self, keyboard_table, number_input};
 
-use super::color_picker::Target;
 use super::{Choice, Draft, Edit, ThemeChoice, theme_choices};
+use crate::connection_window::{
+    color_picker::{Picker, Target},
+    form,
+};
 
 const LABEL_WIDTH: f32 = 116.0;
 const FIELD_WIDTH: f32 = 200.0;
@@ -38,12 +41,13 @@ impl fmt::Display for StyleTheme {
 }
 
 impl Draft {
-    pub(in crate::connection_window) fn ssh_style_view(
-        &self,
+    pub(in crate::connection_window) fn ssh_style_view<'a>(
+        &'a self,
+        picker: &'a Picker,
         themes: &Themes,
         defaults: &TerminalStyle,
         own: bool,
-    ) -> Element<'_, Edit> {
+    ) -> Element<'a, form::Edit> {
         let defaults = &defaults.appearance;
         let current = if own {
             self.options.theme.as_ref()
@@ -73,9 +77,14 @@ impl Draft {
             .font_size
             .map_or_else(String::new, |value| value.to_string());
         let size_input = if own { self.size.as_str() } else { &size };
+        let appearance_color = |index: usize, inherited| {
+            own.then(|| Rgb::parse(&self.colors[index]))
+                .flatten()
+                .or(inherited)
+        };
         column![
-            field("Theme", theme),
-            field("Font family", self.ssh_font_family(font, own)),
+            field("Theme", theme).map(form::Edit::Terminal),
+            field("Font family", self.ssh_font_family(font, own)).map(form::Edit::Terminal),
             field(
                 "Font size",
                 quantity(
@@ -84,25 +93,28 @@ impl Draft {
                     i64::from(MIN_TERMINAL_FONT)..=i64::from(MAX_TERMINAL_FONT),
                     own.then_some(Edit::FontSize),
                 )
-            ),
+            )
+            .map(form::Edit::Terminal),
             rule::horizontal(1),
-            field(
+            labeled(
                 "Text color",
-                self.style_color_picker.view(
-                    Target::Foreground,
-                    &self.colors[0],
-                    defaults.foreground,
-                    own
-                )
+                picker
+                    .view(
+                        Target::Foreground,
+                        appearance_color(0, defaults.foreground),
+                        own
+                    )
+                    .map(form::Edit::ColorPicker)
             ),
-            field(
+            labeled(
                 "Background color",
-                self.style_color_picker.view(
-                    Target::Background,
-                    &self.colors[1],
-                    defaults.background,
-                    own
-                )
+                picker
+                    .view(
+                        Target::Background,
+                        appearance_color(1, defaults.background),
+                        own
+                    )
+                    .map(form::Edit::ColorPicker)
             ),
             ssh_checkbox(
                 "Enable terminal colors",
@@ -110,7 +122,8 @@ impl Draft {
                 defaults.sgr_enabled.unwrap_or(true),
                 own,
                 Edit::Colors,
-            ),
+            )
+            .map(form::Edit::Terminal),
         ]
         .spacing(10)
         .into()
@@ -282,7 +295,11 @@ pub(in crate::connection_window) fn ssh_checkbox<'a, Message: Clone + 'a>(
 }
 
 fn field<'a>(label: &'static str, control: impl Into<Element<'a, Edit>>) -> Element<'a, Edit> {
-    row![text(label).size(14).width(LABEL_WIDTH), control.into()]
+    labeled(label, control.into())
+}
+
+fn labeled<'a, M: 'a>(label: &'static str, control: Element<'a, M>) -> Element<'a, M> {
+    row![text(label).size(14).width(LABEL_WIDTH), control]
         .spacing(8)
         .align_y(Alignment::Center)
         .into()

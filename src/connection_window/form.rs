@@ -21,6 +21,8 @@ use crate::terminal_effects::{Effect, editor::EffectDraft};
 use crate::workspace::dialog_design::{self, keyboard_table};
 
 use super::color::ColorDraft;
+use super::color_picker::{self, Target as ColorTarget};
+use super::custom_color;
 use super::view::ViewChoices;
 use super::{CredentialChoice, Message, os_badge, terminal_overrides, tunnels};
 
@@ -46,7 +48,7 @@ pub enum Edit {
     UseOwnTerminalSettings(Option<Box<TerminalStyle>>),
     ShowAdditionalTerminalSettings(bool),
     UseTabColor(bool),
-    TabColor(String),
+    ColorPicker(color_picker::Edit),
     ToggleOsBadgePicker,
     OsBadge(Option<String>),
     PasteWarning(Option<PasteWarningMode>),
@@ -183,6 +185,7 @@ pub(super) struct Draft {
     retained_terminal_style: Option<Box<TerminalStyle>>,
     show_additional_terminal_settings: bool,
     tab_color: ColorDraft,
+    color_picker: color_picker::Picker,
     os_badge: Option<String>,
     badge_picker_open: bool,
     badge_cursor: Option<String>,
@@ -293,6 +296,7 @@ impl Draft {
             retained_terminal_style: None,
             show_additional_terminal_settings: false,
             tab_color: ColorDraft::new(None, None),
+            color_picker: color_picker::Picker::default(),
             os_badge: None,
             badge_picker_open: false,
             badge_cursor: None,
@@ -346,6 +350,7 @@ impl Draft {
             retained_terminal_style,
             show_additional_terminal_settings: false,
             tab_color: ColorDraft::new(connection.tab_color, None),
+            color_picker: color_picker::Picker::default(),
             os_badge: os_badge.map(str::to_owned),
             badge_picker_open: false,
             badge_cursor: None,
@@ -406,7 +411,7 @@ impl Draft {
         match edit {
             Edit::Page(page) => {
                 if self.page != page {
-                    self.terminal.close_style_color_picker();
+                    self.color_picker.close();
                 }
                 self.page = page;
                 return;
@@ -434,7 +439,7 @@ impl Draft {
                 if self.own_terminal_settings == own {
                     return;
                 }
-                self.terminal.close_style_color_picker();
+                self.color_picker.close();
                 self.own_terminal_settings = own;
                 if !self.has_own_terminal_draft
                     && let Some(mut defaults) = defaults
@@ -450,11 +455,19 @@ impl Draft {
                 self.show_additional_terminal_settings = show;
                 return;
             }
-            Edit::UseTabColor(enabled) => self.tab_color.set_enabled(enabled),
-            Edit::TabColor(value) => {
-                if !self.tab_color.set_input(value) {
+            Edit::UseTabColor(enabled) => {
+                self.color_picker.close();
+                self.tab_color.set_enabled(enabled);
+            }
+            Edit::ColorPicker(edit) => {
+                if matches!(edit, color_picker::Edit::Open(target, _) if !self.allows_color(target))
+                {
                     return;
                 }
+                if let Some((target, color)) = self.color_picker.update(edit) {
+                    self.apply_color(target, color);
+                }
+                return;
             }
             Edit::ToggleOsBadgePicker => {
                 self.badge_picker_open = !self.badge_picker_open;
@@ -724,15 +737,60 @@ impl Draft {
         }
     }
 
-    pub(super) fn style_color_focus(
-        &self,
-        edit: &terminal_overrides::color_picker::Edit,
-    ) -> iced::Task<Message> {
-        if self.page == Page::Settings && self.own_terminal_settings {
-            self.terminal.style_color_focus(edit)
+    pub(super) fn style_color_focus(&self, edit: &color_picker::Edit) -> iced::Task<Message> {
+        if self.page == Page::Settings
+            && !matches!(edit, color_picker::Edit::Open(target, _) if !self.allows_color(*target))
+        {
+            self.color_picker.focus(edit)
         } else {
             iced::Task::none()
         }
+    }
+
+    fn allows_color(&self, target: ColorTarget) -> bool {
+        self.page == Page::Settings
+            && match target {
+                ColorTarget::Foreground | ColorTarget::Background => self.own_terminal_settings,
+                ColorTarget::Tab => self.tab_color.enabled(),
+            }
+    }
+
+    fn apply_color(&mut self, target: ColorTarget, color: Option<crate::terminal_theme::Rgb>) {
+        if !self.allows_color(target) {
+            return;
+        }
+        let value = color.map_or_else(String::new, |color| color.to_string());
+        self.changed |= match target {
+            ColorTarget::Foreground | ColorTarget::Background => self
+                .terminal
+                .update(terminal_overrides::Edit::Color(target as usize, value)),
+            ColorTarget::Tab => color.is_some() && self.tab_color.set_input(value),
+        };
+    }
+
+    pub(super) fn begin_custom_color(&mut self) -> Option<custom_color::Editor> {
+        let (target, current) = self.color_picker.begin_custom()?;
+        self.allows_color(target)
+            .then(|| custom_color::Editor::new(target, current))
+    }
+
+    pub(super) fn finish_custom_color(
+        &mut self,
+        editor: &custom_color::Editor,
+        apply: bool,
+        remember: bool,
+    ) -> iced::Task<Message> {
+        let target = editor.target();
+        if !self.allows_color(target) {
+            return iced::Task::none();
+        }
+        if apply && let Some(color) = editor.color() {
+            if remember {
+                self.color_picker.save_custom(target, color);
+            }
+            self.apply_color(target, Some(color));
+        }
+        self.color_picker.focus_trigger(target)
     }
 
     fn connection_page<'a>(
@@ -858,7 +916,7 @@ impl Draft {
             .then(|| Message::Edit(Edit::Incognito(!self.incognito)));
         let mut editor = column![
             self.terminal_settings_source(defaults),
-            self.terminal.ssh_style_view(choices.themes, defaults, own).map(terminal_edit),
+            self.terminal.ssh_style_view(&self.color_picker, choices.themes, defaults, own).map(Message::Edit),
             rule::horizontal(1),
             self.terminal.ssh_close_confirmation_view(defaults, own).map(terminal_edit),
             terminal_overrides::ssh_style::ssh_checkbox(
@@ -870,15 +928,23 @@ impl Draft {
             ),
             rule::horizontal(1),
             text("Terminal behavior").size(16),
-            tooltip(
-                self.tab_color.view(
-                    "Mark this connection's tabs with a color",
-                    |enabled| Message::Edit(Edit::UseTabColor(enabled)),
-                    |input| Message::Edit(Edit::TabColor(input)),
+            row![
+                tooltip(
+                    keyboard_table::action(
+                        checkbox(self.tab_color.enabled())
+                            .label("Mark this connection's tabs with a color")
+                            .text_size(13)
+                            .on_toggle(|enabled| Message::Edit(Edit::UseTabColor(enabled)))
+                            .into(),
+                        Some(Message::Edit(Edit::UseTabColor(!self.tab_color.enabled()))),
+                        false,
+                    ),
+                    text("Hover over the tab to see its color."),
+                    tooltip::Position::Bottom,
                 ),
-                text("Hover over the tab to see its color."),
-                tooltip::Position::Bottom,
-            ),
+                self.color_picker.view(ColorTarget::Tab, Some(self.tab_color.picker_color()), self.tab_color.enabled())
+                    .map(|edit| Message::Edit(Edit::ColorPicker(edit))),
+            ].spacing(10).align_y(Alignment::Center),
             terminal_overrides::isolation_row(
                 "Keyword highlighting",
                 self.terminal.ssh_highlight_picker(&choices.highlighting, self.ids.behavior_highlight.clone()).map(terminal_edit),

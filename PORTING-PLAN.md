@@ -198,9 +198,13 @@ remain editable. The appearance controls precede the independent behavior
 and launch settings. Windows ARM64 verified source switching, draft recovery
 and persistence against the Java dialog. Apple Silicon passed 104 focused
 tests and strict Clippy. The [font and color controls](PORTING-PARITY.md#november-24-ssh-font-and-color-selectors)
-now use a font selector and foreground and background color popovers. Match
-the tab color picker, the Java custom color dialog and typography, and verify
-the desktop flow on macOS and Linux. The
+now use a font selector and foreground and background color popovers. The
+[tab color and custom color editor](PORTING-PARITY.md#november-24-ssh-tab-color-and-custom-color-editor)
+share the palettes. Windows ARM64 verified the owned editor, its application
+and cancellation actions, and independent profile persistence. Apple
+Silicon passed 78 focused tests and strict Clippy. Compare the remaining
+typography, palette shades and color-dialog placement and repeat the
+desktop flow on macOS and Linux. The
 [SSH Tunnels page](PORTING-PARITY.md#november-24-ssh-tunnel-list-and-editor)
 shows configured tunnels, an aggregate enable switch and owned Add and
 Edit dialogs. Apple Silicon verified the saved route's approval boundary

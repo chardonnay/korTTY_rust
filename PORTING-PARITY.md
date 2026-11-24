@@ -1317,10 +1317,37 @@ dismissal, a foreground preset, and removal of a background override.
 After restart, the compact popover accepted and persisted `#FF8001` with
 DejaVu Sans Mono and an inherited background. The global profile showed
 disabled font and color controls. Apple Silicon passed 68 focused tests,
-with one ignored, and strict Clippy. The Java custom color dialog, tab-color
-picker and visual checks on macOS and Linux remain open.
+with one ignored, and strict Clippy. The follow-up below moves custom hex
+entry into the owned editor and adds the tab color selector.
 [Font and presentation controls](src/connection_window/terminal_overrides/ssh_style.rs)
-· [Color picker](src/connection_window/terminal_overrides/color_picker.rs)
+· [Color picker](src/connection_window/color_picker.rs)
+
+## November 24 SSH tab color and custom color editor
+
+The SSH Terminal Settings page places the tab-color checkbox beside its
+picker. The popup keeps the installed tab color presets and remains
+available for a connection that inherits the global terminal appearance.
+Text and background popups continue to offer individual inheritance.
+
+All three pickers open an owned Custom Colors window with a hue strip,
+saturation and brightness plane, current and new swatches, HSB, RGB and
+web fields, and an opacity preview. Use applies only to the connection
+draft. Save also remembers the swatch in the originating picker's palette
+while the connection editor remains open. Cancel and Escape discard the
+custom color draft. The normal connection Save writes the opaque RGB value
+to the profile, as in Java connection persistence.
+
+Windows ARM64 verified the separate child window, synchronized HSB, RGB and
+web controls, transparency preview, Escape and Cancel, and the distinct
+Use and Save behavior. The stored tab color survived restart without a
+terminal presentation override. A separate profile saved a new background
+hex color without changing the foreground or setting a tab color. Apple
+Silicon passed 78 focused tests, with one ignored, and strict Clippy.
+Exact palette shades, typography, window placement and the macOS and Linux
+desktop walkthroughs remain open.
+[Palette](src/connection_window/color_picker.rs)
+· [Custom color controls](src/connection_window/custom_color.rs)
+· [Owned window](src/workspace/profile_tools/color_editor.rs)
 
 ## November 24 SSH tunnel list and editor
 
