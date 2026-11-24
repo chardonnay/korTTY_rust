@@ -2409,6 +2409,7 @@ name = "iced_widget"
 version = "0.14.2"
 dependencies = [
  "iced_renderer",
+ "iced_tiny_skia",
  "log",
  "num-traits",
  "rustc-hash 2.1.3",
@@ -2892,6 +2893,7 @@ dependencies = [
  "kortty-windowing",
  "latex-rust",
  "lopdf",
+ "memchr",
  "num-bigint",
  "pbkdf2 0.12.2",
  "pdf-writer",

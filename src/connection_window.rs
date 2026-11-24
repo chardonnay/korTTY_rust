@@ -17,6 +17,8 @@ use crate::session_security::{IsolationChoice, IsolationLevel};
 use crate::terminal_effects::Effect;
 
 mod color;
+mod color_picker;
+pub(crate) mod custom_color;
 mod folder_moves;
 mod form;
 mod journal_settings;
@@ -27,6 +29,7 @@ pub(crate) mod overview;
 mod selection;
 mod temporary_ssh_key;
 mod terminal_overrides;
+pub(crate) mod tunnels;
 pub(crate) use terminal_overrides::{ai_profile_choices, theme_choices};
 #[cfg(test)]
 mod tests;
@@ -35,6 +38,9 @@ mod view;
 use color::ColorDraft;
 use form::Draft;
 pub use form::Edit;
+#[cfg(test)]
+pub(crate) use form::Page;
+pub(crate) use journal_settings::Policy as JournalEditorPolicy;
 use selection::{RowKey, Selection};
 pub use temporary_ssh_key::TemporarySaveReply;
 pub(crate) use view::{HighlightChoices, ViewChoices};
@@ -61,9 +67,11 @@ pub enum Message {
     SaveTeamworkAuth,
     ResetTeamworkAuth,
     SelectGroup(String),
+    SelectSharedGroup(String),
     OpenTreeContext(RowKey, Point),
     TreeContext(tree_context::Message),
     ToggleGroup(String),
+    ToggleSharedGroup(String),
     NewGroup,
     RenameGroup,
     DeleteGroup,
@@ -106,6 +114,12 @@ pub enum Message {
     EditSelected,
     Duplicate,
     Edit(Edit),
+    FocusEditor(bool),
+    NavigateOsBadge(String),
+    SelectTunnel(usize),
+    OpenTunnelEditor(tunnels::Request),
+    BrowseTerminalLogFolder,
+    TerminalLogFolderPicked(Arc<()>, Option<PathBuf>),
     PasteTemporaryKey,
     TemporaryKeyPasted(u64, bool, crate::ssh_dialog::Password),
     Save,
@@ -141,7 +155,27 @@ pub enum Scope {
     Tag(String),
 }
 
+#[derive(Clone, Default, PartialEq, Eq)]
+pub(crate) struct OpenCounts {
+    pub(crate) saved: BTreeMap<u64, usize>,
+    pub(crate) teamwork: BTreeMap<teamwork::Identity, usize>,
+}
+
 impl Message {
+    pub(crate) fn opens_custom_color(&self) -> bool {
+        matches!(
+            self,
+            Self::Edit(Edit::ColorPicker(color_picker::Edit::Custom))
+        )
+    }
+
+    pub(crate) fn opens_connection_memory(&self) -> bool {
+        matches!(
+            self,
+            Self::Edit(Edit::Terminal(terminal_overrides::Edit::OpenMemory))
+        )
+    }
+
     pub(crate) fn java_ai_adoption(
         &self,
     ) -> Option<(
@@ -353,7 +387,8 @@ pub struct ConnectionWindow {
     network_map: network_map::State,
     folder_moves: folder_moves::History,
     collapsed: BTreeSet<String>,
-    open_counts: Option<BTreeMap<u64, usize>>,
+    shared_collapsed: BTreeSet<String>,
+    open_counts: Option<OpenCounts>,
     draft: Option<Draft>,
     serial_draft: Option<serial::Draft>,
     local_draft: Option<local::Draft>,
@@ -382,6 +417,58 @@ pub(crate) struct OverviewSources<'a> {
 }
 
 impl ConnectionWindow {
+    pub(crate) fn begin_custom_color(&mut self) -> Option<custom_color::Editor> {
+        if self.busy || self.confirming_close {
+            return None;
+        }
+        self.draft.as_mut()?.begin_custom_color()
+    }
+
+    pub(crate) fn finish_custom_color(
+        &mut self,
+        editor: &custom_color::Editor,
+        apply: bool,
+        remember: bool,
+    ) -> Task<Message> {
+        if self.busy || self.confirming_close {
+            return Task::none();
+        }
+        self.draft.as_mut().map_or_else(Task::none, |draft| {
+            draft.finish_custom_color(editor, apply, remember)
+        })
+    }
+
+    pub(crate) fn begin_tunnel_editor(&self, request: tunnels::Request) -> Option<tunnels::Editor> {
+        if self.busy || self.confirming_close {
+            return None;
+        }
+        self.draft.as_ref()?.begin_tunnel_editor(request)
+    }
+
+    pub(crate) fn commit_tunnel_editor(&mut self, editor: &tunnels::Editor) {
+        if !self.busy
+            && !self.confirming_close
+            && let Some(draft) = &mut self.draft
+        {
+            draft.commit_tunnel_editor(editor);
+        }
+    }
+
+    pub(crate) fn start_terminal_log_folder_picker(&mut self) -> Option<(Arc<()>, PathBuf)> {
+        if self.busy || self.confirming_close {
+            return None;
+        }
+        self.draft
+            .as_mut()?
+            .start_terminal_log_folder_picker(self.path.parent()?)
+    }
+
+    pub(crate) fn saved_ssh_editor_profile(&self) -> Option<&Connection> {
+        let id = self.draft.as_ref()?.id();
+        (id != 0).then_some(())?;
+        self.store.get(id)
+    }
+
     pub fn open(path: PathBuf) -> Result<Self, String> {
         let store = Store::open(path.clone()).map_err(|error| error.to_string())?;
         let profile_root = path
@@ -422,6 +509,7 @@ impl ConnectionWindow {
             network_map: network_map::State::default(),
             folder_moves: folder_moves::History::default(),
             collapsed: BTreeSet::new(),
+            shared_collapsed: BTreeSet::new(),
             open_counts: None,
             store,
             server_access: Default::default(),
@@ -589,6 +677,7 @@ impl ConnectionWindow {
                 let in_scope = match &self.scope {
                     Scope::All | Scope::Teamwork => true,
                     Scope::Favorites => self.store.is_teamwork_favorite(entry.identity()),
+                    Scope::Open => self.shared_open_count(entry.identity()) > 0,
                     Scope::Tag(tag) => entry.connection.tag.to_lowercase() == *tag,
                     _ => false,
                 };
@@ -977,7 +1066,7 @@ impl ConnectionWindow {
         self.reconcile_selection();
     }
 
-    pub fn set_open_counts(&mut self, counts: BTreeMap<u64, usize>) {
+    pub(crate) fn set_open_counts(&mut self, counts: OpenCounts) {
         if self.open_counts.as_ref() != Some(&counts) {
             self.open_counts = Some(counts);
             self.reconcile_selection();
@@ -1018,7 +1107,15 @@ impl ConnectionWindow {
     fn open_count(&self, id: u64) -> usize {
         self.open_counts
             .as_ref()
-            .and_then(|counts| counts.get(&id))
+            .and_then(|counts| counts.saved.get(&id))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn shared_open_count(&self, id: &teamwork::Identity) -> usize {
+        self.open_counts
+            .as_ref()
+            .and_then(|counts| counts.teamwork.get(id))
             .copied()
             .unwrap_or(0)
     }
@@ -1046,6 +1143,9 @@ impl ConnectionWindow {
 
     fn set_scope(&mut self, scope: Scope) {
         self.badge_picker = None;
+        if self.scope != scope {
+            self.shared_collapsed.clear();
+        }
         if let Scope::Group(path) = &scope {
             self.selection.replace(Some(RowKey::Group(path.clone())));
         } else {
@@ -1086,6 +1186,15 @@ impl ConnectionWindow {
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        if let Message::TerminalLogFolderPicked(ticket, path) = &message {
+            if let Some(draft) = &mut self.draft {
+                let path = path
+                    .as_deref()
+                    .filter(|_| !self.busy && !self.confirming_close);
+                draft.finish_terminal_log_folder_picker(ticket, path);
+            }
+            return Task::none();
+        }
         if (self.busy && !matches!(message, Message::Completed(_)))
             || (self.confirming_close && !matches!(message, Message::KeepEditing))
             || (!self.confirming_teamwork_hide.is_empty()
@@ -1128,6 +1237,9 @@ impl ConnectionWindow {
         match message {
             Message::Search(query) if self.can_browse() && query.len() <= 240 => {
                 self.badge_picker = None;
+                if self.query != query {
+                    self.shared_collapsed.clear();
+                }
                 self.query = query;
                 self.reconcile_selection();
             }
@@ -1158,9 +1270,11 @@ impl ConnectionWindow {
                     auth.conflict = false;
                 }
             }
-            Message::MapView(enabled) if self.can_browse() => {
-                self.dismiss_tree_context();
+            Message::MapView(enabled)
+                if self.can_browse() && self.network_map.visible != enabled =>
+            {
                 self.network_map.visible = enabled;
+                self.reconcile_selection();
             }
             Message::MapJumpRoutes(enabled) if self.network_map.visible => {
                 self.network_map.jumps = enabled;
@@ -1194,7 +1308,14 @@ impl ConnectionWindow {
             Message::SelectGroup(path) if self.can_browse() => {
                 self.select_row(RowKey::Group(path));
             }
+            Message::SelectSharedGroup(path) if self.can_browse() => {
+                self.select_row(RowKey::SharedGroup(path));
+            }
             Message::OpenTreeContext(row, point) if self.can_browse() => {
+                if matches!(row, RowKey::SharedGroup(_)) {
+                    self.select_row(row);
+                    return Task::none();
+                }
                 if row == RowKey::Empty && self.scope == Scope::Teamwork {
                     return Task::none();
                 }
@@ -1213,6 +1334,17 @@ impl ConnectionWindow {
                     self.collapsed.insert(path);
                 }
                 self.reconcile_selection();
+            }
+            Message::ToggleSharedGroup(path) if self.can_browse() && !self.network_map.visible => {
+                if self
+                    .visible_row_keys()
+                    .contains(&RowKey::SharedGroup(path.clone()))
+                {
+                    if !self.shared_collapsed.remove(&path) {
+                        self.shared_collapsed.insert(path);
+                    }
+                    self.reconcile_selection();
+                }
             }
             Message::New if self.can_browse() && self.scope != Scope::Teamwork => {
                 self.badge_picker = None;
@@ -1294,12 +1426,42 @@ impl ConnectionWindow {
                 }
             }
             Message::Edit(Edit::OsBadge(Some(ref id))) if !self.valid_os_badge(Some(id)) => {}
+            Message::FocusEditor(backwards) => {
+                if let Some(draft) = &self.draft {
+                    return draft.focus_editor(backwards);
+                }
+            }
+            Message::SelectTunnel(index) => {
+                if let Some(draft) = &mut self.draft {
+                    return draft.select_tunnel(index);
+                }
+            }
+            Message::NavigateOsBadge(reference)
+                if reference.is_empty() || self.valid_os_badge(Some(&reference)) =>
+            {
+                if let Some(draft) = &mut self.draft {
+                    return draft.navigate_badge_picker(reference);
+                }
+            }
+            Message::Edit(Edit::Terminal(terminal_overrides::Edit::AiSkillNavigate(id))) => {
+                if let Some(draft) = &mut self.draft {
+                    draft.update(Edit::Terminal(terminal_overrides::Edit::AiSkillNavigate(
+                        id,
+                    )));
+                    return draft.reveal_ai_skill(id);
+                }
+            }
             Message::Edit(edit) => {
                 if let Some(draft) = &mut self.draft {
+                    let focus = match &edit {
+                        Edit::ColorPicker(edit) => draft.style_color_focus(edit),
+                        _ => Task::none(),
+                    };
                     draft.update(edit);
                     if !self.draft_conflict {
                         self.notice = None;
                     }
+                    return focus;
                 }
             }
             Message::DraftGroup(group) => {

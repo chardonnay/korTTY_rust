@@ -10,6 +10,7 @@ use super::{
     Workspace, wrap,
 };
 use crate::ssh_dialog::{self, LoginMessage};
+use crate::terminal_logging::EditorAction;
 use crate::vault_window::Kind;
 use crate::workspace::dialog_placement::escape::on_escape;
 
@@ -235,11 +236,17 @@ impl Workspace {
                         body = body.push(
                             dialog
                                 .ssh
-                                .logging_view(
-                                    self.clipboard.policy.problem.is_none()
-                                        && !dialog.selected_ssh_incognito(),
+                                .logging_form()
+                                .compact_editor_view(
+                                    self.quick_logging_available(dialog),
+                                    LABEL_WIDTH,
                                 )
-                                .map(Message::Ssh),
+                                .map(|action| match action {
+                                    EditorAction::Edit(edit) => {
+                                        Message::Ssh(ssh_dialog::Message::Logging(edit))
+                                    }
+                                    EditorAction::Browse => Message::BrowseTerminalLogFolder,
+                                }),
                         );
                     }
                 }

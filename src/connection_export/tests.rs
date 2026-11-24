@@ -77,6 +77,74 @@ fn fixture() -> Connection {
 }
 
 #[test]
+fn java_terminal_logging_round_trips_settings_and_dormant_review() {
+    use crate::terminal_logging::{DirectoryMode, Format as LogFormat};
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("connections.xml");
+    let java = include_bytes!("fixtures/java-2.26-terminal-logging.xml");
+    fs::write(&path, java).unwrap();
+    let ordinary = Preview::read(&path).unwrap();
+    let (profile, group) = ordinary.entries().next().unwrap();
+    let fields = profile.logging.java_fields();
+    assert_eq!(fields.format, LogFormat::Json);
+    assert_eq!(fields.directory_mode, DirectoryMode::Relative);
+    assert!(fields.include_username);
+    assert!(!fields.compress && !fields.rotate_daily);
+    assert_eq!(fields.retention_days, 45);
+    assert_eq!(fields.max_mib, 1000);
+    assert!(!fields.enabled && fields.folder.is_empty());
+    let review = profile.logging.java_review().unwrap();
+    assert!(review.enable_requested);
+    assert_eq!(review.source_max_mib, None);
+    assert_eq!(
+        review.source_path,
+        r"Z:\fixture\Terminal & Ops\ssh-log.json"
+    );
+
+    let backup = Preview::java_backup(java).unwrap();
+    let (document, count) = backup.portable_java_backup().unwrap();
+    assert_eq!(count, 1);
+    let store_path = directory.path().join("connections.json");
+    fs::write(&store_path, document).unwrap();
+    let store = Store::open(store_path).unwrap();
+    assert_eq!(store.connections()[0].logging, profile.logging);
+
+    let xml = encode(
+        Format::Kortty,
+        &[Entry {
+            connection: profile,
+            group,
+            os_badge: None,
+        }],
+    )
+    .unwrap();
+    let document = roxmltree::Document::parse(std::str::from_utf8(&xml).unwrap()).unwrap();
+    let log = document
+        .descendants()
+        .find(|node| node.has_tag_name("logConfig"))
+        .unwrap();
+    assert!(
+        log.children()
+            .any(|node| node.has_tag_name("enabled") && node.text() == Some("false"))
+    );
+    assert!(
+        log.children()
+            .any(|node| node.has_tag_name("format") && node.text() == Some("JSON"))
+    );
+    assert!(
+        log.children()
+            .any(|node| node.has_tag_name("logFilePath") && node.text().is_none())
+    );
+    fs::write(&path, xml).unwrap();
+    let restored = Preview::read(&path).unwrap();
+    assert_eq!(
+        restored.entries().next().unwrap().0.logging,
+        profile.logging
+    );
+}
+
+#[test]
 fn custom_theme_export_keeps_the_library_id_and_field_inheritance() {
     use crate::connection_store::ThemeOverride;
     use crate::terminal_theme::{Rgb, Scheme, java};
@@ -406,6 +474,68 @@ fn local_shell_xml_round_trip_keeps_java_compatible_and_exact_rust_launches() {
 }
 
 #[test]
+fn java_journal_input_xml_preserves_explicit_choices_and_defaults_omissions_to_off() {
+    for capture in [None, Some(false), Some(true)] {
+        let scratch = Scratch::new();
+        let mut connection = fixture();
+        connection.terminal.journal.auto_start = true;
+        connection.terminal.journal.capture_input = capture.unwrap_or(false);
+        connection.terminal.journal.max_log_parts = 100_001;
+        let data = encode_profiles(
+            Format::Kortty,
+            &[Entry {
+                connection: &connection,
+                group: "",
+                os_badge: None,
+            }],
+            &[],
+            &[],
+            Options::default(),
+            None,
+        )
+        .unwrap();
+        let mut xml = String::from_utf8(data).unwrap();
+        let field = format!("<captureInput>{}</captureInput>", capture.unwrap_or(false));
+        assert!(xml.contains(&field));
+        if capture.is_none() {
+            xml = xml.replace(&field, "");
+        }
+        let path = scratch.0.join("journal.xml");
+        fs::write(&path, xml).unwrap();
+        let preview = Preview::read(&path).unwrap();
+        assert_eq!(preview.invalid, 0);
+        let profile_path = scratch.0.join("connections.json");
+        let mut store = Store::open(profile_path.clone()).unwrap();
+        assert_eq!(preview.apply(&mut store).unwrap().imported, 1);
+        drop(store);
+        let store = Store::open(profile_path).unwrap();
+        let imported = &store.connections()[0];
+        assert!(imported.terminal.journal.auto_start);
+        assert_eq!(imported.terminal.journal.max_log_parts, 100_001);
+        assert_eq!(
+            imported.terminal.journal.capture_input,
+            capture.unwrap_or(false)
+        );
+        let exported = encode_profiles(
+            Format::Kortty,
+            &[Entry {
+                connection: imported,
+                group: "",
+                os_badge: None,
+            }],
+            &[],
+            &[],
+            Options::default(),
+            None,
+        )
+        .unwrap();
+        let xml = str::from_utf8(&exported).unwrap();
+        assert!(xml.contains(&field));
+        assert!(xml.contains("<maxLogParts>100001</maxLogParts>"));
+    }
+}
+
+#[test]
 fn java_serial_xml_round_trips_device_line_settings_encoding_and_folder() {
     use crate::session::{
         SerialConnection, SerialFlowControl, SerialLineEnding, SerialParity, SerialSettings,
@@ -683,14 +813,19 @@ fn java_unknown_theme_id_and_fallback_colors_round_trip_exactly() {
 
 #[test]
 fn java_initial_grid_can_override_one_dimension_while_appearance_inherits() {
+    use crate::connection_store::TerminalStylePreference;
+    use kortty_terminal::TextEncoding;
+
     let scratch = Scratch::new();
     let file = scratch.0.join("java-initial-grid.xml");
     fs::write(
         &file,
         concat!(
             "<connections schemaVersion=\"2\"><connection><host>server.example</host>",
-            "<username>operator</username><settings><useGlobalSettings>true</useGlobalSettings>",
+            "<username>operator</username><encoding>windows-1252</encoding>",
+            "<settings><useGlobalSettings>true</useGlobalSettings>",
             "<fontSize>18</fontSize><terminalColumns>40</terminalColumns>",
+            "<commandTimestampsEnabled>true</commandTimestampsEnabled>",
             "</settings></connection></connections>",
         ),
     )
@@ -701,6 +836,17 @@ fn java_initial_grid_can_override_one_dimension_while_appearance_inherits() {
     assert_eq!(connection.terminal.terminal_columns, Some(40));
     assert_eq!(connection.terminal.terminal_rows, None);
     assert_eq!(connection.terminal.font_size, None);
+    assert_eq!(connection.command_timestamps, None);
+    assert_eq!(
+        connection.terminal.encoding,
+        Some(TextEncoding::Windows1252)
+    );
+    let Some(TerminalStylePreference::Global(retained)) = &connection.terminal.style_preference
+    else {
+        panic!("expected the inactive Java appearance settings");
+    };
+    assert_eq!(retained.appearance.font_size, Some(18));
+    assert_eq!(retained.command_timestamps, Some(true));
 
     let entries = [Entry {
         connection,
@@ -710,6 +856,8 @@ fn java_initial_grid_can_override_one_dimension_while_appearance_inherits() {
     let xml = String::from_utf8(encode(Format::Kortty, &entries).unwrap()).unwrap();
     assert!(xml.contains("<useGlobalSettings>true</useGlobalSettings>"));
     assert!(xml.contains("<terminalColumns>40</terminalColumns>"));
+    assert!(xml.contains("<fontSize>18</fontSize>"));
+    assert!(xml.contains("<commandTimestampsEnabled>true</commandTimestampsEnabled>"));
     assert!(!xml.contains("<terminalRows>"));
     let reimport = scratch.preview(Format::Kortty, &entries);
     assert_eq!(
@@ -828,7 +976,14 @@ fn java_ssh_keepalive_uses_transport_fields_independent_of_terminal_inheritance(
         let (connection, group) = preview.entries().next().unwrap();
         let expected = expected.map(|(enabled, seconds)| KeepAlive::new(enabled, seconds).unwrap());
         assert_eq!(connection.startup.keepalive(), expected);
-        assert!(connection.terminal.is_default());
+        let mut effective = connection.terminal.clone();
+        let mode = effective.style_preference.take();
+        assert!(effective.is_default());
+        assert_eq!(
+            mode,
+            (schema == 2 && !uses_global)
+                .then_some(crate::connection_store::TerminalStylePreference::Own)
+        );
         let exported = scratch.preview(
             Format::Kortty,
             &[Entry {
@@ -839,7 +994,7 @@ fn java_ssh_keepalive_uses_transport_fields_independent_of_terminal_inheritance(
         );
         let (imported, _) = exported.entries().next().unwrap();
         assert_eq!(imported.startup.keepalive(), expected);
-        assert!(imported.terminal.is_default());
+        assert_eq!(imported.terminal, connection.terminal);
     }
 }
 

@@ -5,9 +5,9 @@ use std::ops::RangeInclusive;
 use iced::advanced::graphics::text::Paragraph;
 use iced::advanced::text::{self as layout_text, Paragraph as _};
 use iced::widget::{Id, column, container, row, scrollable, space, text, text_input};
-use iced::{Alignment, Element, Font, Length, Pixels, Size, border};
+use iced::{Alignment, Element, Font, Length, Pixels, Size};
 
-use crate::workspace::dialog_design::{form_input, header, number_step, secondary_button};
+use crate::workspace::dialog_design::{header, number_input};
 
 use super::Message;
 
@@ -100,44 +100,7 @@ pub(super) fn number<'a>(
     step: i64,
     on_step: Option<fn(String) -> Message>,
 ) -> Element<'a, Message> {
-    let adjustment = |delta: i64| {
-        let update = on_step?;
-        let value: i64 = value.trim().parse().ok()?;
-        if !bounds.contains(&value) {
-            return None;
-        }
-        let next = (value + delta).clamp(*bounds.start(), *bounds.end());
-        (next != value).then(|| update(next.to_string()))
-    };
-    let input = input
-        .size(FORM_FONT_SIZE)
-        .line_height(text::LineHeight::Absolute(16.0.into()))
-        .padding([7, 5])
-        .width(128)
-        .style(|theme, status| {
-            let mut style = form_input(theme, status);
-            style.border.radius = style.border.radius.right(0);
-            style
-        });
-    let increment = number_step("▴", adjustment(step))
-        .padding([1, 6])
-        .width(26)
-        .style(|theme, status| {
-            let mut style = secondary_button(theme, status);
-            style.border.radius = border::top_right(style.border.radius.top_right);
-            style
-        });
-    let decrement = number_step("▾", adjustment(-step))
-        .padding([1, 6])
-        .width(26)
-        .style(|theme, status| {
-            let mut style = secondary_button(theme, status);
-            style.border.radius = border::bottom_right(style.border.radius.bottom_right);
-            style
-        });
-    row![input, column![increment, decrement]]
-        .align_y(Alignment::Center)
-        .into()
+    number_input(input, value, bounds, step, on_step, 128.0)
 }
 
 #[cfg(test)]

@@ -1320,11 +1320,13 @@ impl Workspace {
             let profile = store
                 .get(reference.id)
                 .ok_or("The saved SSH connection is missing or unavailable.")?;
-            let credentials = job_executor::Credentials::resolve_directory_browser(
+            let credentials = job_executor::Credentials::resolve_scheduled(
                 reference,
                 profile,
+                false,
                 self.clipboard.policy.server_access(),
                 |id, kind, endpoint| self.vault_credential(id, kind, endpoint),
+                self.scheduler_temporary_keys(&store),
             )?;
             (credentials, store.group_of(reference.id))
         };
@@ -3118,6 +3120,15 @@ impl Workspace {
         let Some(reference) = &action.connection else {
             return job_executor::JobAuth::Manual;
         };
+        if action.agent.is_some() && action.targets().any(|route| route.temporary_keys.is_some()) {
+            let error =
+                "AI Agent and Swarm jobs require a different saved SSH authentication method.";
+            return if action.additional_connections.is_empty() {
+                job_executor::JobAuth::Saved(Err(error))
+            } else {
+                job_executor::JobAuth::Batch(Err(error))
+            };
+        }
         if action.has_teamwork_targets() {
             return self.scheduler_teamwork_auth(action);
         }
@@ -3140,13 +3151,26 @@ impl Workspace {
                     let current = store
                         .get(reference.id)
                         .ok_or("The saved SSH connection is missing or unavailable.")?;
-                    job_executor::Credentials::resolve(action, current, server_access, secret)
+                    job_executor::Credentials::resolve_scheduled(
+                        reference,
+                        current,
+                        action.virtual_terminal.is_some(),
+                        server_access,
+                        secret,
+                        self.scheduler_temporary_keys(store),
+                    )
                 })
                 .map(Box::new);
             job_executor::JobAuth::Saved(saved)
         } else {
             let batch = store.as_ref().map_err(|error| *error).and_then(|store| {
-                job_executor::Credentials::resolve_batch(action, store, server_access, secret)
+                job_executor::Credentials::resolve_scheduled_batch(
+                    action,
+                    store,
+                    server_access,
+                    secret,
+                    Some(self.scheduler_temporary_keys(store)),
+                )
             });
             job_executor::JobAuth::Batch(batch)
         };
@@ -3160,6 +3184,17 @@ impl Workspace {
                 .and_then(|store| store.group_of(reference.id));
             self.scheduler_sudo_password(reference, group)
         })
+    }
+
+    fn scheduler_temporary_keys<'a>(
+        &'a self,
+        store: &'a ConnectionStore,
+    ) -> job_executor::TemporaryKeys<'a> {
+        job_executor::TemporaryKeys {
+            enabled: self.window_settings.temporary_ssh_key_enabled,
+            vault: self.vault.as_ref(),
+            connections: store.path(),
+        }
     }
 
     fn scheduler_teamwork_auth(&self, action: &SshCommand) -> job_executor::JobAuth {
@@ -3205,11 +3240,13 @@ impl Workspace {
                         let current = store
                             .get(reference.id)
                             .ok_or("The saved SSH connection is unavailable.")?;
-                        job_executor::Credentials::resolve_directory_browser(
+                        job_executor::Credentials::resolve_scheduled(
                             reference,
                             current,
+                            false,
                             server_access,
                             secret,
+                            self.scheduler_temporary_keys(&store),
                         )
                     }
                 })

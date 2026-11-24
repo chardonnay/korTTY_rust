@@ -1,27 +1,35 @@
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use iced::widget::{button, checkbox, column, pick_list, row, text, text_input, tooltip};
+use iced::widget::{
+    Id, button, checkbox, column, pick_list, radio, row, rule, text, text_input, tooltip,
+};
 use iced::{Alignment, Element, Length};
 use kortty_terminal::TerminalProfile;
 
 use crate::clipboard_policy::PasteWarningMode;
 use crate::connection_store::custom_os_badges::Catalog;
 use crate::connection_store::{
-    Auth, AuthMethod, Connection, MAX_TUNNELS, SavedLogin, TunnelConfig, TunnelRule, TunnelTarget,
+    Auth, AuthMethod, Connection, SavedLogin, TerminalStyle, TerminalStylePreference,
 };
 use crate::session_security::{IsolationChoice, IsolationLevel, resolve_isolation};
 use crate::ssh_dialog::{
     KeepAliveEdit, KeyChoice, LoginTarget, Password, StartupField, StartupFields, normalize_host,
 };
 use crate::terminal_effects::{Effect, editor::EffectDraft};
+use crate::workspace::dialog_design::{self, keyboard_table};
 
 use super::color::ColorDraft;
+use super::color_picker::{self, Target as ColorTarget};
+use super::custom_color;
 use super::view::ViewChoices;
-use super::{CredentialChoice, Message, os_badge, terminal_overrides};
+use super::{CredentialChoice, Message, os_badge, terminal_overrides, tunnels};
 
 mod geometry;
+mod tabs;
+
+const LOGIN_LABEL_WIDTH: f32 = 168.0;
 
 #[derive(Clone, Debug)]
 pub enum Edit {
@@ -37,8 +45,10 @@ pub enum Edit {
     TerminalEffect(Option<Effect>),
     TerminalEffectSpeed(String),
     CommandTimestamps(Option<bool>),
+    UseOwnTerminalSettings(Option<Box<TerminalStyle>>),
+    ShowAdditionalTerminalSettings(bool),
     UseTabColor(bool),
-    TabColor(String),
+    ColorPicker(color_picker::Edit),
     ToggleOsBadgePicker,
     OsBadge(Option<String>),
     PasteWarning(Option<PasteWarningMode>),
@@ -46,9 +56,8 @@ pub enum Edit {
     WindowGeometry(geometry::Edit),
     UseJump(bool),
     Login(bool, LoginEdit),
-    AddTunnel,
-    RemoveTunnel(usize),
-    Tunnel(usize, TunnelEdit),
+    EnableTunnels(bool),
+    RemoveSelectedTunnel,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -59,17 +68,34 @@ pub enum Page {
     Tunnels,
     JumpHost,
     Logging,
+    Journal,
     WindowGeometry,
+    Ai,
 }
 
 impl Page {
-    const ALL: [Self; 6] = [
+    fn keyboard_navigation(self) -> bool {
+        matches!(
+            self,
+            Self::Connection
+                | Self::Settings
+                | Self::Tunnels
+                | Self::JumpHost
+                | Self::Logging
+                | Self::WindowGeometry
+                | Self::Ai
+        )
+    }
+
+    const ALL: [Self; 8] = [
         Self::Connection,
         Self::Settings,
         Self::Tunnels,
         Self::JumpHost,
         Self::Logging,
+        Self::Journal,
         Self::WindowGeometry,
+        Self::Ai,
     ];
 
     fn label(self) -> &'static str {
@@ -79,7 +105,9 @@ impl Page {
             Self::Tunnels => "SSH Tunnels",
             Self::JumpHost => "Jump Server",
             Self::Logging => "Terminal Logging",
+            Self::Journal => "Journal",
             Self::WindowGeometry => "Window Geometry",
+            Self::Ai => "AI",
         }
     }
 }
@@ -98,17 +126,6 @@ pub enum LoginEdit {
     TemporaryLifetime(String),
     TemporaryAutomatic(bool),
     RemoveTemporaryKey,
-}
-
-#[derive(Clone, Debug)]
-pub enum TunnelEdit {
-    Enabled(bool),
-    Mode(TunnelMode),
-    Bind(String),
-    Port(String),
-    Host(String),
-    TargetPort(String),
-    Description(String),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -135,41 +152,6 @@ impl fmt::Display for Method {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum TunnelMode {
-    #[default]
-    Local,
-    Remote,
-    Dynamic,
-}
-
-impl fmt::Display for TunnelMode {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Local => "Local",
-            Self::Remote => "Remote",
-            Self::Dynamic => "Dynamic (SOCKS)",
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TimestampChoice(Option<bool>);
-
-impl TimestampChoice {
-    const ALL: [Self; 3] = [Self(None), Self(Some(true)), Self(Some(false))];
-}
-
-impl fmt::Display for TimestampChoice {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self.0 {
-            None => "Use global setting",
-            Some(true) => "Show",
-            Some(false) => "Hide",
-        })
-    }
-}
-
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct PasteChoice {
     mode: Option<PasteWarningMode>,
@@ -187,6 +169,7 @@ impl fmt::Display for PasteChoice {
 
 pub(super) struct Draft {
     page: Page,
+    ids: EditorIds,
     id: u64,
     name: String,
     tag: String,
@@ -197,16 +180,57 @@ pub(super) struct Draft {
     logging: crate::terminal_logging::Form,
     terminal_effect: EffectDraft,
     command_timestamps: Option<bool>,
+    own_terminal_settings: bool,
+    has_own_terminal_draft: bool,
+    retained_terminal_style: Option<Box<TerminalStyle>>,
+    show_additional_terminal_settings: bool,
     tab_color: ColorDraft,
+    color_picker: color_picker::Picker,
     os_badge: Option<String>,
     badge_picker_open: bool,
+    badge_cursor: Option<String>,
     paste_warning: Option<PasteWarningMode>,
     terminal: terminal_overrides::Draft,
     window_geometry: geometry::Draft,
     login: Login,
-    jump: Option<Login>,
-    tunnels: Vec<TunnelDraft>,
+    jump: Login,
+    jump_enabled: bool,
+    tunnels: tunnels::List,
     pub changed: bool,
+}
+
+struct EditorIds {
+    menu: Id,
+    focus_scope: Id,
+    page_scope: Id,
+    page_scroll: Id,
+    emulation: Id,
+    encoding: Id,
+    folder: Id,
+    keepalive: Id,
+    badge_list: Id,
+    behavior_highlight: Id,
+    behavior_paste: Id,
+    behavior_isolation: Id,
+}
+
+impl EditorIds {
+    fn new() -> Self {
+        Self {
+            menu: Id::unique(),
+            focus_scope: Id::unique(),
+            page_scope: Id::unique(),
+            page_scroll: Id::unique(),
+            emulation: Id::unique(),
+            encoding: Id::unique(),
+            folder: Id::unique(),
+            keepalive: Id::unique(),
+            badge_list: Id::unique(),
+            behavior_highlight: Id::unique(),
+            behavior_paste: Id::unique(),
+            behavior_isolation: Id::unique(),
+        }
+    }
 }
 
 struct Login {
@@ -220,6 +244,8 @@ struct Login {
     stored_key: Option<u64>,
     passphrase: String,
     temporary: TemporaryDraft,
+    method_picker: Id,
+    credential_picker: Id,
 }
 
 struct TemporaryDraft {
@@ -242,16 +268,6 @@ impl Default for TemporaryDraft {
     }
 }
 
-struct TunnelDraft {
-    enabled: bool,
-    description: String,
-    mode: TunnelMode,
-    bind: String,
-    port: String,
-    host: String,
-    target_port: String,
-}
-
 impl Draft {
     pub fn id(&self) -> u64 {
         self.id
@@ -264,6 +280,7 @@ impl Draft {
     pub fn new() -> Self {
         Self {
             page: Page::default(),
+            ids: EditorIds::new(),
             id: 0,
             name: String::new(),
             tag: String::new(),
@@ -274,22 +291,46 @@ impl Draft {
             logging: crate::terminal_logging::Form::new(Default::default()),
             terminal_effect: EffectDraft::default(),
             command_timestamps: None,
+            own_terminal_settings: false,
+            has_own_terminal_draft: false,
+            retained_terminal_style: None,
+            show_additional_terminal_settings: false,
             tab_color: ColorDraft::new(None, None),
+            color_picker: color_picker::Picker::default(),
             os_badge: None,
             badge_picker_open: false,
+            badge_cursor: None,
             paste_warning: None,
             terminal: terminal_overrides::Draft::new(&Default::default()),
             window_geometry: geometry::Draft::new(None),
             login: Login::new(),
-            jump: None,
-            tunnels: Vec::new(),
+            jump: Login::new(),
+            jump_enabled: false,
+            tunnels: tunnels::List::new(Vec::new()),
             changed: false,
         }
     }
 
     pub fn from_profile(connection: &Connection, os_badge: Option<&str>, duplicate: bool) -> Self {
+        let style =
+            TerminalStyle::from_terminal(&connection.terminal, connection.command_timestamps);
+        let own_terminal_settings = !style.is_default()
+            || matches!(
+                connection.terminal.style_preference,
+                Some(TerminalStylePreference::Own),
+            );
+        let retained_terminal_style = if own_terminal_settings {
+            (!style.is_default()).then(|| Box::new(style))
+        } else if let Some(TerminalStylePreference::Global(retained)) =
+            &connection.terminal.style_preference
+        {
+            Some(retained.clone())
+        } else {
+            None
+        };
         Self {
             page: Page::default(),
+            ids: EditorIds::new(),
             id: if duplicate { 0 } else { connection.id },
             name: if duplicate {
                 format!("{} (copy)", connection.name)
@@ -304,9 +345,15 @@ impl Draft {
             logging: crate::terminal_logging::Form::new(connection.logging.clone()),
             terminal_effect: EffectDraft::new(connection.terminal_effect),
             command_timestamps: connection.command_timestamps,
+            own_terminal_settings,
+            has_own_terminal_draft: own_terminal_settings,
+            retained_terminal_style,
+            show_additional_terminal_settings: false,
             tab_color: ColorDraft::new(connection.tab_color, None),
+            color_picker: color_picker::Picker::default(),
             os_badge: os_badge.map(str::to_owned),
             badge_picker_open: false,
+            badge_cursor: None,
             paste_warning: connection.paste_warning,
             terminal: terminal_overrides::Draft::new(&connection.terminal),
             window_geometry: geometry::Draft::new(if duplicate {
@@ -318,12 +365,9 @@ impl Draft {
             jump: connection
                 .jump
                 .as_ref()
-                .map(|login| Login::from_saved(login, duplicate)),
-            tunnels: connection
-                .tunnels
-                .iter()
-                .map(TunnelDraft::from_config)
-                .collect(),
+                .map_or_else(Login::new, |login| Login::from_saved(login, duplicate)),
+            jump_enabled: connection.jump.is_some(),
+            tunnels: tunnels::List::new(connection.tunnels.clone()),
             changed: duplicate,
         }
     }
@@ -366,6 +410,9 @@ impl Draft {
     pub fn update(&mut self, edit: Edit) {
         match edit {
             Edit::Page(page) => {
+                if self.page != page {
+                    self.color_picker.close();
+                }
                 self.page = page;
                 return;
             }
@@ -376,22 +423,60 @@ impl Draft {
             Edit::Isolation(level) => self.isolation = level,
             Edit::Startup(field, value) => self.startup.update(field, value),
             Edit::KeepAlive(edit) => self.startup.update_keepalive(edit),
-            Edit::Logging(edit) => self.logging.update(edit),
-            Edit::TerminalEffect(effect) => self.terminal_effect.effect = effect,
-            Edit::TerminalEffectSpeed(value) => self.terminal_effect.set_speed(value),
-            Edit::CommandTimestamps(visibility) => self.command_timestamps = visibility,
-            Edit::UseTabColor(enabled) => self.tab_color.set_enabled(enabled),
-            Edit::TabColor(value) => {
-                if !self.tab_color.set_input(value) {
+            Edit::Logging(edit) => {
+                if !self.logging.accepts_editor_edit(!self.incognito, &edit) {
                     return;
                 }
+                self.logging.update(edit);
+            }
+            Edit::TerminalEffect(effect) => self.terminal_effect.effect = effect,
+            Edit::TerminalEffectSpeed(value) => self.terminal_effect.set_speed(value),
+            Edit::CommandTimestamps(visibility) if self.own_terminal_settings => {
+                self.command_timestamps = visibility
+            }
+            Edit::UseOwnTerminalSettings(defaults) => {
+                let own = defaults.is_some();
+                if self.own_terminal_settings == own {
+                    return;
+                }
+                self.color_picker.close();
+                self.own_terminal_settings = own;
+                if !self.has_own_terminal_draft
+                    && let Some(mut defaults) = defaults
+                {
+                    self.command_timestamps = defaults.command_timestamps;
+                    // Inherit the global busy-terminal rule until the editor chooses an override.
+                    defaults.confirm_close = None;
+                    self.terminal.seed_style(&defaults);
+                    self.has_own_terminal_draft = true;
+                }
+            }
+            Edit::ShowAdditionalTerminalSettings(show) => {
+                self.show_additional_terminal_settings = show;
+                return;
+            }
+            Edit::UseTabColor(enabled) => {
+                self.color_picker.close();
+                self.tab_color.set_enabled(enabled);
+            }
+            Edit::ColorPicker(edit) => {
+                if matches!(edit, color_picker::Edit::Open(target, _) if !self.allows_color(target))
+                {
+                    return;
+                }
+                if let Some((target, color)) = self.color_picker.update(edit) {
+                    self.apply_color(target, color);
+                }
+                return;
             }
             Edit::ToggleOsBadgePicker => {
                 self.badge_picker_open = !self.badge_picker_open;
+                self.badge_cursor = None;
                 return;
             }
             Edit::OsBadge(badge) if self.badge_picker_open => {
                 self.badge_picker_open = false;
+                self.badge_cursor = None;
                 if self.os_badge == badge {
                     return;
                 }
@@ -399,6 +484,9 @@ impl Draft {
             }
             Edit::PasteWarning(mode) => self.paste_warning = mode,
             Edit::Terminal(edit) => {
+                if edit.edits_style() && !self.own_terminal_settings {
+                    return;
+                }
                 self.changed |= self.terminal.update(edit);
                 return;
             }
@@ -406,26 +494,33 @@ impl Draft {
                 self.changed |= self.window_geometry.update(edit);
                 return;
             }
-            Edit::UseJump(true) => {
-                self.jump.get_or_insert_with(Login::new);
-            }
-            Edit::UseJump(false) => self.jump = None,
-            Edit::Login(false, edit) => self.login.update(edit),
-            Edit::Login(true, edit) => {
-                if let Some(jump) = &mut self.jump {
-                    jump.update(edit);
+            Edit::UseJump(enabled) => {
+                if self.jump_enabled == enabled {
+                    return;
                 }
+                self.jump_enabled = enabled;
             }
-            Edit::AddTunnel if self.tunnels.len() < MAX_TUNNELS => {
-                self.tunnels.push(TunnelDraft::new())
-            }
-            Edit::RemoveTunnel(index) if index < self.tunnels.len() => {
-                self.tunnels.remove(index);
-            }
-            Edit::Tunnel(index, edit) => {
-                if let Some(tunnel) = self.tunnels.get_mut(index) {
-                    tunnel.update(edit);
+            Edit::Login(jump, edit) => {
+                let login = if jump {
+                    if !self.jump_enabled {
+                        return;
+                    }
+                    &mut self.jump
+                } else {
+                    &mut self.login
+                };
+                if matches!(&edit, LoginEdit::Method(method) if login.method == *method) {
+                    return;
                 }
+                login.update(edit);
+            }
+            Edit::EnableTunnels(enabled) if self.page == Page::Tunnels => {
+                self.changed |= self.tunnels.enable_all(enabled);
+                return;
+            }
+            Edit::RemoveSelectedTunnel if self.page == Page::Tunnels => {
+                self.changed |= self.tunnels.remove_selected();
+                return;
             }
             _ => return,
         }
@@ -443,21 +538,20 @@ impl Draft {
             .saved()
             .map_err(|error| format!("Destination. {error}"))?;
         let jump = self
-            .jump
-            .as_ref()
-            .map(Login::saved)
+            .jump_enabled
+            .then(|| self.jump.saved())
             .transpose()
             .map_err(|error| format!("Jump host. {error}"))?;
-        let tunnels = self
-            .tunnels
-            .iter()
-            .enumerate()
-            .map(|(index, tunnel)| {
-                tunnel
-                    .config()
-                    .map_err(|error| format!("Tunnel {}. {error}", index + 1))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut terminal = self.terminal.value_with_style(self.own_terminal_settings)?;
+        terminal.style_preference = if self.own_terminal_settings {
+            TerminalStyle::from_terminal(&terminal, self.command_timestamps)
+                .is_default()
+                .then_some(TerminalStylePreference::Own)
+        } else {
+            self.retained_terminal_style
+                .clone()
+                .map(TerminalStylePreference::Global)
+        };
         let connection = Connection {
             id: self.id,
             name: name.into(),
@@ -465,18 +559,21 @@ impl Draft {
             login,
             jump,
             emulation: self.profile.term_name().into(),
-            tunnels,
+            tunnels: self.tunnels.configs().to_vec(),
             incognito: self.incognito,
             isolation: self.isolation.0.unwrap_or_default(),
             inherit_isolation: self.isolation.0.is_none(),
             startup: self.startup.options().map_err(|error| error.to_string())?,
             logging: self.logging.config().map_err(|error| error.to_string())?,
             terminal_effect: self.terminal_effect.selection(),
-            command_timestamps: self.command_timestamps,
+            command_timestamps: self
+                .own_terminal_settings
+                .then_some(self.command_timestamps)
+                .flatten(),
             tab_color,
             paste_warning: self.paste_warning,
             window_geometry: self.window_geometry.value()?,
-            terminal: self.terminal.value()?,
+            terminal,
         };
         connection.validate().map_err(|error| error.to_string())?;
         Ok(connection)
@@ -490,79 +587,210 @@ impl Draft {
         inherited: Option<(&str, IsolationLevel)>,
     ) -> Element<'a, Message> {
         use crate::workspace::dialog_design;
-        use iced::widget::{container, keyed_column, scrollable, space};
+        use iced::widget::{container, keyed_column, scrollable};
 
-        let tabs = Page::ALL.into_iter().fold(row![], |tabs, page| {
-            let selected = self.page == page;
-            tabs.push(
-                button(text(page.label()).size(13))
-                    .padding([8, 12])
-                    .style(move |theme, status| dialog_design::tab(theme, status, selected))
-                    .on_press(Message::Edit(Edit::Page(page))),
-            )
-        });
-        let index = Page::ALL
-            .iter()
-            .position(|page| *page == self.page)
-            .expect("every editor page has a tab");
-        let arrows = row![
-            space::horizontal(),
-            text(format!("{} / {}", index + 1, Page::ALL.len())).size(13),
-            button(text("◂").size(13))
-                .style(button::secondary)
-                .padding([4, 8])
-                .on_press_maybe(
-                    index
-                        .checked_sub(1)
-                        .map(|previous| Message::Edit(Edit::Page(Page::ALL[previous])))
-                ),
-            button(text("▸").size(13))
-                .style(button::secondary)
-                .padding([4, 8])
-                .on_press_maybe(
-                    Page::ALL
-                        .get(index + 1)
-                        .map(|next| Message::Edit(Edit::Page(*next)))
-                ),
-        ]
-        .align_y(Alignment::Center)
-        .spacing(4);
         let content = match self.page {
             Page::Connection => self.connection_page(choices, custom_badges, group),
             Page::Settings => self.settings_page(choices, inherited),
-            Page::Tunnels => self.tunnels_page(),
-            Page::JumpHost => column![
-                checkbox(self.jump.is_some())
-                    .label("Use a jump host")
-                    .on_toggle(|value| Message::Edit(Edit::UseJump(value))),
-                self.jump.as_ref().map(|jump| jump.view(true, choices)),
-            ]
-            .spacing(10)
-            .into(),
+            Page::Tunnels => self.tunnels.view(),
+            Page::JumpHost => self.jump_page(choices),
             Page::Logging => self
                 .logging
-                .view(!self.incognito, true)
-                .map(|edit| Message::Edit(Edit::Logging(edit))),
+                .editor_view(!self.incognito, choices.logging_policy, &self.name)
+                .map(|action| match action {
+                    crate::terminal_logging::EditorAction::Edit(edit) => {
+                        Message::Edit(Edit::Logging(edit))
+                    }
+                    crate::terminal_logging::EditorAction::Browse => {
+                        Message::BrowseTerminalLogFolder
+                    }
+                }),
+            Page::Journal => self
+                .terminal
+                .journal_view(choices)
+                .map(|edit| Message::Edit(Edit::Terminal(edit))),
             Page::WindowGeometry => self
                 .window_geometry
                 .view()
                 .map(|edit| Message::Edit(Edit::WindowGeometry(edit))),
+            Page::Ai => self
+                .terminal
+                .ai_view(choices, Some(self.id))
+                .map(|edit| Message::Edit(Edit::Terminal(edit))),
         };
-        let page = container(
-            scrollable(container(content).width(Length::Fill).padding(20))
-                .height(Length::Fill)
-                .width(Length::Fill),
-        )
-        .style(dialog_design::page);
+        let mut scroll = scrollable(container(content).width(Length::Fill).padding(20))
+            .height(Length::Fill)
+            .width(Length::Fill);
+        if self.page.keyboard_navigation() {
+            scroll = scroll.id(self.ids.page_scroll.clone());
+        }
+        let mut page = container(scroll).style(dialog_design::page);
+        if self.page.keyboard_navigation() {
+            page = page.id(self.ids.page_scope.clone());
+        }
         column![
-            arrows,
-            tabs,
+            tabs::arrows(self.page),
+            tabs::view(self.page, self.ids.menu.clone()),
             keyed_column![(self.page, page)].height(Length::Fill),
             self.connection().err().map(|error| text(error).size(13)),
         ]
         .spacing(4)
         .height(Length::Fill)
         .into()
+    }
+
+    pub(super) fn tab_shortcut(
+        &self,
+        key: &iced::keyboard::Key,
+        modifiers: iced::keyboard::Modifiers,
+    ) -> Option<Message> {
+        use iced::keyboard::{Key, Modifiers, key::Named};
+        if self.page.keyboard_navigation()
+            && *key == Key::Named(Named::Tab)
+            && (modifiers - Modifiers::SHIFT).is_empty()
+        {
+            return Some(Message::FocusEditor(modifiers.shift()));
+        }
+        tabs::shortcut(self.page, key, modifiers)
+    }
+
+    pub(super) fn focus_scope(&self) -> Option<Id> {
+        self.page
+            .keyboard_navigation()
+            .then(|| self.ids.focus_scope.clone())
+    }
+
+    pub(super) fn folder_picker_id(&self) -> Id {
+        self.ids.folder.clone()
+    }
+
+    pub(super) fn begin_tunnel_editor(&self, request: tunnels::Request) -> Option<tunnels::Editor> {
+        (self.page == Page::Tunnels).then_some(())?;
+        self.tunnels.begin(request, self.ids.focus_scope.clone())
+    }
+
+    pub(super) fn commit_tunnel_editor(&mut self, editor: &tunnels::Editor) {
+        if self.page == Page::Tunnels {
+            self.changed |= self.tunnels.commit(editor, &self.ids.focus_scope);
+        }
+    }
+
+    pub(super) fn select_tunnel(&mut self, index: usize) -> iced::Task<Message> {
+        if self.page == Page::Tunnels {
+            self.tunnels.select(index)
+        } else {
+            iced::Task::none()
+        }
+    }
+
+    pub(super) fn start_terminal_log_folder_picker(
+        &mut self,
+        root: &Path,
+    ) -> Option<(Arc<()>, PathBuf)> {
+        self.logging
+            .start_folder_picker(self.page == Page::Logging && !self.incognito, root)
+    }
+
+    pub(super) fn finish_terminal_log_folder_picker(
+        &mut self,
+        ticket: &Arc<()>,
+        path: Option<&Path>,
+    ) {
+        let eligible = self.page == Page::Logging && !self.incognito;
+        if let Some(edit) = self.logging.finish_folder_picker(ticket, eligible, path) {
+            self.update(Edit::Logging(edit));
+        }
+    }
+
+    pub(super) fn navigate_badge_picker(&mut self, reference: String) -> iced::Task<Message> {
+        if self.page != Page::Connection || !self.badge_picker_open {
+            return iced::Task::none();
+        }
+        let reveal = os_badge::reveal(self.ids.badge_list.clone(), &reference);
+        self.badge_cursor = Some(reference);
+        reveal
+    }
+
+    pub(super) fn focus_editor(&self, backwards: bool) -> iced::Task<Message> {
+        use iced::advanced::widget::operation::{focusable, scope};
+        use iced_runtime::{Action, task};
+
+        let Some(root) = self.focus_scope() else {
+            return iced::Task::none();
+        };
+        let move_focus = if backwards {
+            Action::widget(scope(root, focusable::focus_previous()))
+        } else {
+            Action::widget(scope(root, focusable::focus_next()))
+        };
+        task::effect(move_focus).chain(crate::workspace::dialog_design::scroll::reveal_focused(
+            self.ids.page_scope.clone(),
+            self.ids.page_scroll.clone(),
+        ))
+    }
+
+    pub(super) fn reveal_ai_skill(&self, id: u64) -> iced::Task<Message> {
+        if self.page == Page::Ai {
+            self.terminal.reveal_ai_skill(id)
+        } else {
+            iced::Task::none()
+        }
+    }
+
+    pub(super) fn style_color_focus(&self, edit: &color_picker::Edit) -> iced::Task<Message> {
+        if self.page == Page::Settings
+            && !matches!(edit, color_picker::Edit::Open(target, _) if !self.allows_color(*target))
+        {
+            self.color_picker.focus(edit)
+        } else {
+            iced::Task::none()
+        }
+    }
+
+    fn allows_color(&self, target: ColorTarget) -> bool {
+        self.page == Page::Settings
+            && match target {
+                ColorTarget::Foreground | ColorTarget::Background => self.own_terminal_settings,
+                ColorTarget::Tab => self.tab_color.enabled(),
+            }
+    }
+
+    fn apply_color(&mut self, target: ColorTarget, color: Option<crate::terminal_theme::Rgb>) {
+        if !self.allows_color(target) {
+            return;
+        }
+        let value = color.map_or_else(String::new, |color| color.to_string());
+        self.changed |= match target {
+            ColorTarget::Foreground | ColorTarget::Background => self
+                .terminal
+                .update(terminal_overrides::Edit::Color(target as usize, value)),
+            ColorTarget::Tab => color.is_some() && self.tab_color.set_input(value),
+        };
+    }
+
+    pub(super) fn begin_custom_color(&mut self) -> Option<custom_color::Editor> {
+        let (target, current) = self.color_picker.begin_custom()?;
+        self.allows_color(target)
+            .then(|| custom_color::Editor::new(target, current))
+    }
+
+    pub(super) fn finish_custom_color(
+        &mut self,
+        editor: &custom_color::Editor,
+        apply: bool,
+        remember: bool,
+    ) -> iced::Task<Message> {
+        let target = editor.target();
+        if !self.allows_color(target) {
+            return iced::Task::none();
+        }
+        if apply && let Some(color) = editor.color() {
+            if remember {
+                self.color_picker.save_custom(target, color);
+            }
+            self.apply_color(target, Some(color));
+        }
+        self.color_picker.focus_trigger(target)
     }
 
     fn connection_page<'a>(
@@ -572,46 +800,85 @@ impl Draft {
         group: Element<'a, Message>,
     ) -> Element<'a, Message> {
         column![
-            row![
-                text("Name").width(105),
+            login_row(
+                "Name",
                 text_input("Connection name", &self.name)
                     .on_input(|value| Message::Edit(Edit::Name(value)))
                     .width(250),
-            ]
-            .spacing(10)
-            .align_y(Alignment::Center),
-            self.login.view(false, choices),
-            row![
-                text("Tag").width(105),
+            ),
+            self.login.endpoint_fields(false, true),
+            login_row("Connection protocol", text("SSH over TCP/IP").size(14)),
+            login_row(
+                "Terminal emulation",
+                pick_list(TerminalProfile::ALL, Some(self.profile), |value| {
+                    Message::Edit(Edit::Emulation(value))
+                })
+                .width(300)
+                .keyboard_navigation(self.ids.emulation.clone()),
+            ),
+            login_row(
+                "Text encoding",
+                iced::widget::container(
+                    self.terminal
+                        .encoding_picker(Some(self.ids.encoding.clone()))
+                        .map(|edit| { Message::Edit(Edit::Terminal(edit)) })
+                )
+                .width(300),
+            ),
+            login_row("Folder", group),
+            login_row(
+                "Tag",
                 text_input("Tag (optional)", &self.tag)
                     .on_input(|value| Message::Edit(Edit::Tag(value)))
                     .width(250),
-            ]
-            .spacing(10)
-            .align_y(Alignment::Center),
-            group,
-            os_badge::picker(
-                os_badge::Badge::resolve(self.os_badge_id(), custom_badges),
-                custom_badges,
-                self.badge_picker_open,
-                Some(Message::Edit(Edit::ToggleOsBadgePicker)),
-                None,
-                |badge| Message::Edit(Edit::OsBadge(badge)),
             ),
-            row![
-                text("Terminal emulation").width(144),
-                pick_list(TerminalProfile::ALL, Some(self.profile), |value| {
-                    Message::Edit(Edit::Emulation(value))
-                }),
-            ]
-            .spacing(10)
-            .align_y(Alignment::Center),
+            login_row(
+                "OS symbol",
+                iced::widget::container(os_badge::picker_control(
+                    os_badge::Badge::resolve(self.os_badge_id(), custom_badges),
+                    custom_badges,
+                    self.badge_picker_open,
+                    Some(Message::Edit(Edit::ToggleOsBadgePicker)),
+                    |badge| Message::Edit(Edit::OsBadge(badge)),
+                    Some(os_badge::KeyboardPicker {
+                        scroll: self.ids.badge_list.clone(),
+                        cursor: self.badge_cursor.as_deref(),
+                    }),
+                ))
+                .width(300),
+            ),
+            rule::horizontal(1),
             self.startup
-                .view(168.0)
+                .editor_view(LOGIN_LABEL_WIDTH)
                 .map(|(field, value)| Message::Edit(Edit::Startup(field, value))),
             self.startup
-                .keepalive_view(168.0)
+                .keepalive_view(LOGIN_LABEL_WIDTH, self.ids.keepalive.clone())
                 .map(|edit| Message::Edit(Edit::KeepAlive(edit))),
+            login_row(
+                "Host key check",
+                text("Verify before authentication").size(14)
+            ),
+            rule::horizontal(1),
+            self.login.authentication_fields(false, choices, true),
+        ]
+        .spacing(10)
+        .into()
+    }
+
+    fn jump_page(&self, choices: &ViewChoices<'_>) -> Element<'_, Message> {
+        let enabled = self.jump_enabled;
+        let toggle = checkbox(enabled)
+            .label("Use a jump host")
+            .on_toggle(|value| Message::Edit(Edit::UseJump(value)));
+        column![
+            keyboard_table::action(
+                toggle.into(),
+                Some(Message::Edit(Edit::UseJump(!enabled))),
+                false
+            ),
+            rule::horizontal(1),
+            self.jump.endpoint_fields(true, enabled),
+            self.jump.authentication_fields(true, choices, enabled),
         ]
         .spacing(10)
         .into()
@@ -638,36 +905,56 @@ impl Draft {
             .chain(PasteWarningMode::ALL.map(Some))
             .map(paste_choice)
             .collect();
+        let own = self.own_terminal_settings;
+        let defaults = &choices.terminal_style;
+        let terminal_edit = |edit| Message::Edit(Edit::Terminal(edit));
+        let additional = Message::Edit(Edit::ShowAdditionalTerminalSettings(
+            !self.show_additional_terminal_settings,
+        ));
+        let incognito = choices
+            .incognito_allowed
+            .then(|| Message::Edit(Edit::Incognito(!self.incognito)));
         let mut editor = column![
-            column![
-                text("Tab color").size(16),
+            self.terminal_settings_source(defaults),
+            self.terminal.ssh_style_view(&self.color_picker, choices.themes, defaults, own).map(Message::Edit),
+            rule::horizontal(1),
+            self.terminal.ssh_close_confirmation_view(defaults, own).map(terminal_edit),
+            terminal_overrides::ssh_style::ssh_checkbox(
+                "Show command timestamps",
+                self.command_timestamps,
+                defaults.command_timestamps.unwrap_or(false),
+                own,
+                |value| Message::Edit(Edit::CommandTimestamps(value)),
+            ),
+            rule::horizontal(1),
+            text("Terminal behavior").size(16),
+            row![
                 tooltip(
-                    self.tab_color.view(
-                        "Mark this connection's tabs with a color",
-                        |enabled| Message::Edit(Edit::UseTabColor(enabled)),
-                        |input| Message::Edit(Edit::TabColor(input)),
+                    keyboard_table::action(
+                        checkbox(self.tab_color.enabled())
+                            .label("Mark this connection's tabs with a color")
+                            .text_size(13)
+                            .on_toggle(|enabled| Message::Edit(Edit::UseTabColor(enabled)))
+                            .into(),
+                        Some(Message::Edit(Edit::UseTabColor(!self.tab_color.enabled()))),
+                        false,
                     ),
                     text("Hover over the tab to see its color."),
                     tooltip::Position::Bottom,
                 ),
-            ]
-            .spacing(6),
-            row![
-                text("Show command timestamps"),
-                pick_list(
-                    TimestampChoice::ALL,
-                    Some(TimestampChoice(self.command_timestamps)),
-                    |choice| Message::Edit(Edit::CommandTimestamps(choice.0))
-                ),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
+                self.color_picker.view(ColorTarget::Tab, Some(self.tab_color.picker_color()), self.tab_color.enabled())
+                    .map(|edit| Message::Edit(Edit::ColorPicker(edit))),
+            ].spacing(10).align_y(Alignment::Center),
+            terminal_overrides::isolation_row(
+                "Keyword highlighting",
+                self.terminal.ssh_highlight_picker(&choices.highlighting, self.ids.behavior_highlight.clone()).map(terminal_edit),
+            ),
             column![
                 text("Warn about multi-line pastes"),
                 tooltip(
                     pick_list(paste_choices, Some(paste_choice(self.paste_warning)), |choice| {
                         Message::Edit(Edit::PasteWarning(choice.mode))
-                    }),
+                    }).keyboard_navigation(self.ids.behavior_paste.clone()),
                     text("Use the default follows Settings → Terminal → Paste Protection. Off also turns off control-character warnings."),
                     tooltip::Position::Bottom,
                 ),
@@ -675,6 +962,8 @@ impl Draft {
                     text(format!("Organization minimum · {}", choices.minimum_paste_warning)).size(13)
                 }),
             ].spacing(5),
+            self.terminal.ssh_paste_delay_view().map(terminal_edit),
+            self.terminal.ssh_launch_size_view().map(terminal_edit),
             column![
                 text("Session isolation").size(16),
                 terminal_overrides::isolation_row(
@@ -683,11 +972,11 @@ impl Draft {
                         IsolationChoice::ALL,
                         Some(self.isolation),
                         |value| Message::Edit(Edit::Isolation(value))
-                    ).width(Length::Fill),
+                    ).width(Length::Fill).keyboard_navigation(self.ids.behavior_isolation.clone()),
                 ),
                 text(format!("Effective isolation · {level} · {source}")).size(13),
                 self.terminal.strict_mode_view().map(|edit| Message::Edit(Edit::Terminal(edit))),
-                checkbox(self.incognito)
+                keyboard_table::action(checkbox(self.incognito)
                     .label(if choices.incognito_allowed {
                         "Incognito session"
                     } else {
@@ -697,10 +986,18 @@ impl Draft {
                         choices
                             .incognito_allowed
                             .then_some(|value| Message::Edit(Edit::Incognito(value)))
-                    ),
+                    ).into(), incognito, false),
             ]
             .spacing(6),
-            self.terminal.view(choices).map(|edit| Message::Edit(Edit::Terminal(edit))),
+            keyboard_table::action(
+                button(if self.show_additional_terminal_settings { "Hide additional terminal settings" } else { "Show additional terminal settings" })
+                    .style(dialog_design::secondary_button)
+                    .on_press(additional.clone())
+                    .into(),
+                Some(additional),
+                true,
+            ),
+            self.show_additional_terminal_settings.then(|| self.terminal.ssh_additional_style_view(defaults, own).map(terminal_edit)),
         ]
         .spacing(8);
         if let Some(effects) = choices.terminal_effects {
@@ -719,19 +1016,56 @@ impl Draft {
         editor.into()
     }
 
-    fn tunnels_page(&self) -> Element<'_, Message> {
-        column![button("Add tunnel").on_press_maybe(
-            (self.tunnels.len() < MAX_TUNNELS).then_some(Message::Edit(Edit::AddTunnel))
-        )]
-        .extend(
-            self.tunnels
-                .iter()
-                .enumerate()
-                .map(|(index, tunnel)| tunnel.view(index)),
+    fn terminal_settings_source(&self, defaults: &TerminalStyle) -> Element<'_, Message> {
+        use iced::keyboard::{Key, key::Named};
+        use keyboard_table::TableKey;
+
+        let own = self.own_terminal_settings;
+        let global = Message::Edit(Edit::UseOwnTerminalSettings(None));
+        let custom = Message::Edit(Edit::UseOwnTerminalSettings(Some(Box::new(
+            defaults.clone(),
+        ))));
+        let global_radio = radio("Use the global terminal settings", false, Some(own), {
+            let global = global.clone();
+            move |_| global.clone()
+        })
+        .text_size(14)
+        .size(16);
+        let custom_radio = radio("Own settings for this connection", true, Some(own), {
+            let custom = custom.clone();
+            move |_| custom.clone()
+        })
+        .text_size(14)
+        .size(16);
+        keyboard_table::view(
+            column![global_radio, custom_radio].spacing(9).into(),
+            move |key, modifiers, _| {
+                if !modifiers.is_empty() {
+                    return TableKey::Ignored;
+                }
+                match key {
+                    Key::Named(Named::ArrowDown | Named::ArrowRight) => {
+                        TableKey::Handled(Some(custom.clone()))
+                    }
+                    Key::Named(Named::ArrowUp | Named::ArrowLeft) => {
+                        TableKey::Handled(Some(global.clone()))
+                    }
+                    Key::Named(Named::Space) => TableKey::Handled(None),
+                    _ => TableKey::Ignored,
+                }
+            },
         )
-        .spacing(8)
-        .into()
     }
+}
+
+fn login_row<'a>(
+    label: &'static str,
+    field: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    row![text(label).size(14).width(LOGIN_LABEL_WIDTH), field.into()]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .into()
 }
 
 impl Login {
@@ -747,6 +1081,8 @@ impl Login {
             stored_key: None,
             passphrase: String::new(),
             temporary: TemporaryDraft::default(),
+            method_picker: Id::unique(),
+            credential_picker: Id::unique(),
         }
     }
 
@@ -911,74 +1247,156 @@ impl Login {
         })
     }
 
-    fn view<'a>(&'a self, jump: bool, choices: &ViewChoices<'_>) -> Element<'a, Message> {
+    fn endpoint_fields(&self, jump: bool, enabled: bool) -> Element<'_, Message> {
         let edit = move |edit| Message::Edit(Edit::Login(jump, edit));
-        let mut methods = vec![
-            Method::Ask,
-            Method::Vault,
-            Method::Key,
-            Method::StoredKey,
-            Method::Interactive,
-        ];
-        if (!jump && choices.temporary_keys) || self.method == Method::TemporaryKey {
-            methods.push(Method::TemporaryKey);
-        }
-        let mut fields = column![
-            row![
-                text_input("Hostname or IP", &self.host)
-                    .on_input(move |value| edit(LoginEdit::Host(value))),
-                text_input("Port", &self.port)
-                    .on_input(move |value| edit(LoginEdit::Port(value)))
-                    .width(80),
+        let port = dialog_design::number_input(
+            text_input("22", &self.port).on_input_maybe(enabled.then_some(LoginEdit::Port)),
+            &self.port,
+            1..=65535,
+            1,
+            enabled.then_some(LoginEdit::Port),
+            54.0,
+        )
+        .map(edit);
+        column![
+            login_row(
+                if jump { "Jump host" } else { "Host" },
+                row![
+                    text_input("Hostname or IP", &self.host).on_input_maybe(
+                        enabled.then_some(move |value| edit(LoginEdit::Host(value)))
+                    ),
+                    text("Port").size(14),
+                    port,
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+            ),
+            login_row(
+                "Username",
                 text_input("Username", &self.username)
-                    .on_input(move |value| edit(LoginEdit::Username(value))),
-            ]
-            .spacing(8),
-            pick_list(methods, Some(self.method), move |method| edit(
-                LoginEdit::Method(method)
-            )),
+                    .width(250)
+                    .on_input_maybe(
+                        enabled.then_some(move |value| edit(LoginEdit::Username(value)))
+                    ),
+            ),
         ]
-        .spacing(8);
+        .spacing(10)
+        .into()
+    }
+
+    fn authentication_fields<'a>(
+        &'a self,
+        jump: bool,
+        choices: &ViewChoices<'_>,
+        enabled: bool,
+    ) -> Element<'a, Message> {
+        if !enabled {
+            return self.disabled_authentication(choices);
+        }
+        let edit = move |edit| Message::Edit(Edit::Login(jump, edit));
+        let method_picker = |methods: Vec<_>| {
+            pick_list(methods, Some(self.method), move |method| {
+                edit(LoginEdit::Method(method))
+            })
+            .width(300)
+            .keyboard_navigation(self.method_picker.clone())
+        };
+        let method = if jump {
+            let mut methods = vec![
+                Method::Ask,
+                Method::Vault,
+                Method::Key,
+                Method::StoredKey,
+                Method::Interactive,
+            ];
+            if self.method == Method::TemporaryKey {
+                methods.push(Method::TemporaryKey);
+            }
+            login_row("Authentication", method_picker(methods))
+        } else {
+            login_row(
+                "Authentication",
+                self.authentication_options(choices.temporary_keys),
+            )
+        };
+        let mut fields = column![method].spacing(10);
+        if !jump {
+            let source = match self.method {
+                Method::Ask | Method::Vault => Some(login_row(
+                    "Password source",
+                    method_picker(vec![Method::Ask, Method::Vault]),
+                )),
+                Method::Key | Method::StoredKey => Some(login_row(
+                    "SSH key source",
+                    method_picker(vec![Method::Key, Method::StoredKey]),
+                )),
+                Method::TemporaryKey | Method::Interactive => None,
+            };
+            fields = fields.push(source);
+        }
         match self.method {
             Method::Ask | Method::Interactive => {}
             Method::Vault => {
                 let (choices, selected) =
                     CredentialChoice::options(choices.passwords, &self.password, false);
-                fields = fields.push(
+                fields = fields.push(login_row(
+                    "Saved credentials",
                     pick_list(choices, selected, move |choice| {
                         edit(LoginEdit::Password(choice))
                     })
-                    .placeholder("Unlock the vault to select a password"),
-                );
+                    .placeholder("Unlock the vault to select a password")
+                    .width(300)
+                    .keyboard_navigation(self.credential_picker.clone()),
+                ));
             }
             Method::Key => {
                 let (choices, selected) =
                     CredentialChoice::options(choices.passphrases, &self.passphrase, true);
                 fields = fields
-                    .push(
+                    .push(login_row(
+                        "Private key file",
                         text_input("Absolute private key path", &self.key_path)
                             .on_input(move |value| edit(LoginEdit::KeyPath(value))),
-                    )
-                    .push(pick_list(choices, selected, move |choice| {
-                        edit(LoginEdit::Passphrase(choice))
-                    }));
+                    ))
+                    .push(login_row(
+                        "Key passphrase",
+                        pick_list(choices, selected, move |choice| {
+                            edit(LoginEdit::Passphrase(choice))
+                        })
+                        .width(300)
+                        .keyboard_navigation(self.credential_picker.clone()),
+                    ));
             }
             Method::StoredKey => {
-                fields = fields.push(
+                fields = fields.push(login_row(
+                    "Registered SSH key",
                     pick_list(
                         choices.keys.to_vec(),
                         KeyChoice::selected(choices.keys, self.stored_key),
                         move |key| edit(LoginEdit::StoredKey(key)),
                     )
-                    .placeholder("Select a registered SSH key"),
-                );
+                    .placeholder("Select a registered SSH key")
+                    .width(300)
+                    .keyboard_navigation(self.credential_picker.clone()),
+                ));
             }
             Method::TemporaryKey => {
                 let key = &self.temporary;
                 let can_write = choices.temporary_keys && choices.vault_unlocked && !jump;
                 let can_set_options = can_write && (key.credential.is_none() || key.key.is_some());
+                let paste = can_write.then_some(Message::PasteTemporaryKey);
+                let remove = (choices.vault_unlocked
+                    && (key.credential.is_some() || key.key.is_some()))
+                .then_some(edit(LoginEdit::RemoveTemporaryKey));
+                let automatic = checkbox(key.automatic)
+                    .label("Select the saved key automatically until it expires")
+                    .on_toggle_maybe(
+                        can_set_options
+                            .then_some(move |enabled| edit(LoginEdit::TemporaryAutomatic(enabled))),
+                    );
                 fields = fields
-                    .push(
+                    .push(login_row(
+                        "Temporary key",
                         text(if key.key.is_some() {
                             "Private key pasted. Save to verify and store it."
                         } else if key.credential.is_some() {
@@ -987,8 +1405,9 @@ impl Login {
                             "Paste a private key for this SSH account."
                         })
                         .size(13),
-                    )
-                    .push(
+                    ))
+                    .push(login_row(
+                        "Expiration",
                         row![
                             text_input("1–1440", &key.minutes).width(88).on_input_maybe(
                                 can_set_options.then_some(move |minutes| edit(
@@ -996,167 +1415,180 @@ impl Login {
                                 ))
                             ),
                             text("minutes"),
-                            button("Paste private key")
-                                .on_press_maybe(can_write.then_some(Message::PasteTemporaryKey)),
-                            button("Remove key").on_press_maybe(
-                                (choices.vault_unlocked
-                                    && (key.credential.is_some() || key.key.is_some()))
-                                .then_some(edit(LoginEdit::RemoveTemporaryKey)),
+                            keyboard_table::action(
+                                button("Paste private key")
+                                    .on_press_maybe(paste.clone())
+                                    .into(),
+                                paste,
+                                true
+                            ),
+                            keyboard_table::action(
+                                button("Remove key").on_press_maybe(remove.clone()).into(),
+                                remove,
+                                true
                             ),
                         ]
                         .spacing(8)
+                        .align_y(Alignment::Center)
                         .wrap(),
-                    )
-                    .push(
-                        checkbox(key.automatic)
-                            .label("Select the saved key automatically until it expires")
-                            .on_toggle_maybe(can_set_options.then_some(move |enabled| {
-                                edit(LoginEdit::TemporaryAutomatic(enabled))
-                            })),
-                    );
+                    ))
+                    .push(login_row(
+                        "",
+                        keyboard_table::action(
+                            automatic.into(),
+                            can_set_options
+                                .then_some(edit(LoginEdit::TemporaryAutomatic(!key.automatic))),
+                            false,
+                        ),
+                    ));
                 if !choices.vault_unlocked {
-                    fields =
-                        fields.push(button("Open Credential Vault…").on_press(Message::OpenVault));
+                    fields = fields.push(login_row(
+                        "",
+                        keyboard_table::action(
+                            button("Open Credential Vault…")
+                                .on_press(Message::OpenVault)
+                                .into(),
+                            Some(Message::OpenVault),
+                            true,
+                        ),
+                    ));
                 } else if key.credential.is_some() && key.key.is_none() {
-                    fields = fields
-                        .push(text("Paste a replacement to change the key’s lifetime.").size(13));
+                    fields = fields.push(login_row(
+                        "",
+                        text("Paste a replacement to change the key’s lifetime.").size(13),
+                    ));
                 }
             }
         }
         if self.method != Method::Interactive {
-            fields = fields.push(
-                checkbox(self.keyboard_interactive)
-                    .label("Also allow keyboard-interactive")
-                    .on_toggle(move |enabled| edit(LoginEdit::KeyboardFollowUp(enabled))),
-            );
-        }
-        fields.into()
-    }
-}
-
-impl TunnelDraft {
-    fn new() -> Self {
-        Self {
-            enabled: true,
-            description: String::new(),
-            mode: TunnelMode::Local,
-            bind: String::new(),
-            port: String::new(),
-            host: String::new(),
-            target_port: String::new(),
-        }
-    }
-
-    fn from_config(config: &TunnelConfig) -> Self {
-        let mut draft = Self {
-            enabled: config.enabled,
-            description: config.description.clone(),
-            bind: config.rule.bind.ip().to_string(),
-            port: config.rule.bind.port().to_string(),
-            ..Self::new()
-        };
-        match &config.rule.target {
-            TunnelTarget::Local { host, port } | TunnelTarget::Remote { host, port } => {
-                draft.mode = if matches!(config.rule.target, TunnelTarget::Local { .. }) {
-                    TunnelMode::Local
-                } else {
-                    TunnelMode::Remote
-                };
-                draft.host = host.clone();
-                draft.target_port = port.to_string();
-            }
-            TunnelTarget::Dynamic => draft.mode = TunnelMode::Dynamic,
-        }
-        draft
-    }
-
-    fn update(&mut self, edit: TunnelEdit) {
-        match edit {
-            TunnelEdit::Enabled(value) => self.enabled = value,
-            TunnelEdit::Mode(mode) => self.mode = mode,
-            TunnelEdit::Bind(value) => self.bind = bounded(value, 64),
-            TunnelEdit::Port(value) => self.port = bounded(value, 8),
-            TunnelEdit::Host(value) => self.host = bounded(value, 256),
-            TunnelEdit::TargetPort(value) => self.target_port = bounded(value, 8),
-            TunnelEdit::Description(value) => self.description = bounded(value, 160),
-        }
-    }
-
-    fn config(&self) -> Result<TunnelConfig, &'static str> {
-        let address = self.bind.trim();
-        let ip: IpAddr = if address.is_empty() || address.eq_ignore_ascii_case("localhost") {
-            Ipv4Addr::LOCALHOST.into()
-        } else {
-            address
-                .parse()
-                .map_err(|_| "Use localhost or a numeric listen address.")?
-        };
-        let bind = SocketAddr::new(
-            ip,
-            port(&self.port).ok_or("Enter a listen port from 1 to 65535.")?,
-        );
-        let target = match self.mode {
-            TunnelMode::Local | TunnelMode::Remote => {
-                let host = normalize_host(&self.host)
-                    .map_err(|_| "Enter a service hostname or IP address.")?;
-                let port =
-                    port(&self.target_port).ok_or("Enter a service port from 1 to 65535.")?;
-                if self.mode == TunnelMode::Local {
-                    TunnelTarget::Local { host, port }
-                } else {
-                    TunnelTarget::Remote { host, port }
-                }
-            }
-            TunnelMode::Dynamic => TunnelTarget::Dynamic,
-        };
-        Ok(TunnelConfig {
-            enabled: self.enabled,
-            description: self.description.trim().into(),
-            rule: TunnelRule { bind, target },
-        })
-    }
-
-    fn view(&self, index: usize) -> Element<'_, Message> {
-        let edit = move |edit| Message::Edit(Edit::Tunnel(index, edit));
-        let mut fields = column![
-            row![
-                checkbox(self.enabled)
-                    .label("Enabled")
-                    .on_toggle(move |value| edit(TunnelEdit::Enabled(value))),
-                pick_list(
-                    [TunnelMode::Local, TunnelMode::Remote, TunnelMode::Dynamic],
-                    Some(self.mode),
-                    move |mode| edit(TunnelEdit::Mode(mode))
+            let follow_up = checkbox(self.keyboard_interactive)
+                .label("Also allow keyboard-interactive")
+                .on_toggle(move |enabled| edit(LoginEdit::KeyboardFollowUp(enabled)));
+            fields = fields.push(login_row(
+                "",
+                keyboard_table::action(
+                    follow_up.into(),
+                    Some(edit(LoginEdit::KeyboardFollowUp(
+                        !self.keyboard_interactive,
+                    ))),
+                    false,
                 ),
-                text_input("Description (optional)", &self.description)
-                    .on_input(move |value| edit(TunnelEdit::Description(value))),
-                button("Remove").on_press(Message::Edit(Edit::RemoveTunnel(index))),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
-            row![
-                text_input("Listen address (localhost)", &self.bind)
-                    .on_input(move |value| edit(TunnelEdit::Bind(value))),
-                text_input("Listen port", &self.port)
-                    .on_input(move |value| edit(TunnelEdit::Port(value)))
-                    .width(105),
-            ]
-            .spacing(8),
-        ]
-        .spacing(6);
-        if self.mode != TunnelMode::Dynamic {
-            fields = fields.push(
-                row![
-                    text_input("Service hostname or IP", &self.host)
-                        .on_input(move |value| edit(TunnelEdit::Host(value))),
-                    text_input("Service port", &self.target_port)
-                        .on_input(move |value| edit(TunnelEdit::TargetPort(value)))
-                        .width(105),
-                ]
-                .spacing(8),
-            );
+            ));
         }
         fields.into()
+    }
+
+    fn disabled_authentication<'a>(&self, choices: &ViewChoices<'_>) -> Element<'a, Message> {
+        let disabled = |label, value: &str| login_row(label, text_input("", value).width(300));
+        let credential = choices
+            .passwords
+            .iter()
+            .find(|choice| choice.id == self.password);
+        let key = KeyChoice::selected(choices.keys, self.stored_key);
+        let fields = match self.method {
+            Method::Ask | Method::Vault => Some(disabled(
+                "Saved credentials",
+                credential.map_or("Ask when connecting", |choice| choice.label.as_str()),
+            )),
+            Method::Key => Some(disabled("Private key file", &self.key_path)),
+            Method::StoredKey => Some(disabled(
+                "Registered SSH key",
+                key.as_ref()
+                    .map_or("Select a registered SSH key", |choice| choice.name.as_str()),
+            )),
+            Method::TemporaryKey => Some(disabled("Expiration", &self.temporary.minutes)),
+            Method::Interactive => None,
+        };
+        column![
+            disabled("Authentication", &self.method.to_string()),
+            fields,
+            (self.method != Method::Interactive).then(|| login_row(
+                "",
+                checkbox(self.keyboard_interactive).label("Also allow keyboard-interactive")
+            )),
+        ]
+        .spacing(10)
+        .into()
+    }
+
+    fn authentication_options(&self, temporary_keys: bool) -> Element<'_, Message> {
+        use iced::keyboard::{Key, key::Named};
+        use keyboard_table::TableKey;
+
+        let selected = match self.method {
+            Method::Vault => Method::Ask,
+            Method::StoredKey => Method::Key,
+            method => method,
+        };
+        let option = |label, value, method| {
+            radio(label, value, Some(selected), |_| {
+                let next = if value == selected {
+                    self.method
+                } else {
+                    method
+                };
+                Message::Edit(Edit::Login(false, LoginEdit::Method(next)))
+            })
+            .text_size(14)
+            .size(16)
+        };
+        let password = if self.password.is_empty() {
+            Method::Ask
+        } else {
+            Method::Vault
+        };
+        let key = if self.stored_key.is_some() {
+            Method::StoredKey
+        } else {
+            Method::Key
+        };
+        let temporary_keys = temporary_keys || self.method == Method::TemporaryKey;
+        let mut methods = vec![
+            ("Password", Method::Ask, password),
+            ("SSH key", Method::Key, key),
+        ];
+        if temporary_keys {
+            methods.push((
+                "Temporary SSH key",
+                Method::TemporaryKey,
+                Method::TemporaryKey,
+            ));
+        }
+        methods.push((
+            "Keyboard-interactive",
+            Method::Interactive,
+            Method::Interactive,
+        ));
+        let current = methods
+            .iter()
+            .position(|(_, family, _)| *family == selected)
+            .unwrap_or(0);
+        let content = iced::widget::row(
+            methods
+                .iter()
+                .map(|&(label, family, method)| option(label, family, method).into()),
+        )
+        .spacing(12)
+        .align_y(Alignment::Center)
+        .wrap()
+        .into();
+        keyboard_table::view(content, move |key, modifiers, _| {
+            if !modifiers.is_empty() {
+                return TableKey::Ignored;
+            }
+            let index = match key {
+                Key::Named(Named::ArrowDown | Named::ArrowRight) => (current + 1) % methods.len(),
+                Key::Named(Named::ArrowUp | Named::ArrowLeft) => {
+                    (current + methods.len() - 1) % methods.len()
+                }
+                Key::Named(Named::Space) => return TableKey::Handled(None),
+                _ => return TableKey::Ignored,
+            };
+            TableKey::Handled(Some(Message::Edit(Edit::Login(
+                false,
+                LoginEdit::Method(methods[index].2),
+            ))))
+        })
     }
 }
 
@@ -1179,6 +1611,113 @@ fn port(value: &str) -> Option<u16> {
 #[cfg(test)]
 mod page_tests {
     use super::*;
+
+    #[test]
+    fn ssh_editor_port_stepper_routes_edits_to_the_correct_login() {
+        use iced::advanced::widget::operation::focusable;
+        use iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
+        use iced::keyboard::{Key, key::Named};
+        use iced::{Event, Font, Renderer, Size, mouse};
+        use iced_runtime::{Action, UserInterface, task, user_interface::Cache};
+
+        use crate::settings_search::test_input;
+
+        let login = Login::new();
+        let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+        let size = Size::new(520.0, 350.0);
+        for jump in [false, true] {
+            let mut view = login.endpoint_fields(jump, true);
+            let mut tree = Tree::new(view.as_widget());
+            let node = view.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, size),
+            );
+            let layout = Layout::new(&node);
+            let mut fields = layout.children();
+            let host = fields.next().unwrap().children().nth(1).unwrap();
+            let username = fields.next().unwrap().children().nth(1).unwrap();
+            assert_eq!(host.bounds().x, username.bounds().x);
+            let spinner = host.children().nth(2).unwrap();
+            let buttons = spinner.children().nth(1).unwrap();
+            let cursor =
+                mouse::Cursor::Available(buttons.children().next().unwrap().bounds().center());
+            let mut messages = Vec::new();
+            for event in [
+                mouse::Event::ButtonPressed(mouse::Button::Left),
+                mouse::Event::ButtonReleased(mouse::Button::Left),
+            ] {
+                view.as_widget_mut().update(
+                    &mut tree,
+                    &Event::Mouse(event),
+                    layout,
+                    cursor,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &node.bounds(),
+                );
+            }
+            assert!(matches!(
+                messages.as_slice(),
+                [Message::Edit(Edit::Login(actual, LoginEdit::Port(port)))]
+                    if *actual == jump && port == "23"
+            ));
+            let mut interface = UserInterface::build(
+                login.endpoint_fields(jump, true),
+                size,
+                Cache::default(),
+                &mut renderer,
+            );
+            for _ in 0..2 {
+                test_input::apply(
+                    &mut interface,
+                    &renderer,
+                    task::effect(Action::widget(focusable::focus_next())),
+                );
+            }
+            let messages = test_input::press(
+                &mut interface,
+                &mut renderer,
+                Key::Named(Named::ArrowDown),
+                None,
+            );
+            assert!(matches!(
+                messages.as_slice(),
+                [Message::Edit(Edit::Login(actual, LoginEdit::Port(port)))]
+                    if *actual == jump && port == "21"
+            ));
+        }
+    }
+
+    #[test]
+    fn disabling_the_jump_host_preserves_its_draft_and_ignores_disabled_edits() {
+        let mut draft = Draft::new();
+        draft.update(Edit::Name("Fixture".into()));
+        draft.update(Edit::Login(false, LoginEdit::Host("target.example".into())));
+        draft.update(Edit::UseJump(true));
+        draft.update(Edit::Login(true, LoginEdit::Host("jump.example".into())));
+        draft.update(Edit::Login(true, LoginEdit::Port("2223".into())));
+        draft.update(Edit::UseJump(false));
+        draft.update(Edit::Login(true, LoginEdit::Port("22".into())));
+        assert!(draft.connection().unwrap().jump.is_none());
+        draft.update(Edit::UseJump(true));
+        let jump = draft.connection().unwrap().jump.unwrap();
+        assert_eq!(jump.endpoint.host, "jump.example");
+        assert_eq!(jump.endpoint.port, 2223);
+    }
+
+    #[test]
+    fn reselecting_the_current_authentication_keeps_a_pending_temporary_key() {
+        let mut draft = Draft::new();
+        draft.update(Edit::Login(false, LoginEdit::Host("ssh.example".into())));
+        draft.update(Edit::Login(false, LoginEdit::Method(Method::TemporaryKey)));
+        draft.changed = false;
+        assert!(draft.begin_temporary_paste(9));
+        draft.update(Edit::Login(false, LoginEdit::Method(Method::TemporaryKey)));
+        assert!(!draft.changed);
+        assert!(draft.finish_temporary_paste(9, Password::new("fixture".into())));
+    }
 
     #[test]
     fn switching_pages_preserves_the_draft_without_making_it_dirty() {

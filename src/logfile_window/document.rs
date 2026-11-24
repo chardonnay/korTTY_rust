@@ -1,23 +1,27 @@
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Mutex;
 
 use bzip2::read::MultiBzDecoder;
 use flate2::read::MultiGzDecoder;
+use memchr::memchr_iter;
 
 use crate::sftp_window::StagedDownload;
+use crate::terminal_logging::MAX_LOG_BYTES;
 
 use super::catalog::{Compression, Entry, Format, check_cancel, check_path, invalid};
 use super::range::Range;
 
-const MAX_PLAIN: u64 = 512 * 1024 * 1024;
-const MAX_PACKED_VIEW: u64 = 64 * 1024 * 1024;
-const MAX_OUTPUT: u64 = 512 * 1024 * 1024;
+// Java may write the XML or JSON footer after reaching the rotation size.
+const MAX_PLAIN: u64 = MAX_LOG_BYTES + 24;
+const MAX_PACKED_INPUT: u64 = 1024 * 1024 * 1024;
+const MAX_OUTPUT: u64 = MAX_PLAIN;
 const MAX_ENTRY: usize = 16 * 1024 * 1024;
 const MAX_PREAMBLE: u64 = 64 * 1024;
-const MAX_LINES: usize = 2 * 1024 * 1024;
+const INDEX_LINES: usize = 1024;
+const INDEX_BYTES: u64 = 1024 * 1024;
 const PREVIEW_BYTES: usize = 32 * 1024;
 const PREVIEW_CHARS: usize = 8192;
 pub const PAGE_LINES: usize = 200;
@@ -75,21 +79,27 @@ pub(super) fn preamble(
     ))
 }
 
-enum Image {
-    Plain(Mutex<File>),
-    Packed(Vec<u8>),
+struct Checkpoint {
+    row: usize,
+    offset: u64,
+}
+
+#[derive(Default)]
+struct LineIndex {
+    checkpoints: Vec<Checkpoint>,
+    rows: usize,
 }
 
 pub struct Document {
-    image: Image,
-    offsets: Vec<u64>,
+    file: Mutex<File>,
+    index: LineIndex,
     length: u64,
 }
 
 impl std::fmt::Debug for Document {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LogDocument")
-            .field("lines", &self.offsets.len())
+            .field("lines", &self.index.rows)
             .finish_non_exhaustive()
     }
 }
@@ -114,49 +124,47 @@ impl Document {
         let source = entry.read()?;
         let file = source.file().try_clone()?;
         let length = source.size();
-        if length > MAX_PLAIN {
-            return Err(invalid("The logfile exceeds the 512 MiB input limit"));
-        }
-        if entry.compression() == Compression::None {
-            let offsets = index(BufReader::new((&file).take(length)), length, &cancelled)?;
-            if !entry.live {
-                source.verify()?;
+        let compression = entry.compression();
+        check_input_size(length, compression)?;
+        let (file, index, indexed_length) = if compression == Compression::None {
+            let (index, indexed_length) =
+                index_log((&file).take(length), None, MAX_PLAIN, &cancelled)?;
+            if indexed_length != length {
+                return Err(invalid("The logfile shortened while reading the snapshot"));
             }
-            Ok(Self {
-                image: Image::Plain(Mutex::new(file)),
-                offsets,
-                length,
-            })
+            (file, index, indexed_length)
         } else {
-            let mut bytes = Vec::new();
-            copy_bounded(
-                decoded(file.take(length), entry.compression(), &cancelled),
-                &mut bytes,
-                MAX_PACKED_VIEW,
+            // Keep the decoded image in a private, delete-on-close temporary
+            // file. Only the line index and currently displayed page use RAM.
+            let mut image = BufWriter::with_capacity(128 * 1024, tempfile::tempfile()?);
+            let (index, indexed_length) = index_log(
+                decoded(file.take(length), compression, &cancelled),
+                Some(&mut image),
+                MAX_PLAIN,
                 &cancelled,
             )?;
-            let length = bytes.len() as u64;
-            let offsets = index(Cursor::new(&bytes), length, &cancelled)?;
-            if !entry.live {
-                source.verify()?;
-            }
-            Ok(Self {
-                image: Image::Packed(bytes),
-                offsets,
-                length,
-            })
+            let file = image.into_inner().map_err(|error| error.into_error())?;
+            (file, index, indexed_length)
+        };
+        if !entry.live {
+            source.verify()?;
         }
+        Ok(Self {
+            file: Mutex::new(file),
+            index,
+            length: indexed_length,
+        })
     }
 
     pub fn lines(&self) -> usize {
-        self.offsets.len()
+        self.index.rows
     }
 
     pub fn page(&self, first: usize, cancelled: impl Fn() -> bool) -> io::Result<Page> {
         let first = first.min(self.lines().saturating_sub(1));
         let mut lines = Vec::new();
         if first < self.lines() {
-            self.at(first, |input| {
+            self.at(first, &cancelled, |input| {
                 for _ in 0..PAGE_LINES {
                     check_cancel(&cancelled)?;
                     let Some((bytes, clipped)) =
@@ -219,59 +227,106 @@ impl Document {
     fn at<T>(
         &self,
         row: usize,
+        cancelled: &impl Fn() -> bool,
         read: impl FnOnce(&mut dyn BufRead) -> io::Result<T>,
     ) -> io::Result<T> {
-        let offset = self.offsets[row];
-        match &self.image {
-            Image::Plain(file) => {
-                let mut file = file.lock().unwrap_or_else(|error| error.into_inner());
-                if file.metadata()?.len() < self.length {
-                    return Err(invalid("The logfile shortened. Refresh the viewer."));
-                }
-                file.seek(SeekFrom::Start(offset))?;
-                read(&mut BufReader::new((&*file).take(self.length - offset)))
-            }
-            Image::Packed(bytes) => read(&mut Cursor::new(&bytes[offset as usize..])),
+        let checkpoints = &self.index.checkpoints;
+        let checkpoint = &checkpoints[checkpoints.partition_point(|item| item.row <= row) - 1];
+        let mut file = self.file.lock().unwrap_or_else(|error| error.into_inner());
+        if file.metadata()?.len() < self.length {
+            return Err(invalid("The logfile shortened. Refresh the viewer."));
         }
+        file.seek(SeekFrom::Start(checkpoint.offset))?;
+        let mut input = BufReader::new((&*file).take(self.length - checkpoint.offset));
+        skip_lines(&mut input, row - checkpoint.row, cancelled)?;
+        read(&mut input)
     }
 }
 
-fn index(
-    mut input: impl BufRead,
-    length: u64,
-    cancelled: &impl Fn() -> bool,
-) -> io::Result<Vec<u64>> {
-    let mut offsets = Vec::new();
-    if length == 0 {
-        return Ok(offsets);
+fn check_input_size(length: u64, compression: Compression) -> io::Result<()> {
+    let limit = if compression == Compression::None {
+        MAX_PLAIN
+    } else {
+        MAX_PACKED_INPUT
+    };
+    if length > limit {
+        return Err(invalid("The logfile exceeds its input size limit"));
     }
-    offsets.push(0);
+    Ok(())
+}
+
+fn index_log(
+    mut input: impl Read,
+    mut image: Option<&mut dyn Write>,
+    limit: u64,
+    cancelled: &impl Fn() -> bool,
+) -> io::Result<(LineIndex, u64)> {
+    let mut index = LineIndex::default();
+    let mut chunk = vec![0; 128 * 1024];
     let mut position = 0_u64;
+    let mut ended_with_newline = false;
+    let mut checkpoint = Checkpoint { row: 0, offset: 0 };
     loop {
+        check_cancel(cancelled)?;
+        let count = input.read(&mut chunk)?;
+        if count == 0 {
+            break;
+        }
+        let end = position + count as u64;
+        if end > limit {
+            return Err(invalid("The decoded logfile exceeds its size limit"));
+        }
+        let bytes = &chunk[..count];
+        if let Some(output) = image.as_mut() {
+            output.write_all(bytes)?;
+        }
+        for newline in memchr_iter(b'\n', bytes) {
+            index.rows += 1;
+            let offset = position + newline as u64 + 1;
+            if index.rows - checkpoint.row >= INDEX_LINES
+                || offset - checkpoint.offset >= INDEX_BYTES
+            {
+                index.checkpoints.push(checkpoint);
+                checkpoint = Checkpoint {
+                    row: index.rows,
+                    offset,
+                };
+            }
+        }
+        ended_with_newline = bytes.last() == Some(&b'\n');
+        position = end;
+    }
+    if checkpoint.offset < position {
+        index.checkpoints.push(checkpoint);
+    }
+    if position != 0 && !ended_with_newline {
+        index.rows += 1;
+    }
+    Ok((index, position))
+}
+
+fn skip_lines(
+    input: &mut dyn BufRead,
+    mut lines: usize,
+    cancelled: &impl Fn() -> bool,
+) -> io::Result<()> {
+    while lines != 0 {
         check_cancel(cancelled)?;
         let bytes = input.fill_buf()?;
         if bytes.is_empty() {
-            break;
+            return Err(invalid("The logfile shortened. Refresh the viewer."));
         }
-        for (index, byte) in bytes.iter().enumerate() {
-            let next = position + index as u64 + 1;
-            if *byte == b'\n' && next < length {
-                if offsets.len() == MAX_LINES {
-                    return Err(invalid(
-                        "The logfile exceeds the two-million-line viewer limit",
-                    ));
-                }
-                offsets.push(next);
+        let mut consumed = bytes.len();
+        for newline in memchr_iter(b'\n', bytes) {
+            lines -= 1;
+            if lines == 0 {
+                consumed = newline + 1;
+                break;
             }
         }
-        let consumed = bytes.len();
-        position += consumed as u64;
         input.consume(consumed);
     }
-    if position != length {
-        return Err(invalid("The logfile shortened while reading the snapshot"));
-    }
-    Ok(offsets)
+    Ok(())
 }
 
 fn display(bytes: &[u8], clipped: bool) -> String {
@@ -404,9 +459,7 @@ pub(super) fn export_range(
         return Err(invalid("Choose a new file for the logfile export"));
     }
     let source = entry.require_closed()?;
-    if source.size() > MAX_PLAIN {
-        return Err(invalid("The logfile exceeds the 512 MiB input limit"));
-    }
+    check_input_size(source.size(), entry.compression())?;
     let reader = decoded(
         source.file().try_clone()?.take(source.size()),
         entry.compression(),

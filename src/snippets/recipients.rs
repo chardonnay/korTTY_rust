@@ -166,6 +166,10 @@ pub(super) fn certificate(path: &Path, choice: &Choice) -> io::Result<String> {
     Ok(document.entries.swap_remove(index).certificate)
 }
 
+pub(crate) fn require_current_choice(root: &Path, choice: &Choice) -> io::Result<()> {
+    certificate(&root.join(FILE_NAME), choice).map(drop)
+}
+
 pub(super) fn certificate_by_fingerprint(path: &Path, fingerprint: &str) -> io::Result<String> {
     let fingerprint = normalize_fingerprint(fingerprint)?;
     Document::read(path)?

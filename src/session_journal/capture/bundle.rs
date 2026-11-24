@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
-use std::io::{self, Read as _};
+use std::io::{self, BufRead, BufReader, Read as _, Write};
 
 use jiff::Timestamp;
 
@@ -81,14 +81,14 @@ impl ScreenshotRef {
     }
 }
 
-pub(in crate::session_journal) enum Output<'a> {
-    Part(PartOutput<'a>),
-    Record(PreviewRecord),
-}
+pub(in crate::session_journal) type MemberData<'a> =
+    dyn FnMut(&mut dyn Write) -> io::Result<()> + 'a;
+pub(in crate::session_journal) type WriteMember<'a> =
+    dyn FnMut(&str, &mut MemberData<'_>) -> io::Result<()> + 'a;
 
-pub(in crate::session_journal) struct PartOutput<'a> {
-    pub name: &'a str,
-    pub bytes: &'a [u8],
+pub(in crate::session_journal) struct Output<'a, 'b> {
+    pub members: Option<&'a mut WriteMember<'b>>,
+    pub record: &'a mut dyn FnMut(PreviewRecord) -> io::Result<()>,
 }
 
 pub(in crate::session_journal) struct PreviewRecord {
@@ -103,8 +103,8 @@ pub(in crate::session_journal) struct Exported {
     pub partial: bool,
 }
 
-/// Emits each bounded decoded part once and releases it before opening the next.
-/// The caller stages all output, since a later part or callback can still fail.
+/// Streams decoded parts. Filtered members are opened only after a scan finds retained rows.
+/// The caller stages all output, since a later read or callback can still fail.
 pub(in crate::session_journal) fn export(
     source: &LocalSource,
     journal_id: &str,
@@ -112,7 +112,7 @@ pub(in crate::session_journal) fn export(
     selection: Option<Selection<'_>>,
     budget: &mut u64,
     cancelled: &dyn Fn() -> bool,
-    mut emit: impl FnMut(Output<'_>) -> io::Result<()>,
+    mut output: Output<'_, '_>,
 ) -> io::Result<Exported> {
     check_content_cancel(cancelled)?;
     if selection
@@ -121,7 +121,7 @@ pub(in crate::session_journal) fn export(
     {
         return Ok(Exported::default());
     }
-    let (parts, status) = discover_parts(source, declared_parts)?;
+    let (parts, status) = discover_parts(source, declared_parts, cancelled)?;
     if status.limited {
         return Err(invalid(
             "Journal capture discovery exceeds the bundle limit",
@@ -133,74 +133,62 @@ pub(in crate::session_journal) fn export(
     };
     for part in parts.values() {
         check_content_cancel(cancelled)?;
-        let mut bytes = read_part(source, part, budget, cancelled)?;
         let scan = PartScan {
             part,
             journal_id,
             selection: selection.as_ref(),
             cancelled,
         };
-        let kept = scan.run(&mut bytes, &mut exported, &mut emit)?;
-        if selection.is_none() || kept {
-            let name = match part.compression {
-                Compression::Plain => part.name.as_str(),
-                Compression::Zstd => part.name.trim_end_matches(".zst"),
-                Compression::Gzip => part.name.trim_end_matches(".gz"),
-            };
-            check_content_cancel(cancelled)?;
-            emit(Output::Part(PartOutput {
-                name,
-                bytes: &bytes,
-            }))?;
-        }
+        let name = match part.compression {
+            Compression::Plain => part.name.as_str(),
+            Compression::Zstd => part.name.trim_end_matches(".zst"),
+            Compression::Gzip => part.name.trim_end_matches(".gz"),
+        };
+        let limit = (*budget).min(MAX_PART_BYTES);
+        let mut preview = |record, reference: Option<&str>| {
+            PartScan::record(&mut exported, output.record, record, reference)
+        };
+        let read = match (selection.is_some(), output.members.as_deref_mut()) {
+            (false, Some(member)) => {
+                let mut scanned = None;
+                member(name, &mut |target| {
+                    scanned = Some(scan.read(source, limit, None, target, &mut preview)?);
+                    Ok(())
+                })?;
+                scanned.ok_or_else(|| invalid("Journal capture writer skipped a member"))?
+            }
+            (true, Some(member)) => {
+                let reviewed = scan.read(source, limit, None, &mut io::sink(), &mut preview)?;
+                if reviewed.kept {
+                    member(name, &mut |target| {
+                        scan.read(source, limit, Some(&reviewed.stamp), target, &mut |_, _| {
+                            Ok(())
+                        })?;
+                        Ok(())
+                    })?;
+                }
+                reviewed
+            }
+            (_, None) => scan.read(source, limit, None, &mut io::sink(), &mut preview)?,
+        };
+        exported.partial |= read.partial;
+        *budget -= read.bytes;
     }
     check_content_cancel(cancelled)?;
     Ok(exported)
 }
 
-fn read_part(
-    source: &LocalSource,
-    part: &Part,
-    budget: &mut u64,
-    cancelled: &dyn Fn() -> bool,
-) -> io::Result<Vec<u8>> {
-    let file = source.open_sibling(OsStr::new(&part.name))?;
-    require_single_link(&file)?;
-    let stamp = FileStamp::read(&file)?;
-    let size = file.metadata()?.len();
-    let limit = (*budget).min(MAX_PART_BYTES);
-    if size > limit {
-        return Err(invalid(
-            "Journal capture part exceeds the bundle byte limit",
-        ));
-    }
-    let mut bytes = Vec::new();
-    let mut raw = (&file).take(size + 1);
-    {
-        let decoded = part.decode(ContentReader::new(&mut raw, cancelled), cancelled);
-        let mut bounded = ContentReader::new(decoded, cancelled).take(limit);
-        let result = bounded.read_to_end(&mut bytes);
-        check_content_cancel(cancelled)?;
-        result?;
-        if bounded.limit() == 0 {
-            let result = bounded.get_mut().read(&mut [0]);
-            check_content_cancel(cancelled)?;
-            if result? != 0 {
-                return Err(invalid(
-                    "Decoded journal capture part exceeds the bundle byte limit",
-                ));
-            }
-        }
-    }
-    if raw.limit() != 1 {
-        return Err(invalid(
-            "Journal capture part changed or was incompletely decoded",
-        ));
-    }
-    stamp.require_unchanged(&file)?;
-    require_single_link(&file)?;
-    *budget -= size.max(bytes.len() as u64);
-    Ok(bytes)
+struct ReadPart {
+    stamp: FileStamp,
+    bytes: u64,
+    kept: bool,
+    partial: bool,
+}
+
+#[derive(Default)]
+struct PartResult {
+    kept: bool,
+    partial: bool,
 }
 
 struct PartScan<'a> {
@@ -211,36 +199,97 @@ struct PartScan<'a> {
 }
 
 impl PartScan<'_> {
-    fn run(
+    fn read(
         &self,
-        bytes: &mut Vec<u8>,
-        exported: &mut Exported,
-        emit: &mut impl FnMut(Output<'_>) -> io::Result<()>,
-    ) -> io::Result<bool> {
+        source: &LocalSource,
+        limit: u64,
+        reviewed: Option<&FileStamp>,
+        output: &mut dyn Write,
+        preview: &mut dyn FnMut(CaptureRecord, Option<&str>) -> io::Result<()>,
+    ) -> io::Result<ReadPart> {
+        check_content_cancel(self.cancelled)?;
+        let name = OsStr::new(&self.part.name);
+        let file = source.open_sibling(name)?;
+        require_single_link(&file)?;
+        let stamp = FileStamp::read(&file)?;
+        if reviewed.is_some_and(|reviewed| *reviewed != stamp) {
+            return Err(invalid("Journal capture part changed during export"));
+        }
+        let size = file.metadata()?.len();
+        if size > limit {
+            return Err(invalid(
+                "Journal capture part exceeds the bundle byte limit",
+            ));
+        }
+        let mut raw = (&file).take(size + 1);
+        let (decoded_size, result) = {
+            let decoded = self
+                .part
+                .decode(ContentReader::new(&mut raw, self.cancelled), self.cancelled);
+            let mut reader =
+                BufReader::new(ContentReader::new(decoded, self.cancelled).take(limit + 1));
+            let result = self.lines(&mut reader, output, preview);
+            check_content_cancel(self.cancelled)?;
+            (limit + 1 - reader.get_ref().limit(), result?)
+        };
+        if decoded_size > limit {
+            return Err(invalid(
+                "Decoded journal capture part exceeds the bundle byte limit",
+            ));
+        }
+        if raw.limit() != 1 {
+            return Err(invalid(
+                "Journal capture part changed or was incompletely decoded",
+            ));
+        }
+        stamp.require_unchanged(&file)?;
+        require_single_link(&file)?;
+        let current = source.open_sibling(name)?;
+        stamp.require_unchanged(&current)?;
+        require_single_link(&current)?;
+        Ok(ReadPart {
+            stamp,
+            bytes: size.max(decoded_size),
+            kept: result.kept,
+            partial: result.partial,
+        })
+    }
+
+    fn lines(
+        &self,
+        reader: &mut impl BufRead,
+        output: &mut dyn Write,
+        preview: &mut dyn FnMut(CaptureRecord, Option<&str>) -> io::Result<()>,
+    ) -> io::Result<PartResult> {
         let mut envelope = PartEnvelope::default();
-        let mut offset = 0;
-        let mut written = 0;
-        let mut kept = false;
+        let mut line = Vec::new();
+        let mut result = PartResult::default();
+        let mut written = 0u64;
+        let mut newline = true;
         let mut body_started = false;
         let mut yaml_entries = false;
-        while offset < bytes.len() {
+        loop {
             check_content_cancel(self.cancelled)?;
-            let end = bytes[offset..]
-                .iter()
-                .position(|&byte| byte == b'\n')
-                .map_or(bytes.len(), |length| offset + length + 1);
-            let line = &bytes[offset..end];
+            if read_line(reader, &mut line)? == 0 {
+                break;
+            }
+            if self.selection.is_none() {
+                output.write_all(&line)?;
+            }
             if line.len() as u64 > MAX_LINE_BYTES {
                 if self.selection.is_some() {
                     return Err(invalid(
                         "Journal capture line exceeds the bundle line limit",
                     ));
                 }
-                exported.partial = true;
-                offset = end;
+                result.partial = true;
+                while line.last() != Some(&b'\n') && read_line(reader, &mut line)? != 0 {
+                    check_content_cancel(self.cancelled)?;
+                    output.write_all(&line)?;
+                }
                 continue;
             }
-            let parsed = envelope.line(line, self.part, self.journal_id, CaptureText::Bundle)?;
+            let parsed = envelope.line(&line, self.part, self.journal_id, CaptureText::Bundle)?;
             let retain = match parsed {
                 PartLine::Record(record, reference) => {
                     body_started = true;
@@ -252,8 +301,8 @@ impl PartScan<'_> {
                     }
                     let retain = self.retains(&record);
                     if retain {
-                        kept = true;
-                        Self::record(exported, emit, record, reference.as_deref())?;
+                        result.kept = true;
+                        preview(record, reference.as_deref())?;
                     }
                     retain
                 }
@@ -263,35 +312,35 @@ impl PartScan<'_> {
                 }
                 PartLine::Preamble | PartLine::Header => true,
                 PartLine::Skipped | PartLine::Metadata => {
-                    exported.partial = true;
+                    result.partial = true;
                     false
                 }
                 _ => false,
             };
             if self.selection.is_some() && retain {
-                bytes.copy_within(offset..end, written);
-                written += end - offset;
+                output.write_all(&line)?;
+                written += line.len() as u64;
+                newline = line.last() == Some(&b'\n');
             }
-            offset = end;
         }
-        exported.partial |= !envelope.header || !envelope.footer;
-        if self.selection.is_some() && kept {
-            bytes.truncate(written);
-            if bytes.last() != Some(&b'\n') {
-                bytes.push(b'\n');
-            }
-            bytes.extend_from_slice(match self.part.format {
+        result.partial |= !envelope.header || !envelope.footer;
+        if self.selection.is_some() && result.kept {
+            let footer: &[u8] = match self.part.format {
                 Format::Xml => b"</session-log>\n",
                 Format::Json => b"{\"type\":\"end\"}\n",
                 Format::Yaml => b"end: true\n",
-            });
-            if bytes.len() as u64 > MAX_PART_BYTES {
+            };
+            if written + u64::from(!newline) + footer.len() as u64 > MAX_PART_BYTES {
                 return Err(invalid(
                     "Rewritten journal capture part exceeds the bundle byte limit",
                 ));
             }
+            if !newline {
+                output.write_all(b"\n")?;
+            }
+            output.write_all(footer)?;
         }
-        Ok(kept)
+        Ok(result)
     }
 
     fn retains(&self, record: &CaptureRecord) -> bool {
@@ -302,7 +351,7 @@ impl PartScan<'_> {
 
     fn record(
         exported: &mut Exported,
-        emit: &mut impl FnMut(Output<'_>) -> io::Result<()>,
+        emit: &mut dyn FnMut(PreviewRecord) -> io::Result<()>,
         mut record: CaptureRecord,
         reference: Option<&str>,
     ) -> io::Result<()> {
@@ -322,8 +371,13 @@ impl PartScan<'_> {
         } else {
             record.text = display_text(&record.text);
         }
-        emit(Output::Record(PreviewRecord { record, screenshot }))
+        emit(PreviewRecord { record, screenshot })
     }
+}
+
+fn read_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> io::Result<usize> {
+    line.clear();
+    reader.take(MAX_LINE_BYTES + 1).read_until(b'\n', line)
 }
 
 #[cfg(test)]

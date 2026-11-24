@@ -54,7 +54,8 @@ mod tests;
 pub(crate) use capture::capture_page;
 pub(crate) use capture::{CaptureKind, CapturePage, CaptureRecord, Cursor, LiveCursor, LivePage};
 pub(crate) use connection::{
-    ConnectionConfig, MAX_PART_MIB, MAX_PARTS as MAX_CONNECTION_JOURNAL_PARTS, MAX_SUMMARY_MINUTES,
+    ConnectionConfig, DEFAULT_PART_LIMIT, MAX_PART_MIB, MAX_PARTS as MAX_CONNECTION_JOURNAL_PARTS,
+    MAX_SUMMARY_MINUTES,
 };
 pub(crate) use links::{LinkField, LinkSpan, LinkTarget};
 pub(crate) use metadata::{MetadataEdit, edit_metadata, edit_metadata_in};

@@ -498,6 +498,13 @@ impl SshCommand {
         let mut selected = BTreeSet::new();
         for target in self.targets() {
             target.validate()?;
+            if target.temporary_keys.is_some()
+                && (self.agent.is_some() || self.imported_ai.is_some())
+            {
+                return Err(
+                    "AI Agent and Swarm jobs require a different saved SSH authentication method.",
+                );
+            }
             if !selected.insert(target.id) {
                 return Err("Choose each saved SSH connection only once");
             }

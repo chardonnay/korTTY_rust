@@ -586,7 +586,10 @@ impl Workspace {
                 SshOutcome::Unavailable
             }
         };
-        self.finish_reopen_member(owner, Phase::Serial(token), outcome)
+        Task::batch([
+            self.finish_reopen_member(owner, Phase::Serial(token), outcome),
+            self.reconcile_journal_sources(),
+        ])
     }
 
     pub(super) fn finish_reopen_ssh(

@@ -87,6 +87,49 @@ pub(crate) struct Skill {
     external: Option<external::Source>,
 }
 
+pub(crate) struct ConnectionChoice<'a> {
+    pub(crate) id: u64,
+    skill: &'a Skill,
+}
+
+impl ConnectionChoice<'_> {
+    pub(crate) fn name(&self) -> &str {
+        &self.skill.name
+    }
+
+    pub(crate) fn available_to_quick_connect(&self) -> bool {
+        self.skill.enabled && self.skill.target != Target::Agent
+    }
+
+    fn target_label(&self) -> &'static str {
+        match self.skill.target {
+            Target::Chat => "AI Chat/Functions",
+            Target::Agent => "AI Agent",
+            Target::Both => "Both",
+            Target::Connection => "Connection",
+        }
+    }
+
+    pub(crate) fn label(&self) -> String {
+        let state = if self.skill.enabled {
+            ""
+        } else {
+            " (disabled)"
+        };
+        format!(
+            "{} ({}){state}",
+            self.skill.name.trim(),
+            self.target_label()
+        )
+    }
+
+    pub(crate) fn matches(&self, query: &str) -> bool {
+        self.skill.matches(query)
+            || self.label().to_lowercase().contains(query)
+            || self.skill.tags.join(", ").to_lowercase().contains(query)
+    }
+}
+
 impl fmt::Debug for Skill {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Skill([redacted])")
@@ -607,6 +650,22 @@ impl Store {
             .collect()
     }
 
+    pub(super) fn connection_editor_choices(&self) -> Vec<ConnectionChoice<'_>> {
+        let mut choices: Vec<_> = self
+            .skills
+            .iter()
+            .filter(|(_, skill)| !skill.hidden)
+            .map(|(&id, skill)| ConnectionChoice { id, skill })
+            .collect();
+        choices.sort_by_cached_key(|choice| {
+            (
+                choice.skill.target != Target::Connection,
+                choice.skill.name.trim().to_lowercase(),
+            )
+        });
+        choices
+    }
+
     #[cfg(test)]
     pub(super) fn prompt_addendum_selected(
         &self,
@@ -1078,6 +1137,53 @@ mod tests {
         );
         store.skills.get_mut(&agent).unwrap().hidden = true;
         assert!(store.snippet_prompt(&[agent]).is_empty());
+    }
+
+    #[test]
+    fn connection_editor_skills_match_java_scope_order_and_metadata_search() {
+        let mut store = Store::default();
+        store.skills.clear();
+        let skill = |name: &str, target, enabled| Skill {
+            name: name.to_owned(),
+            content: "Synthetic fixture body".into(),
+            enabled,
+            target,
+            ..Skill::default()
+        };
+        let general = store.insert(skill("Zulu", Target::Both, false)).unwrap();
+        let agent = store
+            .insert(Skill {
+                description: "Review release notes".into(),
+                tags: vec!["compile".into(), "validation".into()],
+                ..skill("alpha", Target::Agent, true)
+            })
+            .unwrap();
+        let connection = store
+            .insert(skill("Zebra", Target::Connection, true))
+            .unwrap();
+        let hidden = store.insert(skill("hidden", Target::Chat, true)).unwrap();
+        store.skills.get_mut(&hidden).unwrap().hidden = true;
+
+        let choices = store.connection_editor_choices();
+        assert_eq!(
+            choices.iter().map(|choice| choice.id).collect::<Vec<_>>(),
+            [connection, agent, general],
+        );
+        assert_eq!(choices[0].label(), "Zebra (Connection)");
+        assert_eq!(choices[1].label(), "alpha (AI Agent)");
+        assert_eq!(choices[2].label(), "Zulu (Both) (disabled)");
+        assert!(choices[1].matches("release notes"));
+        assert!(choices[1].matches("compile, validation"));
+        assert!(choices[1].matches("ai agent"));
+        assert!(!choices[1].matches("synthetic fixture body"));
+        assert!(!choices[1].available_to_quick_connect());
+        assert!(!choices[2].available_to_quick_connect());
+        assert!(
+            store
+                .reviewed_pinned_guidance(Target::Agent, &[general])
+                .text
+                .is_empty()
+        );
     }
 
     #[test]

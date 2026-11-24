@@ -48,6 +48,7 @@ mod backup_automatic;
 pub(crate) mod backup_data;
 mod backup_ui;
 mod bell;
+mod chat_appearance;
 mod chrome;
 pub(crate) use chrome::ToolIcon;
 pub(crate) use chrome::popup as native_popup;
@@ -79,6 +80,7 @@ mod journal_note_translation;
 mod journal_thumbnail;
 mod key_bindings;
 pub(crate) use key_bindings::SnippetCompletionChord;
+mod connection_memory;
 mod known_hosts;
 mod local_dock;
 mod logfile_access;
@@ -124,6 +126,11 @@ pub(crate) fn installed_default_isolation() -> std::io::Result<IsolationLevel> {
         Err(error) => Err(error),
     }
 }
+
+pub(crate) fn installed_temporary_ssh_keys_enabled(root: &std::path::Path) -> bool {
+    tab_titles::WindowSettings::read(&crate::profile::window_settings_path_at(root))
+        .is_ok_and(|settings| settings.temporary_ssh_key_enabled)
+}
 pub(crate) use tab_titles::{analysis_content_limit_at, analysis_history_limit_at};
 mod tab_watch;
 mod teamwork_auth;
@@ -147,6 +154,7 @@ mod terminal_text_drop;
 mod tool_tabs;
 mod transparency;
 mod tunnel_access;
+pub(crate) mod ui_font_scale;
 #[cfg(target_os = "linux")]
 mod wayland_file_drop;
 mod window_lifecycle;
@@ -289,6 +297,7 @@ pub enum Message {
     DesktopTextDrop(desktop_text_drop::Message),
     RemoteDockTick,
     AiManager(ai_access::Message),
+    ConnectionMemory(window::Id, crate::ai_manager::connection_memory::Event),
     TerminalAi(window::Id, terminal_ai::Message),
     SavedChats(window::Id, saved_chats::Message),
     Recording(recording_access::Message),
@@ -358,6 +367,8 @@ pub enum Message {
     OpenConnections(window::Id),
     Connections(window::Id, crate::connection_window::Message),
     ConnectionEditor(window::Id, crate::connection_window::Message),
+    ConnectionTunnelEditor(window::Id, crate::connection_window::tunnels::Event),
+    ConnectionColorEditor(window::Id, crate::connection_window::custom_color::Event),
     FocusConnectionEditor(window::Id),
     ConnectionCatalogReloaded(u64, Option<crate::connection_store::Store>),
     ConnectionOverview(window::Id, profile_tools::connection_overview::Event),
@@ -413,6 +424,7 @@ pub enum Message {
     Notice(window::Id, String),
     Quit,
     ExitReady,
+    UiDisplaySize(Option<Size>),
     Noop,
     Highlight(highlight::Message),
 }
@@ -420,6 +432,7 @@ pub enum Message {
 #[derive(Default)]
 pub struct Workspace {
     highlight: highlight::State,
+    ui_display_size: Option<Size>,
     application_updates: application_updates::State,
     app_logging: crate::app_logging::Runtime,
     bell: bell::Bell,
@@ -522,6 +535,7 @@ pub struct Workspace {
     retained_sftp_download: Option<crate::sftp_window::ClosedDownload>,
     sftp_logins: HashMap<window::Id, ssh_access::PendingSsh>,
     connection_managers: BTreeMap<window::Id, profile_tools::ConnectionManager>,
+    connection_memory: BTreeMap<window::Id, connection_memory::Window>,
     connection_manager_open_after_close: BTreeMap<window::Id, window::Id>,
     connection_overview: BTreeMap<window::Id, profile_tools::connection_overview::Dialog>,
     teamwork_restore: BTreeMap<window::Id, profile_tools::teamwork_restore::Dialog>,
@@ -1072,7 +1086,13 @@ impl Workspace {
             Ok("settings") => task.chain(Task::done(Message::Settings(
                 settings_window::Message::Open(id),
             ))),
+            Ok("settings-sftp") => task.chain(Task::done(Message::Settings(
+                settings_window::Message::OpenAt(id, settings_window::Section::Sftp),
+            ))),
             Ok("connections") => task.chain(Task::done(Message::OpenConnections(id))),
+            Ok("quick-connect") => task.chain(Task::done(Message::Chrome(
+                chrome::Message::Invoke(id, chrome::Action::QuickConnect),
+            ))),
             Ok("agent-design" | "agent-design-compact") => {
                 task.chain(Task::done(Message::Settings(
                     settings_window::Message::OpenAt(id, settings_window::Section::AgentDesign),
@@ -1184,6 +1204,15 @@ impl Workspace {
         }
         if let Some(title) = self.connection_editor_title(id) {
             return title.into();
+        }
+        if let Some(title) = self.tunnel_editor_title(id) {
+            return title.into();
+        }
+        if self.color_editor_manager(id).is_some() {
+            return "Custom Colors".into();
+        }
+        if let Some(title) = self.connection_memory_title(id) {
+            return title;
         }
         if self.connection_managers.contains_key(&id) {
             return "Connection Manager".into();
@@ -1367,6 +1396,7 @@ impl Workspace {
                     | Message::ConnectionUsed(..)
                     | Message::Connections(..)
                     | Message::ConnectionEditor(..)
+                    | Message::ConnectionMemory(..)
                     | Message::ConnectionCatalogReloaded(..)
                     | Message::CloseAllDialog(..)
                     | Message::ConfirmSerialClose(..)
@@ -1670,6 +1700,10 @@ impl Workspace {
             return Task::none();
         }
         match message {
+            Message::UiDisplaySize(size) => {
+                self.ui_display_size = size;
+                return Task::none();
+            }
             Message::Chrome(message) => return self.update_chrome(message),
             Message::Palette(id, message) => return self.update_palette(id, message),
             Message::Dashboard(id, message) => return self.update_dashboard(id, message),
@@ -1904,9 +1938,10 @@ impl Workspace {
                 self.ai_manager_child_closed(id);
                 let placed = self.finish_placed_dialog_closed(id);
                 let manager = self.connection_window_closed(id).unwrap_or_else(Task::none);
+                let memory = self.connection_memory_closed(id);
                 let teamwork = self.resume_teamwork_after_vault(id);
                 let control = self.resume_control_ssh_after_vault(id);
-                return Task::batch([placed, manager, teamwork, control]);
+                return Task::batch([placed, manager, memory, teamwork, control]);
             }
             Message::SaveLastWindow => return self.lifecycle.save_if_due(),
             Message::WindowPlacementPoll(id, request) => {
@@ -2102,6 +2137,9 @@ impl Workspace {
             Message::RemoteDockTick => return self.remote_dock_tick(),
             Message::Recording(message) => return self.update_recording(message),
             Message::AiManager(message) => return self.update_ai_manager(message),
+            Message::ConnectionMemory(id, message) => {
+                return self.update_connection_memory(id, message);
+            }
             Message::TerminalAi(id, message) => return self.update_terminal_ai(id, message),
             Message::SavedChats(id, message) => return self.update_saved_chats(id, message),
             Message::ProjectFile(id, message) => return self.update_project_file(id, message),
@@ -2640,9 +2678,18 @@ impl Workspace {
             Message::ConnectionEditor(id, message) => {
                 return self.update_connection_editor(id, message);
             }
+            Message::ConnectionTunnelEditor(id, event) => {
+                return self.update_tunnel_editor(id, event);
+            }
+            Message::ConnectionColorEditor(id, event) => {
+                return self.update_color_editor(id, event);
+            }
             Message::FocusConnectionEditor(id) => {
                 if self.connection_editor_manager(id).is_some() {
-                    return window::gain_focus(id);
+                    return window::gain_focus(
+                        self.connection_editor_child(id)
+                            .map_or(id, |(child, _)| child),
+                    );
                 }
             }
             Message::ConnectionCatalogReloaded(revision, store) => {
@@ -2931,7 +2978,8 @@ impl Workspace {
         );
         (
             id,
-            task.then(move |id| window_lifecycle::restore_native_position(id, placement.position)),
+            task.then(move |id| window_lifecycle::restore_native_position(id, placement.position))
+                .chain(iced_runtime::window::primary_monitor_size(id).map(Message::UiDisplaySize)),
         )
     }
 
@@ -4046,10 +4094,16 @@ impl Workspace {
             return Task::none();
         }
         let replacement = if let Some(old) = pending.replace {
-            let Some((tab, pane, _)) = self.disconnected_serial_pane(window, old) else {
+            let Some((index, _, _)) = self.disconnected_serial_pane(window, old) else {
                 return Task::none();
             };
-            Some((tab, pane, old))
+            let Some(tab) = self.windows[&window].tabs[index].terminal() else {
+                return Task::none();
+            };
+            Some(reconnect::ReconnectTarget {
+                tab: tab.id,
+                source: old,
+            })
         } else {
             None
         };
@@ -4059,7 +4113,7 @@ impl Workspace {
             .and_then(|profile| profile.strict_terminal_mode);
         let strict = saved_strict.unwrap_or_else(|| {
             replacement
-                .and_then(|(_, _, old)| self.sessions.get(&old))
+                .and_then(|target| self.sessions.get(&target.source))
                 .is_some_and(PaneSession::reconnect_strict_escapes)
         });
         let session = match Session::start_serial_with_options(
@@ -4086,8 +4140,12 @@ impl Workspace {
         if let Some(state) = self.windows.get_mut(&window) {
             state.pending_serial = None;
         }
-        let new_id =
-            self.store_connected_session(session, grid, replacement.map(|(_, _, old)| old), font);
+        let new_id = self.store_connected_session(
+            session,
+            grid,
+            replacement.map(|target| target.source),
+            font,
+        );
         if let Some(saved) = &saved {
             self.saved_terminal_preferences
                 .remember_serial_highlight(saved);
@@ -4108,21 +4166,17 @@ impl Workspace {
         if let Some(effect) = effect {
             self.apply_terminal_effect_selection(new_id, effect);
         }
-        if let Some((tab, pane, old)) = replacement {
-            if let Some(slot) = self
-                .windows
-                .get_mut(&window)
-                .and_then(|window| window.tabs.get_mut(tab))
-                .and_then(TabEntry::terminal_mut)
-                .and_then(|tab| tab.grid.get_mut(pane))
-            {
-                *slot = new_id;
-                self.rebind_coding_agent_alias(old, new_id);
-                self.stop_session(old);
-            } else {
-                self.stop_session(new_id);
-            }
-        } else if let Some(target) = split {
+        if let Some(target) = replacement {
+            return self.start_reconnect_worker(
+                window,
+                target,
+                new_id,
+                None,
+                Default::default(),
+                None,
+            );
+        }
+        if let Some(target) = split {
             self.start_split_worker_with_effect(window, target, new_id, effect.is_none());
         } else {
             self.add_tab_with_privacy(window, new_id, incognito);
@@ -4130,7 +4184,10 @@ impl Workspace {
         if split.is_none() {
             self.refresh_connection_counts();
         }
-        self.record_serial_session_used(new_id)
+        Task::batch([
+            self.record_serial_session_used(new_id),
+            self.reconcile_journal_sources(),
+        ])
     }
 
     fn open_saved_serial(&mut self, window: window::Id, saved: SerialProfile) -> Task<Message> {
@@ -5764,7 +5821,9 @@ impl Workspace {
         }
         if key == Key::Named(Named::Tab)
             && (modifiers.is_empty() || modifiers == Modifiers::SHIFT)
-            && let Some(task) = self.swarm_focus_next(id, modifiers.shift())
+            && let Some(task) = self
+                .focus_settings_next(id, modifiers.shift())
+                .or_else(|| self.swarm_focus_next(id, modifiers.shift()))
         {
             return task;
         }
@@ -6348,7 +6407,13 @@ impl Workspace {
             .or_else(|| self.window_owner_dialog(id))
             .map(|(_, focus)| focus);
         let element = profile_tools::vault_modal::gate(element, modal);
-        profile_tools::vault_modal::view(element, self.vault_unlock_modal(id))
+        let element = profile_tools::vault_modal::view(element, self.vault_unlock_modal(id));
+        let scale = if self.current_vault_unlock() == Some(id) {
+            1.0
+        } else {
+            ui_font_scale::ratio(self.window_settings.appearance, self.ui_display_size)
+        };
+        ui_font_scale::scope(element, scale)
     }
 
     fn view_window(&self, id: window::Id) -> Element<'_, Message> {
@@ -7144,7 +7209,7 @@ impl Workspace {
                         .window_settings
                         .terminal_scrollbar_visible(window.fullscreen()))
                 .then(|| terminal_view::Scrollbar::new(&terminal));
-                let view = terminal_view::view(terminal);
+                let view = ui_font_scale::unscaled(terminal_view::view(terminal));
                 let view = if let Some(effect) = effect {
                     iced::widget::stack![
                         view,

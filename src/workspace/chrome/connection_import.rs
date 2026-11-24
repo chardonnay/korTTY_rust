@@ -587,6 +587,24 @@ impl Dialog {
                 preview.skipped_tunnels,
             )));
         }
+        if preview.skipped_logging != 0 {
+            summary = summary.push(
+                text(format!(
+                    "{} invalid terminal logging configurations omitted.",
+                    preview.skipped_logging,
+                ))
+                .size(13),
+            );
+        }
+        if self.options.prepared().is_some_and(|prepared| {
+            prepared
+                .entries()
+                .any(|(connection, _)| connection.logging.java_review().is_some())
+        }) {
+            summary = summary.push(text(
+                "Review imported terminal logging and log directories in the connection editor."
+            ).size(13));
+        }
         let content = summary
             .push(
                 text(format!(

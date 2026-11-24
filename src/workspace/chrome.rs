@@ -2345,6 +2345,7 @@ impl Workspace {
         self.native_focused_window.filter(|&id| {
             self.connection_managers.contains_key(&id)
                 || self.connection_editor_manager(id).is_some()
+                || self.tunnel_editor_manager(id).is_some()
                 || self.connection_import_title(id).is_some()
                 || self.connection_export_title(id).is_some()
                 || self.connection_overview_title(id).is_some()

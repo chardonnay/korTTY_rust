@@ -168,7 +168,7 @@ pub(crate) fn capture(window: &ConnectionWindow, tunnels: bool) -> Topology {
                 GroupKey::Local(window.store.group_of(connection.id)),
                 window.connection_badge(connection.id),
             ),
-            VisualRow::Shared(entry) => (
+            VisualRow::Shared(entry, _) => (
                 &entry.connection,
                 RowKey::Shared(entry.identity.clone()),
                 GroupKey::Teamwork(&entry.group),
@@ -196,7 +196,9 @@ pub(crate) fn capture(window: &ConnectionWindow, tunnels: bool) -> Topology {
                 );
                 continue;
             }
-            VisualRow::Group { .. } => unreachable!("map entries contain connections only"),
+            VisualRow::Group { .. } | VisualRow::SharedGroup { .. } => {
+                unreachable!("map entries contain connections only")
+            }
         };
         let endpoint = &connection.login.endpoint;
         let host = address(&endpoint.host, endpoint.port);

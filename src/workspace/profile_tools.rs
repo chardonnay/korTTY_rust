@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,7 +7,7 @@ use iced::{Element, Size, Task, window};
 use kortty_vault::Secret;
 
 use crate::connection_store::{Connection, LocalProfile, SerialProfile, Store};
-use crate::connection_window::{self, ConnectionWindow, CredentialChoice, ViewChoices};
+use crate::connection_window::{self, ConnectionWindow, CredentialChoice, OpenCounts, ViewChoices};
 use crate::profile;
 use crate::ssh_dialog::LoginTarget;
 use crate::terminal_effects::Effect;
@@ -22,11 +22,13 @@ use super::{
     window_lifecycle,
 };
 
+mod color_editor;
 #[cfg(test)]
 mod connection_manager_tests;
 pub(super) mod connection_overview;
 pub(super) mod teamwork_restore;
 mod terminal_preferences;
+mod tunnel_editor;
 pub(super) mod vault_modal;
 pub(super) use terminal_preferences::SavedTerminalPreferences;
 
@@ -45,6 +47,8 @@ pub(super) struct ConnectionManager {
     launch: Option<ConnectionLaunch>,
     editor: Option<window::Id>,
     editor_closing: bool,
+    tunnel: Option<tunnel_editor::Window>,
+    color_editor: Option<color_editor::Window>,
 }
 
 impl ConnectionManager {
@@ -57,6 +61,8 @@ impl ConnectionManager {
             launch: None,
             editor: None,
             editor_closing: false,
+            tunnel: None,
+            color_editor: None,
         }
     }
 }
@@ -155,6 +161,20 @@ impl Workspace {
         if let Some(owner) = self.connection_manager_open_after_close.remove(&id) {
             return Some(self.show_connections(owner));
         }
+        if let Some(manager) = self.tunnel_editor_manager(id) {
+            self.connection_managers
+                .get_mut(&manager)
+                .expect("current manager")
+                .tunnel = None;
+            return Some(Task::none());
+        }
+        if let Some(manager) = self.color_editor_manager(id) {
+            self.connection_managers
+                .get_mut(&manager)
+                .expect("current manager")
+                .color_editor = None;
+            return Some(Task::none());
+        }
         if let Some(owner) = self.connection_editor_manager(id) {
             let manager = self
                 .connection_managers
@@ -162,11 +182,18 @@ impl Workspace {
                 .expect("current manager");
             manager.editor = None;
             manager.editor_closing = false;
-            return Some(if manager.closing || self.exiting {
+            let tunnel = manager.tunnel.take();
+            let colors = manager.color_editor.take();
+            let focus = if manager.closing || self.exiting {
                 Task::none()
             } else {
                 window::gain_focus(owner)
-            });
+            };
+            let close =
+                tunnel.map_or_else(Task::none, |tunnel| self.close_placed_dialog(tunnel.id));
+            let close_colors =
+                colors.map_or_else(Task::none, |colors| self.close_placed_dialog(colors.id));
+            return Some(Task::batch([focus, close, close_colors]));
         }
         let manager = self.connection_managers.remove(&id)?;
         if self.quit_waiting_profile == Some(id) || self.should_exit_after_window_close() {
@@ -248,6 +275,12 @@ impl Workspace {
 
     pub(super) fn close_connection_editor(&mut self, editor: window::Id) -> Option<Task<Message>> {
         let id = self.connection_editor_manager(editor)?;
+        if let Some((child, _)) = self.connection_editor_child(editor) {
+            return Some(window::gain_focus(child));
+        }
+        if let Some(memory) = self.connection_memory_for_editor(editor) {
+            return Some(window::gain_focus(memory));
+        }
         let manager = &self.connection_managers[&id];
         if manager.closing || manager.editor_closing || manager.window.store_busy() {
             return Some(Task::none());
@@ -265,27 +298,33 @@ impl Workspace {
         if self.connection_managers.is_empty() {
             return;
         }
-        let mut counts = BTreeMap::new();
+        let mut counts = OpenCounts::default();
         for tab in self
             .windows
             .values()
             .flat_map(|window| window.terminal_tabs())
             .filter(|tab| !tab.incognito)
         {
-            let connections: BTreeSet<_> = tab
-                .grid
-                .iter()
-                .filter_map(|(_, id)| {
-                    let pane = self.sessions.get(id)?;
-                    pane.ssh
-                        .as_ref()
-                        .and_then(SshTarget::saved_id)
-                        .or_else(|| pane.saved_serial.as_ref().map(|profile| profile.id))
-                        .or_else(|| pane.saved_local.as_ref().map(|profile| profile.id))
-                })
-                .collect();
-            for id in connections {
-                *counts.entry(id).or_default() += 1;
+            let mut saved = BTreeSet::new();
+            let mut teamwork = BTreeSet::new();
+            for pane in tab.grid.iter().filter_map(|(_, id)| self.sessions.get(id)) {
+                if let Some(shared) = &pane.teamwork_ssh {
+                    teamwork.insert(shared.identity());
+                } else if let Some(id) = pane
+                    .ssh
+                    .as_ref()
+                    .and_then(SshTarget::saved_id)
+                    .or_else(|| pane.saved_serial.as_ref().map(|profile| profile.id))
+                    .or_else(|| pane.saved_local.as_ref().map(|profile| profile.id))
+                {
+                    saved.insert(id);
+                }
+            }
+            for id in saved {
+                *counts.saved.entry(id).or_default() += 1;
+            }
+            for id in teamwork {
+                *counts.teamwork.entry(id.clone()).or_default() += 1;
             }
         }
         for manager in self.connection_managers.values_mut() {
@@ -408,6 +447,9 @@ impl Workspace {
     pub(super) fn is_profile_tool(&self, id: window::Id) -> bool {
         self.connection_managers.contains_key(&id)
             || self.connection_editor_manager(id).is_some()
+            || self.tunnel_editor_manager(id).is_some()
+            || self.color_editor_manager(id).is_some()
+            || self.connection_memory.contains_key(&id)
             || self.teamwork_restore.contains_key(&id)
             || self.vault_id == Some(id)
     }
@@ -421,7 +463,10 @@ impl Workspace {
         }
         self.connection_managers[&owner]
             .editor
-            .map(|id| (id, Message::FocusConnectionEditor(id)))
+            .map(|id| {
+                self.connection_editor_child(id)
+                    .unwrap_or((id, Message::FocusConnectionEditor(id)))
+            })
             .or_else(|| {
                 self.connection_overview_for_owner(owner)
                     .map(|id| (id, connection_overview::focus(id)))
@@ -457,6 +502,15 @@ impl Workspace {
     }
 
     pub(super) fn profile_tool_view(&self, id: window::Id) -> Option<Element<'_, Message>> {
+        if let Some(tunnel) = self.tunnel_editor_view(id) {
+            return Some(tunnel);
+        }
+        if let Some(colors) = self.color_editor_view(id) {
+            return Some(colors);
+        }
+        if self.connection_memory.contains_key(&id) {
+            return self.connection_memory_view(id);
+        }
         let editor_owner = self.connection_editor_manager(id);
         if let Some(manager) = self.connection_managers.get(&editor_owner.unwrap_or(id)) {
             let effects = self.terminal_effects_enabled().then(|| {
@@ -490,9 +544,11 @@ impl Workspace {
                     })
                     .collect()
             });
-            let ai_skills = self
-                .ai_configuration()
-                .map_or_else(Vec::new, |config| config.connection_skill_choices());
+            let skill_config = self.ai_configuration();
+            let ai_skills = skill_config.as_deref().map_or_else(
+                Vec::new,
+                crate::ai_manager::Configuration::connection_editor_skill_choices,
+            );
             let ai_agent_designs = self
                 .window_settings
                 .ai_agent_designs
@@ -502,11 +558,24 @@ impl Workspace {
                 ai_agent_designs: &ai_agent_designs,
                 highlighting: self.highlight.connection_choices(),
                 themes: &self.window_settings.themes,
-                journal_max_parts: self
+                terminal_style: self.default_connection_terminal_style(),
+                logging_policy: self
                     .clipboard
                     .policy
                     .terminal_logging
-                    .journal_max_log_parts(),
+                    .managed_terminal_fields(),
+                journal_policy: connection_window::JournalEditorPolicy {
+                    allowed: self.journal_allowed(),
+                    required: self.journal_required(),
+                    summaries_allowed: crate::session_journal::topic_ai_settings::allowed(
+                        &self.clipboard.policy,
+                    ),
+                    max_parts: self
+                        .clipboard
+                        .policy
+                        .terminal_logging
+                        .journal_max_log_parts(),
+                },
                 passwords: &passwords,
                 passphrases: &passphrases,
                 keys: &self.ssh_key_choices,
@@ -528,10 +597,12 @@ impl Workspace {
                 local_isolation_default: self.default_local_isolation(),
             };
             if editor_owner.is_some() {
-                return Some(manager.window.editor_view(choices).map_or_else(
+                let content = manager.window.editor_view(choices).map_or_else(
                     || iced::widget::text("Closing…").into(),
                     |content| content.map(move |message| Message::ConnectionEditor(id, message)),
-                ));
+                );
+                let modal = self.connection_editor_child(id).map(|(_, focus)| focus);
+                return Some(vault_modal::gate(content, modal));
             }
             let content = manager
                 .window
@@ -553,6 +624,49 @@ impl Workspace {
             });
         }
         None
+    }
+
+    fn default_connection_terminal_style(&self) -> crate::connection_store::TerminalStyle {
+        use crate::connection_store::{TerminalAppearance, TerminalStyle};
+        use crate::terminal_theme::{CursorStyle, MONOSPACED, Rgb};
+
+        let settings = &self.window_settings;
+        let scheme = settings.themes.appearance();
+        let style = settings.terminal_appearance();
+        let scrollback = settings.scrollback_config();
+        let family = settings.terminal_font_face(scheme).family;
+        let family = match family {
+            iced::font::Family::Name(name) => name,
+            _ => MONOSPACED,
+        };
+        TerminalStyle {
+            appearance: TerminalAppearance {
+                theme: settings.themes.selected().map(Into::into),
+                font_family: Some(family.to_owned()),
+                font_size: Some(settings.themes.font_size(
+                    scheme,
+                    settings.terminal_font,
+                    settings.terminal_font,
+                )),
+                foreground: Some(style.foreground),
+                background: Some(style.background),
+                sgr_enabled: Some(style.sgr_enabled),
+            },
+            cursor: Some(style.cursor),
+            cursor_style: CursorStyle::ALL
+                .into_iter()
+                .find(|cursor| cursor.behavior() == (style.cursor_shape, style.cursor_blink)),
+            selection: style.selection,
+            ansi: std::array::from_fn(|index| {
+                Some(Rgb::from_bytes(style.palette.rgb(index as u8)))
+            }),
+            bold: Some(style.bold_text_mode),
+            scrollback_lines: Some(scrollback.lines),
+            scrollback_memory_mib: Some(scrollback.memory_mib),
+            scrollback_compression: Some(scrollback.compression),
+            confirm_close: Some(settings.confirm_busy_terminal_close),
+            command_timestamps: Some(settings.command_timestamps_enabled),
+        }
     }
 
     pub(super) fn credential_choices(&self, kind: Kind) -> Vec<CredentialChoice> {
@@ -698,7 +812,10 @@ impl Workspace {
         match self.store_saved_local_session(profile, None) {
             Ok(session) => {
                 self.add_tab(owner, session);
-                self.record_local_session_used(session)
+                Task::batch([
+                    self.record_local_session_used(session),
+                    self.reconcile_journal_sources(),
+                ])
             }
             Err(error) => {
                 self.notice(owner, format!("Could not start the local shell ({error})"));
@@ -802,6 +919,55 @@ impl Workspace {
         else {
             return Task::none();
         };
+        use connection_window::{Edit, Message as Profile};
+        if let Some((child, _)) = self.connection_editor_child(editor)
+            && !matches!(message, Profile::TerminalLogFolderPicked(..))
+        {
+            return window::gain_focus(child);
+        }
+        if message.opens_custom_color() {
+            return self.open_color_editor(id, editor);
+        }
+        if message.opens_connection_memory() {
+            return self.open_connection_memory(id, editor);
+        }
+        if let Profile::OpenTunnelEditor(request) = message {
+            return self.open_tunnel_editor(id, editor, request);
+        }
+        if matches!(message, Profile::BrowseTerminalLogFolder) {
+            let Some((ticket, directory)) = self
+                .connection_managers
+                .get_mut(&id)
+                .and_then(|manager| manager.window.start_terminal_log_folder_picker())
+            else {
+                return Task::none();
+            };
+            return crate::terminal_logging::pick_folder(editor, directory).map(move |path| {
+                Message::ConnectionEditor(
+                    editor,
+                    Profile::TerminalLogFolderPicked(ticket.clone(), path),
+                )
+            });
+        }
+        if let Profile::Edit(Edit::Logging(edit)) = &message
+            && !self
+                .clipboard
+                .policy
+                .terminal_logging
+                .managed_terminal_fields()
+                .allows(edit)
+        {
+            return Task::none();
+        }
+        if matches!(
+            message,
+            connection_window::Message::Save
+                | connection_window::Message::CancelEdit
+                | connection_window::Message::DiscardAndClose
+        ) && let Some(memory) = self.connection_memory_for_editor(editor)
+        {
+            return window::gain_focus(memory);
+        }
         self.update_connection_profile(id, message, true)
     }
 
@@ -1194,6 +1360,27 @@ impl Workspace {
 
     pub(super) fn request_profile_quit(&mut self) -> Option<Task<Message>> {
         self.quit_waiting_profile = None;
+        if let Some(child) = self.connection_managers.values().find_map(|manager| {
+            manager
+                .tunnel
+                .as_ref()
+                .map(|tunnel| tunnel.id)
+                .or_else(|| manager.color_editor.as_ref().map(|colors| colors.id))
+        }) {
+            return Some(self.defer_profile_quit(child, true));
+        }
+        if let Some((id, busy)) = self.connection_memory_needing_attention() {
+            if busy {
+                return Some(self.defer_profile_quit(id, true));
+            }
+            self.quit_waiting_profile = Some(id);
+            return Some(
+                self.update_connection_memory(
+                    id,
+                    crate::ai_manager::connection_memory::Event::Close,
+                ),
+            );
+        }
         if let Some(id) = self.connection_overview_busy() {
             return Some(self.defer_profile_quit(id, true));
         }
@@ -1233,7 +1420,7 @@ impl Workspace {
         }
     }
 
-    fn cancel_profile_quit(&mut self, id: window::Id) {
+    pub(super) fn cancel_profile_quit(&mut self, id: window::Id) {
         if self.quit_waiting_profile == Some(id) {
             self.quit_waiting_profile = None;
             window_lifecycle::reply_to_native_quit(false);
@@ -1267,6 +1454,16 @@ impl Workspace {
     }
 
     pub(super) fn close_profile_tool(&mut self, id: window::Id, discard: bool) -> Task<Message> {
+        if self.tunnel_editor_manager(id).is_some() {
+            return self.update_tunnel_editor(id, connection_window::tunnels::Event::Cancel);
+        }
+        if self.color_editor_manager(id).is_some() {
+            return self.update_color_editor(id, connection_window::custom_color::Event::Cancel);
+        }
+        if self.connection_memory.contains_key(&id) {
+            return self
+                .update_connection_memory(id, crate::ai_manager::connection_memory::Event::Close);
+        }
         if self.teamwork_restore.contains_key(&id) {
             return self.close_teamwork_restore(id);
         }

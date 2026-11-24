@@ -7,6 +7,96 @@ use std::time::{Duration, Instant};
 use super::{Config, DirectoryMode, Format, Policy, Prepared, Warning};
 use crate::snippets::tests::Profile;
 
+#[test]
+fn an_existing_java_size_review_can_restore_the_supported_limit() {
+    use super::{Edit, Form, JavaReview};
+
+    let defaults = Config::default();
+    let mut fields = defaults.java_fields();
+    fields.max_mib = 256;
+    let imported = Config::from_java(
+        fields,
+        JavaReview {
+            source_max_mib: Some(1000),
+            ..JavaReview::default()
+        },
+    )
+    .unwrap();
+    let mut form = Form::new(imported);
+    form.update(Edit::UseJavaMaxSize);
+    let reviewed = form.config().unwrap();
+    assert_eq!(reviewed.java_fields().max_mib, 1000);
+    assert!(!reviewed.enabled());
+    assert!(reviewed.java_review().is_none());
+
+    form.update(Edit::Enabled(true));
+    form.update(Edit::Size("1001".into()));
+    assert!(form.config().is_err());
+    form.update(Edit::Size("1000".into()));
+    assert_eq!(form.config().unwrap().java_fields().max_mib, 1000);
+}
+
+#[test]
+fn java_logging_uses_a_legacy_file_parent_only_after_explicit_review() {
+    use super::{Edit, Form, JavaReview};
+
+    let profile = Profile::new();
+    let root = profile.0.canonicalize().unwrap();
+    let directory = root.join("java-logs");
+    let legacy = directory.join("legacy.log");
+    let logging = Config::default();
+    let mut fields = logging.java_fields();
+    fields.enabled = true;
+    fields.folder = legacy.to_str().unwrap();
+    let imported = Config::from_java(fields, JavaReview::default()).unwrap();
+    let make_prepared = |config| {
+        Prepared::new(
+            config,
+            Policy::default(),
+            "fixture".into(),
+            "localhost".into(),
+            "operator".into(),
+        )
+        .with_test_profile(root.clone())
+    };
+    assert!(!make_prepared(imported.clone()).enabled());
+    let (redraw, _updates) = async_channel::bounded(1);
+    assert!(
+        make_prepared(imported.clone())
+            .start(Warning::new(redraw))
+            .is_err()
+    );
+    assert!(!directory.exists());
+
+    let mut form = Form::new(imported);
+    assert!(!form.accepts_editor_edit(false, &Edit::UseJavaFolder));
+    assert!(form.accepts_editor_edit(true, &Edit::UseJavaFolder));
+    form.update(Edit::UseJavaFolder);
+    let config = form.config().unwrap();
+    assert!(!config.enabled());
+    assert_eq!(config.custom_folder(), Some(directory.as_path()));
+    assert!(!directory.exists());
+
+    form.update(Edit::Enabled(true));
+    let config = form.config().unwrap();
+    assert!(config.enabled());
+    assert!(config.java_review().is_none());
+    assert!(!directory.exists());
+
+    fs::create_dir(&directory).unwrap();
+    let (redraw, _updates) = async_channel::bounded(1);
+    let mut capture = make_prepared(config).start(Warning::new(redraw)).unwrap();
+    capture.advance(b"approved recording\r\n");
+    capture.finish().wait().unwrap();
+    let file = archive(&directory).unwrap();
+    let mut recorded = String::new();
+    flate2::read::GzDecoder::new(fs::File::open(file).unwrap())
+        .read_to_string(&mut recorded)
+        .unwrap();
+    assert!(recorded.contains("approved recording"));
+    assert!(!legacy.exists());
+}
+
 fn archive(folder: &Path) -> Option<PathBuf> {
     fs::read_dir(folder)
         .ok()?

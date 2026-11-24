@@ -88,7 +88,7 @@ impl TemporaryKey {
         Ok(Zeroizing::new(key.to_vec()))
     }
 
-    fn is_current(&self) -> bool {
+    pub(crate) fn is_current(&self) -> bool {
         Instant::now() < self.0.deadline
     }
 }

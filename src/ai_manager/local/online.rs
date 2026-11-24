@@ -254,7 +254,7 @@ impl State {
             }
             Control::DownloadRuntimeOnline => self.selection(required).is_some(),
             Control::KeepRuntimeDownload => self.discard_confirmed,
-            Control::CheckRuntimeOnline | Control::DiscardRuntimeDownload => true,
+            Control::DiscardRuntimeDownload => true,
             _ => false,
         }
     }

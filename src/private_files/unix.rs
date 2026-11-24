@@ -238,18 +238,28 @@ impl Directory {
 
     pub(crate) fn names(&self, limit: usize) -> io::Result<Vec<OsString>> {
         let mut names = Vec::new();
-        for entry in Dir::read_from(&self.0)? {
-            let entry = entry?;
-            let bytes = entry.file_name().to_bytes();
-            if matches!(bytes, b"." | b"..") {
-                continue;
-            }
+        self.visit_names(|name| {
             if names.len() == limit {
                 return Err(invalid("profile directory exceeds its file count limit"));
             }
-            names.push(OsStr::from_bytes(bytes).to_owned());
-        }
+            names.push(name);
+            Ok(())
+        })?;
         Ok(names)
+    }
+
+    pub(crate) fn visit_names(
+        &self,
+        mut visit: impl FnMut(OsString) -> io::Result<()>,
+    ) -> io::Result<()> {
+        for entry in Dir::read_from(&self.0)? {
+            let entry = entry?;
+            let bytes = entry.file_name().to_bytes();
+            if !matches!(bytes, b"." | b"..") {
+                visit(OsStr::from_bytes(bytes).to_owned())?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn has_entry(&self, name: &str) -> io::Result<bool> {

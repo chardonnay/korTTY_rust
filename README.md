@@ -208,7 +208,7 @@ For the operation check, start a recording with the allowed local image profile,
 
 With journal AI enabled, **Translate** translates a note in the live journal, the entry editor, or the screenshot editor. It uses the **Text and translation** profile or the default AI profile. A configuration without either assignment can still use the local journal profile. Saved HTTPS and CLI profiles show the exact masked input and destination for one approval. The worker rechecks the saved profile, masking policy and journal source before dispatch and before returning the translation. The target language is saved for the next translation. **Undo translation** or Cmd/Ctrl+Z in the note field restores the previous text. Only **Add** or **Save** adopts the draft into the journal. `bash scripts/with-scratch.sh cargo test --offline --locked -p kortty --bin kortty -- journal_note_translation journal_note_outbound_cli translation_stays translation_preserves` checks profile selection, source changes, the loopback request, the exact CLI payload and delayed responses.
 
-A single unprotected Markdown journal is saved as `.md` with a `-files` folder for attachments. An HTML bundle contains `journal.html`, `journal.xml`, decompressed capture logs, and the associated PNG files. Filtered HTML bundles include only the selected entries and the capture lines within their sequence ranges and time windows. `journal.html` works offline in the browser after extraction. Search, marker and time jumps, as well as the embedded capture preview, are part of the export file. A separate storage limit applies to the preview. The capture files are additionally included in full for the selected export range. If the output exceeds 128 MiB or 4,096 files, the export is aborted.
+A single unprotected Markdown journal is saved as `.md` with a `-files` folder for attachments. An HTML bundle contains `journal.html`, `journal.xml`, decompressed capture logs, and the associated PNG files. Filtered HTML bundles include only the selected entries and the capture lines within their sequence ranges and time windows. `journal.html` works offline in the browser after extraction. Search, marker and time jumps, as well as the embedded capture preview, are part of the export file. The preview has its own storage limit. HTML bundles include the full log files for the selected export range and stream them into the archive. Markdown and PDF exports have a batch limit of 128 MiB or 4,096 files.
 
 A single PDF uses A4 pages, embedded Noto fonts, and selectable text. Screenshots appear directly in the document. Optional chat histories begin in the appendix and are accessible via PDF bookmarks. **Configuration → Global Settings → Export** configures the footer for all three journal formats and the optional watermark for PDF. The watermark color can be set as `#RRGGBB`.
 
@@ -254,18 +254,37 @@ For the usability check, use an isolated profile with imported test journals. Pi
 
 For the metadata check, open an imported journal with entries and a screenshot, change the title first, and select **Cancel**. Then change it again and save with **OK**. In two open managers, save a multi-line description and compare the display. During a capture, save its description in the manager, change the viewer title, record another note, and finish the capture. After reopening, the title, description, and new entries must be present. `bash scripts/with-scratch.sh cargo test --offline --locked -p kortty --bin kortty -- journal_metadata session_journal::writer::tests journal_rename_policy` checks these workflows including stale responses, path aliases, and write errors.
 
-**Tools → Start/Stop Session Journal** starts a manual recording for the main pane of the active tab. kortty takes over a limited scrollback excerpt and the ongoing text output. The recording follows the tab when switching windows. After a reconnection, it binds the new main pane. **Note** inserts a timeline note. **Screenshot** saves the visible grid of the focused pane as a PNG if the session can capture the image without known credentials and without managed text masks. Incognito tabs and IBM block mode are locked for this recording. The data is stored by default under `journals/` in the active profile. **Open journal** opens the finished session journal.
+**Tools → Start/Stop Session Journal** starts a manual recording for the main pane of the active tab. kortty takes over a limited scrollback excerpt and the ongoing text output. The recording follows the tab when switching windows. An SSH journal stays open while the tab is disconnected. After a successful reconnect, it continues in the same journal with a `session reconnected` entry followed by live output from the new stream. **Note** inserts a timeline note. **Screenshot** saves the visible grid of the focused pane as a PNG if the session can capture the image without known credentials and without managed text masks. Incognito tabs and IBM block mode are locked for this recording. The data is stored by default under `journals/` in the active profile. **Open journal** opens the finished session journal.
 
 For the session journal smoke test in an isolated profile, run `printf 'journal-seed\n'`, start the recording, and wait for **Journal recording**. Then run `printf 'journal-live\n'`, add a note and a screenshot, and end the recording. Search for `journal-live` under **Open journal → Capture log**. The timeline must be able to open the note and the screenshot. `cargo test --locked -p kortty --bin kortty journal` additionally checks the recording of a real local PTY, text masks, and the writer limits.
 
 **Configuration → Global Settings → Logging → Session journal** saves the session journal folder. An empty field uses `journals/` in the active profile. Relative paths and `~/` are resolved before use. A policy setting for `[rule.session-journal].storage-path` locks the folder selection. For the folder smoke test in an isolated profile, choose and save a custom folder, start and end a new recording, and open **Tools → Session Journals…**. The manager must show the session journal in the chosen folder. Then change the selection and choose **Cancel**, record again, and check the saved folder. `cargo test --locked -p kortty --bin kortty journal_settings` checks default values, path resolution, saving, policy, and stale answers from the folder selection.
 
 Saved SSH, local-shell and serial profiles expose **Session journal** settings.
-**Start a journal on connect** starts fresh capture once per primary stream.
+**Start a journal on connect** starts a capture for the primary stream.
+A running SSH capture continues across reconnects in the same tab. A
+serial capture continues when reconnecting to the same device path.
+Serial journaling supports every byte-stream terminal profile and
+captures parsed, visible host output.
+Automatic terminal journals log the effective isolation at launch.
+After an SSH or serial reconnect, the journal records the new stream's isolation.
 **Capture typed commands at recognized shell prompts** starts with the next
-shell-integration prompt and records confirmed physical input. Paste, mirrored
-input, password prompts and partial commands already in progress are excluded.
-Capture-log part sizes and counts are bounded, and managed limits remain effective.
+shell-integration prompt that also marks the start of command input
+(OSC 133 A followed by B). It records confirmed physical input. Paste,
+mirrored input, password prompts and partial commands already in progress
+are excluded. The setting defaults to off when the profile or imported
+Java XML omits it.
+Capture-log parts can be up to 1,000 MiB each. The profile editor offers up
+to 500 parts by default. A managed policy can set a part count limit up to
+2,147,483,647, matching the Java policy range.
+
+An administrator can set `[rule.session-journal] enforced = true` to start
+the journal automatically and lock the stop action on supported terminal
+streams. The SSH editor shows the requirement without changing the saved
+autostart preference. An effective `session-journal = "deny"` feature rule
+disables capture. In incognito tabs, the requirement captures masked live
+output with journal metadata. Separate typed-input records, screenshots,
+notes and journal AI stay disabled in those tabs.
 
 **View → Live Journal** opens the running recording on the left or right side of the main window. Position and width are saved. **Show/Hide** restores the last selected side. On macOS, this is also possible with `Cmd+Alt+L`, and on Linux with `Ctrl+Alt+L`. For the dock smoke test during recording, open **Dock Right** and **Live Log** and run `printf 'dock-live\n'`. Switch to a tab without a recording and choose **Note** in the dock. The note must appear in the previous session journal. Move the recording tab to a second main window via **View → Move Tab…**. The last state remains visible in the source window. In the target window, the dock can take over the running recording.
 
@@ -1062,6 +1081,16 @@ root names, empty files and empty folders.
 Both pane filters accept a filename fragment or wildcard. On the server side, **Search subfolders…** reviews the starting folder before searching. The search follows the current hidden-file setting and displays up to 1,024 results. Opening a result rechecks its server path and selects the file or opens its folder. Cancelling a search in progress closes its SFTP connection. Reconnect to continue browsing.
 
 **Scheduler** opens job definitions, the run journal, and a native dependency diagram. A job executes a command, a script stored in the job, or a **Shared snippet** on an already confirmed SSH target. Linked snippets retain their ID when renamed. Each run reads the last saved version. Bash, Python 3, Perl, and Ruby are available for scripts. The server requires a POSIX login shell and the selected interpreter. Each argument line with content is passed as its own value. `jobs.json` in the Rust profile stores the path of the unencrypted SSH key, the source, and structured results. Jobs can start manually, at fixed times, at intervals, or in dependency chains. **Run now** and **Run with successors** save the current job draft before checking dependencies. If saving fails, the draft stays open and no job starts. While kortty is running, due jobs are executed even if the scheduler window is closed. Up to four SSH jobs run simultaneously. The SFTP actions create directories, rename entries without overwriting, and set octal POSIX permissions. They require absolute server paths and operate via the SFTP subsystem. **Upload file** and **Download file** transfer one regular file up to 1 GiB each between full paths. The file transfer policy applies before the SSH setup. A new target is published only after the transfer is complete. In case of connection loss, a private upload staging folder may remain on the server.
+
+To run a saved SSH or rsync job with a temporary private key, turn on
+**Enable temporary SSH key option** in Security. Save the key in Connection
+Manager with automatic selection enabled. A target and its jump host can
+each use their own saved key. Verify the host keys for both destinations,
+choose or reselect the connection in Scheduler, and save the job. Leave
+the vault unlocked when it runs. Each key keeps its original expiration.
+When replacing a key, select the route again and renew any applicable
+rsync transfer approval. Restored portable jobs that used temporary keys
+require local route selection before enabling them.
 
 In a Scheduler ownership action with one saved SSH target, use **Resolve
 Name…** next to the UID or GID field. Check the endpoint and its host key

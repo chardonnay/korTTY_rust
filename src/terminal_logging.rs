@@ -7,11 +7,19 @@ use iced::widget::{checkbox, column, pick_list, row, text, text_input};
 use serde::{Deserialize, Serialize};
 
 mod capture;
+mod editor;
+mod interchange;
 mod policy;
 mod writer;
 
 pub(crate) use capture::{Capture, Prepared, RedactionSecrets, Redactor, Secrets, Warning};
+pub(crate) use editor::{Action as EditorAction, ManagedFields, pick_folder};
+pub(crate) use interchange::{JavaFields, JavaReview};
 pub(crate) use policy::Policy;
+
+pub(crate) const MAX_LOG_MIB: u16 = 1000;
+pub(crate) const MAX_LOG_BYTES: u64 = MAX_LOG_MIB as u64 * 1024 * 1024;
+const MAX_RETENTION_DAYS: u16 = 3650;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -63,6 +71,8 @@ pub(crate) struct Config {
     retention_days: u16,
     include_username: bool,
     directory_mode: DirectoryMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    java_review: Option<JavaReview>,
 }
 
 impl Default for Config {
@@ -77,6 +87,7 @@ impl Default for Config {
             retention_days: 30,
             include_username: false,
             directory_mode: DirectoryMode::None,
+            java_review: None,
         }
     }
 }
@@ -94,8 +105,7 @@ impl Config {
     }
 
     pub(crate) fn validate(&self) -> io::Result<()> {
-        if self.folder.len() > 4096
-            || self.folder.chars().any(char::is_control)
+        if !interchange::valid_path_text(&self.folder)
             || (!self.folder.is_empty() && !valid_folder(Path::new(&self.folder)))
         {
             return Err(io::Error::new(
@@ -103,11 +113,14 @@ impl Config {
                 "Use an absolute log folder without parent segments.",
             ));
         }
-        if !(1..=256).contains(&self.max_mib) || self.retention_days > 3650 {
+        if !(1..=MAX_LOG_MIB).contains(&self.max_mib) || self.retention_days > MAX_RETENTION_DAYS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Use a log size of 1–256 MiB and retention of 0–3650 days.",
+                format!("Use a log size of 1–{MAX_LOG_MIB} MiB and retention of 0–3650 days."),
             ));
+        }
+        if let Some(review) = &self.java_review {
+            review.validate()?;
         }
         Ok(())
     }
@@ -125,6 +138,46 @@ fn valid_folder(path: &Path) -> bool {
     path.is_absolute() && !path.components().any(|part| part == Component::ParentDir)
 }
 
+fn slug(connection: &str) -> String {
+    let mut sanitized = String::new();
+    for character in connection.chars() {
+        if character.is_ascii_alphanumeric() || matches!(character, '.' | '-') {
+            sanitized.push(character);
+        } else if !sanitized.is_empty() && !sanitized.ends_with('_') {
+            sanitized.push('_');
+        }
+    }
+    let sanitized = sanitized.trim_end_matches('_').trim_start_matches('.');
+    if sanitized.is_empty() {
+        return "terminal".into();
+    }
+    sanitized[..sanitized.len().min(64)].into()
+}
+
+fn filename(
+    slug: &str,
+    stamp: jiff::civil::DateTime,
+    part: u32,
+    sequence: u16,
+    format: Format,
+) -> String {
+    let stamp = stamp.strftime("%Y-%m-%d-%H-%M-%S");
+    let extension = match format {
+        Format::Text => "log",
+        Format::Xml => "xml",
+        Format::Json => "json",
+    };
+    if part <= 1 {
+        format!("{stamp}-{slug}_{sequence}.{extension}")
+    } else {
+        format!("{stamp}-{slug}_{sequence}.p{part}.{extension}")
+    }
+}
+
+fn compressed_filename(name: &str) -> String {
+    format!("{name}.gz")
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum Edit {
     Enabled(bool),
@@ -136,12 +189,16 @@ pub(crate) enum Edit {
     Retention(String),
     Username(bool),
     Directory(DirectoryMode),
+    UseJavaFolder,
+    UseJavaMaxSize,
+    DismissJavaReview,
 }
 
 pub(crate) struct Form {
     config: Config,
     size: String,
     retention: String,
+    editor: editor::Controls,
 }
 
 impl Form {
@@ -150,18 +207,19 @@ impl Form {
             size: config.max_mib.to_string(),
             retention: config.retention_days.to_string(),
             config,
+            editor: editor::Controls::default(),
         }
     }
 
     pub(crate) fn update(&mut self, edit: Edit) {
         match edit {
-            Edit::Enabled(value) => self.config.enabled = value,
-            Edit::Folder(value) if value.len() <= 4096 && !value.chars().any(char::is_control) => {
+            Edit::Enabled(value) => self.config.set_enabled(value),
+            Edit::Folder(value) if interchange::valid_path_text(&value) => {
                 self.config.folder = value
             }
             Edit::Format(value) => self.config.format = value,
             Edit::Size(value)
-                if value.len() <= 3 && value.bytes().all(|byte| byte.is_ascii_digit()) =>
+                if value.len() <= 4 && value.bytes().all(|byte| byte.is_ascii_digit()) =>
             {
                 self.size = value
             }
@@ -174,6 +232,13 @@ impl Form {
             }
             Edit::Username(value) => self.config.include_username = value,
             Edit::Directory(value) => self.config.directory_mode = value,
+            Edit::UseJavaFolder => self.config.adopt_java_folder(),
+            Edit::UseJavaMaxSize => {
+                if let Some(size) = self.config.adopt_java_max_size() {
+                    self.size = size.to_string();
+                }
+            }
+            Edit::DismissJavaReview => self.config.java_review = None,
             _ => {}
         }
     }
@@ -190,7 +255,7 @@ impl Form {
         Ok(config)
     }
 
-    pub(crate) fn view(&self, eligible: bool, advanced: bool) -> Element<'_, Edit> {
+    pub(crate) fn view(&self, eligible: bool) -> Element<'_, Edit> {
         let mut fields = column![
             text("Terminal Logging").size(17),
             checkbox(self.config.enabled && eligible)
@@ -226,17 +291,6 @@ impl Form {
             ]
             .spacing(8),
         );
-        if advanced {
-            fields = fields.push(row![
-                text_input("Max size (MiB)", &self.size).width(110).on_input(Edit::Size),
-                text_input("Retention (days)", &self.retention).width(125).on_input(Edit::Retention),
-                checkbox(self.config.rotate_daily).label("Rotate daily").on_toggle(Edit::Daily),
-            ].spacing(8)).push(text("Automatic retention applies to logs created in the private default folder. Zero keeps them.").size(12))
-            .push(row![
-                checkbox(self.config.include_username).label("Include SSH username").on_toggle(Edit::Username),
-                pick_list([DirectoryMode::None, DirectoryMode::Full, DirectoryMode::Relative], Some(self.config.directory_mode), Edit::Directory),
-            ].spacing(8));
-        }
         if let Err(error) = self.config() {
             fields = fields.push(text(error.to_string()).size(12));
         }

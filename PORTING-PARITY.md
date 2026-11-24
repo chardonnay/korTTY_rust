@@ -481,11 +481,10 @@ Java's non-interactive tab restore consults the saved profile and can use
 a registered, valid temporary key. Tabs that need input are deferred for
 interactive resolution. The Java Scheduler remote session can also use
 temporary key contents and makes an owner-only key file for an external
-SSH process when required. The Rust Scheduler currently treats temporary
+SSH process when required. At that checkpoint the Rust Scheduler treated temporary
 keys as interactive credentials. Its rsync bridge uses the existing
-native SSH transport. The remaining Scheduler work is to bind eligible
-temporary keys to the reviewed job and route and verify the resulting
-native SSH and rsync runs.
+native SSH transport. The [scheduled temporary-key checkpoint](#scheduled-ssh-and-rsync-with-temporary-keys)
+records the implementation after this Java comparison.
 [Java tab restore](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/TabRestoreTriage.java)
 · [Java Scheduler remote session](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/jobscheduler/JobSchedulerRemoteSession.java)
 · [Rust Scheduler authentication](src/job_executor/connection.rs)
@@ -518,6 +517,40 @@ SFTP fixtures. Windows ARM64 passed the all-target application check with
 reconnect still need acceptance.
 [Apple Silicon project and SSH tests](target/verification/20261123-project-temporary-key-macos-final.log)
 · [Windows application check](target/verification/20261123-project-temporary-key-windows-final-check.log)
+
+## Scheduled SSH and rsync with temporary keys
+
+Selecting and saving a local SSH connection in Scheduler records its
+temporary-key binding for the exact saved account and endpoint. A jump
+login can use a different eligible key. A run requires an unlocked vault
+and automatic selection for each temporary key. Changing a key reference
+requires choosing the route again and renewing any applicable rsync
+approval. Portable backup strips the binding and disables the job.
+
+The native transport loads key material after verifying the host and
+rechecks expiry, the vault revision, current permissions and the saved
+route before offering or signing with a key. The rsync bridge uses the
+same authenticated native transport. AI Agent and Swarm jobs retain
+their existing authentication options.
+
+The Apple Silicon OpenSSH fixture verified direct and jump authentication
+with the expected public-key fingerprints. It also checked account and
+key mismatches, credential replacement, vault locking and a Security change
+after opening TCP. The focused expiry and portable backup tests passed.
+[Apple Silicon verification](target/verification/scheduler-temp-ssh-macos-native-final.log)
+
+Fedora ARM64 passed strict application Clippy and the native application
+build. The same OpenSSH fixture authenticated both hops with their
+separately saved temporary keys, transferred a file through the native
+rsync bridge and verified the downloaded bytes. Its expiry and portable
+backup tests also passed.
+[Fedora OpenSSH and rsync verification](target/verification/scheduler-temp-ssh-fedora-native-storage.log)
+
+Windows ARM64 passed strict Clippy for the app and SSH crate and all 60
+regular SSH crate tests. One opt-in test was ignored. The Scheduler
+desktop review and key replacement interactions remain open.
+[Windows Clippy](target/verification/scheduler-temp-ssh-windows-final-clippy.log)
+· [Windows SSH tests](target/verification/scheduler-temp-ssh-windows-ssh-suite.log)
 
 ## November 23 Native vault startup unlock
 
@@ -836,6 +869,1121 @@ Models page first. Enter opened the page and cleared the search.
 [Rust matcher](src/settings_search.rs)
 · [Tagged Java matcher](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SettingsSearchMatcher.java)
 · [Apple Silicon focused tests](target/verification/20261123-settings-ranking-macos-final.log)
+
+## November 24 Knowledge Stores toolbar search
+
+The tagged Java search indexes visible toolbar labels, including disabled
+buttons. Rust now includes the previously unindexed Knowledge Stores
+inventory actions. The store toolbar adds Configure, Test search and
+Refresh. The source toolbar adds Add files, Add folder, Cancel indexing,
+Sync mode, Advanced, Enable / disable and Remove sources.
+
+A result opens the Knowledge Stores page and scrolls to the highlighted
+button. Its normal availability and policy still apply. Revealing a
+button preserves the store and source selection and leaves the inventory
+and indexes untouched. When an owned Knowledge Stores review or editor is
+open, its parent toolbar results are unavailable. The remaining desktop
+coverage includes comparison of the search results and keyboard focus.
+[Tagged Java toolbar](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/RagKnowledgeStorePane.java)
+· [Rust search targets](src/ai_manager/search.rs)
+
+Apple Silicon passed strict application Clippy and eight focused tests.
+The tests located all ten new toolbar targets at 640 by 300 logical
+pixels on first visit, kept an existing source selection, and refused a
+stale parent result while the Sync mode dialog was open. Windows ARM64
+passed strict application Clippy for all targets.
+[Apple Silicon search tests](target/verification/20261124-knowledge-inventory-search-macos-acceptance.log)
+· [Windows Clippy](target/verification/20261124-knowledge-inventory-search-windows-clippy-final.log)
+
+## November 24 Local Models toolbar search
+
+The tagged Java Local Models toolbar exposes the selected runtime's
+install or update action, other versions, local package import and
+removal. Its model toolbar also exposes Import GGUF. Rust now indexes
+the visible llama.cpp install or update, Other versions and signed
+package controls alongside the existing Remove action. The GGUF import
+toggle and Choose GGUF files button have their own search targets.
+
+Selecting a result reveals the current control while preserving runtime
+and model state. Selecting Choose GGUF files reveals the import form
+with the picker button highlighted. The user opens the file picker from
+that button. Runtime and import actions keep their existing policy and
+confirmation checks. Parent toolbar entries are unavailable inside an
+owned review or editor.
+[Tagged Java toolbar](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/LocalModelManagerPane.java)
+· [Rust search targets](src/ai_manager/search.rs)
+
+Apple Silicon passed strict application Clippy for all targets and five
+focused tests. They verified first-visit search and widget placement,
+current runtime state, stale results, and preservation of draft paths.
+Windows ARM64 passed strict application Clippy for all targets. Visual
+comparison in the running desktop application remains open.
+[Apple Silicon search tests](target/verification/20261124-local-models-toolbar-search-macos.log)
+· [Windows Clippy](target/verification/20261124-local-models-toolbar-search-windows-clippy.log)
+
+## November 24 Appearance inventory
+
+Rust Settings search independently reveals the App Design selector,
+Previous design and Next design buttons, and Enable design animations
+checkbox. Choosing a result highlights only the matched control and
+leaves the settings draft untouched. The Java search ranks the design
+field and animations label. Its one-character navigation button labels
+fall below the label-length threshold. Rust uses their tooltip names.
+
+Windows ARM64 and Apple Silicon each passed all 49 Settings tests.
+Apple Silicon also passed strict application Clippy for all targets.
+Windows ran the native test binary linked by LLVM from the objects
+produced by the Cargo test build. Its original Microsoft linker was
+stopped after the LLVM-linked suite passed.
+The regression opened Settings on Font, searched for each Appearance
+control and checked the distinct highlight bounds at 620 by 300 logical
+pixels and the unchanged draft. Native desktop visual comparison
+remains open. On Windows, the standalone Settings preview can open the
+dialog for that comparison without terminal-window interaction.
+[Apple Silicon Settings tests](target/verification/20261124-appearance-search-macos.log)
+· [Windows ARM64 Settings tests](target/verification/20261124-appearance-search-windows-lld.log)
+
+Chat color profile is searchable in Settings → Appearance. Automatic
+(theme) follows the selected global terminal theme and its agent-panel
+colors. The ten fixed profiles and the automatic fallback retain all 99
+tagged Java values. AI Chat and Swarm read the current global profile
+when they render. It colors the conversation background, controls,
+transcript, code and user messages. The AI Chat toolbar saves its choice
+immediately. Settings applies its draft on Save, and Java backup import
+only fills an unset profile.
+[Rust palette and resolver](src/workspace/chat_appearance.rs)
+· [Rust AI Chat](src/workspace/terminal_ai.rs)
+· [Rust Swarm view](src/workspace/terminal_agent/swarm.rs)
+
+Windows ARM64 passed 118 focused Settings, AI Chat and Swarm tests.
+Apple Silicon passed 121 tests and strict application Clippy for all
+targets. The opt-in live OpenSSH fixture was ignored on macOS. The tests
+exercised saved settings, failed saves, the Java backup merge, independent
+highlights and the shared palette choice. Visual comparison in the
+running AI Chat and Swarm views remains open.
+[Apple Silicon chat color checks](target/verification/20261124-chat-color-profiles-macos-verified.log)
+· [Windows ARM64 chat color checks](target/verification/20261124-chat-color-profiles-windows-final.log)
+
+[Tagged Java Appearance page](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SettingsDialog.java)
+· [Tagged Java index](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SettingsSearchBar.java)
+· [Tagged Java chat palettes](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ChatColorProfileSupport.java)
+· [Rust Appearance page](src/workspace/settings_window/appearance_settings.rs)
+
+## November 24 Application font scale
+
+Settings → Appearance offers UI font size from 80% through 160% in
+five-point steps. Match display resolution uses the primary monitor's
+OS logical height to choose 100%, 110%, 125% or 140%. When the display
+backend cannot identify a primary monitor, Rust uses the window's
+monitor. An unavailable display size uses 100%. Automatic mode keeps
+the saved manual value for the next switch back.
+
+The application scale recalculates standard text, editor controls and
+popup menu layout in logical pixels. The terminal cells, source editor
+content, AI Chat and Agent activity have separate font scopes. Guide
+content continues to use its own zoom. Settings commits both scale
+preferences on Save. Java backup import maps the UI and guide fields
+to separate preferences and preserves fields already set in Rust.
+[Tagged Java UI font scaling](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/UiFontScaleSupport.java)
+· [Rust application text scope](src/workspace/ui_font_scale.rs)
+
+Windows ARM64 passed 57 focused tests before the visual layout
+adjustments. Apple Silicon repeated those 57 tests and strict Clippy
+for all application targets after the adjustments. The tests covered
+the imported preferences, Save and Cancel, search and the automatic
+thresholds. Iced layout checks exercised 80%, 100% and 160% for labels,
+inputs and closed drop-downs, with a separate fixed-size text scope.
+[Apple Silicon UI font scale checks](target/verification/20261124-ui-font-scale-macos-layout.log)
+· [Windows ARM64 UI font scale checks](target/verification/20261124-ui-font-scale-windows-final.log)
+
+The Windows ARM64 standalone Settings preview compared 100% and 160%
+in isolated profiles. The corrected 160% layout showed the full
+selected chat profile, accepted Ocean from its scaled drop-down and
+matched the 100% terminal font sample at the same 14-point terminal
+setting. Match display resolution showed 125% on the test display and
+disabled the stepper. Switching back revealed 160% again. Save closed
+Settings and wrote automatic mode, the retained 160% manual value and
+the Ocean profile to the private preview profile. This check covered
+one Windows display. The Java comparison and other native display
+configurations remain open.
+[Windows ARM64 standalone preview build](target/verification/20261124-ui-font-scale-windows-preview-final.log)
+
+## November 24 Settings section overflow
+
+The Settings tab strip shows a drop-down at its right edge when its
+labels exceed the available width. The width check uses the same font
+metrics and scale as the tabs and accounts for the Keyboard conflict
+count. The menu lists all sections in order and marks the active one.
+Picking a section uses the same page and scroll navigation as clicking
+its tab. The menu widens to the left of its trigger to fit longer section
+names, and its list scrolls when the window has limited vertical space.
+[OpenJFX 21 tab menu](https://github.com/openjdk/jfx21u/blob/master/modules/javafx.controls/src/main/java/javafx/scene/control/skin/TabPaneSkin.java#L1731)
+· [Rust Settings tab strip](src/workspace/settings_window/section_tabs.rs)
+
+Windows ARM64 passed 102 Settings tests before the tooltip was removed.
+Apple Silicon repeated all 102 Settings tests and strict application and
+test-target Clippy after the removal. The widget test opened the offscreen
+AI Agent Design page at 100% and checked menu visibility at a width that
+fits all tabs at 100% and overflows at 160%.
+[Apple Silicon verification](target/verification/20261124-settings-overflow-macos-visual-fix.log)
+· [Windows ARM64 verification](target/verification/20261124-settings-overflow-windows-final.log)
+
+At a width of 1,122 pixels, the standalone Windows ARM64 Settings window
+showed all 18 menu entries and marked Font as active. Selecting AI Agent
+Design opened the page and scrolled its tab into view. Maximizing the
+window exposed the entire strip and hid the menu. The corrected preview
+repeated the menu selection after removing a tooltip that overlapped the
+tab labels.
+[Final Windows ARM64 preview build](target/verification/20261124-settings-overflow-windows-preview-final.log)
+
+## November 24 Settings section keyboard navigation
+
+Tab and Shift+Tab move through focusable controls in the current
+Settings window. The section menu joins the order while the strip
+overflows. Enter, Space and the vertical arrow keys open the focused
+trigger at the active section. The arrow keys move the highlight.
+Home and End reach the first and last choices. The menu scrolls to
+reveal the highlighted choice. Enter and Space open that section with
+the current draft intact. Escape closes the menu and keeps focus on
+its trigger. Tab and Shift+Tab dismiss the menu and continue focus traversal.
+[OpenJFX 21 context menu keyboard handling](https://github.com/openjdk/jfx21u/blob/master/modules/javafx.controls/src/main/java/com/sun/javafx/scene/control/ContextMenuContent.java#L456)
+
+Windows ARM64 and Apple Silicon each passed 106 Settings and search
+tests. Apple Silicon also passed strict application and test-target
+Clippy. The widget test exercised focus traversal from the search field,
+selection in a compact window, Escape and Shift+Escape precedence,
+Tab handoff and draft retention after switching to Snippet Editor.
+[Apple Silicon verification](target/verification/20261124-settings-menu-keyboard-macos-modifiers.log)
+· [Windows ARM64 verification](target/verification/20261124-settings-menu-keyboard-windows-verified.log)
+
+The compact Windows ARM64 Settings preview measured 742 by 542 pixels.
+Tab reached the menu from search. End and the arrow keys brought the
+last rows into view, Escape kept the menu trigger focused, and Enter
+opened Snippet Editor. Returning to Font showed the same unsaved
+15-point value. Shift+Tab closed the reopened menu and focused search.
+[Windows ARM64 preview build](target/verification/20261124-settings-menu-keyboard-windows-preview.log)
+
+## November 24 SSH editor Journal and AI tabs
+
+The saved SSH editor has eight tabs in the order of the tagged Java
+editor. Journal sits between Terminal Logging and Window Geometry.
+AI follows Window Geometry and displays the saved provider profile,
+the agent execution override, the design and skill assignments.
+Filtering skills by their displayed names preserves the existing
+assignments. Unavailable assignments remain visible and removable
+when their labels match the filter. The tab strip wraps on a narrow
+window and the form scrolls above the fixed footer.
+
+The Journal tab edits the existing capture and rotation settings.
+The applicable policy controls editability and displays the managed
+part count. The summary interval is editable when AI summaries are
+allowed and enabled for the connection. Capture preferences are
+available for manually started journals. Restoring global terminal
+defaults preserves the Journal and AI drafts and requires the normal
+connection Save.
+
+Apple Silicon and Windows ARM64 each passed 129 connection editor,
+store and manager tests, with two ignored. Apple Silicon also passed
+strict application and test-target Clippy. The focused regression
+checked all eight tab bounds and the footer at the minimum window size,
+then saved and reopened a profile after changing Journal and AI options
+and resetting only terminal overrides.
+[Apple Silicon verification](target/verification/20261124-connection-editor-tabs-macos-native.log)
+· [Windows ARM64 verification](target/verification/20261124-connection-editor-tabs-windows.log)
+
+The 642 by 462 pixel Windows ARM64 preview showed all eight tabs,
+including Journal and AI, with Save and Cancel visible in both pages.
+Searching for Ansible reduced the skills list to that entry. Cancel
+returned directly to the Connection Manager after the search. Windows
+also passed the two opt-in tests for Teamwork Git over loopback and
+temporary-key replacement in the vault.
+
+## November 24 SSH journal editor desktop comparison
+
+The Journal page follows the Java layout with an enable switch, a
+separator, two options and three aligned editable spinners. The
+summary interval follows the AI summaries switch. The dependent controls
+are disabled when automatic capture is off. A managed requirement locks
+the enable switch on and shows the applied rotation ceiling. Capture
+choices remain available to manually started journals when saved after
+clearing automatic capture. Invalid numeric drafts return to the saved
+values when automatic capture is cleared.
+[Journal editor](src/connection_window/journal_settings.rs)
+
+The Windows comparison used the actual Java v2.26.0 connection dialog
+from the released x86-64 ZIP under emulation and native ARM64 Rust.
+The dedicated Java fixture opened the Journal tab directly in an isolated
+profile. Rust uses a wider input column to show all ten digits at the
+managed ceiling and retains its 1,440-minute summary range. The final
+normal-theme comparison displayed values 0, 25 and 500 in both editors.
+The three inputs began at approximately 308 pixels in Java and 303 in
+Rust. The fixture windows measured 1,114 by 1,336 and 862 by 722 pixels
+respectively.
+[Tagged Java connection editor](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ConnectionEditDialog.java)
+
+The disabled profile showed inactive capture controls. In the managed
+profile the stepper increased 2,147,483,646 to 2,147,483,647 and Save
+persisted the change. After the private application restarted, the
+editor showed the exact saved value, the disabled increment at the
+ceiling and the locked enable switch. The stored typed input and
+automatic start preferences remained off, with automatic start applied
+by the installation policy.
+[Windows ARM64 preview build](target/verification/20261124-journal-editor-windows-build-verified.log)
+
+Windows ARM64 and Apple Silicon each passed 40 focused tests. Apple
+Silicon also passed strict Clippy for the application and test targets.
+[Apple Silicon verification](target/verification/20261124-journal-editor-macos-verified.log)
+· [Windows ARM64 verification](target/verification/20261124-journal-editor-windows-verified.log)
+
+## November 24 SSH connection AI editor
+
+The saved SSH editor follows Java's order for the profile, execution
+switch, connection memory, design and skill list. Profile and design
+controls use the same column. The design remains visible in a read-only
+field when agent execution is disabled for the connection. Available
+profiles are ordered by name and an unavailable assignment stays in the
+picker for that profile.
+[Tagged Java connection editor](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ConnectionEditDialog.java)
+· [Rust connection editor](src/connection_window/terminal_overrides.rs)
+
+The scrollable skill list groups connection-targeted skills first and
+sorts each group by name. The search checks the displayed label,
+description and tags. Agent-targeted skills can be assigned explicitly.
+Disabled skills remain identifiable and ineligible for runtime prompts
+while disabled. Hidden or deleted assignments survive a save and may
+be removed explicitly in the Rust editor.
+[Native skill inventory](src/ai_manager/skills.rs)
+
+The Windows comparison used the released Java v2.26.0 dialog under
+x86-64 emulation and an isolated Rust ARM64 preview. Both listed the
+connection-targeted Zebra before Atlas and Beacon. A description-only
+search for `release ledger` found Atlas in both. In Rust, `worksheet`
+found Beacon by its tag. Saving while that filter was active retained
+the newly assigned Atlas, the previous Zebra and the unavailable
+assignment. A separate fixture with execution disabled showed the
+current design in the read-only field.
+[Windows ARM64 preview build](target/verification/20261124-connection-ai-editor-windows-build-final.log)
+
+Windows ARM64 and Apple Silicon each passed 46 focused tests. Apple
+Silicon also passed strict Clippy. The tests covered skill order,
+metadata matching and disabled-skill eligibility.
+[Apple Silicon verification](target/verification/20261124-connection-ai-editor-macos-final.log)
+· [Windows ARM64 verification](target/verification/20261124-connection-ai-editor-windows-tests.log)
+[Windows ARM64 preview build](target/verification/20261124-connection-editor-tabs-windows-preview.log)
+· [Windows ARM64 opt-in tests](target/verification/20261124-connection-editor-tabs-windows-opt-in.log)
+
+The later [tab navigation update](#november-24-ssh-editor-tab-navigation)
+adds single-row overflow. The [managed session journal](#november-24-managed-session-journal)
+covers enforced policy behavior. Rotation limits remain in the porting plan.
+[Tagged Java editor](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ConnectionEditDialog.java)
+· [Rust editor](src/connection_window/form.rs)
+
+## November 24 Connection Manager Teamwork sidebar
+
+Java v2.26.0 places Teamwork in its own sidebar section after Library,
+Folders and Tags. Rust follows this order, with the same folder indentation
+step and separate section headings. A Teamwork entry remains available
+when its shared count is zero. Sidebar folder counts include local shell
+profiles.
+[Tagged Java sidebar implementation](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ConnectionManagerDialog.java#L857)
+· [Tagged Java screenshot](https://github.com/chardonnay/korTTY/blob/v2.26.0/app-docs/screenshots/main/connection-manager.png)
+· [Rust manager view](src/connection_window/view.rs)
+
+The Library's Open now filter includes Teamwork sessions by source-qualified
+identity. Each open tab contributes once per profile, even when the tab has
+multiple panes for that profile. Incognito tabs and locally hidden Teamwork
+entries stay outside the filter. The list row and inspector show the
+current open-tab count for a shared entry.
+[Workspace count collection](src/workspace/profile_tools.rs)
+
+The native Windows ARM64 preview matched the tagged Java screenshot's
+sidebar order with two local and two shared connections. Selecting Teamwork
+showed the two shared groups. The shared inspector showed its open-tab
+count, the local subfolder and shared tag filtered the expected rows, and
+Open now showed an empty list before any connection was opened.
+[Windows ARM64 desktop verification](target/verification/20261124-connection-manager-teamwork-windows-desktop.log)
+
+Apple Silicon passed 44 focused tests and strict Clippy. The regressions
+cover the Teamwork sidebar action, folder drops, hidden entries in Open
+now, and removal from Open now when the last non-incognito tab closes.
+[Apple Silicon verification](target/verification/20261124-connection-manager-teamwork-macos-native.log)
+
+## November 24 SSH connection form alignment
+
+The SSH Connection page uses one label column and follows the Java order
+for the destination, terminal metadata, folder and tag, startup settings,
+and authentication. Host and port share a row. Username uses a separate
+row. The port accepts typed values and includes stepper buttons with
+the existing range of 1 through 65535. The Jump Server page uses the same
+destination field layout.
+
+The protocol and host-key verification are visible as read-only facts in
+the SSH editor. Character encoding is on the Connection page and uses the
+saved terminal setting and its Inherit choice. The SSH editor has radio
+choices for authentication families, source pickers for password and SSH
+key authentication, and an explicit keyboard-interactive option. The
+editor uses vault references and the existing reviewed temporary-key
+workflow.
+[Tagged Java editor](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ConnectionEditDialog.java#L235)
+· [Rust SSH form](src/connection_window/form.rs)
+
+The released Java dialog ran under x86-64 emulation on Windows ARM64.
+The native Rust preview used the same synthetic destination and jump host.
+The desktop check compared field order and alignment, scrolled to the
+password and key-file controls, and kept Save reachable. The saved fixture
+contained the independently changed ports 2223 and 2224 and Windows-1252.
+Control widths differed in this comparison. The later
+[keyboard and control update](#november-24-ssh-editor-keyboard-and-disabled-jump-host)
+adds the timeout and retry steppers.
+[Windows ARM64 desktop verification](target/verification/20261124-ssh-connection-fields-windows-desktop.log)
+
+Apple Silicon passed 54 focused tests and strict Clippy. The widget
+regression sends the destination and jump-host step actions to their own
+drafts. A second regression covers reselection while a temporary-key
+paste is pending.
+[Apple Silicon verification](target/verification/20261124-ssh-connection-fields-macos-native.log)
+
+## November 24 SSH editor keyboard and disabled jump host
+
+Timeout and retry use the same editable stepper as the SSH port.
+An unmodified Up or Down steps a focused numeric input and respects
+its bounds. Retries continue to accept zero for a single attempt.
+
+Jump Server shows disabled fields when the jump host is off. The
+current draft keeps its gateway settings if the user turns it back on
+before saving. Saving with the jump host off writes a direct connection.
+Disabled fields stay outside the tab order, and draft updates targeting
+the disabled jump host are ignored.
+
+Tab and Shift+Tab traverse enabled controls in Connection and Jump
+Server, and the form follows the focus when it scrolls. The authentication
+radio group uses the arrow keys. The OS symbol picker supports arrows,
+Home, End, Enter and Escape, including navigation to an offscreen symbol.
+[SSH editor](src/connection_window/form.rs)
+· [OS symbol picker](src/connection_window/os_badge.rs)
+
+Apple Silicon passed 56 focused tests and strict Clippy. The checks cover
+keyboard stepping for both port fields, retention of an unsaved jump
+configuration, and the focus transition from the disabled Jump Server
+toggle to Save.
+[Apple Silicon verification](target/verification/20261124-ssh-editor-keyboard-macos-retest.log)
+
+Windows ARM64 passed the same 56 focused tests. The native preview build
+passed and opened a private Connection Manager. Windows Graphics Capture reported
+`DXGI_ERROR_DEVICE_REMOVED` when capturing the private window. The
+desktop comparison and keyboard walkthrough remain open.
+[Windows ARM64 tests](target/verification/20261124-ssh-editor-keyboard-windows-tests-native.log)
+· [Windows ARM64 build](target/verification/20261124-ssh-editor-keyboard-windows-build-retest.log)
+· [Desktop check](target/verification/20261124-ssh-editor-keyboard-windows-desktop.md)
+
+## November 24 SSH terminal settings source
+
+The SSH Terminal Settings page starts with the global and own choices
+followed by the theme, font, colors and close and timestamp behavior.
+The global choice shows current defaults in disabled controls. Changing
+the source within the open editor retains an unsaved own draft. The first
+switch to own settings on a global profile seeds the editor from the
+current defaults. Existing Rust profiles keep their per-field inheritance.
+
+Saving global settings clears the active presentation overrides and keeps
+the previously saved own presentation as inactive data. Initial sizing,
+character encoding, paste delay, highlighting, isolation, Journal and AI
+retain their independent settings. Java connection XML carries the
+settings source and saved presentation. It reads and writes the connection
+encoding independently of the presentation choice.
+
+On Windows ARM64 the Java v2.26.0 reference and the native Rust editor
+both restored the unsaved font size when switching back to own settings.
+Rust also saved the 18 pt own draft and retained the second connection's
+23 pt presentation as inactive data when switching it to global settings.
+The second connection kept Windows-1252 and its 88-column initial width.
+Apple Silicon passed 104 focused tests, with one ignored, and strict Clippy.
+The desktop flow remains to be checked on macOS and Linux.
+[SSH editor](src/connection_window/form.rs)
+· [Presentation controls](src/connection_window/terminal_overrides/ssh_style.rs)
+
+## November 24 SSH font and color selectors
+
+The saved SSH font selector offers the Java families and installed
+families. It also shows a profile's saved family when it is unavailable on
+the machine. Foreground and background show their active swatches and open
+palettes with presets, tints, shades and custom hex input. Selecting a preset
+or applying a valid custom value edits the connection draft. Escape
+dismisses the popover and restores focus to the color control. Individual
+fields can still inherit their values, and the global display is read-only.
+
+Windows ARM64 confirmed keyboard font selection, palette focus and
+dismissal, a foreground preset, and removal of a background override.
+After restart, the compact popover accepted and persisted `#FF8001` with
+DejaVu Sans Mono and an inherited background. The global profile showed
+disabled font and color controls. Apple Silicon passed 68 focused tests,
+with one ignored, and strict Clippy. The follow-up below moves custom hex
+entry into the owned editor and adds the tab color selector.
+[Font and presentation controls](src/connection_window/terminal_overrides/ssh_style.rs)
+· [Color picker](src/connection_window/color_picker.rs)
+
+## November 24 SFTP settings layout and search
+
+The SFTP Settings page follows the Java ordering for inactivity,
+transfers, and ZIP creation. Timeout, parallel transfers, and ZIP
+compression use editable steppers and validate their effective ranges.
+The timeout stays visible while disabled and remembers its value if
+re-enabled in the draft. A managed limit caps the allowed parallel count
+and disables the field at a cap of one. Timeout, retaining a cancelled
+transfer's partial file, ZIP path, and ZIP compression have separate
+search targets. The external editor executable and rsync executable
+continue to use the native file and job approval workflows.
+
+Windows ARM64 and Apple Silicon each passed 108 focused tests. The tests
+cover discovery from an unopened page, the specific search target,
+timeout draft retention, invalid-range handling, and live policy caps.
+Apple Silicon also passed strict Clippy. The Windows x64 Java v2.26.0
+portable reference ran under Windows ARM64 emulation. Its archive
+matched the published SHA-256, and a JavaFX scene snapshot confirmed
+the Settings layout and visible disabled timeout.
+[SFTP Settings](src/workspace/settings_window/sftp_settings.rs)
+· [Settings search inventory](src/workspace/settings_window.rs)
+· [Windows ARM64 test log](target/verification/20261124-sftp-settings-windows-arm64.log)
+· [Apple Silicon test log](target/verification/20261124-sftp-settings-macos-arm64.log)
+
+## November 24 Quick Connect terminal logging
+
+The SSH Terminal log section shows the directory, format, and gzip
+setting in a compact grid even when logging is off. Selecting a saved
+connection shows its stored values. The owned native directory picker
+edits the current connection draft. Cancel preserves the previous path.
+Picker results carry a draft ticket, and switching profiles, protocols,
+or the group tab invalidates the old ticket. Incognito profiles and
+incognito terminal splits cannot edit these controls.
+
+Windows ARM64 and Apple Silicon each passed 118 focused tests, with two
+opt-in tests omitted. The Quick Connect test checks the chooser's owner,
+disabled state, cancellation, adoption of a different directory, and
+rejection of a stale result. Apple Silicon also passed strict Clippy.
+
+On the Windows ARM64 desktop, the blank draft showed the disabled
+directory, format, and compression controls. Selecting a private saved
+SSH profile loaded its active directory, JSON format, and gzip setting.
+The native chooser started in the configured directory. After cancelling,
+reopening it still showed that directory. Selecting a different directory
+and reopening it showed the new location. The saved SSH editor also
+accepted a different directory and opened there on its next invocation.
+The saved test fixture's checksum stayed the same after the walkthrough.
+No SSH connection was opened.
+[Quick Connect view](src/workspace/quick_connect/view.rs)
+· [Chooser and shared controls](src/terminal_logging/editor.rs)
+· [Windows ARM64 test log](target/verification/20261124-quick-terminal-log-windows-arm64-final.log)
+· [Apple Silicon test log](target/verification/20261124-quick-terminal-log-macos-arm64-final.log)
+
+## November 24 terminal logfile naming
+
+New terminal logs use the sanitized connection name, local timestamp,
+and a sequence from 1 through 999. The writer uses the name from redacted
+capture metadata. Parallel writers claim distinct slots through exclusive
+file creation. A lock sidecar, existing plain log, or gzip archive occupies
+its slot. Later parts use the local time of the record that opens each part
+and keep the most recently claimed sequence when the slot is available.
+Daily rotation resets the part number. Older Rust names and Java filenames
+remain readable, and retention still checks Rust's archive ownership marker.
+
+The saved SSH editor uses the same sanitizer and filename format with the
+draft connection name, local time, part one, and sequence one. The preview
+updates with the text, XML, or JSON format and the gzip setting.
+
+Windows ARM64 passed 51 focused tests and Apple Silicon passed 56. Both
+platforms passed the separate 1,000 MiB rotation, gzip, and viewer fixture.
+The focused tests cover concurrent allocation around an existing archive,
+preservation of an existing plain logfile, fresh timestamps after size
+rotation, and part reset at the next day. Apple Silicon passed strict
+Clippy. The Windows ARM64 desktop showed the sanitized `Edge_West_2_1`
+portion for the saved `Edge / West_2` profile and changed the extension
+from `.json.gz` to `.xml.gz` when the format changed. Desktop checks
+remain open on macOS and Linux.
+[Terminal writer](src/terminal_logging/writer.rs)
+· [Connection editor preview](src/terminal_logging/editor.rs)
+· [Windows ARM64 test log](target/verification/20261124-terminal-log-names-windows-arm64-final.log)
+· [Apple Silicon test log](target/verification/20261124-terminal-log-names-macos-arm64-final.log)
+
+## November 24 terminal logfile size limit
+
+The connection editor and writer accept log sizes up to 1,000 MiB. A
+rotated file is closed with its JSON or XML footer before compression. A
+bounded worker publishes gzip archives while the writer continues on the
+next part. Reaching the shutdown deadline or compression backlog leaves
+complete plain parts readable. The source is removed after successful
+archive publication.
+
+The viewer keeps a sparse line index for both plain and compressed logs.
+Compressed data is decoded into a private temporary file that is discarded
+on close or cancellation. Plain and gzip views and unchanged exports accept
+the new limit. An existing connection with a pending Java size can adopt
+that value on the Terminal Logging page.
+
+The boundary fixture writes a 1,000 MiB logfile, verifies the next active
+part and the published gzip archive, opens both the compressed log and its
+plain export, and cancels while the compressor is reading. The original
+plain file stays complete and no partial archive remains. Another fixture
+pages and searches a compressed image with more than two million lines.
+The boundary fixture passed natively on Apple Silicon and Windows ARM64.
+Apple Silicon passed 82 focused tests and strict Clippy, and Windows ARM64
+passed 77 focused tests. The large-file fixture ran separately on both
+platforms.
+[Terminal writer](src/terminal_logging/writer.rs)
+· [Logfile viewer and export](src/logfile_window/document.rs)
+· [Logging review](src/terminal_logging/interchange.rs)
+
+## November 24 Java terminal logging XML
+
+Java connection imports and portable Java backup restore carry the
+`logConfig` format, size, retention, rotation, compression and metadata
+options into the native saved SSH profile. The connection editor shows
+requests to enable logging or use a Java path. The user may enable recording
+and adopt a suggested native directory independently. A legacy file path
+can suggest its parent without checking the imported path on disk. An
+incompatible path stays visible for review, and a malformed logging block
+is reported without dropping the associated connection.
+
+Native XML exports write the local settings in Java's `logConfig` and
+preserve pending review data in a Rust extension. A tagged Java v2.26.0
+JAXB fixture exercises the JSON format, metadata, legacy file path and
+1,000 MiB size. Windows ARM64 verified direct import, separately saved
+directory adoption and activation, and the portable export. The tagged
+Java JAXB model read all nine fields from that native export. Apple Silicon
+passed 111 focused tests and strict Clippy, including portable backup
+staging and a capture into the explicitly adopted directory. At this
+checkpoint the native size ceiling was 256 MiB, and the editor kept the
+original Java value for review. The follow-up above raises the ceiling.
+[Java XML import](src/connection_store/import/kortty.rs)
+· [XML export](src/connection_export/xml.rs)
+· [Review and native field mapping](src/terminal_logging/interchange.rs)
+
+## November 24 SSH tab color and custom color editor
+
+The SSH Terminal Settings page places the tab-color checkbox beside its
+picker. The popup keeps the installed tab color presets and remains
+available for a connection that inherits the global terminal appearance.
+Text and background popups continue to offer individual inheritance.
+
+All three pickers open an owned Custom Colors window with a hue strip,
+saturation and brightness plane, current and new swatches, HSB, RGB and
+web fields, and an opacity preview. Use applies only to the connection
+draft. Save also remembers the swatch in the originating picker's palette
+while the connection editor remains open. Cancel and Escape discard the
+custom color draft. The normal connection Save writes the opaque RGB value
+to the profile, as in Java connection persistence.
+
+Windows ARM64 verified the separate child window, synchronized HSB, RGB and
+web controls, transparency preview, Escape and Cancel, and the distinct
+Use and Save behavior. The stored tab color survived restart without a
+terminal presentation override. A separate profile saved a new background
+hex color without changing the foreground or setting a tab color. Apple
+Silicon passed 78 focused tests, with one ignored, and strict Clippy.
+Exact palette shades, typography, window placement and the macOS and Linux
+desktop walkthroughs remain open.
+[Palette](src/connection_window/color_picker.rs)
+· [Custom color controls](src/connection_window/custom_color.rs)
+· [Owned window](src/workspace/profile_tools/color_editor.rs)
+
+## November 24 SSH tunnel list and editor
+
+The saved SSH editor lists tunnels with enabled status, forwarding type,
+listener and target, exposure and description. With mixed enabled states
+the aggregate checkbox shows a dash and activates all tunnels on its next
+press. Add, Edit and Remove operate on the connection draft. Add and Edit
+open a window owned by the SSH editor, and the owner rejects input while
+the child is open. The tunnel Save action returns to the connection draft.
+The connection Save persists the draft through the existing tunnel plan
+validation and approval path.
+
+The tunnel editor displays the listener pair first for each forwarding
+type. Local and remote port steppers use the Java 1–65,535 range. Dynamic
+forwarding keeps the destination fields visible and disabled. The bind
+warning follows the active listener, including the SSH server's
+`GatewayPorts` setting for remote forwarding.
+[Tunnel list](src/connection_window/tunnels.rs)
+· [Tunnel editor](src/connection_window/tunnels/editor.rs)
+
+Apple Silicon passed 48 focused tests and strict Clippy. Five opt-in
+OpenSSH tests were excluded from the default run. The separate live
+loopback forwarding test passed. An approved listener stayed active after
+a description edit, and a changed destination waited for renewed approval
+before traffic reached it. A manually created forward remained active
+throughout.
+[Apple Silicon verification](target/verification/20261124-tunnel-editor-macos-theme-verified.log)
+· [Windows ARM64 focused tests](target/verification/20261124-tunnel-editor-windows-native.log)
+
+The Windows ARM64 desktop walkthrough verified the mixed indicator, the
+two rows, Add with Java's default ports, Escape back to the unchanged
+list, and Edit with its disabled SOCKS destination fields. A second
+native build confirmed that the list uses the Connection Manager row
+style and that the owned child follows the SSH editor's Normal theme.
+[Windows ARM64 desktop comparison](target/verification/20261124-tunnel-editor-windows-desktop.md)
+· [Final Windows ARM64 build](target/verification/20261124-tunnel-editor-windows-final-build.log)
+
+## November 24 SSH terminal logging editor
+
+The saved SSH editor follows the tagged Java order for the log directory,
+format, filename example, file size, retention, metadata, rotation and
+compression. The settings remain visible and are skipped during keyboard
+traversal while logging is off. The filename example uses the native
+writer's format and gzip naming. File size and retention have editable
+steppers. Incognito disables the logging controls. Managed username and
+directory settings display their effective values and stay locked.
+
+Browse opens a native folder picker owned by the SSH editor. A result
+applies to the matching active draft. Cancel leaves the draft untouched.
+Existing profiles keep their native log settings and 256 MiB file limit.
+[Logging editor](src/terminal_logging/editor.rs)
+· [Log writer](src/terminal_logging/writer.rs)
+
+Apple Silicon and Windows ARM64 each passed 64 selected tests. Apple
+Silicon also passed strict Clippy. The regressions cover the format and
+gzip example, folder picker cancellation and result identity, managed
+choices, keyboard traversal, and the native log writer.
+[Apple Silicon verification](target/verification/20261124-terminal-logging-editor-macos-verified.log)
+· [Windows ARM64 verification](target/verification/20261124-terminal-logging-editor-windows-native.log)
+
+On Windows ARM64, the Java reference ran in x64 emulation and the Rust
+preview ran natively. The comparison covered enabled and disabled
+logging, the managed username and directory fields, and the control
+order. The native chooser opened at the saved folder and returned to the
+same draft on Cancel. Changing JSON to XML updated the example
+immediately. After the layout adjustment, a separate native rebuild
+verified the aligned control positions, the 300-pixel directory input,
+the 200-pixel format choice and the secondary Browse action. Confirming
+the existing directory returned without changing the saved fixture. The
+remaining backend differences include the maximum log size and
+connection-based naming.
+[Windows desktop comparison](target/verification/20261124-terminal-logging-editor-windows-desktop.md)
+· [Final Windows build](target/verification/20261124-terminal-logging-editor-windows-final-build.log)
+
+## November 24 SSH editor window geometry
+
+The Window Geometry page follows the tagged Java form's size, position
+and maximized rows. Width, height, X and Y have editable steppers with
+the saved profile's existing limits. The values stay visible when
+custom geometry is off. The inputs and maximized toggle are disabled
+and skipped in keyboard traversal. Re-enabling custom geometry before
+saving brings back the current draft. The help explains that the
+settings apply when a connection opens in a separate window.
+[Geometry form](src/connection_window/form/geometry.rs)
+
+Apple Silicon passed 51 focused tests and strict Clippy. The geometry
+regression exercises the upper width and lower height limits with the
+arrow keys, ignores edits while custom geometry is off, and verifies
+that re-enabling it restores the entered size and maximized setting.
+[Apple Silicon verification](target/verification/20261124-window-geometry-macos-native.log)
+
+## November 24 Connection Manager Teamwork tree
+
+The general views append a Teamwork branch with nested read-only folders
+and descendant counts. The dedicated Teamwork view starts at the shared
+folders and individual root connections. Folder names match case-insensitively.
+Search rebuilds the matching paths. A connection selected on the map
+reveals its path when returning to the list. Shared folders have no local
+folder actions or drop targets. In Recently used, the combined recency
+cutoff is applied before building the Teamwork branch.
+[Tagged Java tree](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ConnectionManagerTreeView.java#L236)
+· [Rust tree and selection](src/connection_window/selection.rs)
+
+Teamwork authentication sits below the center heading in the list and map
+views. The form can scroll within a bounded height so compact layouts
+leave room for results.
+[Tagged Java dialog](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ConnectionManagerDialog.java#L365)
+· [Rust manager view](src/connection_window/view.rs)
+
+The Windows ARM64 desktop preview showed separate local and shared Ops
+folders. The shared West folder collapsed, and right-clicking it selected
+the folder without opening a local folder menu. After collapsing the whole
+Teamwork branch, selecting Nested monitor on the map and returning to the
+list reopened the branch and its ancestors. The Teamwork scope kept the
+ordered authentication form below the title in both List and Map.
+[Windows ARM64 desktop verification](target/verification/20261124-connection-manager-teamwork-tree-windows-desktop.log)
+
+Apple Silicon passed 50 focused tests and strict Clippy. The compact layout
+test used a 940 by 520 viewport and checked that the ordered authentication
+form stayed in the center pane and left at least 100 logical pixels for the
+list. The tree regression verifies matching search paths after a collapse.
+[Apple Silicon verification](target/verification/20261124-connection-manager-teamwork-tree-macos-retest.log)
+
+## November 24 SSH connection AI keyboard
+
+The AI page accepts Tab and Shift+Tab between available controls,
+including the profile and design pickers, execution checkbox, connection
+memory action, skill filter and list, and editor footer. A disabled
+design stays visible and the tab order skips it. The connection memory
+button uses the secondary action style.
+
+Up, Down, Home and End move the skill cursor and reveal its row. Space
+changes the assignment. Moving the cursor or filtering the list leaves
+the saved selections and the draft's dirty flag unchanged. The list
+uses one focus stop for all visible skills and preserves the existing
+Ctrl+Tab and Ctrl+Page Up or Down editor shortcuts.
+[SSH editor](src/connection_window/form.rs)
+· [Skill list](src/connection_window/terminal_overrides/skills.rs)
+
+The Windows ARM64 desktop preview selected a local profile and the
+Classic design by keyboard. It revealed both ends of a 21-row skill
+list and assigned a skill with Space. The saved profile retained
+both previous assignments, including the unavailable one. The
+read-only design was skipped in both directions, and Ctrl+Page Up
+still opened Window Geometry from the focused skill filter.
+[Windows ARM64 desktop verification](target/verification/20261124-connection-ai-keyboard-windows-desktop.log)
+
+Windows ARM64 and Apple Silicon each passed 48 focused tests. Apple
+Silicon also passed strict Clippy. The widget regression uses a compact
+editor and checks focus, selection without a draft edit, and persistence
+after a keyboard assignment.
+[Windows ARM64 verification](target/verification/20261124-connection-ai-keyboard-windows-tests.log)
+· [Apple Silicon verification](target/verification/20261124-connection-ai-keyboard-macos-native.log)
+
+## November 24 Memory from the SSH editor
+
+The AI tab opens Connection memory as a modeless child of the editor.
+The button requires a saved SSH profile. The child uses its stored
+name and stable ID and keeps the scope fixed to that profile while
+the SSH draft remains in the parent. The memory pane shares storage,
+editing, history, archive, references, and policy handling with AI
+Manager.
+
+Closing asks before discarding unsaved Markdown or a row edit.
+The parent can still edit its form while the child is open. Closing
+or saving the parent brings the memory window forward for completion.
+Shared memory preferences save on close under the AI settings lock.
+The save preserves unrelated AI settings and detects a concurrent
+memory preference change. The user can discard a conflicting
+preference draft and close the window.
+[Tagged Java connection memory dialog](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AiMemoryDialog.java)
+· [Rust scoped memory editor](src/ai_manager/memory/connection.rs)
+
+Apple Silicon and Windows ARM64 each passed 54 memory and connection
+manager tests. Apple Silicon also passed strict application and
+test-target Clippy. The new cases exercised two separate saved scopes,
+a modeless child of the SSH editor, unsaved Markdown on close, and
+rejection and discard of stale shared memory preferences.
+[Apple Silicon verification](target/verification/20261124-connection-memory-macos-final.log)
+· [Windows ARM64 verification](target/verification/20261124-connection-memory-windows-verified.log)
+
+With two saved profiles in the Windows ARM64 preview, the first
+fixture with inherited file permissions was rejected. A fixture with
+protected owner-only permissions loaded the selected profile's memory
+in the owned window under its stored name. Closing it returned to the
+SSH editor with the unsaved tag still in place.
+[Windows ARM64 preview build](target/verification/20261124-connection-memory-windows-preview.log)
+
+## November 24 managed session journal
+
+The `[rule.session-journal] enforced` boolean uses the effective user,
+group or global scope for that field. At the same scope, `true` wins. An
+effective feature denial prevents capture. The SSH editor shows a checked,
+locked autostart control while retaining the saved preference.
+
+On a supported terminal stream, the requirement starts the journal even
+when the profile's autostart preference is off. The tab and the AI probe
+cannot stop a required recording. Source closure and the capture limits
+still finalize it. An incognito stream uses the same output masking and
+omits the scrollback seed, separate typed-input records, screenshots, notes
+and journal AI. SSH prepares the credential mask for this case even when
+terminal logging and AI are off.
+
+Windows ARM64 and Apple Silicon each passed 17 focused tests. Apple
+Silicon also passed strict application and test-target Clippy. The PTY
+test starts and finalizes a required journal in regular and incognito
+tabs, exercises the disabled stop action, and reads the masked output
+back through the journal viewer. The SSH test covers credential-mask
+preparation. A subsequent Apple Silicon run authenticated a saved private
+SSH profile against a pinned OpenSSH loopback server, verified automatic
+start and the stop lock, and read the masked output back from the finalized
+journal. It used a fresh profile with AI and terminal logfile capture off.
+The managed editor control still needs desktop verification.
+[Apple Silicon verification](target/verification/20261124-managed-journal-macos-verified.log)
+· [Windows ARM64 verification](target/verification/20261124-managed-journal-windows-verified.log)
+· [Apple Silicon OpenSSH verification](target/verification/20261124-ssh-editor-navigation-macos-verified.log)
+
+[Tagged Java policy](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/policy/EffectivePolicy.java)
+· [Tagged Java terminal](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/TerminalView.java)
+· [Tagged Java editor](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ConnectionEditDialog.java)
+· [Rust recording](src/workspace/journal_capture_access.rs)
+
+## November 24 SSH editor tab navigation
+
+The editor lays out all eight tabs on one line when they fit. At narrow
+widths, the strip keeps the active tab visible and offers the full list
+with the current tab marked. The previous and next controls and position
+counter sit above the header. The arrows stop at the first and last tabs.
+Ctrl+Tab, Ctrl+Shift+Tab and Ctrl+Page Down or Up use those same boundaries.
+These shortcuts route through the SSH editor while fields have focus.
+Changing tabs leaves the edited values in their draft and the Save and
+Cancel controls outside page scrolling.
+
+Windows ARM64 and Apple Silicon each passed 57 focused tests with one
+ignored. Windows also passed the opt-in temporary-key editor test. Apple
+Silicon passed strict application and test-target Clippy. The native
+widget checks open the overflow menu, jump to the hidden AI page, verify
+the compact footer, and route the Java tab shortcuts through the editor.
+The desktop comparison of the revised strip remains open.
+[Apple Silicon verification](target/verification/20261124-ssh-editor-navigation-macos-verified.log)
+· [Windows ARM64 verification](target/verification/20261124-ssh-editor-navigation-windows-verified.log)
+
+[Tagged Java navigation](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/TabPaneArrowNavigation.java)
+· [Rust SSH editor navigation](src/connection_window/form/tabs.rs)
+
+## November 24 streaming journal replacement
+
+The replacement preview reads the source one bounded record at a time.
+Apply streams changed records through the existing plain, gzip or Zstandard
+codec into the private replacement stage. Preview stores each part's
+physical record count and file stamp. Apply checks both, validates the
+directory inventory, and publishes staged files using the existing
+identity and durability checks. Parts with zero changes stay on the
+preview path. Metadata edits are published last.
+
+Streaming removes the whole-part buffers from this operation. The
+rotation limits still depend on streaming HTML bundle export and updating
+the associated I/O budgets.
+[Log-part replacement](src/session_journal/capture/replacement.rs)
+· [Replacement publication](src/session_journal/replace.rs)
+
+Windows ARM64 and Apple Silicon each passed 20 focused tests. Apple
+Silicon also passed strict application and test-target Clippy. The cases
+cover all nine format and codec combinations, the independent input and
+output budgets, malformed records, cancellation, file identity changes,
+and a failed private stage.
+[Apple Silicon verification](target/verification/20261124-journal-replacement-streaming-macos-native.log)
+· [Windows ARM64 verification](target/verification/20261124-journal-replacement-streaming-windows.log)
+
+## November 24 streaming HTML journal bundles
+
+The HTML bundle exporter decodes unfiltered log parts directly into the
+private ZIP stage. It produces the bounded HTML preview during the same
+pass. A filtered export scans a part to find the matching records and
+opens an archive member only when at least one record qualifies. It
+rechecks the file stamp before the second pass and after reading. The
+second pass streams the retained records and their format envelope.
+Standalone Browser HTML needs only the preview pass.
+
+Decoded input, individual lines, and the archive byte and file counts
+have separate bounds. The archive stage is discarded when a source check,
+write or cancellation fails. The next rotation step aligns these bounds
+with the Java editor and Java XML import limits.
+[Capture part streaming](src/session_journal/capture/bundle.rs)
+· [ZIP publication](src/session_journal/export_output.rs)
+
+Windows ARM64 and Apple Silicon each passed 48 focused tests, with two
+manual fixture generators ignored. Apple Silicon also passed strict
+application and test-target Clippy. The tests cover retained format
+headers, exact decoded bytes, long unfiltered lines, the Java Zstandard
+fixture, capture rotation, cancellation, file replacement between filtered
+passes, and archive publication with encryption.
+[Apple Silicon verification](target/verification/20261124-journal-bundle-streaming-macos-verified.log)
+· [Windows ARM64 verification](target/verification/20261124-journal-bundle-streaming-windows.log)
+
+## November 24 Java journal rotation limits
+
+The connection editor and XML import support 1,000 MiB per capture part
+and the Java editor's regular ceiling of 500 parts. This checkpoint used
+a 1,000-part ceiling for the reader and managed policy.
+The capture reader allows the writer's retained tail and compression
+overhead above the configured size. Search, replacement and HTML export
+use corresponding cumulative byte limits with bounded buffers. The Java
+Zstandard window remains 128 MiB.
+
+The HTML bundle uses its own archive budget. OpenPGP HTML exports connect
+ZIP creation to encryption through a small in-memory queue. The output
+remains staged until writing and encryption finish and the selected recipient
+and destination are checked again. Markdown and PDF use their existing
+batch budget.
+[Tagged Java editor](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ConnectionEditDialog.java)
+· [Native configuration](src/session_journal/connection.rs)
+· [Archive publication](src/session_journal/export_output.rs)
+
+Windows ARM64 and Apple Silicon each passed 22 focused tests. Apple
+Silicon also passed strict application and test-target Clippy. One test
+finds and replaces a record past the previous 128 MiB boundary in a decoded
+gzip part, then checks that record in the published HTML ZIP. The OpenPGP
+test decrypts the streamed ZIP and verifies that a recipient changed before
+publication leaves no export.
+[Apple Silicon verification](target/verification/20261124-journal-rotation-macos-final.log)
+· [Current Windows ARM64 retest](#november-24-managed-journal-rotation-range)
+
+## November 24 Managed journal rotation range
+
+Java v2.26.0 accepts managed `max-log-parts` values from 1 through
+2,147,483,647. Rust now preserves that range in managed policies, saved
+connection settings, Java XML and the native writers for interactive and
+automation journals. The ordinary editor ceiling remains 500 parts.
+[Tagged Java policy loader](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/policy/PolicyLoader.java)
+· [Native configuration](src/session_journal/connection.rs)
+
+The reader, search, replacement and HTML ZIP export discover actual files
+across the full range. Automation storage measurement and confirmed
+deletion accept high part counts while retaining their limits for other
+directory entries. A sparse maximum-numbered part exercises missing-file
+reporting. An 8,193-part journal exercises the live tail, viewer, search,
+reviewed replacement, complete ZIP export and deletion.
+[Native reader](src/session_journal/capture.rs)
+· [Large rotation test](src/session_journal/export_output/tests.rs)
+
+Apple Silicon passed 82 focused tests and strict Clippy for the
+application and test targets. Windows ARM64 passed 80 application tests
+and all 27 file-library tests. The 8,193-part journal and sparse-limit
+tests passed on both platforms.
+[Apple Silicon verification](target/verification/20261124-managed-journal-rotation-macos.log)
+· [Windows ARM64 verification](target/verification/20261124-managed-journal-rotation-windows.log)
+· [Windows file-library verification](target/verification/20261124-managed-journal-rotation-windows-files.log)
+
+## November 24 SSH journal reconnect
+
+Java v2.26.0 retains the journal writer across an SSH disconnect. It
+records `session reconnected` when the replacement connection becomes
+active. Rust now retains the capture for the same tab and moves it to the
+new primary stream after the reconnect commits. The previous terminal
+listener detaches before recording resumes. The reconnect entry precedes
+new live output. The terminal restores the inherited scrollback for
+display. Closing the tab finalizes the journal.
+
+This lifecycle applies to manual, configured automatic and managed SSH
+journals. Incognito rules block manual capture and typed input. A managed
+journal uses the current stream's output masks. Exiting a local shell
+finishes its automatic journal.
+[Tagged Java terminal](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/TerminalView.java)
+· [Rust journal binding](src/workspace/journal_capture_access.rs)
+· [Native OpenSSH test](src/workspace/ssh_access/tests/native_isolation_reconnect.rs)
+
+Apple Silicon passed 33 focused regressions, strict application and
+test-target Clippy, and the private OpenSSH test. The native test closes
+the first SSH connection, reconnects the same incognito tab, and checks
+both masked outputs and exactly one reconnect entry in the same journal.
+Windows ARM64 passed 28 focused regressions. Desktop and other native SSH
+routes are tracked in J1.
+[Apple Silicon verification](target/verification/20261124-journal-ssh-reconnect-macos-actor.log)
+· [Windows ARM64 verification](target/verification/20261124-journal-ssh-reconnect-windows-verified.log)
+· [Windows ARM64 journal actor checks](target/verification/20261124-journal-ssh-reconnect-windows-actor.log)
+
+## November 24 Journal isolation status
+
+The automatic capture writes the effective isolation when the terminal
+starts. On SSH reconnect, the journal writes `session reconnected` and
+then the replacement stream's isolation before receiving its live output.
+A seeded manual SSH recording receives the isolation entry on its next
+successful SSH reconnect, following Java v2.26.0.
+
+The status is `isolation: none`, `isolation: process`, or
+`isolation: sandboxed (<backend>)`. A verified sandbox supplies its own
+backend ID. An isolated SSH stream is identified by its active worker
+transport. A local shell uses its launched process mode and the backend
+reported by the PTY. The isolation entry contains only this status and
+the backend ID.
+[Tagged Java journal](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/core/SessionJournalSession.java)
+· [Rust terminal actor](src/session/journal.rs)
+· [Native OpenSSH reconnect test](src/workspace/ssh_access/tests/native_isolation_reconnect.rs)
+
+Apple Silicon passed strict application and test-target Clippy, the
+application build, 33 focused regressions, and two private OpenSSH tests.
+The incognito test upgrades the saved route from direct SSH to process
+isolation and verifies the order of both isolation records, the reconnect
+entry and the masked output. The other OpenSSH test checks the saved and
+Teamwork reconnect routes.
+[Apple Silicon verification](target/verification/20261124-journal-isolation-macos-native.log)
+
+Windows ARM64 passed 28 focused regressions, including a launched local
+shell with process isolation and a terminal actor test for the sandbox
+backend label. Verify the label in journals produced by native sandboxed
+sessions as part of desktop acceptance.
+[Windows ARM64 verification](target/verification/20261124-journal-isolation-windows.log)
+
+## November 24 Serial session journals
+
+Serial sessions using the ANSI/DEC parser now expose the terminal's
+parsed output to the journal. A saved profile can enable automatic
+capture, and the managed journal requirement also applies to eligible
+serial tabs. The output uses the same masking rules as terminal journals
+for local shells and SSH. Local keyboard echo stays on the terminal
+display during live capture. Serial streams have no verified shell prompt
+for recording typed commands.
+
+The disconnected pane's Connect action uses the same reconnect commit
+as the terminal's Reconnect action. After the same device path is opened
+again, the existing journal records the reconnect and `isolation: none`
+before new live output. A failed replacement leaves the old journal
+waiting. A different device path finishes the previous journal and follows
+the new stream's capture settings.
+[Tagged Java serial connector](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/core/SerialTtyConnector.java)
+· [Rust journal binding](src/workspace/journal_capture_access.rs)
+· [Native virtual port test](src/workspace/journal_capture_access/serial_tests.rs)
+
+Apple Silicon passed 57 focused regressions, strict application and
+test-target Clippy, the application build and two OpenSSH reconnect
+regressions. The virtual-port journal test covers profile opt-in,
+mandatory incognito capture, masking, local echo, a failed reconnect and
+switching devices. Separate native tests cover the serial reconnect
+confirmation and port release.
+[Apple Silicon verification](target/verification/20261124-serial-journal-macos-final.log)
+
+Windows ARM64 passed 43 focused regressions, including restoration of
+serial settings and the journal lifecycle tests. The virtual serial
+transport case used an Apple Silicon pseudo-terminal.
+[Windows ARM64 verification](target/verification/20261124-serial-journal-windows-final.log)
+
+## November 24 Journals for PETSCII, Wyse, TeleVideo and HP
+
+All byte-stream emulations can now contribute parsed output to session
+journals. PETSCII uses the decoded glyphs and its native Return and Delete.
+Wyse and TeleVideo pass decoded text and line controls from their own
+parsers. HP records host display text through its parser, including text
+displayed by a host-triggered softkey replay. Key definitions, status
+payloads consumed by the parser, concealed host text, local HP form edits
+and local serial echo stay outside live journal output. The native page
+clears and parser resets discard the unfinished journal line.
+
+The same masking, automatic-start and reconnect rules apply to the new
+streams. The base Java path observes connector output. Rust keeps its
+parser-based capture so that these modes can use the same visibility and
+masking rules as ANSI/DEC.
+[Tagged Java journal connection](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/TerminalView.java)
+· [Rust journal observer and parser tests](crates/terminal/src/journal.rs)
+· [Native virtual serial test](src/workspace/journal_capture_access/serial_tests.rs)
+
+Apple Silicon and Windows ARM64 each passed the 280 terminal-library
+tests. Apple Silicon also passed strict Clippy, the application build,
+57 focused application tests and two OpenSSH reconnect tests. The virtual
+serial test covers VT100, PETSCII, WY-60, TeleVideo 925, HP 2392 and HP
+700/92. Both configured and policy-required captures record masked
+output across a same-device reconnect and finish on a device change.
+Windows ARM64 passed 43 focused application tests.
+[Apple Silicon verification](target/verification/20261124-emulation-journal-macos-native.log)
+· [Windows ARM64 terminal-library verification](target/verification/20261124-emulation-journal-windows-terminal-final.log)
+· [Windows ARM64 application verification](target/verification/20261124-emulation-journal-windows-app.log)
+
+## November 24 Session journal typed input
+
+The session journal now waits for the command-input boundary
+(OSC 133 B) of the same prompt that started with OSC 133 A. A key
+pressed before the boundary suppresses capture for that prompt, and
+attaching to an existing prompt still waits for a new one. The writer
+records the line after a successful physical Enter write. Pasted
+text and password prompts remain outside typed-input records.
+
+The SSH editor keeps the explicit input preference across duplicate,
+save and reopen. Java-format XML preserves explicit on and off values.
+Omitting the field uses Rust's off default. Saved local-shell profiles
+check for automatic journal startup when the terminal is already ready
+as it is added to the workspace.
+[Tagged Java journal configuration](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/model/SessionJournalConfig.java)
+· [Rust prompt evidence](src/session/shell_activity.rs)
+· [Native PTY input test](src/workspace/journal_capture_access/input_tests.rs)
+
+Apple Silicon passed 70 focused application tests, strict Clippy, the
+application build and two OpenSSH tests. Windows ARM64 passed all 56
+focused application tests, including repeat runs with two and eight
+test threads. Its fixture uses PowerShell to drive the native ConPTY.
+The native PTY test exercised the workspace keyboard and paste routes
+with input capture off and on. It verified the ready-prompt rule,
+masked input, output and the ordering of the command-finished entry.
+The editor and XML tests checked duplicate and reopened profiles.
+[Apple Silicon verification](target/verification/20261124-typed-journal-macos-final-native.log)
+· [Windows ARM64 verification](target/verification/20261124-typed-journal-windows-final-native.log)
+· [Eight-thread repeat](target/verification/20261124-typed-journal-windows-repeat-eight.log)
 
 ## November 23 GGUF Configure sizing
 
@@ -13556,8 +14704,10 @@ The Connection Manager accepts positive `lastUsed` values from Teamwork XML
 as Unix milliseconds. The cache preserves these values for offline use and
 continues to read older snapshots. The Recent scope ranks the combined local
 and shared catalog, takes up to 15 entries, then applies the search. The
-list, range selection, map, and map PDF use that projection. Shared launch
-attempts have no local saved ID and do not update the local recent store.
+list, range selection, map, and map PDF use that set of connections.
+The [Teamwork tree update](#november-24-connection-manager-teamwork-tree)
+groups the eligible shared entries in the list. Shared launch attempts have
+no local saved ID and do not update the local recent store.
 
 An instrumented Fedora X11 run traced premature context-menu dismissal to
 `ConnectionWindow::set_open_counts`. It reconciled the selection even when

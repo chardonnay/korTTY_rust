@@ -11,6 +11,7 @@ use jiff::Timestamp;
 use zeroize::Zeroizing;
 
 use crate::private_files::Directory;
+use crate::session_journal::connection::RETAINED_TAIL_BYTES;
 
 use super::super::annotation::{self, Annotation};
 use super::super::capture::LiveArchives;
@@ -46,7 +47,6 @@ const MAX_TIMELINE: usize = 1024;
 const MAX_TIMELINE_TEXT_BYTES: usize = 1024 * 1024;
 const SCREENSHOTS: &str = "screenshots";
 const LOG_LIMIT: &str = "the capture log reached its storage limit";
-const RETAINED_TAIL_BYTES: u64 = 1024 * 1024;
 const INPUT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 const TIMELINE_LIMIT: &str = "the journal timeline reached its storage limit";
 

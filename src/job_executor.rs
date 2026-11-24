@@ -26,6 +26,7 @@ pub(crate) mod rsync;
 mod sudo;
 pub(crate) mod virtual_terminal;
 
+pub(crate) use connection::TemporaryKeys;
 pub(crate) use connection::{BatchAuth, Credentials, JobAuth, SavedAuth};
 pub(crate) use output::CapturedOutput;
 pub(crate) use remote::sync::preview as preview_sftp_sync;

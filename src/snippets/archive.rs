@@ -27,7 +27,7 @@ use super::diagrams;
 
 pub(crate) use files::{
     AnalysisFile, CertificateInfo, OpenPgpSettings, ZipSettings, analysis_files,
-    encrypt_profile_zip, encrypt_saved_payload, inspect_certificate,
+    encrypt_profile_zip, encrypt_saved_payload, encrypt_saved_reader, inspect_certificate,
 };
 pub(super) use files::{
     MAX_CERTIFICATE_BYTES, enroll_certificate, normalize_fingerprint, validate_backup_certificate,

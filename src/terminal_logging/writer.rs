@@ -1,6 +1,8 @@
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
+use std::thread;
 
 use async_channel::Receiver;
 use jiff::civil::Date;
@@ -11,7 +13,10 @@ use crate::logfile_window::document::{Fields, write_entry, write_header};
 use crate::sftp_window::{LocalSource, StagedDownload};
 
 use super::capture::{Record, Shutdown};
-use super::{Config, Format};
+use super::{Config, Format, MAX_LOG_BYTES};
+
+const COMPRESSION_QUEUE: usize = 2;
+const MAX_SEQUENCE: u16 = 999;
 
 pub(super) fn run(
     profile: &Path,
@@ -30,53 +35,89 @@ pub(super) fn run(
         Format::Xml => DocumentFormat::Xml,
         Format::Json => DocumentFormat::Json,
     };
-    let mut writer = LogWriter {
-        config,
-        metadata,
-        format,
-        folder,
-        open: None,
-        day: None,
-        base: String::new(),
-        part: 0,
-        timezone,
-        shutdown,
-        skipped_compression: false,
-    };
-    if writer.folder.retention {
-        writer
-            .folder
-            .sweep(first.at.to_zoned(writer.timezone.clone()).date(), || {
-                shutdown.started()
-            });
-    }
-    let result = (|| {
-        writer.append(first)?;
-        while let Ok(record) = records.recv_blocking() {
-            writer.append(record)?;
+    thread::scope(|threads| {
+        let folder = &folder;
+        let (sender, archive) = if config.compress {
+            let (send, pending) = mpsc::sync_channel(COMPRESSION_QUEUE);
+            let days = config.retention_days;
+            let worker = thread::Builder::new()
+                .name("kortty-logfile-compress".into())
+                .spawn_scoped(threads, move || {
+                    let mut failure = None;
+                    for record in pending {
+                        if let Err(error) = folder.compress_closed(record, days, shutdown) {
+                            failure.get_or_insert(error);
+                        }
+                    }
+                    failure.map_or(Ok(()), Err)
+                })?;
+            (Some(send), Some(worker))
+        } else {
+            (None, None)
+        };
+        let mut writer = LogWriter {
+            config,
+            slug: super::slug(metadata.get("connection").map_or("", String::as_str)),
+            metadata,
+            format,
+            folder,
+            open: None,
+            day: None,
+            sequence: 1,
+            part: 0,
+            timezone,
+            shutdown,
+            compression: sender.as_ref(),
+            compression_backlog: false,
+        };
+        if writer.folder.retention {
+            writer
+                .folder
+                .sweep(first.at.to_zoned(writer.timezone.clone()).date(), || {
+                    shutdown.started()
+                });
+        }
+        let result = (|| {
+            writer.append(first)?;
+            while let Ok(record) = records.recv_blocking() {
+                writer.append(record)?;
+            }
+            Ok(())
+        })();
+        let cleanup = writer.close(result.is_ok());
+        let backlog = writer.compression_backlog;
+        drop(sender);
+        let archive_result = archive.map_or(Ok(()), |worker| {
+            worker.join().unwrap_or_else(|_| {
+                Err(io::Error::other(
+                    "The logfile compression worker stopped unexpectedly",
+                ))
+            })
+        });
+        combine_errors(combine_errors(result, cleanup), archive_result)?;
+        if backlog {
+            return Err(io::Error::other(
+                "Compression could not keep up. The complete plain logfiles were kept.",
+            ));
         }
         Ok(())
-    })();
-    let cleanup = writer.close(result.is_ok());
-    combine_errors(result, cleanup)?;
-    if writer.skipped_compression {
-        return Err(compression_timeout());
-    }
-    Ok(())
+    })
 }
 
 struct LogWriter<'a> {
     config: Config,
     metadata: Fields,
     format: DocumentFormat,
-    folder: Folder,
+    folder: &'a Folder,
     open: Option<Active>,
     day: Option<Date>,
-    base: String,
+    slug: String,
+    sequence: u16,
     part: u32,
     timezone: TimeZone,
     shutdown: &'a Shutdown,
-    skipped_compression: bool,
+    compression: Option<&'a SyncSender<ClosedLog>>,
+    compression_backlog: bool,
 }
 
 impl LogWriter<'_> {
@@ -92,7 +133,8 @@ impl LogWriter<'_> {
         let rotate_daily =
             self.config.rotate_daily && self.day.is_some_and(|date| at.date() > date);
         let rotate_size = self.open.as_ref().is_some_and(|open| {
-            open.bytes.saturating_add(line.len() as u64 + 24)
+            open.bytes
+                .saturating_add((line.len() + footer(self.format, true).len()) as u64)
                 > u64::from(self.config.max_mib) * 1024 * 1024
         });
         if rotate_daily || rotate_size {
@@ -101,8 +143,7 @@ impl LogWriter<'_> {
             write_entry(&mut line, self.format, &record.fields, 0)?;
         }
         if self.open.is_none() {
-            if self.base.is_empty() || rotate_daily {
-                self.base = fresh_base(&at)?;
+            if self.part == 0 || rotate_daily {
                 self.day = Some(at.date());
                 self.part = 1;
             } else {
@@ -111,18 +152,7 @@ impl LogWriter<'_> {
                     .checked_add(1)
                     .ok_or_else(|| io::Error::other("Logfile part limit reached"))?;
             }
-            let extension = match self.format {
-                DocumentFormat::Text => "log",
-                DocumentFormat::Xml => "xml",
-                DocumentFormat::Json => "json",
-            };
-            let part = if self.part <= 1 {
-                String::new()
-            } else {
-                format!(".p{}", self.part)
-            };
-            let filename = format!("{}{part}.{extension}", self.base);
-            self.open = Some(self.folder.begin(&filename, self.format, &self.metadata)?);
+            self.open = Some(self.open_part(at.datetime())?);
             if rotate_daily && self.folder.retention {
                 self.folder.sweep(at.date(), || self.shutdown.started());
             }
@@ -138,6 +168,21 @@ impl LogWriter<'_> {
         Ok(())
     }
 
+    fn open_part(&mut self, stamp: jiff::civil::DateTime) -> io::Result<Active> {
+        for sequence in self.sequence..=MAX_SEQUENCE {
+            let filename =
+                super::filename(&self.slug, stamp, self.part, sequence, self.config.format);
+            if let Some(active) = self.folder.begin(&filename, self.format, &self.metadata)? {
+                self.sequence = sequence;
+                return Ok(active);
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "No free terminal logfile name in the session sequence range",
+        ))
+    }
+
     fn close(&mut self, complete: bool) -> io::Result<()> {
         let Some(Active {
             writer,
@@ -150,49 +195,57 @@ impl LogWriter<'_> {
         else {
             return Ok(());
         };
-        let result = if complete {
-            self.finalize(writer, &filename, lines)
-        } else {
+        if !complete {
             // A previous output error may have left a partial entry. Keep the
             // raw logfile for recovery and release only the owned marker.
             drop(writer);
-            Ok(())
+            return self.folder.remove(&marker_name, marker);
+        }
+        let finish = |mut writer: BufWriter<File>| {
+            writer.write_all(footer(self.format, lines != 0))?;
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+            writer.into_inner().map_err(|error| error.into_error())
         };
-        combine_errors(result, self.folder.remove(&marker_name, marker))
-    }
-
-    fn finalize(
-        &mut self,
-        mut writer: BufWriter<File>,
-        filename: &str,
-        lines: usize,
-    ) -> io::Result<()> {
-        match self.format {
-            DocumentFormat::Text => {}
-            DocumentFormat::Xml => writer.write_all(b"</terminal-log>\n")?,
-            DocumentFormat::Json => {
-                if lines != 0 {
-                    writer.write_all(b"\n")?;
+        match finish(writer) {
+            Ok(file) => {
+                if let Some(compression) = self.compression {
+                    let job = ClosedLog {
+                        filename,
+                        file,
+                        marker,
+                        marker_name,
+                    };
+                    match compression.try_send(job) {
+                        Ok(()) => Ok(()),
+                        Err(TrySendError::Full(job) | TrySendError::Disconnected(job)) => {
+                            self.compression_backlog = true;
+                            self.folder.remove(&job.marker_name, job.marker)
+                        }
+                    }
+                } else {
+                    self.folder.remove(&marker_name, marker)
                 }
-                writer.write_all(b"  ]\n}\n")?;
             }
+            Err(error) => combine_errors(Err(error), self.folder.remove(&marker_name, marker)),
         }
-        writer.flush()?;
-        writer.get_ref().sync_all()?;
-        let file = writer.into_inner().map_err(|error| error.into_error())?;
-        if self.config.compress
-            && let Err(error) =
-                self.folder
-                    .compress(filename, file, self.config.retention_days, self.shutdown)
-        {
-            if is_compression_timeout(&error) {
-                self.skipped_compression = true;
-            } else {
-                return Err(error);
-            }
-        }
-        Ok(())
     }
+}
+
+fn footer(format: DocumentFormat, has_entries: bool) -> &'static [u8] {
+    match format {
+        DocumentFormat::Text => b"",
+        DocumentFormat::Xml => b"</terminal-log>\n",
+        DocumentFormat::Json if has_entries => b"\n  ]\n}\n",
+        DocumentFormat::Json => b"  ]\n}\n",
+    }
+}
+
+struct ClosedLog {
+    filename: String,
+    file: File,
+    marker: File,
+    marker_name: String,
 }
 
 struct Active {
@@ -365,40 +418,96 @@ impl Folder {
             .create_read_write_file(std::ffi::OsStr::new(name))
     }
 
+    fn name_exists(&self, name: &str) -> io::Result<bool> {
+        #[cfg(unix)]
+        let entry: io::Result<()> =
+            rustix::fs::statat(&self.handle, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+                .map(|_| ())
+                .map_err(Into::into);
+        #[cfg(windows)]
+        let entry = self
+            .handle
+            .open_entry_metadata(std::ffi::OsStr::new(name))
+            .map(|_| ());
+        match entry {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     fn begin(
         &self,
         filename: &str,
         format: DocumentFormat,
         metadata: &Fields,
-    ) -> io::Result<Active> {
+    ) -> io::Result<Option<Active>> {
+        let marker_name = format!(".{filename}.lock");
+        let archive_name = super::compressed_filename(filename);
+        if self.name_exists(&marker_name)? || self.name_exists(&archive_name)? {
+            return Ok(None);
+        }
         let mut header = Vec::new();
         write_header(&mut header, format, metadata)?;
-        let marker_name = format!(".{filename}.lock");
+        // Java also claims the plain name first. The sidecar must only be
+        // created once this writer owns that name.
+        let file = match self.create_file(filename) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(None),
+            Err(error) => return Err(error),
+        };
         #[cfg(unix)]
-        let marker = self.create_file(&marker_name)?;
+        let marker = self.create_file(&marker_name);
         #[cfg(windows)]
         let marker = self
             .handle
-            .create_shared_lock_file(std::ffi::OsStr::new(&marker_name))?;
-        let open = || -> io::Result<_> {
-            lock_marker(&marker)?;
-            let mut writer = BufWriter::new(self.create_file(filename)?);
-            writer.write_all(&header)?;
-            writer.flush()?;
-            Ok(writer)
+            .create_shared_lock_file(std::ffi::OsStr::new(&marker_name));
+        let marker = match marker {
+            Ok(marker) => marker,
+            Err(error) => {
+                let result = if error.kind() == io::ErrorKind::AlreadyExists {
+                    Ok(None)
+                } else {
+                    Err(error)
+                };
+                return combine_errors(result, self.remove(filename, file));
+            }
         };
-        let writer = match open() {
-            Ok(writer) => writer,
-            Err(error) => return combine_errors(Err(error), self.remove(&marker_name, marker)),
-        };
-        Ok(Active {
+        // A previous writer can publish its archive and release the plain name
+        // between the first check and exclusive creation of the plain file.
+        let archived = lock_marker(&marker).and_then(|()| self.name_exists(&archive_name));
+        if !matches!(archived, Ok(false)) {
+            let cleanup = combine_errors(
+                self.remove(filename, file),
+                self.remove(&marker_name, marker),
+            );
+            return combine_errors(archived.map(|_| None), cleanup);
+        }
+        let mut writer = BufWriter::new(file);
+        if let Err(error) = writer.write_all(&header).and_then(|()| writer.flush()) {
+            drop(writer);
+            return combine_errors(Err(error), self.remove(&marker_name, marker));
+        }
+        Ok(Some(Active {
             writer,
             filename: filename.into(),
             marker,
             marker_name,
             bytes: header.len() as u64,
             lines: 0,
-        })
+        }))
+    }
+
+    fn compress_closed(
+        &self,
+        record: ClosedLog,
+        retention_days: u16,
+        shutdown: &Shutdown,
+    ) -> io::Result<()> {
+        let result = self.compress(&record.filename, record.file, retention_days, &|| {
+            shutdown.compression_expired()
+        });
+        combine_errors(result, self.remove(&record.marker_name, record.marker))
     }
 
     fn compress(
@@ -406,9 +515,9 @@ impl Folder {
         name: &str,
         file: File,
         retention_days: u16,
-        shutdown: &Shutdown,
+        cancelled: &impl Fn() -> bool,
     ) -> io::Result<()> {
-        check_compression_budget(shutdown)?;
+        check_compression_budget(cancelled)?;
         let identity = file_identity(&file)?;
         #[cfg(windows)]
         drop(file);
@@ -424,7 +533,12 @@ impl Folder {
                 "Terminal logfile moved before compression",
             ));
         }
-        let archive_name = format!("{name}.gz");
+        if source.size() > MAX_LOG_BYTES {
+            return Err(io::Error::other(
+                "Terminal logfile exceeds the compression limit",
+            ));
+        }
+        let archive_name = super::compressed_filename(name);
         let destination = self.path.join(&archive_name);
         let staging = StagedDownload::create(&destination)?;
         if !staging.shares_parent_with(&source)? {
@@ -435,30 +549,28 @@ impl Folder {
         #[cfg(target_os = "macos")]
         staging.require_no_extended_acl()?;
         let mut encoder =
-            flate2::write::GzEncoder::new(staging.writer()?, flate2::Compression::default());
+            flate2::write::GzEncoder::new(staging.writer()?, flate2::Compression::fast());
         let mut input = CompressInput {
-            source: source.file().take(256 * 1024 * 1024 + 1),
-            shutdown,
+            source: source.file().take(MAX_LOG_BYTES + 1),
+            cancelled,
         };
         let copied = io::copy(&mut input, &mut encoder)?;
-        if copied != source.size() || copied > 256 * 1024 * 1024 {
+        if copied != source.size() || copied > MAX_LOG_BYTES {
             return Err(io::Error::other(
                 "Terminal logfile size changed during compression",
             ));
         }
-        check_compression_budget(shutdown)?;
+        check_compression_budget(cancelled)?;
         encoder.finish()?;
         let archive_identity = file_identity(staging.writer()?)?;
         source.verify()?;
-        staging
-            .publish(|| shutdown.compression_expired())
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::Interrupted && shutdown.compression_expired() {
-                    compression_timeout()
-                } else {
-                    error
-                }
-            })?;
+        staging.publish(cancelled).map_err(|error| {
+            if error.kind() == io::ErrorKind::Interrupted && cancelled() {
+                compression_timeout()
+            } else {
+                error
+            }
+        })?;
         drop(source);
         #[cfg(unix)]
         self.remove(name, file)?;
@@ -493,20 +605,20 @@ impl Folder {
     }
 }
 
-struct CompressInput<'a, R> {
+struct CompressInput<'a, R, C> {
     source: R,
-    shutdown: &'a Shutdown,
+    cancelled: &'a C,
 }
 
-impl<R: Read> Read for CompressInput<'_, R> {
+impl<R: Read, C: Fn() -> bool> Read for CompressInput<'_, R, C> {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        check_compression_budget(self.shutdown)?;
+        check_compression_budget(self.cancelled)?;
         self.source.read(bytes)
     }
 }
 
-fn check_compression_budget(shutdown: &Shutdown) -> io::Result<()> {
-    if shutdown.compression_expired() {
+fn check_compression_budget(cancelled: &impl Fn() -> bool) -> io::Result<()> {
+    if cancelled() {
         return Err(compression_timeout());
     }
     Ok(())
@@ -538,6 +650,7 @@ fn compression_timeout() -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, CompressionTimeout)
 }
 
+#[cfg(test)]
 fn is_compression_timeout(error: &io::Error) -> bool {
     error
         .get_ref()
@@ -566,20 +679,276 @@ fn file_identity(file: &File) -> io::Result<(u64, u64)> {
 #[cfg(windows)]
 use kortty_files::tree::file_identity;
 
-fn fresh_base(at: &jiff::Zoned) -> io::Result<String> {
-    let mut nonce = [0; 4];
-    getrandom::fill(&mut nonce).map_err(io::Error::other)?;
-    let sequence = u32::from_le_bytes(nonce) % 1_000_000_000 + 1;
-    Ok(format!(
-        "{}-ssh_{sequence}",
-        at.strftime("%Y-%m-%d-%H-%M-%S")
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::snippets::tests::Profile;
+
+    #[test]
+    fn concurrent_sessions_skip_an_existing_archive_and_claim_distinct_sequences() {
+        let profile = Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        let folder = Folder::open(&root, &Config::default()).unwrap();
+        let at: jiff::Timestamp = "2025-01-02T10:00:00Z".parse().unwrap();
+        let stamp = at
+            .to_zoned(TimeZone::system())
+            .strftime("%Y-%m-%d-%H-%M-%S")
+            .to_string();
+        let archived = folder.path.join(format!("{stamp}-Edge_west_2_1.log.gz"));
+        fs::write(&archived, b"existing archive").unwrap();
+        let simultaneous = std::sync::Barrier::new(3);
+        thread::scope(|threads| {
+            for line in ["session alpha", "session beta", "session gamma"] {
+                let (send, records) = async_channel::bounded(1);
+                send.send_blocking(Record {
+                    at,
+                    fields: Fields::from([("line".into(), line.into())]),
+                })
+                .unwrap();
+                let root = &root;
+                let simultaneous = &simultaneous;
+                threads.spawn(move || {
+                    simultaneous.wait();
+                    drop(send);
+                    run(
+                        root,
+                        Config {
+                            compress: false,
+                            ..Config::default()
+                        },
+                        Fields::from([("connection".into(), "Edge / west__2".into())]),
+                        records,
+                        &Shutdown::default(),
+                    )
+                    .unwrap();
+                });
+            }
+        });
+        let logs: String = (2..=4)
+            .map(|sequence| {
+                fs::read_to_string(
+                    folder
+                        .path
+                        .join(format!("{stamp}-Edge_west_2_{sequence}.log")),
+                )
+                .unwrap()
+            })
+            .collect();
+        for line in ["session alpha", "session beta", "session gamma"] {
+            assert_eq!(logs.matches(line).count(), 1);
+        }
+        assert_eq!(fs::read(archived).unwrap(), b"existing archive");
+        assert_eq!(fs::read_dir(&folder.path).unwrap().count(), 4);
+    }
+
+    #[test]
+    fn rotated_parts_use_their_own_timestamps_and_keep_the_claimed_sequence() {
+        let profile = Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        let folder = Folder::open(&root, &Config::default()).unwrap();
+        let times = [
+            "2025-01-02T10:00:00Z",
+            "2025-01-02T10:01:00Z",
+            "2025-01-04T10:00:00Z",
+        ]
+        .map(|time| time.parse::<jiff::Timestamp>().unwrap());
+        let [first, second, next_day] = times.map(|at| {
+            at.to_zoned(TimeZone::system())
+                .strftime("%Y-%m-%d-%H-%M-%S")
+                .to_string()
+        });
+        let existing = folder.path.join(format!("{first}-Edge_1.log"));
+        fs::write(&existing, b"existing logfile").unwrap();
+        let (send, records) = async_channel::bounded(3);
+        for (at, line) in times
+            .into_iter()
+            .zip(["first part", "size roll", "daily roll"])
+        {
+            send.send_blocking(Record {
+                at,
+                fields: Fields::from([("line".into(), line.into())]),
+            })
+            .unwrap();
+        }
+        drop(send);
+        run(
+            &root,
+            Config {
+                max_mib: 0, // Force size rotation without generating large test records.
+                compress: false,
+                ..Config::default()
+            },
+            Fields::from([("connection".into(), "Edge".into())]),
+            records,
+            &Shutdown::default(),
+        )
+        .unwrap();
+        for (name, line) in [
+            (format!("{first}-Edge_2.log"), "first part"),
+            (format!("{second}-Edge_2.p2.log"), "size roll"),
+            (format!("{next_day}-Edge_2.log"), "daily roll"),
+        ] {
+            assert!(
+                fs::read_to_string(folder.path.join(name))
+                    .unwrap()
+                    .contains(line)
+            );
+        }
+        assert_eq!(fs::read(existing).unwrap(), b"existing logfile");
+        assert_eq!(fs::read_dir(&folder.path).unwrap().count(), 4);
+    }
+
+    #[test]
+    #[ignore = "Writes a 1,000 MiB part and exercises native rotation, compression and paging"]
+    fn java_limit_rotates_without_waiting_for_gzip_and_views_both_images() {
+        use crate::logfile_window::document::{self, Document, ExportFormat};
+
+        let profile = Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        let log_directory = root.join("terminal-logs");
+        let config = Config {
+            max_mib: super::super::MAX_LOG_MIB,
+            rotate_daily: false,
+            ..Config::default()
+        };
+        let at: jiff::Timestamp = "2025-01-02T10:00:00Z".parse().unwrap();
+        let timestamp = at
+            .to_zoned(TimeZone::system())
+            .strftime("%Y-%m-%d %H:%M:%S.%3f")
+            .to_string();
+        let metadata = Fields::from([("connection".into(), "large log fixture".into())]);
+        let mut header = Vec::new();
+        write_header(&mut header, DocumentFormat::Text, &metadata).unwrap();
+        let mut remaining = MAX_LOG_BYTES - header.len() as u64;
+        let overhead = timestamp.len() + 4;
+        let padding = "x".repeat(15 * 1024);
+        let (send, receive) = async_channel::bounded(64);
+        let shutdown = Shutdown::default();
+        let mut expected_rows = 1;
+        let archive_path = thread::scope(|threads| {
+            let writer = threads.spawn(|| run(&root, config, metadata, receive, &shutdown));
+            let marker = "last record at Java boundary";
+            let closing_record = (overhead + marker.len()) as u64;
+            let mut generated_rows = 0;
+            let send_record = |line: String| {
+                send.send_blocking(Record {
+                    at,
+                    fields: Fields::from([("line".into(), line)]),
+                })
+                .unwrap();
+            };
+            while remaining > closing_record {
+                let record = (remaining - closing_record).min((overhead + padding.len()) as u64);
+                if record < overhead as u64 {
+                    break;
+                }
+                send_record(padding[..record as usize - overhead].into());
+                remaining -= record;
+                generated_rows += 1;
+            }
+            let final_line = format!(
+                "{marker}{}",
+                "x".repeat((remaining - closing_record) as usize)
+            );
+            send_record(final_line);
+            send_record("next rotated part".into());
+            expected_rows += generated_rows + 1;
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+            let (archive, part) = loop {
+                let entries = catalog::scan(&root, || false).unwrap().entries;
+                let archive = entries
+                    .iter()
+                    .find(|entry| entry.path.to_string_lossy().ends_with(".log.gz") && !entry.live);
+                let part = entries
+                    .iter()
+                    .find(|entry| entry.path.to_string_lossy().ends_with(".p2.log"));
+                if let (Some(archive), Some(part)) = (archive, part)
+                    && fs::read_to_string(&part.path)
+                        .unwrap()
+                        .contains("next rotated part")
+                {
+                    break (archive.path.clone(), part.path.clone());
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "rotation and compression did not complete while the capture was open"
+                );
+                thread::sleep(std::time::Duration::from_millis(50));
+            };
+            assert!(part.is_file());
+            drop(send);
+            writer.join().unwrap().unwrap();
+            archive
+        });
+        let entry = |path: &Path| {
+            catalog::scan(&root, || false)
+                .unwrap()
+                .entries
+                .into_iter()
+                .find(|entry| entry.path == path)
+                .unwrap()
+        };
+        let packed = entry(&archive_path);
+        let documentation = Document::open(&packed, || false).unwrap();
+        assert_eq!(documentation.lines(), expected_rows);
+        assert!(
+            documentation
+                .page(expected_rows - 1, || false)
+                .unwrap()
+                .lines[0]
+                .contains("last record at Java boundary")
+        );
+        drop(documentation);
+
+        let plain = log_directory.join("2025-01-02-10-00-00-ssh_99.log");
+        document::export(
+            &packed,
+            &plain,
+            ExportFormat::Unchanged,
+            catalog::Compression::None,
+            || false,
+        )
+        .unwrap();
+        assert_eq!(fs::metadata(&plain).unwrap().len(), MAX_LOG_BYTES);
+        let plain_entry = entry(&plain);
+        let documentation = Document::open(&plain_entry, || false).unwrap();
+        assert_eq!(documentation.lines(), expected_rows);
+        assert!(
+            documentation
+                .page(expected_rows - 1, || false)
+                .unwrap()
+                .lines[0]
+                .contains("last record at Java boundary")
+        );
+        drop(documentation);
+
+        let polls = std::cell::Cell::new(0);
+        let cancelled = Document::open(&packed, || {
+            polls.set(polls.get() + 1);
+            polls.get() > 24
+        })
+        .unwrap_err();
+        assert_eq!(cancelled.kind(), io::ErrorKind::Interrupted);
+
+        let folder = Folder::open(&root, &Config::default()).unwrap();
+        let before = fs::read_dir(&log_directory).unwrap().count();
+        let compressed_reads = std::cell::Cell::new(0);
+        let cancel_compression = || {
+            compressed_reads.set(compressed_reads.get() + 1);
+            compressed_reads.get() > 64
+        };
+        let result = folder.compress(
+            plain.file_name().unwrap().to_str().unwrap(),
+            File::open(&plain).unwrap(),
+            0,
+            &cancel_compression,
+        );
+        assert!(is_compression_timeout(&result.unwrap_err()));
+        assert_eq!(fs::metadata(&plain).unwrap().len(), MAX_LOG_BYTES);
+        assert!(!plain.with_extension("log.gz").exists());
+        assert_eq!(fs::read_dir(&log_directory).unwrap().count(), before);
+    }
 
     #[test]
     fn native_lock_spans_capture_and_a_marker_collision_prevents_writing() {
@@ -615,7 +984,8 @@ mod tests {
         assert!(
             folder
                 .begin(name, DocumentFormat::Text, &Fields::new())
-                .is_err()
+                .unwrap()
+                .is_none()
         );
         assert!(!folder.path.join(name).exists());
         folder.remove(&marker_name, marker).unwrap();
@@ -623,7 +993,8 @@ mod tests {
         assert!(
             folder
                 .begin(name, DocumentFormat::Text, &Fields::new())
-                .is_err()
+                .unwrap()
+                .is_none()
         );
         assert!(!marker_path.exists());
         assert_eq!(fs::read(folder.path.join(name)).unwrap(), b"other logfile");
@@ -631,6 +1002,7 @@ mod tests {
 
         let active = folder
             .begin(name, DocumentFormat::Text, &Fields::new())
+            .unwrap()
             .unwrap();
         let source = LocalSource::open(&folder.path.join(name)).unwrap();
         assert!(source.sibling_exists_or_uncertain(std::ffi::OsStr::new(&marker_name)));

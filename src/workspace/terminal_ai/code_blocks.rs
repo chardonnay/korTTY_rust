@@ -15,6 +15,7 @@ use crate::session::{
     CodePrompt, Frame, PromptState, SessionId, Status, TerminalCommand, TerminalCommandResult,
     valid_ai_run_line,
 };
+use crate::workspace::chat_appearance::Palette;
 use crate::workspace::paste_protection::{self, Decision, Warning};
 use crate::workspace::remote_dock::{ForeignShell, foreign_shell};
 
@@ -223,6 +224,7 @@ pub(super) fn answer_view<'a>(
     controls: &CodeControls,
     idle: bool,
     font_size: f32,
+    palette: Palette,
 ) -> Element<'a, Message> {
     let answer = turn.answer();
     let mut content = column![].spacing(6);
@@ -275,6 +277,8 @@ pub(super) fn answer_view<'a>(
         content = content.push(
             container(
                 column![
+                    (!block.language.is_empty())
+                        .then(|| text(block.language).size(12).color(palette.muted.color())),
                     text(code)
                         .size(font_size)
                         .font(Font::MONOSPACE)
@@ -296,7 +300,7 @@ pub(super) fn answer_view<'a>(
                 ]
                 .spacing(6),
             )
-            .style(container::bordered_box)
+            .style(move |_| palette.code())
             .padding(8)
             .width(Length::Fill),
         );

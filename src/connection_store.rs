@@ -28,7 +28,7 @@ mod window_geometry;
 pub(crate) use terminal::{
     ANSI_NAMES, AiAssignments, JAVA_ANSI_FIELDS, MAX_ASSIGNED_AI_SKILLS, MAX_TERMINAL_COLUMNS,
     MAX_TERMINAL_ROWS, MIN_TERMINAL_COLUMNS, MIN_TERMINAL_ROWS, TerminalAppearance,
-    TerminalOverrides, ThemeOverride,
+    TerminalOverrides, TerminalStyle, TerminalStylePreference, ThemeOverride,
 };
 pub(crate) use terminal::{MAX_PASTE_LINE_DELAY_MS, validate_paste_line_delay};
 pub(crate) mod teamwork;

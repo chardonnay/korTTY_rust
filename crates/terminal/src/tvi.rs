@@ -126,6 +126,7 @@ impl Tvi {
                 }
                 State::ColumnMode => {
                     // The reference WideColumn mode clears the grid and resets the margins.
+                    model.journal_boundary();
                     model.erase_display(2, false);
                     set_region(model, 0, model.rows - 1);
                     State::Ground
@@ -139,6 +140,9 @@ impl Tvi {
         if self.utf8_len != 0 && byte & 0xc0 != 0x80 {
             self.utf8_len = 0;
             print(model, '\u{fffd}');
+        }
+        if matches!(byte, 0x08..=0x0b | 0x0d) {
+            model.journal_control(byte);
         }
         match byte {
             ESC => return State::Escape,
@@ -318,7 +322,7 @@ fn print_character(model: &mut Model, ch: char) {
     {
         model.carriage_return();
     }
-    model.put_char(ch);
+    model.put_journaled_char(ch);
 }
 
 fn backspace(model: &mut Model) {
@@ -339,6 +343,7 @@ fn line_motion(model: &mut Model, motion: fn(&mut Model)) {
 }
 
 fn clear_and_home(model: &mut Model) {
+    model.journal_boundary();
     model.erase_display(2, false);
     model.move_cursor(0, 0);
 }

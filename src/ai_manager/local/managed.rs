@@ -844,6 +844,11 @@ impl Models {
     ) -> bool {
         use ManagedSetting::*;
         match setting {
+            OpenImport => !self.import_open,
+            CloseImport => self.import_open,
+            ChooseFiles => {
+                ai_allowed && !self.has_action() && !mlx.has_review() && self.file_picker.is_none()
+            }
             Name | Backend | Purpose | Context | CpuThreads | GpuLayers | IdleMinutes
             | NeverUnload => {
                 ai_allowed
@@ -911,7 +916,7 @@ impl Models {
         use ManagedSetting::*;
         if matches!(
             setting,
-            Source | Projector | ImportPurpose | Import | Reference | Reattach
+            ChooseFiles | Source | Projector | ImportPurpose | Import | Reference | Reattach
         ) {
             self.import_open = true;
         }
@@ -963,6 +968,11 @@ impl Dialog {
             .as_ref()
             .is_some_and(|id| self.installed_contains(id));
         let status = models.status.as_ref().unwrap_or(&ModelStatus::Stopped);
+        let (import_target, import_label, import_action) = if models.import_open {
+            (Target::CloseImport, "Close import", Message::CloseImport)
+        } else {
+            (Target::OpenImport, "Import GGUF…", Message::Browse)
+        };
         let idle = !matches!(status, ModelStatus::Starting | ModelStatus::Busy);
         let selected_count = models.selected_models().count();
         let action: Option<Element<'_, LocalMessage>> = models
@@ -1007,12 +1017,9 @@ impl Dialog {
                     Setting::Control(crate::ai_manager::search::Control::LocalSetup),
                     dialog_design::secondary_action("Setup assistant…").on_press_maybe(setup_available.then_some(LocalMessage::OpenModelSetup)),
                 ),
-                dialog_design::secondary_action(if models.import_open { "Close import" } else { "Import GGUF…" })
-                    .on_press_maybe(enabled.then_some(if models.import_open {
-                        Managed(Message::CloseImport)
-                    } else {
-                        Managed(Message::Browse)
-                    })),
+                reveal_action(import_target, dialog_design::secondary_action(import_label)
+                    .on_press_maybe(enabled.then_some(Managed(import_action))),
+                ),
                 reveal_action(Target::Configure, dialog_design::secondary_action("Configure…")
                     .on_press_maybe(configure)),
                 reveal_action(Target::SetDefault, dialog_design::secondary_action("Set as default").on_press_maybe(
@@ -1061,8 +1068,9 @@ impl Dialog {
                 purpose_picker(models.import_purpose, enabled, Message::ImportPurpose)
             )),
             row![
-                dialog_design::secondary_action("Choose GGUF files…")
+                reveal_action(Target::ChooseFiles, dialog_design::secondary_action("Choose GGUF files…")
                     .on_press_maybe(enabled.then_some(Managed(Message::Browse))),
+                ),
                 reveal_action(Target::Import, button("Import private copy").on_press_maybe(
                     (enabled && has_source
                         && (models.projector_path.trim().is_empty() || (models.single_source().is_some()

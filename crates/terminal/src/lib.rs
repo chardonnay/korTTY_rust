@@ -1931,22 +1931,11 @@ impl Perform for Model {
     fn print(&mut self, ch: char) {
         let charset = self.single_shift.take().unwrap_or(self.charset);
         let character = self.charsets[charset].map(ch);
-        if self.journal.is_some() {
-            self.journal_print(character);
-        }
-        self.put_char(character);
+        self.put_journaled_char(character);
     }
 
     fn execute(&mut self, byte: u8) {
-        if self.journal.is_some() {
-            match byte {
-                b'\x08' => self.journal_event(JournalEvent::Backspace),
-                b'\t' => self.journal_event(JournalEvent::Tab),
-                b'\n' | b'\x0b' | b'\x0c' => self.journal_event(JournalEvent::LineFeed),
-                b'\r' => self.journal_event(JournalEvent::CarriageReturn),
-                _ => {}
-            }
-        }
+        self.journal_control(byte);
         match byte {
             b'\x07' => self.ring_bell(),
             b'\x08' => self.move_ansi_cursor_left(1),
@@ -2356,10 +2345,7 @@ impl Model {
             self.charset
         };
         let character = self.charsets[slot].map(ch);
-        if self.journal.is_some() {
-            self.journal_print(character);
-        }
-        self.put_char(character);
+        self.put_journaled_char(character);
     }
 
     fn report_device_attributes(&mut self) {

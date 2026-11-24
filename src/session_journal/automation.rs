@@ -486,7 +486,7 @@ struct OrderedDigest {
 pub(crate) struct CaptureSettings {
     pub(crate) root: PathBuf,
     pub(crate) format: LogFormat,
-    pub(crate) max_parts: Option<u16>,
+    pub(crate) max_parts: Option<u32>,
     pub(crate) markers: Arc<Compiled>,
     pub(crate) stopped: Arc<AtomicBool>,
 }

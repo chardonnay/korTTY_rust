@@ -1,12 +1,44 @@
+use std::ops::RangeInclusive;
 use std::sync::LazyLock;
 
+use iced::advanced::text::{self as layout_text, Paragraph as _};
 use iced::theme::Base as _;
 use iced::{
-    Color, Element, Font, Length, Theme,
-    widget::{button, container, rule, stack, text, text_input},
+    Alignment, Color, Element, Font, Length, Pixels, Size, Theme, border,
+    widget::{button, column, container, row, rule, stack, text, text_input},
 };
+use iced_tiny_skia::font_scale::Paragraph;
 
+pub(crate) use super::dialog_placement::escape::on_key_press;
 pub(crate) mod keyboard_table;
+pub(crate) mod scroll;
+
+pub(crate) const TAB_LABEL_SIZE: f32 = 13.0;
+
+pub(crate) fn tab_label<'a>(
+    label: impl iced::widget::text::IntoFragment<'a>,
+) -> iced::widget::Text<'a> {
+    text(label)
+        .size(TAB_LABEL_SIZE)
+        .shaping(layout_text::Shaping::Advanced)
+        .wrapping(layout_text::Wrapping::None)
+}
+
+pub(crate) fn tab_label_width(label: &str) -> f32 {
+    // Measure labels inside the same font-scale scope as their actual widgets.
+    Paragraph::with_text(layout_text::Text {
+        content: label,
+        bounds: Size::INFINITE,
+        size: Pixels(TAB_LABEL_SIZE),
+        line_height: layout_text::LineHeight::default(),
+        font: Font::DEFAULT,
+        align_x: layout_text::Alignment::Default,
+        align_y: iced::alignment::Vertical::Top,
+        shaping: layout_text::Shaping::Advanced,
+        wrapping: layout_text::Wrapping::None,
+    })
+    .min_width()
+}
 
 const NAME: &str = "Normal Dialog";
 const PAGE: Color = Color::from_rgb8(30, 30, 30);
@@ -158,6 +190,59 @@ pub(crate) fn number_step<'a, Message: Clone + 'a>(
     .width(24)
     .style(secondary_button)
     .on_press_maybe(action)
+}
+
+pub(crate) fn number_input<'a, Message: Clone + 'a>(
+    input: text_input::TextInput<'a, Message>,
+    value: &str,
+    bounds: RangeInclusive<i64>,
+    step: i64,
+    on_step: Option<impl Fn(String) -> Message>,
+    input_width: f32,
+) -> Element<'a, Message> {
+    let adjustment = |delta: i64| {
+        let update = on_step.as_ref()?;
+        let value: i64 = value.trim().parse().ok()?;
+        if !bounds.contains(&value) {
+            return None;
+        }
+        let next = value
+            .saturating_add(delta)
+            .clamp(*bounds.start(), *bounds.end());
+        (next != value).then(|| update(next.to_string()))
+    };
+    let up = adjustment(step);
+    let down = adjustment(-step);
+    let input = input
+        .vertical_steps(up.clone(), down.clone())
+        .size(13)
+        .line_height(text::LineHeight::Absolute(16.0.into()))
+        .padding([7, 5])
+        .width(input_width)
+        .style(|theme, status| {
+            let mut style = form_input(theme, status);
+            style.border.radius = style.border.radius.right(0);
+            style
+        });
+    let increment = number_step("▴", up)
+        .padding([1, 6])
+        .width(26)
+        .style(|theme, status| {
+            let mut style = secondary_button(theme, status);
+            style.border.radius = border::top_right(style.border.radius.top_right);
+            style
+        });
+    let decrement = number_step("▾", down)
+        .padding([1, 6])
+        .width(26)
+        .style(|theme, status| {
+            let mut style = secondary_button(theme, status);
+            style.border.radius = border::bottom_right(style.border.radius.bottom_right);
+            style
+        });
+    row![input, column![increment, decrement]]
+        .align_y(Alignment::Center)
+        .into()
 }
 
 pub(crate) fn segment(theme: &Theme, status: button::Status, selected: bool) -> button::Style {

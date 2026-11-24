@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fmt;
-use std::io::{self, Cursor, Seek, Write};
+use std::io::{self, BufWriter, Cursor, Seek, Write};
 use std::path::PathBuf;
 
 use zeroize::Zeroizing;
@@ -12,15 +12,21 @@ use zip::{AesMode, CompressionMethod, System, ZipWriter};
 
 use crate::private_files::{Directory, EntryIdentity, FileStamp, desktop::Document, nonce};
 use crate::snippets::{
-    archive::{ZipSettings, encrypt_saved_payload},
+    archive::{ZipSettings, encrypt_saved_payload, encrypt_saved_reader},
     recipients::Choice,
 };
 
+use super::capture::{MAX_CAPTURE_BYTES, bundle::MemberData};
 use super::export::{Markdown, Options, Selection, Snapshot, TopicSelection};
-use super::{MAX_CATALOG_ROWS, check_path};
+use super::{MAX_CATALOG_ROWS, MAX_CONNECTION_JOURNAL_PARTS, MAX_PNG_BYTES, check_path};
 
-const MAX_BATCH_BYTES: usize = 128 * 1024 * 1024;
+mod archive_stream;
+
+const MAX_BATCH_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_BATCH_FILES: usize = 4096;
+const MAX_HTML_BYTES: u64 =
+    MAX_CAPTURE_BYTES + MAX_BATCH_FILES as u64 * MAX_PNG_BYTES + MAX_BATCH_BYTES;
+const MAX_HTML_FILES: usize = MAX_BATCH_FILES + MAX_CONNECTION_JOURNAL_PARTS as usize + 2;
 const MAX_STEM_BYTES: usize = 120;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -311,10 +317,48 @@ pub(crate) fn publish_reviewed(
             published.exported = 1;
             published.skipped_assets = pdf.skipped_assets;
         }
+        Protection::OpenPgp { profile, recipient } if format == Format::HtmlBundle => {
+            let check = || {
+                check()?;
+                crate::snippets::recipients::require_current_choice(profile, recipient)
+            };
+            parent.publish_checked(
+                name,
+                |file| {
+                    let result = archive_stream::transfer(
+                        |output| {
+                            batch.write_zip(
+                                ZipWriter::new_stream(output),
+                                journals,
+                                None,
+                                &mut published,
+                            )
+                        },
+                        |input| {
+                            encrypt_saved_reader(
+                                profile,
+                                recipient,
+                                input,
+                                file,
+                                "kortty-journals.zip",
+                            )
+                        },
+                    );
+                    check_cancelled(cancelled)?;
+                    result
+                },
+                check,
+            )?;
+        }
         Protection::OpenPgp { profile, recipient } => {
             // The bounded unencrypted archive never needs a plaintext file.
             let mut plaintext = Zeroizing::new(Vec::new());
-            batch.write_zip(Cursor::new(&mut *plaintext), journals, None, &mut published)?;
+            batch.write_zip(
+                ZipWriter::new(Cursor::new(&mut *plaintext)),
+                journals,
+                None,
+                &mut published,
+            )?;
             check()?;
             parent.publish_checked(
                 name,
@@ -340,7 +384,12 @@ pub(crate) fn publish_reviewed(
             parent.publish_checked(
                 name,
                 |file| {
-                    batch.write_zip(&mut *file, journals, password, &mut published)?;
+                    batch.write_zip(
+                        ZipWriter::new(&mut *file),
+                        journals,
+                        password,
+                        &mut published,
+                    )?;
                     if matches!(protection, Protection::None) {
                         staged = FileStamp::read(file).ok();
                     }
@@ -422,31 +471,46 @@ impl Batch<'_> {
 
     fn write_zip(
         &self,
-        output: impl Write + Seek,
+        mut zip: ZipWriter<impl Write + Seek>,
         journals: impl IntoIterator<Item = JournalInput>,
         password: Option<&str>,
         published: &mut Published,
     ) -> io::Result<()> {
-        let mut zip = ZipWriter::new(output);
-        let mut budget = Budget::default();
+        let html = self.format == Format::HtmlBundle;
+        let mut budget = if html {
+            Budget::html_bundle()
+        } else {
+            Budget::default()
+        };
         let mut used = HashSet::new();
         let mut members = HashSet::new();
         let files = SimpleFileOptions::default()
             .system(System::Unix)
             .unix_permissions(0o600)
+            .large_file(html)
             .compression_method(CompressionMethod::Deflated);
         let files = match password {
             Some(password) => files.with_aes_encryption(AesMode::Aes256, password),
             None => files,
         };
-        let mut write_member = |name: &str, bytes: &[u8]| -> io::Result<()> {
+        let mut write_member = |name: &str, write: &mut MemberData<'_>| -> io::Result<()> {
             check_cancelled(self.cancelled)?;
             if !name.split('/').all(valid_component) || !members.insert(name.to_lowercase()) {
                 return Err(invalid("Invalid or duplicate journal archive member name"));
             }
-            budget.include_file(bytes.len())?;
+            budget.include_file(0)?;
             zip.start_file(name, files)?;
-            write_bytes(&mut zip, bytes, self.cancelled)
+            let member = ArchiveMember {
+                output: CancelWriter {
+                    file: &mut zip,
+                    cancelled: self.cancelled,
+                },
+                budget: &mut budget,
+            };
+            let mut member = BufWriter::with_capacity(64 * 1024, member);
+            let result = write(&mut member).and_then(|()| member.flush());
+            check_cancelled(self.cancelled)?;
+            result
         };
         let mut journals = journals.into_iter();
         for _ in 0..self.selected_count {
@@ -501,18 +565,24 @@ impl Batch<'_> {
                         &self.options.branding,
                         self.cancelled,
                     )?;
-                    write_member(&format!("{stem}.pdf"), &pdf.bytes)?;
+                    write_member(&format!("{stem}.pdf"), &mut |output| {
+                        write_bytes(output, &pdf.bytes, self.cancelled)
+                    })?;
                     pdf.skipped_assets
                 }
                 Format::Markdown => {
                     let folder = asset_folder(&stem)?;
                     let markdown = selection.render(self.options, &folder)?;
-                    write_member(&format!("{stem}.md"), markdown.text.as_bytes())?;
+                    write_member(&format!("{stem}.md"), &mut |output| {
+                        write_bytes(output, markdown.text.as_bytes(), self.cancelled)
+                    })?;
                     for asset in markdown.assets {
                         if !valid_component(&asset.name) {
                             return Err(invalid("Invalid journal export asset name"));
                         }
-                        write_member(&format!("{folder}/{}", asset.name), &asset.bytes)?;
+                        write_member(&format!("{folder}/{}", asset.name), &mut |output| {
+                            write_bytes(output, &asset.bytes, self.cancelled)
+                        })?;
                     }
                     markdown.skipped_assets
                 }
@@ -520,11 +590,11 @@ impl Batch<'_> {
                     let stats = selection.write_html_bundle(
                         self.options,
                         self.links_allowed,
-                        |name, bytes| {
+                        |name, write| {
                             if self.selected_count == 1 {
-                                write_member(name, bytes)
+                                write_member(name, write)
                             } else {
-                                write_member(&format!("{stem}/{name}"), bytes)
+                                write_member(&format!("{stem}/{name}"), write)
                             }
                         },
                         self.cancelled,
@@ -557,13 +627,33 @@ impl Batch<'_> {
     }
 }
 
-#[derive(Default)]
 struct Budget {
-    bytes: usize,
+    bytes: u64,
     files: usize,
+    byte_limit: u64,
+    file_limit: usize,
+}
+
+impl Default for Budget {
+    fn default() -> Self {
+        Self {
+            bytes: 0,
+            files: 0,
+            byte_limit: MAX_BATCH_BYTES,
+            file_limit: MAX_BATCH_FILES,
+        }
+    }
 }
 
 impl Budget {
+    fn html_bundle() -> Self {
+        Self {
+            byte_limit: MAX_HTML_BYTES,
+            file_limit: MAX_HTML_FILES,
+            ..Self::default()
+        }
+    }
+
     fn include(&mut self, markdown: &Markdown) -> io::Result<()> {
         let mut names = HashSet::new();
         self.include_file(markdown.text.len())?;
@@ -577,14 +667,46 @@ impl Budget {
     }
 
     fn include_file(&mut self, size: usize) -> io::Result<()> {
+        self.check_bytes(size)?;
         self.files = self.files.saturating_add(1);
-        self.bytes = self.bytes.saturating_add(size);
-        if self.bytes > MAX_BATCH_BYTES || self.files > MAX_BATCH_FILES {
-            return Err(invalid(
-                "The journal export exceeds the 128 MiB or 4096 file limit",
-            ));
+        if self.files > self.file_limit {
+            return Err(self.limit_error());
+        }
+        self.bytes += size as u64;
+        Ok(())
+    }
+
+    fn check_bytes(&self, size: usize) -> io::Result<()> {
+        if self.bytes.saturating_add(size as u64) > self.byte_limit {
+            return Err(self.limit_error());
         }
         Ok(())
+    }
+
+    fn limit_error(&self) -> io::Error {
+        if self.byte_limit == MAX_BATCH_BYTES {
+            invalid("The journal export exceeds the 128 MiB or 4096 file limit")
+        } else {
+            invalid("The HTML journal bundle exceeds its archive size or file limit")
+        }
+    }
+}
+
+struct ArchiveMember<'a, W> {
+    output: CancelWriter<'a, W>,
+    budget: &'a mut Budget,
+}
+
+impl<W: Write> Write for ArchiveMember<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.budget.check_bytes(bytes.len())?;
+        let written = self.output.write(bytes)?;
+        self.budget.bytes += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.flush()
     }
 }
 
@@ -736,7 +858,7 @@ impl<W: Write> Write for CancelWriter<'_, W> {
 }
 
 fn write_bytes(
-    output: &mut impl Write,
+    output: &mut (impl Write + ?Sized),
     bytes: &[u8],
     cancelled: &dyn Fn() -> bool,
 ) -> io::Result<()> {

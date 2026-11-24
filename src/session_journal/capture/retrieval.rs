@@ -63,7 +63,7 @@ pub(in crate::session_journal) fn visit(
     mut visitor: impl FnMut(Row<'_>) -> bool,
 ) -> io::Result<CaptureStatus> {
     check_content_cancel(cancelled)?;
-    let (parts, mut status) = discover_parts(source, declared_parts)?;
+    let (parts, mut status) = discover_parts(source, declared_parts, cancelled)?;
     for part in parts
         .values()
         .filter(|part| only_part.is_none_or(|n| n == part.number))

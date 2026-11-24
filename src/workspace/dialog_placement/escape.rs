@@ -14,7 +14,7 @@ pub(in crate::workspace) fn on_escape<'a, Message: Clone + 'a>(
     })
 }
 
-pub(in crate::workspace) fn on_key_press<'a, Message: 'a>(
+pub(crate) fn on_key_press<'a, Message: 'a>(
     content: Element<'a, Message>,
     action: impl Fn(&Key, Modifiers) -> Option<Message> + 'a,
 ) -> Element<'a, Message> {

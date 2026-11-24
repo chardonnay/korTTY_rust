@@ -94,11 +94,13 @@ impl Workspace {
                     let connection = store
                         .get(reference.id)
                         .ok_or("The saved rsync route is unavailable.")?;
-                    job_executor::Credentials::resolve_directory_browser(
+                    job_executor::Credentials::resolve_scheduled(
                         reference,
                         connection,
+                        false,
                         installed.server_access(),
                         |id, kind, endpoint| self.vault_credential(id, kind, endpoint),
+                        self.scheduler_temporary_keys(&store),
                     )
                 };
                 for (reference, destination) in targets {

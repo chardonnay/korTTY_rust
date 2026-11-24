@@ -10,7 +10,7 @@ use iced::widget::{button, checkbox, column, pane_grid, row, text, text_editor};
 use iced::{Alignment, Element, Task, window};
 use kortty_recording::{RecordedCell, RecordedScreen};
 
-use crate::session::{InputError, JournalAttachment, SessionId};
+use crate::session::{InputError, JournalAttachStart, JournalAttachment, SessionId};
 use crate::session_journal::markers::Compiled as MarkerRules;
 use crate::session_journal::viewer::Source as ViewerSource;
 use crate::session_journal::{
@@ -35,7 +35,7 @@ pub enum Message {
     NoteTranslated(u64, u64, note_translation::Event),
     Open(window::Id, u64, u64),
     Started(u64, u64),
-    Attached(u64, u64, SessionId, Result<(), String>),
+    Attached(u64, u64, SessionId, u64, Result<(), String>),
     Ended(u64, u64),
     Finalized(u64, u64),
     SourceRetired(u64, u64),
@@ -144,7 +144,14 @@ pub(super) struct Entry {
     automatic_screenshot_ai_disabled: bool,
     without_ai: bool,
     automatic: Option<(SessionId, u64)>,
+    reconnect: Option<ReconnectCapture>,
     capture_input: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ReconnectCapture {
+    target: ProbeTarget,
+    reconnected: bool,
 }
 
 enum Phase {
@@ -510,8 +517,20 @@ impl Workspace {
             .is_some()
     }
 
+    fn journal_capture_allowed_for(&self, tab: &Tab) -> bool {
+        if !self.journal_allowed() || (tab.incognito && !self.journal_required()) {
+            return false;
+        }
+        let serial = tab
+            .grid
+            .get(tab.primary)
+            .and_then(|id| self.sessions.get(id))
+            .is_some_and(|pane| pane.frame.serial.is_some());
+        !serial || (self.clipboard.policy.serial_allowed && !self.isolation_required())
+    }
+
     fn journal_source(&self, tab: &Tab) -> Option<(SessionId, &PaneSession)> {
-        if tab.incognito || !self.journal_allowed() {
+        if !self.journal_capture_allowed_for(tab) {
             return None;
         }
         let id = *tab.grid.get(tab.primary)?;
@@ -538,7 +557,7 @@ impl Workspace {
             return false;
         }
         match self.journal_captures.get(&tab.id).map(|entry| &entry.phase) {
-            Some(Phase::Starting(..) | Phase::Active { .. }) => true,
+            Some(Phase::Starting(..) | Phase::Active { .. }) => !self.journal_required(),
             Some(Phase::Finishing(..)) => false,
             _ => self.journal_source(tab).is_some(),
         }
@@ -619,6 +638,16 @@ impl Workspace {
         tab_id: u64,
         automatic: bool,
     ) -> Task<Desktop> {
+        if self
+            .journal_tab_in(owner, tab_id)
+            .is_some_and(|tab| tab.incognito)
+        {
+            return if automatic && self.journal_required() {
+                self.open_journal_capture(owner, tab_id, true, true).1
+            } else {
+                Task::none()
+            };
+        }
         if let Err(error) = self.journal_directory() {
             self.notice(owner, format!("Could not start session journal ({error})."));
             return Task::none();
@@ -652,12 +681,26 @@ impl Workspace {
         let Some(tab) = self.journal_tab_in(owner, tab_id) else {
             return (None, Task::none());
         };
+        if tab.incognito && !automatic {
+            return (None, Task::none());
+        }
+        let incognito = tab.incognito;
+        let without_ai = without_ai || incognito;
         let journal_pane = tab.primary;
         let Some((source, pane)) = self.journal_source(tab) else {
             return (None, Task::none());
         };
         let generation = pane.stream_generation;
+        let reconnect =
+            (pane.ssh.is_some() || pane.frame.serial.is_some()).then_some(ReconnectCapture {
+                target: ProbeTarget {
+                    session: source,
+                    generation,
+                },
+                reconnected: false,
+            });
         let mut config = pane.journal_config;
+        config.capture_input &= !incognito && pane.frame.serial.is_none();
         config.ai_summaries &= !without_ai;
         if let Some(cap) = self
             .clipboard
@@ -671,6 +714,8 @@ impl Workspace {
             ssh.label()
         } else if let Some(local) = &pane.saved_local {
             local.display_name()
+        } else if let Some(serial) = &pane.saved_serial {
+            serial.name.clone()
         } else if let Some(serial) = &pane.frame.serial {
             serial.device.display().to_string()
         } else {
@@ -731,13 +776,14 @@ impl Workspace {
                 pane: journal_pane,
                 title,
                 phase: Phase::Starting(source, startup),
-                notice: without_ai.then(|| "Recording without AI.".into()),
+                notice: (without_ai && !incognito).then(|| "Recording without AI.".into()),
                 note: None,
                 screenshot: None,
                 automatic_screenshot_ai,
                 automatic_screenshot_ai_disabled: without_ai,
                 without_ai,
                 automatic: automatic.then_some((source, generation)),
+                reconnect,
                 capture_input: config.capture_input,
             },
         );
@@ -794,13 +840,25 @@ impl Workspace {
             .journal_tab(tab_id)
             .and_then(|tab| self.journal_source(tab))
             .filter(|(id, pane)| {
-                original.is_none_or(|original| original == *id)
-                    && entry.automatic.is_none_or(|(source, generation)| {
-                        source == *id && generation == pane.stream_generation
-                    })
+                let generation = pane.stream_generation;
+                match entry.reconnect {
+                    Some(reconnect) => {
+                        reconnect.target
+                            == ProbeTarget {
+                                session: *id,
+                                generation,
+                            }
+                    }
+                    None => {
+                        original.is_none_or(|original| original == *id)
+                            && entry
+                                .automatic
+                                .is_none_or(|source| source == (*id, generation))
+                    }
+                }
             })
         else {
-            if original.is_some() {
+            if original.is_some() && entry.reconnect.is_none() {
                 self.fail_journal(
                     tab_id,
                     "The original terminal session ended during startup.".into(),
@@ -810,14 +868,33 @@ impl Workspace {
         };
         let sink = capture.sink();
         let generation = pane.stream_generation;
+        let isolation = || {
+            let local_process = pane.local_security.as_ref().is_some_and(|settings| {
+                settings.isolation == crate::session_security::IsolationLevel::Process
+            });
+            pane.session.journal_isolation(local_process)
+        };
+        let start = if entry
+            .reconnect
+            .is_some_and(|reconnect| reconnect.reconnected)
+        {
+            JournalAttachStart::Reconnected(isolation())
+        } else if entry.automatic.is_some() {
+            JournalAttachStart::Connected(isolation())
+        } else if original.is_some() {
+            JournalAttachStart::Seeded
+        } else {
+            JournalAttachStart::Live
+        };
         let result = pane.session.attach_journal_configured(
             sink,
             self.clipboard.policy.terminal_logging.clone(),
-            original.is_some() && entry.automatic.is_none(),
+            start,
             entry.capture_input,
         );
         let (attachment, reply) = match result {
             Ok(result) => result,
+            Err(InputError::Closed) if entry.reconnect.is_some() => return Task::none(),
             Err(error) => {
                 let message = match error {
                     InputError::Busy => "The terminal is busy. Start the journal again.",
@@ -848,8 +925,32 @@ impl Workspace {
                 .await
                 .map_err(|_| "The terminal session ended before recording could attach.".to_owned())
                 .and_then(|result| result.map_err(|error| error.to_string()));
-            Desktop::JournalCapture(Message::Attached(tab_id, run, id, result))
+            Desktop::JournalCapture(Message::Attached(tab_id, run, id, generation, result))
         })
+    }
+
+    /// Only a committed reconnect may move the journal to a replacement stream.
+    pub(super) fn rebind_reconnected_journal(
+        &mut self,
+        tab: u64,
+        previous: (SessionId, u64),
+        replacement: (SessionId, u64),
+    ) {
+        if let Some(entry) = self
+            .journal_captures
+            .get_mut(&tab)
+            .filter(|entry| entry.capturing())
+            && let Some(reconnect) = &mut entry.reconnect
+            && (reconnect.target.session, reconnect.target.generation) == previous
+        {
+            *reconnect = ReconnectCapture {
+                target: ProbeTarget {
+                    session: replacement.0,
+                    generation: replacement.1,
+                },
+                reconnected: true,
+            };
+        }
     }
 
     pub(super) fn reconcile_journal_sources(&mut self) -> Task<Desktop> {
@@ -857,9 +958,10 @@ impl Workspace {
         let mut retire = Vec::new();
         let mut stop = Vec::new();
         for (&id, entry) in &self.journal_captures {
-            let Some(tab) = self.journal_tab(id).filter(|tab| {
-                tab.primary == entry.pane && !tab.incognito && self.journal_allowed()
-            }) else {
+            let Some(tab) = self
+                .journal_tab(id)
+                .filter(|tab| tab.primary == entry.pane && self.journal_capture_allowed_for(tab))
+            else {
                 if entry.capturing() {
                     stop.push(id);
                 }
@@ -870,11 +972,21 @@ impl Workspace {
                     .get(&id)
                     .map(|pane| (id, pane.stream_generation, &pane.frame.status))
             });
-            if entry.automatic.is_some_and(|(id, generation)| {
-                !primary.is_some_and(|(pane, stream, status)| {
-                    id == pane && generation == stream && *status == crate::session::Status::Running
-                })
-            }) {
+            let current = primary.map(|(session, generation, _)| ProbeTarget {
+                session,
+                generation,
+            });
+            let still_bound = match entry.reconnect {
+                Some(reconnect) => current == Some(reconnect.target),
+                None => entry.automatic.is_none_or(|(id, generation)| {
+                    primary.is_some_and(|(pane, stream, status)| {
+                        id == pane
+                            && generation == stream
+                            && *status == crate::session::Status::Running
+                    })
+                }),
+            };
+            if !still_bound {
                 if entry.capturing() {
                     stop.push(id);
                 }
@@ -888,7 +1000,15 @@ impl Workspace {
             else {
                 continue;
             };
-            match (source, primary.map(|(id, generation, _)| (id, generation))) {
+            let ready = if entry.reconnect.is_some() {
+                current.filter(|target| self.sessions[&target.session].session.journal_available())
+            } else {
+                current
+            };
+            match (
+                source,
+                ready.map(|target| (target.session, target.generation)),
+            ) {
                 (Some(bound), current) if Some((bound.id, bound.generation)) != current => {
                     retire.push(id)
                 }
@@ -950,13 +1070,14 @@ impl Workspace {
         if !self.journal_allowed() {
             return Vec::new();
         }
+        let required = self.journal_required();
         let mut candidates = Vec::new();
         for (&owner, window) in &self.windows {
             for tab in window.terminal_tabs() {
                 let Some((session, pane)) = self.journal_source(tab) else {
                     continue;
                 };
-                if pane.journal_config.auto_start
+                if (required || pane.journal_config.auto_start)
                     && pane.frame.status == crate::session::Status::Running
                     && pane.journal_attempted != Some(pane.stream_generation)
                 {
@@ -1270,8 +1391,12 @@ impl Workspace {
             Message::AiProbeChoice(owner, tab, ticket, choice) => {
                 return self.journal_probe_choice(owner, tab, ticket, choice);
             }
-            Message::Attached(tab, run, id, result) => {
+            Message::Attached(tab, run, id, generation, result) => {
+                let current_stream = self.sessions.get(&id).is_some_and(|pane| {
+                    pane.stream_generation == generation && pane.session.journal_available()
+                });
                 if let Some(Entry {
+                    reconnect,
                     phase:
                         Phase::Active {
                             source: Some(source),
@@ -1282,7 +1407,15 @@ impl Workspace {
                     .journal_captures
                     .get_mut(&tab)
                     .filter(|entry| entry.run == run)
-                    && source.id == id
+                    && (source.id, source.generation) == (id, generation)
+                    && reconnect.is_none_or(|reconnect| {
+                        reconnect.target
+                            == ProbeTarget {
+                                session: id,
+                                generation,
+                            }
+                            && current_stream
+                    })
                 {
                     match result {
                         Ok(()) => source.ready = true,
@@ -1441,6 +1574,10 @@ impl Workspace {
         if let Some(automatic) = self.journal_screenshot_ai_run_control(owner, id, run) {
             content = content.push(automatic);
         }
+        if self.journal_required() && entry.capturing() {
+            content =
+                content.push(text("Session journaling is required by managed policy.").size(13));
+        }
         if let Some(notice) = &entry.notice {
             content = content.push(text(notice).size(13));
         }
@@ -1586,6 +1723,14 @@ impl Workspace {
     }
 }
 
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+#[path = "journal_capture_access/serial_tests.rs"]
+mod serial_tests;
+
+#[cfg(all(test, any(unix, windows)))]
+#[path = "journal_capture_access/input_tests.rs"]
+mod input_tests;
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -1676,6 +1821,7 @@ mod tests {
                 automatic_screenshot_ai_disabled: false,
                 without_ai: false,
                 automatic: None,
+                reconnect: None,
                 capture_input: false,
             },
         );
@@ -1785,6 +1931,7 @@ mod tests {
                 automatic_screenshot_ai_disabled: false,
                 without_ai: false,
                 automatic: None,
+                reconnect: None,
                 capture_input: false,
             },
         );
@@ -1892,6 +2039,7 @@ mod tests {
                 automatic_screenshot_ai_disabled: false,
                 without_ai: false,
                 automatic: None,
+                reconnect: None,
                 capture_input: false,
             },
         );
@@ -1991,10 +2139,16 @@ mod tests {
         let (owner, _) = workspace.open_window(false);
         workspace.window_settings.session_journal.directory =
             scratch.0.join("journals").to_str().unwrap().into();
-        let grid = crate::session::GridSize::default();
-        let shell =
-            crate::session::Session::start(grid, kortty_terminal::TerminalProfile::Xterm).unwrap();
-        let session = workspace.store_session(shell, grid, 14);
+        let session = workspace
+            .start_session_with_policy(
+                owner,
+                kortty_terminal::TerminalProfile::Xterm,
+                Some(crate::session_security::LocalSettings {
+                    isolation: crate::session_security::IsolationLevel::Process,
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
         workspace.add_tab(owner, session);
         let pane = workspace.sessions.get_mut(&session).unwrap();
         wait(|| {
@@ -2027,20 +2181,7 @@ mod tests {
                 .journal_agent_capture(session, generation)
                 .is_none()
         );
-        {
-            use iced::futures::StreamExt as _;
-
-            let mut events = iced_runtime::task::into_stream(attach).unwrap();
-            loop {
-                if let iced_runtime::Action::Output(Desktop::JournalCapture(
-                    message @ Message::Attached(..),
-                )) = block_on(events.next()).expect("the journal attachment must finish")
-                {
-                    let _ = workspace.update_journal_capture(message);
-                    break;
-                }
-            }
-        }
+        deliver_journal_attachment(&mut workspace, attach);
         let capture = workspace.journal_captures[&tab].metadata_capture().unwrap();
         let note_authority = workspace.live_journal_note_authority(&capture).unwrap();
         assert!(note_authority());
@@ -2079,6 +2220,17 @@ mod tests {
         };
         wait(|| done.is_closed());
         let _ = workspace.update_journal_capture(Message::Finalized(tab, run));
+        let page = ViewerSource::capture(&capture)
+            .capture_page(None, None, None)
+            .unwrap();
+        assert_eq!(
+            page.records
+                .iter()
+                .filter(|record| record.kind == crate::session_journal::CaptureKind::Note)
+                .map(|record| record.text.as_str())
+                .collect::<Vec<_>>(),
+            ["isolation: process"]
+        );
         assert!(
             workspace
                 .journal_agent_capture(session, generation)
@@ -2087,6 +2239,100 @@ mod tests {
         let _ = workspace.reconcile_journal_sources();
         assert_eq!(workspace.journal_captures[&tab].run, run);
         let _ = workspace.sessions[&session].session.stop().recv_blocking();
+    }
+
+    pub(super) fn deliver_journal_attachment(workspace: &mut Workspace, attach: Task<Desktop>) {
+        use iced::futures::StreamExt as _;
+
+        let mut events = iced_runtime::task::into_stream(attach).unwrap();
+        loop {
+            if let iced_runtime::Action::Output(Desktop::JournalCapture(
+                message @ Message::Attached(..),
+            )) = block_on(events.next()).expect("the journal attachment must finish")
+            {
+                let _ = workspace.update_journal_capture(message);
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn required_journal_starts_without_profile_opt_in_and_cannot_be_stopped_from_the_tab() {
+        for incognito in [false, true] {
+            let scratch = Scratch::new();
+            let mut workspace = Workspace::default();
+            workspace.clipboard.policy = crate::clipboard_policy::parse(
+                "[meta]\nschema-version = 1\n[[rule]]\n[rule.session-journal]\nenforced = true\nlog-format = 'xml'\n\
+                 [[rule.session-journal.replace]]\npattern = 'MANAGED_JOURNAL_PRIVATE_MARKER'\nreplacement = 'REDACTED_JOURNAL_MARKER'",
+            ).unwrap();
+            workspace.window_settings.session_journal.directory =
+                scratch.0.join("journals").to_str().unwrap().into();
+            let (owner, _) = workspace.open_window(false);
+            let grid = crate::session::GridSize::default();
+            let shell =
+                crate::session::Session::start(grid, kortty_terminal::TerminalProfile::Xterm)
+                    .unwrap();
+            let session = workspace.store_session(shell, grid, 14);
+            workspace.add_tab(owner, session);
+            let active = workspace.active_tab_mut(owner).unwrap();
+            active.incognito = incognito;
+            let tab = active.id;
+            let pane = workspace.sessions.get_mut(&session).unwrap();
+            wait(|| pane.session.journal_available());
+            pane.frame = pane.session.frame();
+            pane.journal_config.capture_input = true;
+            assert!(!pane.journal_config.auto_start);
+
+            let _ = workspace.reconcile_journal_sources();
+            let entry = &workspace.journal_captures[&tab];
+            let run = entry.run;
+            assert_eq!(entry.capture_input, !incognito);
+            assert_eq!(entry.without_ai, incognito);
+            let Phase::Starting(_, startup) = &entry.phase else {
+                panic!("required journal did not start");
+            };
+            wait(|| startup.done.is_closed());
+            let attach = workspace.update_journal_capture(Message::Started(tab, run));
+            deliver_journal_attachment(&mut workspace, attach);
+            assert!(!workspace.journal_toggle_enabled(owner));
+            let _ = workspace.update_journal_capture(Message::Toggle(owner, tab));
+            let capture = workspace.journal_captures[&tab]
+                .recording()
+                .unwrap()
+                .clone();
+            assert_eq!(workspace.active_dock_journal(owner).is_none(), incognito);
+            assert!(!workspace.sessions[&session].journal_config.auto_start);
+
+            let shell = &workspace.sessions[&session].session;
+            shell
+                .send(b"echo MANAGED_JOURNAL_PRIVATE_MARKER\rexit\r".to_vec())
+                .unwrap();
+            wait(|| shell.frame().status != crate::session::Status::Running);
+            let _ = workspace.update(Desktop::SessionUpdate(session));
+            wait(|| capture.done().is_closed());
+            let page = ViewerSource::capture(&capture)
+                .capture_page(None, None, None)
+                .unwrap();
+            assert!(page.status.notice().is_none(), "{page:?}");
+            assert!(
+                page.records.iter().any(|record| {
+                    record.kind == crate::session_journal::CaptureKind::Output
+                        && record.text.contains("REDACTED_JOURNAL_MARKER")
+                }),
+                "{page:?}"
+            );
+            assert!(
+                page.records.iter().all(|record| {
+                    !record.text.contains("MANAGED_JOURNAL_PRIVATE_MARKER")
+                        && (!incognito
+                            || record.kind == crate::session_journal::CaptureKind::Output
+                            || (record.kind == crate::session_journal::CaptureKind::Note
+                                && record.text == "isolation: none"))
+                }),
+                "{page:?}"
+            );
+            let _ = workspace.sessions[&session].session.stop().recv_blocking();
+        }
     }
 
     #[test]
@@ -2119,7 +2365,14 @@ mod tests {
         wait(|| startup.done.is_closed());
         // Test doubles for Iced completion delivery, using a real session and capture.
         let _ = workspace.update_journal_capture(Message::Started(tab, run));
-        let _ = workspace.update_journal_capture(Message::Attached(tab, run, session, Ok(())));
+        let generation = workspace.sessions[&session].stream_generation;
+        let _ = workspace.update_journal_capture(Message::Attached(
+            tab,
+            run,
+            session,
+            generation,
+            Ok(()),
+        ));
         assert!(workspace.dock_note_enabled(owner, tab, run));
         let _ = workspace
             .update_journal_capture(Message::AutomaticScreenshotAi(owner, tab, run, false));
@@ -2212,6 +2465,7 @@ mod tests {
                 automatic_screenshot_ai_disabled: false,
                 without_ai: false,
                 automatic: None,
+                reconnect: None,
                 capture_input: false,
             },
         );

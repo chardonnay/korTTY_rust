@@ -9,7 +9,7 @@ use roxmltree::Node;
 use crate::private_files::Directory;
 use crate::sftp_window::LocalSource;
 
-use super::capture::{ContentMatch, content_match};
+use super::capture::{ContentMatch, MAX_CAPTURE_BYTES, content_match};
 use super::deletion::DeletionIdentity;
 use super::tree::{Filter, matches_metadata};
 use super::{
@@ -17,8 +17,6 @@ use super::{
     child, document_id, entries, invalid, number, open_document, parse_document, scalar_text,
     source_text,
 };
-
-const MAX_SEARCH_LOG_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Default)]
 pub(crate) struct SearchResult {
@@ -48,7 +46,7 @@ pub(crate) fn scan(
         normalized_query,
         Budget {
             xml: MAX_CATALOG_BYTES,
-            log: MAX_SEARCH_LOG_BYTES,
+            log: MAX_CAPTURE_BYTES,
         },
         cancelled,
     )

@@ -16,6 +16,7 @@ use super::*;
 const HOME_MARKER: &str = "KORTTY_ISOLATION_RECONNECT_TEST_HOME";
 const TEST: &str = "workspace::ssh_access::tests::native_isolation_reconnect::openssh_reconnect_keeps_saved_and_teamwork_isolation";
 const PROJECT_TEMPORARY_KEY_TEST: &str = "workspace::ssh_access::tests::native_isolation_reconnect::openssh_project_reconnect_checks_saved_temporary_key";
+const REQUIRED_JOURNAL_TEST: &str = "workspace::ssh_access::tests::native_isolation_reconnect::openssh_incognito_terminal_enforces_masked_journal";
 
 fn fixture_profile(test: &str) -> Option<PathBuf> {
     let Some(home) = std::env::var_os(HOME_MARKER).map(PathBuf::from) else {
@@ -137,7 +138,7 @@ fn openssh_reconnect_keeps_saved_and_teamwork_isolation() {
             tab: tab.id,
             source,
         };
-        wait_for_output(&workspace.sessions[&source].session);
+        wait_for_output(&workspace.sessions[&source].session, "isolation-wire-ready");
         assert_eq!(workspace.sessions[&source].teamwork_ssh.is_some(), shared);
 
         if shared {
@@ -171,7 +172,7 @@ fn openssh_reconnect_keeps_saved_and_teamwork_isolation() {
             IsolationLevel::Process
         );
         assert_eq!(pane.teamwork_ssh.is_some(), shared);
-        wait_for_output(&pane.session);
+        wait_for_output(&pane.session, "isolation-wire-ready");
         workspace.stop_session(replacement);
         for shutdown in std::mem::take(&mut workspace.pending_shutdown) {
             let _ = shutdown.recv_blocking();
@@ -180,6 +181,225 @@ fn openssh_reconnect_keeps_saved_and_teamwork_isolation() {
             let log = server.join().unwrap();
             assert!(String::from_utf8_lossy(&log.stderr).contains("Accepted publickey"));
         }
+    }
+}
+
+#[test]
+#[ignore = "requires OpenSSH and KORTTY_SSH_TEST_EXE pointing to the built app"]
+fn openssh_incognito_terminal_enforces_masked_journal() {
+    use crate::session_journal::{CaptureKind, Status, viewer};
+    use crate::workspace::journal_capture_access::Message as Journal;
+
+    let Some(root) = fixture_profile(REQUIRED_JOURNAL_TEST) else {
+        return;
+    };
+    let peer = OpenSshFixture::new();
+    let client = peer.directory().join("client");
+    let endpoint = peer.request(client.clone()).target.endpoint;
+    let host = Endpoint::new(&endpoint.host, endpoint.port).unwrap();
+    let host_key = fs::read_to_string(peer.directory().join("host.pub")).unwrap();
+    let host_key = HostKey::from_openssh(host_key.trim()).unwrap();
+    crate::private_files::Directory::open(&root, true).unwrap();
+    assert_eq!(
+        trust_store().unwrap().remember(&host, &host_key).unwrap(),
+        HostKeyStatus::Known
+    );
+    let mut store = Store::open(crate::profile::connections_path().unwrap()).unwrap();
+    let id = store
+        .save(Connection {
+            id: 0,
+            name: "Managed journal fixture".into(),
+            tag: String::new(),
+            login: SavedLogin {
+                endpoint,
+                auth: Auth::KeyFile {
+                    path: client,
+                    passphrase: None,
+                },
+                keyboard_interactive: false,
+            },
+            jump: None,
+            emulation: PROFILE.term_name().into(),
+            tunnels: Vec::new(),
+            incognito: true,
+            isolation: IsolationLevel::None,
+            inherit_isolation: false,
+            startup: Default::default(),
+            logging: Default::default(),
+            terminal_effect: None,
+            command_timestamps: None,
+            tab_color: None,
+            paste_warning: None,
+            window_geometry: None,
+            terminal: Default::default(),
+        })
+        .unwrap();
+    let mut saved = store.get(id).unwrap().clone();
+    assert!(!saved.terminal.journal.auto_start);
+
+    let script = peer.directory().join("journal-fixture-shell");
+    fs::write(
+        &script,
+        "printf 'journal-wire-ready\\n'\nIFS= read -r line\nprintf 'MANAGED_SSH_FIXTURE_OUTPUT %s\\n' \"$line\"\nIFS= read -r line\n",
+    )
+    .unwrap();
+    let script = script.to_str().unwrap().replace('\'', "'\\''");
+    let force_shell = format!("PermitUserRC no\nForceCommand /bin/sh '{script}'\n");
+    let first = peer.serve_with_extra("host", &force_shell);
+    let mut workspace = Workspace::default();
+    workspace.set_test_ai_configuration(
+        serde_json::from_value(json!({"general": {"features_enabled": false}})).unwrap(),
+    );
+    workspace.clipboard.policy = crate::clipboard_policy::parse(
+        "[meta]\nschema-version = 1\n[[rule]]\n[rule.session-journal]\nenforced = true\n\
+         [[rule.session-journal.replace]]\npattern = 'MANAGED_SSH_FIXTURE_OUTPUT'\nreplacement = 'MASKED_SSH_FIXTURE_OUTPUT'",
+    ).unwrap();
+    workspace.window_settings.session_journal.directory =
+        root.join("journals").display().to_string();
+    let (owner, _) = workspace.open_window(false);
+    let _ = workspace.show_saved_ssh(owner, saved.clone(), false);
+    let dial = workspace.connect_ssh(owner);
+    finish_wire_attempt(&mut workspace, owner, dial, IsolationLevel::None);
+
+    let tab = workspace.windows[&owner].tab().unwrap();
+    assert!(tab.incognito);
+    let (tab_id, source) = (tab.id, tab.focused_session().unwrap());
+    let pane = workspace.sessions.get_mut(&source).unwrap();
+    wait_for_output(&pane.session, "journal-wire-ready");
+    assert!(pane.session.journal_available());
+    pane.frame = pane.session.frame();
+    let start = workspace.reconcile_journal_sources();
+    let mut events = task::into_stream(start).unwrap();
+    let Some(Action::Output(WorkspaceMessage::JournalCapture(started @ Journal::Started(..)))) =
+        block_on(events.next())
+    else {
+        panic!("the required SSH journal must start");
+    };
+    let attach_journal = |workspace: &mut Workspace, attach| {
+        let mut events = task::into_stream(attach).unwrap();
+        loop {
+            if let Action::Output(WorkspaceMessage::JournalCapture(attached)) =
+                block_on(events.next()).expect("SSH journal attachment")
+                && let Journal::Attached(_, _, _, _, result) = &attached
+            {
+                assert!(result.is_ok(), "{result:?}");
+                let _ = workspace.update_journal_capture(attached);
+                break;
+            }
+        }
+    };
+    let attach = workspace.update_journal_capture(started);
+    attach_journal(&mut workspace, attach);
+    let capture = workspace.journal_metadata_captures().pop().unwrap();
+    let _ = workspace.update_journal_capture(Journal::Toggle(owner, tab_id));
+    assert_eq!(capture.status(), Status::Recording);
+    assert!(workspace.active_dock_journal(owner).is_none());
+
+    let shell = &workspace.sessions[&source].session;
+    shell.send(b"before-reconnect\r".to_vec()).unwrap();
+    wait_for_output(shell, "MANAGED_SSH_FIXTURE_OUTPUT before-reconnect");
+    shell.send(b"disconnect\r".to_vec()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while shell.journal_available() {
+        assert!(
+            Instant::now() < deadline,
+            "the first SSH session is still active"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let pane = workspace.sessions.get_mut(&source).unwrap();
+    pane.frame = pane.session.frame();
+    let mut events = task::into_stream(workspace.reconcile_journal_sources()).unwrap();
+    let Some(Action::Output(WorkspaceMessage::JournalCapture(
+        retired @ Journal::SourceRetired(..),
+    ))) = block_on(events.next())
+    else {
+        panic!("the first SSH journal attachment must retire");
+    };
+    let _ = workspace.update_journal_capture(retired);
+    assert_eq!(capture.status(), Status::Recording);
+    assert!(!capture.done().is_closed());
+
+    saved.isolation = IsolationLevel::Process;
+    let mut store = Store::open(crate::profile::connections_path().unwrap()).unwrap();
+    assert_eq!(store.save(saved).unwrap(), id);
+    let next = peer.serve_with_extra("host", &force_shell);
+    let dial = workspace.start_ssh_reconnect(
+        owner,
+        ReconnectTarget {
+            tab: tab_id,
+            source,
+        },
+    );
+    finish_wire_attempt(&mut workspace, owner, dial, IsolationLevel::Process);
+    let attach = if let Some(candidate) = workspace.pending_reconnects.keys().next().copied() {
+        workspace.complete_test_reconnect(candidate)
+    } else {
+        workspace.reconcile_journal_sources()
+    };
+    let tab = workspace.windows[&owner].tab().unwrap();
+    assert_eq!(tab.id, tab_id);
+    let replacement = tab.focused_session().unwrap();
+    assert_ne!(replacement, source);
+    let shell = &workspace.sessions[&replacement].session;
+    wait_for_output(shell, "journal-wire-ready");
+    attach_journal(&mut workspace, attach);
+    let captures = workspace.journal_metadata_captures();
+    assert_eq!(captures.len(), 1);
+    assert!(std::sync::Arc::ptr_eq(&captures[0], &capture));
+    let shell = &workspace.sessions[&replacement].session;
+    shell.send(b"after-reconnect\r".to_vec()).unwrap();
+    wait_for_output(shell, "MANAGED_SSH_FIXTURE_OUTPUT after-reconnect");
+    workspace.stop_session(replacement);
+    let _ = workspace.reconcile_journal_sources();
+    for shutdown in std::mem::take(&mut workspace.pending_shutdown) {
+        let _ = shutdown.recv_blocking();
+    }
+    assert!(capture.done().is_closed());
+    let page = viewer::Source::capture(&capture)
+        .capture_page(None, None, None)
+        .unwrap();
+    assert!(page.status.notice().is_none(), "{page:?}");
+    let find = |kind, value: &str| {
+        let mut matches = page
+            .records
+            .iter()
+            .filter(|record| record.kind == kind && record.text == value);
+        let sequence = matches
+            .next()
+            .unwrap_or_else(|| panic!("{value}: {page:?}"))
+            .sequence;
+        assert!(matches.next().is_none(), "{value}: {page:?}");
+        sequence
+    };
+    let before = find(
+        CaptureKind::Output,
+        "MASKED_SSH_FIXTURE_OUTPUT before-reconnect",
+    );
+    let reconnected = find(CaptureKind::Note, "session reconnected");
+    let initial_isolation = find(CaptureKind::Note, "isolation: none");
+    let next_isolation = find(CaptureKind::Note, "isolation: process");
+    let after = find(
+        CaptureKind::Output,
+        "MASKED_SSH_FIXTURE_OUTPUT after-reconnect",
+    );
+    assert!(
+        initial_isolation < before
+            && before < reconnected
+            && reconnected < next_isolation
+            && next_isolation < after,
+        "{page:?}"
+    );
+    assert!(
+        page.records.iter().all(|record| matches!(
+            record.kind,
+            CaptureKind::Output | CaptureKind::Note
+        ) && !record.text.contains("MANAGED_SSH_FIXTURE_OUTPUT")),
+        "{page:?}"
+    );
+    for server in [first, next] {
+        let log = server.join().unwrap();
+        assert!(String::from_utf8_lossy(&log.stderr).contains("Accepted publickey"));
     }
 }
 
@@ -296,7 +516,10 @@ fn openssh_project_reconnect_checks_saved_temporary_key() {
     let replacement = tab.focused_session().unwrap();
     assert_eq!(tab.id, target.tab);
     assert_ne!(replacement, target.source);
-    wait_for_output(&workspace.sessions[&replacement].session);
+    wait_for_output(
+        &workspace.sessions[&replacement].session,
+        "isolation-wire-ready",
+    );
     assert!(workspace.project_attention_bar(owner).is_none());
     workspace.stop_session(replacement);
     for shutdown in std::mem::take(&mut workspace.pending_shutdown) {
@@ -427,7 +650,7 @@ fn finish_wire_attempt(
     let _ = workspace.update_ssh(Message::Dialed(window, id, response));
 }
 
-fn wait_for_output(session: &Session) {
+fn wait_for_output(session: &Session, marker: &str) {
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {
         let frame = session.frame();
@@ -437,7 +660,7 @@ fn wait_for_output(session: &Session) {
             .iter()
             .map(|cell| cell.text.as_str())
             .collect::<String>()
-            .contains("isolation-wire-ready")
+            .contains(marker)
         {
             return;
         }

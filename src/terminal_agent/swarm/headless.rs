@@ -254,6 +254,7 @@ mod tests {
         };
         let reference = ConnectionRef {
             teamwork: None,
+            temporary_keys: None,
             id: 3,
             target: login("target.example"),
             jump: Some(login("jump.example")),
@@ -297,6 +298,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let reference = ConnectionRef {
             teamwork: None,
+            temporary_keys: None,
             id: 3,
             target: LoginTarget {
                 host: "target.example.test".into(),
@@ -377,6 +379,7 @@ mod tests {
         let trust = TrustStore::from_pins(vec![(endpoint.clone(), pin)]).unwrap();
         let reference = ConnectionRef {
             teamwork: None,
+            temporary_keys: None,
             id: 1,
             target: LoginTarget {
                 host: endpoint.host().into(),

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 #[cfg(unix)]
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::ops::Range;
 
 use flate2::write::GzEncoder;
@@ -15,9 +15,8 @@ use crate::private_files::{Directory, EntryIdentity, FileStamp};
 use super::super::metadata::{require_single_link, xml_character};
 use super::super::replace::rule::Rule;
 use super::{
-    CaptureStatus, CaptureText, Compression, ContentReader, Format, MAX_DIRECTORY_NAMES,
-    MAX_LINE_BYTES, MAX_PART_BYTES, MAX_PARTS, PartEnvelope, PartLine, check_content_cancel,
-    invalid, parse_xml, zstandard,
+    CaptureStatus, CaptureText, Compression, ContentReader, Format, MAX_LINE_BYTES, MAX_PART_BYTES,
+    MAX_PARTS, PartEnvelope, PartLine, check_content_cancel, invalid, parse_xml, zstandard,
 };
 
 pub(in crate::session_journal) struct Part {
@@ -25,30 +24,32 @@ pub(in crate::session_journal) struct Part {
     identity: EntryIdentity,
 }
 
-#[derive(Clone, Copy)]
-pub(in crate::session_journal) enum Mode {
-    Preview { allow_open: bool },
-    Rewrite,
+pub(in crate::session_journal) struct Request<'a> {
+    pub(in crate::session_journal) journal_id: &'a str,
+    pub(in crate::session_journal) rule: &'a Rule,
+    pub(in crate::session_journal) cancelled: &'a dyn Fn() -> bool,
 }
 
 /// A replacement must account for every physical part, including unlisted new parts.
 pub(in crate::session_journal) fn inventory(
     directory: &Directory,
     declared: u32,
+    cancelled: &dyn Fn() -> bool,
 ) -> io::Result<Vec<Part>> {
     if declared > MAX_PARTS {
         return Err(invalid("Session journal capture exceeds the part limit"));
     }
     let mut parts = BTreeMap::new();
     let volume = directory.identity()?.0;
-    for name in directory.names(MAX_DIRECTORY_NAMES)? {
+    directory.visit_names(|name| {
+        check_content_cancel(cancelled)?;
         const PREFIX: &[u8] = b"session-log";
         if !name
             .as_encoded_bytes()
             .get(..PREFIX.len())
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(PREFIX))
         {
-            continue;
+            return Ok(());
         }
         let format = name
             .into_string()
@@ -68,7 +69,8 @@ pub(in crate::session_journal) fn inventory(
         {
             return Err(invalid("Duplicate session journal capture part"));
         }
-    }
+        Ok(())
+    })?;
     let expected = declared.max(parts.last_key_value().map_or(0, |(&number, _)| number));
     if parts.len() != expected as usize {
         return Err(invalid("Missing session journal capture part"));
@@ -92,90 +94,109 @@ impl Part {
         Ok(file)
     }
 
-    /// Reads an unchanged, single-link regular part without crossing filesystem boundaries.
-    pub(in crate::session_journal) fn read(
+    pub(in crate::session_journal) fn preview(
         &self,
         directory: &Directory,
         budget: &mut u64,
-    ) -> io::Result<(FileStamp, Zeroizing<Vec<u8>>)> {
+        request: &Request<'_>,
+        allow_open: bool,
+    ) -> io::Result<(FileStamp, u64)> {
+        self.scan(directory, budget, request, allow_open, &mut io::sink())
+    }
+
+    /// Streams into a private stage that the caller publishes only after validation.
+    pub(in crate::session_journal) fn rewrite(
+        &self,
+        directory: &Directory,
+        budget: &mut u64,
+        request: &Request<'_>,
+        output: &mut dyn Write,
+        staged_limit: u64,
+    ) -> io::Result<(FileStamp, u64)> {
+        let mut output = Encoded {
+            target: BufWriter::new(output),
+            remaining: staged_limit.min(MAX_PART_BYTES),
+            cancelled: request.cancelled,
+        };
+        let result = match self.format.compression {
+            Compression::Plain => self.scan(directory, budget, request, false, &mut output)?,
+            Compression::Gzip => {
+                let mut encoder = GzEncoder::new(&mut output, flate2::Compression::default());
+                let result = self.scan(directory, budget, request, false, &mut encoder)?;
+                encoder.finish()?;
+                result
+            }
+            Compression::Zstd => {
+                let mut encoder = zstandard::Encoder::new(&mut output);
+                let result = self.scan(directory, budget, request, false, &mut encoder)?;
+                encoder.finish()?;
+                result
+            }
+        };
+        check_content_cancel(request.cancelled)?;
+        output.flush()?;
+        Ok(result)
+    }
+
+    fn scan(
+        &self,
+        directory: &Directory,
+        budget: &mut u64,
+        request: &Request<'_>,
+        allow_open: bool,
+        output: &mut dyn Write,
+    ) -> io::Result<(FileStamp, u64)> {
+        let cancelled = request.cancelled;
+        check_content_cancel(cancelled)?;
         let file = self.checked_file(directory)?;
         let stamp = FileStamp::read(&file)?;
         let size = file.metadata()?.len();
         if size > (*budget).min(MAX_PART_BYTES) {
             return Err(part_limit());
         }
-        let mut raw = Zeroizing::new(Vec::new());
-        (&file).take(size + 1).read_to_end(&mut raw)?;
-        if raw.len() as u64 != size {
-            return Err(invalid("Session journal capture part changed"));
-        }
-        stamp.require_unchanged(&file)?;
-        stamp.require_unchanged(&self.checked_file(directory)?)?;
-        *budget -= size;
-        Ok((stamp, raw))
-    }
-
-    /// Counts changed physical records. Only a complete changed part produces output bytes.
-    pub(in crate::session_journal) fn rewrite(
-        &self,
-        raw: &[u8],
-        journal_id: &str,
-        rule: &Rule,
-        mode: Mode,
-        budget: &mut u64,
-        cancelled: &dyn Fn() -> bool,
-    ) -> io::Result<(u64, Option<Zeroizing<Vec<u8>>>)> {
-        if raw.len() as u64 > MAX_PART_BYTES {
-            return Err(part_limit());
-        }
-        let limit = (*budget).min(MAX_PART_BYTES);
-        let mut remaining = raw;
-        let mut scan = Scan::new(&self.format, journal_id, rule, limit);
-        let mut rewritten = matches!(mode, Mode::Rewrite).then(|| Zeroizing::new(Vec::new()));
+        let limit = (*budget - size).min(MAX_PART_BYTES);
+        let mut raw = (&file).take(size + 1);
+        let mut scan = Scan::new(&self.format, request.journal_id, request.rule, limit);
         {
             let decoded = self
                 .format
-                .decode(ContentReader::new(&mut remaining, cancelled), cancelled);
+                .decode(ContentReader::new(&mut raw, cancelled), cancelled);
             let mut reader = BufReader::new(ContentReader::new(decoded, cancelled).take(limit + 1));
             let mut line = Zeroizing::new(Vec::new());
             loop {
                 check_content_cancel(cancelled)?;
                 line.as_mut_slice().zeroize();
                 line.clear();
-                let size = (&mut reader)
+                let count = (&mut reader)
                     .take(MAX_LINE_BYTES + 1)
                     .read_until(b'\n', &mut line)?;
-                if size == 0 {
+                if count == 0 {
                     break;
                 }
                 let replacement = scan.line(&line)?;
-                if let Some(output) = &mut rewritten {
-                    let bytes = replacement
-                        .as_deref()
-                        .map_or(line.as_slice(), String::as_bytes);
-                    output.extend_from_slice(bytes);
-                }
+                let bytes = replacement
+                    .as_deref()
+                    .map_or(line.as_slice(), String::as_bytes);
+                output.write_all(bytes)?;
             }
         }
         check_content_cancel(cancelled)?;
-        if !remaining.is_empty() {
+        if raw.limit() != 1 {
             return Err(invalid(
-                "Unread data after the session journal capture stream",
+                "Session journal capture part changed or was incompletely decoded",
             ));
         }
         let mut status = CaptureStatus::default();
         scan.envelope.finish(&mut status)?;
-        if status.unclosed_parts != 0 && !matches!(mode, Mode::Preview { allow_open: true }) {
+        if status.unclosed_parts != 0 && !allow_open {
             return Err(invalid(
                 "Session journal capture part is still open or truncated",
             ));
         }
-        let rewritten = rewritten
-            .filter(|_| scan.changed != 0)
-            .map(|output| encode(self.format.compression, output, cancelled))
-            .transpose()?;
-        *budget -= scan.read.max(scan.written);
-        Ok((scan.changed, rewritten))
+        stamp.require_unchanged(&file)?;
+        stamp.require_unchanged(&self.checked_file(directory)?)?;
+        *budget -= size + scan.read.max(scan.written);
+        Ok((stamp, scan.changed))
     }
 }
 
@@ -424,46 +445,9 @@ fn part_limit() -> io::Error {
     invalid("Session journal capture part exceeds the replacement size limit")
 }
 
-fn encode(
-    compression: Compression,
-    bytes: Zeroizing<Vec<u8>>,
-    cancelled: &dyn Fn() -> bool,
-) -> io::Result<Zeroizing<Vec<u8>>> {
-    let mut output = Encoded {
-        bytes: Zeroizing::new(Vec::new()),
-        cancelled,
-    };
-    match compression {
-        Compression::Plain => return Ok(bytes),
-        Compression::Gzip => {
-            let mut encoder = GzEncoder::new(&mut output, flate2::Compression::default());
-            write_chunks(&mut encoder, &bytes, cancelled)?;
-            encoder.finish()?;
-        }
-        Compression::Zstd => {
-            let mut encoder = zstandard::Encoder::new(&mut output);
-            write_chunks(&mut encoder, &bytes, cancelled)?;
-            encoder.finish()?;
-        }
-    }
-    check_content_cancel(cancelled)?;
-    Ok(output.bytes)
-}
-
-fn write_chunks(
-    output: &mut impl Write,
-    bytes: &[u8],
-    cancelled: &dyn Fn() -> bool,
-) -> io::Result<()> {
-    for chunk in bytes.chunks(256 * 1024) {
-        check_content_cancel(cancelled)?;
-        output.write_all(chunk)?;
-    }
-    Ok(())
-}
-
 struct Encoded<'a> {
-    bytes: Zeroizing<Vec<u8>>,
+    target: BufWriter<&'a mut dyn Write>,
+    remaining: u64,
     cancelled: &'a dyn Fn() -> bool,
 }
 
@@ -471,15 +455,16 @@ impl Write for Encoded<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         // Write::write_all retries Interrupted, so cancellation must terminate that loop.
         check_content_cancel(self.cancelled).map_err(io::Error::other)?;
-        if (self.bytes.len() + bytes.len()) as u64 > MAX_PART_BYTES {
+        if bytes.len() as u64 > self.remaining {
             return Err(part_limit());
         }
-        self.bytes.extend_from_slice(bytes);
-        Ok(bytes.len())
+        let size = self.target.write(bytes)?;
+        self.remaining -= size as u64;
+        Ok(size)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        self.target.flush()
     }
 }
 

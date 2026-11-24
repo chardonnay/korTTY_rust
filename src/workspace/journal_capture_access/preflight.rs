@@ -6,7 +6,11 @@ impl Workspace {
         &self,
         tab: u64,
     ) -> Option<(ProbeTarget, crate::session_journal::ConnectionConfig)> {
-        let (session, pane) = self.journal_source(self.journal_tab(tab)?)?;
+        let tab = self.journal_tab(tab)?;
+        if tab.incognito {
+            return None;
+        }
+        let (session, pane) = self.journal_source(tab)?;
         Some((
             ProbeTarget {
                 session,
@@ -52,6 +56,7 @@ impl Workspace {
         Some(JournalProbeView {
             ticket: start.ticket,
             automatic,
+            can_cancel: !automatic || !self.journal_required(),
             status,
         })
     }
@@ -224,6 +229,9 @@ impl Workspace {
             return Task::none();
         };
         let run = start.capture_run;
+        if choice == ProbeChoice::Cancel && run.is_some() && self.journal_required() {
+            return Task::none();
+        }
         let Some((target, config)) = self
             .journal_probe_target(tab)
             .filter(|(target, _)| *target == start.target)

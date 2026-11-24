@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use crate::connection_store::teamwork::{
     self, DefaultAuth, Entry, Identity, Origin, ReviewedRoute, SourceKind,
 };
-use crate::connection_store::{Connection, SavedLogin, Store};
+use crate::connection_store::{Auth, Connection, SavedLogin, Store};
 use crate::ssh_dialog::LoginTarget;
 
 pub(crate) const MAX_TARGETS: usize = 8;
@@ -434,6 +434,8 @@ pub struct ConnectionRef {
     pub jump: Option<LoginTarget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) teamwork: Option<Box<SharedBinding>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) temporary_keys: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -500,11 +502,23 @@ fn shared_id(identity: &Identity) -> u64 {
 
 impl From<&Connection> for ConnectionRef {
     fn from(profile: &Connection) -> Self {
+        fn temporary(login: &SavedLogin) -> Option<&SavedLogin> {
+            matches!(login.auth, Auth::TemporaryKey { .. }).then_some(login)
+        }
+        let target_key = temporary(&profile.login);
+        let jump_key = profile.jump.as_ref().and_then(temporary);
+        let temporary_keys = (target_key.is_some() || jump_key.is_some()).then(|| {
+            let mut hash = Sha256::new();
+            hash.update(b"kortty scheduler temporary SSH keys\0");
+            hash.update(serde_json::to_vec(&(target_key, jump_key)).expect("temporary SSH route"));
+            hash.finalize().into()
+        });
         Self {
             id: profile.id,
             target: profile.login.endpoint.clone(),
             jump: profile.jump.as_ref().map(|login| login.endpoint.clone()),
             teamwork: None,
+            temporary_keys,
         }
     }
 }
@@ -553,6 +567,7 @@ impl ConnectionRef {
                 pin,
                 jump,
             })),
+            temporary_keys: None,
         }
     }
 
@@ -721,7 +736,8 @@ impl ConnectionRef {
     pub(super) fn validate(&self) -> Result<(), &'static str> {
         if let Some(binding) = &self.teamwork {
             let endpoint = binding.route.endpoint();
-            if self.id != shared_id(binding.route.identity())
+            if self.temporary_keys.is_some()
+                || self.id != shared_id(binding.route.identity())
                 || endpoint.host != self.target.host
                 || endpoint.port != self.target.port
                 || binding.route.jump() != self.jump.as_ref()
@@ -777,6 +793,9 @@ impl fmt::Display for ConnectionChoice {
             Self::Manual => formatter.write_str("Manual SSH endpoint and key file"),
             Self::Saved { name, reference } => {
                 write!(formatter, "{name} ({})", reference.target.label())?;
+                if reference.temporary_keys.is_some() {
+                    formatter.write_str(" · temporary SSH key")?;
+                }
                 if let Some(binding) = &reference.teamwork {
                     if let Some(jump) = &reference.jump {
                         write!(formatter, " via {}", jump.label())?;

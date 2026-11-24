@@ -586,6 +586,7 @@ mod tests {
             let plan = Plan::new(settings, run, Policy::default());
             let reference = ConnectionRef {
                 teamwork: None,
+                temporary_keys: None,
                 id: 9,
                 target: LoginTarget {
                     host: "fixture.example".into(),
@@ -604,6 +605,7 @@ mod tests {
                 &plan,
                 &ConnectionRef {
                     teamwork: None,
+                    temporary_keys: None,
                     id: 10,
                     ..reference
                 },

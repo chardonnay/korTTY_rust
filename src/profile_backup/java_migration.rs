@@ -829,6 +829,19 @@ pub(super) fn convert(
                 "invalid or unsupported tunnels omitted",
             );
             report.note_count(
+                preview.skipped_logging,
+                "invalid Java terminal logging settings omitted",
+            );
+            let logging_reviews = preview
+                .entries()
+                .filter(|(connection, _)| connection.logging.java_review().is_some())
+                .count();
+            if logging_reviews != 0 {
+                report.entries.push(format!(
+                    "Java terminal logging to review in Connection Manager ({logging_reviews})"
+                ));
+            }
+            report.note_count(
                 matched,
                 "Java connection AI assignments require review in Connection Manager",
             );

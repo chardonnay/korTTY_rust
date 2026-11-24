@@ -19,6 +19,8 @@ use crate::session_journal::{
 };
 use crate::terminal_logging::{Policy, RedactionSecrets, Redactor};
 
+use super::{JournalAttachStart, JournalIsolation};
+
 const SEED_BUDGET: Duration = Duration::from_millis(32);
 const OUTPUT_BUDGET: Duration = Duration::from_millis(8);
 const MAX_METADATA_BYTES: usize = 4096;
@@ -58,7 +60,7 @@ pub(super) enum Command {
         id: u64,
         sink: Sink,
         policy: Policy,
-        seed: bool,
+        start: JournalAttachStart,
         capture_input: bool,
         reply: Sender<io::Result<()>>,
     },
@@ -121,11 +123,11 @@ impl Actor {
                 id,
                 sink,
                 policy,
-                seed,
+                start,
                 capture_input,
                 reply,
             } => {
-                let result = self.attach(terminal, id, sink, policy, seed, capture_input);
+                let result = self.attach(terminal, id, sink, policy, start, capture_input);
                 if result.is_ok() {
                     self.bind_existing_prompt(prompt);
                 }
@@ -146,13 +148,12 @@ impl Actor {
         id: u64,
         sink: Sink,
         policy: Policy,
-        seed: bool,
+        start: JournalAttachStart,
         capture_input: bool,
     ) -> io::Result<()> {
         let secrets = self
             .secrets
             .as_ref()
-            .filter(|_| terminal.supports_journal_output())
             .ok_or_else(|| io::Error::other("Session journal capture is unavailable."))?;
         if self.active.is_some() {
             return Err(io::Error::other(
@@ -165,13 +166,40 @@ impl Actor {
             prompt: None,
         });
         let redact = Redactor::for_journal(secrets.clone(), policy);
-        if seed {
-            let (lines, omitted) = seed_lines(terminal, &redact);
-            if !lines.is_empty() || omitted != 0 {
-                sink.try_seed_batch(lines, omitted).map_err(|_| {
-                    io::Error::other("Could not queue the session journal scrollback.")
-                })?;
+        match start {
+            JournalAttachStart::Seeded => {
+                let (lines, omitted) = seed_lines(terminal, &redact);
+                if !lines.is_empty() || omitted != 0 {
+                    sink.try_seed_batch(lines, omitted).map_err(|_| {
+                        io::Error::other("Could not queue the session journal scrollback.")
+                    })?;
+                }
             }
+            JournalAttachStart::Connected(isolation)
+            | JournalAttachStart::Reconnected(isolation) => {
+                if matches!(start, JournalAttachStart::Reconnected(_)) {
+                    sink.try_write(
+                        RecordKind::SystemNote,
+                        Zeroizing::new("session reconnected".into()),
+                        false,
+                    )
+                    .map_err(|_| {
+                        io::Error::other("Could not queue the session journal reconnect marker.")
+                    })?;
+                }
+                let note = match isolation {
+                    JournalIsolation::None => "isolation: none".into(),
+                    JournalIsolation::Process => "isolation: process".into(),
+                    JournalIsolation::Sandboxed(backend) => {
+                        format!("isolation: sandboxed ({backend})")
+                    }
+                };
+                sink.try_write(RecordKind::SystemNote, Zeroizing::new(note), false)
+                    .map_err(|_| {
+                        io::Error::other("Could not queue the session journal isolation status.")
+                    })?;
+            }
+            JournalAttachStart::Live => {}
         }
         terminal.set_journal_observer(Some(journal_output_observer(
             sink.clone(),

@@ -100,7 +100,16 @@ pub(in crate::workspace) fn popover<'a, Message: Clone + 'a>(
     contents: Option<Element<'a, Message>>,
     dismiss: Message,
 ) -> Element<'a, Message> {
-    interactive_popover(trigger, contents, dismiss, false)
+    interactive_popover(trigger, contents, dismiss, false, |_, _| None)
+}
+
+pub(crate) fn popover_with_keyboard<'a, Message: Clone + 'a>(
+    trigger: Element<'a, Message>,
+    contents: Option<Element<'a, Message>>,
+    dismiss: Message,
+    keyboard: impl Fn(&Key, Modifiers) -> Option<Message> + 'a,
+) -> Element<'a, Message> {
+    interactive_popover(trigger, contents, dismiss, false, keyboard)
 }
 
 /// An option list can dismiss itself while letting the parent handle the same outside click.
@@ -109,7 +118,7 @@ pub(in crate::workspace) fn popover_options<'a, Message: Clone + 'a>(
     contents: Option<Element<'a, Message>>,
     dismiss: Message,
 ) -> Element<'a, Message> {
-    interactive_popover(trigger, contents, dismiss, true)
+    interactive_popover(trigger, contents, dismiss, true, |_, _| None)
 }
 
 /// Opens a context menu at the right-click position within its trigger.
@@ -159,6 +168,7 @@ fn interactive_popover<'a, Message: Clone + 'a>(
     contents: Option<Element<'a, Message>>,
     dismiss: Message,
     nested: bool,
+    keyboard: impl Fn(&Key, Modifiers) -> Option<Message> + 'a,
 ) -> Element<'a, Message> {
     Element::new(Anchor {
         trigger,
@@ -170,8 +180,12 @@ fn interactive_popover<'a, Message: Clone + 'a>(
                 placement: Placement::Popover { nested },
                 commands: Some(Commands {
                     dismiss,
-                    keyboard: Box::new(move |key, _| {
-                        (key == &Key::Named(Named::Escape)).then(|| escape.clone())
+                    keyboard: Box::new(move |key, modifiers| {
+                        if *key == Key::Named(Named::Escape) {
+                            Some(escape.clone())
+                        } else {
+                            keyboard(key, modifiers)
+                        }
                     }),
                     forward_input: true,
                 }),

@@ -256,6 +256,7 @@ pub(crate) use local::retrieval::{
 };
 pub(crate) use memory::Scope;
 pub(crate) use memory::checked_reference_text;
+pub(crate) use memory::connection as connection_memory;
 pub(crate) use memory::learning::{
     MAX_RULE_CHARACTERS, RuleProposal, SavedRule, normalized_length as rule_normalized_length,
     preview as review_memory_rule,
@@ -265,8 +266,9 @@ pub(crate) use memory::prompt::{MemoryPrompt, Origin as MemoryOrigin};
 pub(crate) use profiles::Message as ProfileMessageForTest;
 pub(crate) use skills::statistics::Surface as SkillUsageSurface;
 pub(crate) use skills::{
-    Options as SkillRuleOptions, SavedSkillRule, SkillCandidate, SkillGuidance, SkillRuleProposal,
-    SkillRuleTarget, SkillSelection, SkillUsageReceipt,
+    ConnectionChoice as ConnectionSkillChoice, Options as SkillRuleOptions, SavedSkillRule,
+    SkillCandidate, SkillGuidance, SkillRuleProposal, SkillRuleTarget, SkillSelection,
+    SkillUsageReceipt,
 };
 
 pub(crate) fn shutdown_skill_statistics() {
@@ -1396,6 +1398,10 @@ impl Configuration {
 
     pub(crate) fn connection_skill_choices(&self) -> Vec<(u64, String)> {
         self.skills.choices()
+    }
+
+    pub(crate) fn connection_editor_skill_choices(&self) -> Vec<ConnectionSkillChoice<'_>> {
+        self.skills.connection_editor_choices()
     }
 
     pub(crate) fn snippet_skill_choices(&self) -> Vec<(u64, String)> {
@@ -3994,15 +4000,9 @@ impl Dialog {
                     self.editable() && self.profile_form_lock().is_none(),
                 )
             }
-            search::Target::Setting(search::Setting::Knowledge(setting))
-                if setting.needs_store() =>
-            {
-                self.local.can_reveal_knowledge_setting(
-                    &self.local_state,
-                    self.profiles.catalog(),
-                    setting,
-                )
-            }
+            search::Target::Setting(search::Setting::Knowledge(setting)) => self
+                .local
+                .can_reveal_knowledge_setting(&self.local_state, self.profiles.catalog(), setting),
             search::Target::Setting(search::Setting::Hub(setting)) => self
                 .local
                 .can_reveal_hub_setting(setting, self.editable() && self.general.features_enabled),
@@ -4099,6 +4099,7 @@ impl Dialog {
             ) => true,
             search::Target::Setting(search::Setting::Knowledge(setting)) => {
                 setting.needs_active_review()
+                    || matches!(setting, search::KnowledgeSetting::Inventory(_))
             }
             search::Target::Setting(search::Setting::Control(control)) => {
                 control.contextual_memory()
@@ -4179,6 +4180,14 @@ impl Dialog {
                 iced::widget::operation::RelativeOffset::START,
             ),
         };
+        if matches!(
+            self.revealed.setting,
+            Some(search::Setting::Knowledge(
+                search::KnowledgeSetting::Inventory(_)
+            ))
+        ) {
+            return scroll;
+        }
         if let Some(search::Setting::Managed(setting)) = self.revealed.setting {
             let load = self.local.reveal_managed_setting(setting, self.editable());
             return Task::batch([scroll, load.map(Message::Local)]);

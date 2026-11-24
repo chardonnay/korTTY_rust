@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 
-use iced::widget::{button, column, row, scrollable, text, text_input};
+use iced::widget::{button, column, container, row, scrollable, text, text_input};
 use iced::{Element, Length, Task, window};
 use kortty_jobs::{
     MAX_SWARM_QUESTION_BYTES, MAX_SWARM_TARGET_DETAIL_BYTES, RunOutcome, SwarmReport,
@@ -18,6 +18,7 @@ use crate::ai_manager::{Configuration, ProfileRef};
 use crate::terminal_agent::swarm::headless::Review as RouteReview;
 use crate::terminal_agent::swarm::report::{self, Format};
 use crate::terminal_logging::{Redactor, Secrets};
+use crate::workspace::chat_appearance::Palette;
 use crate::workspace::saved_chats::swarm::{self as store, Record};
 
 use super::{
@@ -271,7 +272,7 @@ impl Conversation {
             .collect()
     }
 
-    pub(super) fn history(&self, show_status: bool) -> Element<'_, Message> {
+    pub(super) fn history(&self, show_status: bool, palette: Palette) -> Element<'_, Message> {
         if self.record.is_draft() {
             return column![
                 text(self.record.title()).size(22),
@@ -296,7 +297,15 @@ impl Conversation {
             if searching && matches.get(current) != Some(&index) {
                 continue;
             }
-            history = history.push(text(&turn.question).size(15));
+            history = history.push(
+                container(
+                    container(text(&turn.question).size(15))
+                        .padding([8, 12])
+                        .style(move |_| palette.user()),
+                )
+                .align_x(iced::alignment::Horizontal::Right)
+                .width(Length::Fill),
+            );
             for target in &turn.targets {
                 history = history
                     .push(
@@ -305,7 +314,8 @@ impl Conversation {
                             target.label,
                             outcome_label(target.outcome)
                         ))
-                        .size(13),
+                        .size(13)
+                        .color(palette.accent.color()),
                     )
                     .push(text(&target.detail).size(13));
                 if let Some(route) = turn
@@ -326,8 +336,13 @@ impl Conversation {
             }
             if let Some(comparison) = &turn.comparison {
                 history = history
-                    .push(text("AI comparison").size(14))
-                    .push(text(comparison).font(iced::Font::MONOSPACE).size(13));
+                    .push(text("AI comparison").size(14).color(palette.accent.color()))
+                    .push(
+                        container(text(comparison).font(iced::Font::MONOSPACE).size(13))
+                            .padding(8)
+                            .width(Length::Fill)
+                            .style(move |_| palette.code()),
+                    );
             }
         }
         column![
@@ -344,7 +359,8 @@ impl Conversation {
                 }).size(13)),
             ].spacing(6).wrap(),
             status,
-            scrollable(history).height(Length::Fixed(165.0)),
+            scrollable(history).height(Length::Fixed(165.0))
+                .style(move |theme, status| palette.scroll(theme, status)),
             text("Saved history stays here. A follow-up sends a fresh question with the current target context after you review it.").size(13),
             text("A completed follow-up saves the masked question and final target summaries.").size(13),
         ].spacing(6).into()

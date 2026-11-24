@@ -325,7 +325,11 @@ impl StartupFields {
         }
     }
 
-    pub(crate) fn keepalive_view(&self, label_width: f32) -> Element<'_, KeepAliveEdit> {
+    pub(crate) fn keepalive_view(
+        &self,
+        label_width: f32,
+        picker_id: widget::Id,
+    ) -> Element<'_, KeepAliveEdit> {
         let modes = [
             KeepAliveMode(None),
             KeepAliveMode(Some(true)),
@@ -336,6 +340,7 @@ impl StartupFields {
                 label_width,
                 "SSH keepalive",
                 pick_list(modes, Some(self.keepalive), KeepAliveEdit::Mode)
+                    .keyboard_navigation(picker_id)
             ),
             self.keepalive.0.is_some().then(|| labeled(
                 label_width,
@@ -355,30 +360,64 @@ impl StartupFields {
     }
 
     pub(crate) fn view(&self, label_width: f32) -> Element<'_, (StartupField, String)> {
+        Self::startup_view(
+            label_width,
+            text_input("1–300", &self.seconds)
+                .width(72)
+                .on_input(|value| (StartupField::Timeout, value))
+                .into(),
+            text_input("0–20", &self.attempts)
+                .width(72)
+                .on_input(|value| (StartupField::Attempts, value))
+                .into(),
+        )
+    }
+
+    pub(crate) fn editor_view(&self, label_width: f32) -> Element<'_, (StartupField, String)> {
+        use crate::workspace::dialog_design::number_input;
+
+        let timeout = |value| (StartupField::Timeout, value);
+        let retry = |value| (StartupField::Attempts, value);
+        Self::startup_view(
+            label_width,
+            number_input(
+                text_input("1–300", &self.seconds).on_input(timeout),
+                &self.seconds,
+                1..=300,
+                1,
+                Some(timeout),
+                54.0,
+            ),
+            number_input(
+                text_input("0–20", &self.attempts).on_input(retry),
+                &self.attempts,
+                0..=20,
+                1,
+                Some(retry),
+                54.0,
+            ),
+        )
+    }
+
+    fn startup_view<'a>(
+        label_width: f32,
+        timeout: Element<'a, (StartupField, String)>,
+        attempts: Element<'a, (StartupField, String)>,
+    ) -> Element<'a, (StartupField, String)> {
         column![
             labeled(
                 label_width,
                 "Timeout",
-                row![
-                    text_input("1–300", &self.seconds)
-                        .width(72)
-                        .on_input(|value| (StartupField::Timeout, value)),
-                    text("seconds").size(13),
-                ]
-                .spacing(6)
-                .align_y(Alignment::Center)
+                row![timeout, text("seconds").size(13),]
+                    .spacing(6)
+                    .align_y(Alignment::Center)
             ),
             labeled(
                 label_width,
                 "Connection attempts",
-                row![
-                    text_input("0–20", &self.attempts)
-                        .width(72)
-                        .on_input(|value| (StartupField::Attempts, value)),
-                    text("0 = no retries").size(13),
-                ]
-                .spacing(6)
-                .align_y(Alignment::Center)
+                row![attempts, text("0 = no retries").size(13),]
+                    .spacing(6)
+                    .align_y(Alignment::Center)
             ),
         ]
         .spacing(6)
@@ -550,8 +589,12 @@ impl SshDialog {
         self.logging.config()
     }
 
-    pub(crate) fn logging_view(&self, eligible: bool) -> Element<'_, Message> {
-        self.logging.view(eligible, false).map(Message::Logging)
+    pub(crate) fn logging_form(&self) -> &crate::terminal_logging::Form {
+        &self.logging
+    }
+
+    pub(crate) fn logging_form_mut(&mut self) -> &mut crate::terminal_logging::Form {
+        &mut self.logging
     }
 
     pub(crate) fn with_isolation(
@@ -790,7 +833,7 @@ impl SshDialog {
         }
         content = content.push(self.options_view(INLINE_LABEL_WIDTH, keys));
         if !sftp {
-            content = content.push(self.logging_view(logging_allowed));
+            content = content.push(self.logging.view(logging_allowed).map(Message::Logging));
         }
         let mut controls = row![
             button("Connect").on_press_maybe(can_connect.then_some(Message::Connect)),

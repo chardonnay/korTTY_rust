@@ -412,7 +412,8 @@ where
             cursor.x = x;
         }
 
-        let line_height = self.line_height.to_absolute(
+        let line_height = iced_tiny_skia::font_scale::line_height(
+            self.line_height,
             self.text_size.unwrap_or_else(|| renderer.default_size()),
         );
 
@@ -1143,7 +1144,7 @@ where
         let horizontal = self.horizontal_viewport(state, &internal.editor, text_bounds.width);
         let origin = text_bounds.position() - Vector::new(horizontal.offset, 0.0);
         let text_size = self.text_size.unwrap_or_else(|| renderer.default_size());
-        let line_height = f32::from(self.line_height.to_absolute(text_size));
+        let line_height = f32::from(iced_tiny_skia::font_scale::line_height(self.line_height, text_size));
         let inline = self.inline_suggestion.and_then(|suggestion| {
             if !state.focus.as_ref().is_some_and(|focus| focus.is_window_focused) {
                 return None;
@@ -1259,10 +1260,10 @@ where
                             position + translation,
                             Size::new(
                                 1.0,
-                                self.line_height
-                                    .to_absolute(self.text_size.unwrap_or_else(
-                                        || renderer.default_size(),
-                                    ))
+                                iced_tiny_skia::font_scale::line_height(
+                                    self.line_height,
+                                    self.text_size.unwrap_or_else(|| renderer.default_size()),
+                                )
                                     .into(),
                             ),
                         );

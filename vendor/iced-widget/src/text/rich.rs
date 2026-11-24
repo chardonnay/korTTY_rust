@@ -311,10 +311,10 @@ where
                         .or(self.size)
                         .unwrap_or(renderer.default_size());
 
-                    let line_height = span
-                        .line_height
-                        .unwrap_or(self.line_height)
-                        .to_absolute(size);
+                    let line_height = iced_tiny_skia::font_scale::line_height(
+                        span.line_height.unwrap_or(self.line_height),
+                        size,
+                    );
 
                     let color = span
                         .color

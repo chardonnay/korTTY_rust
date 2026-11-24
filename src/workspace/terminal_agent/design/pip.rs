@@ -207,7 +207,9 @@ pub(super) fn decorate<'a>(
     };
     surface::view(
         terminal,
-        view.map(move |message| Desktop::TerminalAgent(id, message)),
+        crate::workspace::ui_font_scale::unscaled(
+            view.map(move |message| Desktop::TerminalAgent(id, message)),
+        ),
         id,
         panel.corner,
         if panel.hidden {

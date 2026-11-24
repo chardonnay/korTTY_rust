@@ -208,6 +208,12 @@ pub(super) struct Preferences {
     pub(super) design: Option<Design>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) animations: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) chat_color_profile: Option<super::chat_appearance::Profile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) ui_font_scale_percent: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) ui_font_scale_auto: Option<bool>,
 }
 
 fn read_design_id<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Design>, D::Error> {
@@ -396,6 +402,7 @@ mod tests {
         let disabled = Preferences {
             design: Some(Design::AmberCrt),
             animations: Some(false),
+            ..Preferences::default()
         };
         assert!(disabled.status_cursor::<()>(true).is_none());
         let now = Instant::now();

@@ -2,6 +2,8 @@
 
 use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use iced::{Size, Task, window};
 use kortty_pty::{LocalShell, validate_shell_integration};
@@ -121,6 +123,8 @@ pub enum Message {
     ShellIntegration(bool),
     AdHocLocal,
     Ssh(ssh_dialog::Message),
+    BrowseTerminalLogFolder,
+    TerminalLogFolderPicked(Arc<()>, Option<PathBuf>),
     TemporaryKeyPasted(u64, bool, ssh_dialog::Password),
     Serial(serial_dialog::Message),
     IbmAddress(String),
@@ -254,6 +258,7 @@ impl Dialog {
         } else {
             return false;
         }
+        self.ssh.logging_form_mut().cancel_folder_picker();
         self.save = false;
         self.name.clear();
         self.status = None;
@@ -578,6 +583,16 @@ impl Workspace {
         }
     }
 
+    fn quick_logging_available(&self, dialog: &Dialog) -> bool {
+        !dialog.saving
+            && dialog.section_visible(Section::Logging)
+            && self.clipboard.policy.problem.is_none()
+            && !dialog.selected_ssh_incognito()
+            && dialog.split.is_none_or(|target| {
+                self.split_connection_privacy(dialog.owner, target, false) == Ok(false)
+            })
+    }
+
     pub(super) fn update_quick_connect(
         &mut self,
         id: window::Id,
@@ -594,11 +609,20 @@ impl Workspace {
         let ai = self.ai_configuration();
         let themes = &self.window_settings.themes;
         let preferences = &self.window_settings.terminal_effects;
+        let logging_available = self
+            .quick_connect
+            .as_ref()
+            .is_some_and(|dialog| self.quick_logging_available(dialog));
         let Some(dialog) = self.quick_connect.as_mut().filter(|dialog| dialog.id == id) else {
             return Task::none();
         };
         let owner = dialog.owner;
-        if dialog.saving && !matches!(message, Message::Saved(_)) {
+        if dialog.saving
+            && !matches!(
+                message,
+                Message::Saved(_) | Message::TerminalLogFolderPicked(..)
+            )
+        {
             return Task::none();
         }
         dialog.set_temporary_key_enabled(temporary_key_enabled);
@@ -650,6 +674,9 @@ impl Workspace {
             }
             Message::GroupTab(group) if !split => {
                 dialog.group_tab = group;
+                if group {
+                    dialog.ssh.logging_form_mut().cancel_folder_picker();
+                }
                 dialog.set_temporary_key_enabled(temporary_key_enabled);
             }
             Message::Group(group) if !split && dialog.group_members(&group) > 0 => {
@@ -667,6 +694,7 @@ impl Workspace {
                 dialog.protocol = protocol;
                 dialog.set_temporary_key_enabled(temporary_key_enabled);
                 if changed {
+                    dialog.ssh.logging_form_mut().cancel_folder_picker();
                     dialog.reset_effect_draft();
                     dialog.reset_ai_draft();
                     dialog.reset_appearance_draft();
@@ -846,6 +874,40 @@ impl Workspace {
                     ssh_dialog::Password::default()
                 };
                 dialog.ssh.finish_temporary_key_paste(request, key);
+            }
+            Message::BrowseTerminalLogFolder if logging_available => {
+                let root = match profile::root() {
+                    Ok(root) => root,
+                    Err(error) => {
+                        dialog.status =
+                            Some(format!("Could not locate the log directory ({error})"));
+                        return Task::none();
+                    }
+                };
+                let Some((ticket, directory)) = dialog
+                    .ssh
+                    .logging_form_mut()
+                    .start_folder_picker(logging_available, &root)
+                else {
+                    return Task::none();
+                };
+                return crate::terminal_logging::pick_folder(id, directory).map(move |path| {
+                    wrap(id, Message::TerminalLogFolderPicked(ticket.clone(), path))
+                });
+            }
+            Message::TerminalLogFolderPicked(ticket, path) => {
+                let logging = dialog.ssh.logging_form_mut();
+                if let Some(edit) =
+                    logging.finish_folder_picker(&ticket, logging_available, path.as_deref())
+                {
+                    logging.update(edit);
+                }
+            }
+            Message::Ssh(ssh_dialog::Message::Logging(edit)) => {
+                let logging = dialog.ssh.logging_form_mut();
+                if logging.accepts_editor_edit(logging_available, &edit) {
+                    logging.update(edit);
+                }
             }
             Message::Ssh(message) => {
                 dialog.ssh.update(message);
@@ -1748,6 +1810,90 @@ mod tests {
         assert_eq!(
             workspace.window_settings.quick_connect_expanded_sections,
             Some(ExpandedSections::new())
+        );
+    }
+
+    #[test]
+    fn quick_terminal_log_folder_is_owned_and_only_updates_the_current_ssh_draft() {
+        use crate::terminal_logging::Edit;
+        use iced::futures::{StreamExt, executor::block_on};
+        use iced_runtime::{Action, task, window::Action as WindowAction};
+
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.show_quick_connect(owner);
+        let id = workspace.quick_connect_for_owner(owner).unwrap();
+        let edit = |edit| Message::Ssh(ssh_dialog::Message::Logging(edit));
+        let config = |workspace: &Workspace| {
+            workspace
+                .quick_connect
+                .as_ref()
+                .unwrap()
+                .ssh
+                .logging_config()
+                .unwrap()
+        };
+        let folder = std::env::temp_dir().join("quick-connect log fixture");
+        assert!(
+            task::into_stream(workspace.update_quick_connect(id, Message::BrowseTerminalLogFolder))
+                .is_none()
+        );
+        let _ =
+            workspace.update_quick_connect(id, edit(Edit::Folder(folder.to_str().unwrap().into())));
+        assert_eq!(config(&workspace).custom_folder(), None);
+
+        let _ = workspace.update_quick_connect(id, edit(Edit::Enabled(true)));
+        let mut open =
+            task::into_stream(workspace.update_quick_connect(id, Message::BrowseTerminalLogFolder))
+                .unwrap();
+        assert!(
+            matches!(block_on(open.next()), Some(Action::Window(WindowAction::Run(parent, _))) if parent == id)
+        );
+        assert!(
+            task::into_stream(workspace.update_quick_connect(id, Message::BrowseTerminalLogFolder))
+                .is_none()
+        );
+
+        let _ = workspace.update_quick_connect(id, Message::GroupTab(true));
+        let _ = workspace.update_quick_connect(id, Message::GroupTab(false));
+        let start = |workspace: &mut Workspace| {
+            workspace
+                .quick_connect
+                .as_mut()
+                .unwrap()
+                .ssh
+                .logging_form_mut()
+                .start_folder_picker(true, &std::env::temp_dir())
+                .unwrap()
+                .0
+        };
+        let stale = start(&mut workspace);
+        let _ = workspace.update_quick_connect(id, Message::Protocol(Protocol::Sftp));
+        let _ = workspace.update_quick_connect(id, Message::Protocol(Protocol::Ssh));
+        let ticket = start(&mut workspace);
+        let _ = workspace.update_quick_connect(
+            id,
+            Message::TerminalLogFolderPicked(stale, Some(folder.clone())),
+        );
+        assert_eq!(config(&workspace).custom_folder(), None);
+        let _ = workspace.update_quick_connect(id, Message::TerminalLogFolderPicked(ticket, None));
+
+        let ticket = start(&mut workspace);
+        let _ = workspace.update_quick_connect(
+            id,
+            Message::TerminalLogFolderPicked(ticket, Some(folder.clone())),
+        );
+        let _ = workspace.update_quick_connect(id, edit(Edit::Enabled(false)));
+        let disabled = config(&workspace);
+        assert!(!disabled.enabled());
+        assert_eq!(disabled.custom_folder(), Some(folder.as_path()));
+
+        workspace.quick_connect.as_mut().unwrap().selected_ssh = Some((0, true));
+        let _ = workspace.update_quick_connect(id, edit(Edit::Enabled(true)));
+        assert!(!config(&workspace).enabled());
+        assert!(
+            task::into_stream(workspace.update_quick_connect(id, Message::BrowseTerminalLogFolder))
+                .is_none()
         );
     }
 

@@ -14,6 +14,47 @@ use crate::terminal_logging::Secrets;
 use super::*;
 
 #[test]
+fn reconnect_marker_precedes_live_output_without_seeding_history() {
+    let profile = Profile::new();
+    let capture = Capture::start(profile.0.join("journals"), Metadata::default()).unwrap();
+    let mut actor = Actor {
+        secrets: Some(Secrets::default().seal().unwrap()),
+        active: None,
+    };
+    let mut terminal = Terminal::with_profile(80, 24, TerminalProfile::Xterm);
+    terminal.advance(b"previous scrollback\r\n");
+
+    actor
+        .attach(
+            &mut terminal,
+            1,
+            capture.sink(),
+            Policy::default(),
+            JournalAttachStart::Reconnected(JournalIsolation::Sandboxed("test-sandbox")),
+            false,
+        )
+        .unwrap();
+    terminal.advance(b"new live output\r\n");
+    actor.stop(&mut terminal);
+    assert!(capture.finish().recv_blocking().is_err());
+
+    let page = capture_page(capture.directory(), None, None, None).unwrap();
+    let records: Vec<_> = page
+        .records
+        .iter()
+        .map(|record| (record.kind, record.text.as_str()))
+        .collect();
+    assert_eq!(
+        records,
+        [
+            (CaptureKind::Note, "session reconnected"),
+            (CaptureKind::Note, "isolation: sandboxed (test-sandbox)"),
+            (CaptureKind::Output, "new live output"),
+        ]
+    );
+}
+
+#[test]
 fn input_capture_redacts_verified_commands_and_suppresses_password_prompts() {
     let profile = Profile::new();
     let capture = Capture::start(profile.0.join("journals"), Metadata::default()).unwrap();
@@ -35,7 +76,7 @@ fn input_capture_redacts_verified_commands_and_suppresses_password_prompts() {
             1,
             capture.sink(),
             Policy::default(),
-            false,
+            JournalAttachStart::Live,
             true,
         )
         .unwrap();

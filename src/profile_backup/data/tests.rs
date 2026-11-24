@@ -6,6 +6,45 @@ use kortty_terminal::TerminalProfile;
 use serde_json::{Value, json};
 
 use super::*;
+
+#[test]
+fn portable_job_releases_temporary_key_bindings_and_requires_local_reselection() {
+    use kortty_jobs::{Job, JobGraph, JobId, SchedulerStore};
+
+    let route = |id, host| {
+        serde_json::json!({
+            "id": id,
+            "target": { "host": host, "port": 22, "username": "operator" },
+            "jump": null,
+            "temporary_keys": vec![7; 32],
+        })
+    };
+    let target = route(1, "target.example.test");
+    let additional = route(2, "additional.example.test");
+    let action: crate::scheduler_window::SshCommand = serde_json::from_value(serde_json::json!({
+        "connection": target,
+        "additional_connections": [additional],
+        "command": "true",
+    }))
+    .unwrap();
+    let id = JobId::new("temporary-key-test").unwrap();
+    let graph = JobGraph::new(vec![
+        Job::new(id.clone(), "Temporary keys", action).unwrap(),
+    ])
+    .unwrap();
+    let input = SchedulerStore::encode_backup(&graph).unwrap();
+    let portable = super::portable_jobs(&input).unwrap();
+    let output =
+        SchedulerStore::decode_backup::<crate::scheduler_window::SshCommand>(&portable).unwrap();
+    let job = output.job(&id).unwrap();
+    assert!(!job.enabled());
+    assert_eq!(job.action().targets().count(), 2);
+    assert!(
+        job.action()
+            .targets()
+            .all(|route| route.temporary_keys.is_none())
+    );
+}
 use crate::connection_store::{
     Auth, Connection, SavedLogin, Store, TunnelConfig, TunnelRule, TunnelTarget,
 };

@@ -112,6 +112,9 @@ pub(super) fn collect(root: &Path) -> io::Result<Snapshot> {
 
 pub(super) fn portable_jobs(bytes: &[u8]) -> io::Result<Vec<u8>> {
     SchedulerStore::portable_backup_project(bytes, |definition, action| {
+        if strip_temporary_key_bindings(action) {
+            definition.enabled = false;
+        }
         if let Some(journal) = action
             .get_mut("automation_journal")
             .and_then(serde_json::Value::as_object_mut)
@@ -194,6 +197,28 @@ pub(super) fn portable_jobs(bytes: &[u8]) -> io::Result<Vec<u8>> {
         }
     })
     .map_err(invalid)
+}
+
+fn strip_temporary_key_bindings(value: &mut serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(fields) => {
+            let mut removed = fields
+                .remove("temporary_keys")
+                .is_some_and(|value| !value.is_null());
+            for value in fields.values_mut() {
+                removed |= strip_temporary_key_bindings(value);
+            }
+            removed
+        }
+        serde_json::Value::Array(entries) => {
+            let mut removed = false;
+            for value in entries {
+                removed |= strip_temporary_key_bindings(value);
+            }
+            removed
+        }
+        _ => false,
+    }
 }
 
 pub(super) fn existing_project_paths(root: &Path) -> io::Result<Vec<String>> {

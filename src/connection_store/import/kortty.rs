@@ -19,12 +19,13 @@ use super::{
 };
 use crate::clipboard_policy::PasteWarningMode;
 use crate::connection_store::{
-    AuthMethod, JAVA_ANSI_FIELDS, TabColor, TerminalOverrides, ThemeOverride, WindowGeometry,
-    valid_os_badge_reference,
+    AuthMethod, JAVA_ANSI_FIELDS, TabColor, TerminalOverrides, TerminalStyle,
+    TerminalStylePreference, ThemeOverride, WindowGeometry, valid_os_badge_reference,
 };
 use crate::session_journal::ConnectionConfig;
 use crate::session_security::IsolationLevel;
 use crate::terminal_effects::{Effect, Selection, Speed};
+use crate::terminal_logging::{self, DirectoryMode, Format as LogFormat, JavaFields, JavaReview};
 use crate::terminal_theme::Rgb;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -211,8 +212,10 @@ pub(super) fn parse(root: Node<'_, '_>, source: Source) -> io::Result<Preview> {
             Ok((profile, skipped))
         }) {
             Ok((entry, skipped)) => {
+                let logging_omitted = entry.java_logging_omitted;
                 if preview.push(entry)? {
                     preview.skipped_tunnels += skipped;
+                    preview.skipped_logging += usize::from(logging_omitted);
                 }
             }
             Err(_) => preview.invalid += 1,
@@ -441,7 +444,7 @@ fn local_profile(
         shell_integration: local_shell_integration(node)?,
         emulation: terminal_profile(node)?.term_name().into(),
         terminal_effect: terminal_effect(node)?,
-        terminal: terminal_overrides(node, supports_own_settings)?.0,
+        terminal: terminal_overrides(node, supports_own_settings, false)?.0,
     };
     profile.validate()?;
     Ok(ImportedLocal {
@@ -503,7 +506,7 @@ fn serial_profile(
         assert_dtr: optional_boolean(serial, "assertDtr")?.unwrap_or(defaults.assert_dtr),
         assert_rts: optional_boolean(serial, "assertRts")?.unwrap_or(defaults.assert_rts),
     };
-    let terminal = terminal_overrides(node, supported)?.0;
+    let terminal = terminal_overrides(node, supported, false)?.0;
     let connection = SerialConnection {
         device: PathBuf::from(device.trim()),
         settings,
@@ -683,17 +686,71 @@ pub(super) fn connection(
     connection.incognito = boolean(node, "incognito")?;
     connection.terminal_effect = terminal_effect(node)?;
     (connection.terminal, connection.command_timestamps) =
-        terminal_overrides(node, supports_own_settings)?;
+        terminal_overrides(node, supports_own_settings, true)?;
+    if let Some(encoding) = raw_scalar(node, "encoding")? {
+        connection.terminal.encoding = TextEncoding::from_name(encoding.trim());
+    }
     let timeout = number(node, "connectionTimeoutSeconds")?.unwrap_or(connection.startup.seconds());
     let attempts = number(node, "retryCount")?.unwrap_or(connection.startup.attempts());
     connection.startup =
         ConnectOptions::new(timeout, attempts)?.with_keepalive(ssh_keepalive(node)?);
+    let log_config = logging(node, supports_own_settings);
+    let java_logging_omitted = log_config.is_err();
+    connection.logging = log_config.unwrap_or_default();
     connection.validate()?;
     let mut entry = ImportedProfile::new(connection, group);
+    entry.java_logging_omitted = java_logging_omitted;
     entry.badge = raw_scalar(node, "osBadge")?.filter(|value| valid_os_badge_reference(value));
     entry.has_password = has_embedded_password(node);
     entry.jump_has_password = jump_has_password;
     Ok((entry, skipped))
+}
+
+fn logging(node: Node<'_, '_>, rust_schema: bool) -> io::Result<terminal_logging::Config> {
+    let review = if rust_schema {
+        optional_child(node, "rustTerminalLoggingReview")?
+            .map(|review| {
+                Ok::<_, io::Error>(JavaReview {
+                    enable_requested: boolean(review, "enableRequested")?,
+                    source_path: raw_scalar(review, "sourcePath")?
+                        .unwrap_or_default()
+                        .trim()
+                        .to_owned(),
+                    source_max_mib: number(review, "sourceMaxFileSizeMB")?,
+                    source_retention_days: number(review, "sourceRetentionDays")?,
+                })
+            })
+            .transpose()?
+            .unwrap_or_default()
+    } else {
+        JavaReview::default()
+    };
+    let config = terminal_logging::Config::default();
+    let mut fields: JavaFields<'_> = config.java_fields();
+    if let Some(log) = optional_child(node, "logConfig")? {
+        let folder = raw_scalar(log, "logFilePath")?.unwrap_or_default();
+        fields.folder = folder.trim();
+        fields.enabled = boolean(log, "enabled")?;
+        fields.max_mib = number(log, "maxFileSizeMB")?.unwrap_or(fields.max_mib);
+        fields.retention_days = number(log, "retentionDays")?.unwrap_or(fields.retention_days);
+        fields.rotate_daily = optional_boolean(log, "rotateDaily")?.unwrap_or(fields.rotate_daily);
+        fields.compress = optional_boolean(log, "compress")?.unwrap_or(fields.compress);
+        fields.include_username = boolean(log, "includeUsername")?;
+        fields.format = match raw_scalar(log, "format")?.as_deref().map(str::trim) {
+            None | Some("" | "PLAIN_TEXT") => LogFormat::Text,
+            Some("XML") => LogFormat::Xml,
+            Some("JSON") => LogFormat::Json,
+            _ => return Err(invalid("invalid Java terminal log format")),
+        };
+        fields.directory_mode = match raw_scalar(log, "directoryMode")?.as_deref().map(str::trim) {
+            None | Some("" | "NONE") => DirectoryMode::None,
+            Some("FULL") => DirectoryMode::Full,
+            Some("RELATIVE") => DirectoryMode::Relative,
+            _ => return Err(invalid("invalid Java terminal log directory mode")),
+        };
+        return terminal_logging::Config::from_java(fields, review);
+    }
+    terminal_logging::Config::from_java(fields, review)
 }
 
 fn isolation_mode(node: Node<'_, '_>) -> io::Result<Option<IsolationLevel>> {
@@ -798,6 +855,7 @@ fn window_geometry(node: Node<'_, '_>) -> io::Result<Option<WindowGeometry>> {
 fn terminal_overrides(
     node: Node<'_, '_>,
     supported: bool,
+    retain_style: bool,
 ) -> io::Result<(TerminalOverrides, Option<bool>)> {
     let mut inherited = TerminalOverrides {
         paste_line_delay_ms: number::<i32>(node, "pasteLineDelayMs")?.map(|delay| {
@@ -833,9 +891,31 @@ fn terminal_overrides(
     let Some(settings) = settings else {
         return Ok((inherited, None));
     };
-    if optional_boolean(settings, "useGlobalSettings")? != Some(false) {
-        return Ok((inherited, None));
+    match optional_boolean(settings, "useGlobalSettings")? {
+        Some(false) => {
+            let (mut options, timestamps) = parse_own_terminal_style(settings, inherited)?;
+            if retain_style && TerminalStyle::from_terminal(&options, timestamps).is_default() {
+                options.style_preference = Some(TerminalStylePreference::Own);
+            }
+            Ok((options, timestamps))
+        }
+        Some(true) if retain_style => {
+            let retained = parse_own_terminal_style(settings, inherited.clone())
+                .ok()
+                .map(|(options, timestamps)| TerminalStyle::from_terminal(&options, timestamps))
+                .filter(|style| !style.is_default())
+                .map(Box::new);
+            inherited.style_preference = retained.map(TerminalStylePreference::Global);
+            Ok((inherited, None))
+        }
+        _ => Ok((inherited, None)),
     }
+}
+
+fn parse_own_terminal_style(
+    settings: Node<'_, '_>,
+    inherited: TerminalOverrides,
+) -> io::Result<(TerminalOverrides, Option<bool>)> {
     let color = |field| -> io::Result<Option<Rgb>> {
         Ok(raw_scalar(settings, field)?.as_deref().and_then(Rgb::parse))
     };
@@ -1049,11 +1129,7 @@ fn tunnel(node: Node<'_, '_>) -> io::Result<TunnelConfig> {
 }
 
 fn boolean(node: Node<'_, '_>, field: &str) -> io::Result<bool> {
-    match raw_scalar(node, field)?.as_deref().map(str::trim) {
-        None | Some("false" | "0") => Ok(false),
-        Some("true" | "1") => Ok(true),
-        _ => Err(invalid("invalid boolean field in kortty connection XML")),
-    }
+    Ok(optional_boolean(node, field)?.unwrap_or(false))
 }
 
 fn number<T: std::str::FromStr>(node: Node<'_, '_>, field: &str) -> io::Result<Option<T>> {
@@ -1065,4 +1141,24 @@ fn number<T: std::str::FromStr>(node: Node<'_, '_>, field: &str) -> io::Result<O
                 .map_err(|_| invalid("invalid number in kortty connection XML"))
         })
         .transpose()
+}
+
+#[cfg(test)]
+mod journal_rotation_tests {
+    use super::*;
+
+    #[test]
+    fn journal_rotation_import_accepts_the_java_editor_limits() {
+        let xml = roxmltree::Document::parse(
+            "<settings><sessionJournalConfig><maxLogSizeMB>1000</maxLogSizeMB>\
+             <maxLogParts>2147483647</maxLogParts></sessionJournalConfig></settings>",
+        )
+        .unwrap();
+        let config = journal_config(xml.root_element()).unwrap();
+        assert_eq!(config.max_log_size_mib, 1000);
+        assert_eq!(
+            config.max_log_parts,
+            crate::session_journal::MAX_CONNECTION_JOURNAL_PARTS
+        );
+    }
 }

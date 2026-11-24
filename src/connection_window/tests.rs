@@ -594,7 +594,7 @@ fn teamwork_favorites_toggle_mixed_selection_and_filter_the_map_and_pdf() {
     let primary_row = RowKey::Shared(primary.clone());
     let mut manager = ConnectionWindow::open(profile.path()).unwrap();
     manager.set_teamwork(catalog.clone(), None);
-    manager.set_open_counts(BTreeMap::new());
+    manager.set_open_counts(OpenCounts::default());
     assert_eq!(manager.favorite_count(), 1);
 
     let _ = manager.update(Message::Select(local));
@@ -604,7 +604,7 @@ fn teamwork_favorites_toggle_mixed_selection_and_filter_the_map_and_pdf() {
     let _ = manager.update(Message::OpenTreeContext(primary_row.clone(), Point::ORIGIN));
     assert_eq!(manager.selected_connection_ids(), vec![local]);
     assert!(manager.selection.contains(&primary_row));
-    manager.set_open_counts(BTreeMap::new());
+    manager.set_open_counts(OpenCounts::default());
     complete_persisted(
         &mut manager,
         Message::TreeContext(Context::Activate(Page::Root, 0)),
@@ -620,7 +620,11 @@ fn teamwork_favorites_toggle_mixed_selection_and_filter_the_map_and_pdf() {
     let _ = manager.update(Message::Scope(Scope::Favorites));
     assert_eq!(
         manager.visible_row_keys(),
-        [RowKey::Connection(local), primary_row.clone()]
+        [
+            RowKey::Connection(local),
+            RowKey::SharedGroup(String::new()),
+            primary_row.clone()
+        ]
     );
     let _ = manager.update(Message::MapView(true));
     let snapshot = manager.map_pdf_snapshot().unwrap();
@@ -688,6 +692,20 @@ fn teamwork_hide_confirms_separately_and_excludes_hidden_rows_from_every_scope()
 
     let mut manager = ConnectionWindow::open(profile.path()).unwrap();
     manager.set_teamwork(catalog.clone(), None);
+    manager.set_open_counts(OpenCounts {
+        saved: BTreeMap::from([(local, 1)]),
+        teamwork: BTreeMap::from([(identity.clone(), 2)]),
+    });
+    let _ = manager.update(Message::Scope(Scope::Open));
+    assert_eq!(
+        manager.visible_row_keys(),
+        [
+            RowKey::Connection(local),
+            RowKey::SharedGroup(String::new()),
+            shared.clone()
+        ]
+    );
+    let _ = manager.update(Message::Scope(Scope::All));
     assert!(!manager.can_restore_teamwork());
     manager.set_teamwork_available(true);
     assert!(manager.can_restore_teamwork());
@@ -716,6 +734,7 @@ fn teamwork_hide_confirms_separately_and_excludes_hidden_rows_from_every_scope()
         (Scope::Teamwork, 0),
         (Scope::Favorites, 1),
         (Scope::Recent, 1),
+        (Scope::Open, 1),
         (Scope::Tag("prod".into()), 1),
     ] {
         let _ = manager.update(Message::Scope(scope));
@@ -818,7 +837,11 @@ fn teamwork_recency_shares_the_combined_cutoff_order_and_search_with_map_pdf() {
     let mut manager = ConnectionWindow::open(profile.path()).unwrap();
     manager.set_teamwork(catalog.clone(), None);
     let _ = manager.update(Message::Scope(Scope::Recent));
-    let rows = manager.visible_row_keys();
+    let rows: Vec<_> = manager
+        .recent_entries()
+        .iter()
+        .map(selection::VisualRow::key)
+        .collect();
     assert_eq!(rows.len(), RECENT_LIMIT);
     assert_eq!(
         rows[..4],
@@ -831,6 +854,10 @@ fn teamwork_recency_shares_the_combined_cutoff_order_and_search_with_map_pdf() {
     );
     assert!(!rows.contains(&outside));
     assert!(!rows.contains(&row("Never used")));
+    let visible = manager.visible_row_keys();
+    assert_eq!(visible.len(), RECENT_LIMIT + 1);
+    assert!(visible.contains(&RowKey::SharedGroup(String::new())));
+    assert!(rows.iter().all(|row| visible.contains(row)));
 
     let _ = manager.update(Message::MapView(true));
     let snapshot = manager.map_pdf_snapshot().unwrap();
@@ -854,6 +881,86 @@ fn teamwork_recency_shares_the_combined_cutoff_order_and_search_with_map_pdf() {
             .collect::<Vec<_>>(),
         [local, serial]
     );
+}
+
+#[test]
+fn teamwork_tree_collapses_read_only_folders_and_reveals_matching_routes() {
+    let profile = Profile::new();
+    let source = profile.0.join("shared.xml");
+    let xml = r#"<connections>
+        <connection id="root"><name>Root host</name><host>root.example</host>
+          <username>fixture</username></connection>
+        <connection id="direct"><name>Direct host</name><host>direct.example</host>
+          <username>fixture</username><group>OPS</group></connection>
+        <connection id="nested"><name>Nested host</name><host>nested.example</host>
+          <username>fixture</username><group>Ops/West</group></connection>
+        </connections>"#;
+    fs::write(&source, xml).unwrap();
+    let settings = teamwork::Settings {
+        sources: vec![teamwork::Source {
+            location: source.to_str().unwrap().into(),
+            enabled: true,
+            kind: teamwork::SourceKind::File,
+            check_interval_minutes: teamwork::DEFAULT_CHECK_INTERVAL_MINUTES,
+        }],
+        ..Default::default()
+    };
+    let catalog =
+        teamwork::Catalog::default().refreshed(&settings.active_sources(true, &[]).unwrap());
+    let identity = |id| {
+        catalog
+            .entries()
+            .find(|entry| entry.identity().external_id() == id)
+            .unwrap()
+            .identity()
+            .clone()
+    };
+    let nested = identity("nested");
+    let direct = RowKey::Shared(identity("direct"));
+    let ungrouped = RowKey::Shared(identity("root"));
+    let branch = RowKey::SharedGroup(String::new());
+    let ops = RowKey::SharedGroup("ops".into());
+    let west = RowKey::SharedGroup("ops/west".into());
+    let leaf = RowKey::Shared(nested.clone());
+    let mut manager = ConnectionWindow::open(profile.path()).unwrap();
+    manager.set_teamwork(catalog, None);
+    assert_eq!(
+        manager.visible_row_keys(),
+        [
+            branch.clone(),
+            ops.clone(),
+            west.clone(),
+            leaf.clone(),
+            direct,
+            ungrouped
+        ]
+    );
+
+    let _ = manager.update(Message::SelectShared(nested.clone()));
+    let _ = manager.update(Message::ToggleSharedGroup("ops".into()));
+    assert!(manager.selected_shared().is_none());
+    assert!(!manager.visible_row_keys().contains(&west));
+    let _ = manager.update(Message::OpenTreeContext(ops.clone(), Point::ORIGIN));
+    assert!(manager.selection.contains(&ops));
+    assert!(manager.active_group().is_none());
+
+    let _ = manager.update(Message::ToggleSharedGroup(String::new()));
+    assert_eq!(manager.visible_row_keys(), std::slice::from_ref(&branch));
+    let _ = manager.update(Message::MapView(true));
+    assert_eq!(manager.map_pdf_snapshot().unwrap().connection_count, 3);
+    let _ = manager.update(Message::MapSelect(leaf.clone()));
+    let _ = manager.update(Message::MapView(false));
+    assert_eq!(manager.selected_shared().unwrap().identity(), &nested);
+    assert!(manager.visible_row_keys().contains(&west));
+
+    let _ = manager.update(Message::ToggleSharedGroup("ops".into()));
+    let _ = manager.update(Message::Search("nested.example".into()));
+    assert_eq!(
+        manager.visible_row_keys(),
+        [branch, ops.clone(), west.clone(), leaf.clone()]
+    );
+    let _ = manager.update(Message::Scope(Scope::Teamwork));
+    assert_eq!(manager.visible_row_keys(), [ops, west, leaf]);
 }
 
 #[test]
@@ -920,11 +1027,14 @@ fn library_navigation_and_search_never_leave_a_hidden_connection_connectable() {
         let _ = window.update(Message::Scope(scope));
         assert_eq!(window.selected().map(|entry| entry.id), Some(web));
     }
-    window.set_open_counts(BTreeMap::from([(web, 2)]));
+    window.set_open_counts(OpenCounts {
+        saved: BTreeMap::from([(web, 2)]),
+        ..OpenCounts::default()
+    });
     let _ = window.update(Message::Scope(Scope::Open));
     assert_eq!(window.selected().map(|entry| entry.id), Some(web));
     assert_eq!(window.open_count(web), 2);
-    window.set_open_counts(BTreeMap::new());
+    window.set_open_counts(OpenCounts::default());
     assert!(window.selected().is_none());
 }
 
@@ -1044,6 +1154,9 @@ fn custom_symbol_resolves_in_manager_and_overview_and_keeps_dormant_reference() 
 
 #[test]
 fn connection_tab_color_draft_validates_saves_and_can_be_removed() {
+    use super::color_picker::{Edit as Picker, Target};
+    use crate::terminal_theme::Rgb;
+
     let profile = Profile::new();
     let mut store = Store::open(profile.path()).unwrap();
     let id = store.save(connection("Operations", "")).unwrap();
@@ -1054,10 +1167,23 @@ fn connection_tab_color_draft_validates_saves_and_can_be_removed() {
     );
     let mut window = ConnectionWindow::open(profile.path()).unwrap();
     let _ = window.update(Message::EditSelected);
+    let _ = window.update(Message::Edit(Edit::Page(form::Page::Settings)));
+    let picker = |action| Message::Edit(Edit::ColorPicker(action));
+    let _ = window.update(picker(Picker::Open(Target::Tab, None)));
+    let _ = window.update(picker(Picker::Select(Some(Rgb::from_hex(0x112233)))));
+    assert!(
+        window
+            .draft
+            .as_ref()
+            .unwrap()
+            .connection()
+            .unwrap()
+            .tab_color
+            .is_none()
+    );
     let _ = window.update(Message::Edit(Edit::UseTabColor(true)));
-    let _ = window.update(Message::Edit(Edit::TabColor("#abcd".into())));
-    assert!(window.draft.as_ref().unwrap().connection().is_err());
-    let _ = window.update(Message::Edit(Edit::TabColor(" #Abc ".into())));
+    let _ = window.update(picker(Picker::Open(Target::Tab, None)));
+    let _ = window.update(picker(Picker::Select(Some(Rgb::from_hex(0xAABBCC)))));
     let draft = window.draft.as_ref().unwrap().connection().unwrap();
     assert_eq!(draft.tab_color.unwrap().to_string(), "#AABBCC");
     let _ = window.update(Message::CancelEdit);
@@ -1101,6 +1227,383 @@ fn connection_tab_color_draft_validates_saves_and_can_be_removed() {
             .tab_color
             .is_none()
     );
+}
+
+#[test]
+fn ssh_editor_journal_and_ai_tabs_keep_their_drafts_when_terminal_defaults_are_restored() {
+    use iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
+    use iced::keyboard::{
+        self, Key, Location, Modifiers,
+        key::{self, Named},
+    };
+    use iced::{Event, Font, Renderer, Size, mouse};
+    use terminal_overrides::Edit as Terminal;
+
+    let profile = Profile::new();
+    let mut store = Store::open(profile.path()).unwrap();
+    let mut saved = connection("Build host", "");
+    saved.terminal.font_size = Some(22);
+    saved.terminal.ai_skills = vec![17, 19];
+    let id = store.save(saved).unwrap();
+    let mut window = ConnectionWindow::open(profile.path()).unwrap();
+    let _ = window.update(Message::EditSelected);
+
+    let themes = crate::terminal_theme::Themes::default();
+    let mut view = window
+        .editor_view(ViewChoices {
+            passwords: &[],
+            passphrases: &[],
+            keys: &[],
+            temporary_keys: false,
+            vault_unlocked: false,
+            ai_profiles: &[],
+            java_ai_profiles: &[],
+            ai_skills: &[],
+            ai_agent_designs: &[],
+            highlighting: HighlightChoices::default(),
+            themes: &themes,
+            journal_policy: JournalEditorPolicy::default(),
+            terminal_style: Default::default(),
+            logging_policy: Default::default(),
+            incognito_allowed: true,
+            serial_allowed: true,
+            terminal_effects: None,
+            default_paste_warning: Default::default(),
+            minimum_paste_warning: PasteWarningMode::Off,
+            isolation: Default::default(),
+            local_isolation_default: Default::default(),
+        })
+        .unwrap();
+    let compact = Size::new(640.0, 430.0);
+    let renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+    let mut tree = Tree::new(view.as_widget());
+    let node = view.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &layout::Limits::new(Size::ZERO, compact),
+    );
+    let root = Layout::new(&node);
+    let body = root.children().next().unwrap();
+    let form = body.children().next().unwrap().children().next().unwrap();
+    let tabs: Vec<_> = form
+        .children()
+        .nth(1)
+        .unwrap()
+        .children()
+        .next()
+        .unwrap()
+        .children()
+        .map(|tab| tab.bounds())
+        .collect();
+    assert_eq!(tabs.last().unwrap().width, 34.0);
+    assert!(tabs.iter().all(|tab| tab.x + tab.width <= compact.width));
+    assert!(
+        tabs.iter()
+            .all(|tab| (tab.center().y - tabs[0].center().y).abs() < 1.0)
+    );
+    let footer = body.children().nth(2).unwrap().bounds();
+    assert!(footer.height > 0.0 && footer.y + footer.height <= compact.height);
+
+    for (named, modifiers, selected) in [
+        (Named::Tab, Modifiers::CTRL, form::Page::Settings),
+        (
+            Named::Tab,
+            Modifiers::CTRL | Modifiers::SHIFT,
+            form::Page::Connection,
+        ),
+        (Named::PageDown, Modifiers::CTRL, form::Page::Settings),
+        (Named::PageUp, Modifiers::CTRL, form::Page::Connection),
+    ] {
+        let key = Key::Named(named);
+        let event = Event::Keyboard(keyboard::Event::KeyPressed {
+            modified_key: key.clone(),
+            key,
+            location: Location::Standard,
+            physical_key: key::Physical::Unidentified(key::NativeCode::Unidentified),
+            modifiers,
+            text: None,
+            repeat: false,
+        });
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+        view.as_widget_mut().update(
+            &mut tree,
+            &event,
+            root,
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut shell,
+            &node.bounds(),
+        );
+        assert!(shell.is_event_captured());
+        assert!(
+            matches!(messages.as_slice(), [Message::Edit(Edit::Page(page))] if *page == selected)
+        );
+    }
+    drop(view);
+
+    let _ = window.update(Message::Edit(Edit::Page(form::Page::Ai)));
+    let _ = window.update(Message::Edit(Edit::Terminal(Terminal::AiSkillSearch(
+        "release".into(),
+    ))));
+    assert!(!window.draft.as_ref().unwrap().changed);
+    for edit in [
+        Edit::Terminal(Terminal::AiAgentDisabled(true)),
+        Edit::Page(form::Page::Journal),
+        Edit::Terminal(Terminal::Journal(journal_settings::Edit::Auto(true))),
+        Edit::Terminal(Terminal::Journal(journal_settings::Edit::Input(true))),
+        Edit::Terminal(Terminal::Journal(journal_settings::Edit::Interval(
+            "45".into(),
+        ))),
+        Edit::Page(form::Page::Settings),
+        Edit::Terminal(Terminal::ResetTerminal),
+    ] {
+        let _ = window.update(Message::Edit(edit));
+    }
+    complete_persisted(&mut window, Message::Save);
+    let reopened = Store::open(profile.path()).unwrap();
+    let terminal = &reopened.get(id).unwrap().terminal;
+    assert!(terminal.font_size.is_none());
+    assert!(terminal.ai_agent_disabled);
+    assert_eq!(terminal.ai_skills, [17, 19]);
+    assert!(terminal.journal.auto_start);
+    assert!(terminal.journal.capture_input);
+    assert_eq!(terminal.journal.summary_interval_minutes, 45);
+
+    let _ = window.update(Message::Duplicate);
+    assert_eq!(
+        window
+            .draft
+            .as_ref()
+            .unwrap()
+            .connection()
+            .unwrap()
+            .terminal
+            .journal,
+        terminal.journal
+    );
+    complete_persisted(&mut window, Message::Save);
+    let duplicated = Store::open(profile.path()).unwrap();
+    assert_eq!(duplicated.connections().len(), 2);
+    assert!(
+        duplicated
+            .connections()
+            .iter()
+            .all(|saved| saved.terminal.journal == terminal.journal)
+    );
+}
+
+#[test]
+fn ssh_editor_ai_tab_moves_focus_and_assigns_skills_with_the_keyboard() {
+    use crate::settings_search::test_input;
+    use crate::terminal_agent::design::Choice;
+    use iced::keyboard::{Key, key::Named};
+    use iced::{Font, Renderer, Size, Theme};
+    use iced_runtime::{UserInterface, user_interface::Cache};
+    use terminal_overrides::Edit as Terminal;
+
+    let profile = Profile::new();
+    let mut saved = connection("Keyboard fixture", "");
+    saved.terminal.ai_skills = (9000..9020).collect();
+    let id = Store::open(profile.path()).unwrap().save(saved).unwrap();
+    let mut window = ConnectionWindow::open(profile.path()).unwrap();
+    let _ = window.update(Message::EditSelected);
+    let _ = window.update(Message::Edit(Edit::Page(form::Page::Ai)));
+    let themes = crate::terminal_theme::Themes::default();
+    let designs = [
+        Choice {
+            id: String::new(),
+            name: "Default".into(),
+        },
+        Choice {
+            id: "standard".into(),
+            name: "Standard".into(),
+        },
+    ];
+    let view = keyboard_editor_view;
+    let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+    let compact = Size::new(900.0, 410.0);
+    let mut cache = Cache::default();
+    for _ in 0..4 {
+        let mut interface = UserInterface::build(
+            view(&window, &themes, &designs),
+            compact,
+            cache,
+            &mut renderer,
+        );
+        let events = test_input::press(&mut interface, &mut renderer, Key::Named(Named::Tab), None);
+        assert!(matches!(events.as_slice(), [Message::FocusEditor(false)]));
+        let focus = window.draft.as_ref().unwrap().focus_editor(false);
+        test_input::apply(&mut interface, &renderer, focus);
+        cache = interface.into_cache();
+    }
+    let mut interface = UserInterface::build(
+        view(&window, &themes, &designs),
+        compact,
+        cache,
+        &mut renderer,
+    );
+    let named =
+        |interface: &mut UserInterface<'_, Message, Theme, Renderer>,
+         renderer: &mut Renderer,
+         key| { test_input::press(interface, renderer, Key::Named(key), None) };
+    assert!(named(&mut interface, &mut renderer, Named::Enter).is_empty());
+    assert!(named(&mut interface, &mut renderer, Named::End).is_empty());
+    assert!(matches!(
+        named(&mut interface, &mut renderer, Named::Enter).as_slice(),
+        [Message::Edit(Edit::Terminal(Terminal::AiAgentDesign(Some(design))))] if design == "standard"
+    ));
+    for _ in 0..2 {
+        assert!(matches!(
+            named(&mut interface, &mut renderer, Named::Tab).as_slice(),
+            [Message::FocusEditor(false)]
+        ));
+        let focus = window.draft.as_ref().unwrap().focus_editor(false);
+        test_input::apply(&mut interface, &renderer, focus);
+    }
+    let mut navigate = named(&mut interface, &mut renderer, Named::End);
+    assert!(matches!(
+        navigate.as_slice(),
+        [Message::Edit(Edit::Terminal(Terminal::AiSkillNavigate(
+            9019
+        )))]
+    ));
+    let cache = interface.into_cache();
+    let reveal = window.update(navigate.remove(0));
+    assert!(!window.draft.as_ref().unwrap().changed);
+
+    let mut interface = UserInterface::build(
+        view(&window, &themes, &designs),
+        compact,
+        cache,
+        &mut renderer,
+    );
+    test_input::apply(&mut interface, &renderer, reveal);
+    let mut assignment = named(&mut interface, &mut renderer, Named::Space);
+    assert!(matches!(
+        assignment.as_slice(),
+        [Message::Edit(Edit::Terminal(Terminal::AiSkill(
+            9019, false
+        )))]
+    ));
+    let cache = interface.into_cache();
+    let _ = window.update(assignment.remove(0));
+    let mut interface = UserInterface::build(
+        view(&window, &themes, &designs),
+        compact,
+        cache,
+        &mut renderer,
+    );
+    assert!(matches!(
+        named(&mut interface, &mut renderer, Named::Tab).as_slice(),
+        [Message::FocusEditor(false)]
+    ));
+    let focus = window.draft.as_ref().unwrap().focus_editor(false);
+    test_input::apply(&mut interface, &renderer, focus);
+    assert!(matches!(
+        named(&mut interface, &mut renderer, Named::Enter).as_slice(),
+        [Message::Save]
+    ));
+    drop(interface);
+    complete_persisted(&mut window, Message::Save);
+    let reopened = Store::open(profile.path()).unwrap();
+    assert_eq!(
+        reopened.get(id).unwrap().terminal.ai_skills,
+        (9000..9019).collect::<Vec<_>>()
+    );
+}
+
+fn keyboard_editor_view<'a>(
+    window: &'a ConnectionWindow,
+    themes: &crate::terminal_theme::Themes,
+    designs: &[crate::terminal_agent::design::Choice],
+) -> iced::Element<'a, Message> {
+    window
+        .editor_view(ViewChoices {
+            passwords: &[],
+            passphrases: &[],
+            keys: &[],
+            temporary_keys: false,
+            vault_unlocked: false,
+            ai_profiles: &[],
+            java_ai_profiles: &[],
+            ai_skills: &[],
+            ai_agent_designs: designs,
+            highlighting: HighlightChoices::default(),
+            themes,
+            journal_policy: JournalEditorPolicy::default(),
+            terminal_style: Default::default(),
+            logging_policy: Default::default(),
+            incognito_allowed: true,
+            serial_allowed: true,
+            terminal_effects: None,
+            default_paste_warning: Default::default(),
+            minimum_paste_warning: PasteWarningMode::Off,
+            isolation: Default::default(),
+            local_isolation_default: Default::default(),
+        })
+        .unwrap()
+}
+
+#[test]
+fn ssh_editor_skips_disabled_jump_and_log_controls_in_tab_order() {
+    use crate::settings_search::test_input;
+    use iced::keyboard::{Key, key::Named};
+    use iced::{Font, Renderer, Size, Theme};
+    use iced_runtime::{UserInterface, user_interface::Cache};
+
+    let profile = Profile::new();
+    Store::open(profile.path())
+        .unwrap()
+        .save(connection("Private test", ""))
+        .unwrap();
+    let mut window = ConnectionWindow::open(profile.path()).unwrap();
+    let _ = window.update(Message::EditSelected);
+    let themes = crate::terminal_theme::Themes::default();
+    let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+    for page in [form::Page::JumpHost, form::Page::Logging] {
+        let _ = window.update(Message::Edit(Edit::Page(page)));
+        let mut interface = UserInterface::build(
+            keyboard_editor_view(&window, &themes, &[]),
+            Size::new(900.0, 420.0),
+            Cache::default(),
+            &mut renderer,
+        );
+        let tab = |interface: &mut UserInterface<'_, Message, Theme, Renderer>,
+                   renderer: &mut Renderer| {
+            let messages = test_input::press(interface, renderer, Key::Named(Named::Tab), None);
+            assert!(matches!(messages.as_slice(), [Message::FocusEditor(false)]));
+            let focus = window.draft.as_ref().unwrap().focus_editor(false);
+            test_input::apply(interface, renderer, focus);
+        };
+        tab(&mut interface, &mut renderer);
+        let toggle = test_input::press(
+            &mut interface,
+            &mut renderer,
+            Key::Named(Named::Space),
+            None,
+        );
+        assert!(match page {
+            form::Page::JumpHost =>
+                matches!(toggle.as_slice(), [Message::Edit(Edit::UseJump(true))]),
+            form::Page::Logging => matches!(
+                toggle.as_slice(),
+                [Message::Edit(Edit::Logging(
+                    crate::terminal_logging::Edit::Enabled(true)
+                ))]
+            ),
+            _ => unreachable!(),
+        });
+        tab(&mut interface, &mut renderer);
+        let save = test_input::press(
+            &mut interface,
+            &mut renderer,
+            Key::Named(Named::Enter),
+            None,
+        );
+        assert!(matches!(save.as_slice(), [Message::Save]));
+    }
 }
 
 #[test]
@@ -1293,7 +1796,9 @@ fn connection_manager_pointer_drags_accept_local_folders_and_refuse_teamwork_sou
     let mut view = manager.view(ViewChoices {
         temporary_keys: false,
         vault_unlocked: false,
-        journal_max_parts: None,
+        journal_policy: JournalEditorPolicy::default(),
+        terminal_style: Default::default(),
+        logging_policy: Default::default(),
         serial_allowed: true,
         passwords: &[],
         passphrases: &[],
@@ -1341,15 +1846,9 @@ fn connection_manager_pointer_drags_accept_local_folders_and_refuse_teamwork_sou
         .children()
         .next()
         .unwrap();
-    let sidebar_destination = sidebar
-        .children()
-        .next()
-        .unwrap()
-        .children()
-        .last()
-        .unwrap()
-        .bounds()
-        .center();
+    let sidebar_rows: Vec<_> = sidebar.children().next().unwrap().children().collect();
+    let sidebar_destination = sidebar_rows[sidebar_rows.len() - 3].bounds().center();
+    let sidebar_teamwork = sidebar_rows.last().unwrap().bounds().center();
     let row_point = |key| {
         rows.children()
             .nth(row_index(&key))
@@ -1393,6 +1892,31 @@ fn connection_manager_pointer_drags_accept_local_folders_and_refuse_teamwork_sou
             .iter()
             .all(|message| !matches!(message, Message::TreeMove(..)))
     );
+    assert!(
+        drag(start, sidebar_teamwork)
+            .iter()
+            .all(|message| !matches!(message, Message::TreeMove(..)))
+    );
+    let mut messages = Vec::new();
+    for event in [
+        mouse::Event::ButtonPressed(mouse::Button::Left),
+        mouse::Event::ButtonReleased(mouse::Button::Left),
+    ] {
+        view.as_widget_mut().update(
+            &mut tree,
+            &Event::Mouse(event),
+            layout,
+            mouse::Cursor::Available(sidebar_teamwork),
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &node.bounds(),
+        );
+    }
+    assert!(matches!(
+        messages.as_slice(),
+        [Message::Scope(Scope::Teamwork)]
+    ));
 }
 
 #[test]
@@ -1401,13 +1925,22 @@ fn native_workbench_keeps_reference_side_widths_at_default_and_minimum_size() {
     use iced::{Font, Renderer, Size};
 
     let profile = Profile::new();
-    let window = ConnectionWindow::open(profile.path()).unwrap();
+    let mut window = ConnectionWindow::open(profile.path()).unwrap();
+    window.set_teamwork_auth(Some(teamwork::DefaultAuth::Ordered(Default::default())));
     let renderer = Renderer::new(Font::DEFAULT, 16.0.into());
-    for width in [1240.0, 940.0] {
+    let mut workbench_y = 0.0;
+    for (width, height, scope) in [
+        (1240.0, 760.0, Scope::All),
+        (940.0, 520.0, Scope::All),
+        (940.0, 520.0, Scope::Teamwork),
+    ] {
+        let _ = window.update(Message::Scope(scope.clone()));
         let mut view = window.view(ViewChoices {
             temporary_keys: false,
             vault_unlocked: false,
-            journal_max_parts: None,
+            journal_policy: JournalEditorPolicy::default(),
+            terminal_style: Default::default(),
+            logging_policy: Default::default(),
             serial_allowed: true,
             passwords: &[],
             passphrases: &[],
@@ -1429,7 +1962,7 @@ fn native_workbench_keeps_reference_side_widths_at_default_and_minimum_size() {
         let layout = view.as_widget_mut().layout(
             &mut tree,
             &renderer,
-            &layout::Limits::new(Size::ZERO, Size::new(width, 760.0)),
+            &layout::Limits::new(Size::ZERO, Size::new(width, height)),
         );
         let layout = Layout::new(&layout);
         let workbench = layout.children().nth(2).unwrap();
@@ -1440,6 +1973,22 @@ fn native_workbench_keeps_reference_side_widths_at_default_and_minimum_size() {
         assert_eq!(workbench.bounds().x, 12.0);
         assert_eq!(workbench.bounds().width, width - 24.0);
         assert_eq!(widths, [210.0, 4.0, width - 612.0, 4.0, 370.0]);
+        if scope == Scope::Teamwork {
+            assert_eq!(workbench.bounds().y, workbench_y);
+            let center = workbench.children().nth(2).unwrap();
+            let body = center.children().next().unwrap();
+            let sections: Vec<_> = body.children().map(|child| child.bounds()).collect();
+            assert_eq!(sections.len(), 3);
+            let [header, auth, list] = sections.as_slice() else {
+                unreachable!()
+            };
+            assert!(auth.x >= center.bounds().x);
+            assert!(auth.x + auth.width <= center.bounds().x + center.bounds().width);
+            assert!(auth.y >= header.y + header.height && auth.height <= 200.0);
+            assert!(list.y >= auth.y + auth.height && list.height >= 100.0);
+        } else {
+            workbench_y = workbench.bounds().y;
+        }
     }
 }
 
@@ -1461,7 +2010,9 @@ fn long_scope_titles_keep_list_and_map_visible_at_minimum_width() {
         let mut view = window.view(ViewChoices {
             temporary_keys: false,
             vault_unlocked: false,
-            journal_max_parts: None,
+            journal_policy: JournalEditorPolicy::default(),
+            terminal_style: Default::default(),
+            logging_policy: Default::default(),
             serial_allowed: true,
             passwords: &[],
             passphrases: &[],
@@ -1566,6 +2117,101 @@ fn editor_retains_the_last_valid_speed_and_duplicates_the_saved_effect() {
             speed: imported_speed
         })
     );
+}
+
+#[test]
+fn saved_ssh_terminal_settings_switches_sources_without_losing_the_editor_draft() {
+    use crate::connection_store::{TerminalAppearance, TerminalStyle, TerminalStylePreference};
+    use crate::terminal_theme::Rgb;
+    use kortty_terminal::TextEncoding;
+
+    let mut saved = connection("SSH fixture", "");
+    saved.command_timestamps = Some(false);
+    saved.terminal.font_size = Some(23);
+    saved.terminal.encoding = Some(TextEncoding::Windows1252);
+    saved.terminal.terminal_columns = Some(88);
+    saved.terminal.paste_line_delay_ms = Some(15);
+    let mut draft = form::Draft::from_profile(&saved, None, false);
+    let defaults = Box::new(TerminalStyle {
+        appearance: TerminalAppearance {
+            font_size: Some(17),
+            foreground: Some(Rgb::from_hex(0x112233)),
+            ..TerminalAppearance::default()
+        },
+        command_timestamps: Some(true),
+        ..TerminalStyle::default()
+    });
+    assert_eq!(draft.connection().unwrap().terminal.font_size, Some(23));
+    draft.update(Edit::Terminal(terminal_overrides::Edit::FontSize(
+        "25".into(),
+    )));
+    draft.update(Edit::UseOwnTerminalSettings(None));
+    let global = draft.connection().unwrap();
+    assert!(global.terminal.font_size.is_none());
+    assert!(global.command_timestamps.is_none());
+    assert_eq!(global.terminal.encoding, saved.terminal.encoding);
+    assert_eq!(global.terminal.terminal_columns, Some(88));
+    assert_eq!(global.terminal.paste_line_delay_ms, Some(15));
+    let Some(TerminalStylePreference::Global(retained)) = &global.terminal.style_preference else {
+        panic!("the saved own settings must be retained");
+    };
+    assert_eq!(retained.appearance.font_size, Some(23));
+    assert_eq!(retained.command_timestamps, Some(false));
+    draft.update(Edit::Terminal(terminal_overrides::Edit::FontSize(
+        "99".into(),
+    )));
+    draft.update(Edit::UseOwnTerminalSettings(Some(defaults.clone())));
+    assert_eq!(draft.connection().unwrap().terminal.font_size, Some(25));
+    let mut reopened = form::Draft::from_profile(&global, None, false);
+    assert!(reopened.connection().unwrap().terminal.font_size.is_none());
+    reopened.update(Edit::UseOwnTerminalSettings(Some(defaults)));
+    let custom = reopened.connection().unwrap();
+    assert_eq!(custom.terminal.font_size, Some(17));
+    assert_eq!(custom.terminal.foreground, Some(Rgb::from_hex(0x112233)));
+    assert_eq!(custom.command_timestamps, Some(true));
+}
+
+#[test]
+fn saved_ssh_color_picker_keeps_unapplied_values_out_of_the_connection() {
+    use super::color_picker::{Edit as Picker, Target};
+    use super::custom_color::{Change, Mode};
+    use crate::terminal_theme::Rgb;
+
+    let mut saved = connection("SSH colors", "");
+    let original = Rgb::from_hex(0xC0FFEE);
+    let custom = Rgb::from_hex(0x123456);
+    saved.terminal.foreground = Some(original);
+    saved.terminal.background = Some(Rgb::from_hex(0x010203));
+    let mut draft = form::Draft::from_profile(&saved, None, false);
+    draft.update(Edit::Page(form::Page::Settings));
+    let edit = Edit::ColorPicker;
+
+    draft.update(edit(Picker::Open(Target::Foreground, Some(original))));
+    let mut editor = draft.begin_custom_color().unwrap();
+    editor.update(Change::Mode(Mode::Web));
+    editor.update(Change::Hex("#12".into()));
+    drop(draft.finish_custom_color(&editor, true, false));
+    assert_eq!(
+        draft.connection().unwrap().terminal.foreground,
+        Some(original)
+    );
+    assert!(!draft.changed);
+    editor.update(Change::Hex(custom.to_string()));
+    drop(draft.finish_custom_color(&editor, false, false));
+    assert!(!draft.changed);
+
+    drop(draft.finish_custom_color(&editor, true, true));
+    assert!(draft.changed);
+    assert_eq!(
+        draft.connection().unwrap().terminal.foreground,
+        Some(custom)
+    );
+
+    draft.update(edit(Picker::Open(Target::Background, None)));
+    draft.update(edit(Picker::Select(None)));
+    let terminal = draft.connection().unwrap().terminal;
+    assert_eq!(terminal.foreground, Some(custom));
+    assert_eq!(terminal.background, None);
 }
 
 #[test]

@@ -87,6 +87,17 @@ impl ConnectionWindow {
         if let RowKey::Connection(id) | RowKey::Serial(id) = row {
             self.collapsed
                 .retain(|folder| !self.store.is_in_group(id, folder));
+        } else if let RowKey::Shared(ref identity) = row
+            && let Some(entry) = self.shared_entry(identity)
+        {
+            let path = entry.group.to_lowercase();
+            self.shared_collapsed.retain(|folder| {
+                !folder.is_empty()
+                    && folder != &path
+                    && path
+                        .strip_prefix(folder.as_str())
+                        .is_none_or(|rest| !rest.starts_with('/'))
+            });
         }
         self.badge_picker = None;
         self.dismiss_tree_context();
@@ -237,7 +248,7 @@ impl MapCanvas<'_> {
             RowKey::Serial(id) => self.window.selection.single_serial() == Some(*id),
             RowKey::Local(id) => self.window.selection.single_local() == Some(*id),
             RowKey::Shared(identity) => self.window.selection.single_shared() == Some(identity),
-            RowKey::Group(_) | RowKey::Empty => false,
+            RowKey::Group(_) | RowKey::SharedGroup(_) | RowKey::Empty => false,
         }
     }
 }

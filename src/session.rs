@@ -37,6 +37,8 @@ mod paste;
 pub(crate) use journal::journal_output_observer;
 mod recording;
 mod serial;
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+pub(crate) use serial::serial_test_pair;
 mod shell_activity;
 mod typewriter;
 #[cfg(windows)]
@@ -344,6 +346,21 @@ pub(crate) struct JournalAttachment {
     events: Sender<Event>,
     actor: thread::Thread,
     done: Receiver<()>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum JournalAttachStart {
+    Seeded,
+    Live,
+    Connected(JournalIsolation),
+    Reconnected(JournalIsolation),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum JournalIsolation {
+    None,
+    Process,
+    Sandboxed(&'static str),
 }
 
 impl JournalAttachment {
@@ -1217,6 +1234,24 @@ impl Session {
             .unwrap_or_else(|error| error.into_inner())
     }
 
+    pub(crate) fn journal_isolation(&self, local_process: bool) -> JournalIsolation {
+        if let Some(backend) = self.sandbox_backend() {
+            JournalIsolation::Sandboxed(backend)
+        } else if local_process
+            || matches!(
+                &self.backend,
+                Backend::Stream {
+                    exec: Some(crate::ssh_connection::ExecOpener::Worker(_)),
+                    ..
+                }
+            )
+        {
+            JournalIsolation::Process
+        } else {
+            JournalIsolation::None
+        }
+    }
+
     /// Reads the authoritative terminal without changing the displayed viewport.
     pub(crate) fn control_read(
         &self,
@@ -1465,7 +1500,7 @@ impl Session {
         &self,
         sink: crate::session_journal::Sink,
         policy: crate::terminal_logging::Policy,
-        seed: bool,
+        start: JournalAttachStart,
         capture_input: bool,
     ) -> Result<(JournalAttachment, Receiver<io::Result<()>>), InputError> {
         let Backend::Stream { events, actor, .. } = &self.backend else {
@@ -1484,7 +1519,7 @@ impl Session {
                 id,
                 sink,
                 policy,
-                seed,
+                start,
                 capture_input,
                 reply,
             }))
@@ -2241,7 +2276,7 @@ fn run_session(
         return Ok(());
     }
     let logging = match &mut source {
-        StreamSource::Pty { .. } => {
+        StreamSource::Pty { .. } | StreamSource::Serial { .. } => {
             state.journal.secrets = crate::terminal_logging::Secrets::default().seal().ok();
             None
         }
@@ -2332,9 +2367,7 @@ fn run_session(
                     .journal_secrets
                     .lock()
                     .unwrap_or_else(|error| error.into_inner()) = Some(secrets.clone());
-                shared
-                    .journal_available
-                    .store(terminal.supports_journal_output(), Ordering::Release);
+                shared.journal_available.store(true, Ordering::Release);
             }
             emulate(
                 &mut terminal,
@@ -2925,9 +2958,10 @@ fn emulate(
                             .and_then(|state| state.lock().ok()?.journal_prompt());
                         let permit = journal.permit(
                             terminal,
-                            prompt,
+                            prompt.map(|prompt| prompt.id),
                             applied_output,
-                            shared.output_activity.last_output() == applied_output,
+                            prompt.is_some_and(|prompt| prompt.accepts_input)
+                                && shared.output_activity.last_output() == applied_output,
                             &bytes,
                             enter,
                         );
@@ -3032,7 +3066,8 @@ fn emulate(
                     let prompt = shared
                         .shell_activity
                         .as_ref()
-                        .and_then(|state| state.lock().ok()?.journal_prompt());
+                        .and_then(|state| state.lock().ok()?.journal_prompt())
+                        .map(|prompt| prompt.id);
                     journal.command(terminal, command, prompt);
                     shared
                         .journal_input
@@ -5586,7 +5621,12 @@ int main(int argc, char **argv) {
         )
         .unwrap();
         let (attachment, attached) = session
-            .attach_journal_configured(capture.sink(), Default::default(), true, false)
+            .attach_journal_configured(
+                capture.sink(),
+                Default::default(),
+                JournalAttachStart::Seeded,
+                false,
+            )
             .unwrap();
         attached.recv_blocking().unwrap().unwrap();
         let mut note_policy = crate::terminal_logging::Policy::default();

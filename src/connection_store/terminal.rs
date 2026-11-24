@@ -135,6 +135,8 @@ impl From<Id> for ThemeOverride {
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct TerminalOverrides {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) style_preference: Option<TerminalStylePreference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) theme: Option<ThemeOverride>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) font_family: Option<String>,
@@ -207,6 +209,68 @@ pub(crate) struct TerminalAppearance {
     pub(crate) background: Option<Rgb>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) sgr_enabled: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub(crate) enum TerminalStylePreference {
+    Own,
+    Global(Box<TerminalStyle>),
+}
+
+/// The presentation and close behavior controlled by the saved SSH editor's settings source.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct TerminalStyle {
+    pub(crate) appearance: TerminalAppearance,
+    pub(crate) cursor: Option<Rgb>,
+    pub(crate) cursor_style: Option<CursorStyle>,
+    pub(crate) selection: Option<Rgb>,
+    pub(crate) ansi: [Option<Rgb>; 16],
+    pub(crate) bold: Option<BoldTextMode>,
+    pub(crate) scrollback_lines: Option<u32>,
+    pub(crate) scrollback_memory_mib: Option<u8>,
+    pub(crate) scrollback_compression: Option<bool>,
+    pub(crate) confirm_close: Option<bool>,
+    pub(crate) command_timestamps: Option<bool>,
+}
+
+impl TerminalStyle {
+    pub(crate) fn from_terminal(
+        terminal: &TerminalOverrides,
+        command_timestamps: Option<bool>,
+    ) -> Self {
+        Self {
+            appearance: TerminalAppearance::from_terminal(terminal),
+            cursor: terminal.cursor,
+            cursor_style: terminal.cursor_style,
+            selection: terminal.selection,
+            ansi: terminal.ansi,
+            bold: terminal.bold,
+            scrollback_lines: terminal.scrollback_lines,
+            scrollback_memory_mib: terminal.scrollback_memory_mib,
+            scrollback_compression: terminal.scrollback_compression,
+            confirm_close: terminal.confirm_close,
+            command_timestamps,
+        }
+    }
+
+    pub(crate) fn write_terminal(&self, terminal: &mut TerminalOverrides) {
+        self.appearance.write_terminal(terminal);
+        terminal.cursor = self.cursor;
+        terminal.cursor_style = self.cursor_style;
+        terminal.selection = self.selection;
+        terminal.ansi = self.ansi;
+        terminal.bold = self.bold;
+        terminal.scrollback_lines = self.scrollback_lines;
+        terminal.scrollback_memory_mib = self.scrollback_memory_mib;
+        terminal.scrollback_compression = self.scrollback_compression;
+        terminal.confirm_close = self.confirm_close;
+    }
+
+    pub(crate) fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 impl TerminalAppearance {
@@ -301,6 +365,11 @@ impl TerminalOverrides {
     }
 
     pub(crate) fn validate(&self) -> io::Result<()> {
+        if let Some(TerminalStylePreference::Global(retained)) = &self.style_preference {
+            let mut retained_values = Self::default();
+            retained.write_terminal(&mut retained_values);
+            retained_values.validate()?;
+        }
         if self
             .java_ai_profile
             .as_ref()

@@ -43,11 +43,13 @@ pub(crate) struct ViewChoices<'a> {
     pub(crate) vault_unlocked: bool,
     pub(crate) ai_profiles: &'a [(Option<u64>, ProfileRef, String)],
     pub(crate) java_ai_profiles: &'a [(crate::ai_manager::JavaProfileSource, ProfileRef, String)],
-    pub(crate) ai_skills: &'a [(u64, String)],
+    pub(crate) ai_skills: &'a [crate::ai_manager::ConnectionSkillChoice<'a>],
     pub(crate) ai_agent_designs: &'a [AgentDesignChoice],
     pub(crate) highlighting: HighlightChoices<'a>,
     pub(crate) themes: &'a Themes,
-    pub(crate) journal_max_parts: Option<u16>,
+    pub(crate) terminal_style: crate::connection_store::TerminalStyle,
+    pub(crate) journal_policy: super::JournalEditorPolicy,
+    pub(crate) logging_policy: crate::terminal_logging::ManagedFields,
     pub(crate) incognito_allowed: bool,
     pub(crate) serial_allowed: bool,
     pub(crate) terminal_effects: Option<&'a [Effect]>,
@@ -376,7 +378,7 @@ impl ConnectionWindow {
                 .view(
                     title,
                     &choices,
-                    self.editor_group_picker(super::local::Edit::Folder),
+                    self.editor_group_row(super::local::Edit::Folder),
                     inherited,
                 )
                 .map(Message::Local)
@@ -386,7 +388,7 @@ impl ConnectionWindow {
                 text_input("Name (defaults to port and speed)", &draft.name)
                     .on_input(Message::SerialName),
                 text_input("Tag", &draft.tag).on_input(Message::SerialTag),
-                self.editor_group_picker(Message::DraftGroup),
+                self.editor_group_row(Message::DraftGroup),
                 draft.form.editor_fields().map(Message::Serial),
                 row![
                     text("Paste line delay (ms)"),
@@ -404,10 +406,14 @@ impl ConnectionWindow {
                 ]
                 .spacing(8)
                 .align_y(iced::Alignment::Center),
-                draft
-                    .journal
-                    .view(choices.journal_max_parts)
-                    .map(Message::SerialJournal),
+                column![
+                    text("Session journal").size(16),
+                    draft
+                        .journal
+                        .view(choices.journal_policy)
+                        .map(Message::SerialJournal),
+                ]
+                .spacing(8),
                 row![
                     text("Keyword highlighting"),
                     super::terminal_overrides::highlight_picker(
@@ -437,7 +443,7 @@ impl ConnectionWindow {
             draft.view(
                 &choices,
                 &self.custom_badges,
-                self.editor_group_picker(Message::DraftGroup),
+                self.editor_group_picker(Message::DraftGroup, Some(draft.folder_picker_id())),
                 inherited,
             )
         };
@@ -453,6 +459,7 @@ impl ConnectionWindow {
                     .into()
             };
         let mut body = column![form].height(Length::Fill);
+        let focus_scope = self.draft.as_ref().and_then(|draft| draft.focus_scope());
         if !self.confirming_close && !self.busy {
             let valid = if let Some(draft) = &self.local_draft {
                 draft.profile().is_ok()
@@ -463,21 +470,28 @@ impl ConnectionWindow {
                     .as_ref()
                     .is_some_and(|draft| draft.connection().is_ok())
             };
+            let save_action = (!self.draft_conflict && valid).then_some(Message::Save);
+            let save = button("Save").on_press_maybe(save_action.clone());
+            let cancel = button(if self.draft.as_ref().is_some_and(|draft| draft.changed) {
+                "Discard draft"
+            } else {
+                "Cancel"
+            })
+            .style(button::secondary)
+            .on_press(Message::CancelEdit);
+            let (save, cancel) = if focus_scope.is_some() {
+                use crate::workspace::dialog_design::keyboard_table::action;
+                (
+                    action(save.into(), save_action, true),
+                    action(cancel.into(), Some(Message::CancelEdit), true),
+                )
+            } else {
+                (save.into(), cancel.into())
+            };
             body = body.push(rule::horizontal(1)).push(
-                row![
-                    space::horizontal(),
-                    button("Save")
-                        .on_press_maybe((!self.draft_conflict && valid).then_some(Message::Save)),
-                    button(if self.draft.as_ref().is_some_and(|draft| draft.changed) {
-                        "Discard draft"
-                    } else {
-                        "Cancel"
-                    })
-                    .style(button::secondary)
-                    .on_press(Message::CancelEdit),
-                ]
-                .spacing(8)
-                .padding([8, 16]),
+                row![space::horizontal(), save, cancel]
+                    .spacing(8)
+                    .padding([8, 16]),
             );
         }
         if let Some(notice) = &self.notice {
@@ -485,7 +499,24 @@ impl ConnectionWindow {
                 .push(rule::horizontal(1))
                 .push(container(text(notice).size(13)).padding([8, 16]));
         }
-        Some(body.into())
+        let body = if let Some(root) = focus_scope {
+            container(body).id(root).height(Length::Fill).into()
+        } else {
+            body.into()
+        };
+        Some(
+            if let Some(draft) = self
+                .draft
+                .as_ref()
+                .filter(|_| !self.confirming_close && !self.busy)
+            {
+                crate::workspace::dialog_design::on_key_press(body, |key, modifiers| {
+                    draft.tab_shortcut(key, modifiers)
+                })
+            } else {
+                body
+            },
+        )
     }
 
     pub(crate) fn view(&self, choices: ViewChoices<'_>) -> Element<'_, Message> {
@@ -498,11 +529,6 @@ impl ConnectionWindow {
             .flatten()
             .collect::<Vec<_>>()
             .join(" · ");
-        let teamwork_auth = self
-            .teamwork_auth
-            .as_ref()
-            .filter(|_| self.scope == Scope::Teamwork)
-            .map(|draft| self.teamwork_auth_bar(draft, &choices));
         let footer = row![
             button("Reload")
                 .style(button::text)
@@ -535,7 +561,7 @@ impl ConnectionWindow {
                         .height(Length::Fill)
                         .style(crate::workspace::dialog_design::sidebar),
                     rule::vertical(4),
-                    container(self.results(&zone))
+                    container(self.results(&zone, &choices))
                         .width(Length::Fill)
                         .height(Length::Fill)
                         .style(crate::workspace::dialog_design::page),
@@ -553,7 +579,6 @@ impl ConnectionWindow {
         column![
             self.toolbar(choices.serial_allowed),
             rule::horizontal(1),
-            teamwork_auth,
             panes,
             rule::horizontal(1),
             footer,
@@ -805,7 +830,7 @@ impl ConnectionWindow {
         let profiles = self.store.connections();
         let shared_count = self.shared_entries().count();
         let mut items = column![
-            heading("Library"),
+            sidebar_heading("Library"),
             self.scope_item(
                 Scope::All,
                 Icon::ViewList,
@@ -830,15 +855,8 @@ impl ConnectionWindow {
                 self.recent_entries().len(),
                 0
             ),
-            self.scope_item(
-                Scope::Teamwork,
-                Icon::Teamwork,
-                "Teamwork connections",
-                shared_count,
-                0
-            ),
         ]
-        .spacing(2);
+        .spacing(1);
         if self.open_counts.is_some() {
             items = items.push(
                 self.scope_item(
@@ -860,6 +878,10 @@ impl ConnectionWindow {
                             .local_profiles()
                             .iter()
                             .filter(|entry| self.open_count(entry.id) > 0)
+                            .count()
+                        + self
+                            .shared_entries()
+                            .filter(|entry| self.shared_open_count(entry.identity()) > 0)
                             .count(),
                     0,
                 ),
@@ -870,12 +892,13 @@ impl ConnectionWindow {
             profiles
                 .iter()
                 .map(|entry| entry.id)
-                .chain(self.store.serial_profiles().iter().map(|entry| entry.id)),
+                .chain(self.store.serial_profiles().iter().map(|entry| entry.id))
+                .chain(self.store.local_profiles().iter().map(|entry| entry.id)),
         );
         let mut folders: Vec<_> = self.store.groups().collect();
         folders.sort_by_cached_key(|path| path.to_lowercase());
         if !folders.is_empty() {
-            items = items.push(heading("Folders"));
+            items = items.push(sidebar_heading("Folders"));
             for path in folders {
                 let item = self.scope_item(
                     Scope::Group(path.to_owned()),
@@ -898,7 +921,7 @@ impl ConnectionWindow {
         if !tags.is_empty() {
             let chips = tags
                 .into_iter()
-                .fold(row![].spacing(5), |chips, (key, label)| {
+                .fold(row![].spacing(6), |chips, (key, label)| {
                     let scope = Scope::Tag(key);
                     chips.push(
                         button(chip(Icon::Tag, label))
@@ -913,12 +936,26 @@ impl ConnectionWindow {
                             })),
                     )
                 });
-            items = items.push(heading("Tags")).push(chips.wrap());
+            items = items.push(sidebar_heading("Tags")).push(chips.wrap());
         }
-        scrollable(items.padding(8))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
+        items = items
+            .push(sidebar_heading("Teamwork"))
+            .push(self.scope_item(
+                Scope::Teamwork,
+                Icon::Teamwork,
+                "Teamwork connections",
+                shared_count,
+                0,
+            ));
+        scrollable(items.padding(iced::Padding {
+            top: 6.0,
+            bottom: 10.0,
+            left: 6.0,
+            right: 6.0,
+        }))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
     }
 
     fn scope_item<'a>(
@@ -931,7 +968,6 @@ impl ConnectionWindow {
     ) -> Element<'a, Message> {
         button(
             row![
-                space::horizontal().width((indent * 14) as u32),
                 icon.widget(17, true),
                 text(label)
                     .size(14)
@@ -939,18 +975,27 @@ impl ConnectionWindow {
                     .wrapping(text::Wrapping::None),
                 text(count.to_string()).size(12).style(text::secondary),
             ]
-            .spacing(7)
+            .spacing(8)
             .align_y(Alignment::Center),
         )
         .style(selectable(self.scope == scope))
         .width(Length::Fill)
-        .padding([5, 7])
+        .padding(iced::Padding {
+            top: 4.0,
+            bottom: 4.0,
+            left: 8.0 + indent as f32 * 16.0,
+            right: 8.0,
+        })
         .clip(true)
         .on_press_maybe(self.can_browse().then_some(Message::Scope(scope)))
         .into()
     }
 
-    fn results<'a>(&'a self, zone: &DragZone<'a>) -> Element<'a, Message> {
+    fn results<'a>(
+        &'a self,
+        zone: &DragZone<'a>,
+        choices: &ViewChoices<'_>,
+    ) -> Element<'a, Message> {
         let entries = self.visible_entries();
         let count = entries.len();
         let scope = match &self.scope {
@@ -997,15 +1042,23 @@ impl ConnectionWindow {
         .spacing(10)
         .align_y(Alignment::Center)
         .padding([10, 12]);
+        let mut body = column![header].height(Length::Fill);
+        if self.scope == Scope::Teamwork
+            && let Some(draft) = &self.teamwork_auth
+        {
+            body = body.push(
+                container(
+                    scrollable(self.teamwork_auth_bar(draft, choices)).height(Length::Shrink),
+                )
+                .max_height(200),
+            );
+        }
         if self.network_map.visible {
-            return column![header, self.network_map_view(count)]
-                .height(Length::Fill)
-                .into();
+            return body.push(self.network_map_view(count)).into();
         }
         let rows = self.visible_rows(entries);
         let has_rows = !rows.is_empty();
         let mut list = column![].spacing(1);
-        let mut shared_group = None;
         for entry in rows {
             let (source, folder) = match &entry {
                 VisualRow::Connection(connection, _) => {
@@ -1021,19 +1074,19 @@ impl ConnectionWindow {
                 }
                 VisualRow::Serial(profile, indent) => self.serial_row(profile, indent),
                 VisualRow::Local(profile, indent) => self.local_row(profile, indent),
-                VisualRow::Shared(entry) => {
-                    if self.scope != Scope::Recent && shared_group != Some(&entry.group) {
-                        list = list.push(heading(teamwork::group_title(&entry.group)));
-                        shared_group = Some(&entry.group);
-                    }
-                    self.shared_row(entry)
-                }
+                VisualRow::Shared(entry, indent) => self.shared_row(entry, indent),
                 VisualRow::Group {
                     path,
                     indent,
                     count,
                     collapsed,
                 } => self.group_row(path, indent, count, collapsed),
+                VisualRow::SharedGroup {
+                    path,
+                    indent,
+                    count,
+                    collapsed,
+                } => self.shared_group_row(path, indent, count, collapsed),
             };
             list = list.push(
                 if self.can_move_folders() && (source.is_some() || folder.is_some()) {
@@ -1066,7 +1119,7 @@ impl ConnectionWindow {
         } else {
             self.tree_context_view(&RowKey::Empty, list)
         };
-        column![header, list].height(Length::Fill).into()
+        body.push(list).into()
     }
 
     fn group_row<'a>(
@@ -1230,6 +1283,7 @@ impl ConnectionWindow {
         } else if let Some(entry) = self.selected_shared() {
             let endpoint = &entry.connection.login.endpoint;
             let blocked = entry.connection.blocked_server(&self.server_access);
+            let open = self.shared_open_count(entry.identity());
             column![
                 text(&entry.connection.name).size(21),
                 row![Icon::Teamwork.widget(17, true), text("Shared (Teamwork)")].spacing(6),
@@ -1238,6 +1292,7 @@ impl ConnectionWindow {
                     endpoint.username, endpoint.host, endpoint.port
                 )),
                 text(format!("Source  {}", entry.source())).size(13),
+                fact("Open tabs", open.to_string()),
                 blocked.map(|(host, port)| text(server_policy_note(host, port)).size(13)),
                 entry.last_used_at.map(|millis| {
                     let when = jiff::Timestamp::from_millisecond(millis as i64).map_or_else(
@@ -1346,10 +1401,53 @@ impl ConnectionWindow {
         container(contents).padding(16).width(Length::Fill).into()
     }
 
-    fn shared_row<'a>(&'a self, entry: &'a teamwork::Entry) -> Element<'a, Message> {
+    fn shared_group_row<'a>(
+        &'a self,
+        path: &'a str,
+        indent: usize,
+        count: usize,
+        collapsed: bool,
+    ) -> Element<'a, Message> {
+        let key = path.to_lowercase();
+        let row_key = RowKey::SharedGroup(key.clone());
+        let (icon, label) = if path.is_empty() {
+            (Icon::Teamwork, "Teamwork connections")
+        } else {
+            (Icon::Folder, basename(path))
+        };
+        let base = row![
+            space::horizontal().width((10 + indent * 20) as u32),
+            button(if collapsed { "▸" } else { "▾" })
+                .style(button::text)
+                .padding(2)
+                .on_press_maybe(
+                    self.can_browse()
+                        .then(|| Message::ToggleSharedGroup(key.clone()))
+                ),
+            button(
+                row![
+                    icon.widget(17, true),
+                    text(label).size(15).wrapping(text::Wrapping::None),
+                    text(count.to_string()).size(12).style(text::secondary),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center)
+            )
+            .style(selectable(self.selection.contains(&row_key)))
+            .clip(true)
+            .width(Length::Fill)
+            .on_press_maybe(self.can_browse().then_some(Message::SelectSharedGroup(key))),
+        ]
+        .align_y(Alignment::Center)
+        .into();
+        self.tree_context_view(&row_key, base)
+    }
+
+    fn shared_row<'a>(&'a self, entry: &'a teamwork::Entry, indent: usize) -> Element<'a, Message> {
         let endpoint = &entry.connection.login.endpoint;
         let key = RowKey::Shared(entry.identity.clone());
         let blocked = entry.connection.blocked_server(&self.server_access);
+        let open = self.shared_open_count(entry.identity());
         let name = text(&entry.connection.name)
             .size(15)
             .wrapping(text::Wrapping::None);
@@ -1369,16 +1467,23 @@ impl ConnectionWindow {
                         .wrapping(text::Wrapping::None),
                 ]
                 .spacing(1),
+                (!entry.connection.tag.is_empty()).then(|| chip(Icon::Tag, &entry.connection.tag)),
                 self.store
                     .is_teamwork_favorite(entry.identity())
                     .then(|| Icon::Star.widget(16, true)),
+                (open > 0).then(|| text(format!("{open} open")).size(12)),
                 blocked.map(|(host, port)| blocked_server_badge(host, port)),
             ]
             .align_y(Alignment::Center)
             .spacing(9),
         )
         .width(Length::Fill)
-        .padding([5, 18])
+        .padding(iced::Padding {
+            top: 5.0,
+            bottom: 5.0,
+            left: 18.0 + indent as f32 * 20.0,
+            right: 18.0,
+        })
         .clip(true)
         .style(selectable(self.selection.contains(&key)))
         .on_press_maybe(
@@ -1389,9 +1494,23 @@ impl ConnectionWindow {
         self.tree_context_view(&key, base)
     }
 
+    fn editor_group_row<Msg: Clone + 'static>(
+        &self,
+        edit: fn(Option<String>) -> Msg,
+    ) -> Element<'_, Msg> {
+        row![
+            text("Folder").size(14),
+            self.editor_group_picker(edit, None)
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .into()
+    }
+
     fn editor_group_picker<Msg: Clone + 'static>(
         &self,
         edit: fn(Option<String>) -> Msg,
+        keyboard: Option<iced::widget::Id>,
     ) -> Element<'_, Msg> {
         let options: Vec<_> = std::iter::once(GroupChoice(None))
             .chain(
@@ -1401,16 +1520,14 @@ impl ConnectionWindow {
             )
             .collect();
         let selected = GroupChoice(self.draft_group.clone());
-        row![
-            text("Folder").size(14),
-            pick_list(options, Some(selected), move |choice: GroupChoice| edit(
-                choice.0
-            ))
-            .width(Length::Fill),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center)
-        .into()
+        let picker = pick_list(options, Some(selected), move |choice: GroupChoice| {
+            edit(choice.0)
+        });
+        if let Some(id) = keyboard {
+            picker.width(300).keyboard_navigation(id).into()
+        } else {
+            picker.width(Length::Fill).into()
+        }
     }
 
     fn serial_row<'a>(&'a self, profile: &'a SerialProfile, indent: usize) -> Element<'a, Message> {
@@ -1984,6 +2101,25 @@ fn favorite_tool(favorite: bool, enabled: bool) -> Element<'static, Message> {
     )
 }
 
+fn sidebar_heading(label: &'static str) -> Element<'static, Message> {
+    container(
+        text(label)
+            .size(12)
+            .style(text::secondary)
+            .font(iced::Font {
+                weight: iced::font::Weight::Bold,
+                ..iced::Font::DEFAULT
+            }),
+    )
+    .padding(iced::Padding {
+        top: 10.0,
+        bottom: 3.0,
+        left: 8.0,
+        right: 8.0,
+    })
+    .into()
+}
+
 fn heading<'a>(label: impl text::IntoFragment<'a>) -> Element<'a, Message> {
     container(text(label).size(12).style(text::secondary))
         .padding(iced::Padding {
@@ -2054,7 +2190,7 @@ fn blocked_server_badge(host: &str, port: u16) -> Element<'_, Message> {
     .into()
 }
 
-fn selectable(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+pub(super) fn selectable(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |theme, status| {
         let base = button::text(theme, status);
         if active {
@@ -2148,7 +2284,9 @@ fn teamwork_auth_picker_displays_missing_references_without_offering_them() {
         ai_agent_designs: &[],
         highlighting: HighlightChoices::default(),
         themes: &Themes::default(),
-        journal_max_parts: None,
+        terminal_style: Default::default(),
+        journal_policy: super::JournalEditorPolicy::default(),
+        logging_policy: Default::default(),
         incognito_allowed: true,
         serial_allowed: true,
         terminal_effects: None,

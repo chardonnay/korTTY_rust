@@ -29,6 +29,7 @@ iced_runtime = "0.14"
 iced_tiny_skia = { version = "0.14", default-features = false }
 image = { version = "0.25.10", default-features = false, features = ["bmp", "gif", "jpeg", "png"] }
 jiff = { version = "0.2.39", default-features = false, features = ["std", "tz-system"] }
+memchr = "2"
 kortty-control = { path = "crates/control" }
 kortty-diagram = { path = "crates/diagram" }
 kortty-ibm = { path = "crates/ibm" }

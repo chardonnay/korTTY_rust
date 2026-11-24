@@ -57,6 +57,7 @@ mod highlight_settings;
 mod logging_settings;
 mod quick_select_settings;
 mod search_input;
+mod section_tabs;
 pub(super) mod sftp_settings;
 mod snippet_editor_settings;
 mod startup_settings;
@@ -177,7 +178,13 @@ pub enum Setting {
     FontSize,
     Colors,
     Themes,
-    Appearance,
+    AppDesign,
+    PreviousAppDesign,
+    NextAppDesign,
+    DesignAnimations,
+    UiFontScale,
+    UiFontScaleAuto,
+    ChatColorProfile,
     PasteWarning,
     LargePasteWarning,
     PasteLineDelay,
@@ -189,9 +196,12 @@ pub enum Setting {
     RemoteSidebar,
     SftpParallel,
     SftpResume,
+    SftpKeepPartial,
     SftpConflictDefault,
     SftpArchive,
+    SftpArchiveCompression,
     SftpIdle,
+    SftpIdleMinutes,
     InitialTerminalSize,
     SerialDefaultEncoding,
     SshDefaultEncoding,
@@ -278,7 +288,13 @@ impl Setting {
         Self::FontSize,
         Self::Colors,
         Self::Themes,
-        Self::Appearance,
+        Self::AppDesign,
+        Self::PreviousAppDesign,
+        Self::NextAppDesign,
+        Self::DesignAnimations,
+        Self::UiFontScale,
+        Self::UiFontScaleAuto,
+        Self::ChatColorProfile,
         Self::PasteWarning,
         Self::LargePasteWarning,
         Self::PasteLineDelay,
@@ -290,9 +306,12 @@ impl Setting {
         Self::RemoteSidebar,
         Self::SftpParallel,
         Self::SftpResume,
+        Self::SftpKeepPartial,
         Self::SftpConflictDefault,
         Self::SftpArchive,
+        Self::SftpArchiveCompression,
         Self::SftpIdle,
+        Self::SftpIdleMinutes,
         Self::InitialTerminalSize,
         Self::SerialDefaultEncoding,
         Self::SshDefaultEncoding,
@@ -379,7 +398,13 @@ impl Setting {
             Self::FontSize => "Terminal font size",
             Self::Colors => "Terminal colors",
             Self::Themes => "Terminal themes",
-            Self::Appearance => "App design and animations",
+            Self::AppDesign => "App Design",
+            Self::PreviousAppDesign => "Previous design",
+            Self::NextAppDesign => "Next design",
+            Self::DesignAnimations => "Enable design animations",
+            Self::UiFontScale => "UI font size",
+            Self::UiFontScaleAuto => "Match display resolution",
+            Self::ChatColorProfile => "Chat color profile",
             Self::PasteWarning => "Warn about line breaks and control characters",
             Self::LargePasteWarning => "Warn about pastes larger than",
             Self::PasteLineDelay => "Pause between pasted lines",
@@ -396,10 +421,13 @@ impl Setting {
             Self::CommandTimestamps => "Show command timestamps",
             Self::RemoteSidebar => "Remote files sidebar",
             Self::SftpParallel => "Parallel file transfers",
-            Self::SftpResume => "Resume partial transfers",
+            Self::SftpResume => "Resume interrupted transfers",
+            Self::SftpKeepPartial => "Keep the partial file when a transfer is cancelled",
             Self::SftpConflictDefault => "Default transfer conflict action",
-            Self::SftpArchive => "Archive defaults",
-            Self::SftpIdle => "Close SFTP after inactivity",
+            Self::SftpArchive => "Default ZIP path",
+            Self::SftpArchiveCompression => "Default ZIP compression (0–9)",
+            Self::SftpIdle => "Auto-close SFTP tabs after inactivity",
+            Self::SftpIdleMinutes => "SFTP timeout (minutes)",
             Self::InitialTerminalSize => "Initial terminal size",
             Self::SerialDefaultEncoding => "Default serial character encoding",
             Self::SshDefaultEncoding => "Default SSH character encoding",
@@ -492,14 +520,23 @@ impl Setting {
             Self::FontFamily | Self::FontSize => Section::Font,
             Self::Colors => Section::Colors,
             Self::Themes => Section::Themes,
-            Self::Appearance => Section::Appearance,
+            Self::AppDesign
+            | Self::PreviousAppDesign
+            | Self::NextAppDesign
+            | Self::DesignAnimations
+            | Self::UiFontScale
+            | Self::UiFontScaleAuto
+            | Self::ChatColorProfile => Section::Appearance,
             Self::AgentDesign => Section::AgentDesign,
             Self::ApplicationUpdates | Self::ApplicationUpdateInterval => Section::Updates,
             Self::SftpParallel
             | Self::SftpResume
+            | Self::SftpKeepPartial
             | Self::SftpConflictDefault
             | Self::SftpArchive
-            | Self::SftpIdle => Section::Sftp,
+            | Self::SftpArchiveCompression
+            | Self::SftpIdle
+            | Self::SftpIdleMinutes => Section::Sftp,
             Self::PasteWarning
             | Self::LargePasteWarning
             | Self::PasteLineDelay
@@ -591,7 +628,13 @@ impl Setting {
                 "color profile palette foreground background cursor blink selection ANSI SGR TrueColor"
             }
             Self::Themes => "palette background foreground cursor colors appearance light dark",
-            Self::Appearance => "windows dialogs menus toolbar theme light dark reduced motion",
+            Self::AppDesign => "application design windows dialogs menus toolbar theme light dark",
+            Self::PreviousAppDesign => "previous app design",
+            Self::NextAppDesign => "next app design",
+            Self::DesignAnimations => "animation reduced motion transitions",
+            Self::UiFontScale => "application chrome menus labels manual text scaling percentage",
+            Self::UiFontScaleAuto => "automatic UI font size primary monitor DPI HiDPI",
+            Self::ChatColorProfile => "AI Chat Swarm palette theme",
             Self::PasteWarning => {
                 "paste safety protection multiline bracketed escape bidi confirmation"
             }
@@ -606,12 +649,15 @@ impl Setting {
             Self::SftpParallel => {
                 "sftp simultaneous parallel uploads downloads transfer queue channels"
             }
-            Self::SftpResume => "sftp resume interrupted partial cancel upload download",
+            Self::SftpResume => "sftp resume interrupted partial upload download",
+            Self::SftpKeepPartial => "sftp transfer partial cancellation cancel keep retain",
             Self::SftpConflictDefault => {
                 "sftp default conflict ask skip overwrite replace existing files"
             }
-            Self::SftpArchive => "sftp archive remote destination path zip compression level",
-            Self::SftpIdle => "sftp idle auto close inactive timeout minutes",
+            Self::SftpArchive => "sftp archive remote destination directory path zip",
+            Self::SftpArchiveCompression => "sftp archive compression level zip",
+            Self::SftpIdle => "sftp idle auto close inactive enable",
+            Self::SftpIdleMinutes => "sftp auto close timeout duration minutes",
             Self::InitialTerminalSize => {
                 "initial terminal grid dimensions columns rows pty shell ssh"
             }
@@ -787,6 +833,9 @@ pub enum Message {
     Theme(window::Id, theme_settings::Edit),
     Design(window::Id, Design),
     DesignAnimations(window::Id, bool),
+    UiFontScaleStep(window::Id, bool),
+    UiFontScaleAuto(window::Id, bool),
+    ChatColorProfile(window::Id, super::chat_appearance::Profile),
     AgentDesignCatalog(window::Id, agent_design_settings::Edit),
     AgentDesignName(window::Id, agent_design_name::Action),
     ApplicationUpdates(window::Id, bool),
@@ -816,15 +865,13 @@ pub enum Message {
     AutomaticLocalShellIntegration(window::Id, bool),
     CommandTimestamps(window::Id, bool),
     RemoteSidebar(window::Id, RemoteSidebarPosition),
-    SftpParallel(window::Id, u8),
+    SftpNumber(window::Id, sftp_settings::Number, String),
     SftpResume(window::Id, bool),
     SftpKeepPartial(window::Id, bool),
     SftpXml(window::Id, sftp_settings::java::Action),
     SftpConflictDefault(window::Id, ConflictDefault),
     SftpArchiveDirectory(window::Id, String),
-    SftpArchiveLevel(window::Id, u8),
     SftpIdleEnabled(window::Id, bool),
-    SftpIdleMinutes(window::Id, u16),
     TerminalColumns(window::Id, String),
     TerminalRows(window::Id, String),
     SerialDefaultEncoding(window::Id, TextEncoding),
@@ -908,6 +955,15 @@ impl Draft {
         }
         if edit.appearance.animations != before.appearance.animations {
             current.appearance.animations = edit.appearance.animations;
+        }
+        if edit.appearance.ui_font_scale_percent != before.appearance.ui_font_scale_percent {
+            current.appearance.ui_font_scale_percent = edit.appearance.ui_font_scale_percent;
+        }
+        if edit.appearance.ui_font_scale_auto != before.appearance.ui_font_scale_auto {
+            current.appearance.ui_font_scale_auto = edit.appearance.ui_font_scale_auto;
+        }
+        if edit.appearance.chat_color_profile != before.appearance.chat_color_profile {
+            current.appearance.chat_color_profile = edit.appearance.chat_color_profile;
         }
         if edit.ai_agent_design != before.ai_agent_design {
             current.ai_agent_design = edit.ai_agent_design;
@@ -1169,13 +1225,16 @@ struct Dialog {
     draft: Draft,
     sandbox_availability: Option<String>,
     installed_sftp_conflict_policy: SftpConflictPolicy,
+    sftp_numbers: sftp_settings::Numbers,
     sftp_xml: sftp_settings::java::Exchange,
     initial_highlighting: highlight::Preferences,
     highlighting: highlight::Preferences,
     section: Section,
     search_input: widget::Id,
     search_scroll: widget::Id,
+    focus_scope: widget::Id,
     tab_scroll: widget::Id,
+    tab_menu: widget::Id,
     selected_tab: widget::Id,
     page_scroll: widget::Id,
     revealed_row: widget::Id,
@@ -1353,6 +1412,14 @@ impl Dialog {
         }
         None
     }
+
+    fn reveal_invalid_sftp_number(&mut self, policy: SftpConflictPolicy) -> Option<Task<Desktop>> {
+        let setting = self
+            .sftp_numbers
+            .first_problem(&self.draft.preferences, policy)?;
+        self.problem = None;
+        Some(self.reveal_result(setting))
+    }
 }
 
 #[derive(Default)]
@@ -1458,6 +1525,22 @@ impl Workspace {
             widget::operation::focus(dialog.search_input.clone())
                 .chain(widget::operation::select_all(dialog.search_input.clone())),
         )
+    }
+
+    pub(super) fn focus_settings_next(
+        &self,
+        id: window::Id,
+        backwards: bool,
+    ) -> Option<Task<Desktop>> {
+        use iced::advanced::widget::operation::{focusable, scope};
+        let dialog = self.settings.0.as_ref().filter(|dialog| dialog.id == id)?;
+        let root = dialog.focus_scope.clone();
+        let action = if backwards {
+            iced_runtime::Action::widget(scope(root, focusable::focus_previous()))
+        } else {
+            iced_runtime::Action::widget(scope(root, focusable::focus_next()))
+        };
+        Some(iced_runtime::task::effect(action))
     }
 
     pub(super) fn update_settings(&mut self, message: Message) -> Task<Desktop> {
@@ -1609,6 +1692,9 @@ impl Workspace {
             | Message::Export(id, _)
             | Message::Design(id, _)
             | Message::DesignAnimations(id, _)
+            | Message::UiFontScaleStep(id, _)
+            | Message::UiFontScaleAuto(id, _)
+            | Message::ChatColorProfile(id, _)
             | Message::AgentDesignCatalog(id, _)
             | Message::ApplicationUpdates(id, _)
             | Message::ApplicationUpdateInterval(id, _)
@@ -1628,15 +1714,13 @@ impl Workspace {
             | Message::AutomaticLocalShellIntegration(id, _)
             | Message::CommandTimestamps(id, _)
             | Message::RemoteSidebar(id, _)
-            | Message::SftpParallel(id, _)
+            | Message::SftpNumber(id, _, _)
             | Message::SftpResume(id, _)
             | Message::SftpKeepPartial(id, _)
             | Message::SftpXml(id, _)
             | Message::SftpConflictDefault(id, _)
             | Message::SftpArchiveDirectory(id, _)
-            | Message::SftpArchiveLevel(id, _)
             | Message::SftpIdleEnabled(id, _)
-            | Message::SftpIdleMinutes(id, _)
             | Message::TerminalColumns(id, _)
             | Message::TerminalRows(id, _)
             | Message::SerialDefaultEncoding(id, _)
@@ -1808,6 +1892,32 @@ impl Workspace {
                 dialog.draft.preferences.appearance.animations = Some(enabled);
                 dialog.problem = None;
             }
+            Message::UiFontScaleStep(_, larger)
+                if dialog.section == Section::Appearance
+                    && !dialog
+                        .draft
+                        .preferences
+                        .appearance
+                        .ui_font_scale_auto
+                        .unwrap_or(false) =>
+            {
+                let appearance = &mut dialog.draft.preferences.appearance;
+                appearance.ui_font_scale_percent =
+                    Some(super::ui_font_scale::step(*appearance, larger));
+                dialog.problem = None;
+            }
+            Message::UiFontScaleAuto(_, auto) if dialog.section == Section::Appearance => {
+                dialog.draft.preferences.appearance.ui_font_scale_auto = Some(auto);
+                dialog.problem = None;
+                if auto {
+                    return iced_runtime::window::primary_monitor_size(dialog.owner)
+                        .map(Desktop::UiDisplaySize);
+                }
+            }
+            Message::ChatColorProfile(_, profile) if dialog.section == Section::Appearance => {
+                dialog.draft.preferences.appearance.chat_color_profile = Some(profile);
+                dialog.problem = None;
+            }
             Message::EditorCaret(_, edit) if dialog.section == Section::Editor => {
                 editor_settings::update(dialog, edit);
                 dialog.problem = None;
@@ -1964,17 +2074,14 @@ impl Workspace {
             Message::RemoteSidebar(_, position) => {
                 dialog.draft.preferences.remote_sidebar_position = position;
             }
-            Message::SftpParallel(_, parallel) if dialog.section == Section::Sftp => {
+            Message::SftpNumber(_, number, input) if dialog.section == Section::Sftp => {
                 dialog.installed_sftp_conflict_policy = SftpConflictPolicy::load();
                 let policy = dialog
                     .installed_sftp_conflict_policy
                     .restrict(&self.clipboard.policy);
-                if policy.transfer_allowed
-                    && policy.parallel_cap > 1
-                    && (1..=policy.parallel_cap).contains(&parallel)
-                {
-                    dialog.draft.preferences.sftp_parallel_transfers = parallel;
-                }
+                dialog
+                    .sftp_numbers
+                    .update(&mut dialog.draft.preferences, policy, number, input);
             }
             Message::SftpResume(_, enabled) if dialog.section == Section::Sftp => {
                 dialog.installed_sftp_conflict_policy = SftpConflictPolicy::load();
@@ -2012,6 +2119,7 @@ impl Workspace {
                     if policy.parallel_cap > 1 {
                         preferences.sftp_parallel_transfers =
                             imported.parallel.min(policy.parallel_cap);
+                        dialog.sftp_numbers.clear(sftp_settings::Number::Parallel);
                     }
                     preferences.sftp_resume_partial_transfers = imported.resume;
                     preferences.sftp_keep_partial_on_cancel = imported.keep;
@@ -2020,6 +2128,9 @@ impl Workspace {
                     }
                     if let Some(level) = imported.archive_level {
                         preferences.sftp_archive.level = level;
+                        dialog
+                            .sftp_numbers
+                            .clear(sftp_settings::Number::Compression);
                     }
                 }
                 return task.map(move |action| Desktop::Settings(Message::SftpXml(id, action)));
@@ -2035,25 +2146,14 @@ impl Workspace {
                 }
             }
             Message::SftpIdleEnabled(_, enabled) if dialog.section == Section::Sftp => {
-                dialog.draft.preferences.sftp_idle_minutes =
-                    enabled.then_some(dialog.draft.preferences.sftp_idle_minutes.unwrap_or(10));
+                dialog
+                    .sftp_numbers
+                    .set_idle_enabled(&mut dialog.draft.preferences, enabled);
             }
             Message::SftpArchiveDirectory(_, path)
                 if dialog.section == Section::Sftp && path.len() <= 4096 =>
             {
                 dialog.draft.preferences.sftp_archive.remote_directory = path;
-            }
-            Message::SftpArchiveLevel(_, level)
-                if dialog.section == Section::Sftp && level <= 9 =>
-            {
-                dialog.draft.preferences.sftp_archive.level = level;
-            }
-            Message::SftpIdleMinutes(_, minutes)
-                if dialog.section == Section::Sftp
-                    && dialog.draft.preferences.sftp_idle_minutes.is_some()
-                    && (1..=profile::RemoteProjectTool::MAX_IDLE_MINUTES).contains(&minutes) =>
-            {
-                dialog.draft.preferences.sftp_idle_minutes = Some(minutes);
             }
             Message::TerminalColumns(_, value) if dialog.section == Section::Terminal => {
                 update_grid_dimension(
@@ -2394,7 +2494,14 @@ impl Workspace {
                 size: if standalone_agent_design {
                     agent_design_size
                 } else {
-                    Size::new(1120.0, 1080.0)
+                    super::ui_font_scale::dialog_size(
+                        Size::new(1120.0, 1080.0),
+                        super::ui_font_scale::ratio(
+                            self.window_settings.appearance,
+                            self.ui_display_size,
+                        ),
+                        self.ui_display_size,
+                    )
                 },
                 min_size: Some(if standalone_agent_design {
                     agent_design_minimum
@@ -2415,13 +2522,16 @@ impl Workspace {
             draft,
             sandbox_availability: None,
             installed_sftp_conflict_policy: SftpConflictPolicy::load(),
+            sftp_numbers: sftp_settings::Numbers::default(),
             sftp_xml: sftp_settings::java::Exchange::default(),
             initial_highlighting: highlighting.clone(),
             highlighting,
             section: section.unwrap_or(Section::Font),
             search_input: widget::Id::unique(),
             search_scroll: widget::Id::unique(),
+            focus_scope: widget::Id::unique(),
             tab_scroll: widget::Id::unique(),
+            tab_menu: widget::Id::unique(),
             selected_tab: widget::Id::unique(),
             page_scroll: widget::Id::unique(),
             revealed_row: widget::Id::unique(),
@@ -2459,6 +2569,27 @@ impl Workspace {
                 .as_ref()
                 .map_or_else(Task::none, Dialog::reveal_tab),
         );
+        #[cfg(all(debug_assertions, feature = "dialog-preview"))]
+        let reveal = if section == Some(Section::Sftp) {
+            if let Some(path) = std::env::var_os("KORTTY_SFTP_FIXTURE_FRAME") {
+                reveal.chain(window::screenshot(id).then(move |frame| {
+                    if let Err(error) = image::save_buffer(
+                        &path,
+                        &frame.rgba,
+                        frame.size.width,
+                        frame.size.height,
+                        image::ColorType::Rgba8,
+                    ) {
+                        eprintln!("could not save SFTP fixture frame: {error}");
+                    }
+                    Task::none()
+                }))
+            } else {
+                reveal
+            }
+        } else {
+            reveal
+        };
         if standalone_agent_design {
             reveal
         } else {
@@ -2502,6 +2633,13 @@ impl Workspace {
             return Task::none();
         };
         if let Some(reveal) = dialog.reveal_invalid_input() {
+            return reveal;
+        }
+        dialog.installed_sftp_conflict_policy = SftpConflictPolicy::load();
+        let policy = dialog
+            .installed_sftp_conflict_policy
+            .restrict(&self.clipboard.policy);
+        if let Some(reveal) = dialog.reveal_invalid_sftp_number(policy) {
             return reveal;
         }
         if dialog.logging.browsing() || dialog.backup.browsing() {
@@ -2723,6 +2861,9 @@ impl Workspace {
             .installed_sftp_conflict_policy
             .restrict(&self.clipboard.policy);
         if let Some(reveal) = dialog.reveal_invalid_input() {
+            return reveal;
+        }
+        if let Some(reveal) = dialog.reveal_invalid_sftp_number(sftp_conflict_policy) {
             return reveal;
         }
         if dialog.themes.editing() {
@@ -3298,34 +3439,11 @@ impl Workspace {
             .width(Length::Fill),
         ]
         .align_y(Alignment::Center);
-        let conflicts = dialog.draft.preferences.key_bindings.conflicts().len();
-        let tabs = Section::ALL.into_iter().fold(row![], |row, section| {
-            let label = text(section.label()).size(13);
-            let selected = dialog.section == section;
-            let tab = container(
-                button(if section == Section::Keyboard && conflicts != 0 {
-                    row![label, text(conflicts).size(13).style(text::danger)].spacing(5)
-                } else {
-                    row![label]
-                })
-                .padding([8, 15])
-                .style(move |theme, status| dialog_design::tab(theme, status, selected))
-                .on_press(msg(Message::Section(id, section))),
-            );
-            row.push(if selected {
-                tab.id(dialog.selected_tab.clone())
-            } else {
-                tab
-            })
-        });
-        let tabs = scrollable(tabs)
-            .id(dialog.tab_scroll.clone())
-            .direction(scrollable::Direction::Horizontal(
-                scrollable::Scrollbar::new().width(4).scroller_width(4),
-            ))
-            .width(Length::Fill);
+        let tabs = section_tabs::view(dialog);
+        let ui_scale =
+            super::ui_font_scale::ratio(self.window_settings.appearance, self.ui_display_size);
         let page = match dialog.section {
-            Section::Font => font_settings_page(dialog),
+            Section::Font => font_settings_page(dialog, ui_scale),
             Section::Colors => highlighted(
                 dialog,
                 Setting::Colors,
@@ -3349,11 +3467,9 @@ impl Workspace {
                     )
                     .map(move |edit| msg(Message::Theme(id, edit))),
             ),
-            Section::Appearance => highlighted(
-                dialog,
-                Setting::Appearance,
-                appearance_settings::view(dialog.draft.preferences.appearance, id).map(msg),
-            ),
+            Section::Appearance => {
+                appearance_settings::view(dialog, self.ui_display_size, ui_scale)
+            }
             Section::Terminal => self.terminal_settings_page(dialog),
             Section::Sftp => self.sftp_settings_page(dialog),
             Section::Messaging => messaging_settings_page(
@@ -3528,6 +3644,11 @@ impl Workspace {
             .highlight_rules_for_settings(id)
             .map(|id| Desktop::Highlight(highlight::Message::Focus(id)))
             .or(naming_modal);
+        let content = container(content)
+            .id(dialog.focus_scope.clone())
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
         Some(super::profile_tools::vault_modal::gate(content, modal))
     }
 
@@ -4480,7 +4601,7 @@ fn messaging_settings_page(
     .into()
 }
 
-fn font_settings_page(dialog: &Dialog) -> Element<'_, Desktop> {
+fn font_settings_page(dialog: &Dialog, ui_scale: f32) -> Element<'_, Desktop> {
     let id = dialog.id;
     let preferences = &dialog.draft.preferences;
     let family = preferences
@@ -4496,7 +4617,7 @@ fn font_settings_page(dialog: &Dialog) -> Element<'_, Desktop> {
                 .size(10)
                 .line_height(iced::widget::text::LineHeight::Absolute(13.0.into())),
         )
-        .width(24)
+        .width(24.0 * ui_scale)
         .padding([0, 4])
         .style(button::secondary)
         .on_press_maybe(message)
@@ -4506,13 +4627,13 @@ fn font_settings_page(dialog: &Dialog) -> Element<'_, Desktop> {
             dialog,
             Setting::FontFamily,
             row![
-                text("Font Family:").size(13).width(70),
+                text("Font Family:").size(13).width(70.0 * ui_scale),
                 pick_list(
                     installed_families(),
                     Some(family.to_owned()),
                     move |value| { Desktop::Settings(Message::FontFamily(id, value)) }
                 )
-                .width(200)
+                .width(200.0 * ui_scale)
                 .text_size(13),
             ]
             .spacing(10)
@@ -4524,7 +4645,7 @@ fn font_settings_page(dialog: &Dialog) -> Element<'_, Desktop> {
             dialog,
             Setting::FontSize,
             row![
-                text("Font Size:").size(13).width(70),
+                text("Font Size:").size(13).width(70.0 * ui_scale),
                 row![
                     dialog.reveal_input(
                         Setting::FontSize,
@@ -4533,7 +4654,7 @@ fn font_settings_page(dialog: &Dialog) -> Element<'_, Desktop> {
                             "8–72",
                             dialog.font_size_input.as_deref().unwrap_or(&formatted_size)
                         )
-                        .width(56)
+                        .width(56.0 * ui_scale)
                         .size(13)
                         .on_input(move |value| Desktop::Settings(Message::FontSizeInput(
                             id, value
@@ -4564,13 +4685,14 @@ fn font_settings_page(dialog: &Dialog) -> Element<'_, Desktop> {
                 .size(13)
                 .style(text::danger)),
         row![
-            text("Preview:").size(13).width(70),
-            container(
+            text("Preview:").size(13).width(70.0 * ui_scale),
+            container(super::ui_font_scale::unscaled(
                 text("AaBbCcDdEe 0123456789")
                     .font(font.unwrap_or(iced::Font::MONOSPACE))
                     .size(f32::from(size))
                     .color(Color::WHITE)
-            )
+                    .into()
+            ))
             .padding(10)
             .style(|_| container::Style::default().background(Color::from_rgb8(30, 30, 30))),
         ]
@@ -4605,13 +4727,24 @@ fn highlighted<'a>(
     setting: Setting,
     content: impl Into<Element<'a, Desktop>>,
 ) -> Element<'a, Desktop> {
-    let row = container(content).width(Length::Fill).padding(4);
+    highlight_setting(
+        dialog,
+        setting,
+        container(content).width(Length::Fill).padding(4),
+    )
+    .into()
+}
+
+fn highlight_setting<'a>(
+    dialog: &Dialog,
+    setting: Setting,
+    row: widget::Container<'a, Desktop>,
+) -> widget::Container<'a, Desktop> {
     if dialog.revealed == Some(setting) {
         row.id(dialog.revealed_row.clone())
             .style(container::secondary)
-            .into()
     } else {
-        row.style(container::transparent).into()
+        row.style(container::transparent)
     }
 }
 
@@ -4721,6 +4854,7 @@ mod tests {
 
     #[test]
     fn app_design_save_is_atomic_and_keeps_terminal_and_editor_colors() {
+        use super::super::chat_appearance::Profile;
         use super::super::chrome::{Action, Message as ChromeMessage};
         use crate::terminal_theme::{Id, Preset};
 
@@ -4734,21 +4868,28 @@ mod tests {
         let terminal = workspace.window_settings.terminal_appearance();
         let editor = workspace.editor_content_theme();
         let original = workspace.window_theme(owner);
+        let original_chat = workspace.chat_palette();
         let _ = workspace.update_chrome(ChromeMessage::Invoke(owner, Action::AppearanceSettings));
         let dialog = workspace.settings.0.as_ref().unwrap();
         assert_eq!(dialog.section, Section::Appearance);
         let id = dialog.id;
         assert!(workspace.settings_view(id).is_some());
         let _ = workspace.update_settings(Message::Design(id, Design::AmberCrt));
+        let _ = workspace.update_settings(Message::ChatColorProfile(id, Profile::Ocean));
         let _ =
             workspace.save_settings_to(id, |_| Err(std::io::Error::other("test write failure")));
         assert_eq!(workspace.window_theme(owner), original);
         assert_eq!(workspace.window_theme(other), original);
+        assert_eq!(workspace.chat_palette(), original_chat);
         assert!(workspace.settings.0.as_ref().unwrap().problem.is_some());
         let _ = workspace.update_settings(Message::Cancel(id));
         assert_eq!(
             workspace.window_settings.appearance.design(),
             Design::Normal
+        );
+        assert_eq!(
+            workspace.window_settings.appearance.chat_color_profile,
+            None
         );
 
         let _ = workspace.update_settings(Message::OpenAt(owner, Section::Appearance));
@@ -4756,6 +4897,7 @@ mod tests {
         let design = Design::AtlantaFxPrimerLight;
         let _ = workspace.update_settings(Message::Design(id, design));
         let _ = workspace.update_settings(Message::DesignAnimations(id, false));
+        let _ = workspace.update_settings(Message::ChatColorProfile(id, Profile::Paper));
         let mut random = [0; 8];
         getrandom::fill(&mut random).unwrap();
         let folder = std::env::temp_dir().join(format!(
@@ -4770,6 +4912,11 @@ mod tests {
         std::fs::remove_dir_all(folder).unwrap();
         assert_eq!(restored.appearance.design(), design);
         assert!(!restored.appearance.animations());
+        assert_eq!(restored.appearance.chat_color_profile, Some(Profile::Paper));
+        assert_eq!(
+            workspace.chat_palette(),
+            Profile::Paper.palette(&restored.themes)
+        );
         assert_eq!(workspace.window_settings, restored);
         let palette = design.palette().unwrap();
         for window in [owner, other] {
@@ -4779,6 +4926,73 @@ mod tests {
         }
         assert_eq!(workspace.window_settings.terminal_appearance(), terminal);
         assert_eq!(workspace.editor_content_theme(), editor);
+    }
+
+    #[test]
+    fn ui_font_scale_settings_preserve_the_manual_draft_and_persist_only_on_save() {
+        let mut workspace = Workspace {
+            ui_display_size: Some(Size::new(3840.0, 2160.0)),
+            ..Workspace::default()
+        };
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.open_settings(owner, Some(Section::Appearance));
+        let id = workspace.settings.for_owner(owner).unwrap();
+        let _ = workspace.update_settings(Message::UiFontScaleStep(id, true));
+        let _ = workspace.update_settings(Message::UiFontScaleAuto(id, true));
+        let _ = workspace.update_settings(Message::UiFontScaleStep(id, true));
+        let preferences = workspace
+            .settings
+            .0
+            .as_ref()
+            .unwrap()
+            .draft
+            .preferences
+            .appearance;
+        assert_eq!(preferences.ui_font_scale_percent, Some(105));
+        assert_eq!(
+            super::super::ui_font_scale::effective(preferences, workspace.ui_display_size),
+            125
+        );
+        let _ = workspace.update_settings(Message::Cancel(id));
+        assert_eq!(
+            workspace.window_settings.appearance.ui_font_scale_percent,
+            None
+        );
+        assert_eq!(
+            workspace.window_settings.appearance.ui_font_scale_auto,
+            None
+        );
+
+        let _ = workspace.open_settings(owner, Some(Section::Font));
+        let id = workspace.settings.for_owner(owner).unwrap();
+        for (query, setting) in [
+            ("UI font size", Setting::UiFontScale),
+            ("Match display resolution", Setting::UiFontScaleAuto),
+        ] {
+            let _ = workspace.update_settings(Message::Search(id, query.into()));
+            let _ = workspace.update_settings(Message::SearchChoose(id));
+            assert_eq!(
+                workspace.settings.0.as_ref().unwrap().revealed,
+                Some(setting)
+            );
+        }
+        let _ = workspace.update_settings(Message::UiFontScaleStep(id, false));
+        let _ = workspace.update_settings(Message::UiFontScaleAuto(id, true));
+        let _ = workspace.save_settings_to(id, |settings| {
+            let encoded = serde_json::to_vec(settings)?;
+            let restored: WindowSettings = serde_json::from_slice(&encoded)?;
+            assert_eq!(restored.appearance.ui_font_scale_percent, Some(95));
+            assert_eq!(restored.appearance.ui_font_scale_auto, Some(true));
+            Ok(())
+        });
+        assert_eq!(
+            workspace.window_settings.appearance.ui_font_scale_percent,
+            Some(95)
+        );
+        assert_eq!(
+            workspace.window_settings.appearance.ui_font_scale_auto,
+            Some(true)
+        );
     }
 
     #[test]
@@ -5663,6 +5877,84 @@ mod tests {
     }
 
     #[test]
+    fn appearance_search_reveals_distinct_controls_without_editing_the_draft() {
+        use iced::advanced::widget::Operation;
+        use iced::{Font, Rectangle, Renderer};
+        use iced_runtime::{UserInterface, user_interface::Cache};
+
+        struct FindHighlight<'a> {
+            id: &'a widget::Id,
+            bounds: Option<Rectangle>,
+        }
+
+        impl Operation for FindHighlight<'_> {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+
+            fn container(&mut self, id: Option<&widget::Id>, bounds: Rectangle) {
+                if id == Some(self.id) {
+                    assert!(self.bounds.replace(bounds).is_none());
+                }
+            }
+        }
+
+        let measure = |query: &str, setting| {
+            let mut workspace = Workspace::default();
+            let (owner, _) = workspace.open_window(false);
+            let _ = workspace.open_settings(owner, Some(Section::Font));
+            let id = workspace.settings.for_owner(owner).unwrap();
+            let dialog = workspace.settings.0.as_ref().unwrap();
+            assert_eq!(dialog.section, Section::Font);
+            let appearance = dialog.draft.preferences.appearance;
+
+            let _ = workspace.update_settings(Message::Search(id, query.into()));
+            assert_eq!(
+                workspace
+                    .settings
+                    .0
+                    .as_ref()
+                    .unwrap()
+                    .search_results(false)
+                    .next(),
+                Some(SearchTarget::Setting(setting)),
+            );
+            let _ = workspace.update_settings(Message::SearchChoose(id));
+
+            let dialog = workspace.settings.0.as_ref().unwrap();
+            assert_eq!(dialog.section, Section::Appearance);
+            assert_eq!(dialog.revealed, Some(setting));
+            assert!(dialog.search.is_empty());
+            assert_eq!(dialog.draft.preferences.appearance, appearance);
+            let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+            let mut interface = UserInterface::build(
+                workspace.settings_view(id).unwrap(),
+                Size::new(620.0, 300.0),
+                Cache::default(),
+                &mut renderer,
+            );
+            let mut highlight = FindHighlight {
+                id: &dialog.revealed_row,
+                bounds: None,
+            };
+            interface.operate(&renderer, &mut highlight);
+            highlight
+                .bounds
+                .expect("the selected control has a highlight")
+        };
+
+        let picker = measure("App Design", Setting::AppDesign);
+        let previous = measure("previous app design", Setting::PreviousAppDesign);
+        let next = measure("Next design", Setting::NextAppDesign);
+        let animations = measure("reduced motion", Setting::DesignAnimations);
+        let chat_color = measure("chat color profile", Setting::ChatColorProfile);
+        assert!(picker.x + picker.width <= previous.x);
+        assert!(previous.x + previous.width <= next.x);
+        assert!(picker.y + picker.height < animations.y);
+        assert!(animations.y + animations.height < chat_color.y);
+    }
+
+    #[test]
     fn settings_escape_cancels_focused_theme_and_parent_fields_separately() {
         use iced::advanced::{
             clipboard,
@@ -5701,7 +5993,7 @@ mod tests {
                 Cache::default(),
                 &mut renderer,
             );
-            for _ in 0..2 {
+            for _ in 0..3 {
                 let mut focus = focusable::focus_next();
                 interface.operate(&renderer, &mut focus);
                 let operation::Outcome::Chain(mut focus) = focus.finish() else {
@@ -5926,7 +6218,8 @@ mod tests {
                 &renderer,
                 &layout::Limits::new(Size::ZERO, compact),
             );
-            let pane = Layout::new(&node).children().nth(1).unwrap();
+            let content = Layout::new(&node).children().next().unwrap();
+            let pane = content.children().nth(1).unwrap();
             let mut pane = pane.children();
             let search = pane.next().unwrap().bounds();
             let body = pane.next().unwrap();

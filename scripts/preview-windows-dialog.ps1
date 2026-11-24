@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('settings', 'connections', 'ai-manager', 'agent-design', 'agent-design-compact')]
+    [ValidateSet('settings', 'settings-sftp', 'connections', 'quick-connect', 'ai-manager', 'agent-design', 'agent-design-compact')]
     [string] $Dialog,
     [ValidateRange(30, 3600)]
     [int] $LifetimeSeconds = 600
@@ -28,7 +28,11 @@ try {
         New-Item -ItemType Directory -Path (Join-Path $scratch $folder) | Out-Null
     }
     $profile = New-Item -ItemType Directory -Path (Join-Path $environment.LOCALAPPDATA 'kortty')
-    '{"appearance":{"design":"normal"}}' |
+    $settings = @{ appearance = @{ design = 'normal' } }
+    if ($Dialog -eq 'quick-connect') {
+        $settings.quick_connect_expanded_sections = @('logging')
+    }
+    $settings | ConvertTo-Json -Depth 3 |
         Set-Content -LiteralPath (Join-Path $profile.FullName 'window-settings.json') -Encoding utf8
     foreach ($key in $environment.Keys) {
         [Environment]::SetEnvironmentVariable($key, $environment[$key])

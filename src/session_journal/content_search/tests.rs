@@ -168,7 +168,7 @@ fn journal_content_search_reports_exhausted_xml_budget_and_aborts_mid_scan() {
     let snapshot = catalog(&fixture.0).unwrap();
     let budget = Budget {
         xml: fs::metadata(first.join(DOCUMENT)).unwrap().len() + 1,
-        log: MAX_SEARCH_LOG_BYTES,
+        log: MAX_CAPTURE_BYTES,
     };
     let result = scan_bounded(
         &fixture.0,

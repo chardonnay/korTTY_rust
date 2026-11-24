@@ -187,6 +187,34 @@ fn latest_page_and_live_refresh_keep_an_unterminated_last_line() {
 }
 
 #[test]
+fn sparse_viewer_index_handles_more_than_two_million_physical_lines() {
+    let fixture = Fixture::new();
+    let path = fixture.folder().join("2026-11-06-13-00-00-dense_1.log.gz");
+    let mut archive =
+        flate2::write::GzEncoder::new(File::create(&path).unwrap(), flate2::Compression::fast());
+    let empty = [b'\n'; 32 * 1024];
+    for _ in 0..65 {
+        archive.write_all(&empty).unwrap();
+    }
+    archive
+        .write_all(b"last line across the old viewer limit\n")
+        .unwrap();
+    archive.finish().unwrap();
+    let entry = fixture.entry(&path);
+    let document = Document::open(&entry, || false).unwrap();
+    let last = empty.len() * 65;
+    assert_eq!(document.lines(), last + 1);
+    assert_eq!(
+        document.page(last - 1, || false).unwrap().lines,
+        ["", "last line across the old viewer limit"]
+    );
+    assert_eq!(
+        document.search("old viewer", None, true, || false).unwrap(),
+        Some(last)
+    );
+}
+
+#[test]
 fn catalog_loads_additional_folders_and_guards_hold_liveness_and_badges() {
     let fixture = Fixture::new();
     let extra = fixture.0.join("Java logs");

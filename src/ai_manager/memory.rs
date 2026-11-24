@@ -27,6 +27,7 @@ use super::{Configuration, document_find};
 
 mod cleanup;
 mod comparison;
+pub(crate) mod connection;
 mod format;
 pub(super) mod learning;
 pub(super) mod prompt;
@@ -1224,10 +1225,14 @@ impl State {
             .as_ref()
             .map_or(0, |file| format::estimate(&file.text));
         let token_label = format!("Approx. {estimated} / {budget:.0} tokens");
-        let selector = pick_list(self.scopes.as_slice(), Some(&self.scope), Message::Scope)
-            .width(320)
-            .text_size(13)
-            .dismiss_on_escape();
+        let selector: Element<'_, Message> = if self.scopes.is_empty() {
+            text(self.scope.to_string()).size(13).into()
+        } else {
+            pick_list(self.scopes.as_slice(), Some(&self.scope), Message::Scope)
+                .width(320)
+                .text_size(13)
+                .dismiss_on_escape()
+        };
         let can_edit = self.can_edit_rows() && !self.pending && self.decision.is_none();
         let mut body = column![
             environment_notice,

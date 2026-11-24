@@ -686,11 +686,11 @@ async fn run_instance<P>(
 
                 #[cfg(any(target_os = "linux", target_os = "windows"))]
                 {
+                    use desktop_drop::Event;
                     #[cfg(target_os = "windows")]
                     use kortty_windowing::windows_desktop_drop as desktop_drop;
                     #[cfg(target_os = "linux")]
                     use kortty_windowing::x11_desktop_drop as desktop_drop;
-                    use desktop_drop::Event;
                     use winit::raw_window_handle::HasWindowHandle as _;
 
                     let proxy = proxy.clone();
@@ -1720,6 +1720,21 @@ fn run_action<'a, P, C>(
 
                     let _ = channel.send(size);
                 }
+            }
+            window::Action::GetPrimaryMonitorSize(id, channel) => {
+                let size = window_manager
+                    .get(id)
+                    .and_then(|window| {
+                        window
+                            .raw
+                            .primary_monitor()
+                            .or_else(|| window.raw.current_monitor())
+                    })
+                    .map(|monitor| {
+                        let size = monitor.size().to_logical(monitor.scale_factor());
+                        Size::new(size.width, size.height)
+                    });
+                let _ = channel.send(size);
             }
             window::Action::SetAllowAutomaticTabbing(enabled) => {
                 control_sender

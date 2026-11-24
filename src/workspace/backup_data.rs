@@ -49,7 +49,6 @@ pub(crate) mod workflow_headers;
 const DISPLAY_SECTION: &str = "java_display_preferences";
 const JAVA_SETTINGS_BYTES: usize = 4 * 1024 * 1024;
 const JAVA_SETTINGS_NODES: u32 = 65_536;
-const JAVA_UI_FONT_SCALE: std::ops::RangeInclusive<u16> = 80..=160;
 const TERMINAL_TRANSPARENCY_PERCENT: std::ops::RangeInclusive<u8> = 0..=100;
 const TERMINAL_SILENCE_SECONDS: std::ops::RangeInclusive<u16> =
     MIN_TERMINAL_SILENCE_SECONDS..=MAX_TERMINAL_SILENCE_SECONDS;
@@ -1022,6 +1021,19 @@ pub(crate) fn portable_java_preferences(
     let appearance = appearance::Preferences {
         design: preference(root, "appDesign", &mut omitted, appearance::Design::from_id),
         animations: preference(root, "appDesignAnimationsEnabled", &mut omitted, java_flag),
+        chat_color_profile: preference(
+            root,
+            "chatColorProfileId",
+            &mut omitted,
+            super::chat_appearance::Profile::from_id,
+        ),
+        ui_font_scale_percent: preference(root, "uiFontScalePercent", &mut omitted, |value| {
+            value
+                .parse::<i32>()
+                .ok()
+                .map(super::ui_font_scale::clamp_percent)
+        }),
+        ui_font_scale_auto: preference(root, "uiFontScaleAuto", &mut omitted, java_flag),
     };
     let snippet_alternative_count = preference(
         root,
@@ -1416,6 +1428,9 @@ pub(crate) fn portable_java_preferences(
         + usize::from(display.java_backup_defaults.interval.is_some())
         + usize::from(display.appearance.design.is_some())
         + usize::from(display.appearance.animations.is_some())
+        + usize::from(display.appearance.chat_color_profile.is_some())
+        + usize::from(display.appearance.ui_font_scale_percent.is_some())
+        + usize::from(display.appearance.ui_font_scale_auto.is_some())
         + usize::from(display.snippet_diagram_appearance.mode.is_some())
         + usize::from(display.snippet_diagram_appearance.background.is_some())
         + usize::from(display.snippet_structure.visible.is_some())
@@ -1569,39 +1584,10 @@ fn java_history_popup_extent(text: &str, range: std::ops::RangeInclusive<u16>) -
 }
 
 fn java_guide_scale(root: Node<'_, '_>, omitted: &mut usize) -> Option<u16> {
-    match preference_text(root, "guideFontScalePercent") {
-        Ok(Some(text)) => {
-            return match text.parse::<i32>() {
-                Ok(scale) => Some(
-                    scale.clamp(i32::from(MIN_MANUAL_SCALE), i32::from(MAX_MANUAL_SCALE)) as u16,
-                ),
-                Err(_) => {
-                    *omitted += 1;
-                    None
-                }
-            };
-        }
-        Err(()) => {
-            *omitted += 1;
-            return None;
-        }
-        Ok(None) => {}
-    }
-    // Older imports used the explicit manual UI scale as a fallback.
-    match preference_text(root, "uiFontScaleAuto") {
-        Ok(None) | Ok(Some("false" | "0")) => {
-            preference(root, "uiFontScalePercent", omitted, |text| {
-                text.parse()
-                    .ok()
-                    .filter(|scale| JAVA_UI_FONT_SCALE.contains(scale))
-            })
-        }
-        Ok(Some("true" | "1")) => None,
-        _ => {
-            *omitted += 1;
-            None
-        }
-    }
+    preference(root, "guideFontScalePercent", omitted, |text| {
+        let scale = text.parse::<i32>().ok()?;
+        Some(scale.clamp(i32::from(MIN_MANUAL_SCALE), i32::from(MAX_MANUAL_SCALE)) as u16)
+    })
 }
 
 fn java_flag(text: &str) -> Option<bool> {
@@ -3012,14 +2998,16 @@ mod tests {
 
     #[test]
     fn java_application_appearance_import_preserves_explicit_native_defaults() {
-        let read = |design, animations| {
+        use super::super::chat_appearance::Profile;
+
+        let read = |design, animations, chat_profile| {
             let xml = format!(
-                "<globalSettings><appDesign>{design}</appDesign><appDesignAnimationsEnabled>{animations}</appDesignAnimationsEnabled></globalSettings>"
+                "<globalSettings><appDesign>{design}</appDesign><appDesignAnimationsEnabled>{animations}</appDesignAnimationsEnabled><chatColorProfileId>{chat_profile}</chatColorProfileId></globalSettings>"
             );
             portable_java_preferences(xml.as_bytes(), None).unwrap()
         };
-        let imported = read("ATLANTAFX_CUPERTINO_LIGHT", "false");
-        assert_eq!((imported.count, imported.omitted), (2, 0));
+        let imported = read("ATLANTAFX_CUPERTINO_LIGHT", "false", "midnight");
+        assert_eq!((imported.count, imported.omitted), (3, 0));
         let incoming = imported.contents.unwrap();
         let restore = |local: Option<&[u8]>| {
             let merged = merge_java_window_settings(local, &incoming, &Default::default())
@@ -3033,18 +3021,26 @@ mod tests {
             appearance::Design::AtlantaFxCupertinoLight
         );
         assert!(!fresh.appearance.animations());
+        assert_eq!(fresh.appearance.chat_color_profile, Some(Profile::Midnight));
 
         let local = WindowSettings::decode(br#"{"appearance":{"design":"normal"}}"#).unwrap();
         let serialized = serde_json::to_vec(&local).unwrap();
         let restored = restore(Some(&serialized));
         assert_eq!(restored.appearance.design(), appearance::Design::Normal);
         assert!(!restored.appearance.animations());
-        let restored = restore(Some(br#"{"appearance":{"animations":true}}"#));
+        assert_eq!(
+            restored.appearance.chat_color_profile,
+            Some(Profile::Midnight)
+        );
+        let restored = restore(Some(
+            br#"{"appearance":{"animations":true,"chat_color_profile":"auto"}}"#,
+        ));
         assert_eq!(
             restored.appearance.design(),
             appearance::Design::AtlantaFxCupertinoLight
         );
         assert!(restored.appearance.animations());
+        assert_eq!(restored.appearance.chat_color_profile, Some(Profile::Auto));
         let saved = serde_json::to_vec(&restored).unwrap();
         assert!(
             merge_java_window_settings(Some(&saved), &incoming, &Default::default())
@@ -3052,8 +3048,8 @@ mod tests {
                 .is_none()
         );
 
-        let invalid = read("unknown", "maybe");
-        assert_eq!((invalid.count, invalid.omitted), (0, 2));
+        let invalid = read("unknown", "maybe", "missing");
+        assert_eq!((invalid.count, invalid.omitted), (0, 3));
     }
 
     #[test]
@@ -3147,11 +3143,11 @@ mod tests {
     }
 
     #[test]
-    fn java_manual_scale_fallback_requires_explicit_percent_and_disabled_auto() {
+    fn java_ui_font_scale_restores_manual_value_independently_of_auto_and_guide() {
         for (auto, expected, omitted) in [
-            ("", Some(131), 0),
-            ("<uiFontScaleAuto>false</uiFontScaleAuto>", Some(131), 0),
-            ("<uiFontScaleAuto>true</uiFontScaleAuto>", None, 0),
+            ("", None, 0),
+            ("<uiFontScaleAuto>false</uiFontScaleAuto>", Some(false), 0),
+            ("<uiFontScaleAuto>true</uiFontScaleAuto>", Some(true), 0),
             ("<uiFontScaleAuto>maybe</uiFontScaleAuto>", None, 1),
             (
                 "<uiFontScaleAuto>false</uiFontScaleAuto><uiFontScaleAuto>false</uiFontScaleAuto>",
@@ -3164,24 +3160,18 @@ mod tests {
             );
             let import = portable_java_preferences(xml.as_bytes(), None).unwrap();
             assert_eq!(import.omitted, omitted);
-            let active = import.contents.map(|bytes| {
-                merge_java_window_settings(None, &bytes, &Default::default())
+            assert_eq!(import.count, 1 + usize::from(expected.is_some()));
+            let active =
+                merge_java_window_settings(None, &import.contents.unwrap(), &Default::default())
                     .unwrap()
-                    .unwrap()
-            });
-            let fields: RawFields = active
-                .as_deref()
-                .map(serde_json::from_slice)
-                .transpose()
-                .unwrap()
-                .unwrap_or_default();
+                    .unwrap();
+            let settings = WindowSettings::decode(&active).unwrap();
+            assert_eq!(settings.appearance.ui_font_scale_percent, Some(131));
+            assert_eq!(settings.appearance.ui_font_scale_auto, expected);
             assert_eq!(
-                fields
-                    .get("manual_scale")
-                    .map(|value| serde_json::from_str::<u16>(value.get()).unwrap()),
-                expected
+                settings.manual_scale,
+                WindowSettings::default().manual_scale
             );
-            assert!(!fields.contains_key(DISPLAY_SECTION));
         }
     }
 
@@ -3231,27 +3221,31 @@ mod tests {
                 );
                 let import = portable_java_preferences(xml.as_bytes(), None).unwrap();
                 assert_eq!(import.omitted, omitted);
-                assert_eq!(import.count, usize::from(expected.is_some()));
-                if let Some(bytes) = import.contents {
-                    let restored = merge_java_window_settings(None, &bytes, &Default::default())
-                        .unwrap()
-                        .unwrap();
-                    assert_eq!(
-                        Some(WindowSettings::decode(&restored).unwrap().manual_scale),
-                        expected
-                    );
-                    assert!(
-                        merge_java_window_settings(
-                            Some(br#"{"manual_scale":177}"#),
-                            &bytes,
-                            &Default::default()
-                        )
-                        .unwrap()
-                        .is_none()
-                    );
-                } else {
-                    assert!(expected.is_none());
-                }
+                assert_eq!(import.count, 2 + usize::from(expected.is_some()));
+                let bytes = import.contents.unwrap();
+                let restored = merge_java_window_settings(None, &bytes, &Default::default())
+                    .unwrap()
+                    .unwrap();
+                let restored = WindowSettings::decode(&restored).unwrap();
+                assert_eq!(
+                    restored.manual_scale,
+                    expected.unwrap_or(WindowSettings::default().manual_scale)
+                );
+                assert_eq!(restored.appearance.ui_font_scale_percent, Some(132));
+                let local = merge_java_window_settings(
+                    Some(br#"{"manual_scale":177,"appearance":{"ui_font_scale_percent":105}}"#),
+                    &bytes,
+                    &Default::default(),
+                )
+                .unwrap()
+                .unwrap();
+                let local = WindowSettings::decode(&local).unwrap();
+                assert_eq!(local.manual_scale, 177);
+                assert_eq!(local.appearance.ui_font_scale_percent, Some(105));
+                assert_eq!(
+                    local.appearance.ui_font_scale_auto,
+                    Some(automatic == "true")
+                );
             }
         }
     }
@@ -3469,7 +3463,7 @@ mod tests {
             <openToolWindowsAsTabs>false</openToolWindowsAsTabs>
         </globalSettings>"#;
         let incoming = portable_java_preferences(xml, None).unwrap();
-        assert_eq!((incoming.count, incoming.omitted), (1, 7));
+        assert_eq!((incoming.count, incoming.omitted), (2, 6));
         let active = merge_java_window_settings(
             Some(b"[]"),
             &incoming.contents.unwrap(),
@@ -3480,7 +3474,7 @@ mod tests {
         let fields: serde_json::Value = serde_json::from_slice(&active).unwrap();
         assert_eq!(
             fields,
-            serde_json::json!({"show_terminal_scrollbar": false})
+            serde_json::json!({"show_terminal_scrollbar": false, "appearance": {"ui_font_scale_percent": 160}})
         );
     }
     #[test]

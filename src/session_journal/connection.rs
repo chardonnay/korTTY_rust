@@ -4,8 +4,12 @@ use std::io;
 
 use serde::{Deserialize, Serialize};
 
-pub(crate) const MAX_PART_MIB: u16 = 120;
-pub(crate) const MAX_PARTS: u16 = 64;
+pub(crate) const MAX_PART_MIB: u16 = 1000;
+pub(crate) const DEFAULT_PART_LIMIT: u32 = 500;
+pub(crate) const MAX_PARTS: u32 = i32::MAX as u32;
+pub(super) const RETAINED_TAIL_BYTES: u64 = 1024 * 1024;
+// Allow the writer's retained tail and the framing overhead of compressed parts.
+pub(super) const MAX_STORED_PART_BYTES: u64 = (MAX_PART_MIB as u64 + 8) * 1024 * 1024;
 pub(crate) const MAX_SUMMARY_MINUTES: u16 = 1440;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -16,7 +20,7 @@ pub(crate) struct ConnectionConfig {
     pub(crate) ai_summaries: bool,
     pub(crate) summary_interval_minutes: u16,
     pub(crate) max_log_size_mib: u16,
-    pub(crate) max_log_parts: u16,
+    pub(crate) max_log_parts: u32,
 }
 
 impl Default for ConnectionConfig {
@@ -76,7 +80,7 @@ mod tests {
             ai_summaries: false,
             summary_interval_minutes: 15,
             max_log_size_mib: 5,
-            max_log_parts: 3,
+            max_log_parts: MAX_PARTS,
         };
         config.validate().unwrap();
         let json = serde_json::to_string(&config).unwrap();
@@ -87,6 +91,14 @@ mod tests {
         assert!(
             ConnectionConfig {
                 max_log_parts: 0,
+                ..config
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            ConnectionConfig {
+                max_log_parts: MAX_PARTS + 1,
                 ..config
             }
             .validate()
