@@ -13,6 +13,7 @@ use crate::terminal_agent::design::{Choice as AgentDesignChoice, valid_id as val
 use crate::terminal_theme::{BoldTextMode, CursorStyle, Rgb, Scheme, Themes};
 use crate::workspace::dialog_design::{self, keyboard_table};
 
+pub(super) mod color_picker;
 mod skills;
 pub(super) mod ssh_style;
 
@@ -26,6 +27,7 @@ pub enum Edit {
     FontFamily(String),
     FontSize(String),
     Color(usize, String),
+    SshColor(color_picker::Edit),
     CursorStyle(Option<CursorStyle>),
     Bold(Option<BoldTextMode>),
     Colors(Option<bool>),
@@ -60,6 +62,7 @@ impl Edit {
                 | Self::FontFamily(_)
                 | Self::FontSize(_)
                 | Self::Color(..)
+                | Self::SshColor(_)
                 | Self::CursorStyle(_)
                 | Self::Bold(_)
                 | Self::Colors(_)
@@ -90,8 +93,10 @@ pub(super) struct Draft {
     ai_skill_search_revision: u64,
     ai_skill_cursor: Option<u64>,
     style_theme_picker: Id,
+    style_font_picker: Id,
     style_cursor_picker: Id,
     style_bold_picker: Id,
+    style_color_picker: color_picker::Picker,
 }
 
 impl Draft {
@@ -115,8 +120,10 @@ impl Draft {
             ai_skill_search_revision: 0,
             ai_skill_cursor: None,
             style_theme_picker: Id::unique(),
+            style_font_picker: Id::unique(),
             style_cursor_picker: Id::unique(),
             style_bold_picker: Id::unique(),
+            style_color_picker: color_picker::Picker::default(),
             font: options.font_family.clone().unwrap_or_default(),
             size: options
                 .font_size
@@ -193,6 +200,7 @@ impl Draft {
                 };
                 *field = value.chars().take(7).collect();
             }
+            Edit::SshColor(edit) => return self.style_color_picker.update(edit, &mut self.colors),
             Edit::CursorStyle(value) => self.options.cursor_style = value,
             Edit::Bold(value) => self.options.bold = value,
             Edit::Colors(value) => self.options.sgr_enabled = value,
@@ -266,6 +274,14 @@ impl Draft {
 
     pub(super) fn value(&self) -> Result<TerminalOverrides, String> {
         self.value_with_style(true)
+    }
+
+    pub(super) fn close_style_color_picker(&mut self) {
+        self.style_color_picker.close();
+    }
+
+    pub(super) fn style_color_focus(&self, edit: &color_picker::Edit) -> Task<super::Message> {
+        self.style_color_picker.focus(edit)
     }
 
     pub(super) fn seed_style(&mut self, style: &TerminalStyle) {

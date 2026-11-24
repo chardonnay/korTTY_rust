@@ -1298,10 +1298,29 @@ Rust also saved the 18 pt own draft and retained the second connection's
 23 pt presentation as inactive data when switching it to global settings.
 The second connection kept Windows-1252 and its 88-column initial width.
 Apple Silicon passed 104 focused tests, with one ignored, and strict Clippy.
-The font-family input and hex color fields still differ from the Java
-selectors. The desktop flow remains to be checked on macOS and Linux.
+The desktop flow remains to be checked on macOS and Linux.
 [SSH editor](src/connection_window/form.rs)
 · [Presentation controls](src/connection_window/terminal_overrides/ssh_style.rs)
+
+## November 24 SSH font and color selectors
+
+The saved SSH font selector offers the Java families and installed
+families. It also shows a profile's saved family when it is unavailable on
+the machine. Foreground and background show their active swatches and open
+palettes with presets, tints, shades and custom hex input. Selecting a preset
+or applying a valid custom value edits the connection draft. Escape
+dismisses the popover and restores focus to the color control. Individual
+fields can still inherit their values, and the global display is read-only.
+
+Windows ARM64 confirmed keyboard font selection, palette focus and
+dismissal, a foreground preset, and removal of a background override.
+After restart, the compact popover accepted and persisted `#FF8001` with
+DejaVu Sans Mono and an inherited background. The global profile showed
+disabled font and color controls. Apple Silicon passed 68 focused tests,
+with one ignored, and strict Clippy. The Java custom color dialog, tab-color
+picker and visual checks on macOS and Linux remain open.
+[Font and presentation controls](src/connection_window/terminal_overrides/ssh_style.rs)
+· [Color picker](src/connection_window/terminal_overrides/color_picker.rs)
 
 ## November 24 SSH tunnel list and editor
 

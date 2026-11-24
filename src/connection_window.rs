@@ -1423,10 +1423,17 @@ impl ConnectionWindow {
             }
             Message::Edit(edit) => {
                 if let Some(draft) = &mut self.draft {
+                    let focus = match &edit {
+                        Edit::Terminal(terminal_overrides::Edit::SshColor(edit)) => {
+                            draft.style_color_focus(edit)
+                        }
+                        _ => Task::none(),
+                    };
                     draft.update(edit);
                     if !self.draft_conflict {
                         self.notice = None;
                     }
+                    return focus;
                 }
             }
             Message::DraftGroup(group) => {

@@ -405,6 +405,9 @@ impl Draft {
     pub fn update(&mut self, edit: Edit) {
         match edit {
             Edit::Page(page) => {
+                if self.page != page {
+                    self.terminal.close_style_color_picker();
+                }
                 self.page = page;
                 return;
             }
@@ -431,6 +434,7 @@ impl Draft {
                 if self.own_terminal_settings == own {
                     return;
                 }
+                self.terminal.close_style_color_picker();
                 self.own_terminal_settings = own;
                 if !self.has_own_terminal_draft
                     && let Some(mut defaults) = defaults
@@ -715,6 +719,17 @@ impl Draft {
     pub(super) fn reveal_ai_skill(&self, id: u64) -> iced::Task<Message> {
         if self.page == Page::Ai {
             self.terminal.reveal_ai_skill(id)
+        } else {
+            iced::Task::none()
+        }
+    }
+
+    pub(super) fn style_color_focus(
+        &self,
+        edit: &terminal_overrides::color_picker::Edit,
+    ) -> iced::Task<Message> {
+        if self.page == Page::Settings && self.own_terminal_settings {
+            self.terminal.style_color_focus(edit)
         } else {
             iced::Task::none()
         }

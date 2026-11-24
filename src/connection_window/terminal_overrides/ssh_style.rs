@@ -2,17 +2,25 @@ use std::fmt;
 use std::ops::RangeInclusive;
 
 use iced::widget::{Id, button, checkbox, column, pick_list, row, rule, text, text_input};
-use iced::{Alignment, Element};
+use iced::{Alignment, Element, Length};
 
 use crate::connection_store::{ANSI_NAMES, TerminalStyle};
 use crate::profile::{MAX_TERMINAL_FONT, MIN_TERMINAL_FONT};
-use crate::terminal_theme::{BoldTextMode, CursorStyle, Rgb, Scheme, Themes};
+use crate::terminal_theme::{BoldTextMode, CursorStyle, Rgb, Scheme, Themes, installed_families};
 use crate::workspace::dialog_design::{self, keyboard_table, number_input};
 
+use super::color_picker::Target;
 use super::{Choice, Draft, Edit, ThemeChoice, theme_choices};
 
 const LABEL_WIDTH: f32 = 116.0;
 const FIELD_WIDTH: f32 = 200.0;
+const JAVA_FAMILIES: [&str; 5] = [
+    "Monospaced",
+    "Courier New",
+    "Consolas",
+    "Monaco",
+    "DejaVu Sans Mono",
+];
 
 #[derive(Clone, Eq, PartialEq)]
 struct StyleTheme {
@@ -22,7 +30,10 @@ struct StyleTheme {
 
 impl fmt::Display for StyleTheme {
     fn fmt(&self, format: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.choice.fmt(format)
+        match self.choice.value {
+            Some(_) => self.choice.fmt(format),
+            None => format.write_str("Custom"),
+        }
     }
 }
 
@@ -55,11 +66,7 @@ impl Draft {
             .keyboard_navigation(self.style_theme_picker.clone())
             .into()
         } else {
-            read_only_picker(if current.is_none() {
-                "Custom".into()
-            } else {
-                selected.to_string()
-            })
+            read_only_picker(selected.to_string())
         };
         let font = defaults.font_family.as_deref().unwrap_or("Monospaced");
         let size = defaults
@@ -68,14 +75,7 @@ impl Draft {
         let size_input = if own { self.size.as_str() } else { &size };
         column![
             field("Theme", theme),
-            field(
-                "Font family",
-                input(
-                    font,
-                    if own { &self.font } else { font },
-                    own.then_some(Edit::FontFamily),
-                )
-            ),
+            field("Font family", self.ssh_font_family(font, own)),
             field(
                 "Font size",
                 quantity(
@@ -88,11 +88,21 @@ impl Draft {
             rule::horizontal(1),
             field(
                 "Text color",
-                color(0, &self.colors[0], defaults.foreground, own)
+                self.style_color_picker.view(
+                    Target::Foreground,
+                    &self.colors[0],
+                    defaults.foreground,
+                    own
+                )
             ),
             field(
                 "Background color",
-                color(1, &self.colors[1], defaults.background, own)
+                self.style_color_picker.view(
+                    Target::Background,
+                    &self.colors[1],
+                    defaults.background,
+                    own
+                )
             ),
             ssh_checkbox(
                 "Enable terminal colors",
@@ -103,6 +113,22 @@ impl Draft {
             ),
         ]
         .spacing(10)
+        .into()
+    }
+
+    fn ssh_font_family(&self, effective_default: &str, own: bool) -> Element<'_, Edit> {
+        if !own {
+            return read_only_picker(effective_default.to_owned());
+        }
+        let selected = (!self.font.is_empty()).then_some(self.font.as_str());
+        pick_list(
+            font_choices(selected, installed_families()),
+            Some(Choice(selected.map(str::to_owned))),
+            |family| Edit::FontFamily(family.0.unwrap_or_default()),
+        )
+        .width(FIELD_WIDTH)
+        .menu_height(280)
+        .keyboard_navigation(self.style_font_picker.clone())
         .into()
     }
 
@@ -310,10 +336,28 @@ fn color<'a>(index: usize, value: &str, default: Option<Rgb>, own: bool) -> Elem
 }
 
 fn read_only_picker<'a>(value: String) -> Element<'a, Edit> {
-    button(text(value))
+    button(row![text(value).width(Length::Fill), text("▾")].align_y(Alignment::Center))
         .width(FIELD_WIDTH)
         .style(dialog_design::secondary_button)
         .into()
+}
+
+fn font_choices(selected: Option<&str>, installed: &[String]) -> Vec<Choice<String>> {
+    let mut choices: Vec<_> = JAVA_FAMILIES.into_iter().map(str::to_owned).collect();
+    if let Some(selected) = selected.filter(|selected| {
+        !JAVA_FAMILIES.contains(selected) && !installed.iter().any(|font| font == *selected)
+    }) {
+        choices.push(selected.to_owned());
+    }
+    choices.extend(
+        installed
+            .iter()
+            .filter(|font| !JAVA_FAMILIES.contains(&font.as_str()))
+            .cloned(),
+    );
+    std::iter::once(Choice(None))
+        .chain(choices.into_iter().map(|font| Choice(Some(font))))
+        .collect()
 }
 
 fn enum_picker<'a, T: Copy + Eq + fmt::Display + 'a, const N: usize>(
@@ -334,5 +378,32 @@ fn enum_picker<'a, T: Copy + Eq + fmt::Display + 'a, const N: usize>(
             .into()
     } else {
         read_only_picker(Choice(default).to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ssh_font_choices_keep_java_families_and_an_unavailable_saved_name() {
+        let installed = ["Consolas".into(), "Menlo".into()];
+        let labels = font_choices(Some("Retired Mono"), &installed)
+            .into_iter()
+            .map(|choice| choice.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            [
+                "Inherit",
+                "Monospaced",
+                "Courier New",
+                "Consolas",
+                "Monaco",
+                "DejaVu Sans Mono",
+                "Retired Mono",
+                "Menlo",
+            ]
+        );
     }
 }

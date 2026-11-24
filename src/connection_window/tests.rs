@@ -2156,6 +2156,48 @@ fn saved_ssh_terminal_settings_switches_sources_without_losing_the_editor_draft(
 }
 
 #[test]
+fn saved_ssh_color_picker_keeps_unapplied_values_out_of_the_connection() {
+    use crate::terminal_theme::Rgb;
+    use terminal_overrides::color_picker::{Edit as Picker, Target};
+
+    let mut saved = connection("SSH colors", "");
+    let original = Rgb::from_hex(0xC0FFEE);
+    let custom = Rgb::from_hex(0x123456);
+    saved.terminal.foreground = Some(original);
+    saved.terminal.background = Some(Rgb::from_hex(0x010203));
+    let mut draft = form::Draft::from_profile(&saved, None, false);
+    let edit = |picker| Edit::Terminal(terminal_overrides::Edit::SshColor(picker));
+
+    draft.update(edit(Picker::Open(Target::Foreground, None)));
+    draft.update(edit(Picker::Input("#12".into())));
+    draft.update(edit(Picker::Apply));
+    assert_eq!(
+        draft.connection().unwrap().terminal.foreground,
+        Some(original)
+    );
+    assert!(!draft.changed);
+    draft.update(edit(Picker::Input(custom.to_string())));
+    draft.update(edit(Picker::Close));
+    draft.update(edit(Picker::Apply));
+    assert!(!draft.changed);
+
+    draft.update(edit(Picker::Open(Target::Foreground, None)));
+    draft.update(edit(Picker::Input(custom.to_string())));
+    draft.update(edit(Picker::Apply));
+    assert!(draft.changed);
+    assert_eq!(
+        draft.connection().unwrap().terminal.foreground,
+        Some(custom)
+    );
+
+    draft.update(edit(Picker::Open(Target::Background, None)));
+    draft.update(edit(Picker::Select(None)));
+    let terminal = draft.connection().unwrap().terminal;
+    assert_eq!(terminal.foreground, Some(custom));
+    assert_eq!(terminal.background, None);
+}
+
+#[test]
 fn editor_preserves_timestamp_visibility_in_duplicates_and_keeps_discarded_edits_local() {
     let profile = Profile::new();
     let mut saved = connection("Console", "");

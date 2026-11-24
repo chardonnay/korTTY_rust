@@ -5,7 +5,8 @@ use iced::advanced::widget::{Operation, Tree, operation::Focusable, tree};
 use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, overlay, renderer};
 use iced::keyboard::{self, Key, key::Named};
 use iced::{
-    Color, Element, Event, Length, Rectangle, Renderer, Size, Theme, Vector, mouse, window,
+    Color, Element, Event, Length, Rectangle, Renderer, Size, Theme, Vector, mouse, widget::Id,
+    window,
 };
 
 pub(crate) enum TableKey<Message> {
@@ -17,7 +18,11 @@ pub(crate) fn view<'a, Message: 'a>(
     content: Element<'a, Message>,
     on_key: impl Fn(&Key, keyboard::Modifiers, bool) -> TableKey<Message> + 'a,
 ) -> Element<'a, Message> {
-    Element::new(Table { content, on_key })
+    Element::new(Table {
+        content,
+        on_key,
+        id: None,
+    })
 }
 
 pub(crate) fn action<'a, Message: Clone + 'a>(
@@ -25,10 +30,19 @@ pub(crate) fn action<'a, Message: Clone + 'a>(
     message: Option<Message>,
     accept_enter: bool,
 ) -> Element<'a, Message> {
+    action_with_id(content, message, accept_enter, None)
+}
+
+pub(crate) fn action_with_id<'a, Message: Clone + 'a>(
+    content: Element<'a, Message>,
+    message: Option<Message>,
+    accept_enter: bool,
+    id: Option<Id>,
+) -> Element<'a, Message> {
     let Some(message) = message else {
         return content;
     };
-    view(content, move |key, modifiers, repeat| {
+    let on_key = move |key: &Key, modifiers: keyboard::Modifiers, repeat: bool| {
         if modifiers.is_empty()
             && (*key == Key::Named(Named::Space)
                 || accept_enter && *key == Key::Named(Named::Enter))
@@ -36,12 +50,18 @@ pub(crate) fn action<'a, Message: Clone + 'a>(
             return TableKey::Handled((!repeat).then(|| message.clone()));
         }
         TableKey::Ignored
+    };
+    Element::new(Table {
+        content,
+        on_key,
+        id,
     })
 }
 
 struct Table<'a, Message, OnKey> {
     content: Element<'a, Message>,
     on_key: OnKey,
+    id: Option<Id>,
 }
 
 #[derive(Default)]
@@ -103,7 +123,11 @@ where
         renderer: &Renderer,
         operation: &mut dyn Operation,
     ) {
-        operation.focusable(None, layout.bounds(), tree.state.downcast_mut::<Focus>());
+        operation.focusable(
+            self.id.as_ref(),
+            layout.bounds(),
+            tree.state.downcast_mut::<Focus>(),
+        );
         self.content
             .as_widget_mut()
             .operate(&mut tree.children[0], layout, renderer, operation);
