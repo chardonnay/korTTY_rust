@@ -1218,7 +1218,9 @@ struct Dialog {
     section: Section,
     search_input: widget::Id,
     search_scroll: widget::Id,
+    focus_scope: widget::Id,
     tab_scroll: widget::Id,
+    tab_menu: widget::Id,
     selected_tab: widget::Id,
     page_scroll: widget::Id,
     revealed_row: widget::Id,
@@ -1501,6 +1503,22 @@ impl Workspace {
             widget::operation::focus(dialog.search_input.clone())
                 .chain(widget::operation::select_all(dialog.search_input.clone())),
         )
+    }
+
+    pub(super) fn focus_settings_next(
+        &self,
+        id: window::Id,
+        backwards: bool,
+    ) -> Option<Task<Desktop>> {
+        use iced::advanced::widget::operation::{focusable, scope};
+        let dialog = self.settings.0.as_ref().filter(|dialog| dialog.id == id)?;
+        let root = dialog.focus_scope.clone();
+        let action = if backwards {
+            iced_runtime::Action::widget(scope(root, focusable::focus_previous()))
+        } else {
+            iced_runtime::Action::widget(scope(root, focusable::focus_next()))
+        };
+        Some(iced_runtime::task::effect(action))
     }
 
     pub(super) fn update_settings(&mut self, message: Message) -> Task<Desktop> {
@@ -2500,7 +2518,9 @@ impl Workspace {
             section: section.unwrap_or(Section::Font),
             search_input: widget::Id::unique(),
             search_scroll: widget::Id::unique(),
+            focus_scope: widget::Id::unique(),
             tab_scroll: widget::Id::unique(),
+            tab_menu: widget::Id::unique(),
             selected_tab: widget::Id::unique(),
             page_scroll: widget::Id::unique(),
             revealed_row: widget::Id::unique(),
@@ -3582,6 +3602,11 @@ impl Workspace {
             .highlight_rules_for_settings(id)
             .map(|id| Desktop::Highlight(highlight::Message::Focus(id)))
             .or(naming_modal);
+        let content = container(content)
+            .id(dialog.focus_scope.clone())
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
         Some(super::profile_tools::vault_modal::gate(content, modal))
     }
 
@@ -5926,7 +5951,7 @@ mod tests {
                 Cache::default(),
                 &mut renderer,
             );
-            for _ in 0..2 {
+            for _ in 0..3 {
                 let mut focus = focusable::focus_next();
                 interface.operate(&renderer, &mut focus);
                 let operation::Outcome::Chain(mut focus) = focus.finish() else {
@@ -6151,7 +6176,8 @@ mod tests {
                 &renderer,
                 &layout::Limits::new(Size::ZERO, compact),
             );
-            let pane = Layout::new(&node).children().nth(1).unwrap();
+            let content = Layout::new(&node).children().next().unwrap();
+            let pane = content.children().nth(1).unwrap();
             let mut pane = pane.children();
             let search = pane.next().unwrap().bounds();
             let body = pane.next().unwrap();

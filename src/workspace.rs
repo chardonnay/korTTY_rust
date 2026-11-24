@@ -5778,7 +5778,9 @@ impl Workspace {
         }
         if key == Key::Named(Named::Tab)
             && (modifiers.is_empty() || modifiers == Modifiers::SHIFT)
-            && let Some(task) = self.swarm_focus_next(id, modifiers.shift())
+            && let Some(task) = self
+                .focus_settings_next(id, modifiers.shift())
+                .or_else(|| self.swarm_focus_next(id, modifiers.shift()))
         {
             return task;
         }

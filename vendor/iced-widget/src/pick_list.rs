@@ -69,7 +69,9 @@ use crate::core::renderer;
 use crate::core::text::paragraph;
 use crate::core::text::{self, Text};
 use crate::core::touch;
+use crate::core::widget::operation::{Focusable, Operation};
 use crate::core::widget::tree::{self, Tree};
+use crate::core::widget::Id;
 use crate::core::window;
 use crate::core::{
     Background, Border, Clipboard, Color, Element, Event, Layout, Length,
@@ -78,6 +80,7 @@ use crate::core::{
 use crate::overlay::menu::{self, Menu};
 
 use std::borrow::Borrow;
+use std::cell::Cell;
 use std::f32;
 
 /// A widget for selecting a single value from a list of options.
@@ -176,6 +179,8 @@ pub struct PickList<
     last_status: Option<Status>,
     menu_height: Length,
     menu_width: Option<Pixels>,
+    focus_id: Option<Id>,
+    show_value: bool,
 }
 
 impl<'a, T, L, V, Message, Theme, Renderer>
@@ -215,6 +220,8 @@ where
             last_status: None,
             menu_height: Length::Shrink,
             menu_width: None,
+            focus_id: None,
+            show_value: true,
         }
     }
 
@@ -246,6 +253,41 @@ where
     pub fn menu_width(mut self, width: impl Into<Pixels>) -> Self {
         self.menu_width = Some(width.into());
         self
+    }
+
+    /// Includes this pick list in focus traversal and enables keyboard selection.
+    pub fn keyboard_navigation(mut self, id: Id) -> Self {
+        self.focus_id = Some(id);
+        self
+    }
+
+    /// Controls whether the value or placeholder is drawn beside the handle.
+    pub fn show_value(mut self, show: bool) -> Self {
+        self.show_value = show;
+        self
+    }
+
+    fn open_menu(
+        &self,
+        state: &mut State<Renderer::Paragraph>,
+        shell: &mut Shell<'_, Message>,
+    ) {
+        let selected = self.selected.as_ref().map(Borrow::borrow);
+        let options = self.options.borrow();
+        state.is_open.set(true);
+        state.hovered_option = options.iter().position(|option| Some(option) == selected);
+        if self.focus_id.is_some() {
+            state.hovered_option = state
+                .hovered_option
+                .filter(|&index| (self.option_enabled)(&options[index]))
+                .or_else(|| options.iter().position(self.option_enabled));
+            state.menu.reveal(state.hovered_option);
+        }
+        if let Some(on_open) = &self.on_open {
+            shell.publish(on_open.clone());
+        }
+        shell.capture_event();
+        shell.request_redraw();
     }
 
     /// Sets the [`Padding`] of the [`PickList`].
@@ -363,6 +405,22 @@ where
         tree::State::new(State::<Renderer::Paragraph>::new())
     }
 
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        _renderer: &Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        if let Some(id) = &self.focus_id {
+            operation.focusable(
+                Some(id),
+                layout.bounds(),
+                tree.state.downcast_mut::<State<Renderer::Paragraph>>(),
+            );
+        }
+    }
+
     fn size(&self) -> Size<Length> {
         Size {
             width: self.width,
@@ -463,13 +521,29 @@ where
     ) {
         let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
 
+        use keyboard::key::Named;
+        let open_with_key = self.focus_id.is_some()
+            && state.focused
+            && !state.is_open.get()
+            && matches!(
+                event,
+                Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(Named::Enter | Named::Space | Named::ArrowDown | Named::ArrowUp),
+                    modifiers,
+                    repeat: false,
+                    ..
+                }) if modifiers.is_empty()
+            );
         match event {
+            _ if open_with_key => {
+                self.open_menu(state, shell);
+            }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
             | Event::Touch(touch::Event::FingerPressed { .. }) => {
-                if state.is_open {
+                if state.is_open.get() {
                     // Event wasn't processed by overlay, so cursor was clicked either outside its
                     // bounds or on the drop-down, either way we close the overlay.
-                    state.is_open = false;
+                    state.is_open.set(false);
 
                     if let Some(on_close) = &self.on_close {
                         shell.publish(on_close.clone());
@@ -477,20 +551,7 @@ where
 
                     shell.capture_event();
                 } else if cursor.is_over(layout.bounds()) {
-                    let selected = self.selected.as_ref().map(Borrow::borrow);
-
-                    state.is_open = true;
-                    state.hovered_option = self
-                        .options
-                        .borrow()
-                        .iter()
-                        .position(|option| Some(option) == selected);
-
-                    if let Some(on_open) = &self.on_open {
-                        shell.publish(on_open.clone());
-                    }
-
-                    shell.capture_event();
+                    self.open_menu(state, shell);
                 }
             }
             Event::Mouse(mouse::Event::WheelScrolled {
@@ -498,7 +559,7 @@ where
             }) => {
                 if state.keyboard_modifiers.command()
                     && cursor.is_over(layout.bounds())
-                    && !state.is_open
+                    && !state.is_open.get()
                 {
                     fn find_next<'a, T: PartialEq>(
                         selected: &'a T,
@@ -554,7 +615,7 @@ where
         let status = {
             let is_hovered = cursor.is_over(layout.bounds());
 
-            if state.is_open {
+            if state.is_open.get() {
                 Status::Opened { is_hovered }
             } else if is_hovered {
                 Status::Hovered
@@ -607,11 +668,13 @@ where
 
         let bounds = layout.bounds();
 
-        let style = Catalog::style(
-            theme,
-            &self.class,
-            self.last_status.unwrap_or(Status::Active),
-        );
+        let status = self.last_status.unwrap_or(Status::Active);
+        let status = if state.focused && status == Status::Active {
+            Status::Hovered
+        } else {
+            status
+        };
+        let style = Catalog::style(theme, &self.class, status);
 
         renderer.fill_quad(
             renderer::Quad {
@@ -638,7 +701,7 @@ where
                 shaping,
             }) => Some((*font, *code_point, *size, *line_height, *shaping)),
             Handle::Dynamic { open, closed } => {
-                if state.is_open {
+                if state.is_open.get() {
                     Some((
                         open.font,
                         open.code_point,
@@ -688,7 +751,9 @@ where
 
         let label = selected.map(ToString::to_string);
 
-        if let Some(label) = label.or_else(|| self.placeholder.clone()) {
+        if self.show_value
+            && let Some(label) = label.or_else(|| self.placeholder.clone())
+        {
             let text_size =
                 self.text_size.unwrap_or_else(|| renderer.default_size());
 
@@ -729,7 +794,7 @@ where
         let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
         let font = self.font.unwrap_or_else(|| renderer.default_font());
 
-        if state.is_open {
+        if state.is_open.get() {
             let bounds = layout.bounds();
             let mut position = layout.position() + translation;
             let mut width = bounds.width;
@@ -739,13 +804,14 @@ where
             }
 
             let on_select = &self.on_select;
+            let is_open = &state.is_open;
 
             let mut menu = Menu::new(
                 &mut state.menu,
                 self.options.borrow(),
                 &mut state.hovered_option,
                 |option| {
-                    state.is_open = false;
+                    is_open.set(false);
 
                     (on_select)(option)
                 },
@@ -757,6 +823,11 @@ where
             .padding(self.padding)
             .font(font)
             .text_shaping(self.text_shaping);
+
+            if self.focus_id.is_some() {
+                let on_close = &self.on_close;
+                menu = menu.keyboard_navigation(is_open, move || on_close.clone());
+            }
 
             if let Some(text_size) = self.text_size {
                 menu = menu.text_size(text_size);
@@ -796,7 +867,8 @@ where
 struct State<P: text::Paragraph> {
     menu: menu::State,
     keyboard_modifiers: keyboard::Modifiers,
-    is_open: bool,
+    is_open: Cell<bool>,
+    focused: bool,
     hovered_option: Option<usize>,
     options: Vec<paragraph::Plain<P>>,
     placeholder: paragraph::Plain<P>,
@@ -808,11 +880,27 @@ impl<P: text::Paragraph> State<P> {
         Self {
             menu: menu::State::default(),
             keyboard_modifiers: keyboard::Modifiers::default(),
-            is_open: bool::default(),
+            is_open: Cell::default(),
+            focused: false,
             hovered_option: Option::default(),
             options: Vec::new(),
             placeholder: paragraph::Plain::default(),
         }
+    }
+}
+
+impl<P: text::Paragraph> Focusable for State<P> {
+    fn is_focused(&self) -> bool {
+        self.focused
+    }
+
+    fn focus(&mut self) {
+        self.focused = true;
+    }
+
+    fn unfocus(&mut self) {
+        self.focused = false;
+        self.is_open.set(false);
     }
 }
 

@@ -1036,6 +1036,33 @@ repeated the menu selection after removing a tooltip that overlapped the
 tab labels.
 [Final Windows ARM64 preview build](target/verification/20261124-settings-overflow-windows-preview-final.log)
 
+## November 24 Settings section keyboard navigation
+
+Tab and Shift+Tab move through focusable controls in the current
+Settings window. The section menu joins the order while the strip
+overflows. Enter, Space and the vertical arrow keys open the focused
+trigger at the active section. The arrow keys move the highlight.
+Home and End reach the first and last choices. The menu scrolls to
+reveal the highlighted choice. Enter and Space open that section with
+the current draft intact. Escape closes the menu and keeps focus on
+its trigger. Tab and Shift+Tab dismiss the menu and continue focus traversal.
+[OpenJFX 21 context menu keyboard handling](https://github.com/openjdk/jfx21u/blob/master/modules/javafx.controls/src/main/java/com/sun/javafx/scene/control/ContextMenuContent.java#L456)
+
+Windows ARM64 and Apple Silicon each passed 106 Settings and search
+tests. Apple Silicon also passed strict application and test-target
+Clippy. The widget test exercised focus traversal from the search field,
+selection in a compact window, Escape and Shift+Escape precedence,
+Tab handoff and draft retention after switching to Snippet Editor.
+[Apple Silicon verification](target/verification/20261124-settings-menu-keyboard-macos-modifiers.log)
+· [Windows ARM64 verification](target/verification/20261124-settings-menu-keyboard-windows-verified.log)
+
+The compact Windows ARM64 Settings preview measured 742 by 542 pixels.
+Tab reached the menu from search. End and the arrow keys brought the
+last rows into view, Escape kept the menu trigger focused, and Enter
+opened Snippet Editor. Returning to Font showed the same unsaved
+15-point value. Shift+Tab closed the reopened menu and focused search.
+[Windows ARM64 preview build](target/verification/20261124-settings-menu-keyboard-windows-preview.log)
+
 ## November 23 GGUF Configure sizing
 
 Java sizes the Configure grid to its path label. Rust now measures the

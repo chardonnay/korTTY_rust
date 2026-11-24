@@ -71,10 +71,12 @@ pub(super) fn view(dialog: &Dialog) -> Element<'_, Desktop> {
             section,
             selected: dialog.section == section,
         });
-        let trigger = pick_list(entries, None::<MenuEntry>, move |entry| {
+        let selected = entries[dialog.section.index()];
+        let trigger = pick_list(entries, Some(selected), move |entry| {
             Desktop::Settings(Message::Section(id, entry.section))
         })
-        .placeholder("")
+        .show_value(false)
+        .keyboard_navigation(dialog.tab_menu.clone())
         .width(34)
         .menu_width(MENU_WIDTH)
         .text_size(LABEL_SIZE)
@@ -118,12 +120,120 @@ fn label_width(label: &str) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use iced::advanced::clipboard;
+    use iced::advanced::{
+        clipboard,
+        widget::operation::{Operation, Outcome, focusable},
+    };
+    use iced::keyboard::{
+        self, Key, Location, Modifiers,
+        key::{self, Named},
+    };
     use iced::{Event, Point, Renderer, event, mouse};
     use iced_runtime::{UserInterface, user_interface::Cache};
 
     use super::*;
     use crate::workspace::{Workspace, ui_font_scale};
+
+    #[test]
+    fn focused_section_menu_handles_navigation_and_escape_before_settings() {
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.update_settings(Message::OpenAt(owner, Section::Font));
+        let id = workspace.settings.for_owner(owner).unwrap();
+        let _ = workspace.update_settings(Message::FontSize(id, 24));
+        let messages = {
+            let dialog = workspace.settings.0.as_ref().unwrap();
+            let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+            let mut interface = UserInterface::build(
+                workspace.settings_view(id).unwrap(),
+                Size::new(680.0, 450.0),
+                Cache::default(),
+                &mut renderer,
+            );
+            interface.operate(
+                &renderer,
+                &mut focusable::focus(dialog.search_input.clone()),
+            );
+            let mut next = focusable::focus_next();
+            interface.operate(&renderer, &mut next);
+            let Outcome::Chain(mut next) = next.finish() else {
+                panic!("expected a focusable section menu");
+            };
+            interface.operate(&renderer, next.as_mut());
+
+            let mut messages = Vec::new();
+            let mut press = |named, modifiers, messages: &mut Vec<_>| {
+                let key = Key::Named(named);
+                let event = Event::Keyboard(keyboard::Event::KeyPressed {
+                    modified_key: key.clone(),
+                    key,
+                    location: Location::Standard,
+                    physical_key: key::Physical::Unidentified(key::NativeCode::Unidentified),
+                    modifiers,
+                    text: None,
+                    repeat: false,
+                });
+                interface
+                    .update(
+                        &[event],
+                        mouse::Cursor::Unavailable,
+                        &mut renderer,
+                        &mut clipboard::Null,
+                        messages,
+                    )
+                    .1[0]
+            };
+            for key in [Named::Enter, Named::End, Named::Escape] {
+                assert_eq!(
+                    press(key, Modifiers::empty(), &mut messages),
+                    event::Status::Captured,
+                    "{key:?}"
+                );
+            }
+            assert!(
+                messages.is_empty(),
+                "Escape dismissed the menu instead of Settings"
+            );
+            assert_eq!(
+                press(Named::Space, Modifiers::empty(), &mut messages),
+                event::Status::Captured
+            );
+            assert_eq!(
+                press(Named::Escape, Modifiers::SHIFT, &mut messages),
+                event::Status::Captured
+            );
+            assert_eq!(
+                press(Named::Space, Modifiers::empty(), &mut messages),
+                event::Status::Captured
+            );
+            assert_eq!(
+                press(Named::Tab, Modifiers::SHIFT, &mut messages),
+                event::Status::Ignored
+            );
+            assert!(
+                messages.is_empty(),
+                "Tab can continue normal focus traversal"
+            );
+            for key in [Named::ArrowDown, Named::End, Named::ArrowUp, Named::Enter] {
+                assert_eq!(
+                    press(key, Modifiers::empty(), &mut messages),
+                    event::Status::Captured,
+                    "{key:?}"
+                );
+            }
+            messages
+        };
+        assert!(matches!(
+            messages.as_slice(),
+            [Desktop::Settings(Message::Section(target, Section::SnippetEditor))] if *target == id
+        ));
+        for message in messages {
+            let _ = workspace.update(message);
+        }
+        let dialog = workspace.settings.0.as_ref().unwrap();
+        assert_eq!(dialog.section, Section::SnippetEditor);
+        assert_eq!(dialog.draft.preferences.terminal_font, 24);
+    }
 
     #[test]
     fn overflow_selects_an_offscreen_section_and_respects_font_scale() {

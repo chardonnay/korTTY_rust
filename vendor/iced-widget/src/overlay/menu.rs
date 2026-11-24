@@ -1,13 +1,16 @@
 //! Build and show dropdown menus.
 use crate::core::alignment;
 use crate::core::border::{self, Border};
+use crate::core::keyboard::{self, Key, Modifiers, key::Named};
 use crate::core::layout::{self, Layout};
 use crate::core::mouse;
 use crate::core::overlay;
 use crate::core::renderer;
 use crate::core::text::{self, Text};
 use crate::core::touch;
+use crate::core::widget::operation::{self, Operation, scrollable::AbsoluteOffset};
 use crate::core::widget::tree::{self, Tree};
+use crate::core::widget::Id;
 use crate::core::window;
 use crate::core::{
     Background, Clipboard, Color, Event, Length, Padding, Pixels, Point,
@@ -15,6 +18,7 @@ use crate::core::{
 };
 use crate::core::{Element, Shell, Widget};
 use crate::scrollable::{self, Scrollable};
+use std::cell::Cell;
 
 /// A list of selectable options.
 pub struct Menu<
@@ -35,6 +39,7 @@ pub struct Menu<
     on_selected: Box<dyn FnMut(T) -> Message + 'a>,
     option_enabled: fn(&T) -> bool,
     on_option_hovered: Option<&'a dyn Fn(T) -> Message>,
+    keyboard: Option<Keyboard<'a, Message>>,
     width: f32,
     padding: Padding,
     text_size: Option<Pixels>,
@@ -70,6 +75,7 @@ where
             on_selected: Box::new(on_selected),
             option_enabled: |_| true,
             on_option_hovered,
+            keyboard: None,
             width: 0.0,
             padding: Padding::ZERO,
             text_size: None,
@@ -83,6 +89,15 @@ where
     /// Sets which options can be selected. Disabled options remain visible.
     pub fn option_enabled(mut self, enabled: fn(&T) -> bool) -> Self {
         self.option_enabled = enabled;
+        self
+    }
+
+    pub(crate) fn keyboard_navigation(
+        mut self,
+        is_open: &'a Cell<bool>,
+        on_close: impl Fn() -> Option<Message> + 'a,
+    ) -> Self {
+        self.keyboard = Some(Keyboard { is_open, on_close: Box::new(on_close) });
         self
     }
 
@@ -152,6 +167,7 @@ where
 #[derive(Debug)]
 pub struct State {
     tree: Tree,
+    reveal_option: Cell<Option<usize>>,
 }
 
 impl State {
@@ -159,7 +175,12 @@ impl State {
     pub fn new() -> Self {
         Self {
             tree: Tree::empty(),
+            reveal_option: Cell::default(),
         }
+    }
+
+    pub(crate) fn reveal(&self, index: Option<usize>) {
+        self.reveal_option.set(index);
     }
 }
 
@@ -178,6 +199,8 @@ where
     viewport: Rectangle,
     tree: &'a mut Tree,
     list: Scrollable<'a, Message, Theme, Renderer>,
+    reveal_option: &'a Cell<Option<usize>>,
+    option_count: usize,
     width: f32,
     target_height: f32,
     class: &'a <Theme as Catalog>::Class<'b>,
@@ -207,6 +230,7 @@ where
             on_selected,
             option_enabled,
             on_option_hovered,
+            keyboard,
             width,
             padding,
             font,
@@ -222,6 +246,8 @@ where
             on_selected,
             option_enabled,
             on_option_hovered,
+            keyboard,
+            reveal_option: &state.reveal_option,
             font,
             text_size,
             text_line_height,
@@ -238,18 +264,61 @@ where
             viewport,
             tree: &mut state.tree,
             list,
+            reveal_option: &state.reveal_option,
+            option_count: options.len(),
             width,
             target_height,
             class,
         }
     }
+
+    fn reveal_pending(&mut self, layout: Layout<'_>, renderer: &Renderer) {
+        if let Some(index) = self.reveal_option.take() {
+            self.list.operate(
+                self.tree,
+                layout,
+                renderer,
+                &mut RevealOption { index, count: self.option_count },
+            );
+        }
+    }
 }
 
-impl<Message, Theme, Renderer> crate::core::Overlay<Message, Theme, Renderer>
-    for Overlay<'_, '_, Message, Theme, Renderer>
+struct RevealOption {
+    index: usize,
+    count: usize,
+}
+
+impl Operation for RevealOption {
+    fn traverse(&mut self, _operate: &mut dyn FnMut(&mut dyn Operation)) {}
+
+    fn scrollable(
+        &mut self,
+        _id: Option<&Id>,
+        viewport: Rectangle,
+        content: Rectangle,
+        translation: Vector,
+        state: &mut dyn operation::Scrollable,
+    ) {
+        if content.height > viewport.height {
+            let row_height = content.height / self.count as f32;
+            let top = self.index as f32 * row_height;
+            let min = (top + row_height - viewport.height).min(top);
+            state.scroll_to(AbsoluteOffset {
+                x: None,
+                y: Some(translation.y.clamp(min, top).max(0.0)),
+            });
+        }
+    }
+}
+
+impl<'a, 'b, Message, Theme, Renderer> crate::core::Overlay<Message, Theme, Renderer>
+    for Overlay<'a, 'b, Message, Theme, Renderer>
 where
-    Theme: Catalog,
-    Renderer: text::Renderer,
+    Message: 'a,
+    Theme: Catalog + 'a,
+    Renderer: text::Renderer + 'a,
+    'b: 'a,
 {
     fn layout(&mut self, renderer: &Renderer, bounds: Size) -> layout::Node {
         let space_below =
@@ -272,11 +341,13 @@ where
         let node = self.list.layout(self.tree, renderer, &limits);
         let size = node.size();
 
-        node.move_to(if space_below > space_above {
+        let node = node.move_to(if space_below > space_above {
             self.position + Vector::new(0.0, self.target_height)
         } else {
             self.position - Vector::new(0.0, size.height)
-        })
+        });
+        self.reveal_pending(Layout::new(&node), renderer);
+        node
     }
 
     fn update(
@@ -294,6 +365,7 @@ where
             self.tree, event, layout, cursor, renderer, clipboard, shell,
             &bounds,
         );
+        self.reveal_pending(layout, renderer);
     }
 
     fn mouse_interaction(
@@ -339,6 +411,11 @@ where
     }
 }
 
+struct Keyboard<'a, Message> {
+    is_open: &'a Cell<bool>,
+    on_close: Box<dyn Fn() -> Option<Message> + 'a>,
+}
+
 struct List<'a, 'b, T, Message, Theme, Renderer>
 where
     Theme: Catalog,
@@ -349,6 +426,8 @@ where
     on_selected: Box<dyn FnMut(T) -> Message + 'a>,
     option_enabled: fn(&T) -> bool,
     on_option_hovered: Option<&'a dyn Fn(T) -> Message>,
+    keyboard: Option<Keyboard<'a, Message>>,
+    reveal_option: &'a Cell<Option<usize>>,
     padding: Padding,
     text_size: Option<Pixels>,
     text_line_height: text::LineHeight,
@@ -359,6 +438,77 @@ where
 
 struct ListState {
     is_hovered: Option<bool>,
+}
+
+impl<T, Message, Theme, Renderer> List<'_, '_, T, Message, Theme, Renderer>
+where
+    T: Clone,
+    Theme: Catalog,
+    Renderer: text::Renderer,
+{
+    fn key_pressed(
+        &mut self,
+        key: &Key,
+        modifiers: Modifiers,
+        repeat: bool,
+        shell: &mut Shell<'_, Message>,
+    ) -> bool {
+        let Some(keyboard) = &self.keyboard else {
+            return false;
+        };
+        if !keyboard.is_open.get() {
+            return false;
+        }
+        let escape = *key == Key::Named(Named::Escape);
+        let tab = *key == Key::Named(Named::Tab)
+            && (modifiers.is_empty() || modifiers == Modifiers::SHIFT);
+        if escape || tab {
+            keyboard.is_open.set(false);
+            if let Some(message) = (keyboard.on_close)() {
+                shell.publish(message);
+            }
+            shell.request_redraw();
+            return escape;
+        }
+        if !modifiers.is_empty() {
+            return false;
+        }
+        let enabled = |&index: &usize| (self.option_enabled)(&self.options[index]);
+        let mut all = 0..self.options.len();
+        let index = match key {
+            Key::Named(Named::ArrowDown) => {
+                let start = self.hovered_option.map_or(0, |index| index + 1);
+                (start..all.end).find(enabled).or_else(|| all.find(enabled))
+            }
+            Key::Named(Named::ArrowUp) => {
+                let end = self.hovered_option.unwrap_or(all.end);
+                (0..end).rev().find(enabled).or_else(|| all.rev().find(enabled))
+            }
+            Key::Named(Named::Home) => all.find(enabled),
+            Key::Named(Named::End) => all.rev().find(enabled),
+            Key::Named(Named::Enter | Named::Space) => {
+                if !repeat
+                    && let Some(option) = self.hovered_option.and_then(|index| self.options.get(index))
+                    && (self.option_enabled)(option)
+                {
+                    shell.publish((self.on_selected)(option.clone()));
+                }
+                shell.request_redraw();
+                return true;
+            }
+            _ => return false,
+        };
+        *self.hovered_option = index;
+        self.reveal_option.set(index);
+        shell.request_redraw();
+        true
+    }
+
+    fn option_height(&self, renderer: &Renderer) -> f32 {
+        let size = self.text_size.unwrap_or_else(|| renderer.default_size());
+        f32::from(iced_tiny_skia::font_scale::line_height(self.text_line_height, size))
+            + self.padding.y()
+    }
 }
 
 impl<T, Message, Theme, Renderer> Widget<Message, Theme, Renderer>
@@ -421,9 +571,18 @@ where
         _viewport: &Rectangle,
     ) {
         match event {
+            Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, repeat, .. }) => {
+                if self.key_pressed(key, *modifiers, *repeat, shell) {
+                    shell.capture_event();
+                }
+            }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
-                if cursor.is_over(layout.bounds())
-                    && let Some(index) = *self.hovered_option
+                if let Some(position) = cursor.position_in(layout.bounds())
+                    && let Some(index) = if self.keyboard.is_some() {
+                        Some((position.y / self.option_height(renderer)) as usize)
+                    } else {
+                        *self.hovered_option
+                    }
                     && let Some(option) = self.options.get(index)
                 {
                     if (self.option_enabled)(option) {
