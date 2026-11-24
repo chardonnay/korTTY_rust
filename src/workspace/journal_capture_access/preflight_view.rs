@@ -7,6 +7,7 @@ use super::{Desktop, Message, ProbeChoice};
 pub(super) struct JournalProbeView<'a> {
     pub(super) ticket: u64,
     pub(super) automatic: bool,
+    pub(super) can_cancel: bool,
     pub(super) status: Status<'a>,
 }
 
@@ -57,9 +58,9 @@ impl<'a> JournalProbeView<'a> {
                     button("Record without AI")
                         .style(button::secondary)
                         .on_press(choice(ProbeChoice::WithoutAi)),
-                    button(stop)
+                    self.can_cancel.then(|| button(stop)
                         .style(button::secondary)
-                        .on_press(choice(ProbeChoice::Cancel)),
+                        .on_press(choice(ProbeChoice::Cancel))),
                 ]
                 .spacing(6)
                 .wrap();
@@ -97,6 +98,7 @@ mod tests {
             let mut view = JournalProbeView {
                 ticket: 14,
                 automatic,
+                can_cancel: true,
                 status: Status::Failed {
                     profile: "Example model",
                     reason: "The model could not answer the test request.",

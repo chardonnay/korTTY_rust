@@ -44,6 +44,22 @@ fn mcp_masking_uses_ssh_secrets_when_journaling_and_logging_are_off() {
 }
 
 #[test]
+fn required_journal_prepares_private_ssh_redaction_without_ai_or_terminal_logging() {
+    let mut workspace = Workspace::default();
+    workspace.set_test_ai_configuration(
+        serde_json::from_value(json!({"general": {"features_enabled": false}})).unwrap(),
+    );
+    workspace.clipboard.policy = crate::clipboard_policy::parse(
+        "[meta]\nschema-version = 1\n[[rule]]\n[rule.session-journal]\nenforced = true",
+    )
+    .unwrap();
+    assert!(workspace.ssh_needs_terminal_secrets(true, false, false));
+    assert!(!workspace.ssh_needs_terminal_secrets(true, true, false));
+    workspace.clipboard.policy.session_journal_allowed = false;
+    assert!(!workspace.ssh_needs_terminal_secrets(true, false, false));
+}
+
+#[test]
 fn terminal_ai_masking_is_independent_of_journal_mcp_and_private_persistence() {
     let mut workspace = Workspace::default();
     workspace.set_test_ai_configuration(crate::ai_manager::Configuration::default());

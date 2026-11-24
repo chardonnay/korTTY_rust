@@ -510,8 +510,12 @@ impl Workspace {
             .is_some()
     }
 
+    fn journal_capture_allowed_for(&self, tab: &Tab) -> bool {
+        self.journal_allowed() && (!tab.incognito || self.journal_required())
+    }
+
     fn journal_source(&self, tab: &Tab) -> Option<(SessionId, &PaneSession)> {
-        if tab.incognito || !self.journal_allowed() {
+        if !self.journal_capture_allowed_for(tab) {
             return None;
         }
         let id = *tab.grid.get(tab.primary)?;
@@ -538,7 +542,7 @@ impl Workspace {
             return false;
         }
         match self.journal_captures.get(&tab.id).map(|entry| &entry.phase) {
-            Some(Phase::Starting(..) | Phase::Active { .. }) => true,
+            Some(Phase::Starting(..) | Phase::Active { .. }) => !self.journal_required(),
             Some(Phase::Finishing(..)) => false,
             _ => self.journal_source(tab).is_some(),
         }
@@ -619,6 +623,16 @@ impl Workspace {
         tab_id: u64,
         automatic: bool,
     ) -> Task<Desktop> {
+        if self
+            .journal_tab_in(owner, tab_id)
+            .is_some_and(|tab| tab.incognito)
+        {
+            return if automatic && self.journal_required() {
+                self.open_journal_capture(owner, tab_id, true, true).1
+            } else {
+                Task::none()
+            };
+        }
         if let Err(error) = self.journal_directory() {
             self.notice(owner, format!("Could not start session journal ({error})."));
             return Task::none();
@@ -652,12 +666,18 @@ impl Workspace {
         let Some(tab) = self.journal_tab_in(owner, tab_id) else {
             return (None, Task::none());
         };
+        if tab.incognito && !automatic {
+            return (None, Task::none());
+        }
+        let incognito = tab.incognito;
+        let without_ai = without_ai || incognito;
         let journal_pane = tab.primary;
         let Some((source, pane)) = self.journal_source(tab) else {
             return (None, Task::none());
         };
         let generation = pane.stream_generation;
         let mut config = pane.journal_config;
+        config.capture_input &= !incognito;
         config.ai_summaries &= !without_ai;
         if let Some(cap) = self
             .clipboard
@@ -731,7 +751,7 @@ impl Workspace {
                 pane: journal_pane,
                 title,
                 phase: Phase::Starting(source, startup),
-                notice: without_ai.then(|| "Recording without AI.".into()),
+                notice: (without_ai && !incognito).then(|| "Recording without AI.".into()),
                 note: None,
                 screenshot: None,
                 automatic_screenshot_ai,
@@ -857,9 +877,10 @@ impl Workspace {
         let mut retire = Vec::new();
         let mut stop = Vec::new();
         for (&id, entry) in &self.journal_captures {
-            let Some(tab) = self.journal_tab(id).filter(|tab| {
-                tab.primary == entry.pane && !tab.incognito && self.journal_allowed()
-            }) else {
+            let Some(tab) = self
+                .journal_tab(id)
+                .filter(|tab| tab.primary == entry.pane && self.journal_capture_allowed_for(tab))
+            else {
                 if entry.capturing() {
                     stop.push(id);
                 }
@@ -950,13 +971,14 @@ impl Workspace {
         if !self.journal_allowed() {
             return Vec::new();
         }
+        let required = self.journal_required();
         let mut candidates = Vec::new();
         for (&owner, window) in &self.windows {
             for tab in window.terminal_tabs() {
                 let Some((session, pane)) = self.journal_source(tab) else {
                     continue;
                 };
-                if pane.journal_config.auto_start
+                if (required || pane.journal_config.auto_start)
                     && pane.frame.status == crate::session::Status::Running
                     && pane.journal_attempted != Some(pane.stream_generation)
                 {
@@ -1440,6 +1462,10 @@ impl Workspace {
         let mut content = column![actions].spacing(4);
         if let Some(automatic) = self.journal_screenshot_ai_run_control(owner, id, run) {
             content = content.push(automatic);
+        }
+        if self.journal_required() && entry.capturing() {
+            content =
+                content.push(text("Session journaling is required by managed policy.").size(13));
         }
         if let Some(notice) = &entry.notice {
             content = content.push(text(notice).size(13));
@@ -2027,20 +2053,7 @@ mod tests {
                 .journal_agent_capture(session, generation)
                 .is_none()
         );
-        {
-            use iced::futures::StreamExt as _;
-
-            let mut events = iced_runtime::task::into_stream(attach).unwrap();
-            loop {
-                if let iced_runtime::Action::Output(Desktop::JournalCapture(
-                    message @ Message::Attached(..),
-                )) = block_on(events.next()).expect("the journal attachment must finish")
-                {
-                    let _ = workspace.update_journal_capture(message);
-                    break;
-                }
-            }
-        }
+        deliver_journal_attachment(&mut workspace, attach);
         let capture = workspace.journal_captures[&tab].metadata_capture().unwrap();
         let note_authority = workspace.live_journal_note_authority(&capture).unwrap();
         assert!(note_authority());
@@ -2087,6 +2100,98 @@ mod tests {
         let _ = workspace.reconcile_journal_sources();
         assert_eq!(workspace.journal_captures[&tab].run, run);
         let _ = workspace.sessions[&session].session.stop().recv_blocking();
+    }
+
+    fn deliver_journal_attachment(workspace: &mut Workspace, attach: Task<Desktop>) {
+        use iced::futures::StreamExt as _;
+
+        let mut events = iced_runtime::task::into_stream(attach).unwrap();
+        loop {
+            if let iced_runtime::Action::Output(Desktop::JournalCapture(
+                message @ Message::Attached(..),
+            )) = block_on(events.next()).expect("the journal attachment must finish")
+            {
+                let _ = workspace.update_journal_capture(message);
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn required_journal_starts_without_profile_opt_in_and_cannot_be_stopped_from_the_tab() {
+        for incognito in [false, true] {
+            let scratch = Scratch::new();
+            let mut workspace = Workspace::default();
+            workspace.clipboard.policy = crate::clipboard_policy::parse(
+                "[meta]\nschema-version = 1\n[[rule]]\n[rule.session-journal]\nenforced = true\nlog-format = 'xml'\n\
+                 [[rule.session-journal.replace]]\npattern = 'MANAGED_JOURNAL_PRIVATE_MARKER'\nreplacement = 'REDACTED_JOURNAL_MARKER'",
+            ).unwrap();
+            workspace.window_settings.session_journal.directory =
+                scratch.0.join("journals").to_str().unwrap().into();
+            let (owner, _) = workspace.open_window(false);
+            let grid = crate::session::GridSize::default();
+            let shell =
+                crate::session::Session::start(grid, kortty_terminal::TerminalProfile::Xterm)
+                    .unwrap();
+            let session = workspace.store_session(shell, grid, 14);
+            workspace.add_tab(owner, session);
+            let active = workspace.active_tab_mut(owner).unwrap();
+            active.incognito = incognito;
+            let tab = active.id;
+            let pane = workspace.sessions.get_mut(&session).unwrap();
+            wait(|| pane.session.journal_available());
+            pane.frame = pane.session.frame();
+            pane.journal_config.capture_input = true;
+            assert!(!pane.journal_config.auto_start);
+
+            let _ = workspace.reconcile_journal_sources();
+            let entry = &workspace.journal_captures[&tab];
+            let run = entry.run;
+            assert_eq!(entry.capture_input, !incognito);
+            assert_eq!(entry.without_ai, incognito);
+            let Phase::Starting(_, startup) = &entry.phase else {
+                panic!("required journal did not start");
+            };
+            wait(|| startup.done.is_closed());
+            let attach = workspace.update_journal_capture(Message::Started(tab, run));
+            deliver_journal_attachment(&mut workspace, attach);
+            assert!(!workspace.journal_toggle_enabled(owner));
+            let _ = workspace.update_journal_capture(Message::Toggle(owner, tab));
+            let capture = workspace.journal_captures[&tab]
+                .recording()
+                .unwrap()
+                .clone();
+            assert_eq!(workspace.active_dock_journal(owner).is_none(), incognito);
+            assert!(!workspace.sessions[&session].journal_config.auto_start);
+
+            let shell = &workspace.sessions[&session].session;
+            shell
+                .send(b"echo MANAGED_JOURNAL_PRIVATE_MARKER\rexit\r".to_vec())
+                .unwrap();
+            wait(|| shell.frame().status != crate::session::Status::Running);
+            let _ = workspace.update(Desktop::SessionUpdate(session));
+            wait(|| capture.done().is_closed());
+            let page = ViewerSource::capture(&capture)
+                .capture_page(None, None, None)
+                .unwrap();
+            assert!(page.status.notice().is_none(), "{page:?}");
+            assert!(
+                page.records.iter().any(|record| {
+                    record.kind == crate::session_journal::CaptureKind::Output
+                        && record.text.contains("REDACTED_JOURNAL_MARKER")
+                }),
+                "{page:?}"
+            );
+            assert!(
+                page.records.iter().all(|record| {
+                    !record.text.contains("MANAGED_JOURNAL_PRIVATE_MARKER")
+                        && (!incognito
+                            || record.kind == crate::session_journal::CaptureKind::Output)
+                }),
+                "{page:?}"
+            );
+            let _ = workspace.sessions[&session].session.stop().recv_blocking();
+        }
     }
 
     #[test]

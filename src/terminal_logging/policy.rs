@@ -22,6 +22,7 @@ pub(crate) struct Policy {
     journal_directory: Option<PathBuf>,
     journal_log_format: Option<LogFormat>,
     journal_max_log_parts: Option<u16>,
+    journal_enforced: bool,
     journal_clickable_links_denied: bool,
     journal_rename_denied: bool,
     journal_delete_denied: bool,
@@ -99,6 +100,10 @@ impl Policy {
         self.journal_max_log_parts
     }
 
+    pub(crate) fn journal_enforced(&self) -> bool {
+        self.journal_enforced
+    }
+
     pub(crate) fn journal_clickable_links_allowed(&self) -> bool {
         !self.journal_clickable_links_denied
     }
@@ -171,6 +176,7 @@ impl Policy {
             allowed(
                 journal,
                 &[
+                    "enforced",
                     "replace",
                     "storage-path",
                     "log-format",
@@ -186,6 +192,7 @@ impl Policy {
                     "automation-max-storage-mb",
                 ],
             )?;
+            self.journal_enforced |= boolean(journal, "enforced")? == Some(true);
             self.journal_clickable_links_denied |=
                 boolean(journal, "clickable-links")? == Some(false);
             self.journal_rename_denied |= boolean(journal, "allow-rename")? == Some(false);

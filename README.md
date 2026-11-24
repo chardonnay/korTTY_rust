@@ -267,6 +267,14 @@ shell-integration prompt and records confirmed physical input. Paste, mirrored
 input, password prompts and partial commands already in progress are excluded.
 Capture-log part sizes and counts are bounded, and managed limits remain effective.
 
+An administrator can set `[rule.session-journal] enforced = true` to start
+the journal automatically and lock the stop action on supported terminal
+streams. The SSH editor shows the requirement without changing the saved
+autostart preference. An effective `session-journal = "deny"` feature rule
+disables capture. In incognito tabs, the requirement captures masked live
+output with journal metadata. Separate typed-input records, screenshots,
+notes and journal AI stay disabled in those tabs.
+
 **View → Live Journal** opens the running recording on the left or right side of the main window. Position and width are saved. **Show/Hide** restores the last selected side. On macOS, this is also possible with `Cmd+Alt+L`, and on Linux with `Ctrl+Alt+L`. For the dock smoke test during recording, open **Dock Right** and **Live Log** and run `printf 'dock-live\n'`. Switch to a tab without a recording and choose **Note** in the dock. The note must appear in the previous session journal. Move the recording tab to a second main window via **View → Move Tab…**. The last state remains visible in the source window. In the target window, the dock can take over the running recording.
 
 **File → Create Backup…** or **⌘⇧B** or **Ctrl+Shift+B** creates an encrypted profile archive at the chosen target. This includes window and toolbar settings, environments, connections, projects, snippets, job definitions, trusted SSH host keys, as well as the vault and registered SSH keys. For externally registered keys, the path is preserved. Copies in the kortty profile are included in the archive. The native password ZIP uses AES-256 with an archive key derived via Argon2id. In OpenPGP mode, kortty encrypts the entire ZIP for the selected recipient.

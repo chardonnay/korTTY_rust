@@ -1139,6 +1139,35 @@ in the owned window under its stored name. Closing it returned to the
 SSH editor with the unsaved tag still in place.
 [Windows ARM64 preview build](target/verification/20261124-connection-memory-windows-preview.log)
 
+## November 24 managed session journal
+
+The `[rule.session-journal] enforced` boolean uses the effective user,
+group or global scope for that field. At the same scope, `true` wins. An
+effective feature denial prevents capture. The SSH editor shows a checked,
+locked autostart control while retaining the saved preference.
+
+On a supported terminal stream, the requirement starts the journal even
+when the profile's autostart preference is off. The tab and the AI probe
+cannot stop a required recording. Source closure and the capture limits
+still finalize it. An incognito stream uses the same output masking and
+omits the scrollback seed, separate typed-input records, screenshots, notes
+and journal AI. SSH prepares the credential mask for this case even when
+terminal logging and AI are off.
+
+Windows ARM64 and Apple Silicon each passed 17 focused tests. Apple
+Silicon also passed strict application and test-target Clippy. The PTY
+test starts and finalizes a required journal in regular and incognito
+tabs, exercises the disabled stop action, and reads the masked output
+back through the journal viewer. The SSH test covers credential-mask
+preparation. The live SSH capture and editor desktop checks remain open.
+[Apple Silicon verification](target/verification/20261124-managed-journal-macos-verified.log)
+· [Windows ARM64 verification](target/verification/20261124-managed-journal-windows-verified.log)
+
+[Tagged Java policy](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/policy/EffectivePolicy.java)
+· [Tagged Java terminal](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/TerminalView.java)
+· [Tagged Java editor](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ConnectionEditDialog.java)
+· [Rust recording](src/workspace/journal_capture_access.rs)
+
 ## November 23 GGUF Configure sizing
 
 Java sizes the Configure grid to its path label. Rust now measures the

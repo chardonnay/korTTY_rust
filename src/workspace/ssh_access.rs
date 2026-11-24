@@ -1752,6 +1752,7 @@ impl Workspace {
                     || policy.ai_agent_allowed()
                     || policy.ai_planning_allowed()
                     || policy.ai_swarm_allowed()))
+                || self.journal_required()
                 || (!incognito
                     && (logging
                         || self.journal_allowed()
@@ -1765,8 +1766,8 @@ impl Workspace {
         name: String,
         target: &SshTarget,
     ) -> crate::terminal_logging::Prepared {
-        // AI still needs an in-memory credential mask in a private terminal.
-        // Never let that mask enable persistent logging for an incognito pane.
+        // AI and mandatory journals can use an in-memory credential mask in a
+        // private terminal. The separate terminal logfile stays disabled.
         crate::terminal_logging::Prepared::new(
             if incognito {
                 Default::default()

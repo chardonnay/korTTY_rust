@@ -235,6 +235,12 @@ impl ClipboardPolicy {
             && self.terminal_logging.automation_journal_allowed()
     }
 
+    pub(crate) fn session_journal_required(&self) -> bool {
+        self.problem.is_none()
+            && self.session_journal_allowed
+            && self.terminal_logging.journal_enforced()
+    }
+
     pub(crate) fn ai_profile_creation_allowed(&self) -> bool {
         self.problem.is_none() && self.ai_profile_creation_allowed
     }
@@ -1735,6 +1741,53 @@ control-api = "deny"
         );
         assert!(parse(&source.replace(&format!("{root}a-journals"), "relative")).is_err());
         assert!(!ClipboardPolicy::lockdown("invalid policy".into()).session_journal_allowed);
+    }
+
+    #[test]
+    fn session_journal_policy_enforcement_uses_the_winning_scope_and_respects_denial() {
+        let source = r#"
+            [meta]
+            schema-version = 1
+
+            [[rule]]
+            [rule.session-journal]
+            enforced = true
+
+            [[rule]]
+            groups = ["exempt"]
+            [rule.session-journal]
+            enforced = false
+
+            [[rule]]
+            users = ["audited"]
+            [rule.session-journal]
+            enforced = false
+
+            [[rule]]
+            users = ["audited", "denied"]
+            [rule.session-journal]
+            enforced = true
+
+            [[rule]]
+            users = ["denied"]
+            [rule.features]
+            session-journal = "deny"
+        "#;
+        let effective = |user: &str, groups: &[String]| {
+            parse_with_identity(source, None, || Ok(user), || Ok(groups)).unwrap()
+        };
+        let exempt = ["exempt".into()];
+        assert!(!parse(POLICY_META).unwrap().session_journal_required());
+        assert!(effective("ordinary", &[]).session_journal_required());
+        assert!(!effective("ordinary", &exempt).session_journal_required());
+        assert!(effective("audited", &exempt).session_journal_required());
+        assert!(!effective("denied", &[]).session_journal_required());
+        assert!(
+            parse(&format!(
+                "{POLICY_META}[[rule]]\n[rule.session-journal]\nenforced = 'true'\n"
+            ))
+            .is_err()
+        );
     }
 
     #[test]

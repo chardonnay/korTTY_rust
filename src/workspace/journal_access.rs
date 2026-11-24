@@ -207,6 +207,10 @@ impl Workspace {
         self.clipboard.policy.session_journal_allowed && self.clipboard.policy.problem.is_none()
     }
 
+    pub(super) fn journal_required(&self) -> bool {
+        self.clipboard.policy.session_journal_required()
+    }
+
     pub(super) fn journal_links_allowed(&self) -> bool {
         self.journal_allowed()
             && self.window_settings.session_journal.clickable_links

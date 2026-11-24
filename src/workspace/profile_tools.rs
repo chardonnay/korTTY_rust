@@ -511,6 +511,7 @@ impl Workspace {
                 themes: &self.window_settings.themes,
                 journal_policy: connection_window::JournalEditorPolicy {
                     allowed: self.journal_allowed(),
+                    required: self.journal_required(),
                     summaries_allowed: crate::session_journal::topic_ai_settings::allowed(
                         &self.clipboard.policy,
                     ),

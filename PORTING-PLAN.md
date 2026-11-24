@@ -168,8 +168,15 @@ Jump Server, Terminal Logging, Journal, Window Geometry and AI. The
 use the existing saved connection options. The
 [connection memory shortcut](PORTING-PARITY.md#november-24-memory-from-the-ssh-editor)
 opens the exact saved SSH profile's memory in a separate owned window.
-The Java overflow menu still needs implementation. Compare the journal
-limits and enforced policy behavior with Java. The Manager's separate
+The [managed Journal requirement](PORTING-PARITY.md#november-24-managed-session-journal)
+locks the SSH editor's autostart control and starts capture on eligible
+terminal streams. Replace the wrapped SSH editor tab strip with the Java
+overflow menu and previous/next controls. Preserve tab stepping from fields
+with Ctrl+Tab, Ctrl+Shift+Tab and Ctrl+Page Up or Down.
+Resolve the Journal rotation difference. The Java editor allows 1,000 MiB
+per part and 500 parts by default. Rust limits these to 120 MiB and 64
+parts. Review the writer, viewer and export limits before changing the
+approved bounds. The Manager's separate
 Teamwork sidebar group and editor form alignment remain open. The earlier
 Windows desktop check covered the three-pane Manager, its Map view, opening
 the editor and navigating between editor tabs.
@@ -2481,7 +2488,7 @@ See [Scheduler screenshots and local vision](PORTING-PARITY.md#scheduler-screens
 
 | ID | State and implemented coverage | Remaining work |
 | --- | --- | --- |
-| J1 | Acceptance. Per-connection automatic capture, opt-in typed input, XML settings, raw evidence, screenshots, redaction and retention exist. | Native input-off/on, imported omitted/explicit values, command boundaries, reconnect, duplicate/import/export, limits and restart. Preserve screenshot consent and the native typed-input privacy default. |
+| J1 | Implementation and acceptance. Per-connection automatic capture, opt-in typed input, XML settings, raw evidence, screenshots, redaction and retention exist. Managed policy can require automatic capture and lock manual stop. | Compare the rotation bounds and reconnect lifecycle against Java. Verify native input-off/on, imported omitted/explicit values, command boundaries, duplicate/import/export and restart. Exercise the managed control on native desktops and the required capture path over SSH. Preserve screenshot consent and the native typed-input privacy default. |
 | J2 | Acceptance. Local/managed periodic and closing summaries, durable catch-up, re-evaluation, backfill and screenshot re-description exist. Command cards, help and failed-start filtering, the reviewed long-output mode, classified command counts in journal metadata, startup finalization of abandoned native interactive journals, reopenable progress details, and row/group status badges are implemented. F1 binds the HTTPS credential at preflight, streaming and retry. Reviewed HTTPS and CLI approvals bind the profile revision, journal root, source identity, redaction rules and output mode. OpenAI-compatible HTTPS summaries support server-selected models through the same approval checks. Live, entry and screenshot note editors offer separate reviewed HTTPS and CLI translation. The native journal viewer and compatible browsers for HTML bundles have a 40-pixel scrollbar thumb minimum. R `src/session_journal/summary_job.rs`, `src/workspace/journal_access/summaries.rs`. | Verify native close and count recovery, scheduling, cancellation, restart, pending deletion and configured HTTPS and CLI providers. Verify local vision, per-connection overrides, desktop progress lifecycle and native scrollbar dragging. |
 | J3 | Acceptance. Reviewed local, HTTPS and CLI Q&A, lexical cross-journal search, reciprocal-rank fusion and exact capture/entry/chat citations exist. Saved HTTP loopback and reviewed OpenAI-compatible HTTPS profiles, including eligible loopback HTTPS, can use server-selected models for Q&A. F1 passes the reviewed HTTPS credential through question dispatch. Each question requires approval of the exact masked evidence and destination. The viewer and manager preselect an eligible saved HTTPS Journal role. Without a dedicated role, the global HTTPS default is used when no configured local answer takes precedence. Recording and Scheduler retain their separate summary approvals. Separately reviewed local semantic ranking reuses a private per-journal vector for the exact document, masked card and model. Stale and unavailable cache entries use fresh reviewed embeddings or lexical fallback. | Verify native citation routing, stale-source/policy rejection, recorded chats and configured providers. The CLI route uses one approved invocation and validates exact quotations from the reviewed evidence. The semantic scope follows the reviewed candidate shortlist. J `core/SessionJournalAskService.java`, `core/SessionJournalSemanticIndex.java`, R `src/session_journal/question/rank.rs`. |
 

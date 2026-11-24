@@ -18,6 +18,7 @@ pub enum Edit {
 #[derive(Clone, Copy)]
 pub(crate) struct Policy {
     pub(crate) allowed: bool,
+    pub(crate) required: bool,
     pub(crate) summaries_allowed: bool,
     pub(crate) max_parts: Option<u16>,
 }
@@ -26,6 +27,7 @@ impl Default for Policy {
     fn default() -> Self {
         Self {
             allowed: true,
+            required: false,
             summaries_allowed: true,
             max_parts: None,
         }
@@ -104,9 +106,12 @@ impl Draft {
                 .align_y(Alignment::Center)
         };
         column![
-            checkbox(self.settings.auto_start)
+            checkbox(policy.required || self.settings.auto_start)
                 .label("Start a journal on connect")
-                .on_toggle_maybe(policy.allowed.then_some(Edit::Auto)),
+                .on_toggle_maybe((policy.allowed && !policy.required).then_some(Edit::Auto)),
+            policy
+                .required
+                .then(|| text("Session journaling is required by managed policy.").size(13)),
             rule::horizontal(1),
             checkbox(self.settings.capture_input)
                 .label("Capture typed commands at recognized shell prompts")
