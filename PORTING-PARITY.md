@@ -1008,6 +1008,34 @@ one Windows display. The Java comparison and other native display
 configurations remain open.
 [Windows ARM64 standalone preview build](target/verification/20261124-ui-font-scale-windows-preview-final.log)
 
+## November 24 Settings section overflow
+
+The Settings tab strip shows a drop-down at its right edge when its
+labels exceed the available width. The width check uses the same font
+metrics and scale as the tabs and accounts for the Keyboard conflict
+count. The menu lists all sections in order and marks the active one.
+Picking a section uses the same page and scroll navigation as clicking
+its tab. The menu widens to the left of its trigger to fit longer section
+names, and its list scrolls when the window has limited vertical space.
+[OpenJFX 21 tab menu](https://github.com/openjdk/jfx21u/blob/master/modules/javafx.controls/src/main/java/javafx/scene/control/skin/TabPaneSkin.java#L1731)
+· [Rust Settings tab strip](src/workspace/settings_window/section_tabs.rs)
+
+Windows ARM64 passed 102 Settings tests before the tooltip was removed.
+Apple Silicon repeated all 102 Settings tests and strict application and
+test-target Clippy after the removal. The widget test opened the offscreen
+AI Agent Design page at 100% and checked menu visibility at a width that
+fits all tabs at 100% and overflows at 160%.
+[Apple Silicon verification](target/verification/20261124-settings-overflow-macos-visual-fix.log)
+· [Windows ARM64 verification](target/verification/20261124-settings-overflow-windows-final.log)
+
+At a width of 1,122 pixels, the standalone Windows ARM64 Settings window
+showed all 18 menu entries and marked Font as active. Selecting AI Agent
+Design opened the page and scrolled its tab into view. Maximizing the
+window exposed the entire strip and hid the menu. The corrected preview
+repeated the menu selection after removing a tooltip that overlapped the
+tab labels.
+[Final Windows ARM64 preview build](target/verification/20261124-settings-overflow-windows-preview-final.log)
+
 ## November 23 GGUF Configure sizing
 
 Java sizes the Configure grid to its path label. Rust now measures the

@@ -175,6 +175,7 @@ pub struct PickList<
     menu_class: <Theme as menu::Catalog>::Class<'a>,
     last_status: Option<Status>,
     menu_height: Length,
+    menu_width: Option<Pixels>,
 }
 
 impl<'a, T, L, V, Message, Theme, Renderer>
@@ -213,6 +214,7 @@ where
             menu_class: <Theme as Catalog>::default_menu(),
             last_status: None,
             menu_height: Length::Shrink,
+            menu_width: None,
         }
     }
 
@@ -237,6 +239,12 @@ where
     /// Sets the height of the [`Menu`].
     pub fn menu_height(mut self, menu_height: impl Into<Length>) -> Self {
         self.menu_height = menu_height.into();
+        self
+    }
+
+    /// Sets a minimum menu width, with extra space extending to the left.
+    pub fn menu_width(mut self, width: impl Into<Pixels>) -> Self {
+        self.menu_width = Some(width.into());
         self
     }
 
@@ -723,6 +731,12 @@ where
 
         if state.is_open {
             let bounds = layout.bounds();
+            let mut position = layout.position() + translation;
+            let mut width = bounds.width;
+            if let Some(minimum) = self.menu_width {
+                width = width.max(minimum.0.min(viewport.width));
+                position.x = (position.x - (width - bounds.width)).max(viewport.x);
+            }
 
             let on_select = &self.on_select;
 
@@ -739,7 +753,7 @@ where
                 &self.menu_class,
             )
             .option_enabled(self.option_enabled)
-            .width(bounds.width)
+            .width(width)
             .padding(self.padding)
             .font(font)
             .text_shaping(self.text_shaping);
@@ -749,7 +763,7 @@ where
             }
 
             Some(menu.overlay(
-                layout.position() + translation,
+                position,
                 *viewport,
                 bounds.height,
                 self.menu_height,

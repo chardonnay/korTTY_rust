@@ -57,6 +57,7 @@ mod highlight_settings;
 mod logging_settings;
 mod quick_select_settings;
 mod search_input;
+mod section_tabs;
 pub(super) mod sftp_settings;
 mod snippet_editor_settings;
 mod startup_settings;
@@ -3376,32 +3377,7 @@ impl Workspace {
             .width(Length::Fill),
         ]
         .align_y(Alignment::Center);
-        let conflicts = dialog.draft.preferences.key_bindings.conflicts().len();
-        let tabs = Section::ALL.into_iter().fold(row![], |row, section| {
-            let label = text(section.label()).size(13);
-            let selected = dialog.section == section;
-            let tab = container(
-                button(if section == Section::Keyboard && conflicts != 0 {
-                    row![label, text(conflicts).size(13).style(text::danger)].spacing(5)
-                } else {
-                    row![label]
-                })
-                .padding([8, 15])
-                .style(move |theme, status| dialog_design::tab(theme, status, selected))
-                .on_press(msg(Message::Section(id, section))),
-            );
-            row.push(if selected {
-                tab.id(dialog.selected_tab.clone())
-            } else {
-                tab
-            })
-        });
-        let tabs = scrollable(tabs)
-            .id(dialog.tab_scroll.clone())
-            .direction(scrollable::Direction::Horizontal(
-                scrollable::Scrollbar::new().width(4).scroller_width(4),
-            ))
-            .width(Length::Fill);
+        let tabs = section_tabs::view(dialog);
         let ui_scale =
             super::ui_font_scale::ratio(self.window_settings.appearance, self.ui_display_size);
         let page = match dialog.section {

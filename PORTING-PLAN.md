@@ -90,6 +90,7 @@ records the broader comparison with the tagged Java release.
 | Area | Remaining change | Completion check |
 | --- | --- | --- |
 | D4 · Searchable controls | Compare the remaining Java Settings and AI Manager pages, subpages and labeled controls with the Rust search inventory. The [Knowledge Stores toolbar](PORTING-PARITY.md#november-24-knowledge-stores-toolbar-search), [Local Models runtime and GGUF import controls](PORTING-PARITY.md#november-24-local-models-toolbar-search), and [Appearance controls](PORTING-PARITY.md#november-24-appearance-inventory) have independent search targets. | Verify that controls on a page that has never been opened are discoverable, and that navigation reveals the exact control with the current page state and policy. |
+| D4 · Settings section navigation | The [Settings section menu](PORTING-PARITY.md#november-24-settings-section-overflow) appears when the tab labels exceed the available width at the current application font scale. It lists every Rust section in tab order and marks the active section. | Add keyboard activation and selection to the menu. Compare the styling with Java and repeat the pointer check on other native desktops. |
 | Appearance preferences | [Chat color profile](PORTING-PARITY.md#november-24-appearance-inventory) is available in Settings and the AI Chat toolbar. [UI font size](PORTING-PARITY.md#november-24-application-font-scale) and Match display resolution are searchable in Settings. Java backup import preserves the application and guide scales independently. | Verify the theme-following and fixed profiles in running AI Chat and Swarm views, including when a chat is already open. Compare manual and automatic UI font scale at multiple native display scales with Java, including popups and the terminal, editor and chat font boundaries. |
 
 The [November 23 review](PORTING-PARITY.md#november-23-dialog-parity-review)
@@ -131,26 +132,32 @@ The shared Settings frame and Font page now follow the Normal Java design.
 The Window page groups tool-window hosting with window preferences. A
 Windows ARM64 comparison covered both pages, search result focus, the
 font-size preview and cancellation. A direct-start recheck confirmed the
-Font field order. Rust has 18 tabs in a scrolling strip. Java has 21
-sections and an overflow menu. The first Security comparison covered the
-master-password group and both search results. Resources, Privacy, Language
-and Translation still need a comparison of their Java controls and Rust
-entry points. The tab overflow affordance, control styling and deeper
-Settings pages still need visual work. [Desktop comparison](PORTING-PARITY.md#november-22-java-dialog-design-on-windows-arm64)
+Font field order. Rust has 18 tabs and shows an overflow menu when the
+full strip exceeds the available width. Java has 21 sections. The first
+Security comparison covered the master-password group and both search
+results. Control styling and deeper Settings pages still need visual
+work. [Desktop comparison](PORTING-PARITY.md#november-22-java-dialog-design-on-windows-arm64)
 
-Resources exposes a JVM launch profile and its heap limit. Compare the
-native resource controls before specifying a Rust equivalent. The Security
-page offers the imported global isolation and Quick Connect temporary-key
-choices for explicit adoption. Windows ARM64 verified the managed display,
-below-minimum rejection and folder review presentation. Exercise the Save
-and restart flow for reviewed choices and repeat it on the other native
-desktops. Continue the [saved temporary-key desktop checks](PORTING-PARITY.md#november-23-native-saved-temporary-ssh-keys).
-Privacy exposes Java
-telemetry consent. Record the native app's behavior and the handling of imported
-consent before designing the corresponding surface. Language selects the
-application language. Translation manages application translation profiles,
-translation runs and generated languages. Audit those workflows separately
-from the existing snippet and journal translation actions.
+Resources exposes a JVM launch profile and its heap limit. Rust already
+detects physical memory for local-model recommendations and provides a
+terminal scrollback memory limit. Compare those native controls before
+specifying a Resources page. [Host memory](src/host_memory.rs)
+· [Settings controls](src/workspace/settings_window.rs).
+
+The Security page offers the imported global isolation and Quick Connect
+temporary-key choices for explicit adoption. Windows ARM64 verified the
+managed display, below-minimum rejection and folder review presentation.
+Exercise the Save and restart flow for reviewed choices and repeat it on
+the other native desktops. Continue the [saved temporary-key desktop checks](PORTING-PARITY.md#november-23-native-saved-temporary-ssh-keys).
+Java Privacy manages analytics consent and the date and version of that
+decision. Rust validates the shared `allow-telemetry` policy field, and
+Java backup restore drops telemetry consent. [Policy validation](src/clipboard_policy.rs)
+· [Backup restore regression](src/workspace/backup_data/maintenance.rs).
+Java Language selects the application locale. Java Translation manages
+profiles, runs and generated UI and guide locales. Application localization
+is deferred under the [port constraints](#scope-and-recorded-decisions). Assess
+the generated guide workflow on its own. The implemented snippet and
+journal translation actions operate on user content.
 [Tagged Java Settings](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SettingsDialog.java)
 
 The Connection Manager adopts the Java toolbar order, places Undo in the
