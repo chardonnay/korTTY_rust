@@ -22,6 +22,7 @@ use super::view::ViewChoices;
 use super::{CredentialChoice, Message, os_badge, terminal_overrides};
 
 mod geometry;
+mod tabs;
 
 #[derive(Clone, Debug)]
 pub enum Edit {
@@ -193,6 +194,7 @@ impl fmt::Display for PasteChoice {
 
 pub(super) struct Draft {
     page: Page,
+    tab_menu: iced::widget::Id,
     id: u64,
     name: String,
     tag: String,
@@ -270,6 +272,7 @@ impl Draft {
     pub fn new() -> Self {
         Self {
             page: Page::default(),
+            tab_menu: iced::widget::Id::unique(),
             id: 0,
             name: String::new(),
             tag: String::new(),
@@ -296,6 +299,7 @@ impl Draft {
     pub fn from_profile(connection: &Connection, os_badge: Option<&str>, duplicate: bool) -> Self {
         Self {
             page: Page::default(),
+            tab_menu: iced::widget::Id::unique(),
             id: if duplicate { 0 } else { connection.id },
             name: if duplicate {
                 format!("{} (copy)", connection.name)
@@ -496,43 +500,8 @@ impl Draft {
         inherited: Option<(&str, IsolationLevel)>,
     ) -> Element<'a, Message> {
         use crate::workspace::dialog_design;
-        use iced::widget::{container, keyed_column, scrollable, space};
+        use iced::widget::{container, keyed_column, scrollable};
 
-        let tabs = Page::ALL.into_iter().fold(row![], |tabs, page| {
-            let selected = self.page == page;
-            tabs.push(
-                button(text(page.label()).size(13))
-                    .padding([8, 12])
-                    .style(move |theme, status| dialog_design::tab(theme, status, selected))
-                    .on_press(Message::Edit(Edit::Page(page))),
-            )
-        });
-        let index = Page::ALL
-            .iter()
-            .position(|page| *page == self.page)
-            .expect("every editor page has a tab");
-        let arrows = row![
-            space::horizontal(),
-            text(format!("{} / {}", index + 1, Page::ALL.len())).size(13),
-            button(text("◂").size(13))
-                .style(button::secondary)
-                .padding([4, 8])
-                .on_press_maybe(
-                    index
-                        .checked_sub(1)
-                        .map(|previous| Message::Edit(Edit::Page(Page::ALL[previous])))
-                ),
-            button(text("▸").size(13))
-                .style(button::secondary)
-                .padding([4, 8])
-                .on_press_maybe(
-                    Page::ALL
-                        .get(index + 1)
-                        .map(|next| Message::Edit(Edit::Page(*next)))
-                ),
-        ]
-        .align_y(Alignment::Center)
-        .spacing(4);
         let content = match self.page {
             Page::Connection => self.connection_page(choices, custom_badges, group),
             Page::Settings => self.settings_page(choices, inherited),
@@ -569,14 +538,22 @@ impl Draft {
         )
         .style(dialog_design::page);
         column![
-            arrows,
-            tabs.wrap(),
+            tabs::arrows(self.page),
+            tabs::view(self.page, self.tab_menu.clone()),
             keyed_column![(self.page, page)].height(Length::Fill),
             self.connection().err().map(|error| text(error).size(13)),
         ]
         .spacing(4)
         .height(Length::Fill)
         .into()
+    }
+
+    pub(super) fn tab_shortcut(
+        &self,
+        key: &iced::keyboard::Key,
+        modifiers: iced::keyboard::Modifiers,
+    ) -> Option<Message> {
+        tabs::shortcut(self.page, key, modifiers)
     }
 
     fn connection_page<'a>(

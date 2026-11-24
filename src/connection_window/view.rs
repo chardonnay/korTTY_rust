@@ -489,7 +489,20 @@ impl ConnectionWindow {
                 .push(rule::horizontal(1))
                 .push(container(text(notice).size(13)).padding([8, 16]));
         }
-        Some(body.into())
+        let body = body.into();
+        Some(
+            if let Some(draft) = self
+                .draft
+                .as_ref()
+                .filter(|_| !self.confirming_close && !self.busy)
+            {
+                crate::workspace::dialog_design::on_key_press(body, |key, modifiers| {
+                    draft.tab_shortcut(key, modifiers)
+                })
+            } else {
+                body
+            },
+        )
     }
 
     pub(crate) fn view(&self, choices: ViewChoices<'_>) -> Element<'_, Message> {

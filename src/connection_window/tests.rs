@@ -1105,8 +1105,12 @@ fn connection_tab_color_draft_validates_saves_and_can_be_removed() {
 
 #[test]
 fn ssh_editor_journal_and_ai_tabs_keep_their_drafts_when_terminal_defaults_are_restored() {
-    use iced::advanced::{Layout, layout, widget::Tree};
-    use iced::{Font, Renderer, Size};
+    use iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
+    use iced::keyboard::{
+        self, Key, Location, Modifiers,
+        key::{self, Named},
+    };
+    use iced::{Event, Font, Renderer, Size, mouse};
     use terminal_overrides::Edit as Terminal;
 
     let profile = Profile::new();
@@ -1157,12 +1161,57 @@ fn ssh_editor_journal_and_ai_tabs_keep_their_drafts_when_terminal_defaults_are_r
         .nth(1)
         .unwrap()
         .children()
+        .next()
+        .unwrap()
+        .children()
         .map(|tab| tab.bounds())
         .collect();
-    assert_eq!(tabs.len(), 8);
+    assert_eq!(tabs.last().unwrap().width, 34.0);
     assert!(tabs.iter().all(|tab| tab.x + tab.width <= compact.width));
+    assert!(
+        tabs.iter()
+            .all(|tab| (tab.center().y - tabs[0].center().y).abs() < 1.0)
+    );
     let footer = root.children().nth(2).unwrap().bounds();
     assert!(footer.height > 0.0 && footer.y + footer.height <= compact.height);
+
+    for (named, modifiers, selected) in [
+        (Named::Tab, Modifiers::CTRL, form::Page::Settings),
+        (
+            Named::Tab,
+            Modifiers::CTRL | Modifiers::SHIFT,
+            form::Page::Connection,
+        ),
+        (Named::PageDown, Modifiers::CTRL, form::Page::Settings),
+        (Named::PageUp, Modifiers::CTRL, form::Page::Connection),
+    ] {
+        let key = Key::Named(named);
+        let event = Event::Keyboard(keyboard::Event::KeyPressed {
+            modified_key: key.clone(),
+            key,
+            location: Location::Standard,
+            physical_key: key::Physical::Unidentified(key::NativeCode::Unidentified),
+            modifiers,
+            text: None,
+            repeat: false,
+        });
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+        view.as_widget_mut().update(
+            &mut tree,
+            &event,
+            root,
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut shell,
+            &node.bounds(),
+        );
+        assert!(shell.is_event_captured());
+        assert!(
+            matches!(messages.as_slice(), [Message::Edit(Edit::Page(page))] if *page == selected)
+        );
+    }
     drop(view);
 
     let _ = window.update(Message::Edit(Edit::Page(form::Page::Ai)));

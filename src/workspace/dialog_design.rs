@@ -1,12 +1,42 @@
 use std::sync::LazyLock;
 
+use iced::advanced::text::{self as layout_text, Paragraph as _};
 use iced::theme::Base as _;
 use iced::{
-    Color, Element, Font, Length, Theme,
+    Color, Element, Font, Length, Pixels, Size, Theme,
     widget::{button, container, rule, stack, text, text_input},
 };
+use iced_tiny_skia::font_scale::Paragraph;
 
+pub(crate) use super::dialog_placement::escape::on_key_press;
 pub(crate) mod keyboard_table;
+
+pub(crate) const TAB_LABEL_SIZE: f32 = 13.0;
+
+pub(crate) fn tab_label<'a>(
+    label: impl iced::widget::text::IntoFragment<'a>,
+) -> iced::widget::Text<'a> {
+    text(label)
+        .size(TAB_LABEL_SIZE)
+        .shaping(layout_text::Shaping::Advanced)
+        .wrapping(layout_text::Wrapping::None)
+}
+
+pub(crate) fn tab_label_width(label: &str) -> f32 {
+    // Measure labels inside the same font-scale scope as their actual widgets.
+    Paragraph::with_text(layout_text::Text {
+        content: label,
+        bounds: Size::INFINITE,
+        size: Pixels(TAB_LABEL_SIZE),
+        line_height: layout_text::LineHeight::default(),
+        font: Font::DEFAULT,
+        align_x: layout_text::Alignment::Default,
+        align_y: iced::alignment::Vertical::Top,
+        shaping: layout_text::Shaping::Advanced,
+        wrapping: layout_text::Wrapping::None,
+    })
+    .min_width()
+}
 
 const NAME: &str = "Normal Dialog";
 const PAGE: Color = Color::from_rgb8(30, 30, 30);

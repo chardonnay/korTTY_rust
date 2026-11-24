@@ -1,13 +1,12 @@
 use std::fmt;
 
-use iced::advanced::text::{self as layout_text, Paragraph as _};
 use iced::widget::{Responsive, button, container, pick_list, row, scrollable, text};
-use iced::{Alignment, Element, Font, Length, Pixels, Size};
-use iced_tiny_skia::font_scale::Paragraph;
+use iced::{Alignment, Element, Length};
+
+use crate::workspace::dialog_design::{TAB_LABEL_SIZE, tab_label, tab_label_width};
 
 use super::{Desktop, Dialog, Message, Section, dialog_design};
 
-const LABEL_SIZE: f32 = 13.0;
 const TAB_HORIZONTAL_PADDING: u16 = 15;
 const CONFLICT_SPACING: f32 = 5.0;
 const MENU_PADDING_Y: u16 = 8;
@@ -35,13 +34,13 @@ pub(super) fn view(dialog: &Dialog) -> Element<'_, Desktop> {
 
     Responsive::new(move |size| {
         let tabs = Section::ALL.into_iter().fold(row![], |row, section| {
-            let mut label = row![tab_text(section.label())];
+            let mut label = row![tab_label(section.label())];
             if section == Section::Keyboard
                 && let Some(conflicts) = &conflict_label
             {
                 label = label
                     .spacing(CONFLICT_SPACING)
-                    .push(tab_text(conflicts.clone()).style(text::danger));
+                    .push(tab_label(conflicts.clone()).style(text::danger));
             }
             let selected = dialog.section == section;
             let tab = container(
@@ -79,7 +78,7 @@ pub(super) fn view(dialog: &Dialog) -> Element<'_, Desktop> {
         .keyboard_navigation(dialog.tab_menu.clone())
         .width(34)
         .menu_width(MENU_WIDTH)
-        .text_size(LABEL_SIZE)
+        .text_size(TAB_LABEL_SIZE)
         .padding([MENU_PADDING_Y, 9]);
         bar.spacing(4).push(trigger).into()
     })
@@ -87,39 +86,17 @@ pub(super) fn view(dialog: &Dialog) -> Element<'_, Desktop> {
     .into()
 }
 
-fn tab_text<'a>(label: impl iced::widget::text::IntoFragment<'a>) -> iced::widget::Text<'a> {
-    text(label)
-        .size(LABEL_SIZE)
-        .shaping(layout_text::Shaping::Advanced)
-        .wrapping(layout_text::Wrapping::None)
-}
-
 fn total_width(conflicts: Option<&str>) -> f32 {
     let tabs = Section::ALL
         .iter()
-        .map(|section| label_width(section.label()) + 2.0 * f32::from(TAB_HORIZONTAL_PADDING))
+        .map(|section| tab_label_width(section.label()) + 2.0 * f32::from(TAB_HORIZONTAL_PADDING))
         .sum::<f32>();
-    tabs + conflicts.map_or(0.0, |label| label_width(label) + CONFLICT_SPACING)
-}
-
-fn label_width(label: &str) -> f32 {
-    // Responsive measures inside the same font-scale scope as the tab widgets.
-    Paragraph::with_text(layout_text::Text {
-        content: label,
-        bounds: Size::INFINITE,
-        size: Pixels(LABEL_SIZE),
-        line_height: layout_text::LineHeight::default(),
-        font: Font::DEFAULT,
-        align_x: layout_text::Alignment::Default,
-        align_y: iced::alignment::Vertical::Top,
-        shaping: layout_text::Shaping::Advanced,
-        wrapping: layout_text::Wrapping::None,
-    })
-    .min_width()
+    tabs + conflicts.map_or(0.0, |label| tab_label_width(label) + CONFLICT_SPACING)
 }
 
 #[cfg(test)]
 mod tests {
+    use iced::advanced::text as layout_text;
     use iced::advanced::{
         clipboard,
         widget::operation::{Operation, Outcome, focusable},
@@ -128,7 +105,7 @@ mod tests {
         self, Key, Location, Modifiers,
         key::{self, Named},
     };
-    use iced::{Event, Point, Renderer, event, mouse};
+    use iced::{Event, Font, Pixels, Point, Renderer, Size, event, mouse};
     use iced_runtime::{UserInterface, user_interface::Cache};
 
     use super::*;
@@ -270,7 +247,7 @@ mod tests {
 
             if width == 660.0 {
                 let row_height = layout_text::LineHeight::default()
-                    .to_absolute(Pixels(LABEL_SIZE))
+                    .to_absolute(Pixels(TAB_LABEL_SIZE))
                     .0
                     + 2.0 * f32::from(MENU_PADDING_Y);
                 let option = Point::new(

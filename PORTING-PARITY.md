@@ -1100,8 +1100,9 @@ temporary-key replacement in the vault.
 [Windows ARM64 preview build](target/verification/20261124-connection-editor-tabs-windows-preview.log)
 · [Windows ARM64 opt-in tests](target/verification/20261124-connection-editor-tabs-windows-opt-in.log)
 
-The single-row overflow navigation remains open, along with the
-comparison of journal limits and enforced policy behavior.
+The later [tab navigation update](#november-24-ssh-editor-tab-navigation)
+adds single-row overflow. The [managed session journal](#november-24-managed-session-journal)
+covers enforced policy behavior. Rotation limits remain in the porting plan.
 [Tagged Java editor](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ConnectionEditDialog.java)
 · [Rust editor](src/connection_window/form.rs)
 
@@ -1159,14 +1160,42 @@ Silicon also passed strict application and test-target Clippy. The PTY
 test starts and finalizes a required journal in regular and incognito
 tabs, exercises the disabled stop action, and reads the masked output
 back through the journal viewer. The SSH test covers credential-mask
-preparation. The live SSH capture and editor desktop checks remain open.
+preparation. A subsequent Apple Silicon run authenticated a saved private
+SSH profile against a pinned OpenSSH loopback server, verified automatic
+start and the stop lock, and read the masked output back from the finalized
+journal. It used a fresh profile with AI and terminal logfile capture off.
+The managed editor control still needs desktop verification.
 [Apple Silicon verification](target/verification/20261124-managed-journal-macos-verified.log)
 · [Windows ARM64 verification](target/verification/20261124-managed-journal-windows-verified.log)
+· [Apple Silicon OpenSSH verification](target/verification/20261124-ssh-editor-navigation-macos-verified.log)
 
 [Tagged Java policy](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/policy/EffectivePolicy.java)
 · [Tagged Java terminal](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/TerminalView.java)
 · [Tagged Java editor](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ConnectionEditDialog.java)
 · [Rust recording](src/workspace/journal_capture_access.rs)
+
+## November 24 SSH editor tab navigation
+
+The editor lays out all eight tabs on one line when they fit. At narrow
+widths, the strip keeps the active tab visible and offers the full list
+with the current tab marked. The previous and next controls and position
+counter sit above the header. The arrows stop at the first and last tabs.
+Ctrl+Tab, Ctrl+Shift+Tab and Ctrl+Page Down or Up use those same boundaries.
+These shortcuts route through the SSH editor while fields have focus.
+Changing tabs leaves the edited values in their draft and the Save and
+Cancel controls outside page scrolling.
+
+Windows ARM64 and Apple Silicon each passed 57 focused tests with one
+ignored. Windows also passed the opt-in temporary-key editor test. Apple
+Silicon passed strict application and test-target Clippy. The native
+widget checks open the overflow menu, jump to the hidden AI page, verify
+the compact footer, and route the Java tab shortcuts through the editor.
+The desktop comparison of the revised strip remains open.
+[Apple Silicon verification](target/verification/20261124-ssh-editor-navigation-macos-verified.log)
+· [Windows ARM64 verification](target/verification/20261124-ssh-editor-navigation-windows-verified.log)
+
+[Tagged Java navigation](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/TabPaneArrowNavigation.java)
+· [Rust SSH editor navigation](src/connection_window/form/tabs.rs)
 
 ## November 23 GGUF Configure sizing
 
