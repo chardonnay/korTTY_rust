@@ -7,6 +7,31 @@ const HEADER: &str =
     "Name,Protocol,Host,Port,Username,Group,LocalTunnels,RemoteTunnels,DynamicTunnels,Comment";
 
 #[test]
+fn java_log_blocks_use_jaxb_defaults_and_isolate_invalid_logging() {
+    let rows = br#"<connections>
+      <connection><name>Defaults</name><host>defaults.test</host><username>operator</username>
+        <logConfig><format>XML</format><enabled>1</enabled></logConfig>
+      </connection>
+      <connection><name>Invalid</name><host>invalid.test</host><username>operator</username>
+        <logConfig><enabled>true</enabled><enabled>false</enabled></logConfig>
+      </connection>
+    </connections>"#;
+    let preview = xml::parse(rows).unwrap();
+    assert_eq!(preview.invalid, 0);
+    assert_eq!(preview.skipped_logging, 1);
+    let mut profiles = preview.entries();
+    let logging = &profiles.next().unwrap().0.logging;
+    let fields = logging.java_fields();
+    assert!(!fields.enabled);
+    assert!(logging.java_review().unwrap().enable_requested);
+    assert_eq!(fields.format, crate::terminal_logging::Format::Xml);
+    assert_eq!(fields.max_mib, 10);
+    assert_eq!(fields.retention_days, 30);
+    assert!(fields.compress && fields.rotate_daily);
+    assert!(profiles.next().unwrap().0.logging.is_default());
+}
+
+#[test]
 fn saved_window_geometry_import_accepts_private_java_xml_and_rejects_ambiguity() {
     let entry = |geometry: &str| {
         format!(

@@ -225,12 +225,12 @@ and viewer loading at the Java limit before raising the native size limit.
 Java log names include the sanitized connection name. Rust names use a
 session identifier. Align new names and their preview while retaining
 support for reading and rotating existing logs.
-Java profile XML also includes a `logConfig` record. The Rust Java
-import path initializes native logging defaults and drops that record.
-Map compatible format, size, retention, rotation, compression and
-metadata choices. Use the existing portable restore review for enabling
-logging and adopting an external directory, including legacy file paths
-stored in Java's `logFilePath` field.
+The [terminal logging XML update](PORTING-PARITY.md#november-24-java-terminal-logging-xml)
+maps the Java `logConfig` record during direct import and portable Java backup
+restore. A request to enable logging and a Java path are stored for explicit
+review on the Terminal Logging page. A native absolute legacy file path can
+suggest its parent directory. The Rust size limit still applies, and the
+review retains any out-of-range Java value.
 The [managed Journal requirement](PORTING-PARITY.md#november-24-managed-session-journal)
 locks the SSH editor's autostart control and starts capture on eligible
 terminal streams. A native Apple Silicon OpenSSH test covered automatic

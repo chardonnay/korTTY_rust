@@ -25,6 +25,7 @@ use crate::connection_store::{
 use crate::session_journal::ConnectionConfig;
 use crate::session_security::IsolationLevel;
 use crate::terminal_effects::{Effect, Selection, Speed};
+use crate::terminal_logging::{self, DirectoryMode, Format as LogFormat, JavaFields, JavaReview};
 use crate::terminal_theme::Rgb;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -211,8 +212,10 @@ pub(super) fn parse(root: Node<'_, '_>, source: Source) -> io::Result<Preview> {
             Ok((profile, skipped))
         }) {
             Ok((entry, skipped)) => {
+                let logging_omitted = entry.java_logging_omitted;
                 if preview.push(entry)? {
                     preview.skipped_tunnels += skipped;
+                    preview.skipped_logging += usize::from(logging_omitted);
                 }
             }
             Err(_) => preview.invalid += 1,
@@ -691,12 +694,63 @@ pub(super) fn connection(
     let attempts = number(node, "retryCount")?.unwrap_or(connection.startup.attempts());
     connection.startup =
         ConnectOptions::new(timeout, attempts)?.with_keepalive(ssh_keepalive(node)?);
+    let log_config = logging(node, supports_own_settings);
+    let java_logging_omitted = log_config.is_err();
+    connection.logging = log_config.unwrap_or_default();
     connection.validate()?;
     let mut entry = ImportedProfile::new(connection, group);
+    entry.java_logging_omitted = java_logging_omitted;
     entry.badge = raw_scalar(node, "osBadge")?.filter(|value| valid_os_badge_reference(value));
     entry.has_password = has_embedded_password(node);
     entry.jump_has_password = jump_has_password;
     Ok((entry, skipped))
+}
+
+fn logging(node: Node<'_, '_>, rust_schema: bool) -> io::Result<terminal_logging::Config> {
+    let review = if rust_schema {
+        optional_child(node, "rustTerminalLoggingReview")?
+            .map(|review| {
+                Ok::<_, io::Error>(JavaReview {
+                    enable_requested: boolean(review, "enableRequested")?,
+                    source_path: raw_scalar(review, "sourcePath")?
+                        .unwrap_or_default()
+                        .trim()
+                        .to_owned(),
+                    source_max_mib: number(review, "sourceMaxFileSizeMB")?,
+                    source_retention_days: number(review, "sourceRetentionDays")?,
+                })
+            })
+            .transpose()?
+            .unwrap_or_default()
+    } else {
+        JavaReview::default()
+    };
+    let config = terminal_logging::Config::default();
+    let mut fields: JavaFields<'_> = config.java_fields();
+    if let Some(log) = optional_child(node, "logConfig")? {
+        let folder = raw_scalar(log, "logFilePath")?.unwrap_or_default();
+        fields.folder = folder.trim();
+        fields.enabled = boolean(log, "enabled")?;
+        fields.max_mib = number(log, "maxFileSizeMB")?.unwrap_or(fields.max_mib);
+        fields.retention_days = number(log, "retentionDays")?.unwrap_or(fields.retention_days);
+        fields.rotate_daily = optional_boolean(log, "rotateDaily")?.unwrap_or(fields.rotate_daily);
+        fields.compress = optional_boolean(log, "compress")?.unwrap_or(fields.compress);
+        fields.include_username = boolean(log, "includeUsername")?;
+        fields.format = match raw_scalar(log, "format")?.as_deref().map(str::trim) {
+            None | Some("" | "PLAIN_TEXT") => LogFormat::Text,
+            Some("XML") => LogFormat::Xml,
+            Some("JSON") => LogFormat::Json,
+            _ => return Err(invalid("invalid Java terminal log format")),
+        };
+        fields.directory_mode = match raw_scalar(log, "directoryMode")?.as_deref().map(str::trim) {
+            None | Some("" | "NONE") => DirectoryMode::None,
+            Some("FULL") => DirectoryMode::Full,
+            Some("RELATIVE") => DirectoryMode::Relative,
+            _ => return Err(invalid("invalid Java terminal log directory mode")),
+        };
+        return terminal_logging::Config::from_java(fields, review);
+    }
+    terminal_logging::Config::from_java(fields, review)
 }
 
 fn isolation_mode(node: Node<'_, '_>) -> io::Result<Option<IsolationLevel>> {
@@ -1075,11 +1129,7 @@ fn tunnel(node: Node<'_, '_>) -> io::Result<TunnelConfig> {
 }
 
 fn boolean(node: Node<'_, '_>, field: &str) -> io::Result<bool> {
-    match raw_scalar(node, field)?.as_deref().map(str::trim) {
-        None | Some("false" | "0") => Ok(false),
-        Some("true" | "1") => Ok(true),
-        _ => Err(invalid("invalid boolean field in kortty connection XML")),
-    }
+    Ok(optional_boolean(node, field)?.unwrap_or(false))
 }
 
 fn number<T: std::str::FromStr>(node: Node<'_, '_>, field: &str) -> io::Result<Option<T>> {

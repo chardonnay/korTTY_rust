@@ -8,11 +8,13 @@ use serde::{Deserialize, Serialize};
 
 mod capture;
 mod editor;
+mod interchange;
 mod policy;
 mod writer;
 
 pub(crate) use capture::{Capture, Prepared, RedactionSecrets, Redactor, Secrets, Warning};
 pub(crate) use editor::{Action as EditorAction, ManagedFields, pick_folder};
+pub(crate) use interchange::{JavaFields, JavaReview};
 pub(crate) use policy::Policy;
 
 const MAX_LOG_MIB: u16 = 256;
@@ -68,6 +70,8 @@ pub(crate) struct Config {
     retention_days: u16,
     include_username: bool,
     directory_mode: DirectoryMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    java_review: Option<JavaReview>,
 }
 
 impl Default for Config {
@@ -82,6 +86,7 @@ impl Default for Config {
             retention_days: 30,
             include_username: false,
             directory_mode: DirectoryMode::None,
+            java_review: None,
         }
     }
 }
@@ -99,8 +104,7 @@ impl Config {
     }
 
     pub(crate) fn validate(&self) -> io::Result<()> {
-        if self.folder.len() > 4096
-            || self.folder.chars().any(char::is_control)
+        if !interchange::valid_path_text(&self.folder)
             || (!self.folder.is_empty() && !valid_folder(Path::new(&self.folder)))
         {
             return Err(io::Error::new(
@@ -113,6 +117,9 @@ impl Config {
                 io::ErrorKind::InvalidInput,
                 "Use a log size of 1–256 MiB and retention of 0–3650 days.",
             ));
+        }
+        if let Some(review) = &self.java_review {
+            review.validate()?;
         }
         Ok(())
     }
@@ -158,6 +165,8 @@ pub(crate) enum Edit {
     Retention(String),
     Username(bool),
     Directory(DirectoryMode),
+    UseJavaFolder,
+    DismissJavaReview,
 }
 
 pub(crate) struct Form {
@@ -179,8 +188,8 @@ impl Form {
 
     pub(crate) fn update(&mut self, edit: Edit) {
         match edit {
-            Edit::Enabled(value) => self.config.enabled = value,
-            Edit::Folder(value) if value.len() <= 4096 && !value.chars().any(char::is_control) => {
+            Edit::Enabled(value) => self.config.set_enabled(value),
+            Edit::Folder(value) if interchange::valid_path_text(&value) => {
                 self.config.folder = value
             }
             Edit::Format(value) => self.config.format = value,
@@ -198,6 +207,8 @@ impl Form {
             }
             Edit::Username(value) => self.config.include_username = value,
             Edit::Directory(value) => self.config.directory_mode = value,
+            Edit::UseJavaFolder => self.config.adopt_java_folder(),
+            Edit::DismissJavaReview => self.config.java_review = None,
             _ => {}
         }
     }

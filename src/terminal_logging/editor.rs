@@ -82,7 +82,12 @@ impl Form {
     }
 
     pub(crate) fn accepts_editor_edit(&self, eligible: bool, edit: &Edit) -> bool {
-        eligible && (self.config.enabled || matches!(edit, Edit::Enabled(_)))
+        eligible
+            && (self.config.enabled
+                || matches!(
+                    edit,
+                    Edit::Enabled(_) | Edit::UseJavaFolder | Edit::DismissJavaReview
+                ))
     }
 
     pub(crate) fn editor_view(
@@ -98,6 +103,7 @@ impl Form {
         let directory = managed.directory_mode.unwrap_or(self.config.directory_mode);
         column![
             check("Enable terminal logging", enabled, eligible.then_some(Edit::Enabled)),
+            self.java_review_view(eligible),
             rule::horizontal(1),
             field(
                 "Log directory",
@@ -171,6 +177,63 @@ impl Form {
         .into()
     }
 
+    fn java_review_view(&self, eligible: bool) -> Option<Element<'_, Action>> {
+        let review = self.config.java_review()?;
+        let mut details = column![text("Imported Java logging settings").size(14)].spacing(6);
+        if review.enable_requested {
+            details = details.push(text("The Java profile requested logging. Enable it above to start recording on future connections.").size(13));
+        }
+        if !review.source_path.is_empty() {
+            details = details.push(
+                text(format!("Java log path · {}", review.source_path))
+                    .size(13)
+                    .wrapping(text::Wrapping::Glyph),
+            );
+            if let Some(folder) = review.folder() {
+                details = details.push(
+                    text(format!("Suggested log directory · {folder}"))
+                        .size(13)
+                        .wrapping(text::Wrapping::Glyph),
+                );
+            } else {
+                details = details
+                    .push(text("Choose a local directory to replace the Java path.").size(13));
+            }
+        }
+        if let Some(size) = review.source_max_mib {
+            details = details.push(
+                text(format!(
+                    "Java maximum file size · {size} MiB. This profile uses {} MiB.",
+                    self.config.max_mib
+                ))
+                .size(13),
+            );
+        }
+        if let Some(days) = review.source_retention_days {
+            details = details.push(
+                text(format!(
+                    "Java retention · {days} days. This profile uses {} days.",
+                    self.config.retention_days
+                ))
+                .size(13),
+            );
+        }
+        let adopt = (eligible && review.folder().is_some()).then_some(Edit::UseJavaFolder);
+        let dismiss = eligible.then_some(Edit::DismissJavaReview);
+        Some(
+            details
+                .push(
+                    row![
+                        (review.folder().is_some())
+                            .then(|| review_action("Use suggested directory", adopt)),
+                        review_action("Dismiss imported suggestion", dismiss),
+                    ]
+                    .spacing(8),
+                )
+                .into(),
+        )
+    }
+
     fn filename_preview(&self) -> String {
         let name = filename("2026-01-15-09-30-00-ssh_1", 1, self.config.format);
         if self.config.compress {
@@ -179,6 +242,17 @@ impl Form {
             name
         }
     }
+}
+
+fn review_action(label: &'static str, edit: Option<Edit>) -> Element<'static, Action> {
+    let action = edit.map(Action::Edit);
+    keyboard_table::action(
+        dialog_design::secondary_action(label)
+            .on_press_maybe(action.clone())
+            .into(),
+        action,
+        true,
+    )
 }
 
 fn field<'a>(label: &'static str, control: impl Into<Element<'a, Action>>) -> Element<'a, Action> {

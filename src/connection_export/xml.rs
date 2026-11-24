@@ -9,6 +9,7 @@ use crate::connection_store::{
     ThemeOverride, TunnelConfig, TunnelTarget, valid_os_badge_reference,
 };
 use crate::terminal_effects::{Selection, Speed};
+use crate::terminal_logging::{self, DirectoryMode, Format as LogFormat};
 use crate::terminal_theme::{CursorStyle, Id, Themes};
 
 use super::{Entry, LocalEntry, Options, SerialEntry, java_emulation, java_local_profile};
@@ -77,6 +78,7 @@ pub(super) fn kortty(
             field(&mut xml, "    ", "isolationMode", isolation.id());
         }
         field(&mut xml, "    ", "incognito", connection.incognito);
+        terminal_logging(&mut xml, &connection.logging);
         if let Some(encoding) = connection.terminal.encoding {
             field(&mut xml, "    ", "encoding", encoding);
         }
@@ -199,6 +201,55 @@ pub(super) fn kortty(
     }
     xml.push_str("</connections>\n");
     Ok(xml)
+}
+
+fn terminal_logging(xml: &mut String, config: &terminal_logging::Config) {
+    if config.is_default() {
+        return;
+    }
+    let config_fields = config.java_fields();
+    let format = match config_fields.format {
+        LogFormat::Text => "PLAIN_TEXT",
+        LogFormat::Xml => "XML",
+        LogFormat::Json => "JSON",
+    };
+    let directory_mode = match config_fields.directory_mode {
+        DirectoryMode::None => "NONE",
+        DirectoryMode::Full => "FULL",
+        DirectoryMode::Relative => "RELATIVE",
+    };
+    xml.push_str("    <logConfig>\n");
+    field(xml, "      ", "enabled", config_fields.enabled);
+    field(xml, "      ", "logFilePath", config_fields.folder);
+    field(xml, "      ", "maxFileSizeMB", config_fields.max_mib);
+    field(xml, "      ", "format", format);
+    field(xml, "      ", "compress", config_fields.compress);
+    field(xml, "      ", "rotateDaily", config_fields.rotate_daily);
+    field(xml, "      ", "retentionDays", config_fields.retention_days);
+    field(
+        xml,
+        "      ",
+        "includeUsername",
+        config_fields.include_username,
+    );
+    field(xml, "      ", "directoryMode", directory_mode);
+    xml.push_str("    </logConfig>\n");
+    if let Some(review) = config.java_review() {
+        xml.push_str("    <rustTerminalLoggingReview>\n");
+        if review.enable_requested {
+            field(xml, "      ", "enableRequested", true);
+        }
+        if !review.source_path.is_empty() {
+            field(xml, "      ", "sourcePath", &review.source_path);
+        }
+        if let Some(size) = review.source_max_mib {
+            field(xml, "      ", "sourceMaxFileSizeMB", size);
+        }
+        if let Some(retention) = review.source_retention_days {
+            field(xml, "      ", "sourceRetentionDays", retention);
+        }
+        xml.push_str("    </rustTerminalLoggingReview>\n");
+    }
 }
 
 fn terminal_effect(xml: &mut String, selection: Option<Selection>) {

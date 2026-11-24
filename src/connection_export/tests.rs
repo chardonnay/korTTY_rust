@@ -77,6 +77,74 @@ fn fixture() -> Connection {
 }
 
 #[test]
+fn java_terminal_logging_round_trips_settings_and_dormant_review() {
+    use crate::terminal_logging::{DirectoryMode, Format as LogFormat};
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("connections.xml");
+    let java = include_bytes!("fixtures/java-2.26-terminal-logging.xml");
+    fs::write(&path, java).unwrap();
+    let ordinary = Preview::read(&path).unwrap();
+    let (profile, group) = ordinary.entries().next().unwrap();
+    let fields = profile.logging.java_fields();
+    assert_eq!(fields.format, LogFormat::Json);
+    assert_eq!(fields.directory_mode, DirectoryMode::Relative);
+    assert!(fields.include_username);
+    assert!(!fields.compress && !fields.rotate_daily);
+    assert_eq!(fields.retention_days, 45);
+    assert_eq!(fields.max_mib, 256);
+    assert!(!fields.enabled && fields.folder.is_empty());
+    let review = profile.logging.java_review().unwrap();
+    assert!(review.enable_requested);
+    assert_eq!(review.source_max_mib, Some(1000));
+    assert_eq!(
+        review.source_path,
+        r"Z:\fixture\Terminal & Ops\ssh-log.json"
+    );
+
+    let backup = Preview::java_backup(java).unwrap();
+    let (document, count) = backup.portable_java_backup().unwrap();
+    assert_eq!(count, 1);
+    let store_path = directory.path().join("connections.json");
+    fs::write(&store_path, document).unwrap();
+    let store = Store::open(store_path).unwrap();
+    assert_eq!(store.connections()[0].logging, profile.logging);
+
+    let xml = encode(
+        Format::Kortty,
+        &[Entry {
+            connection: profile,
+            group,
+            os_badge: None,
+        }],
+    )
+    .unwrap();
+    let document = roxmltree::Document::parse(std::str::from_utf8(&xml).unwrap()).unwrap();
+    let log = document
+        .descendants()
+        .find(|node| node.has_tag_name("logConfig"))
+        .unwrap();
+    assert!(
+        log.children()
+            .any(|node| node.has_tag_name("enabled") && node.text() == Some("false"))
+    );
+    assert!(
+        log.children()
+            .any(|node| node.has_tag_name("format") && node.text() == Some("JSON"))
+    );
+    assert!(
+        log.children()
+            .any(|node| node.has_tag_name("logFilePath") && node.text().is_none())
+    );
+    fs::write(&path, xml).unwrap();
+    let restored = Preview::read(&path).unwrap();
+    assert_eq!(
+        restored.entries().next().unwrap().0.logging,
+        profile.logging
+    );
+}
+
+#[test]
 fn custom_theme_export_keeps_the_library_id_and_field_inheritance() {
     use crate::connection_store::ThemeOverride;
     use crate::terminal_theme::{Rgb, Scheme, java};

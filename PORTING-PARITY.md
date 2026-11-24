@@ -1322,6 +1322,31 @@ entry into the owned editor and adds the tab color selector.
 [Font and presentation controls](src/connection_window/terminal_overrides/ssh_style.rs)
 · [Color picker](src/connection_window/color_picker.rs)
 
+## November 24 Java terminal logging XML
+
+Java connection imports and portable Java backup restore carry the
+`logConfig` format, size, retention, rotation, compression and metadata
+options into the native saved SSH profile. The connection editor shows
+requests to enable logging or use a Java path. The user may enable recording
+and adopt a suggested native directory independently. A legacy file path
+can suggest its parent without checking the imported path on disk. An
+incompatible path stays visible for review, and a malformed logging block
+is reported without dropping the associated connection.
+
+Native XML exports write the local settings in Java's `logConfig` and
+preserve pending review data in a Rust extension. A tagged Java v2.26.0
+JAXB fixture exercises the JSON format, metadata, legacy file path and
+1,000 MiB size. Windows ARM64 verified direct import, separately saved
+directory adoption and activation, and the portable export. The tagged
+Java JAXB model read all nine fields from that native export. Apple Silicon
+passed 111 focused tests and strict Clippy, including portable backup
+staging and a capture into the explicitly adopted directory. The current
+native size ceiling remains 256 MiB, and the editor keeps the original
+Java value visible for review.
+[Java XML import](src/connection_store/import/kortty.rs)
+· [XML export](src/connection_export/xml.rs)
+· [Review and native field mapping](src/terminal_logging/interchange.rs)
+
 ## November 24 SSH tab color and custom color editor
 
 The SSH Terminal Settings page places the tab-color checkbox beside its

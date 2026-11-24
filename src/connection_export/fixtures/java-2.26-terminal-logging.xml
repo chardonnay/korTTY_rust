@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<connections>
+    <connection>
+        <name>Java logging fixture</name>
+        <host>logging.example.test</host>
+        <username>operator</username>
+        <protocol>SSH_TCP</protocol>
+        <logConfig>
+            <includeUsername>true</includeUsername>
+            <directoryMode>RELATIVE</directoryMode>
+            <enabled>true</enabled>
+            <logFilePath>Z:\fixture\Terminal &amp; Ops\ssh-log.json</logFilePath>
+            <maxFileSizeMB>1000</maxFileSizeMB>
+            <format>JSON</format>
+            <compress>false</compress>
+            <rotateDaily>false</rotateDaily>
+            <retentionDays>45</retentionDays>
+        </logConfig>
+    </connection>
+</connections>
