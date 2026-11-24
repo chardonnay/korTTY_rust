@@ -8,12 +8,13 @@ use kortty_terminal::TextEncoding;
 
 use super::{HighlightChoices, journal_settings, view::ViewChoices};
 use crate::ai_manager::{JavaProfileSource, ProfileRef};
-use crate::connection_store::{ANSI_NAMES, TerminalOverrides, ThemeOverride};
+use crate::connection_store::{ANSI_NAMES, TerminalOverrides, TerminalStyle, ThemeOverride};
 use crate::terminal_agent::design::{Choice as AgentDesignChoice, valid_id as valid_design_id};
-use crate::terminal_theme::{BoldTextMode, CursorStyle, Rgb, Themes};
+use crate::terminal_theme::{BoldTextMode, CursorStyle, Rgb, Scheme, Themes};
 use crate::workspace::dialog_design::{self, keyboard_table};
 
 mod skills;
+pub(super) mod ssh_style;
 
 #[derive(Clone, Debug)]
 pub enum Edit {
@@ -21,6 +22,7 @@ pub enum Edit {
     Reset,
     ResetTerminal,
     Theme(Option<ThemeOverride>),
+    SshTheme(Option<ThemeOverride>, Option<Scheme>),
     FontFamily(String),
     FontSize(String),
     Color(usize, String),
@@ -49,6 +51,26 @@ pub enum Edit {
     Journal(journal_settings::Edit),
 }
 
+impl Edit {
+    pub(super) fn edits_style(&self) -> bool {
+        matches!(
+            self,
+            Self::Theme(_)
+                | Self::SshTheme(..)
+                | Self::FontFamily(_)
+                | Self::FontSize(_)
+                | Self::Color(..)
+                | Self::CursorStyle(_)
+                | Self::Bold(_)
+                | Self::Colors(_)
+                | Self::ScrollbackLines(_)
+                | Self::ScrollbackMemory(_)
+                | Self::ScrollbackCompression(_)
+                | Self::ConfirmClose(_)
+        )
+    }
+}
+
 pub(super) struct Draft {
     show: bool,
     options: TerminalOverrides,
@@ -67,6 +89,9 @@ pub(super) struct Draft {
     ai_skill_search: String,
     ai_skill_search_revision: u64,
     ai_skill_cursor: Option<u64>,
+    style_theme_picker: Id,
+    style_cursor_picker: Id,
+    style_bold_picker: Id,
 }
 
 impl Draft {
@@ -89,6 +114,9 @@ impl Draft {
             ai_skill_search: String::new(),
             ai_skill_search_revision: 0,
             ai_skill_cursor: None,
+            style_theme_picker: Id::unique(),
+            style_cursor_picker: Id::unique(),
+            style_bold_picker: Id::unique(),
             font: options.font_family.clone().unwrap_or_default(),
             size: options
                 .font_size
@@ -148,6 +176,15 @@ impl Draft {
                 *self = reset;
             }
             Edit::Theme(value) => self.options.theme = value,
+            Edit::SshTheme(value, scheme) => {
+                self.options.theme = value;
+                if let Some(scheme) = scheme {
+                    self.font = scheme.family.label().to_owned();
+                    self.size = scheme.font_size.to_string();
+                    self.colors[0] = scheme.foreground.to_string();
+                    self.colors[1] = scheme.background.to_string();
+                }
+            }
             Edit::FontFamily(value) => self.font = value.chars().take(160).collect(),
             Edit::FontSize(value) => self.size = value.chars().take(3).collect(),
             Edit::Color(index, value) => {
@@ -228,21 +265,39 @@ impl Draft {
     }
 
     pub(super) fn value(&self) -> Result<TerminalOverrides, String> {
+        self.value_with_style(true)
+    }
+
+    pub(super) fn seed_style(&mut self, style: &TerminalStyle) {
+        style.write_terminal(&mut self.options);
+        self.font = style.appearance.font_family.clone().unwrap_or_default();
+        self.size = style
+            .appearance
+            .font_size
+            .map_or_else(String::new, |size| size.to_string());
+        self.scrollback_lines = style
+            .scrollback_lines
+            .map_or_else(String::new, |lines| lines.to_string());
+        self.scrollback_memory = style
+            .scrollback_memory_mib
+            .map_or_else(String::new, |memory| memory.to_string());
+        let colors = [
+            style.appearance.foreground,
+            style.appearance.background,
+            style.cursor,
+            style.selection,
+        ]
+        .into_iter()
+        .chain(style.ansi);
+        for (input, color) in self.colors.iter_mut().zip(colors) {
+            *input = color.map_or_else(String::new, |rgb| rgb.to_string());
+        }
+    }
+
+    pub(super) fn value_with_style(&self, own_style: bool) -> Result<TerminalOverrides, String> {
         let mut options = self.options.clone();
         options.paste_line_delay_ms = parse_paste_line_delay(&self.paste_line_delay)?;
         options.journal = self.journal.value()?;
-        let font = self.font.trim();
-        options.font_family = (!font.is_empty()).then(|| font.to_owned());
-        options.font_size = if self.size.trim().is_empty() {
-            None
-        } else {
-            Some(
-                self.size
-                    .trim()
-                    .parse()
-                    .map_err(|_| "Enter a terminal font size from 8 to 72.")?,
-            )
-        };
         let columns = self.columns.trim();
         options.terminal_columns = (!columns.is_empty())
             .then(|| {
@@ -254,6 +309,25 @@ impl Draft {
         let rows = self.rows.trim();
         options.terminal_rows = (!rows.is_empty())
             .then(|| rows.parse().map_err(|_| "Enter 10 to 200 initial rows."))
+            .transpose()?;
+        if own_style {
+            self.write_appearance_values(&mut options)?;
+        } else {
+            TerminalStyle::default().write_terminal(&mut options);
+        }
+        options.validate().map_err(|error| error.to_string())?;
+        Ok(options)
+    }
+
+    fn write_appearance_values(&self, options: &mut TerminalOverrides) -> Result<(), String> {
+        let font = self.font.trim();
+        options.font_family = (!font.is_empty()).then(|| font.to_owned());
+        let size = self.size.trim();
+        options.font_size = (!size.is_empty())
+            .then(|| {
+                size.parse()
+                    .map_err(|_| "Enter a terminal font size from 8 to 72.")
+            })
             .transpose()?;
         let lines = self.scrollback_lines.trim();
         options.scrollback_lines = (!lines.is_empty())
@@ -283,14 +357,36 @@ impl Draft {
         options.cursor = cursor;
         options.selection = selection;
         options.ansi = ansi;
-        options.validate().map_err(|error| error.to_string())?;
-        Ok(options)
+        Ok(())
     }
 
     pub(super) fn strict_mode_view(&self) -> Element<'_, Edit> {
         isolation_row(
             "Strict terminal mode",
             strict_terminal_mode(self.options.strict_terminal_mode, Edit::StrictTerminalMode),
+        )
+    }
+
+    pub(super) fn ssh_highlight_picker(
+        &self,
+        catalog: &HighlightChoices<'_>,
+        id: Id,
+    ) -> Element<'static, Edit> {
+        highlight_picker_with_keyboard(
+            catalog,
+            self.options.highlight_set.as_deref(),
+            Edit::HighlightSet,
+            Some(id),
+        )
+    }
+
+    pub(super) fn ssh_paste_delay_view(&self) -> Element<'_, Edit> {
+        labeled(
+            "Paste line delay (ms)",
+            text_input("Inherit", &self.paste_line_delay)
+                .width(220)
+                .on_input(Edit::PasteLineDelay)
+                .style(dialog_design::form_input),
         )
     }
 
@@ -710,14 +806,24 @@ pub(super) fn highlight_picker<'a, Message: Clone + 'a>(
     stored: Option<&str>,
     on_change: impl Fn(String) -> Message + 'a,
 ) -> Element<'a, Message> {
+    highlight_picker_with_keyboard(catalog, stored, on_change, None)
+}
+
+fn highlight_picker_with_keyboard<'a, Message: Clone + 'a>(
+    catalog: &HighlightChoices<'_>,
+    stored: Option<&str>,
+    on_change: impl Fn(String) -> Message + 'a,
+    keyboard: Option<Id>,
+) -> Element<'a, Message> {
     let (sets, selected) = highlight_choices(catalog, stored);
-    let mut picker = column![
-        pick_list(sets, Some(selected), move |choice: HighlightChoice| {
-            on_change(choice.id)
-        })
-        .width(Length::Fill)
-    ]
-    .spacing(4);
+    let mut control = pick_list(sets, Some(selected), move |choice: HighlightChoice| {
+        on_change(choice.id)
+    })
+    .width(Length::Fill);
+    if let Some(id) = keyboard {
+        control = control.keyboard_navigation(id);
+    }
+    let mut picker = column![control].spacing(4);
     if !catalog.enabled {
         picker = picker.push(text("Terminal highlighting is off globally.").size(12));
     }

@@ -538,6 +538,7 @@ impl Workspace {
                 ai_agent_designs: &ai_agent_designs,
                 highlighting: self.highlight.connection_choices(),
                 themes: &self.window_settings.themes,
+                terminal_style: self.default_connection_terminal_style(),
                 logging_policy: self
                     .clipboard
                     .policy
@@ -605,6 +606,49 @@ impl Workspace {
             });
         }
         None
+    }
+
+    fn default_connection_terminal_style(&self) -> crate::connection_store::TerminalStyle {
+        use crate::connection_store::{TerminalAppearance, TerminalStyle};
+        use crate::terminal_theme::{CursorStyle, MONOSPACED, Rgb};
+
+        let settings = &self.window_settings;
+        let scheme = settings.themes.appearance();
+        let style = settings.terminal_appearance();
+        let scrollback = settings.scrollback_config();
+        let family = settings.terminal_font_face(scheme).family;
+        let family = match family {
+            iced::font::Family::Name(name) => name,
+            _ => MONOSPACED,
+        };
+        TerminalStyle {
+            appearance: TerminalAppearance {
+                theme: settings.themes.selected().map(Into::into),
+                font_family: Some(family.to_owned()),
+                font_size: Some(settings.themes.font_size(
+                    scheme,
+                    settings.terminal_font,
+                    settings.terminal_font,
+                )),
+                foreground: Some(style.foreground),
+                background: Some(style.background),
+                sgr_enabled: Some(style.sgr_enabled),
+            },
+            cursor: Some(style.cursor),
+            cursor_style: CursorStyle::ALL
+                .into_iter()
+                .find(|cursor| cursor.behavior() == (style.cursor_shape, style.cursor_blink)),
+            selection: style.selection,
+            ansi: std::array::from_fn(|index| {
+                Some(Rgb::from_bytes(style.palette.rgb(index as u8)))
+            }),
+            bold: Some(style.bold_text_mode),
+            scrollback_lines: Some(scrollback.lines),
+            scrollback_memory_mib: Some(scrollback.memory_mib),
+            scrollback_compression: Some(scrollback.compression),
+            confirm_close: Some(settings.confirm_busy_terminal_close),
+            command_timestamps: Some(settings.command_timestamps_enabled),
+        }
     }
 
     pub(super) fn credential_choices(&self, kind: Kind) -> Vec<CredentialChoice> {

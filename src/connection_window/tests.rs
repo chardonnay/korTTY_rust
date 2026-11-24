@@ -1247,6 +1247,7 @@ fn ssh_editor_journal_and_ai_tabs_keep_their_drafts_when_terminal_defaults_are_r
             highlighting: HighlightChoices::default(),
             themes: &themes,
             journal_policy: JournalEditorPolicy::default(),
+            terminal_style: Default::default(),
             logging_policy: Default::default(),
             incognito_allowed: true,
             serial_allowed: true,
@@ -1516,6 +1517,7 @@ fn keyboard_editor_view<'a>(
             highlighting: HighlightChoices::default(),
             themes,
             journal_policy: JournalEditorPolicy::default(),
+            terminal_style: Default::default(),
             logging_policy: Default::default(),
             incognito_allowed: true,
             serial_allowed: true,
@@ -1779,6 +1781,7 @@ fn connection_manager_pointer_drags_accept_local_folders_and_refuse_teamwork_sou
         temporary_keys: false,
         vault_unlocked: false,
         journal_policy: JournalEditorPolicy::default(),
+        terminal_style: Default::default(),
         logging_policy: Default::default(),
         serial_allowed: true,
         passwords: &[],
@@ -1920,6 +1923,7 @@ fn native_workbench_keeps_reference_side_widths_at_default_and_minimum_size() {
             temporary_keys: false,
             vault_unlocked: false,
             journal_policy: JournalEditorPolicy::default(),
+            terminal_style: Default::default(),
             logging_policy: Default::default(),
             serial_allowed: true,
             passwords: &[],
@@ -1991,6 +1995,7 @@ fn long_scope_titles_keep_list_and_map_visible_at_minimum_width() {
             temporary_keys: false,
             vault_unlocked: false,
             journal_policy: JournalEditorPolicy::default(),
+            terminal_style: Default::default(),
             logging_policy: Default::default(),
             serial_allowed: true,
             passwords: &[],
@@ -2096,6 +2101,58 @@ fn editor_retains_the_last_valid_speed_and_duplicates_the_saved_effect() {
             speed: imported_speed
         })
     );
+}
+
+#[test]
+fn saved_ssh_terminal_settings_switches_sources_without_losing_the_editor_draft() {
+    use crate::connection_store::{TerminalAppearance, TerminalStyle, TerminalStylePreference};
+    use crate::terminal_theme::Rgb;
+    use kortty_terminal::TextEncoding;
+
+    let mut saved = connection("SSH fixture", "");
+    saved.command_timestamps = Some(false);
+    saved.terminal.font_size = Some(23);
+    saved.terminal.encoding = Some(TextEncoding::Windows1252);
+    saved.terminal.terminal_columns = Some(88);
+    saved.terminal.paste_line_delay_ms = Some(15);
+    let mut draft = form::Draft::from_profile(&saved, None, false);
+    let defaults = Box::new(TerminalStyle {
+        appearance: TerminalAppearance {
+            font_size: Some(17),
+            foreground: Some(Rgb::from_hex(0x112233)),
+            ..TerminalAppearance::default()
+        },
+        command_timestamps: Some(true),
+        ..TerminalStyle::default()
+    });
+    assert_eq!(draft.connection().unwrap().terminal.font_size, Some(23));
+    draft.update(Edit::Terminal(terminal_overrides::Edit::FontSize(
+        "25".into(),
+    )));
+    draft.update(Edit::UseOwnTerminalSettings(None));
+    let global = draft.connection().unwrap();
+    assert!(global.terminal.font_size.is_none());
+    assert!(global.command_timestamps.is_none());
+    assert_eq!(global.terminal.encoding, saved.terminal.encoding);
+    assert_eq!(global.terminal.terminal_columns, Some(88));
+    assert_eq!(global.terminal.paste_line_delay_ms, Some(15));
+    let Some(TerminalStylePreference::Global(retained)) = &global.terminal.style_preference else {
+        panic!("the saved own settings must be retained");
+    };
+    assert_eq!(retained.appearance.font_size, Some(23));
+    assert_eq!(retained.command_timestamps, Some(false));
+    draft.update(Edit::Terminal(terminal_overrides::Edit::FontSize(
+        "99".into(),
+    )));
+    draft.update(Edit::UseOwnTerminalSettings(Some(defaults.clone())));
+    assert_eq!(draft.connection().unwrap().terminal.font_size, Some(25));
+    let mut reopened = form::Draft::from_profile(&global, None, false);
+    assert!(reopened.connection().unwrap().terminal.font_size.is_none());
+    reopened.update(Edit::UseOwnTerminalSettings(Some(defaults)));
+    let custom = reopened.connection().unwrap();
+    assert_eq!(custom.terminal.font_size, Some(17));
+    assert_eq!(custom.terminal.foreground, Some(Rgb::from_hex(0x112233)));
+    assert_eq!(custom.command_timestamps, Some(true));
 }
 
 #[test]

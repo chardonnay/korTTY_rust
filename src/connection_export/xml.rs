@@ -5,8 +5,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 
 use crate::clipboard_policy::PasteWarningMode;
 use crate::connection_store::{
-    Auth, AuthMethod, JAVA_ANSI_FIELDS, TerminalOverrides, ThemeOverride, TunnelConfig,
-    TunnelTarget, valid_os_badge_reference,
+    Auth, AuthMethod, JAVA_ANSI_FIELDS, TerminalOverrides, TerminalStyle, TerminalStylePreference,
+    ThemeOverride, TunnelConfig, TunnelTarget, valid_os_badge_reference,
 };
 use crate::terminal_effects::{Selection, Speed};
 use crate::terminal_theme::{CursorStyle, Id, Themes};
@@ -77,12 +77,16 @@ pub(super) fn kortty(
             field(&mut xml, "    ", "isolationMode", isolation.id());
         }
         field(&mut xml, "    ", "incognito", connection.incognito);
+        if let Some(encoding) = connection.terminal.encoding {
+            field(&mut xml, "    ", "encoding", encoding);
+        }
         terminal_settings(
             &mut xml,
             &connection.terminal,
             connection.command_timestamps,
             connection.startup.keepalive(),
             themes,
+            true,
         );
         for tunnel in options.tunnels(connection) {
             tunnel_xml(&mut xml, tunnel, false);
@@ -187,7 +191,7 @@ pub(super) fn kortty(
         if !group.is_empty() {
             field(&mut xml, "    ", "group", group);
         }
-        terminal_settings(&mut xml, &profile.terminal, None, None, themes);
+        terminal_settings(&mut xml, &profile.terminal, None, None, themes, false);
         let _ = writeln!(xml, "  </{node}>");
     }
     for entry in serials {
@@ -288,16 +292,17 @@ fn serial_profile(xml: &mut String, entry: &SerialEntry<'_>, themes: Option<&The
     terminal.paste_line_delay_ms = profile.paste_line_delay_ms;
     terminal.strict_terminal_mode = profile.strict_terminal_mode;
     terminal.highlight_set.clone_from(&profile.highlight_set);
-    terminal_settings(xml, &terminal, None, None, themes);
+    terminal_settings(xml, &terminal, None, None, themes, false);
     xml.push_str("  </connection>\n");
 }
 
 fn terminal_settings(
     xml: &mut String,
     settings: &TerminalOverrides,
-    timestamps: Option<bool>,
+    mut timestamps: Option<bool>,
     keepalive: Option<kortty_ssh::KeepAlive>,
     themes: Option<&Themes>,
+    ssh: bool,
 ) {
     if settings.ai_agent_disabled {
         field(xml, "    ", "aiAgentDisabled", true);
@@ -329,6 +334,19 @@ fn terminal_settings(
         field(xml, "    ", "highlightRuleSetId", id);
     }
     let mut presentation = settings.clone();
+    let use_global = match &settings.style_preference {
+        Some(TerminalStylePreference::Own) => Some(false),
+        Some(TerminalStylePreference::Global(retained))
+            if TerminalStyle::from_terminal(settings, timestamps).is_default() =>
+        {
+            retained.write_terminal(&mut presentation);
+            timestamps = retained.command_timestamps;
+            Some(true)
+        }
+        Some(TerminalStylePreference::Global(_)) => Some(false),
+        None => None,
+    };
+    presentation.style_preference = None;
     presentation.highlight_set = None;
     presentation.ai_profile = None;
     presentation.ai_agent_disabled = false;
@@ -339,7 +357,11 @@ fn terminal_settings(
     presentation.terminal_rows = None;
     presentation.paste_line_delay_ms = None;
     presentation.strict_terminal_mode = None;
-    let theme_id = match &settings.theme {
+    if ssh {
+        presentation.encoding = None;
+    }
+    let theme = presentation.theme.clone();
+    let theme_id = match &theme {
         Some(ThemeOverride::BuiltIn(preset)) => Some(preset.java_id()),
         Some(ThemeOverride::Java { java }) => Some(java.as_str()),
         Some(ThemeOverride::Custom { custom }) => {
@@ -350,7 +372,7 @@ fn terminal_settings(
     if theme_id.is_none() {
         presentation.theme = None;
         // Older custom themes can still export their colors before an exchange ID is assigned.
-        if let Some(ThemeOverride::Custom { custom }) = &settings.theme
+        if let Some(ThemeOverride::Custom { custom }) = &theme
             && let Some(theme) = themes.and_then(|themes| themes.find(Id::Custom(*custom)))
         {
             let scheme = theme.scheme;
@@ -364,8 +386,9 @@ fn terminal_settings(
             presentation.font_size.get_or_insert(scheme.font_size);
         }
     }
-    let use_global = presentation.is_default() && timestamps.is_none();
-    if use_global
+    if use_global.is_none()
+        && presentation.is_default()
+        && timestamps.is_none()
         && keepalive.is_none()
         && settings.terminal_columns.is_none()
         && settings.terminal_rows.is_none()
@@ -374,7 +397,12 @@ fn terminal_settings(
     }
     xml.push_str("    <settings>\n");
     let indent = "      ";
-    field(xml, indent, "useGlobalSettings", use_global);
+    field(
+        xml,
+        indent,
+        "useGlobalSettings",
+        use_global.unwrap_or_else(|| presentation.is_default() && timestamps.is_none()),
+    );
     if let Some(keepalive) = keepalive {
         field(xml, indent, "sshKeepAliveEnabled", keepalive.enabled());
         field(xml, indent, "sshKeepAliveInterval", keepalive.seconds());
@@ -398,23 +426,23 @@ fn terminal_settings(
         style => java_enum_id(style),
     };
     optional!("cursorStyle", cursor_style);
-    optional!("selectionColor", settings.selection);
-    optional!("boldTextMode", java_enum_id(settings.bold));
-    optional!("terminalColorsEnabled", settings.sgr_enabled);
+    optional!("selectionColor", presentation.selection);
+    optional!("boldTextMode", java_enum_id(presentation.bold));
+    optional!("terminalColorsEnabled", presentation.sgr_enabled);
     optional!("encoding", settings.encoding);
     optional!("terminalColumns", settings.terminal_columns);
     optional!("terminalRows", settings.terminal_rows);
-    optional!("scrollbackLines", settings.scrollback_lines);
-    optional!("scrollbackMemoryMb", settings.scrollback_memory_mib);
-    optional!("scrollbackCompression", settings.scrollback_compression);
+    optional!("scrollbackLines", presentation.scrollback_lines);
+    optional!("scrollbackMemoryMb", presentation.scrollback_memory_mib);
+    optional!("scrollbackCompression", presentation.scrollback_compression);
     optional!(
         "closeWithoutConfirmation",
-        settings.confirm_close.map(|confirm| !confirm)
+        presentation.confirm_close.map(|confirm| !confirm)
     );
     optional!("commandTimestampsEnabled", timestamps);
-    if settings.selection.is_some() || settings.ansi.iter().any(Option::is_some) {
+    if presentation.selection.is_some() || presentation.ansi.iter().any(Option::is_some) {
         field(xml, indent, "ansiPaletteCustomized", true);
-        for (tag, color) in JAVA_ANSI_FIELDS.into_iter().zip(settings.ansi) {
+        for (tag, color) in JAVA_ANSI_FIELDS.into_iter().zip(presentation.ansi) {
             if let Some(color) = color {
                 field(xml, indent, tag, color);
             }

@@ -745,14 +745,19 @@ fn java_unknown_theme_id_and_fallback_colors_round_trip_exactly() {
 
 #[test]
 fn java_initial_grid_can_override_one_dimension_while_appearance_inherits() {
+    use crate::connection_store::TerminalStylePreference;
+    use kortty_terminal::TextEncoding;
+
     let scratch = Scratch::new();
     let file = scratch.0.join("java-initial-grid.xml");
     fs::write(
         &file,
         concat!(
             "<connections schemaVersion=\"2\"><connection><host>server.example</host>",
-            "<username>operator</username><settings><useGlobalSettings>true</useGlobalSettings>",
+            "<username>operator</username><encoding>windows-1252</encoding>",
+            "<settings><useGlobalSettings>true</useGlobalSettings>",
             "<fontSize>18</fontSize><terminalColumns>40</terminalColumns>",
+            "<commandTimestampsEnabled>true</commandTimestampsEnabled>",
             "</settings></connection></connections>",
         ),
     )
@@ -763,6 +768,17 @@ fn java_initial_grid_can_override_one_dimension_while_appearance_inherits() {
     assert_eq!(connection.terminal.terminal_columns, Some(40));
     assert_eq!(connection.terminal.terminal_rows, None);
     assert_eq!(connection.terminal.font_size, None);
+    assert_eq!(connection.command_timestamps, None);
+    assert_eq!(
+        connection.terminal.encoding,
+        Some(TextEncoding::Windows1252)
+    );
+    let Some(TerminalStylePreference::Global(retained)) = &connection.terminal.style_preference
+    else {
+        panic!("expected the inactive Java appearance settings");
+    };
+    assert_eq!(retained.appearance.font_size, Some(18));
+    assert_eq!(retained.command_timestamps, Some(true));
 
     let entries = [Entry {
         connection,
@@ -772,6 +788,8 @@ fn java_initial_grid_can_override_one_dimension_while_appearance_inherits() {
     let xml = String::from_utf8(encode(Format::Kortty, &entries).unwrap()).unwrap();
     assert!(xml.contains("<useGlobalSettings>true</useGlobalSettings>"));
     assert!(xml.contains("<terminalColumns>40</terminalColumns>"));
+    assert!(xml.contains("<fontSize>18</fontSize>"));
+    assert!(xml.contains("<commandTimestampsEnabled>true</commandTimestampsEnabled>"));
     assert!(!xml.contains("<terminalRows>"));
     let reimport = scratch.preview(Format::Kortty, &entries);
     assert_eq!(
@@ -890,7 +908,14 @@ fn java_ssh_keepalive_uses_transport_fields_independent_of_terminal_inheritance(
         let (connection, group) = preview.entries().next().unwrap();
         let expected = expected.map(|(enabled, seconds)| KeepAlive::new(enabled, seconds).unwrap());
         assert_eq!(connection.startup.keepalive(), expected);
-        assert!(connection.terminal.is_default());
+        let mut effective = connection.terminal.clone();
+        let mode = effective.style_preference.take();
+        assert!(effective.is_default());
+        assert_eq!(
+            mode,
+            (schema == 2 && !uses_global)
+                .then_some(crate::connection_store::TerminalStylePreference::Own)
+        );
         let exported = scratch.preview(
             Format::Kortty,
             &[Entry {
@@ -901,7 +926,7 @@ fn java_ssh_keepalive_uses_transport_fields_independent_of_terminal_inheritance(
         );
         let (imported, _) = exported.entries().next().unwrap();
         assert_eq!(imported.startup.keepalive(), expected);
-        assert!(imported.terminal.is_default());
+        assert_eq!(imported.terminal, connection.terminal);
     }
 }
 

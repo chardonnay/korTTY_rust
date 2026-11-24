@@ -10,7 +10,9 @@ use kortty_terminal::TerminalProfile;
 
 use crate::clipboard_policy::PasteWarningMode;
 use crate::connection_store::custom_os_badges::Catalog;
-use crate::connection_store::{Auth, AuthMethod, Connection, SavedLogin};
+use crate::connection_store::{
+    Auth, AuthMethod, Connection, SavedLogin, TerminalStyle, TerminalStylePreference,
+};
 use crate::session_security::{IsolationChoice, IsolationLevel, resolve_isolation};
 use crate::ssh_dialog::{
     KeepAliveEdit, KeyChoice, LoginTarget, Password, StartupField, StartupFields, normalize_host,
@@ -41,6 +43,8 @@ pub enum Edit {
     TerminalEffect(Option<Effect>),
     TerminalEffectSpeed(String),
     CommandTimestamps(Option<bool>),
+    UseOwnTerminalSettings(Option<Box<TerminalStyle>>),
+    ShowAdditionalTerminalSettings(bool),
     UseTabColor(bool),
     TabColor(String),
     ToggleOsBadgePicker,
@@ -72,6 +76,7 @@ impl Page {
         matches!(
             self,
             Self::Connection
+                | Self::Settings
                 | Self::Tunnels
                 | Self::JumpHost
                 | Self::Logging
@@ -145,23 +150,6 @@ impl fmt::Display for Method {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TimestampChoice(Option<bool>);
-
-impl TimestampChoice {
-    const ALL: [Self; 3] = [Self(None), Self(Some(true)), Self(Some(false))];
-}
-
-impl fmt::Display for TimestampChoice {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self.0 {
-            None => "Use global setting",
-            Some(true) => "Show",
-            Some(false) => "Hide",
-        })
-    }
-}
-
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct PasteChoice {
     mode: Option<PasteWarningMode>,
@@ -190,6 +178,10 @@ pub(super) struct Draft {
     logging: crate::terminal_logging::Form,
     terminal_effect: EffectDraft,
     command_timestamps: Option<bool>,
+    own_terminal_settings: bool,
+    has_own_terminal_draft: bool,
+    retained_terminal_style: Option<Box<TerminalStyle>>,
+    show_additional_terminal_settings: bool,
     tab_color: ColorDraft,
     os_badge: Option<String>,
     badge_picker_open: bool,
@@ -214,6 +206,9 @@ struct EditorIds {
     folder: Id,
     keepalive: Id,
     badge_list: Id,
+    behavior_highlight: Id,
+    behavior_paste: Id,
+    behavior_isolation: Id,
 }
 
 impl EditorIds {
@@ -228,6 +223,9 @@ impl EditorIds {
             folder: Id::unique(),
             keepalive: Id::unique(),
             badge_list: Id::unique(),
+            behavior_highlight: Id::unique(),
+            behavior_paste: Id::unique(),
+            behavior_isolation: Id::unique(),
         }
     }
 }
@@ -290,6 +288,10 @@ impl Draft {
             logging: crate::terminal_logging::Form::new(Default::default()),
             terminal_effect: EffectDraft::default(),
             command_timestamps: None,
+            own_terminal_settings: false,
+            has_own_terminal_draft: false,
+            retained_terminal_style: None,
+            show_additional_terminal_settings: false,
             tab_color: ColorDraft::new(None, None),
             os_badge: None,
             badge_picker_open: false,
@@ -306,6 +308,22 @@ impl Draft {
     }
 
     pub fn from_profile(connection: &Connection, os_badge: Option<&str>, duplicate: bool) -> Self {
+        let style =
+            TerminalStyle::from_terminal(&connection.terminal, connection.command_timestamps);
+        let own_terminal_settings = !style.is_default()
+            || matches!(
+                connection.terminal.style_preference,
+                Some(TerminalStylePreference::Own),
+            );
+        let retained_terminal_style = if own_terminal_settings {
+            (!style.is_default()).then(|| Box::new(style))
+        } else if let Some(TerminalStylePreference::Global(retained)) =
+            &connection.terminal.style_preference
+        {
+            Some(retained.clone())
+        } else {
+            None
+        };
         Self {
             page: Page::default(),
             ids: EditorIds::new(),
@@ -323,6 +341,10 @@ impl Draft {
             logging: crate::terminal_logging::Form::new(connection.logging.clone()),
             terminal_effect: EffectDraft::new(connection.terminal_effect),
             command_timestamps: connection.command_timestamps,
+            own_terminal_settings,
+            has_own_terminal_draft: own_terminal_settings,
+            retained_terminal_style,
+            show_additional_terminal_settings: false,
             tab_color: ColorDraft::new(connection.tab_color, None),
             os_badge: os_badge.map(str::to_owned),
             badge_picker_open: false,
@@ -401,7 +423,29 @@ impl Draft {
             }
             Edit::TerminalEffect(effect) => self.terminal_effect.effect = effect,
             Edit::TerminalEffectSpeed(value) => self.terminal_effect.set_speed(value),
-            Edit::CommandTimestamps(visibility) => self.command_timestamps = visibility,
+            Edit::CommandTimestamps(visibility) if self.own_terminal_settings => {
+                self.command_timestamps = visibility
+            }
+            Edit::UseOwnTerminalSettings(defaults) => {
+                let own = defaults.is_some();
+                if self.own_terminal_settings == own {
+                    return;
+                }
+                self.own_terminal_settings = own;
+                if !self.has_own_terminal_draft
+                    && let Some(mut defaults) = defaults
+                {
+                    self.command_timestamps = defaults.command_timestamps;
+                    // Inherit the global busy-terminal rule until the editor chooses an override.
+                    defaults.confirm_close = None;
+                    self.terminal.seed_style(&defaults);
+                    self.has_own_terminal_draft = true;
+                }
+            }
+            Edit::ShowAdditionalTerminalSettings(show) => {
+                self.show_additional_terminal_settings = show;
+                return;
+            }
             Edit::UseTabColor(enabled) => self.tab_color.set_enabled(enabled),
             Edit::TabColor(value) => {
                 if !self.tab_color.set_input(value) {
@@ -423,6 +467,9 @@ impl Draft {
             }
             Edit::PasteWarning(mode) => self.paste_warning = mode,
             Edit::Terminal(edit) => {
+                if edit.edits_style() && !self.own_terminal_settings {
+                    return;
+                }
                 self.changed |= self.terminal.update(edit);
                 return;
             }
@@ -478,6 +525,16 @@ impl Draft {
             .then(|| self.jump.saved())
             .transpose()
             .map_err(|error| format!("Jump host. {error}"))?;
+        let mut terminal = self.terminal.value_with_style(self.own_terminal_settings)?;
+        terminal.style_preference = if self.own_terminal_settings {
+            TerminalStyle::from_terminal(&terminal, self.command_timestamps)
+                .is_default()
+                .then_some(TerminalStylePreference::Own)
+        } else {
+            self.retained_terminal_style
+                .clone()
+                .map(TerminalStylePreference::Global)
+        };
         let connection = Connection {
             id: self.id,
             name: name.into(),
@@ -492,11 +549,14 @@ impl Draft {
             startup: self.startup.options().map_err(|error| error.to_string())?,
             logging: self.logging.config().map_err(|error| error.to_string())?,
             terminal_effect: self.terminal_effect.selection(),
-            command_timestamps: self.command_timestamps,
+            command_timestamps: self
+                .own_terminal_settings
+                .then_some(self.command_timestamps)
+                .flatten(),
             tab_color,
             paste_warning: self.paste_warning,
             window_geometry: self.window_geometry.value()?,
-            terminal: self.terminal.value()?,
+            terminal,
         };
         connection.validate().map_err(|error| error.to_string())?;
         Ok(connection)
@@ -772,36 +832,48 @@ impl Draft {
             .chain(PasteWarningMode::ALL.map(Some))
             .map(paste_choice)
             .collect();
+        let own = self.own_terminal_settings;
+        let defaults = &choices.terminal_style;
+        let terminal_edit = |edit| Message::Edit(Edit::Terminal(edit));
+        let additional = Message::Edit(Edit::ShowAdditionalTerminalSettings(
+            !self.show_additional_terminal_settings,
+        ));
+        let incognito = choices
+            .incognito_allowed
+            .then(|| Message::Edit(Edit::Incognito(!self.incognito)));
         let mut editor = column![
-            column![
-                text("Tab color").size(16),
-                tooltip(
-                    self.tab_color.view(
-                        "Mark this connection's tabs with a color",
-                        |enabled| Message::Edit(Edit::UseTabColor(enabled)),
-                        |input| Message::Edit(Edit::TabColor(input)),
-                    ),
-                    text("Hover over the tab to see its color."),
-                    tooltip::Position::Bottom,
+            self.terminal_settings_source(defaults),
+            self.terminal.ssh_style_view(choices.themes, defaults, own).map(terminal_edit),
+            rule::horizontal(1),
+            self.terminal.ssh_close_confirmation_view(defaults, own).map(terminal_edit),
+            terminal_overrides::ssh_style::ssh_checkbox(
+                "Show command timestamps",
+                self.command_timestamps,
+                defaults.command_timestamps.unwrap_or(false),
+                own,
+                |value| Message::Edit(Edit::CommandTimestamps(value)),
+            ),
+            rule::horizontal(1),
+            text("Terminal behavior").size(16),
+            tooltip(
+                self.tab_color.view(
+                    "Mark this connection's tabs with a color",
+                    |enabled| Message::Edit(Edit::UseTabColor(enabled)),
+                    |input| Message::Edit(Edit::TabColor(input)),
                 ),
-            ]
-            .spacing(6),
-            row![
-                text("Show command timestamps"),
-                pick_list(
-                    TimestampChoice::ALL,
-                    Some(TimestampChoice(self.command_timestamps)),
-                    |choice| Message::Edit(Edit::CommandTimestamps(choice.0))
-                ),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
+                text("Hover over the tab to see its color."),
+                tooltip::Position::Bottom,
+            ),
+            terminal_overrides::isolation_row(
+                "Keyword highlighting",
+                self.terminal.ssh_highlight_picker(&choices.highlighting, self.ids.behavior_highlight.clone()).map(terminal_edit),
+            ),
             column![
                 text("Warn about multi-line pastes"),
                 tooltip(
                     pick_list(paste_choices, Some(paste_choice(self.paste_warning)), |choice| {
                         Message::Edit(Edit::PasteWarning(choice.mode))
-                    }),
+                    }).keyboard_navigation(self.ids.behavior_paste.clone()),
                     text("Use the default follows Settings → Terminal → Paste Protection. Off also turns off control-character warnings."),
                     tooltip::Position::Bottom,
                 ),
@@ -809,6 +881,8 @@ impl Draft {
                     text(format!("Organization minimum · {}", choices.minimum_paste_warning)).size(13)
                 }),
             ].spacing(5),
+            self.terminal.ssh_paste_delay_view().map(terminal_edit),
+            self.terminal.ssh_launch_size_view().map(terminal_edit),
             column![
                 text("Session isolation").size(16),
                 terminal_overrides::isolation_row(
@@ -817,11 +891,11 @@ impl Draft {
                         IsolationChoice::ALL,
                         Some(self.isolation),
                         |value| Message::Edit(Edit::Isolation(value))
-                    ).width(Length::Fill),
+                    ).width(Length::Fill).keyboard_navigation(self.ids.behavior_isolation.clone()),
                 ),
                 text(format!("Effective isolation · {level} · {source}")).size(13),
                 self.terminal.strict_mode_view().map(|edit| Message::Edit(Edit::Terminal(edit))),
-                checkbox(self.incognito)
+                keyboard_table::action(checkbox(self.incognito)
                     .label(if choices.incognito_allowed {
                         "Incognito session"
                     } else {
@@ -831,10 +905,18 @@ impl Draft {
                         choices
                             .incognito_allowed
                             .then_some(|value| Message::Edit(Edit::Incognito(value)))
-                    ),
+                    ).into(), incognito, false),
             ]
             .spacing(6),
-            self.terminal.view(choices, false).map(|edit| Message::Edit(Edit::Terminal(edit))),
+            keyboard_table::action(
+                button(if self.show_additional_terminal_settings { "Hide additional terminal settings" } else { "Show additional terminal settings" })
+                    .style(dialog_design::secondary_button)
+                    .on_press(additional.clone())
+                    .into(),
+                Some(additional),
+                true,
+            ),
+            self.show_additional_terminal_settings.then(|| self.terminal.ssh_additional_style_view(defaults, own).map(terminal_edit)),
         ]
         .spacing(8);
         if let Some(effects) = choices.terminal_effects {
@@ -851,6 +933,47 @@ impl Draft {
             );
         }
         editor.into()
+    }
+
+    fn terminal_settings_source(&self, defaults: &TerminalStyle) -> Element<'_, Message> {
+        use iced::keyboard::{Key, key::Named};
+        use keyboard_table::TableKey;
+
+        let own = self.own_terminal_settings;
+        let global = Message::Edit(Edit::UseOwnTerminalSettings(None));
+        let custom = Message::Edit(Edit::UseOwnTerminalSettings(Some(Box::new(
+            defaults.clone(),
+        ))));
+        let global_radio = radio("Use the global terminal settings", false, Some(own), {
+            let global = global.clone();
+            move |_| global.clone()
+        })
+        .text_size(14)
+        .size(16);
+        let custom_radio = radio("Own settings for this connection", true, Some(own), {
+            let custom = custom.clone();
+            move |_| custom.clone()
+        })
+        .text_size(14)
+        .size(16);
+        keyboard_table::view(
+            column![global_radio, custom_radio].spacing(9).into(),
+            move |key, modifiers, _| {
+                if !modifiers.is_empty() {
+                    return TableKey::Ignored;
+                }
+                match key {
+                    Key::Named(Named::ArrowDown | Named::ArrowRight) => {
+                        TableKey::Handled(Some(custom.clone()))
+                    }
+                    Key::Named(Named::ArrowUp | Named::ArrowLeft) => {
+                        TableKey::Handled(Some(global.clone()))
+                    }
+                    Key::Named(Named::Space) => TableKey::Handled(None),
+                    _ => TableKey::Ignored,
+                }
+            },
+        )
     }
 }
 

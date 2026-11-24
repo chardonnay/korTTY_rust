@@ -1276,6 +1276,33 @@ desktop comparison and keyboard walkthrough remain open.
 · [Windows ARM64 build](target/verification/20261124-ssh-editor-keyboard-windows-build-retest.log)
 · [Desktop check](target/verification/20261124-ssh-editor-keyboard-windows-desktop.md)
 
+## November 24 SSH terminal settings source
+
+The SSH Terminal Settings page starts with the global and own choices
+followed by the theme, font, colors and close and timestamp behavior.
+The global choice shows current defaults in disabled controls. Changing
+the source within the open editor retains an unsaved own draft. The first
+switch to own settings on a global profile seeds the editor from the
+current defaults. Existing Rust profiles keep their per-field inheritance.
+
+Saving global settings clears the active presentation overrides and keeps
+the previously saved own presentation as inactive data. Initial sizing,
+character encoding, paste delay, highlighting, isolation, Journal and AI
+retain their independent settings. Java connection XML carries the
+settings source and saved presentation. It reads and writes the connection
+encoding independently of the presentation choice.
+
+On Windows ARM64 the Java v2.26.0 reference and the native Rust editor
+both restored the unsaved font size when switching back to own settings.
+Rust also saved the 18 pt own draft and retained the second connection's
+23 pt presentation as inactive data when switching it to global settings.
+The second connection kept Windows-1252 and its 88-column initial width.
+Apple Silicon passed 104 focused tests, with one ignored, and strict Clippy.
+The font-family input and hex color fields still differ from the Java
+selectors. The desktop flow remains to be checked on macOS and Linux.
+[SSH editor](src/connection_window/form.rs)
+· [Presentation controls](src/connection_window/terminal_overrides/ssh_style.rs)
+
 ## November 24 SSH tunnel list and editor
 
 The saved SSH editor lists tunnels with enabled status, forwarding type,

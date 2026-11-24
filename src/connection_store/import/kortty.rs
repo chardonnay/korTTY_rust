@@ -19,8 +19,8 @@ use super::{
 };
 use crate::clipboard_policy::PasteWarningMode;
 use crate::connection_store::{
-    AuthMethod, JAVA_ANSI_FIELDS, TabColor, TerminalOverrides, ThemeOverride, WindowGeometry,
-    valid_os_badge_reference,
+    AuthMethod, JAVA_ANSI_FIELDS, TabColor, TerminalOverrides, TerminalStyle,
+    TerminalStylePreference, ThemeOverride, WindowGeometry, valid_os_badge_reference,
 };
 use crate::session_journal::ConnectionConfig;
 use crate::session_security::IsolationLevel;
@@ -441,7 +441,7 @@ fn local_profile(
         shell_integration: local_shell_integration(node)?,
         emulation: terminal_profile(node)?.term_name().into(),
         terminal_effect: terminal_effect(node)?,
-        terminal: terminal_overrides(node, supports_own_settings)?.0,
+        terminal: terminal_overrides(node, supports_own_settings, false)?.0,
     };
     profile.validate()?;
     Ok(ImportedLocal {
@@ -503,7 +503,7 @@ fn serial_profile(
         assert_dtr: optional_boolean(serial, "assertDtr")?.unwrap_or(defaults.assert_dtr),
         assert_rts: optional_boolean(serial, "assertRts")?.unwrap_or(defaults.assert_rts),
     };
-    let terminal = terminal_overrides(node, supported)?.0;
+    let terminal = terminal_overrides(node, supported, false)?.0;
     let connection = SerialConnection {
         device: PathBuf::from(device.trim()),
         settings,
@@ -683,7 +683,10 @@ pub(super) fn connection(
     connection.incognito = boolean(node, "incognito")?;
     connection.terminal_effect = terminal_effect(node)?;
     (connection.terminal, connection.command_timestamps) =
-        terminal_overrides(node, supports_own_settings)?;
+        terminal_overrides(node, supports_own_settings, true)?;
+    if let Some(encoding) = raw_scalar(node, "encoding")? {
+        connection.terminal.encoding = TextEncoding::from_name(encoding.trim());
+    }
     let timeout = number(node, "connectionTimeoutSeconds")?.unwrap_or(connection.startup.seconds());
     let attempts = number(node, "retryCount")?.unwrap_or(connection.startup.attempts());
     connection.startup =
@@ -798,6 +801,7 @@ fn window_geometry(node: Node<'_, '_>) -> io::Result<Option<WindowGeometry>> {
 fn terminal_overrides(
     node: Node<'_, '_>,
     supported: bool,
+    retain_style: bool,
 ) -> io::Result<(TerminalOverrides, Option<bool>)> {
     let mut inherited = TerminalOverrides {
         paste_line_delay_ms: number::<i32>(node, "pasteLineDelayMs")?.map(|delay| {
@@ -833,9 +837,31 @@ fn terminal_overrides(
     let Some(settings) = settings else {
         return Ok((inherited, None));
     };
-    if optional_boolean(settings, "useGlobalSettings")? != Some(false) {
-        return Ok((inherited, None));
+    match optional_boolean(settings, "useGlobalSettings")? {
+        Some(false) => {
+            let (mut options, timestamps) = parse_own_terminal_style(settings, inherited)?;
+            if retain_style && TerminalStyle::from_terminal(&options, timestamps).is_default() {
+                options.style_preference = Some(TerminalStylePreference::Own);
+            }
+            Ok((options, timestamps))
+        }
+        Some(true) if retain_style => {
+            let retained = parse_own_terminal_style(settings, inherited.clone())
+                .ok()
+                .map(|(options, timestamps)| TerminalStyle::from_terminal(&options, timestamps))
+                .filter(|style| !style.is_default())
+                .map(Box::new);
+            inherited.style_preference = retained.map(TerminalStylePreference::Global);
+            Ok((inherited, None))
+        }
+        _ => Ok((inherited, None)),
     }
+}
+
+fn parse_own_terminal_style(
+    settings: Node<'_, '_>,
+    inherited: TerminalOverrides,
+) -> io::Result<(TerminalOverrides, Option<bool>)> {
     let color = |field| -> io::Result<Option<Rgb>> {
         Ok(raw_scalar(settings, field)?.as_deref().and_then(Rgb::parse))
     };

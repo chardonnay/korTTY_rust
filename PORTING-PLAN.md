@@ -191,11 +191,14 @@ Graphics Capture failure.
 The [Window Geometry page](PORTING-PARITY.md#november-24-ssh-editor-window-geometry)
 now groups size and position steppers and keeps disabled controls visible.
 Compare both geometry states and keyboard traversal on the native desktops.
-The tagged [Java connection editor](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ConnectionEditDialog.java)
-shows the effective global values in Terminal Settings when the connection
-does not use its own values. Switching back within the dialog restores the
-connection draft. Bring the Rust presentation and draft behavior into line
-while preserving per-field inheritance on existing profiles. The
+The [Terminal Settings page](PORTING-PARITY.md#november-24-ssh-terminal-settings-source)
+shows the effective global values and keeps the connection's own draft
+available while switching between sources. Existing per-field overrides
+remain editable. The appearance controls precede the independent behavior
+and launch settings. Windows ARM64 verified source switching, draft recovery
+and persistence against the Java dialog. Apple Silicon passed 104 focused
+tests and strict Clippy. Match the typography, font and color controls and
+verify the desktop flow on macOS and Linux. The
 [SSH Tunnels page](PORTING-PARITY.md#november-24-ssh-tunnel-list-and-editor)
 shows configured tunnels, an aggregate enable switch and owned Add and
 Edit dialogs. Apple Silicon verified the saved route's approval boundary
