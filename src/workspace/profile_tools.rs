@@ -712,7 +712,10 @@ impl Workspace {
         match self.store_saved_local_session(profile, None) {
             Ok(session) => {
                 self.add_tab(owner, session);
-                self.record_local_session_used(session)
+                Task::batch([
+                    self.record_local_session_used(session),
+                    self.reconcile_journal_sources(),
+                ])
             }
             Err(error) => {
                 self.notice(owner, format!("Could not start the local shell ({error})"));

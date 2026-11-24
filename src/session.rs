@@ -2958,9 +2958,10 @@ fn emulate(
                             .and_then(|state| state.lock().ok()?.journal_prompt());
                         let permit = journal.permit(
                             terminal,
-                            prompt,
+                            prompt.map(|prompt| prompt.id),
                             applied_output,
-                            shared.output_activity.last_output() == applied_output,
+                            prompt.is_some_and(|prompt| prompt.accepts_input)
+                                && shared.output_activity.last_output() == applied_output,
                             &bytes,
                             enter,
                         );
@@ -3065,7 +3066,8 @@ fn emulate(
                     let prompt = shared
                         .shell_activity
                         .as_ref()
-                        .and_then(|state| state.lock().ok()?.journal_prompt());
+                        .and_then(|state| state.lock().ok()?.journal_prompt())
+                        .map(|prompt| prompt.id);
                     journal.command(terminal, command, prompt);
                     shared
                         .journal_input

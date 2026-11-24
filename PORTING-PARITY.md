@@ -1398,6 +1398,36 @@ Windows ARM64 passed 43 focused application tests.
 · [Windows ARM64 terminal-library verification](target/verification/20261124-emulation-journal-windows-terminal-final.log)
 · [Windows ARM64 application verification](target/verification/20261124-emulation-journal-windows-app.log)
 
+## November 24 Session journal typed input
+
+The session journal now waits for the command-input boundary
+(OSC 133 B) of the same prompt that started with OSC 133 A. A key
+pressed before the boundary suppresses capture for that prompt, and
+attaching to an existing prompt still waits for a new one. The writer
+records the line after a successful physical Enter write. Pasted
+text and password prompts remain outside typed-input records.
+
+The SSH editor keeps the explicit input preference across duplicate,
+save and reopen. Java-format XML preserves explicit on and off values.
+Omitting the field uses Rust's off default. Saved local-shell profiles
+check for automatic journal startup when the terminal is already ready
+as it is added to the workspace.
+[Tagged Java journal configuration](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/model/SessionJournalConfig.java)
+· [Rust prompt evidence](src/session/shell_activity.rs)
+· [Native PTY input test](src/workspace/journal_capture_access/input_tests.rs)
+
+Apple Silicon passed 70 focused application tests, strict Clippy, the
+application build and two OpenSSH tests. Windows ARM64 passed all 56
+focused application tests, including repeat runs with two and eight
+test threads. Its fixture uses PowerShell to drive the native ConPTY.
+The native PTY test exercised the workspace keyboard and paste routes
+with input capture off and on. It verified the ready-prompt rule,
+masked input, output and the ordering of the command-finished entry.
+The editor and XML tests checked duplicate and reopened profiles.
+[Apple Silicon verification](target/verification/20261124-typed-journal-macos-final-native.log)
+· [Windows ARM64 verification](target/verification/20261124-typed-journal-windows-final-native.log)
+· [Eight-thread repeat](target/verification/20261124-typed-journal-windows-repeat-eight.log)
+
 ## November 23 GGUF Configure sizing
 
 Java sizes the Configure grid to its path label. Rust now measures the

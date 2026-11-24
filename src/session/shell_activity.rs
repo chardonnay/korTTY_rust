@@ -26,6 +26,12 @@ pub(crate) struct CodePrompt {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ShortcutPrompt(pub(super) u64);
 
+#[derive(Clone, Copy)]
+pub(super) struct JournalPrompt {
+    pub(super) id: u64,
+    pub(super) accepts_input: bool,
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct ShellActivity {
     pub(crate) directory: Option<ReportedDirectory>,
@@ -106,8 +112,11 @@ impl State {
             .then_some(ShortcutPrompt(self.activity.prompt))
     }
 
-    pub(super) fn journal_prompt(&self) -> Option<u64> {
-        (self.at_prompt && self.activity.prompt != 0).then_some(self.activity.prompt)
+    pub(super) fn journal_prompt(&self) -> Option<JournalPrompt> {
+        (self.at_prompt && self.activity.prompt != 0).then_some(JournalPrompt {
+            id: self.activity.prompt,
+            accepts_input: self.saw_command_start,
+        })
     }
 
     pub(super) fn directory_at_prompt(&self) -> Option<&ReportedDirectory> {
@@ -383,6 +392,24 @@ mod tests {
         assert_ne!(state.agent_shortcut_prompt().unwrap(), prompt);
         output(&mut state, &mut terminal, b"\x1b[?1049h", now);
         assert!(state.agent_shortcut_prompt().is_none());
+    }
+
+    #[test]
+    fn journal_keeps_one_prompt_identity_across_the_input_boundary() {
+        let now = Instant::now();
+        let mut state = State::default();
+        let mut terminal = Terminal::new(80, 24);
+        output(&mut state, &mut terminal, b"\x1b]133;B\x07", now);
+        assert!(state.journal_prompt().is_none());
+        output(&mut state, &mut terminal, b"\x1b]133;A\x07$ ", now);
+        let incomplete = state.journal_prompt().unwrap();
+        assert!(!incomplete.accepts_input);
+        output(&mut state, &mut terminal, b"\x1b]133;B\x07", now);
+        let ready = state.journal_prompt().unwrap();
+        assert_eq!(ready.id, incomplete.id);
+        assert!(ready.accepts_input);
+        state.keyboard(true, b"\r", true, now);
+        assert!(state.journal_prompt().is_none());
     }
 
     #[test]

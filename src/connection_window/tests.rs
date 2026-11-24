@@ -1223,6 +1223,7 @@ fn ssh_editor_journal_and_ai_tabs_keep_their_drafts_when_terminal_defaults_are_r
         Edit::Terminal(Terminal::AiAgentDisabled(true)),
         Edit::Page(form::Page::Journal),
         Edit::Terminal(Terminal::Journal(journal_settings::Edit::Auto(true))),
+        Edit::Terminal(Terminal::Journal(journal_settings::Edit::Input(true))),
         Edit::Terminal(Terminal::Journal(journal_settings::Edit::Interval(
             "45".into(),
         ))),
@@ -1238,7 +1239,30 @@ fn ssh_editor_journal_and_ai_tabs_keep_their_drafts_when_terminal_defaults_are_r
     assert!(terminal.ai_agent_disabled);
     assert_eq!(terminal.ai_skills, [17, 19]);
     assert!(terminal.journal.auto_start);
+    assert!(terminal.journal.capture_input);
     assert_eq!(terminal.journal.summary_interval_minutes, 45);
+
+    let _ = window.update(Message::Duplicate);
+    assert_eq!(
+        window
+            .draft
+            .as_ref()
+            .unwrap()
+            .connection()
+            .unwrap()
+            .terminal
+            .journal,
+        terminal.journal
+    );
+    complete_persisted(&mut window, Message::Save);
+    let duplicated = Store::open(profile.path()).unwrap();
+    assert_eq!(duplicated.connections().len(), 2);
+    assert!(
+        duplicated
+            .connections()
+            .iter()
+            .all(|saved| saved.terminal.journal == terminal.journal)
+    );
 }
 
 #[test]

@@ -269,8 +269,11 @@ captures parsed, visible host output.
 Automatic terminal journals log the effective isolation at launch.
 After an SSH or serial reconnect, the journal records the new stream's isolation.
 **Capture typed commands at recognized shell prompts** starts with the next
-shell-integration prompt and records confirmed physical input. Paste, mirrored
-input, password prompts and partial commands already in progress are excluded.
+shell-integration prompt that also marks the start of command input
+(OSC 133 A followed by B). It records confirmed physical input. Paste,
+mirrored input, password prompts and partial commands already in progress
+are excluded. The setting defaults to off when the profile or imported
+Java XML omits it.
 Capture-log parts can be up to 1,000 MiB each. The profile editor offers up
 to 500 parts by default. A managed policy can set the part count limit
 within the native reader's 1,000-part bound.

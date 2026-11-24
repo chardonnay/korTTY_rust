@@ -1727,6 +1727,10 @@ impl Workspace {
 #[path = "journal_capture_access/serial_tests.rs"]
 mod serial_tests;
 
+#[cfg(all(test, any(unix, windows)))]
+#[path = "journal_capture_access/input_tests.rs"]
+mod input_tests;
+
 #[cfg(test)]
 mod tests {
     use std::fs;

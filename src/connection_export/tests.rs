@@ -406,6 +406,64 @@ fn local_shell_xml_round_trip_keeps_java_compatible_and_exact_rust_launches() {
 }
 
 #[test]
+fn java_journal_input_xml_preserves_explicit_choices_and_defaults_omissions_to_off() {
+    for capture in [None, Some(false), Some(true)] {
+        let scratch = Scratch::new();
+        let mut connection = fixture();
+        connection.terminal.journal.auto_start = true;
+        connection.terminal.journal.capture_input = capture.unwrap_or(false);
+        let data = encode_profiles(
+            Format::Kortty,
+            &[Entry {
+                connection: &connection,
+                group: "",
+                os_badge: None,
+            }],
+            &[],
+            &[],
+            Options::default(),
+            None,
+        )
+        .unwrap();
+        let mut xml = String::from_utf8(data).unwrap();
+        let field = format!("<captureInput>{}</captureInput>", capture.unwrap_or(false));
+        assert!(xml.contains(&field));
+        if capture.is_none() {
+            xml = xml.replace(&field, "");
+        }
+        let path = scratch.0.join("journal.xml");
+        fs::write(&path, xml).unwrap();
+        let preview = Preview::read(&path).unwrap();
+        assert_eq!(preview.invalid, 0);
+        let profile_path = scratch.0.join("connections.json");
+        let mut store = Store::open(profile_path.clone()).unwrap();
+        assert_eq!(preview.apply(&mut store).unwrap().imported, 1);
+        drop(store);
+        let store = Store::open(profile_path).unwrap();
+        let imported = &store.connections()[0];
+        assert!(imported.terminal.journal.auto_start);
+        assert_eq!(
+            imported.terminal.journal.capture_input,
+            capture.unwrap_or(false)
+        );
+        let exported = encode_profiles(
+            Format::Kortty,
+            &[Entry {
+                connection: imported,
+                group: "",
+                os_badge: None,
+            }],
+            &[],
+            &[],
+            Options::default(),
+            None,
+        )
+        .unwrap();
+        assert!(str::from_utf8(&exported).unwrap().contains(&field));
+    }
+}
+
+#[test]
 fn java_serial_xml_round_trips_device_line_settings_encoding_and_folder() {
     use crate::session::{
         SerialConnection, SerialFlowControl, SerialLineEnding, SerialParity, SerialSettings,
