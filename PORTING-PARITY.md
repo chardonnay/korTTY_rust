@@ -1208,6 +1208,39 @@ cover the Teamwork sidebar action, folder drops, hidden entries in Open
 now, and removal from Open now when the last non-incognito tab closes.
 [Apple Silicon verification](target/verification/20261124-connection-manager-teamwork-macos-native.log)
 
+## November 24 SSH connection form alignment
+
+The SSH Connection page uses one label column and follows the Java order
+for the destination, terminal metadata, folder and tag, startup settings,
+and authentication. Host and port share a row. Username uses a separate
+row. The port accepts typed values and includes stepper buttons with
+the existing range of 1 through 65535. The Jump Server page uses the same
+destination field layout.
+
+The protocol and host-key verification are visible as read-only facts in
+the SSH editor. Character encoding is on the Connection page and uses the
+saved terminal setting and its Inherit choice. The SSH editor has radio
+choices for authentication families, source pickers for password and SSH
+key authentication, and an explicit keyboard-interactive option. The
+editor uses vault references and the existing reviewed temporary-key
+workflow.
+[Tagged Java editor](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ConnectionEditDialog.java#L235)
+· [Rust SSH form](src/connection_window/form.rs)
+
+The released Java dialog ran under x86-64 emulation on Windows ARM64.
+The native Rust preview used the same synthetic destination and jump host.
+The desktop check compared field order and alignment, scrolled to the
+password and key-file controls, and kept Save reachable. The saved fixture
+contained the independently changed ports 2223 and 2224 and Windows-1252.
+Control widths and the timeout and retry steppers remain visual differences.
+[Windows ARM64 desktop verification](target/verification/20261124-ssh-connection-fields-windows-desktop.log)
+
+Apple Silicon passed 54 focused tests and strict Clippy. The widget
+regression sends the destination and jump-host step actions to their own
+drafts. A second regression covers reselection while a temporary-key
+paste is pending.
+[Apple Silicon verification](target/verification/20261124-ssh-connection-fields-macos-native.log)
+
 ## November 24 Connection Manager Teamwork tree
 
 The general views append a Teamwork branch with nested read-only folders

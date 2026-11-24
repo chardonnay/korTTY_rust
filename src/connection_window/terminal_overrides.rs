@@ -298,6 +298,10 @@ impl Draft {
         self.journal.view(view.journal_policy).map(Edit::Journal)
     }
 
+    pub(super) fn encoding_picker(&self) -> Element<'static, Edit> {
+        pick(TextEncoding::ALL, self.options.encoding, Edit::Encoding)
+    }
+
     pub(super) fn ai_view(
         &self,
         view: &ViewChoices<'_>,
@@ -559,10 +563,7 @@ impl Draft {
                 "Terminal colors",
                 toggle(self.options.sgr_enabled, Edit::Colors)
             ),
-            labeled(
-                "Text encoding",
-                pick(TextEncoding::ALL, self.options.encoding, Edit::Encoding)
-            ),
+            combined.then(|| labeled("Text encoding", self.encoding_picker())),
             labeled(
                 "Initial columns",
                 text_input("Inherit", &self.columns).on_input(Edit::Columns)
@@ -619,7 +620,12 @@ impl Draft {
         let header = row![heading, reset]
             .spacing(8)
             .align_y(iced::Alignment::Center);
-        column![header, text("Clear a field or select Inherit to follow the current default. Initial size applies when opening a terminal. Text encoding applies to new sessions and reconnects.").size(12), choices, fields]
+        let hint = if combined {
+            "Clear a field or select Inherit to follow the current default. Initial size applies when opening a terminal. Text encoding applies to new sessions and reconnects."
+        } else {
+            "Clear a field or select Inherit to follow the current default. Initial size applies when opening a terminal."
+        };
+        column![header, text(hint).size(12), choices, fields]
             .spacing(8)
             .into()
     }

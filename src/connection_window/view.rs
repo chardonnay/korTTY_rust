@@ -376,7 +376,7 @@ impl ConnectionWindow {
                 .view(
                     title,
                     &choices,
-                    self.editor_group_picker(super::local::Edit::Folder),
+                    self.editor_group_row(super::local::Edit::Folder),
                     inherited,
                 )
                 .map(Message::Local)
@@ -386,7 +386,7 @@ impl ConnectionWindow {
                 text_input("Name (defaults to port and speed)", &draft.name)
                     .on_input(Message::SerialName),
                 text_input("Tag", &draft.tag).on_input(Message::SerialTag),
-                self.editor_group_picker(Message::DraftGroup),
+                self.editor_group_row(Message::DraftGroup),
                 draft.form.editor_fields().map(Message::Serial),
                 row![
                     text("Paste line delay (ms)"),
@@ -1492,6 +1492,16 @@ impl ConnectionWindow {
         self.tree_context_view(&key, base)
     }
 
+    fn editor_group_row<Msg: Clone + 'static>(
+        &self,
+        edit: fn(Option<String>) -> Msg,
+    ) -> Element<'_, Msg> {
+        row![text("Folder").size(14), self.editor_group_picker(edit)]
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .into()
+    }
+
     fn editor_group_picker<Msg: Clone + 'static>(
         &self,
         edit: fn(Option<String>) -> Msg,
@@ -1504,15 +1514,10 @@ impl ConnectionWindow {
             )
             .collect();
         let selected = GroupChoice(self.draft_group.clone());
-        row![
-            text("Folder").size(14),
-            pick_list(options, Some(selected), move |choice: GroupChoice| edit(
-                choice.0
-            ))
-            .width(Length::Fill),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center)
+        pick_list(options, Some(selected), move |choice: GroupChoice| {
+            edit(choice.0)
+        })
+        .width(Length::Fill)
         .into()
     }
 

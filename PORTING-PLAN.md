@@ -178,6 +178,12 @@ keeps both the new selection and unrelated existing assignments. The
 adds focused profile and design pickers, skill navigation and keyboard
 access to the editor actions. Repeat the visual comparison and keyboard
 traversal on macOS and Linux.
+The [SSH connection form update](PORTING-PARITY.md#november-24-ssh-connection-form-alignment)
+aligns destination, terminal options, organization, startup, and
+authentication fields with the Java Connection page. Destination and
+jump host have the same port stepper and separate username rows. Continue
+with the remaining controls and forms, including the timeout and retry
+steppers, the disabled Jump Server presentation and keyboard traversal.
 The [managed Journal requirement](PORTING-PARITY.md#november-24-managed-session-journal)
 locks the SSH editor's autostart control and starts capture on eligible
 terminal streams. A native Apple Silicon OpenSSH test covered automatic

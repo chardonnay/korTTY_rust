@@ -75,6 +75,33 @@ pub(super) fn picker<'a>(
     manage: Option<Message>,
     select: impl Fn(Option<String>) -> Message,
 ) -> Element<'a, Message> {
+    let mut label = row![
+        text("OS symbol").size(14),
+        iced::widget::space::horizontal()
+    ]
+    .align_y(Alignment::Center);
+    if let Some(message) = manage {
+        label = label.push(
+            button(text("Manage symbols…").size(13))
+                .style(button::text)
+                .on_press(message),
+        );
+    }
+    column![
+        label,
+        picker_control(selected, catalog, open, toggle, select)
+    ]
+    .spacing(5)
+    .into()
+}
+
+pub(super) fn picker_control<'a>(
+    selected: Option<Badge<'a>>,
+    catalog: &'a Catalog,
+    open: bool,
+    toggle: Option<Message>,
+    select: impl Fn(Option<String>) -> Message,
+) -> Element<'a, Message> {
     let mut summary = row![text(selected.map_or("No symbol", Badge::name))];
     if let Some(badge) = selected {
         summary = row![badge.image(18), summary];
@@ -89,19 +116,7 @@ pub(super) fn picker<'a>(
     .width(Length::Fill)
     .style(button::secondary)
     .on_press_maybe(toggle);
-    let mut label = row![
-        text("OS symbol").size(14),
-        iced::widget::space::horizontal()
-    ]
-    .align_y(Alignment::Center);
-    if let Some(message) = manage {
-        label = label.push(
-            button(text("Manage symbols…").size(13))
-                .style(button::text)
-                .on_press(message),
-        );
-    }
-    let mut content = column![label, toggle].spacing(5);
+    let mut content = column![toggle].spacing(5);
     if open {
         let mut choices = column![choice(None, selected, select(None))].spacing(2);
         let mut custom: Vec<_> = catalog
