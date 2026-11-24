@@ -10,7 +10,7 @@ use iced::widget::{button, checkbox, column, pane_grid, row, text, text_editor};
 use iced::{Alignment, Element, Task, window};
 use kortty_recording::{RecordedCell, RecordedScreen};
 
-use crate::session::{InputError, JournalAttachment, SessionId};
+use crate::session::{InputError, JournalAttachStart, JournalAttachment, SessionId};
 use crate::session_journal::markers::Compiled as MarkerRules;
 use crate::session_journal::viewer::Source as ViewerSource;
 use crate::session_journal::{
@@ -35,7 +35,7 @@ pub enum Message {
     NoteTranslated(u64, u64, note_translation::Event),
     Open(window::Id, u64, u64),
     Started(u64, u64),
-    Attached(u64, u64, SessionId, Result<(), String>),
+    Attached(u64, u64, SessionId, u64, Result<(), String>),
     Ended(u64, u64),
     Finalized(u64, u64),
     SourceRetired(u64, u64),
@@ -144,7 +144,14 @@ pub(super) struct Entry {
     automatic_screenshot_ai_disabled: bool,
     without_ai: bool,
     automatic: Option<(SessionId, u64)>,
+    ssh: Option<SshCapture>,
     capture_input: bool,
+}
+
+#[derive(Clone, Copy)]
+struct SshCapture {
+    target: ProbeTarget,
+    reconnected: bool,
 }
 
 enum Phase {
@@ -676,6 +683,13 @@ impl Workspace {
             return (None, Task::none());
         };
         let generation = pane.stream_generation;
+        let ssh = pane.ssh.as_ref().map(|_| SshCapture {
+            target: ProbeTarget {
+                session: source,
+                generation,
+            },
+            reconnected: false,
+        });
         let mut config = pane.journal_config;
         config.capture_input &= !incognito;
         config.ai_summaries &= !without_ai;
@@ -758,6 +772,7 @@ impl Workspace {
                 automatic_screenshot_ai_disabled: without_ai,
                 without_ai,
                 automatic: automatic.then_some((source, generation)),
+                ssh,
                 capture_input: config.capture_input,
             },
         );
@@ -814,13 +829,25 @@ impl Workspace {
             .journal_tab(tab_id)
             .and_then(|tab| self.journal_source(tab))
             .filter(|(id, pane)| {
-                original.is_none_or(|original| original == *id)
-                    && entry.automatic.is_none_or(|(source, generation)| {
-                        source == *id && generation == pane.stream_generation
-                    })
+                let generation = pane.stream_generation;
+                match entry.ssh {
+                    Some(ssh) => {
+                        ssh.target
+                            == ProbeTarget {
+                                session: *id,
+                                generation,
+                            }
+                    }
+                    None => {
+                        original.is_none_or(|original| original == *id)
+                            && entry
+                                .automatic
+                                .is_none_or(|source| source == (*id, generation))
+                    }
+                }
             })
         else {
-            if original.is_some() {
+            if original.is_some() && entry.ssh.is_none() {
                 self.fail_journal(
                     tab_id,
                     "The original terminal session ended during startup.".into(),
@@ -830,14 +857,22 @@ impl Workspace {
         };
         let sink = capture.sink();
         let generation = pane.stream_generation;
+        let start = if entry.ssh.is_some_and(|ssh| ssh.reconnected) {
+            JournalAttachStart::Reconnected
+        } else if original.is_some() && entry.automatic.is_none() {
+            JournalAttachStart::Seeded
+        } else {
+            JournalAttachStart::Live
+        };
         let result = pane.session.attach_journal_configured(
             sink,
             self.clipboard.policy.terminal_logging.clone(),
-            original.is_some() && entry.automatic.is_none(),
+            start,
             entry.capture_input,
         );
         let (attachment, reply) = match result {
             Ok(result) => result,
+            Err(InputError::Closed) if entry.ssh.is_some() => return Task::none(),
             Err(error) => {
                 let message = match error {
                     InputError::Busy => "The terminal is busy. Start the journal again.",
@@ -868,8 +903,32 @@ impl Workspace {
                 .await
                 .map_err(|_| "The terminal session ended before recording could attach.".to_owned())
                 .and_then(|result| result.map_err(|error| error.to_string()));
-            Desktop::JournalCapture(Message::Attached(tab_id, run, id, result))
+            Desktop::JournalCapture(Message::Attached(tab_id, run, id, generation, result))
         })
+    }
+
+    /// Only a committed reconnect may move an existing SSH journal to a new stream.
+    pub(super) fn rebind_ssh_journal(
+        &mut self,
+        tab: u64,
+        previous: (SessionId, u64),
+        replacement: (SessionId, u64),
+    ) {
+        if let Some(entry) = self
+            .journal_captures
+            .get_mut(&tab)
+            .filter(|entry| entry.capturing())
+            && let Some(ssh) = &mut entry.ssh
+            && (ssh.target.session, ssh.target.generation) == previous
+        {
+            *ssh = SshCapture {
+                target: ProbeTarget {
+                    session: replacement.0,
+                    generation: replacement.1,
+                },
+                reconnected: true,
+            };
+        }
     }
 
     pub(super) fn reconcile_journal_sources(&mut self) -> Task<Desktop> {
@@ -891,11 +950,21 @@ impl Workspace {
                     .get(&id)
                     .map(|pane| (id, pane.stream_generation, &pane.frame.status))
             });
-            if entry.automatic.is_some_and(|(id, generation)| {
-                !primary.is_some_and(|(pane, stream, status)| {
-                    id == pane && generation == stream && *status == crate::session::Status::Running
-                })
-            }) {
+            let current = primary.map(|(session, generation, _)| ProbeTarget {
+                session,
+                generation,
+            });
+            let still_bound = match entry.ssh {
+                Some(ssh) => current == Some(ssh.target),
+                None => entry.automatic.is_none_or(|(id, generation)| {
+                    primary.is_some_and(|(pane, stream, status)| {
+                        id == pane
+                            && generation == stream
+                            && *status == crate::session::Status::Running
+                    })
+                }),
+            };
+            if !still_bound {
                 if entry.capturing() {
                     stop.push(id);
                 }
@@ -909,7 +978,15 @@ impl Workspace {
             else {
                 continue;
             };
-            match (source, primary.map(|(id, generation, _)| (id, generation))) {
+            let ready = if entry.ssh.is_some() {
+                current.filter(|target| self.sessions[&target.session].session.journal_available())
+            } else {
+                current
+            };
+            match (
+                source,
+                ready.map(|target| (target.session, target.generation)),
+            ) {
                 (Some(bound), current) if Some((bound.id, bound.generation)) != current => {
                     retire.push(id)
                 }
@@ -1292,8 +1369,12 @@ impl Workspace {
             Message::AiProbeChoice(owner, tab, ticket, choice) => {
                 return self.journal_probe_choice(owner, tab, ticket, choice);
             }
-            Message::Attached(tab, run, id, result) => {
+            Message::Attached(tab, run, id, generation, result) => {
+                let current_ssh = self.sessions.get(&id).is_some_and(|pane| {
+                    pane.stream_generation == generation && pane.session.journal_available()
+                });
                 if let Some(Entry {
+                    ssh,
                     phase:
                         Phase::Active {
                             source: Some(source),
@@ -1304,7 +1385,15 @@ impl Workspace {
                     .journal_captures
                     .get_mut(&tab)
                     .filter(|entry| entry.run == run)
-                    && source.id == id
+                    && (source.id, source.generation) == (id, generation)
+                    && ssh.is_none_or(|ssh| {
+                        ssh.target
+                            == ProbeTarget {
+                                session: id,
+                                generation,
+                            }
+                            && current_ssh
+                    })
                 {
                     match result {
                         Ok(()) => source.ready = true,
@@ -1702,6 +1791,7 @@ mod tests {
                 automatic_screenshot_ai_disabled: false,
                 without_ai: false,
                 automatic: None,
+                ssh: None,
                 capture_input: false,
             },
         );
@@ -1811,6 +1901,7 @@ mod tests {
                 automatic_screenshot_ai_disabled: false,
                 without_ai: false,
                 automatic: None,
+                ssh: None,
                 capture_input: false,
             },
         );
@@ -1918,6 +2009,7 @@ mod tests {
                 automatic_screenshot_ai_disabled: false,
                 without_ai: false,
                 automatic: None,
+                ssh: None,
                 capture_input: false,
             },
         );
@@ -2224,7 +2316,14 @@ mod tests {
         wait(|| startup.done.is_closed());
         // Test doubles for Iced completion delivery, using a real session and capture.
         let _ = workspace.update_journal_capture(Message::Started(tab, run));
-        let _ = workspace.update_journal_capture(Message::Attached(tab, run, session, Ok(())));
+        let generation = workspace.sessions[&session].stream_generation;
+        let _ = workspace.update_journal_capture(Message::Attached(
+            tab,
+            run,
+            session,
+            generation,
+            Ok(()),
+        ));
         assert!(workspace.dock_note_enabled(owner, tab, run));
         let _ = workspace
             .update_journal_capture(Message::AutomaticScreenshotAi(owner, tab, run, false));
@@ -2317,6 +2416,7 @@ mod tests {
                 automatic_screenshot_ai_disabled: false,
                 without_ai: false,
                 automatic: None,
+                ssh: None,
                 capture_input: false,
             },
         );

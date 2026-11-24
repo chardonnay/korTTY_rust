@@ -346,6 +346,13 @@ pub(crate) struct JournalAttachment {
     done: Receiver<()>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum JournalAttachStart {
+    Seeded,
+    Live,
+    Reconnected,
+}
+
 impl JournalAttachment {
     pub(crate) async fn detach(self) {
         let (reply, received) = bounded(1);
@@ -1465,7 +1472,7 @@ impl Session {
         &self,
         sink: crate::session_journal::Sink,
         policy: crate::terminal_logging::Policy,
-        seed: bool,
+        start: JournalAttachStart,
         capture_input: bool,
     ) -> Result<(JournalAttachment, Receiver<io::Result<()>>), InputError> {
         let Backend::Stream { events, actor, .. } = &self.backend else {
@@ -1484,7 +1491,7 @@ impl Session {
                 id,
                 sink,
                 policy,
-                seed,
+                start,
                 capture_input,
                 reply,
             }))
@@ -5586,7 +5593,12 @@ int main(int argc, char **argv) {
         )
         .unwrap();
         let (attachment, attached) = session
-            .attach_journal_configured(capture.sink(), Default::default(), true, false)
+            .attach_journal_configured(
+                capture.sink(),
+                Default::default(),
+                JournalAttachStart::Seeded,
+                false,
+            )
             .unwrap();
         attached.recv_blocking().unwrap().unwrap();
         let mut note_policy = crate::terminal_logging::Policy::default();

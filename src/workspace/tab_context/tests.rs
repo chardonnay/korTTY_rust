@@ -168,7 +168,7 @@ fn tab_journal_records_note_and_screenshot_for_the_clicked_background_tab() {
     assert!(
         matches!(
             &attached,
-            Desktop::JournalCapture(CaptureMessage::Attached(tab, running, source, Ok(())))
+            Desktop::JournalCapture(CaptureMessage::Attached(tab, running, source, _, Ok(())))
                 if (*tab, *running, *source) == (background, run, session)
         ),
         "{attached:?}"

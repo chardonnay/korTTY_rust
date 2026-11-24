@@ -238,12 +238,14 @@ fn openssh_incognito_terminal_enforces_masked_journal() {
     assert!(!saved.terminal.journal.auto_start);
 
     let script = peer.directory().join("journal-fixture-shell");
-    fs::write(&script, "printf 'journal-wire-ready\\n'\nIFS= read -r line\nprintf 'MANAGED_SSH_FIXTURE_OUTPUT\\n'\nIFS= read -r line\n").unwrap();
+    fs::write(
+        &script,
+        "printf 'journal-wire-ready\\n'\nIFS= read -r line\nprintf 'MANAGED_SSH_FIXTURE_OUTPUT %s\\n' \"$line\"\nIFS= read -r line\n",
+    )
+    .unwrap();
     let script = script.to_str().unwrap().replace('\'', "'\\''");
-    let server = peer.serve_with_extra(
-        "host",
-        &format!("PermitUserRC no\nForceCommand /bin/sh '{script}'\n"),
-    );
+    let force_shell = format!("PermitUserRC no\nForceCommand /bin/sh '{script}'\n");
+    let first = peer.serve_with_extra("host", &force_shell);
     let mut workspace = Workspace::default();
     workspace.set_test_ai_configuration(
         serde_json::from_value(json!({"general": {"features_enabled": false}})).unwrap(),
@@ -273,27 +275,79 @@ fn openssh_incognito_terminal_enforces_masked_journal() {
     else {
         panic!("the required SSH journal must start");
     };
-    let attach = workspace.update_journal_capture(started);
-    let mut events = task::into_stream(attach).unwrap();
-    loop {
-        if let Action::Output(WorkspaceMessage::JournalCapture(attached)) =
-            block_on(events.next()).expect("SSH journal attachment")
-            && let Journal::Attached(_, _, _, result) = &attached
-        {
-            assert!(result.is_ok(), "{result:?}");
-            let _ = workspace.update_journal_capture(attached);
-            break;
+    let attach_journal = |workspace: &mut Workspace, attach| {
+        let mut events = task::into_stream(attach).unwrap();
+        loop {
+            if let Action::Output(WorkspaceMessage::JournalCapture(attached)) =
+                block_on(events.next()).expect("SSH journal attachment")
+                && let Journal::Attached(_, _, _, _, result) = &attached
+            {
+                assert!(result.is_ok(), "{result:?}");
+                let _ = workspace.update_journal_capture(attached);
+                break;
+            }
         }
-    }
+    };
+    let attach = workspace.update_journal_capture(started);
+    attach_journal(&mut workspace, attach);
     let capture = workspace.journal_metadata_captures().pop().unwrap();
     let _ = workspace.update_journal_capture(Journal::Toggle(owner, tab_id));
     assert_eq!(capture.status(), Status::Recording);
     assert!(workspace.active_dock_journal(owner).is_none());
 
     let shell = &workspace.sessions[&source].session;
-    shell.send(b"produce output\r".to_vec()).unwrap();
-    wait_for_output(shell, "MANAGED_SSH_FIXTURE_OUTPUT");
-    workspace.stop_session(source);
+    shell.send(b"before-reconnect\r".to_vec()).unwrap();
+    wait_for_output(shell, "MANAGED_SSH_FIXTURE_OUTPUT before-reconnect");
+    shell.send(b"disconnect\r".to_vec()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while shell.journal_available() {
+        assert!(
+            Instant::now() < deadline,
+            "the first SSH session is still active"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let pane = workspace.sessions.get_mut(&source).unwrap();
+    pane.frame = pane.session.frame();
+    let mut events = task::into_stream(workspace.reconcile_journal_sources()).unwrap();
+    let Some(Action::Output(WorkspaceMessage::JournalCapture(
+        retired @ Journal::SourceRetired(..),
+    ))) = block_on(events.next())
+    else {
+        panic!("the first SSH journal attachment must retire");
+    };
+    let _ = workspace.update_journal_capture(retired);
+    assert_eq!(capture.status(), Status::Recording);
+    assert!(!capture.done().is_closed());
+
+    let next = peer.serve_with_extra("host", &force_shell);
+    let dial = workspace.start_ssh_reconnect(
+        owner,
+        ReconnectTarget {
+            tab: tab_id,
+            source,
+        },
+    );
+    finish_wire_attempt(&mut workspace, owner, dial, IsolationLevel::None);
+    let attach = if let Some(candidate) = workspace.pending_reconnects.keys().next().copied() {
+        workspace.complete_test_reconnect(candidate)
+    } else {
+        workspace.reconcile_journal_sources()
+    };
+    let tab = workspace.windows[&owner].tab().unwrap();
+    assert_eq!(tab.id, tab_id);
+    let replacement = tab.focused_session().unwrap();
+    assert_ne!(replacement, source);
+    let shell = &workspace.sessions[&replacement].session;
+    wait_for_output(shell, "journal-wire-ready");
+    attach_journal(&mut workspace, attach);
+    let captures = workspace.journal_metadata_captures();
+    assert_eq!(captures.len(), 1);
+    assert!(std::sync::Arc::ptr_eq(&captures[0], &capture));
+    let shell = &workspace.sessions[&replacement].session;
+    shell.send(b"after-reconnect\r".to_vec()).unwrap();
+    wait_for_output(shell, "MANAGED_SSH_FIXTURE_OUTPUT after-reconnect");
+    workspace.stop_session(replacement);
     let _ = workspace.reconcile_journal_sources();
     for shutdown in std::mem::take(&mut workspace.pending_shutdown) {
         let _ = shutdown.recv_blocking();
@@ -303,20 +357,39 @@ fn openssh_incognito_terminal_enforces_masked_journal() {
         .capture_page(None, None, None)
         .unwrap();
     assert!(page.status.notice().is_none(), "{page:?}");
-    assert!(
-        page.records
+    let find = |kind, value: &str| {
+        let mut matches = page
+            .records
             .iter()
-            .any(|record| record.text == "MASKED_SSH_FIXTURE_OUTPUT"),
+            .filter(|record| record.kind == kind && record.text == value);
+        let sequence = matches
+            .next()
+            .unwrap_or_else(|| panic!("{value}: {page:?}"))
+            .sequence;
+        assert!(matches.next().is_none(), "{value}: {page:?}");
+        sequence
+    };
+    let before = find(
+        CaptureKind::Output,
+        "MASKED_SSH_FIXTURE_OUTPUT before-reconnect",
+    );
+    let reconnected = find(CaptureKind::Note, "session reconnected");
+    let after = find(
+        CaptureKind::Output,
+        "MASKED_SSH_FIXTURE_OUTPUT after-reconnect",
+    );
+    assert!(before < reconnected && reconnected < after, "{page:?}");
+    assert!(
+        page.records.iter().all(|record| matches!(
+            record.kind,
+            CaptureKind::Output | CaptureKind::Note
+        ) && !record.text.contains("MANAGED_SSH_FIXTURE_OUTPUT")),
         "{page:?}"
     );
-    assert!(
-        page.records
-            .iter()
-            .all(|record| record.kind == CaptureKind::Output
-                && !record.text.contains("MANAGED_SSH_FIXTURE_OUTPUT")),
-        "{page:?}"
-    );
-    assert!(String::from_utf8_lossy(&server.join().unwrap().stderr).contains("Accepted publickey"));
+    for server in [first, next] {
+        let log = server.join().unwrap();
+        assert!(String::from_utf8_lossy(&log.stderr).contains("Accepted publickey"));
+    }
 }
 
 #[test]

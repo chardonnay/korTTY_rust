@@ -1275,6 +1275,34 @@ publication leaves no export.
 [Apple Silicon verification](target/verification/20261124-journal-rotation-macos-final.log)
 · [Windows ARM64 verification](target/verification/20261124-journal-rotation-windows-verified.log)
 
+## November 24 SSH journal reconnect
+
+Java v2.26.0 retains the journal writer across an SSH disconnect. It
+records `session reconnected` when the replacement connection becomes
+active. Rust now retains the capture for the same tab and moves it to the
+new primary stream after the reconnect commits. The previous terminal
+listener detaches before recording resumes. The reconnect entry precedes
+new live output. The terminal restores the inherited scrollback for
+display. Closing the tab finalizes the journal.
+
+This lifecycle applies to manual, configured automatic and managed SSH
+journals. Incognito rules block manual capture and typed input. A managed
+journal uses the current stream's output masks. Exiting a local shell
+finishes its automatic journal.
+[Tagged Java terminal](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/TerminalView.java)
+· [Rust journal binding](src/workspace/journal_capture_access.rs)
+· [Native OpenSSH test](src/workspace/ssh_access/tests/native_isolation_reconnect.rs)
+
+Apple Silicon passed 33 focused regressions, strict application and
+test-target Clippy, and the private OpenSSH test. The native test closes
+the first SSH connection, reconnects the same incognito tab, and checks
+both masked outputs and exactly one reconnect entry in the same journal.
+Windows ARM64 passed 28 focused regressions. Desktop and other native SSH
+routes are tracked in J1.
+[Apple Silicon verification](target/verification/20261124-journal-ssh-reconnect-macos-actor.log)
+· [Windows ARM64 verification](target/verification/20261124-journal-ssh-reconnect-windows-verified.log)
+· [Windows ARM64 journal actor checks](target/verification/20261124-journal-ssh-reconnect-windows-actor.log)
+
 ## November 23 GGUF Configure sizing
 
 Java sizes the Configure grid to its path label. Rust now measures the
