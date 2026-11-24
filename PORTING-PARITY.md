@@ -1276,6 +1276,42 @@ desktop comparison and keyboard walkthrough remain open.
 · [Windows ARM64 build](target/verification/20261124-ssh-editor-keyboard-windows-build-retest.log)
 · [Desktop check](target/verification/20261124-ssh-editor-keyboard-windows-desktop.md)
 
+## November 24 SSH tunnel list and editor
+
+The saved SSH editor lists tunnels with enabled status, forwarding type,
+listener and target, exposure and description. With mixed enabled states
+the aggregate checkbox shows a dash and activates all tunnels on its next
+press. Add, Edit and Remove operate on the connection draft. Add and Edit
+open a window owned by the SSH editor, and the owner rejects input while
+the child is open. The tunnel Save action returns to the connection draft.
+The connection Save persists the draft through the existing tunnel plan
+validation and approval path.
+
+The tunnel editor displays the listener pair first for each forwarding
+type. Local and remote port steppers use the Java 1–65,535 range. Dynamic
+forwarding keeps the destination fields visible and disabled. The bind
+warning follows the active listener, including the SSH server's
+`GatewayPorts` setting for remote forwarding.
+[Tunnel list](src/connection_window/tunnels.rs)
+· [Tunnel editor](src/connection_window/tunnels/editor.rs)
+
+Apple Silicon passed 48 focused tests and strict Clippy. Five opt-in
+OpenSSH tests were excluded from the default run. The separate live
+loopback forwarding test passed. An approved listener stayed active after
+a description edit, and a changed destination waited for renewed approval
+before traffic reached it. A manually created forward remained active
+throughout.
+[Apple Silicon verification](target/verification/20261124-tunnel-editor-macos-theme-verified.log)
+· [Windows ARM64 focused tests](target/verification/20261124-tunnel-editor-windows-native.log)
+
+The Windows ARM64 desktop walkthrough verified the mixed indicator, the
+two rows, Add with Java's default ports, Escape back to the unchanged
+list, and Edit with its disabled SOCKS destination fields. A second
+native build confirmed that the list uses the Connection Manager row
+style and that the owned child follows the SSH editor's Normal theme.
+[Windows ARM64 desktop comparison](target/verification/20261124-tunnel-editor-windows-desktop.md)
+· [Final Windows ARM64 build](target/verification/20261124-tunnel-editor-windows-final-build.log)
+
 ## November 24 SSH terminal logging editor
 
 The saved SSH editor follows the tagged Java order for the log directory,

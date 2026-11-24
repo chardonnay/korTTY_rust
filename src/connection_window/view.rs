@@ -2189,7 +2189,7 @@ fn blocked_server_badge(host: &str, port: u16) -> Element<'_, Message> {
     .into()
 }
 
-fn selectable(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+pub(super) fn selectable(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |theme, status| {
         let base = button::text(theme, status);
         if active {

@@ -195,9 +195,14 @@ The tagged [Java connection editor](https://github.com/chardonnay/korTTY/blob/v2
 shows the effective global values in Terminal Settings when the connection
 does not use its own values. Switching back within the dialog restores the
 connection draft. Bring the Rust presentation and draft behavior into line
-while preserving per-field inheritance on existing profiles. SSH Tunnels
-still needs the list with an aggregate enable switch and owned add and edit
-dialogs. The [Terminal Logging page](PORTING-PARITY.md#november-24-ssh-terminal-logging-editor)
+while preserving per-field inheritance on existing profiles. The
+[SSH Tunnels page](PORTING-PARITY.md#november-24-ssh-tunnel-list-and-editor)
+shows configured tunnels, an aggregate enable switch and owned Add and
+Edit dialogs. Apple Silicon verified the saved route's approval boundary
+with a live OpenSSH loopback fixture. The Windows ARM64 walkthrough saw
+the mixed state and both owned dialogs. Repeat the list and dialog
+walkthrough on macOS and Linux.
+The [Terminal Logging page](PORTING-PARITY.md#november-24-ssh-terminal-logging-editor)
 keeps the disabled fields visible, offers an owned folder chooser, and
 previews the Rust writer's filename. Compare the layout and the chooser's
 select and cancel behavior on macOS and Linux and verify changing the

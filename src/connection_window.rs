@@ -27,6 +27,7 @@ pub(crate) mod overview;
 mod selection;
 mod temporary_ssh_key;
 mod terminal_overrides;
+pub(crate) mod tunnels;
 pub(crate) use terminal_overrides::{ai_profile_choices, theme_choices};
 #[cfg(test)]
 mod tests;
@@ -35,6 +36,8 @@ mod view;
 use color::ColorDraft;
 use form::Draft;
 pub use form::Edit;
+#[cfg(test)]
+pub(crate) use form::Page;
 pub(crate) use journal_settings::Policy as JournalEditorPolicy;
 use selection::{RowKey, Selection};
 pub use temporary_ssh_key::TemporarySaveReply;
@@ -111,6 +114,8 @@ pub enum Message {
     Edit(Edit),
     FocusEditor(bool),
     NavigateOsBadge(String),
+    SelectTunnel(usize),
+    OpenTunnelEditor(tunnels::Request),
     BrowseTerminalLogFolder,
     TerminalLogFolderPicked(Arc<()>, Option<PathBuf>),
     PasteTemporaryKey,
@@ -403,6 +408,22 @@ pub(crate) struct OverviewSources<'a> {
 }
 
 impl ConnectionWindow {
+    pub(crate) fn begin_tunnel_editor(&self, request: tunnels::Request) -> Option<tunnels::Editor> {
+        if self.busy || self.confirming_close {
+            return None;
+        }
+        self.draft.as_ref()?.begin_tunnel_editor(request)
+    }
+
+    pub(crate) fn commit_tunnel_editor(&mut self, editor: &tunnels::Editor) {
+        if !self.busy
+            && !self.confirming_close
+            && let Some(draft) = &mut self.draft
+        {
+            draft.commit_tunnel_editor(editor);
+        }
+    }
+
     pub(crate) fn start_terminal_log_folder_picker(&mut self) -> Option<(Arc<()>, PathBuf)> {
         if self.busy || self.confirming_close {
             return None;
@@ -1378,6 +1399,11 @@ impl ConnectionWindow {
             Message::FocusEditor(backwards) => {
                 if let Some(draft) = &self.draft {
                     return draft.focus_editor(backwards);
+                }
+            }
+            Message::SelectTunnel(index) => {
+                if let Some(draft) = &mut self.draft {
+                    return draft.select_tunnel(index);
                 }
             }
             Message::NavigateOsBadge(reference)

@@ -38,6 +38,84 @@ pub(super) fn seed(store: &mut Store, name: &str) -> u64 {
 }
 
 #[test]
+fn connection_tunnel_child_owns_its_draft_until_the_connection_is_saved() {
+    use crate::connection_window::tunnels::{Event, Request};
+    use iced::theme::Base as _;
+
+    let profile = crate::snippets::tests::Profile::new();
+    let path = profile.0.join("connections.json");
+    let mut store = Store::open(path.clone()).unwrap();
+    let target = seed(&mut store, "Stored SSH target");
+    let mut workspace = Workspace::default();
+    let (owner, _) = workspace.open_window(false);
+    let (manager, _) =
+        workspace.install_connection_manager(owner, ConnectionWindow::open(path.clone()).unwrap());
+    let _ = workspace.update_connections(manager, Profile::EditSelected);
+    let editor = workspace.connection_managers[&manager].editor.unwrap();
+    let _ = workspace.update_connection_editor(
+        editor,
+        Profile::Edit(Edit::Page(crate::connection_window::Page::Tunnels)),
+    );
+    let _ = workspace.update_connection_editor(editor, Profile::OpenTunnelEditor(Request::Add));
+    let child = workspace.tunnel_for_connection_editor(editor).unwrap();
+    assert_eq!(workspace.placed_dialog_owner(child), Some(editor));
+    assert_eq!(workspace.title(child), "Add SSH Tunnel");
+    assert_eq!(
+        workspace.window_theme(child).name(),
+        workspace.window_theme(editor).name()
+    );
+    assert!(workspace.request_profile_quit().is_some());
+    assert!(workspace.quit_waiting_profile.is_none());
+    let _ = workspace.update_connection_editor(editor, Profile::CancelEdit);
+    assert_eq!(
+        workspace.connection_editor_title(editor),
+        Some("Edit connection")
+    );
+    let _ = workspace.update_tunnel_editor(child, Event::Cancel);
+    let _ = workspace.finish_placed_dialog_closed(child);
+    let _ = workspace.connection_window_closed(child);
+    let _ = workspace.update_connection_editor(editor, Profile::OpenTunnelEditor(Request::Edit));
+    assert!(workspace.tunnel_for_connection_editor(editor).is_none());
+    let _ = workspace.update_connection_editor(editor, Profile::OpenTunnelEditor(Request::Add));
+    let child = workspace.tunnel_for_connection_editor(editor).unwrap();
+    let _ = workspace.update_tunnel_editor(child, Event::Save);
+    let _ = workspace.finish_placed_dialog_closed(child);
+    let _ = workspace.connection_window_closed(child);
+    assert!(
+        Store::open(path.clone())
+            .unwrap()
+            .get(target)
+            .unwrap()
+            .tunnels
+            .is_empty()
+    );
+    let _ = workspace.update_connection_editor(editor, Profile::OpenTunnelEditor(Request::Edit));
+    let child = workspace.tunnel_for_connection_editor(editor).unwrap();
+    assert_eq!(workspace.title(child), "Edit SSH Tunnel");
+    let _ = workspace.update_tunnel_editor(child, Event::Cancel);
+    let _ = workspace.finish_placed_dialog_closed(child);
+    let _ = workspace.connection_window_closed(child);
+    let save = workspace.update_connection_editor(editor, Profile::Save);
+    let mut actions = iced_runtime::task::into_stream(save).unwrap();
+    loop {
+        match block_on(actions.next()) {
+            Some(iced_runtime::Action::Output(Message::Connections(id, event)))
+                if id == manager =>
+            {
+                let _ = workspace.update_connections(id, event);
+                break;
+            }
+            Some(_) => {}
+            None => panic!("expected the saved connection result"),
+        }
+    }
+    let published = Store::open(path).unwrap();
+    let saved = published.get(target).unwrap();
+    assert_eq!(saved.tunnels[0].rule.bind.port(), 8080);
+    assert!(!published.approved(target, &saved.plan()));
+}
+
+#[test]
 fn connection_memory_is_owned_by_the_editor_and_keeps_the_connection_draft() {
     use crate::ai_manager::{Scope, connection_memory::Event};
 

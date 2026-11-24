@@ -1,5 +1,4 @@
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -11,9 +10,7 @@ use kortty_terminal::TerminalProfile;
 
 use crate::clipboard_policy::PasteWarningMode;
 use crate::connection_store::custom_os_badges::Catalog;
-use crate::connection_store::{
-    Auth, AuthMethod, Connection, MAX_TUNNELS, SavedLogin, TunnelConfig, TunnelRule, TunnelTarget,
-};
+use crate::connection_store::{Auth, AuthMethod, Connection, SavedLogin};
 use crate::session_security::{IsolationChoice, IsolationLevel, resolve_isolation};
 use crate::ssh_dialog::{
     KeepAliveEdit, KeyChoice, LoginTarget, Password, StartupField, StartupFields, normalize_host,
@@ -23,7 +20,7 @@ use crate::workspace::dialog_design::{self, keyboard_table};
 
 use super::color::ColorDraft;
 use super::view::ViewChoices;
-use super::{CredentialChoice, Message, os_badge, terminal_overrides};
+use super::{CredentialChoice, Message, os_badge, terminal_overrides, tunnels};
 
 mod geometry;
 mod tabs;
@@ -53,9 +50,8 @@ pub enum Edit {
     WindowGeometry(geometry::Edit),
     UseJump(bool),
     Login(bool, LoginEdit),
-    AddTunnel,
-    RemoveTunnel(usize),
-    Tunnel(usize, TunnelEdit),
+    EnableTunnels(bool),
+    RemoveSelectedTunnel,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -75,7 +71,12 @@ impl Page {
     fn keyboard_navigation(self) -> bool {
         matches!(
             self,
-            Self::Connection | Self::JumpHost | Self::Logging | Self::WindowGeometry | Self::Ai
+            Self::Connection
+                | Self::Tunnels
+                | Self::JumpHost
+                | Self::Logging
+                | Self::WindowGeometry
+                | Self::Ai
         )
     }
 
@@ -120,17 +121,6 @@ pub enum LoginEdit {
     RemoveTemporaryKey,
 }
 
-#[derive(Clone, Debug)]
-pub enum TunnelEdit {
-    Enabled(bool),
-    Mode(TunnelMode),
-    Bind(String),
-    Port(String),
-    Host(String),
-    TargetPort(String),
-    Description(String),
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Method {
     #[default]
@@ -151,24 +141,6 @@ impl fmt::Display for Method {
             Self::StoredKey => "Registered SSH key",
             Self::TemporaryKey => "Temporary SSH key",
             Self::Interactive => "Keyboard-interactive",
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum TunnelMode {
-    #[default]
-    Local,
-    Remote,
-    Dynamic,
-}
-
-impl fmt::Display for TunnelMode {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Local => "Local",
-            Self::Remote => "Remote",
-            Self::Dynamic => "Dynamic (SOCKS)",
         })
     }
 }
@@ -228,7 +200,7 @@ pub(super) struct Draft {
     login: Login,
     jump: Login,
     jump_enabled: bool,
-    tunnels: Vec<TunnelDraft>,
+    tunnels: tunnels::List,
     pub changed: bool,
 }
 
@@ -295,16 +267,6 @@ impl Default for TemporaryDraft {
     }
 }
 
-struct TunnelDraft {
-    enabled: bool,
-    description: String,
-    mode: TunnelMode,
-    bind: String,
-    port: String,
-    host: String,
-    target_port: String,
-}
-
 impl Draft {
     pub fn id(&self) -> u64 {
         self.id
@@ -338,7 +300,7 @@ impl Draft {
             login: Login::new(),
             jump: Login::new(),
             jump_enabled: false,
-            tunnels: Vec::new(),
+            tunnels: tunnels::List::new(Vec::new()),
             changed: false,
         }
     }
@@ -378,11 +340,7 @@ impl Draft {
                 .as_ref()
                 .map_or_else(Login::new, |login| Login::from_saved(login, duplicate)),
             jump_enabled: connection.jump.is_some(),
-            tunnels: connection
-                .tunnels
-                .iter()
-                .map(TunnelDraft::from_config)
-                .collect(),
+            tunnels: tunnels::List::new(connection.tunnels.clone()),
             changed: duplicate,
         }
     }
@@ -492,16 +450,13 @@ impl Draft {
                 }
                 login.update(edit);
             }
-            Edit::AddTunnel if self.tunnels.len() < MAX_TUNNELS => {
-                self.tunnels.push(TunnelDraft::new())
+            Edit::EnableTunnels(enabled) if self.page == Page::Tunnels => {
+                self.changed |= self.tunnels.enable_all(enabled);
+                return;
             }
-            Edit::RemoveTunnel(index) if index < self.tunnels.len() => {
-                self.tunnels.remove(index);
-            }
-            Edit::Tunnel(index, edit) => {
-                if let Some(tunnel) = self.tunnels.get_mut(index) {
-                    tunnel.update(edit);
-                }
+            Edit::RemoveSelectedTunnel if self.page == Page::Tunnels => {
+                self.changed |= self.tunnels.remove_selected();
+                return;
             }
             _ => return,
         }
@@ -523,16 +478,6 @@ impl Draft {
             .then(|| self.jump.saved())
             .transpose()
             .map_err(|error| format!("Jump host. {error}"))?;
-        let tunnels = self
-            .tunnels
-            .iter()
-            .enumerate()
-            .map(|(index, tunnel)| {
-                tunnel
-                    .config()
-                    .map_err(|error| format!("Tunnel {}. {error}", index + 1))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         let connection = Connection {
             id: self.id,
             name: name.into(),
@@ -540,7 +485,7 @@ impl Draft {
             login,
             jump,
             emulation: self.profile.term_name().into(),
-            tunnels,
+            tunnels: self.tunnels.configs().to_vec(),
             incognito: self.incognito,
             isolation: self.isolation.0.unwrap_or_default(),
             inherit_isolation: self.isolation.0.is_none(),
@@ -570,7 +515,7 @@ impl Draft {
         let content = match self.page {
             Page::Connection => self.connection_page(choices, custom_badges, group),
             Page::Settings => self.settings_page(choices, inherited),
-            Page::Tunnels => self.tunnels_page(),
+            Page::Tunnels => self.tunnels.view(),
             Page::JumpHost => self.jump_page(choices),
             Page::Logging => self
                 .logging
@@ -640,6 +585,25 @@ impl Draft {
 
     pub(super) fn folder_picker_id(&self) -> Id {
         self.ids.folder.clone()
+    }
+
+    pub(super) fn begin_tunnel_editor(&self, request: tunnels::Request) -> Option<tunnels::Editor> {
+        (self.page == Page::Tunnels).then_some(())?;
+        self.tunnels.begin(request, self.ids.focus_scope.clone())
+    }
+
+    pub(super) fn commit_tunnel_editor(&mut self, editor: &tunnels::Editor) {
+        if self.page == Page::Tunnels {
+            self.changed |= self.tunnels.commit(editor, &self.ids.focus_scope);
+        }
+    }
+
+    pub(super) fn select_tunnel(&mut self, index: usize) -> iced::Task<Message> {
+        if self.page == Page::Tunnels {
+            self.tunnels.select(index)
+        } else {
+            iced::Task::none()
+        }
     }
 
     pub(super) fn start_terminal_log_folder_picker(
@@ -887,20 +851,6 @@ impl Draft {
             );
         }
         editor.into()
-    }
-
-    fn tunnels_page(&self) -> Element<'_, Message> {
-        column![button("Add tunnel").on_press_maybe(
-            (self.tunnels.len() < MAX_TUNNELS).then_some(Message::Edit(Edit::AddTunnel))
-        )]
-        .extend(
-            self.tunnels
-                .iter()
-                .enumerate()
-                .map(|(index, tunnel)| tunnel.view(index)),
-        )
-        .spacing(8)
-        .into()
     }
 }
 
@@ -1435,132 +1385,6 @@ impl Login {
                 LoginEdit::Method(methods[index].2),
             ))))
         })
-    }
-}
-
-impl TunnelDraft {
-    fn new() -> Self {
-        Self {
-            enabled: true,
-            description: String::new(),
-            mode: TunnelMode::Local,
-            bind: String::new(),
-            port: String::new(),
-            host: String::new(),
-            target_port: String::new(),
-        }
-    }
-
-    fn from_config(config: &TunnelConfig) -> Self {
-        let mut draft = Self {
-            enabled: config.enabled,
-            description: config.description.clone(),
-            bind: config.rule.bind.ip().to_string(),
-            port: config.rule.bind.port().to_string(),
-            ..Self::new()
-        };
-        match &config.rule.target {
-            TunnelTarget::Local { host, port } | TunnelTarget::Remote { host, port } => {
-                draft.mode = if matches!(config.rule.target, TunnelTarget::Local { .. }) {
-                    TunnelMode::Local
-                } else {
-                    TunnelMode::Remote
-                };
-                draft.host = host.clone();
-                draft.target_port = port.to_string();
-            }
-            TunnelTarget::Dynamic => draft.mode = TunnelMode::Dynamic,
-        }
-        draft
-    }
-
-    fn update(&mut self, edit: TunnelEdit) {
-        match edit {
-            TunnelEdit::Enabled(value) => self.enabled = value,
-            TunnelEdit::Mode(mode) => self.mode = mode,
-            TunnelEdit::Bind(value) => self.bind = bounded(value, 64),
-            TunnelEdit::Port(value) => self.port = bounded(value, 8),
-            TunnelEdit::Host(value) => self.host = bounded(value, 256),
-            TunnelEdit::TargetPort(value) => self.target_port = bounded(value, 8),
-            TunnelEdit::Description(value) => self.description = bounded(value, 160),
-        }
-    }
-
-    fn config(&self) -> Result<TunnelConfig, &'static str> {
-        let address = self.bind.trim();
-        let ip: IpAddr = if address.is_empty() || address.eq_ignore_ascii_case("localhost") {
-            Ipv4Addr::LOCALHOST.into()
-        } else {
-            address
-                .parse()
-                .map_err(|_| "Use localhost or a numeric listen address.")?
-        };
-        let bind = SocketAddr::new(
-            ip,
-            port(&self.port).ok_or("Enter a listen port from 1 to 65535.")?,
-        );
-        let target = match self.mode {
-            TunnelMode::Local | TunnelMode::Remote => {
-                let host = normalize_host(&self.host)
-                    .map_err(|_| "Enter a service hostname or IP address.")?;
-                let port =
-                    port(&self.target_port).ok_or("Enter a service port from 1 to 65535.")?;
-                if self.mode == TunnelMode::Local {
-                    TunnelTarget::Local { host, port }
-                } else {
-                    TunnelTarget::Remote { host, port }
-                }
-            }
-            TunnelMode::Dynamic => TunnelTarget::Dynamic,
-        };
-        Ok(TunnelConfig {
-            enabled: self.enabled,
-            description: self.description.trim().into(),
-            rule: TunnelRule { bind, target },
-        })
-    }
-
-    fn view(&self, index: usize) -> Element<'_, Message> {
-        let edit = move |edit| Message::Edit(Edit::Tunnel(index, edit));
-        let mut fields = column![
-            row![
-                checkbox(self.enabled)
-                    .label("Enabled")
-                    .on_toggle(move |value| edit(TunnelEdit::Enabled(value))),
-                pick_list(
-                    [TunnelMode::Local, TunnelMode::Remote, TunnelMode::Dynamic],
-                    Some(self.mode),
-                    move |mode| edit(TunnelEdit::Mode(mode))
-                ),
-                text_input("Description (optional)", &self.description)
-                    .on_input(move |value| edit(TunnelEdit::Description(value))),
-                button("Remove").on_press(Message::Edit(Edit::RemoveTunnel(index))),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
-            row![
-                text_input("Listen address (localhost)", &self.bind)
-                    .on_input(move |value| edit(TunnelEdit::Bind(value))),
-                text_input("Listen port", &self.port)
-                    .on_input(move |value| edit(TunnelEdit::Port(value)))
-                    .width(105),
-            ]
-            .spacing(8),
-        ]
-        .spacing(6);
-        if self.mode != TunnelMode::Dynamic {
-            fields = fields.push(
-                row![
-                    text_input("Service hostname or IP", &self.host)
-                        .on_input(move |value| edit(TunnelEdit::Host(value))),
-                    text_input("Service port", &self.target_port)
-                        .on_input(move |value| edit(TunnelEdit::TargetPort(value)))
-                        .width(105),
-                ]
-                .spacing(8),
-            );
-        }
-        fields.into()
     }
 }
 

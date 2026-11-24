@@ -367,6 +367,7 @@ pub enum Message {
     OpenConnections(window::Id),
     Connections(window::Id, crate::connection_window::Message),
     ConnectionEditor(window::Id, crate::connection_window::Message),
+    ConnectionTunnelEditor(window::Id, crate::connection_window::tunnels::Event),
     FocusConnectionEditor(window::Id),
     ConnectionCatalogReloaded(u64, Option<crate::connection_store::Store>),
     ConnectionOverview(window::Id, profile_tools::connection_overview::Event),
@@ -1195,6 +1196,9 @@ impl Workspace {
             return crate::snippet_window::compare::TITLE.into();
         }
         if let Some(title) = self.connection_editor_title(id) {
+            return title.into();
+        }
+        if let Some(title) = self.tunnel_editor_title(id) {
             return title.into();
         }
         if let Some(title) = self.connection_memory_title(id) {
@@ -2664,9 +2668,12 @@ impl Workspace {
             Message::ConnectionEditor(id, message) => {
                 return self.update_connection_editor(id, message);
             }
+            Message::ConnectionTunnelEditor(id, event) => {
+                return self.update_tunnel_editor(id, event);
+            }
             Message::FocusConnectionEditor(id) => {
                 if self.connection_editor_manager(id).is_some() {
-                    return window::gain_focus(id);
+                    return window::gain_focus(self.tunnel_for_connection_editor(id).unwrap_or(id));
                 }
             }
             Message::ConnectionCatalogReloaded(revision, store) => {

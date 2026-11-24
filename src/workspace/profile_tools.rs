@@ -27,6 +27,7 @@ mod connection_manager_tests;
 pub(super) mod connection_overview;
 pub(super) mod teamwork_restore;
 mod terminal_preferences;
+mod tunnel_editor;
 pub(super) mod vault_modal;
 pub(super) use terminal_preferences::SavedTerminalPreferences;
 
@@ -45,6 +46,7 @@ pub(super) struct ConnectionManager {
     launch: Option<ConnectionLaunch>,
     editor: Option<window::Id>,
     editor_closing: bool,
+    tunnel: Option<tunnel_editor::Window>,
 }
 
 impl ConnectionManager {
@@ -57,6 +59,7 @@ impl ConnectionManager {
             launch: None,
             editor: None,
             editor_closing: false,
+            tunnel: None,
         }
     }
 }
@@ -155,6 +158,13 @@ impl Workspace {
         if let Some(owner) = self.connection_manager_open_after_close.remove(&id) {
             return Some(self.show_connections(owner));
         }
+        if let Some(manager) = self.tunnel_editor_manager(id) {
+            self.connection_managers
+                .get_mut(&manager)
+                .expect("current manager")
+                .tunnel = None;
+            return Some(Task::none());
+        }
         if let Some(owner) = self.connection_editor_manager(id) {
             let manager = self
                 .connection_managers
@@ -162,11 +172,15 @@ impl Workspace {
                 .expect("current manager");
             manager.editor = None;
             manager.editor_closing = false;
-            return Some(if manager.closing || self.exiting {
+            let tunnel = manager.tunnel.take();
+            let focus = if manager.closing || self.exiting {
                 Task::none()
             } else {
                 window::gain_focus(owner)
-            });
+            };
+            let close =
+                tunnel.map_or_else(Task::none, |tunnel| self.close_placed_dialog(tunnel.id));
+            return Some(Task::batch([focus, close]));
         }
         let manager = self.connection_managers.remove(&id)?;
         if self.quit_waiting_profile == Some(id) || self.should_exit_after_window_close() {
@@ -248,6 +262,9 @@ impl Workspace {
 
     pub(super) fn close_connection_editor(&mut self, editor: window::Id) -> Option<Task<Message>> {
         let id = self.connection_editor_manager(editor)?;
+        if let Some(tunnel) = self.tunnel_for_connection_editor(editor) {
+            return Some(window::gain_focus(tunnel));
+        }
         if let Some(memory) = self.connection_memory_for_editor(editor) {
             return Some(window::gain_focus(memory));
         }
@@ -417,6 +434,7 @@ impl Workspace {
     pub(super) fn is_profile_tool(&self, id: window::Id) -> bool {
         self.connection_managers.contains_key(&id)
             || self.connection_editor_manager(id).is_some()
+            || self.tunnel_editor_manager(id).is_some()
             || self.connection_memory.contains_key(&id)
             || self.teamwork_restore.contains_key(&id)
             || self.vault_id == Some(id)
@@ -467,6 +485,9 @@ impl Workspace {
     }
 
     pub(super) fn profile_tool_view(&self, id: window::Id) -> Option<Element<'_, Message>> {
+        if let Some(tunnel) = self.tunnel_editor_view(id) {
+            return Some(tunnel);
+        }
         if self.connection_memory.contains_key(&id) {
             return self.connection_memory_view(id);
         }
@@ -555,10 +576,14 @@ impl Workspace {
                 local_isolation_default: self.default_local_isolation(),
             };
             if editor_owner.is_some() {
-                return Some(manager.window.editor_view(choices).map_or_else(
+                let content = manager.window.editor_view(choices).map_or_else(
                     || iced::widget::text("Closing…").into(),
                     |content| content.map(move |message| Message::ConnectionEditor(id, message)),
-                ));
+                );
+                let modal = self.tunnel_for_connection_editor(id).map(|child| {
+                    Message::ConnectionTunnelEditor(child, connection_window::tunnels::Event::Focus)
+                });
+                return Some(vault_modal::gate(content, modal));
             }
             let content = manager
                 .window
@@ -832,10 +857,18 @@ impl Workspace {
         else {
             return Task::none();
         };
+        use connection_window::{Edit, Message as Profile};
+        if let Some(tunnel) = self.tunnel_for_connection_editor(editor)
+            && !matches!(message, Profile::TerminalLogFolderPicked(..))
+        {
+            return window::gain_focus(tunnel);
+        }
         if message.opens_connection_memory() {
             return self.open_connection_memory(id, editor);
         }
-        use connection_window::{Edit, Message as Profile};
+        if let Profile::OpenTunnelEditor(request) = message {
+            return self.open_tunnel_editor(id, editor, request);
+        }
         if matches!(message, Profile::BrowseTerminalLogFolder) {
             let Some((ticket, directory)) = self
                 .connection_managers
@@ -1268,6 +1301,13 @@ impl Workspace {
 
     pub(super) fn request_profile_quit(&mut self) -> Option<Task<Message>> {
         self.quit_waiting_profile = None;
+        if let Some(tunnel) = self
+            .connection_managers
+            .values()
+            .find_map(|manager| manager.tunnel.as_ref().map(|tunnel| tunnel.id))
+        {
+            return Some(self.defer_profile_quit(tunnel, true));
+        }
         if let Some((id, busy)) = self.connection_memory_needing_attention() {
             if busy {
                 return Some(self.defer_profile_quit(id, true));
@@ -1353,6 +1393,9 @@ impl Workspace {
     }
 
     pub(super) fn close_profile_tool(&mut self, id: window::Id, discard: bool) -> Task<Message> {
+        if self.tunnel_editor_manager(id).is_some() {
+            return self.update_tunnel_editor(id, connection_window::tunnels::Event::Cancel);
+        }
         if self.connection_memory.contains_key(&id) {
             return self
                 .update_connection_memory(id, crate::ai_manager::connection_memory::Event::Close);

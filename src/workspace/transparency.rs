@@ -178,6 +178,7 @@ impl Workspace {
             || self.ai_manager_title(id).is_some()
             || self.connection_managers.contains_key(&id)
             || self.connection_editor_manager(id).is_some()
+            || self.tunnel_editor_manager(id).is_some()
         {
             super::dialog_design::normal_theme()
         } else {
