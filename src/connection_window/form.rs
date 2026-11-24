@@ -1,6 +1,7 @@
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use iced::widget::{
     Id, button, checkbox, column, pick_list, radio, row, rule, text, text_input, tooltip,
@@ -74,7 +75,7 @@ impl Page {
     fn keyboard_navigation(self) -> bool {
         matches!(
             self,
-            Self::Connection | Self::JumpHost | Self::WindowGeometry | Self::Ai
+            Self::Connection | Self::JumpHost | Self::Logging | Self::WindowGeometry | Self::Ai
         )
     }
 
@@ -434,7 +435,12 @@ impl Draft {
             Edit::Isolation(level) => self.isolation = level,
             Edit::Startup(field, value) => self.startup.update(field, value),
             Edit::KeepAlive(edit) => self.startup.update_keepalive(edit),
-            Edit::Logging(edit) => self.logging.update(edit),
+            Edit::Logging(edit) => {
+                if !self.logging.accepts_editor_edit(!self.incognito, &edit) {
+                    return;
+                }
+                self.logging.update(edit);
+            }
             Edit::TerminalEffect(effect) => self.terminal_effect.effect = effect,
             Edit::TerminalEffectSpeed(value) => self.terminal_effect.set_speed(value),
             Edit::CommandTimestamps(visibility) => self.command_timestamps = visibility,
@@ -568,8 +574,15 @@ impl Draft {
             Page::JumpHost => self.jump_page(choices),
             Page::Logging => self
                 .logging
-                .view(!self.incognito, true)
-                .map(|edit| Message::Edit(Edit::Logging(edit))),
+                .editor_view(!self.incognito, choices.logging_policy)
+                .map(|action| match action {
+                    crate::terminal_logging::EditorAction::Edit(edit) => {
+                        Message::Edit(Edit::Logging(edit))
+                    }
+                    crate::terminal_logging::EditorAction::Browse => {
+                        Message::BrowseTerminalLogFolder
+                    }
+                }),
             Page::Journal => self
                 .terminal
                 .journal_view(choices)
@@ -627,6 +640,25 @@ impl Draft {
 
     pub(super) fn folder_picker_id(&self) -> Id {
         self.ids.folder.clone()
+    }
+
+    pub(super) fn start_terminal_log_folder_picker(
+        &mut self,
+        root: &Path,
+    ) -> Option<(Arc<()>, PathBuf)> {
+        self.logging
+            .start_folder_picker(self.page == Page::Logging && !self.incognito, root)
+    }
+
+    pub(super) fn finish_terminal_log_folder_picker(
+        &mut self,
+        ticket: &Arc<()>,
+        path: Option<&Path>,
+    ) {
+        let eligible = self.page == Page::Logging && !self.incognito;
+        if let Some(edit) = self.logging.finish_folder_picker(ticket, eligible, path) {
+            self.update(Edit::Logging(edit));
+        }
     }
 
     pub(super) fn navigate_badge_picker(&mut self, reference: String) -> iced::Task<Message> {

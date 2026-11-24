@@ -111,17 +111,7 @@ impl LogWriter<'_> {
                     .checked_add(1)
                     .ok_or_else(|| io::Error::other("Logfile part limit reached"))?;
             }
-            let extension = match self.format {
-                DocumentFormat::Text => "log",
-                DocumentFormat::Xml => "xml",
-                DocumentFormat::Json => "json",
-            };
-            let part = if self.part <= 1 {
-                String::new()
-            } else {
-                format!(".p{}", self.part)
-            };
-            let filename = format!("{}{part}.{extension}", self.base);
+            let filename = super::filename(&self.base, self.part, self.config.format);
             self.open = Some(self.folder.begin(&filename, self.format, &self.metadata)?);
             if rotate_daily && self.folder.retention {
                 self.folder.sweep(at.date(), || self.shutdown.started());
@@ -424,7 +414,7 @@ impl Folder {
                 "Terminal logfile moved before compression",
             ));
         }
-        let archive_name = format!("{name}.gz");
+        let archive_name = super::compressed_filename(name);
         let destination = self.path.join(&archive_name);
         let staging = StagedDownload::create(&destination)?;
         if !staging.shares_parent_with(&source)? {

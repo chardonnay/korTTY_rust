@@ -1276,6 +1276,43 @@ desktop comparison and keyboard walkthrough remain open.
 · [Windows ARM64 build](target/verification/20261124-ssh-editor-keyboard-windows-build-retest.log)
 · [Desktop check](target/verification/20261124-ssh-editor-keyboard-windows-desktop.md)
 
+## November 24 SSH terminal logging editor
+
+The saved SSH editor follows the tagged Java order for the log directory,
+format, filename example, file size, retention, metadata, rotation and
+compression. The settings remain visible and are skipped during keyboard
+traversal while logging is off. The filename example uses the native
+writer's format and gzip naming. File size and retention have editable
+steppers. Incognito disables the logging controls. Managed username and
+directory settings display their effective values and stay locked.
+
+Browse opens a native folder picker owned by the SSH editor. A result
+applies to the matching active draft. Cancel leaves the draft untouched.
+Existing profiles keep their native log settings and 256 MiB file limit.
+[Logging editor](src/terminal_logging/editor.rs)
+· [Log writer](src/terminal_logging/writer.rs)
+
+Apple Silicon and Windows ARM64 each passed 64 selected tests. Apple
+Silicon also passed strict Clippy. The regressions cover the format and
+gzip example, folder picker cancellation and result identity, managed
+choices, keyboard traversal, and the native log writer.
+[Apple Silicon verification](target/verification/20261124-terminal-logging-editor-macos-verified.log)
+· [Windows ARM64 verification](target/verification/20261124-terminal-logging-editor-windows-native.log)
+
+On Windows ARM64, the Java reference ran in x64 emulation and the Rust
+preview ran natively. The comparison covered enabled and disabled
+logging, the managed username and directory fields, and the control
+order. The native chooser opened at the saved folder and returned to the
+same draft on Cancel. Changing JSON to XML updated the example
+immediately. After the layout adjustment, a separate native rebuild
+verified the aligned control positions, the 300-pixel directory input,
+the 200-pixel format choice and the secondary Browse action. Confirming
+the existing directory returned without changing the saved fixture. The
+remaining backend differences include the maximum log size and
+connection-based naming.
+[Windows desktop comparison](target/verification/20261124-terminal-logging-editor-windows-desktop.md)
+· [Final Windows build](target/verification/20261124-terminal-logging-editor-windows-final-build.log)
+
 ## November 24 SSH editor window geometry
 
 The Window Geometry page follows the tagged Java form's size, position

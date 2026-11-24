@@ -1247,6 +1247,7 @@ fn ssh_editor_journal_and_ai_tabs_keep_their_drafts_when_terminal_defaults_are_r
             highlighting: HighlightChoices::default(),
             themes: &themes,
             journal_policy: JournalEditorPolicy::default(),
+            logging_policy: Default::default(),
             incognito_allowed: true,
             serial_allowed: true,
             terminal_effects: None,
@@ -1515,6 +1516,7 @@ fn keyboard_editor_view<'a>(
             highlighting: HighlightChoices::default(),
             themes,
             journal_policy: JournalEditorPolicy::default(),
+            logging_policy: Default::default(),
             incognito_allowed: true,
             serial_allowed: true,
             terminal_effects: None,
@@ -1527,7 +1529,7 @@ fn keyboard_editor_view<'a>(
 }
 
 #[test]
-fn ssh_editor_skips_disabled_jump_controls_in_tab_order() {
+fn ssh_editor_skips_disabled_jump_and_log_controls_in_tab_order() {
     use crate::settings_search::test_input;
     use iced::keyboard::{Key, key::Named};
     use iced::{Font, Renderer, Size, Theme};
@@ -1540,41 +1542,50 @@ fn ssh_editor_skips_disabled_jump_controls_in_tab_order() {
         .unwrap();
     let mut window = ConnectionWindow::open(profile.path()).unwrap();
     let _ = window.update(Message::EditSelected);
-    let _ = window.update(Message::Edit(Edit::Page(form::Page::JumpHost)));
     let themes = crate::terminal_theme::Themes::default();
     let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
-    let mut interface = UserInterface::build(
-        keyboard_editor_view(&window, &themes, &[]),
-        Size::new(900.0, 420.0),
-        Cache::default(),
-        &mut renderer,
-    );
-    let tab = |interface: &mut UserInterface<'_, Message, Theme, Renderer>,
-               renderer: &mut Renderer| {
-        let messages = test_input::press(interface, renderer, Key::Named(Named::Tab), None);
-        assert!(matches!(messages.as_slice(), [Message::FocusEditor(false)]));
-        let focus = window.draft.as_ref().unwrap().focus_editor(false);
-        test_input::apply(interface, renderer, focus);
-    };
-    tab(&mut interface, &mut renderer);
-    let toggle = test_input::press(
-        &mut interface,
-        &mut renderer,
-        Key::Named(Named::Space),
-        None,
-    );
-    assert!(matches!(
-        toggle.as_slice(),
-        [Message::Edit(Edit::UseJump(true))]
-    ));
-    tab(&mut interface, &mut renderer);
-    let save = test_input::press(
-        &mut interface,
-        &mut renderer,
-        Key::Named(Named::Enter),
-        None,
-    );
-    assert!(matches!(save.as_slice(), [Message::Save]));
+    for page in [form::Page::JumpHost, form::Page::Logging] {
+        let _ = window.update(Message::Edit(Edit::Page(page)));
+        let mut interface = UserInterface::build(
+            keyboard_editor_view(&window, &themes, &[]),
+            Size::new(900.0, 420.0),
+            Cache::default(),
+            &mut renderer,
+        );
+        let tab = |interface: &mut UserInterface<'_, Message, Theme, Renderer>,
+                   renderer: &mut Renderer| {
+            let messages = test_input::press(interface, renderer, Key::Named(Named::Tab), None);
+            assert!(matches!(messages.as_slice(), [Message::FocusEditor(false)]));
+            let focus = window.draft.as_ref().unwrap().focus_editor(false);
+            test_input::apply(interface, renderer, focus);
+        };
+        tab(&mut interface, &mut renderer);
+        let toggle = test_input::press(
+            &mut interface,
+            &mut renderer,
+            Key::Named(Named::Space),
+            None,
+        );
+        assert!(match page {
+            form::Page::JumpHost =>
+                matches!(toggle.as_slice(), [Message::Edit(Edit::UseJump(true))]),
+            form::Page::Logging => matches!(
+                toggle.as_slice(),
+                [Message::Edit(Edit::Logging(
+                    crate::terminal_logging::Edit::Enabled(true)
+                ))]
+            ),
+            _ => unreachable!(),
+        });
+        tab(&mut interface, &mut renderer);
+        let save = test_input::press(
+            &mut interface,
+            &mut renderer,
+            Key::Named(Named::Enter),
+            None,
+        );
+        assert!(matches!(save.as_slice(), [Message::Save]));
+    }
 }
 
 #[test]
@@ -1768,6 +1779,7 @@ fn connection_manager_pointer_drags_accept_local_folders_and_refuse_teamwork_sou
         temporary_keys: false,
         vault_unlocked: false,
         journal_policy: JournalEditorPolicy::default(),
+        logging_policy: Default::default(),
         serial_allowed: true,
         passwords: &[],
         passphrases: &[],
@@ -1908,6 +1920,7 @@ fn native_workbench_keeps_reference_side_widths_at_default_and_minimum_size() {
             temporary_keys: false,
             vault_unlocked: false,
             journal_policy: JournalEditorPolicy::default(),
+            logging_policy: Default::default(),
             serial_allowed: true,
             passwords: &[],
             passphrases: &[],
@@ -1978,6 +1991,7 @@ fn long_scope_titles_keep_list_and_map_visible_at_minimum_width() {
             temporary_keys: false,
             vault_unlocked: false,
             journal_policy: JournalEditorPolicy::default(),
+            logging_policy: Default::default(),
             serial_allowed: true,
             passwords: &[],
             passphrases: &[],

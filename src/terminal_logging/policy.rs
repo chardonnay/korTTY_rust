@@ -141,6 +141,13 @@ impl Policy {
         }
     }
 
+    pub(crate) fn managed_terminal_fields(&self) -> super::ManagedFields {
+        super::ManagedFields {
+            include_username: self.include_username,
+            directory_mode: self.directory_mode,
+        }
+    }
+
     pub(crate) fn read_rule(&mut self, rule: &Table) -> io::Result<()> {
         if let Some(logging) = table(rule, "logging")? {
             allowed(

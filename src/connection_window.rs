@@ -111,6 +111,8 @@ pub enum Message {
     Edit(Edit),
     FocusEditor(bool),
     NavigateOsBadge(String),
+    BrowseTerminalLogFolder,
+    TerminalLogFolderPicked(Arc<()>, Option<PathBuf>),
     PasteTemporaryKey,
     TemporaryKeyPasted(u64, bool, crate::ssh_dialog::Password),
     Save,
@@ -401,6 +403,15 @@ pub(crate) struct OverviewSources<'a> {
 }
 
 impl ConnectionWindow {
+    pub(crate) fn start_terminal_log_folder_picker(&mut self) -> Option<(Arc<()>, PathBuf)> {
+        if self.busy || self.confirming_close {
+            return None;
+        }
+        self.draft
+            .as_mut()?
+            .start_terminal_log_folder_picker(self.path.parent()?)
+    }
+
     pub(crate) fn saved_ssh_editor_profile(&self) -> Option<&Connection> {
         let id = self.draft.as_ref()?.id();
         (id != 0).then_some(())?;
@@ -1124,6 +1135,15 @@ impl ConnectionWindow {
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        if let Message::TerminalLogFolderPicked(ticket, path) = &message {
+            if let Some(draft) = &mut self.draft {
+                let path = path
+                    .as_deref()
+                    .filter(|_| !self.busy && !self.confirming_close);
+                draft.finish_terminal_log_folder_picker(ticket, path);
+            }
+            return Task::none();
+        }
         if (self.busy && !matches!(message, Message::Completed(_)))
             || (self.confirming_close && !matches!(message, Message::KeepEditing))
             || (!self.confirming_teamwork_hide.is_empty()

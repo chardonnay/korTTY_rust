@@ -7,11 +7,16 @@ use iced::widget::{checkbox, column, pick_list, row, text, text_input};
 use serde::{Deserialize, Serialize};
 
 mod capture;
+mod editor;
 mod policy;
 mod writer;
 
 pub(crate) use capture::{Capture, Prepared, RedactionSecrets, Redactor, Secrets, Warning};
+pub(crate) use editor::{Action as EditorAction, ManagedFields, pick_folder};
 pub(crate) use policy::Policy;
+
+const MAX_LOG_MIB: u16 = 256;
+const MAX_RETENTION_DAYS: u16 = 3650;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -103,7 +108,7 @@ impl Config {
                 "Use an absolute log folder without parent segments.",
             ));
         }
-        if !(1..=256).contains(&self.max_mib) || self.retention_days > 3650 {
+        if !(1..=MAX_LOG_MIB).contains(&self.max_mib) || self.retention_days > MAX_RETENTION_DAYS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Use a log size of 1–256 MiB and retention of 0–3650 days.",
@@ -125,6 +130,23 @@ fn valid_folder(path: &Path) -> bool {
     path.is_absolute() && !path.components().any(|part| part == Component::ParentDir)
 }
 
+fn filename(base: &str, part: u32, format: Format) -> String {
+    let extension = match format {
+        Format::Text => "log",
+        Format::Xml => "xml",
+        Format::Json => "json",
+    };
+    if part <= 1 {
+        format!("{base}.{extension}")
+    } else {
+        format!("{base}.p{part}.{extension}")
+    }
+}
+
+fn compressed_filename(name: &str) -> String {
+    format!("{name}.gz")
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum Edit {
     Enabled(bool),
@@ -142,6 +164,7 @@ pub(crate) struct Form {
     config: Config,
     size: String,
     retention: String,
+    editor: editor::Controls,
 }
 
 impl Form {
@@ -150,6 +173,7 @@ impl Form {
             size: config.max_mib.to_string(),
             retention: config.retention_days.to_string(),
             config,
+            editor: editor::Controls::default(),
         }
     }
 
@@ -190,7 +214,7 @@ impl Form {
         Ok(config)
     }
 
-    pub(crate) fn view(&self, eligible: bool, advanced: bool) -> Element<'_, Edit> {
+    pub(crate) fn view(&self, eligible: bool) -> Element<'_, Edit> {
         let mut fields = column![
             text("Terminal Logging").size(17),
             checkbox(self.config.enabled && eligible)
@@ -226,17 +250,6 @@ impl Form {
             ]
             .spacing(8),
         );
-        if advanced {
-            fields = fields.push(row![
-                text_input("Max size (MiB)", &self.size).width(110).on_input(Edit::Size),
-                text_input("Retention (days)", &self.retention).width(125).on_input(Edit::Retention),
-                checkbox(self.config.rotate_daily).label("Rotate daily").on_toggle(Edit::Daily),
-            ].spacing(8)).push(text("Automatic retention applies to logs created in the private default folder. Zero keeps them.").size(12))
-            .push(row![
-                checkbox(self.config.include_username).label("Include SSH username").on_toggle(Edit::Username),
-                pick_list([DirectoryMode::None, DirectoryMode::Full, DirectoryMode::Relative], Some(self.config.directory_mode), Edit::Directory),
-            ].spacing(8));
-        }
         if let Err(error) = self.config() {
             fields = fields.push(text(error.to_string()).size(12));
         }

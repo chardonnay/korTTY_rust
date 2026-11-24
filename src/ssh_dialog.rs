@@ -590,7 +590,7 @@ impl SshDialog {
     }
 
     pub(crate) fn logging_view(&self, eligible: bool) -> Element<'_, Message> {
-        self.logging.view(eligible, false).map(Message::Logging)
+        self.logging.view(eligible).map(Message::Logging)
     }
 
     pub(crate) fn with_isolation(

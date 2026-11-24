@@ -197,8 +197,26 @@ does not use its own values. Switching back within the dialog restores the
 connection draft. Bring the Rust presentation and draft behavior into line
 while preserving per-field inheritance on existing profiles. SSH Tunnels
 still needs the list with an aggregate enable switch and owned add and edit
-dialogs. Terminal Logging still needs the visible disabled grid, folder
-chooser and a filename preview linked to the selected format and compression.
+dialogs. The [Terminal Logging page](PORTING-PARITY.md#november-24-ssh-terminal-logging-editor)
+keeps the disabled fields visible, offers an owned folder chooser, and
+previews the Rust writer's filename. Compare the layout and the chooser's
+select and cancel behavior on macOS and Linux and verify changing the
+folder on Windows. Windows ARM64 confirmed the chooser's starting folder,
+cancellation and selection of the existing directory. Bring the same
+directory chooser and disabled-field layout to the compact Quick Connect
+section.
+Java permits 1,000 MiB per log file. Rust validates 256 MiB and bounds
+gzip input to that size. Verify rotation, gzip publication, cancellation
+and viewer loading at the Java limit before raising the native size limit.
+Java log names include the sanitized connection name. Rust names use a
+session identifier. Align new names and their preview while retaining
+support for reading and rotating existing logs.
+Java profile XML also includes a `logConfig` record. The Rust Java
+import path initializes native logging defaults and drops that record.
+Map compatible format, size, retention, rotation, compression and
+metadata choices. Use the existing portable restore review for enabling
+logging and adopting an external directory, including legacy file paths
+stored in Java's `logFilePath` field.
 The [managed Journal requirement](PORTING-PARITY.md#november-24-managed-session-journal)
 locks the SSH editor's autostart control and starts capture on eligible
 terminal streams. A native Apple Silicon OpenSSH test covered automatic

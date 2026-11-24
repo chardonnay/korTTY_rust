@@ -517,6 +517,11 @@ impl Workspace {
                 ai_agent_designs: &ai_agent_designs,
                 highlighting: self.highlight.connection_choices(),
                 themes: &self.window_settings.themes,
+                logging_policy: self
+                    .clipboard
+                    .policy
+                    .terminal_logging
+                    .managed_terminal_fields(),
                 journal_policy: connection_window::JournalEditorPolicy {
                     allowed: self.journal_allowed(),
                     required: self.journal_required(),
@@ -829,6 +834,38 @@ impl Workspace {
         };
         if message.opens_connection_memory() {
             return self.open_connection_memory(id, editor);
+        }
+        use connection_window::{Edit, Message as Profile};
+        if matches!(message, Profile::BrowseTerminalLogFolder) {
+            let Some((ticket, directory)) = self
+                .connection_managers
+                .get_mut(&id)
+                .and_then(|manager| manager.window.start_terminal_log_folder_picker())
+            else {
+                return Task::none();
+            };
+            return window::run(editor, move |owner| {
+                crate::terminal_logging::pick_folder(owner, directory)
+            })
+            .then(move |picker| {
+                let ticket = ticket.clone();
+                Task::perform(picker, move |path| {
+                    Message::ConnectionEditor(
+                        editor,
+                        Profile::TerminalLogFolderPicked(ticket, path),
+                    )
+                })
+            });
+        }
+        if let Profile::Edit(Edit::Logging(edit)) = &message
+            && !self
+                .clipboard
+                .policy
+                .terminal_logging
+                .managed_terminal_fields()
+                .allows(edit)
+        {
+            return Task::none();
         }
         if matches!(
             message,
