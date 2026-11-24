@@ -248,6 +248,9 @@ impl Workspace {
 
     pub(super) fn close_connection_editor(&mut self, editor: window::Id) -> Option<Task<Message>> {
         let id = self.connection_editor_manager(editor)?;
+        if let Some(memory) = self.connection_memory_for_editor(editor) {
+            return Some(window::gain_focus(memory));
+        }
         let manager = &self.connection_managers[&id];
         if manager.closing || manager.editor_closing || manager.window.store_busy() {
             return Some(Task::none());
@@ -408,6 +411,7 @@ impl Workspace {
     pub(super) fn is_profile_tool(&self, id: window::Id) -> bool {
         self.connection_managers.contains_key(&id)
             || self.connection_editor_manager(id).is_some()
+            || self.connection_memory.contains_key(&id)
             || self.teamwork_restore.contains_key(&id)
             || self.vault_id == Some(id)
     }
@@ -457,6 +461,9 @@ impl Workspace {
     }
 
     pub(super) fn profile_tool_view(&self, id: window::Id) -> Option<Element<'_, Message>> {
+        if self.connection_memory.contains_key(&id) {
+            return self.connection_memory_view(id);
+        }
         let editor_owner = self.connection_editor_manager(id);
         if let Some(manager) = self.connection_managers.get(&editor_owner.unwrap_or(id)) {
             let effects = self.terminal_effects_enabled().then(|| {
@@ -808,6 +815,18 @@ impl Workspace {
         else {
             return Task::none();
         };
+        if message.opens_connection_memory() {
+            return self.open_connection_memory(id, editor);
+        }
+        if matches!(
+            message,
+            connection_window::Message::Save
+                | connection_window::Message::CancelEdit
+                | connection_window::Message::DiscardAndClose
+        ) && let Some(memory) = self.connection_memory_for_editor(editor)
+        {
+            return window::gain_focus(memory);
+        }
         self.update_connection_profile(id, message, true)
     }
 
@@ -1200,6 +1219,18 @@ impl Workspace {
 
     pub(super) fn request_profile_quit(&mut self) -> Option<Task<Message>> {
         self.quit_waiting_profile = None;
+        if let Some((id, busy)) = self.connection_memory_needing_attention() {
+            if busy {
+                return Some(self.defer_profile_quit(id, true));
+            }
+            self.quit_waiting_profile = Some(id);
+            return Some(
+                self.update_connection_memory(
+                    id,
+                    crate::ai_manager::connection_memory::Event::Close,
+                ),
+            );
+        }
         if let Some(id) = self.connection_overview_busy() {
             return Some(self.defer_profile_quit(id, true));
         }
@@ -1239,7 +1270,7 @@ impl Workspace {
         }
     }
 
-    fn cancel_profile_quit(&mut self, id: window::Id) {
+    pub(super) fn cancel_profile_quit(&mut self, id: window::Id) {
         if self.quit_waiting_profile == Some(id) {
             self.quit_waiting_profile = None;
             window_lifecycle::reply_to_native_quit(false);
@@ -1273,6 +1304,10 @@ impl Workspace {
     }
 
     pub(super) fn close_profile_tool(&mut self, id: window::Id, discard: bool) -> Task<Message> {
+        if self.connection_memory.contains_key(&id) {
+            return self
+                .update_connection_memory(id, crate::ai_manager::connection_memory::Event::Close);
+        }
         if self.teamwork_restore.contains_key(&id) {
             return self.close_teamwork_restore(id);
         }

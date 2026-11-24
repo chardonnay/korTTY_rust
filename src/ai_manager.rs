@@ -256,6 +256,7 @@ pub(crate) use local::retrieval::{
 };
 pub(crate) use memory::Scope;
 pub(crate) use memory::checked_reference_text;
+pub(crate) use memory::connection as connection_memory;
 pub(crate) use memory::learning::{
     MAX_RULE_CHARACTERS, RuleProposal, SavedRule, normalized_length as rule_normalized_length,
     preview as review_memory_rule,

@@ -559,7 +559,7 @@ impl Draft {
                 .map(|edit| Message::Edit(Edit::WindowGeometry(edit))),
             Page::Ai => self
                 .terminal
-                .ai_view(choices, true)
+                .ai_view(choices, Some(self.id))
                 .map(|edit| Message::Edit(Edit::Terminal(edit))),
         };
         let page = container(

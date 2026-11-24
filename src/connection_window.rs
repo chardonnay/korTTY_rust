@@ -143,6 +143,13 @@ pub enum Scope {
 }
 
 impl Message {
+    pub(crate) fn opens_connection_memory(&self) -> bool {
+        matches!(
+            self,
+            Self::Edit(Edit::Terminal(terminal_overrides::Edit::OpenMemory))
+        )
+    }
+
     pub(crate) fn java_ai_adoption(
         &self,
     ) -> Option<(
@@ -383,6 +390,12 @@ pub(crate) struct OverviewSources<'a> {
 }
 
 impl ConnectionWindow {
+    pub(crate) fn saved_ssh_editor_profile(&self) -> Option<&Connection> {
+        let id = self.draft.as_ref()?.id();
+        (id != 0).then_some(())?;
+        self.store.get(id)
+    }
+
     pub fn open(path: PathBuf) -> Result<Self, String> {
         let store = Store::open(path.clone()).map_err(|error| error.to_string())?;
         let profile_root = path

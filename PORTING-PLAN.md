@@ -165,8 +165,10 @@ Folder group and groups Connect and Close at the right. The SSH editor
 organizes its existing form into Connection, Terminal Settings, SSH Tunnels,
 Jump Server, Terminal Logging, Journal, Window Geometry and AI. The
 [Journal and AI tabs](PORTING-PARITY.md#november-24-ssh-editor-journal-and-ai-tabs)
-use the existing saved connection options. The connection memory shortcut
-and the Java overflow menu still need implementation. Compare the journal
+use the existing saved connection options. The
+[connection memory shortcut](PORTING-PARITY.md#november-24-memory-from-the-ssh-editor)
+opens the exact saved SSH profile's memory in a separate owned window.
+The Java overflow menu still needs implementation. Compare the journal
 limits and enforced policy behavior with Java. The Manager's separate
 Teamwork sidebar group and editor form alignment remain open. The earlier
 Windows desktop check covered the three-pane Manager, its Map view, opening

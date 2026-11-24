@@ -1100,11 +1100,44 @@ temporary-key replacement in the vault.
 [Windows ARM64 preview build](target/verification/20261124-connection-editor-tabs-windows-preview.log)
 · [Windows ARM64 opt-in tests](target/verification/20261124-connection-editor-tabs-windows-opt-in.log)
 
-The Java connection-memory shortcut and the single-row overflow
-navigation remain open, along with the comparison of journal limits
-and enforced policy behavior.
+The single-row overflow navigation remains open, along with the
+comparison of journal limits and enforced policy behavior.
 [Tagged Java editor](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ConnectionEditDialog.java)
 · [Rust editor](src/connection_window/form.rs)
+
+## November 24 Memory from the SSH editor
+
+The AI tab opens Connection memory as a modeless child of the editor.
+The button requires a saved SSH profile. The child uses its stored
+name and stable ID and keeps the scope fixed to that profile while
+the SSH draft remains in the parent. The memory pane shares storage,
+editing, history, archive, references, and policy handling with AI
+Manager.
+
+Closing asks before discarding unsaved Markdown or a row edit.
+The parent can still edit its form while the child is open. Closing
+or saving the parent brings the memory window forward for completion.
+Shared memory preferences save on close under the AI settings lock.
+The save preserves unrelated AI settings and detects a concurrent
+memory preference change. The user can discard a conflicting
+preference draft and close the window.
+[Tagged Java connection memory dialog](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AiMemoryDialog.java)
+· [Rust scoped memory editor](src/ai_manager/memory/connection.rs)
+
+Apple Silicon and Windows ARM64 each passed 54 memory and connection
+manager tests. Apple Silicon also passed strict application and
+test-target Clippy. The new cases exercised two separate saved scopes,
+a modeless child of the SSH editor, unsaved Markdown on close, and
+rejection and discard of stale shared memory preferences.
+[Apple Silicon verification](target/verification/20261124-connection-memory-macos-final.log)
+· [Windows ARM64 verification](target/verification/20261124-connection-memory-windows-verified.log)
+
+With two saved profiles in the Windows ARM64 preview, the first
+fixture with inherited file permissions was rejected. A fixture with
+protected owner-only permissions loaded the selected profile's memory
+in the owned window under its stored name. Closing it returned to the
+SSH editor with the unsaved tag still in place.
+[Windows ARM64 preview build](target/verification/20261124-connection-memory-windows-preview.log)
 
 ## November 23 GGUF Configure sizing
 

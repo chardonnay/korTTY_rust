@@ -80,6 +80,7 @@ mod journal_note_translation;
 mod journal_thumbnail;
 mod key_bindings;
 pub(crate) use key_bindings::SnippetCompletionChord;
+mod connection_memory;
 mod known_hosts;
 mod local_dock;
 mod logfile_access;
@@ -296,6 +297,7 @@ pub enum Message {
     DesktopTextDrop(desktop_text_drop::Message),
     RemoteDockTick,
     AiManager(ai_access::Message),
+    ConnectionMemory(window::Id, crate::ai_manager::connection_memory::Event),
     TerminalAi(window::Id, terminal_ai::Message),
     SavedChats(window::Id, saved_chats::Message),
     Recording(recording_access::Message),
@@ -531,6 +533,7 @@ pub struct Workspace {
     retained_sftp_download: Option<crate::sftp_window::ClosedDownload>,
     sftp_logins: HashMap<window::Id, ssh_access::PendingSsh>,
     connection_managers: BTreeMap<window::Id, profile_tools::ConnectionManager>,
+    connection_memory: BTreeMap<window::Id, connection_memory::Window>,
     connection_manager_open_after_close: BTreeMap<window::Id, window::Id>,
     connection_overview: BTreeMap<window::Id, profile_tools::connection_overview::Dialog>,
     teamwork_restore: BTreeMap<window::Id, profile_tools::teamwork_restore::Dialog>,
@@ -1194,6 +1197,9 @@ impl Workspace {
         if let Some(title) = self.connection_editor_title(id) {
             return title.into();
         }
+        if let Some(title) = self.connection_memory_title(id) {
+            return title;
+        }
         if self.connection_managers.contains_key(&id) {
             return "Connection Manager".into();
         }
@@ -1376,6 +1382,7 @@ impl Workspace {
                     | Message::ConnectionUsed(..)
                     | Message::Connections(..)
                     | Message::ConnectionEditor(..)
+                    | Message::ConnectionMemory(..)
                     | Message::ConnectionCatalogReloaded(..)
                     | Message::CloseAllDialog(..)
                     | Message::ConfirmSerialClose(..)
@@ -1917,9 +1924,10 @@ impl Workspace {
                 self.ai_manager_child_closed(id);
                 let placed = self.finish_placed_dialog_closed(id);
                 let manager = self.connection_window_closed(id).unwrap_or_else(Task::none);
+                let memory = self.connection_memory_closed(id);
                 let teamwork = self.resume_teamwork_after_vault(id);
                 let control = self.resume_control_ssh_after_vault(id);
-                return Task::batch([placed, manager, teamwork, control]);
+                return Task::batch([placed, manager, memory, teamwork, control]);
             }
             Message::SaveLastWindow => return self.lifecycle.save_if_due(),
             Message::WindowPlacementPoll(id, request) => {
@@ -2115,6 +2123,9 @@ impl Workspace {
             Message::RemoteDockTick => return self.remote_dock_tick(),
             Message::Recording(message) => return self.update_recording(message),
             Message::AiManager(message) => return self.update_ai_manager(message),
+            Message::ConnectionMemory(id, message) => {
+                return self.update_connection_memory(id, message);
+            }
             Message::TerminalAi(id, message) => return self.update_terminal_ai(id, message),
             Message::SavedChats(id, message) => return self.update_saved_chats(id, message),
             Message::ProjectFile(id, message) => return self.update_project_file(id, message),

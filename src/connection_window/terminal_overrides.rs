@@ -36,6 +36,7 @@ pub enum Edit {
     DismissJavaAiProfile,
     AiAgentDisabled(bool),
     AiAgentDesign(Option<String>),
+    OpenMemory,
     AiSkillSearch(String),
     AiSkill(u64, bool),
     HighlightSet(String),
@@ -183,6 +184,7 @@ impl Draft {
                 }
                 self.options.ai_agent_design = value;
             }
+            Edit::OpenMemory => return false,
             Edit::AiSkillSearch(value) => {
                 self.ai_skill_search = value.chars().take(160).collect();
                 return false;
@@ -276,7 +278,7 @@ impl Draft {
     pub(super) fn ai_view(
         &self,
         view: &ViewChoices<'_>,
-        lock_disabled_design: bool,
+        ssh_profile: Option<u64>,
     ) -> Element<'_, Edit> {
         let skills = view.ai_skills;
         let (ai_choices, selected) =
@@ -331,7 +333,7 @@ impl Draft {
                 designs.push(unavailable.clone());
                 Some(unavailable)
             });
-        let design: Element<'_, Edit> = if lock_disabled_design && self.options.ai_agent_disabled {
+        let design: Element<'_, Edit> = if ssh_profile.is_some() && self.options.ai_agent_disabled {
             text(selected_design.map_or_else(|| "Use default".into(), |choice| choice.name))
                 .style(text::secondary)
                 .into()
@@ -354,6 +356,11 @@ impl Draft {
             checkbox(self.options.ai_agent_disabled)
                 .label("Disable terminal AI agent execution for this connection")
                 .on_toggle(Edit::AiAgentDisabled),
+            ssh_profile.map(|id| column![
+                button("Connection memory…").on_press_maybe((id != 0).then_some(Edit::OpenMemory)),
+                (id == 0).then(|| text("Save the connection to open its memory.").size(13)),
+            ]
+            .spacing(4)),
             labeled("AI agent design", design),
             text("Assigned AI skills").size(14),
         ]
@@ -486,7 +493,7 @@ impl Draft {
         ]
         .spacing(6);
         if combined {
-            choices = choices.push(self.ai_view(view, false));
+            choices = choices.push(self.ai_view(view, None));
         }
         let labels = ["Foreground", "Background", "Cursor", "Selection"]
             .into_iter()

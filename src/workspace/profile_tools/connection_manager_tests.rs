@@ -38,6 +38,74 @@ pub(super) fn seed(store: &mut Store, name: &str) -> u64 {
 }
 
 #[test]
+fn connection_memory_is_owned_by_the_editor_and_keeps_the_connection_draft() {
+    use crate::ai_manager::{Scope, connection_memory::Event};
+
+    let profile = crate::snippets::tests::Profile::new();
+    let path = profile.0.join("connections.json");
+    let mut store = Store::open(path.clone()).unwrap();
+    let target = seed(&mut store, "Stored SSH target");
+    let mut workspace = Workspace::default();
+    let (owner, _) = workspace.open_window(false);
+    let (manager, _) =
+        workspace.install_connection_manager(owner, ConnectionWindow::open(path).unwrap());
+    let _ = workspace.update_connections(manager, Profile::EditSelected);
+    let editor = workspace.connection_managers[&manager].editor.unwrap();
+    let _ = workspace.update_connection_editor(
+        editor,
+        Profile::Edit(Edit::Name("Unsaved editor name".into())),
+    );
+    let saved = workspace.connection_managers[&manager]
+        .window
+        .saved_ssh_editor_profile()
+        .unwrap();
+    assert_eq!(saved.id, target);
+    assert_eq!(saved.name, "Stored SSH target");
+    let name = saved.name.clone();
+    let open = workspace.open_connection_memory_from(
+        editor,
+        profile.0.clone(),
+        Scope::connection(target, name.clone()),
+        name,
+    );
+    let memory = workspace.connection_memory_for_editor(editor).unwrap();
+    assert_eq!(workspace.placed_dialog_owner(memory), Some(editor));
+    assert_eq!(
+        workspace.title(memory),
+        "Connection memory · Stored SSH target"
+    );
+    let _ = workspace.update_connection_editor(editor, Profile::CancelEdit);
+    assert_eq!(
+        workspace.connection_editor_title(editor),
+        Some("Edit connection")
+    );
+    let mut actions = iced_runtime::task::into_stream(open).unwrap();
+    loop {
+        match block_on(actions.next()) {
+            Some(iced_runtime::Action::Output(Message::ConnectionMemory(id, event)))
+                if id == memory =>
+            {
+                let _ = workspace.update_connection_memory(id, event);
+                break;
+            }
+            Some(_) => {}
+            None => panic!("expected the connection memory load event"),
+        }
+    }
+    let _ = workspace.update_connection_memory(memory, Event::Close);
+    let _ = workspace.connection_memory_closed(memory);
+    assert_eq!(
+        workspace.connection_editor_title(editor),
+        Some("Edit connection")
+    );
+    assert!(!workspace.connection_managers[&manager].editor_closing);
+    assert!(
+        workspace.request_profile_quit().is_some(),
+        "the connection draft is still dirty"
+    );
+}
+
+#[test]
 fn connection_manager_uses_independent_owners_and_keeps_a_dirty_draft_on_cancel() {
     let profile = crate::snippets::tests::Profile::new();
     let path = profile.0.join("connections.json");

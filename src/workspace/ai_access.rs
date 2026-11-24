@@ -196,6 +196,23 @@ impl Workspace {
             .then(|| Arc::clone(&self.ai_manager.config))
     }
 
+    pub(super) fn connection_memory_configuration(&self) -> (&Configuration, bool) {
+        (&self.ai_manager.config, self.ai_manager.problem.is_none())
+    }
+
+    pub(super) fn apply_connection_memory_preferences(
+        &mut self,
+        change: crate::ai_manager::connection_memory::PreferenceChange,
+    ) {
+        let vision = self.configured_automatic_journal_vision();
+        if change.apply(Arc::make_mut(&mut self.ai_manager.config)) {
+            if let Some((_, dialog)) = &mut self.ai_manager.surface {
+                change.rebase(dialog);
+            }
+            self.apply_ai_manager_settings(vision);
+        }
+    }
+
     pub(super) fn ai_chat_enabled(&self) -> bool {
         self.clipboard.policy.ai_chat_allowed && self.ai_features_enabled()
     }
