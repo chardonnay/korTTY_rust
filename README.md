@@ -264,7 +264,8 @@ Saved SSH, local-shell and serial profiles expose **Session journal** settings.
 **Start a journal on connect** starts a capture for the primary stream.
 A running SSH capture continues across reconnects in the same tab. A
 serial capture continues when reconnecting to the same device path.
-Serial journaling currently supports profiles using the ANSI/DEC parser.
+Serial journaling supports every byte-stream terminal profile and
+captures parsed, visible host output.
 Automatic terminal journals log the effective isolation at launch.
 After an SSH or serial reconnect, the journal records the new stream's isolation.
 **Capture typed commands at recognized shell prompts** starts with the next

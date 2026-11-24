@@ -251,6 +251,9 @@ impl Hp {
     fn ground(&mut self, model: &mut Model, byte: u8) {
         if byte.is_ascii() {
             self.flush_utf8(model);
+            if matches!(byte, 0x08..=0x0d) {
+                model.journal_control(byte);
+            }
             match byte {
                 0x07 => model.ring_bell(),
                 0x08 => {
@@ -315,6 +318,7 @@ impl Hp {
         {
             model.carriage_return();
         }
+        model.journal_print(character);
         print(model, character);
         if self.profile == TerminalProfile::Hp2392 {
             self.forms.host_character(model, character);
@@ -344,6 +348,7 @@ impl Hp {
                 self.apply_memory_lock(model);
             }
             b'E' if self.forms.block || self.forms.format => {
+                model.journal_boundary();
                 self.block = false;
                 self.protect = false;
                 self.memory_lock = None;
@@ -388,6 +393,7 @@ impl Hp {
                 model.move_cursor(0, 0);
             }
             b'h' => {
+                model.journal_boundary();
                 model.move_cursor(0, 0);
                 if self.profile == TerminalProfile::Hp2392 {
                     self.forms.erase(model, true);
@@ -694,6 +700,9 @@ impl Hp {
     }
 
     fn erase_display(&self, model: &mut Model, mode: u16) {
+        if mode == 2 || (mode == 3 && self.stream_mode() && model.rows > 1) {
+            model.journal_boundary();
+        }
         match mode {
             0 if self.stream_wrap_pending(model) => {
                 for row in model.cursor().row + 1..model.rows {

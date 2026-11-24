@@ -1368,6 +1368,36 @@ serial settings and the journal lifecycle tests. The virtual serial
 transport case used an Apple Silicon pseudo-terminal.
 [Windows ARM64 verification](target/verification/20261124-serial-journal-windows-final.log)
 
+## November 24 Journals for PETSCII, Wyse, TeleVideo and HP
+
+All byte-stream emulations can now contribute parsed output to session
+journals. PETSCII uses the decoded glyphs and its native Return and Delete.
+Wyse and TeleVideo pass decoded text and line controls from their own
+parsers. HP records host display text through its parser, including text
+displayed by a host-triggered softkey replay. Key definitions, status
+payloads consumed by the parser, concealed host text, local HP form edits
+and local serial echo stay outside live journal output. The native page
+clears and parser resets discard the unfinished journal line.
+
+The same masking, automatic-start and reconnect rules apply to the new
+streams. The base Java path observes connector output. Rust keeps its
+parser-based capture so that these modes can use the same visibility and
+masking rules as ANSI/DEC.
+[Tagged Java journal connection](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/TerminalView.java)
+· [Rust journal observer and parser tests](crates/terminal/src/journal.rs)
+· [Native virtual serial test](src/workspace/journal_capture_access/serial_tests.rs)
+
+Apple Silicon and Windows ARM64 each passed the 280 terminal-library
+tests. Apple Silicon also passed strict Clippy, the application build,
+57 focused application tests and two OpenSSH reconnect tests. The virtual
+serial test covers VT100, PETSCII, WY-60, TeleVideo 925, HP 2392 and HP
+700/92. Both configured and policy-required captures record masked
+output across a same-device reconnect and finish on a device change.
+Windows ARM64 passed 43 focused application tests.
+[Apple Silicon verification](target/verification/20261124-emulation-journal-macos-native.log)
+· [Windows ARM64 terminal-library verification](target/verification/20261124-emulation-journal-windows-terminal-final.log)
+· [Windows ARM64 application verification](target/verification/20261124-emulation-journal-windows-app.log)
+
 ## November 23 GGUF Configure sizing
 
 Java sizes the Configure grid to its path label. Rust now measures the

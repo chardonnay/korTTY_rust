@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 
-use crate::{Cell, Input, Model, Terminal};
+use crate::{Cell, Model, Terminal};
 
 /// An output action accepted by the real terminal parser. No control-string payload is exposed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,10 +32,6 @@ pub struct JournalRow<'a> {
 impl Terminal {
     pub fn journal_input_encoding(&self) -> crate::TextEncoding {
         self.model.text_encoding()
-    }
-
-    pub fn supports_journal_output(&self) -> bool {
-        matches!(self.input, Input::Xterm(_))
     }
 
     /// Replaces the current observer and lets it flush a final partial line.
@@ -120,6 +116,27 @@ impl Model {
             self.journal_event(JournalEvent::Print(character));
         }
     }
+
+    pub(crate) fn put_journaled_char(&mut self, character: char) {
+        if self.journal.is_some() {
+            self.journal_print(character);
+        }
+        self.put_char(character);
+    }
+
+    pub(crate) fn journal_control(&mut self, byte: u8) {
+        if self.journal.is_none() {
+            return;
+        }
+        let event = match byte {
+            b'\x08' => JournalEvent::Backspace,
+            b'\t' => JournalEvent::Tab,
+            b'\n' | b'\x0b' | b'\x0c' => JournalEvent::LineFeed,
+            b'\r' => JournalEvent::CarriageReturn,
+            _ => return,
+        };
+        self.journal_event(event);
+    }
 }
 
 #[cfg(test)]
@@ -180,6 +197,119 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn petscii_journal_decodes_glyphs_and_native_line_controls() {
+        use JournalEvent::{Backspace, Boundary, LineFeed, Print};
+
+        let events = parsed_events(
+            crate::TerminalProfile::Petscii,
+            &[b"A\\Z\x14\r", b"\x0eAB\r\x93C\r"],
+        );
+        assert_eq!(
+            events,
+            [
+                Print('A'),
+                Print('£'),
+                Print('Z'),
+                Backspace,
+                LineFeed,
+                Print('a'),
+                Print('b'),
+                LineFeed,
+                Boundary,
+                Print('c'),
+                LineFeed,
+            ]
+        );
+    }
+
+    #[test]
+    fn wyse_journal_excludes_control_payloads_and_concealed_text() {
+        use crate::TerminalProfile::{Wy50, Wy60, Wy160};
+
+        for profile in [Wy50, Wy60, Wy160] {
+            let events = parsed_events(
+                profile,
+                &[
+                    b"A\x1bG1HIDDEN\x1bG0\x1bz0STATUS",
+                    b"PAYLOAD\r\x1bA0KEYDEFINITION\rB\xc3",
+                    b"\xa9\x1b]OPAQUE\x1b",
+                    b"\\C\r\n",
+                ],
+            );
+            assert_stream_line(&events, "ABéC");
+        }
+    }
+
+    #[test]
+    fn televideo_journal_excludes_status_and_key_definitions() {
+        use crate::TerminalProfile::{Tvi910, Tvi920, Tvi925};
+
+        for profile in [Tvi910, Tvi920, Tvi925] {
+            let mut chunks = vec![b"A\x1bG1HIDDEN\x1bG0\x1blSTATUS".as_slice(), b"PAYLOAD\r"];
+            if profile != Tvi910 {
+                chunks.extend([b"\x1bpKEYDEF\x1b".as_slice(), b"\\"]);
+            }
+            chunks.extend([b"B\xc3".as_slice(), b"\xa9C\r\n"]);
+            assert_stream_line(&parsed_events(profile, &chunks), "ABéC");
+        }
+    }
+
+    #[test]
+    fn hp_journal_excludes_softkey_definitions_and_concealed_text() {
+        use crate::TerminalProfile::{Hp2392, Hp70092};
+
+        for profile in [Hp2392, Hp70092] {
+            let events = parsed_events(
+                profile,
+                &[
+                    b"A\x1b&f1a6LKEY",
+                    b"DEF\x1b&dSHIDDEN\x1b&d@B\xc3",
+                    b"\xa9\x1b]OPAQUE\x1b",
+                    b"\\C\r\n",
+                ],
+            );
+            assert_stream_line(&events, "ABéC");
+        }
+    }
+
+    #[test]
+    fn hp_journal_excludes_local_form_edits_and_replies() {
+        use crate::{Hp2392Input, TerminalProfile};
+
+        let mut terminal = Terminal::with_profile(24, 4, TerminalProfile::Hp2392);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        terminal.set_journal_observer(Some(Box::new(Probe(Arc::clone(&events)))));
+        terminal.advance(b"\x1b&k1B\x1b&s1HNAME:\x1b[      \x1b] READY\x1bW");
+        events.lock().unwrap().clear();
+        assert!(terminal.hp2392_local_input(b"LOCAL", Hp2392Input::Text));
+        let screen = terminal.snapshot();
+        let text: String = screen.cells.iter().map(|cell| cell.text.as_str()).collect();
+        assert!(text.contains("NAME:LOCAL"));
+        terminal.advance(b"\x1bW");
+        assert!(terminal.hp2392_local_input(b"\r", Hp2392Input::Key { enter: true }));
+        assert!(terminal.take_responses().starts_with(b"LOCAL"));
+        assert!(events.lock().unwrap().is_empty());
+    }
+
+    fn parsed_events(profile: crate::TerminalProfile, chunks: &[&[u8]]) -> Vec<JournalEvent> {
+        let mut terminal = Terminal::with_profile(80, 8, profile);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        terminal.set_journal_observer(Some(Box::new(Probe(Arc::clone(&events)))));
+        for bytes in chunks {
+            terminal.advance(bytes);
+        }
+        terminal.echo_serial_input(b"LOCAL ECHO\r\n");
+        terminal.set_journal_observer(None);
+        Arc::try_unwrap(events).unwrap().into_inner().unwrap()
+    }
+
+    fn assert_stream_line(events: &[JournalEvent], expected: &str) {
+        let mut expected: Vec<_> = expected.chars().map(JournalEvent::Print).collect();
+        expected.extend([JournalEvent::CarriageReturn, JournalEvent::LineFeed]);
+        assert_eq!(events, expected);
     }
 
     #[test]

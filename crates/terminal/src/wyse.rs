@@ -184,13 +184,16 @@ impl Wyse {
                 if matches!(ch, '\u{80}'..='\u{9f}') {
                     return c1(ch as u8);
                 }
-                model.put_char(ch);
+                model.put_journaled_char(ch);
                 return State::Ground;
             }
             self.utf8_len = 0;
-            model.put_char(char::REPLACEMENT_CHARACTER);
+            model.put_journaled_char(char::REPLACEMENT_CHARACTER);
         }
 
+        if matches!(byte, 0x08..=0x0a | 0x0d) {
+            model.journal_control(byte);
+        }
         match byte {
             ESC => return State::Escape,
             0x07 => model.ring_bell(),
@@ -207,20 +210,21 @@ impl Wyse {
                 } else {
                     ch
                 };
+                model.journal_print(ch);
                 model.put_character(ch, 1);
             }
             0x80..=0xff
                 if model.text_encoding().is_single_byte()
                     && (byte >= 0xa0 || model.windows_c1_text()) =>
             {
-                model.put_char(model.text_encoding().decode_byte(byte));
+                model.put_journaled_char(model.text_encoding().decode_byte(byte));
             }
             0x80..=0x9f => return c1(byte),
             _ if utf8_width(byte) > 1 => {
                 self.utf8[0] = byte;
                 self.utf8_len = 1;
             }
-            0xa0..=0xff => model.put_char(char::REPLACEMENT_CHARACTER),
+            0xa0..=0xff => model.put_journaled_char(char::REPLACEMENT_CHARACTER),
             _ => {}
         }
         State::Ground
@@ -269,6 +273,7 @@ impl Wyse {
             b'Y' => model.erase_display(0, false),
             b'y' => model.erase_display(1, false),
             b'*' | b'+' => {
+                model.journal_boundary();
                 model.erase_display(2, false);
                 model.move_cursor(0, 0);
             }
@@ -295,7 +300,10 @@ impl Wyse {
             b'"' => model.restore_cursor(),
             b'/' => model.cursor_visible = false,
             b'F' if wy50 => model.cursor_visible = true,
-            b'I' if wy50 => model.horizontal_tab(),
+            b'I' if wy50 => {
+                model.journal_control(b'\t');
+                model.horizontal_tab();
+            }
             b'e' | b'r' if !wy160 => model.insert_mode = byte == b'e',
             b'{' | b'}' if !wy50 => model.auto_wrap = byte == b'{',
             b'Z' if wy160 => model.reply(b"160\r"),

@@ -2367,9 +2367,7 @@ fn run_session(
                     .journal_secrets
                     .lock()
                     .unwrap_or_else(|error| error.into_inner()) = Some(secrets.clone());
-                shared
-                    .journal_available
-                    .store(terminal.supports_journal_output(), Ordering::Release);
+                shared.journal_available.store(true, Ordering::Release);
             }
             emulate(
                 &mut terminal,

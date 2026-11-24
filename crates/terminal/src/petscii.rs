@@ -1,4 +1,4 @@
-use crate::{Color, Model, Style, TerminalKey};
+use crate::{Color, JournalEvent, Model, Style, TerminalKey};
 
 /// The C64 character modes share punctuation and shifted graphics.
 /// These Unicode approximations match the SithTermFX v1.2.7 mapping.
@@ -31,6 +31,7 @@ impl Petscii {
             match byte {
                 0x07 => model.ring_bell(),
                 0x0d => {
+                    model.journal_event(JournalEvent::LineFeed);
                     model.carriage_return();
                     model.line_feed();
                 }
@@ -55,12 +56,14 @@ impl Petscii {
                     };
                     model.move_cursor(cursor.row, column);
                     if byte == 0x14 {
+                        model.journal_event(JournalEvent::Backspace);
                         let right = model.columns - 1;
                         model.screen_mut().delete_cells(1, Style::default(), right);
                     }
                 }
                 0x93 => {
                     // Erased cells retain the normal background even in reverse mode.
+                    model.journal_boundary();
                     model.style.inverse = false;
                     model.erase_display(2, false);
                     model.move_cursor(0, 0);
@@ -76,6 +79,7 @@ impl Petscii {
                     if let Some(color) = color(byte) {
                         model.style.foreground = Color::Indexed(color);
                     } else if let Some(ch) = decode(byte, self.uppercase_graphics) {
+                        model.journal_print(ch);
                         model.put_character(ch, 1);
                     }
                 }

@@ -14,14 +14,22 @@ use super::*;
 
 #[test]
 fn serial_journal_keeps_masked_output_across_a_same_device_reconnect() {
-    for required in [false, true] {
+    use kortty_terminal::TerminalProfile::{self, Hp2392, Hp70092, Petscii, Tvi925, Vt100, Wy60};
+
+    for profile in [Vt100, Petscii, Wy60, Tvi925, Hp2392, Hp70092] {
+        for required in [false, true] {
+            assert_serial_journal(profile, required);
+        }
+    }
+
+    fn assert_serial_journal(profile: TerminalProfile, required: bool) {
         let scratch = Scratch::new();
         let (mut peer, device) = serial_test_pair().unwrap();
         let (mut other_peer, other_device) = serial_test_pair().unwrap();
         let mut workspace = Workspace::default();
         workspace.clipboard.policy = crate::clipboard_policy::parse(&format!(
             "[meta]\nschema-version = 1\n[[rule]]\n[rule.session-journal]\nenforced = {required}\n\
-             [[rule.session-journal.replace]]\npattern = 'SERIAL_PRIVATE'\nreplacement = 'SERIAL_MASKED'",
+             [[rule.session-journal.replace]]\npattern = 'SERIAL PRIVATE'\nreplacement = 'SERIAL MASKED'",
         ))
         .unwrap();
         workspace.window_settings.session_journal.directory =
@@ -34,7 +42,7 @@ fn serial_journal_keeps_masked_output_across_a_same_device_reconnect() {
                 local_echo: true,
                 ..Default::default()
             },
-            kortty_terminal::TerminalProfile::Vt100,
+            profile,
         );
         saved.journal.auto_start = !required;
         saved.journal.capture_input = true;
@@ -57,12 +65,12 @@ fn serial_journal_keeps_masked_output_across_a_same_device_reconnect() {
             .clone();
 
         let shell = &workspace.sessions[&source].session;
-        peer.write_all(b"SERIAL_PRIVATE before\r\n").unwrap();
-        wait_for_text(shell, "SERIAL_PRIVATE before");
+        peer.write_all(b"SERIAL PRIVATE BEFORE\r\n").unwrap();
+        wait_for_text(shell, "SERIAL PRIVATE BEFORE");
         shell
-            .send_user_input(b"LOCAL_KEYBOARD_ONLY".to_vec(), false)
+            .send_user_input(b"LOCAL KEYBOARD ONLY".to_vec(), false)
             .unwrap();
-        wait_for_text(shell, "LOCAL_KEYBOARD_ONLY");
+        wait_for_text(shell, "LOCAL KEYBOARD ONLY");
         disconnect(&mut workspace, source);
         assert_eq!(capture.status(), Status::Recording);
 
@@ -82,10 +90,10 @@ fn serial_journal_keeps_masked_output_across_a_same_device_reconnect() {
             workspace.journal_captures[&tab].recording().unwrap(),
             &capture
         ));
-        peer.write_all(b"SERIAL_PRIVATE after\r\n").unwrap();
+        peer.write_all(b"SERIAL PRIVATE AFTER\r\n").unwrap();
         wait_for_text(
             &workspace.sessions[&replacement].session,
-            "SERIAL_PRIVATE after",
+            "SERIAL PRIVATE AFTER",
         );
         disconnect(&mut workspace, replacement);
 
@@ -98,8 +106,8 @@ fn serial_journal_keeps_masked_output_across_a_same_device_reconnect() {
             .unwrap();
         assert_ne!(other, replacement);
         wait(|| capture.done().is_closed());
-        other_peer.write_all(b"OTHER_PORT_ONLY\r\n").unwrap();
-        wait_for_text(&workspace.sessions[&other].session, "OTHER_PORT_ONLY");
+        other_peer.write_all(b"OTHER PORT ONLY\r\n").unwrap();
+        wait_for_text(&workspace.sessions[&other].session, "OTHER PORT ONLY");
 
         let page = ViewerSource::capture(&capture)
             .capture_page(None, None, None)
@@ -114,11 +122,12 @@ fn serial_journal_keeps_masked_output_across_a_same_device_reconnect() {
             records,
             [
                 (CaptureKind::Note, "isolation: none"),
-                (CaptureKind::Output, "SERIAL_MASKED before"),
+                (CaptureKind::Output, "SERIAL MASKED BEFORE"),
                 (CaptureKind::Note, "session reconnected"),
                 (CaptureKind::Note, "isolation: none"),
-                (CaptureKind::Output, "SERIAL_MASKED after"),
+                (CaptureKind::Output, "SERIAL MASKED AFTER"),
             ],
+            "{profile:?}, required={required}",
         );
         workspace.stop_session(other);
         let _ = workspace.reconcile_journal_sources();

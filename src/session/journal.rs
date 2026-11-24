@@ -154,7 +154,6 @@ impl Actor {
         let secrets = self
             .secrets
             .as_ref()
-            .filter(|_| terminal.supports_journal_output())
             .ok_or_else(|| io::Error::other("Session journal capture is unavailable."))?;
         if self.active.is_some() {
             return Err(io::Error::other(
