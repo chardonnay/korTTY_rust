@@ -1066,3 +1066,20 @@ fn number<T: std::str::FromStr>(node: Node<'_, '_>, field: &str) -> io::Result<O
         })
         .transpose()
 }
+
+#[cfg(test)]
+mod journal_rotation_tests {
+    use super::*;
+
+    #[test]
+    fn journal_rotation_import_accepts_the_java_editor_limits() {
+        let xml = roxmltree::Document::parse(
+            "<settings><sessionJournalConfig><maxLogSizeMB>1000</maxLogSizeMB>\
+             <maxLogParts>500</maxLogParts></sessionJournalConfig></settings>",
+        )
+        .unwrap();
+        let config = journal_config(xml.root_element()).unwrap();
+        assert_eq!(config.max_log_size_mib, 1000);
+        assert_eq!(config.max_log_parts, 500);
+    }
+}

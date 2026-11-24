@@ -208,7 +208,7 @@ For the operation check, start a recording with the allowed local image profile,
 
 With journal AI enabled, **Translate** translates a note in the live journal, the entry editor, or the screenshot editor. It uses the **Text and translation** profile or the default AI profile. A configuration without either assignment can still use the local journal profile. Saved HTTPS and CLI profiles show the exact masked input and destination for one approval. The worker rechecks the saved profile, masking policy and journal source before dispatch and before returning the translation. The target language is saved for the next translation. **Undo translation** or Cmd/Ctrl+Z in the note field restores the previous text. Only **Add** or **Save** adopts the draft into the journal. `bash scripts/with-scratch.sh cargo test --offline --locked -p kortty --bin kortty -- journal_note_translation journal_note_outbound_cli translation_stays translation_preserves` checks profile selection, source changes, the loopback request, the exact CLI payload and delayed responses.
 
-A single unprotected Markdown journal is saved as `.md` with a `-files` folder for attachments. An HTML bundle contains `journal.html`, `journal.xml`, decompressed capture logs, and the associated PNG files. Filtered HTML bundles include only the selected entries and the capture lines within their sequence ranges and time windows. `journal.html` works offline in the browser after extraction. Search, marker and time jumps, as well as the embedded capture preview, are part of the export file. A separate storage limit applies to the preview. The capture files are additionally included in full for the selected export range. If the output exceeds 128 MiB or 4,096 files, the export is aborted.
+A single unprotected Markdown journal is saved as `.md` with a `-files` folder for attachments. An HTML bundle contains `journal.html`, `journal.xml`, decompressed capture logs, and the associated PNG files. Filtered HTML bundles include only the selected entries and the capture lines within their sequence ranges and time windows. `journal.html` works offline in the browser after extraction. Search, marker and time jumps, as well as the embedded capture preview, are part of the export file. The preview has its own storage limit. HTML bundles include the full log files for the selected export range and stream them into the archive. Markdown and PDF exports have a batch limit of 128 MiB or 4,096 files.
 
 A single PDF uses A4 pages, embedded Noto fonts, and selectable text. Screenshots appear directly in the document. Optional chat histories begin in the appendix and are accessible via PDF bookmarks. **Configuration → Global Settings → Export** configures the footer for all three journal formats and the optional watermark for PDF. The watermark color can be set as `#RRGGBB`.
 
@@ -265,7 +265,9 @@ Saved SSH, local-shell and serial profiles expose **Session journal** settings.
 **Capture typed commands at recognized shell prompts** starts with the next
 shell-integration prompt and records confirmed physical input. Paste, mirrored
 input, password prompts and partial commands already in progress are excluded.
-Capture-log part sizes and counts are bounded, and managed limits remain effective.
+Capture-log parts can be up to 1,000 MiB each. The profile editor offers up
+to 500 parts by default. A managed policy can set the part count limit
+within the native reader's 1,000-part bound.
 
 An administrator can set `[rule.session-journal] enforced = true` to start
 the journal automatically and lock the stop action on supported terminal

@@ -430,7 +430,7 @@ impl<'a> Encryption<'a> {
 
     fn write_named(
         self,
-        payload: &[u8],
+        payload: impl Read,
         output: impl Write,
         name: &str,
         armor: Option<ArmorOptions<'_>>,
@@ -499,6 +499,16 @@ pub(crate) fn encrypt_saved_payload(
     root: &Path,
     recipient: &Choice,
     payload: &[u8],
+    output: impl Write,
+    name: &str,
+) -> io::Result<()> {
+    encrypt_saved_reader(root, recipient, payload, output, name)
+}
+
+pub(crate) fn encrypt_saved_reader(
+    root: &Path,
+    recipient: &Choice,
+    payload: impl Read,
     output: impl Write,
     name: &str,
 ) -> io::Result<()> {
@@ -636,7 +646,7 @@ fn is_aes(cipher: SymmetricKeyAlgorithm) -> bool {
 
 fn encrypt(
     key: &impl EncryptionKey,
-    payload: &[u8],
+    payload: impl Read,
     output: impl Write,
     mut rng: StdRng,
     cipher: SymmetricKeyAlgorithm,

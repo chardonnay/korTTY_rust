@@ -4,8 +4,12 @@ use std::io;
 
 use serde::{Deserialize, Serialize};
 
-pub(crate) const MAX_PART_MIB: u16 = 120;
-pub(crate) const MAX_PARTS: u16 = 64;
+pub(crate) const MAX_PART_MIB: u16 = 1000;
+pub(crate) const DEFAULT_PART_LIMIT: u16 = 500;
+pub(crate) const MAX_PARTS: u16 = 1000;
+pub(super) const RETAINED_TAIL_BYTES: u64 = 1024 * 1024;
+// Allow the writer's retained tail and the framing overhead of compressed parts.
+pub(super) const MAX_STORED_PART_BYTES: u64 = (MAX_PART_MIB as u64 + 8) * 1024 * 1024;
 pub(crate) const MAX_SUMMARY_MINUTES: u16 = 1440;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

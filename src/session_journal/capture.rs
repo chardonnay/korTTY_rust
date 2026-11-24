@@ -30,9 +30,9 @@ pub(super) mod retrieval;
 use live_archive::ArchiveReader;
 pub(super) use live_archive::{LiveArchive, LiveArchives};
 
-const MAX_PARTS: u32 = 1000;
+const MAX_PARTS: u32 = super::connection::MAX_PARTS as u32;
 const MAX_DIRECTORY_NAMES: usize = 4096;
-const MAX_PART_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_PART_BYTES: u64 = super::connection::MAX_STORED_PART_BYTES;
 pub(super) const MAX_CAPTURE_BYTES: u64 = MAX_PARTS as u64 * MAX_PART_BYTES;
 // The Java writer uses zstd-jni setLong(27), even for small closed parts.
 const MAX_JAVA_ZSTD_WINDOW_BYTES: u64 = 1 << 27;

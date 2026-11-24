@@ -505,6 +505,9 @@ mod tests {
             assert_eq!(policy.journal_max_log_parts(), Some(3));
         }
         let mut policy = Policy::default();
+        policy.read_rule(rule("750").as_table())?;
+        assert_eq!(policy.journal_max_log_parts(), Some(750));
+        let mut policy = Policy::default();
         policy.read_rule(rule("9223372036854775807").as_table())?;
         assert_eq!(
             policy.journal_max_log_parts(),

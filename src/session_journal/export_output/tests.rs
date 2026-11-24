@@ -334,6 +334,89 @@ fn journal_export_html_bundle_is_always_an_archive_with_unique_per_journal_paths
 }
 
 #[test]
+fn large_java_rotation_part_is_searchable_replaceable_and_exportable() {
+    use crate::session_journal::{capture, open_document, replace};
+
+    const HEADER: &str =
+        "{\"type\":\"meta\",\"formatVersion\":1,\"journalId\":\"one\",\"part\":1}\n";
+    const ROW: &str =
+        "{\"seq\":1,\"t\":\"2026-11-06T10:00:01Z\",\"k\":\"out\",\"x\":\"late-original-marker\"}\n";
+    const FOOTER: &str = "{\"type\":\"end\"}\n";
+    const LINES: u64 = 2050;
+    let fixture = Fixture::new();
+    fixture.seed("one", "Large rotated capture");
+    let directory = fixture.root.join("one");
+    let part = fs::File::create(directory.join("session-log.json.gz")).unwrap();
+    let mut encoded = flate2::write::GzEncoder::new(part, flate2::Compression::fast());
+    let mut line = vec![b' '; 64 * 1024];
+    *line.last_mut().unwrap() = b'\n';
+    encoded.write_all(HEADER.as_bytes()).unwrap();
+    for _ in 0..LINES {
+        encoded.write_all(&line).unwrap();
+    }
+    encoded.write_all(ROW.as_bytes()).unwrap();
+    encoded.write_all(FOOTER.as_bytes()).unwrap();
+    encoded.finish().unwrap();
+    let prefix = HEADER.len() as u64 + LINES * line.len() as u64;
+    assert!(prefix > 128 * 1024 * 1024);
+
+    let source = open_document(&directory).unwrap();
+    let mut budget = capture::MAX_CAPTURE_BYTES;
+    let matched = capture::content_match(
+        &source,
+        "one",
+        1,
+        "late-original-marker",
+        &mut budget,
+        &|| false,
+    )
+    .unwrap();
+    assert!(matched.found && !matched.partial);
+    drop(source);
+
+    let journal = Directory::open(&directory, false).unwrap();
+    let source =
+        crate::session_journal::viewer::Source::from_open_directory(&directory, "one", &journal)
+            .unwrap();
+    let rule = replace::Rule::compile("late-original-marker", "late-reviewed-marker", false, false)
+        .unwrap();
+    let reviewed = replace::preview(&source, rule, true, false, || false).unwrap();
+    assert_eq!(reviewed.counts().records, 1);
+    assert_eq!(replace::apply(&reviewed).unwrap().counts.records, 1);
+
+    let report = publish(
+        &fixture.destination("large.zip"),
+        1,
+        [fixture.input_for("one", Format::HtmlBundle)],
+        Request {
+            format: Format::HtmlBundle,
+            options: &Options::default(),
+            protection: &Protection::None,
+            links_allowed: false,
+            topic_ai: None,
+        },
+        &|| false,
+    )
+    .unwrap();
+    assert_eq!(report.incomplete_capture_journals, 0);
+    let mut archive = ZipArchive::new(fs::File::open(report.path).unwrap()).unwrap();
+    let mut capture = archive.by_name("session-log.json").unwrap();
+    assert_eq!(
+        io::copy(&mut (&mut capture).take(prefix), &mut io::sink()).unwrap(),
+        prefix
+    );
+    let mut tail = String::new();
+    capture.read_to_string(&mut tail).unwrap();
+    assert_eq!(
+        tail,
+        format!(
+            "{}{FOOTER}",
+            ROW.replace("late-original-marker", "late-reviewed-marker")
+        )
+    );
+}
+
+#[test]
 fn journal_export_single_markdown_publishes_sibling_assets_and_rolls_back_conflicts() {
     let fixture = Fixture::new();
     let png = fixture.seed("one", "Sample journal");
@@ -644,17 +727,41 @@ fn journal_export_openpgp_encrypts_whole_zip_and_rejects_a_stale_recipient_choic
         .unwrap();
     assert!(message.as_data_vec().unwrap().starts_with(b"%PDF-"));
 
-    Action::Save(
-        store,
-        Change {
-            previous: Some(recipient),
-            name: "Updated recipient".into(),
-            fingerprint,
-            certificate: None,
+    let reviews = std::cell::Cell::new(0);
+    let result = publish_reviewed(
+        &fixture.destination("changed.zip.gpg"),
+        1,
+        [fixture.input_for("one", Format::HtmlBundle)],
+        Request {
+            format: Format::HtmlBundle,
+            options: &Options::default(),
+            protection: &protection,
+            links_allowed: false,
+            topic_ai: None,
         },
-    )
-    .run()
-    .unwrap();
+        &|| false,
+        &|| {
+            let review = reviews.get() + 1;
+            reviews.set(review);
+            if review == 2 {
+                Action::Save(
+                    store.clone(),
+                    Change {
+                        previous: Some(recipient.clone()),
+                        name: "Updated recipient".into(),
+                        fingerprint: fingerprint.clone(),
+                        certificate: None,
+                    },
+                )
+                .run()
+                .unwrap();
+            }
+            Ok(())
+        },
+    );
+    assert!(result.is_err());
+    assert_eq!(reviews.get(), 2);
+    assert!(!fixture.output.join("changed.zip.gpg").exists());
     let stale = fixture.destination("stale.zip.gpg");
     assert!(
         publish(

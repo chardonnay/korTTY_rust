@@ -177,18 +177,15 @@ uses one row with an overflow menu and a separate position counter and
 arrow controls. Ctrl+Tab, Ctrl+Shift+Tab and Ctrl+Page Up or Down step
 through the tabs from the editor. Compare the compact and wide variants
 on the native desktops at the same font scale as the Java reference.
-Resolve the Journal rotation difference. The Java editor allows 1,000 MiB
-per part and 500 parts by default. Rust limits these to 120 MiB and 64
-parts. Update the editor and Java XML limits together with the writer and
-reader. [Capture replacement streams log parts into its verified private
-stage](PORTING-PARITY.md#november-24-streaming-journal-replacement).
-[Filtered and unfiltered HTML bundle exports](PORTING-PARITY.md#november-24-streaming-html-journal-bundles)
-stream log parts into the private ZIP stage. Align the raw, decoded, staged,
-and archive byte budgets with the larger log parts. The HTML bundle
-currently shares the 128 MiB batch archive limit. Java's compressor uses
-a 128 MiB Zstandard window, which the native reader already supports.
-Verify rotated plain and compressed journals and preserve cancellation
-and file identity checks.
+The [Journal rotation update](PORTING-PARITY.md#november-24-java-journal-rotation-limits)
+matches Java's 1,000 MiB part size and default editor ceiling of 500 parts.
+The native reader and managed policy support up to 1,000 parts. Java's
+editor can use managed ceilings above that bound. The reader, search,
+[replacement](PORTING-PARITY.md#november-24-streaming-journal-replacement),
+and [HTML bundle](PORTING-PARITY.md#november-24-streaming-html-journal-bundles)
+use the larger part budgets. OpenPGP HTML bundles stream the ZIP directly
+into encryption. Verify the rotation settings in native desktop editors,
+including managed values and the interaction with reconnect.
 The Manager's separate
 Teamwork sidebar group and editor form alignment remain open. The earlier
 Windows desktop check covered the three-pane Manager, its Map view, opening
@@ -2501,7 +2498,7 @@ See [Scheduler screenshots and local vision](PORTING-PARITY.md#scheduler-screens
 
 | ID | State and implemented coverage | Remaining work |
 | --- | --- | --- |
-| J1 | Implementation and acceptance. Per-connection automatic capture, opt-in typed input, XML settings, raw evidence, screenshots, redaction and retention exist. Managed policy can require automatic capture and lock manual stop. Apple Silicon verified private SSH capture against pinned OpenSSH. | Compare the rotation bounds and reconnect lifecycle against Java. Verify native input-off/on, imported omitted/explicit values, command boundaries, duplicate/import/export and restart. Exercise the managed control on native desktops and repeat the SSH case on the remaining native platforms. Preserve screenshot consent and the native typed-input privacy default. |
+| J1 | Implementation and acceptance. Per-connection automatic capture, opt-in typed input, XML settings, raw evidence, screenshots, redaction and retention exist. Managed policy can require automatic capture and lock manual stop. Apple Silicon verified private SSH capture against pinned OpenSSH. The editor, XML import and capture pipeline support Java's normal rotation bounds. | Verify managed limits on native desktops and audit values above the native 1,000-part limit. Compare the reconnect lifecycle against Java. Verify native input-off/on, imported omitted/explicit values, command boundaries, duplicate/import/export and restart. Repeat the SSH case on the remaining native platforms. Preserve screenshot consent and the native typed-input privacy default. |
 | J2 | Acceptance. Local/managed periodic and closing summaries, durable catch-up, re-evaluation, backfill and screenshot re-description exist. Command cards, help and failed-start filtering, the reviewed long-output mode, classified command counts in journal metadata, startup finalization of abandoned native interactive journals, reopenable progress details, and row/group status badges are implemented. F1 binds the HTTPS credential at preflight, streaming and retry. Reviewed HTTPS and CLI approvals bind the profile revision, journal root, source identity, redaction rules and output mode. OpenAI-compatible HTTPS summaries support server-selected models through the same approval checks. Live, entry and screenshot note editors offer separate reviewed HTTPS and CLI translation. The native journal viewer and compatible browsers for HTML bundles have a 40-pixel scrollbar thumb minimum. R `src/session_journal/summary_job.rs`, `src/workspace/journal_access/summaries.rs`. | Verify native close and count recovery, scheduling, cancellation, restart, pending deletion and configured HTTPS and CLI providers. Verify local vision, per-connection overrides, desktop progress lifecycle and native scrollbar dragging. |
 | J3 | Acceptance. Reviewed local, HTTPS and CLI Q&A, lexical cross-journal search, reciprocal-rank fusion and exact capture/entry/chat citations exist. Saved HTTP loopback and reviewed OpenAI-compatible HTTPS profiles, including eligible loopback HTTPS, can use server-selected models for Q&A. F1 passes the reviewed HTTPS credential through question dispatch. Each question requires approval of the exact masked evidence and destination. The viewer and manager preselect an eligible saved HTTPS Journal role. Without a dedicated role, the global HTTPS default is used when no configured local answer takes precedence. Recording and Scheduler retain their separate summary approvals. Separately reviewed local semantic ranking reuses a private per-journal vector for the exact document, masked card and model. Stale and unavailable cache entries use fresh reviewed embeddings or lexical fallback. | Verify native citation routing, stale-source/policy rejection, recorded chats and configured providers. The CLI route uses one approved invocation and validates exact quotations from the reviewed evidence. The semantic scope follows the reviewed candidate shortlist. J `core/SessionJournalAskService.java`, `core/SessionJournalSemanticIndex.java`, R `src/session_journal/question/rank.rs`. |
 

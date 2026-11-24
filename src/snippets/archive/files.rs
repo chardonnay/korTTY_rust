@@ -21,7 +21,8 @@ mod openpgp;
 pub(crate) use layout::{AnalysisFile, analysis_files};
 pub(crate) use openpgp::{
     CertificateInfo, MAX_CERTIFICATE_BYTES, encrypt_profile_zip, encrypt_saved_payload,
-    enroll_certificate, inspect_certificate, normalize_fingerprint, validate_backup_certificate,
+    encrypt_saved_reader, enroll_certificate, inspect_certificate, normalize_fingerprint,
+    validate_backup_certificate,
 };
 
 #[derive(Clone, Copy)]

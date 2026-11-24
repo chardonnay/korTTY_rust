@@ -9,7 +9,10 @@ use roxmltree::Node;
 
 use crate::private_files::Directory;
 
-use super::super::capture::bundle::{self as capture, MemberData, WriteMember};
+use super::super::capture::{
+    MAX_CAPTURE_BYTES,
+    bundle::{self as capture, MemberData, WriteMember},
+};
 use super::super::viewer::screenshot::open_published_image;
 use super::super::{DOCUMENT, MAX_PNG_BYTES};
 use super::{
@@ -20,7 +23,6 @@ use super::{
 mod html;
 mod xml;
 
-const MAX_CAPTURE_INPUT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_SCREENSHOT_REFERENCES: usize = 4096;
 const MAX_INLINE_PNG_BYTES: usize = 24 * 1024 * 1024;
 
@@ -115,7 +117,7 @@ impl Selection<'_> {
             matches_time: &matches_time,
         });
         let mut log = html::LogPreview::new(selected);
-        let mut capture_budget = MAX_CAPTURE_INPUT_BYTES;
+        let mut capture_budget = MAX_CAPTURE_BYTES;
         let captured = capture::export(
             &source,
             id,

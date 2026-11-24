@@ -2,7 +2,8 @@ use iced::widget::{checkbox, column, row, rule, text, text_input};
 use iced::{Alignment, Element, Length};
 
 use crate::session_journal::{
-    ConnectionConfig, MAX_CONNECTION_JOURNAL_PARTS, MAX_PART_MIB, MAX_SUMMARY_MINUTES,
+    ConnectionConfig, DEFAULT_PART_LIMIT, MAX_CONNECTION_JOURNAL_PARTS, MAX_PART_MIB,
+    MAX_SUMMARY_MINUTES,
 };
 
 #[derive(Clone, Debug)]
@@ -57,8 +58,8 @@ impl Draft {
             Edit::Input(enabled) => self.settings.capture_input = enabled,
             Edit::Summaries(enabled) => self.settings.ai_summaries = enabled,
             Edit::Interval(value) => self.interval = value.chars().take(4).collect(),
-            Edit::PartSize(value) => self.part_size = value.chars().take(3).collect(),
-            Edit::Parts(value) => self.parts = value.chars().take(2).collect(),
+            Edit::PartSize(value) => self.part_size = value.chars().take(4).collect(),
+            Edit::Parts(value) => self.parts = value.chars().take(4).collect(),
         }
     }
 
@@ -89,13 +90,14 @@ impl Draft {
     }
 
     pub(super) fn view(&self, policy: Policy) -> Element<'_, Edit> {
-        let clamp = move |value: String| match (value.parse::<u16>(), policy.max_parts) {
-            (Ok(parts), Some(cap)) if parts > cap => cap.to_string(),
+        let part_limit = policy.max_parts.unwrap_or(DEFAULT_PART_LIMIT);
+        let clamp = move |value: String| match value.parse::<u16>() {
+            Ok(parts) if parts > part_limit => part_limit.to_string(),
             _ => value,
         };
         let parts = clamp(self.parts.clone());
         let label = policy.max_parts.map_or_else(
-            || "Maximum capture-log parts".into(),
+            || format!("Maximum capture-log parts (up to {part_limit})"),
             |cap| format!("Maximum capture-log parts (managed limit {cap})"),
         );
         let summaries_allowed = policy.allowed && policy.summaries_allowed;
@@ -150,5 +152,22 @@ impl Draft {
         ]
         .spacing(10)
         .into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn journal_rotation_editor_keeps_java_sized_values() {
+        let mut draft = Draft::new(ConnectionConfig::default());
+        draft.update(Edit::PartSize("1000".into()));
+        draft.update(Edit::Parts("500".into()));
+        let config = draft.value().unwrap();
+        assert_eq!(config.max_log_size_mib, 1000);
+        assert_eq!(config.max_log_parts, 500);
+        draft.update(Edit::PartSize("1001".into()));
+        assert!(draft.value().is_err());
     }
 }

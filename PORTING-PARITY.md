@@ -1247,6 +1247,34 @@ passes, and archive publication with encryption.
 [Apple Silicon verification](target/verification/20261124-journal-bundle-streaming-macos-verified.log)
 · [Windows ARM64 verification](target/verification/20261124-journal-bundle-streaming-windows.log)
 
+## November 24 Java journal rotation limits
+
+The connection editor and XML import support 1,000 MiB per capture part
+and the Java editor's regular ceiling of 500 parts. The managed policy
+can set a different limit within the native reader's 1,000-part bound.
+The capture reader allows the writer's retained tail and compression
+overhead above the configured size. Search, replacement and HTML export
+use corresponding cumulative byte limits with bounded buffers. The Java
+Zstandard window remains 128 MiB.
+
+The HTML bundle uses its own archive budget. OpenPGP HTML exports connect
+ZIP creation to encryption through a small in-memory queue. The output
+remains staged until writing and encryption finish and the selected recipient
+and destination are checked again. Markdown and PDF use their existing
+batch budget.
+[Tagged Java editor](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ConnectionEditDialog.java)
+· [Native configuration](src/session_journal/connection.rs)
+· [Archive publication](src/session_journal/export_output.rs)
+
+Windows ARM64 and Apple Silicon each passed 22 focused tests. Apple
+Silicon also passed strict application and test-target Clippy. One test
+finds and replaces a record past the previous 128 MiB boundary in a decoded
+gzip part, then checks that record in the published HTML ZIP. The OpenPGP
+test decrypts the streamed ZIP and verifies that a recipient changed before
+publication leaves no export.
+[Apple Silicon verification](target/verification/20261124-journal-rotation-macos-final.log)
+· [Windows ARM64 verification](target/verification/20261124-journal-rotation-windows-verified.log)
+
 ## November 23 GGUF Configure sizing
 
 Java sizes the Configure grid to its path label. Rust now measures the

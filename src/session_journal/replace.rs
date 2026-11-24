@@ -7,7 +7,10 @@ use std::io::{self, Write};
 
 use crate::private_files::{Directory, EntryIdentity, FileStamp, nonce};
 
-use super::capture::replacement::{Request, inventory};
+use super::capture::{
+    MAX_CAPTURE_BYTES,
+    replacement::{Request, inventory},
+};
 use super::entry_edit::lock_source;
 use super::metadata::require_single_link;
 use super::viewer::Source;
@@ -18,8 +21,8 @@ mod xml;
 
 pub(crate) use rule::{MAX_RULE_BYTES, Rule};
 
-const MAX_CAPTURE_IO: u64 = 512 * 1024 * 1024;
-const MAX_STAGED_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_CAPTURE_IO: u64 = 2 * MAX_CAPTURE_BYTES;
+const MAX_STAGED_BYTES: u64 = MAX_CAPTURE_BYTES + super::MAX_DOCUMENT_BYTES;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct Counts {
