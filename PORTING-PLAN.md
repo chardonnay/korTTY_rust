@@ -205,11 +205,10 @@ rotation settings in native desktop editors, including managed values and
 rotation across a reconnect.
 The [Teamwork sidebar update](PORTING-PARITY.md#november-24-connection-manager-teamwork-sidebar)
 places Teamwork after the library, folders and tags, and includes non-incognito
-Teamwork sessions in Open now. The expandable Teamwork branch in the
-results tree, the authentication bar placement within the center pane,
-and the remaining editor form alignment still need work.
-Compare the Manager and its sidebar on macOS and Linux at the Java
-reference scale.
+Teamwork sessions in Open now. The [Teamwork results tree](PORTING-PARITY.md#november-24-connection-manager-teamwork-tree)
+adds expandable read-only folders and keeps the authentication controls
+inside the center pane. Continue the remaining form alignment and compare
+the Manager on macOS and Linux at the Java reference scale.
 
 The AI Manager now uses the Java window size, a search overlay, underlined
 primary tabs and General subpages. The profile form retains its four

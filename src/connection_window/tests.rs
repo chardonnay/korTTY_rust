@@ -620,7 +620,11 @@ fn teamwork_favorites_toggle_mixed_selection_and_filter_the_map_and_pdf() {
     let _ = manager.update(Message::Scope(Scope::Favorites));
     assert_eq!(
         manager.visible_row_keys(),
-        [RowKey::Connection(local), primary_row.clone()]
+        [
+            RowKey::Connection(local),
+            RowKey::SharedGroup(String::new()),
+            primary_row.clone()
+        ]
     );
     let _ = manager.update(Message::MapView(true));
     let snapshot = manager.map_pdf_snapshot().unwrap();
@@ -695,7 +699,11 @@ fn teamwork_hide_confirms_separately_and_excludes_hidden_rows_from_every_scope()
     let _ = manager.update(Message::Scope(Scope::Open));
     assert_eq!(
         manager.visible_row_keys(),
-        [RowKey::Connection(local), shared.clone()]
+        [
+            RowKey::Connection(local),
+            RowKey::SharedGroup(String::new()),
+            shared.clone()
+        ]
     );
     let _ = manager.update(Message::Scope(Scope::All));
     assert!(!manager.can_restore_teamwork());
@@ -829,7 +837,11 @@ fn teamwork_recency_shares_the_combined_cutoff_order_and_search_with_map_pdf() {
     let mut manager = ConnectionWindow::open(profile.path()).unwrap();
     manager.set_teamwork(catalog.clone(), None);
     let _ = manager.update(Message::Scope(Scope::Recent));
-    let rows = manager.visible_row_keys();
+    let rows: Vec<_> = manager
+        .recent_entries()
+        .iter()
+        .map(selection::VisualRow::key)
+        .collect();
     assert_eq!(rows.len(), RECENT_LIMIT);
     assert_eq!(
         rows[..4],
@@ -842,6 +854,10 @@ fn teamwork_recency_shares_the_combined_cutoff_order_and_search_with_map_pdf() {
     );
     assert!(!rows.contains(&outside));
     assert!(!rows.contains(&row("Never used")));
+    let visible = manager.visible_row_keys();
+    assert_eq!(visible.len(), RECENT_LIMIT + 1);
+    assert!(visible.contains(&RowKey::SharedGroup(String::new())));
+    assert!(rows.iter().all(|row| visible.contains(row)));
 
     let _ = manager.update(Message::MapView(true));
     let snapshot = manager.map_pdf_snapshot().unwrap();
@@ -865,6 +881,86 @@ fn teamwork_recency_shares_the_combined_cutoff_order_and_search_with_map_pdf() {
             .collect::<Vec<_>>(),
         [local, serial]
     );
+}
+
+#[test]
+fn teamwork_tree_collapses_read_only_folders_and_reveals_matching_routes() {
+    let profile = Profile::new();
+    let source = profile.0.join("shared.xml");
+    let xml = r#"<connections>
+        <connection id="root"><name>Root host</name><host>root.example</host>
+          <username>fixture</username></connection>
+        <connection id="direct"><name>Direct host</name><host>direct.example</host>
+          <username>fixture</username><group>OPS</group></connection>
+        <connection id="nested"><name>Nested host</name><host>nested.example</host>
+          <username>fixture</username><group>Ops/West</group></connection>
+        </connections>"#;
+    fs::write(&source, xml).unwrap();
+    let settings = teamwork::Settings {
+        sources: vec![teamwork::Source {
+            location: source.to_str().unwrap().into(),
+            enabled: true,
+            kind: teamwork::SourceKind::File,
+            check_interval_minutes: teamwork::DEFAULT_CHECK_INTERVAL_MINUTES,
+        }],
+        ..Default::default()
+    };
+    let catalog =
+        teamwork::Catalog::default().refreshed(&settings.active_sources(true, &[]).unwrap());
+    let identity = |id| {
+        catalog
+            .entries()
+            .find(|entry| entry.identity().external_id() == id)
+            .unwrap()
+            .identity()
+            .clone()
+    };
+    let nested = identity("nested");
+    let direct = RowKey::Shared(identity("direct"));
+    let ungrouped = RowKey::Shared(identity("root"));
+    let branch = RowKey::SharedGroup(String::new());
+    let ops = RowKey::SharedGroup("ops".into());
+    let west = RowKey::SharedGroup("ops/west".into());
+    let leaf = RowKey::Shared(nested.clone());
+    let mut manager = ConnectionWindow::open(profile.path()).unwrap();
+    manager.set_teamwork(catalog, None);
+    assert_eq!(
+        manager.visible_row_keys(),
+        [
+            branch.clone(),
+            ops.clone(),
+            west.clone(),
+            leaf.clone(),
+            direct,
+            ungrouped
+        ]
+    );
+
+    let _ = manager.update(Message::SelectShared(nested.clone()));
+    let _ = manager.update(Message::ToggleSharedGroup("ops".into()));
+    assert!(manager.selected_shared().is_none());
+    assert!(!manager.visible_row_keys().contains(&west));
+    let _ = manager.update(Message::OpenTreeContext(ops.clone(), Point::ORIGIN));
+    assert!(manager.selection.contains(&ops));
+    assert!(manager.active_group().is_none());
+
+    let _ = manager.update(Message::ToggleSharedGroup(String::new()));
+    assert_eq!(manager.visible_row_keys(), std::slice::from_ref(&branch));
+    let _ = manager.update(Message::MapView(true));
+    assert_eq!(manager.map_pdf_snapshot().unwrap().connection_count, 3);
+    let _ = manager.update(Message::MapSelect(leaf.clone()));
+    let _ = manager.update(Message::MapView(false));
+    assert_eq!(manager.selected_shared().unwrap().identity(), &nested);
+    assert!(manager.visible_row_keys().contains(&west));
+
+    let _ = manager.update(Message::ToggleSharedGroup("ops".into()));
+    let _ = manager.update(Message::Search("nested.example".into()));
+    assert_eq!(
+        manager.visible_row_keys(),
+        [branch, ops.clone(), west.clone(), leaf.clone()]
+    );
+    let _ = manager.update(Message::Scope(Scope::Teamwork));
+    assert_eq!(manager.visible_row_keys(), [ops, west, leaf]);
 }
 
 #[test]
@@ -1744,9 +1840,16 @@ fn native_workbench_keeps_reference_side_widths_at_default_and_minimum_size() {
     use iced::{Font, Renderer, Size};
 
     let profile = Profile::new();
-    let window = ConnectionWindow::open(profile.path()).unwrap();
+    let mut window = ConnectionWindow::open(profile.path()).unwrap();
+    window.set_teamwork_auth(Some(teamwork::DefaultAuth::Ordered(Default::default())));
     let renderer = Renderer::new(Font::DEFAULT, 16.0.into());
-    for width in [1240.0, 940.0] {
+    let mut workbench_y = 0.0;
+    for (width, height, scope) in [
+        (1240.0, 760.0, Scope::All),
+        (940.0, 520.0, Scope::All),
+        (940.0, 520.0, Scope::Teamwork),
+    ] {
+        let _ = window.update(Message::Scope(scope.clone()));
         let mut view = window.view(ViewChoices {
             temporary_keys: false,
             vault_unlocked: false,
@@ -1772,7 +1875,7 @@ fn native_workbench_keeps_reference_side_widths_at_default_and_minimum_size() {
         let layout = view.as_widget_mut().layout(
             &mut tree,
             &renderer,
-            &layout::Limits::new(Size::ZERO, Size::new(width, 760.0)),
+            &layout::Limits::new(Size::ZERO, Size::new(width, height)),
         );
         let layout = Layout::new(&layout);
         let workbench = layout.children().nth(2).unwrap();
@@ -1783,6 +1886,22 @@ fn native_workbench_keeps_reference_side_widths_at_default_and_minimum_size() {
         assert_eq!(workbench.bounds().x, 12.0);
         assert_eq!(workbench.bounds().width, width - 24.0);
         assert_eq!(widths, [210.0, 4.0, width - 612.0, 4.0, 370.0]);
+        if scope == Scope::Teamwork {
+            assert_eq!(workbench.bounds().y, workbench_y);
+            let center = workbench.children().nth(2).unwrap();
+            let body = center.children().next().unwrap();
+            let sections: Vec<_> = body.children().map(|child| child.bounds()).collect();
+            assert_eq!(sections.len(), 3);
+            let [header, auth, list] = sections.as_slice() else {
+                unreachable!()
+            };
+            assert!(auth.x >= center.bounds().x);
+            assert!(auth.x + auth.width <= center.bounds().x + center.bounds().width);
+            assert!(auth.y >= header.y + header.height && auth.height <= 200.0);
+            assert!(list.y >= auth.y + auth.height && list.height >= 100.0);
+        } else {
+            workbench_y = workbench.bounds().y;
+        }
     }
 }
 

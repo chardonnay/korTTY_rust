@@ -1208,6 +1208,38 @@ cover the Teamwork sidebar action, folder drops, hidden entries in Open
 now, and removal from Open now when the last non-incognito tab closes.
 [Apple Silicon verification](target/verification/20261124-connection-manager-teamwork-macos-native.log)
 
+## November 24 Connection Manager Teamwork tree
+
+The general views append a Teamwork branch with nested read-only folders
+and descendant counts. The dedicated Teamwork view starts at the shared
+folders and individual root connections. Folder names match case-insensitively.
+Search rebuilds the matching paths. A connection selected on the map
+reveals its path when returning to the list. Shared folders have no local
+folder actions or drop targets. In Recently used, the combined recency
+cutoff is applied before building the Teamwork branch.
+[Tagged Java tree](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ConnectionManagerTreeView.java#L236)
+· [Rust tree and selection](src/connection_window/selection.rs)
+
+Teamwork authentication sits below the center heading in the list and map
+views. The form can scroll within a bounded height so compact layouts
+leave room for results.
+[Tagged Java dialog](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ConnectionManagerDialog.java#L365)
+· [Rust manager view](src/connection_window/view.rs)
+
+The Windows ARM64 desktop preview showed separate local and shared Ops
+folders. The shared West folder collapsed, and right-clicking it selected
+the folder without opening a local folder menu. After collapsing the whole
+Teamwork branch, selecting Nested monitor on the map and returning to the
+list reopened the branch and its ancestors. The Teamwork scope kept the
+ordered authentication form below the title in both List and Map.
+[Windows ARM64 desktop verification](target/verification/20261124-connection-manager-teamwork-tree-windows-desktop.log)
+
+Apple Silicon passed 50 focused tests and strict Clippy. The compact layout
+test used a 940 by 520 viewport and checked that the ordered authentication
+form stayed in the center pane and left at least 100 logical pixels for the
+list. The tree regression verifies matching search paths after a collapse.
+[Apple Silicon verification](target/verification/20261124-connection-manager-teamwork-tree-macos-retest.log)
+
 ## November 24 SSH connection AI keyboard
 
 The AI page accepts Tab and Shift+Tab between available controls,
@@ -14306,8 +14338,10 @@ The Connection Manager accepts positive `lastUsed` values from Teamwork XML
 as Unix milliseconds. The cache preserves these values for offline use and
 continues to read older snapshots. The Recent scope ranks the combined local
 and shared catalog, takes up to 15 entries, then applies the search. The
-list, range selection, map, and map PDF use that projection. Shared launch
-attempts have no local saved ID and do not update the local recent store.
+list, range selection, map, and map PDF use that set of connections.
+The [Teamwork tree update](#november-24-connection-manager-teamwork-tree)
+groups the eligible shared entries in the list. Shared launch attempts have
+no local saved ID and do not update the local recent store.
 
 An instrumented Fedora X11 run traced premature context-menu dismissal to
 `ConnectionWindow::set_open_counts`. It reconciled the selection even when

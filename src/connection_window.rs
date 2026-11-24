@@ -62,9 +62,11 @@ pub enum Message {
     SaveTeamworkAuth,
     ResetTeamworkAuth,
     SelectGroup(String),
+    SelectSharedGroup(String),
     OpenTreeContext(RowKey, Point),
     TreeContext(tree_context::Message),
     ToggleGroup(String),
+    ToggleSharedGroup(String),
     NewGroup,
     RenameGroup,
     DeleteGroup,
@@ -368,6 +370,7 @@ pub struct ConnectionWindow {
     network_map: network_map::State,
     folder_moves: folder_moves::History,
     collapsed: BTreeSet<String>,
+    shared_collapsed: BTreeSet<String>,
     open_counts: Option<OpenCounts>,
     draft: Option<Draft>,
     serial_draft: Option<serial::Draft>,
@@ -443,6 +446,7 @@ impl ConnectionWindow {
             network_map: network_map::State::default(),
             folder_moves: folder_moves::History::default(),
             collapsed: BTreeSet::new(),
+            shared_collapsed: BTreeSet::new(),
             open_counts: None,
             store,
             server_access: Default::default(),
@@ -1076,6 +1080,9 @@ impl ConnectionWindow {
 
     fn set_scope(&mut self, scope: Scope) {
         self.badge_picker = None;
+        if self.scope != scope {
+            self.shared_collapsed.clear();
+        }
         if let Scope::Group(path) = &scope {
             self.selection.replace(Some(RowKey::Group(path.clone())));
         } else {
@@ -1158,6 +1165,9 @@ impl ConnectionWindow {
         match message {
             Message::Search(query) if self.can_browse() && query.len() <= 240 => {
                 self.badge_picker = None;
+                if self.query != query {
+                    self.shared_collapsed.clear();
+                }
                 self.query = query;
                 self.reconcile_selection();
             }
@@ -1188,9 +1198,11 @@ impl ConnectionWindow {
                     auth.conflict = false;
                 }
             }
-            Message::MapView(enabled) if self.can_browse() => {
-                self.dismiss_tree_context();
+            Message::MapView(enabled)
+                if self.can_browse() && self.network_map.visible != enabled =>
+            {
                 self.network_map.visible = enabled;
+                self.reconcile_selection();
             }
             Message::MapJumpRoutes(enabled) if self.network_map.visible => {
                 self.network_map.jumps = enabled;
@@ -1224,7 +1236,14 @@ impl ConnectionWindow {
             Message::SelectGroup(path) if self.can_browse() => {
                 self.select_row(RowKey::Group(path));
             }
+            Message::SelectSharedGroup(path) if self.can_browse() => {
+                self.select_row(RowKey::SharedGroup(path));
+            }
             Message::OpenTreeContext(row, point) if self.can_browse() => {
+                if matches!(row, RowKey::SharedGroup(_)) {
+                    self.select_row(row);
+                    return Task::none();
+                }
                 if row == RowKey::Empty && self.scope == Scope::Teamwork {
                     return Task::none();
                 }
@@ -1243,6 +1262,17 @@ impl ConnectionWindow {
                     self.collapsed.insert(path);
                 }
                 self.reconcile_selection();
+            }
+            Message::ToggleSharedGroup(path) if self.can_browse() && !self.network_map.visible => {
+                if self
+                    .visible_row_keys()
+                    .contains(&RowKey::SharedGroup(path.clone()))
+                {
+                    if !self.shared_collapsed.remove(&path) {
+                        self.shared_collapsed.insert(path);
+                    }
+                    self.reconcile_selection();
+                }
             }
             Message::New if self.can_browse() && self.scope != Scope::Teamwork => {
                 self.badge_picker = None;

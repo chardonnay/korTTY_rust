@@ -527,11 +527,6 @@ impl ConnectionWindow {
             .flatten()
             .collect::<Vec<_>>()
             .join(" · ");
-        let teamwork_auth = self
-            .teamwork_auth
-            .as_ref()
-            .filter(|_| self.scope == Scope::Teamwork)
-            .map(|draft| self.teamwork_auth_bar(draft, &choices));
         let footer = row![
             button("Reload")
                 .style(button::text)
@@ -564,7 +559,7 @@ impl ConnectionWindow {
                         .height(Length::Fill)
                         .style(crate::workspace::dialog_design::sidebar),
                     rule::vertical(4),
-                    container(self.results(&zone))
+                    container(self.results(&zone, &choices))
                         .width(Length::Fill)
                         .height(Length::Fill)
                         .style(crate::workspace::dialog_design::page),
@@ -582,7 +577,6 @@ impl ConnectionWindow {
         column![
             self.toolbar(choices.serial_allowed),
             rule::horizontal(1),
-            teamwork_auth,
             panes,
             rule::horizontal(1),
             footer,
@@ -995,7 +989,11 @@ impl ConnectionWindow {
         .into()
     }
 
-    fn results<'a>(&'a self, zone: &DragZone<'a>) -> Element<'a, Message> {
+    fn results<'a>(
+        &'a self,
+        zone: &DragZone<'a>,
+        choices: &ViewChoices<'_>,
+    ) -> Element<'a, Message> {
         let entries = self.visible_entries();
         let count = entries.len();
         let scope = match &self.scope {
@@ -1042,15 +1040,23 @@ impl ConnectionWindow {
         .spacing(10)
         .align_y(Alignment::Center)
         .padding([10, 12]);
+        let mut body = column![header].height(Length::Fill);
+        if self.scope == Scope::Teamwork
+            && let Some(draft) = &self.teamwork_auth
+        {
+            body = body.push(
+                container(
+                    scrollable(self.teamwork_auth_bar(draft, choices)).height(Length::Shrink),
+                )
+                .max_height(200),
+            );
+        }
         if self.network_map.visible {
-            return column![header, self.network_map_view(count)]
-                .height(Length::Fill)
-                .into();
+            return body.push(self.network_map_view(count)).into();
         }
         let rows = self.visible_rows(entries);
         let has_rows = !rows.is_empty();
         let mut list = column![].spacing(1);
-        let mut shared_group = None;
         for entry in rows {
             let (source, folder) = match &entry {
                 VisualRow::Connection(connection, _) => {
@@ -1066,19 +1072,19 @@ impl ConnectionWindow {
                 }
                 VisualRow::Serial(profile, indent) => self.serial_row(profile, indent),
                 VisualRow::Local(profile, indent) => self.local_row(profile, indent),
-                VisualRow::Shared(entry) => {
-                    if self.scope != Scope::Recent && shared_group != Some(&entry.group) {
-                        list = list.push(heading(teamwork::group_title(&entry.group)));
-                        shared_group = Some(&entry.group);
-                    }
-                    self.shared_row(entry)
-                }
+                VisualRow::Shared(entry, indent) => self.shared_row(entry, indent),
                 VisualRow::Group {
                     path,
                     indent,
                     count,
                     collapsed,
                 } => self.group_row(path, indent, count, collapsed),
+                VisualRow::SharedGroup {
+                    path,
+                    indent,
+                    count,
+                    collapsed,
+                } => self.shared_group_row(path, indent, count, collapsed),
             };
             list = list.push(
                 if self.can_move_folders() && (source.is_some() || folder.is_some()) {
@@ -1111,7 +1117,7 @@ impl ConnectionWindow {
         } else {
             self.tree_context_view(&RowKey::Empty, list)
         };
-        column![header, list].height(Length::Fill).into()
+        body.push(list).into()
     }
 
     fn group_row<'a>(
@@ -1393,7 +1399,49 @@ impl ConnectionWindow {
         container(contents).padding(16).width(Length::Fill).into()
     }
 
-    fn shared_row<'a>(&'a self, entry: &'a teamwork::Entry) -> Element<'a, Message> {
+    fn shared_group_row<'a>(
+        &'a self,
+        path: &'a str,
+        indent: usize,
+        count: usize,
+        collapsed: bool,
+    ) -> Element<'a, Message> {
+        let key = path.to_lowercase();
+        let row_key = RowKey::SharedGroup(key.clone());
+        let (icon, label) = if path.is_empty() {
+            (Icon::Teamwork, "Teamwork connections")
+        } else {
+            (Icon::Folder, basename(path))
+        };
+        let base = row![
+            space::horizontal().width((10 + indent * 20) as u32),
+            button(if collapsed { "▸" } else { "▾" })
+                .style(button::text)
+                .padding(2)
+                .on_press_maybe(
+                    self.can_browse()
+                        .then(|| Message::ToggleSharedGroup(key.clone()))
+                ),
+            button(
+                row![
+                    icon.widget(17, true),
+                    text(label).size(15).wrapping(text::Wrapping::None),
+                    text(count.to_string()).size(12).style(text::secondary),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center)
+            )
+            .style(selectable(self.selection.contains(&row_key)))
+            .clip(true)
+            .width(Length::Fill)
+            .on_press_maybe(self.can_browse().then_some(Message::SelectSharedGroup(key))),
+        ]
+        .align_y(Alignment::Center)
+        .into();
+        self.tree_context_view(&row_key, base)
+    }
+
+    fn shared_row<'a>(&'a self, entry: &'a teamwork::Entry, indent: usize) -> Element<'a, Message> {
         let endpoint = &entry.connection.login.endpoint;
         let key = RowKey::Shared(entry.identity.clone());
         let blocked = entry.connection.blocked_server(&self.server_access);
@@ -1417,6 +1465,7 @@ impl ConnectionWindow {
                         .wrapping(text::Wrapping::None),
                 ]
                 .spacing(1),
+                (!entry.connection.tag.is_empty()).then(|| chip(Icon::Tag, &entry.connection.tag)),
                 self.store
                     .is_teamwork_favorite(entry.identity())
                     .then(|| Icon::Star.widget(16, true)),
@@ -1427,7 +1476,12 @@ impl ConnectionWindow {
             .spacing(9),
         )
         .width(Length::Fill)
-        .padding([5, 18])
+        .padding(iced::Padding {
+            top: 5.0,
+            bottom: 5.0,
+            left: 18.0 + indent as f32 * 20.0,
+            right: 18.0,
+        })
         .clip(true)
         .style(selectable(self.selection.contains(&key)))
         .on_press_maybe(

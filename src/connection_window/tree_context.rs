@@ -294,6 +294,7 @@ impl ConnectionWindow {
 
         match page {
             Page::Root => match row {
+                RowKey::SharedGroup(_) => Vec::new(),
                 RowKey::Shared(identity) => {
                     let enabled = self.shared_entry(identity).is_some();
                     let hide = if self.selected_profile_ids().is_empty() {

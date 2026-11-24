@@ -14,6 +14,7 @@ pub enum RowKey {
     Serial(u64),
     Local(u64),
     Group(String),
+    SharedGroup(String),
     Empty,
 }
 
@@ -115,10 +116,16 @@ impl Selection {
 /// A single projection drives both rendering and range selection.
 pub(super) enum VisualRow<'a> {
     Connection(&'a Connection, usize),
-    Shared(&'a teamwork::Entry),
+    Shared(&'a teamwork::Entry, usize),
     Serial(&'a SerialProfile, usize),
     Local(&'a LocalProfile, usize),
     Group {
+        path: &'a str,
+        indent: usize,
+        count: usize,
+        collapsed: bool,
+    },
+    SharedGroup {
         path: &'a str,
         indent: usize,
         count: usize,
@@ -130,10 +137,11 @@ impl VisualRow<'_> {
     pub(super) fn key(&self) -> RowKey {
         match self {
             Self::Connection(connection, _) => RowKey::Connection(connection.id),
-            Self::Shared(entry) => RowKey::Shared(entry.identity.clone()),
+            Self::Shared(entry, _) => RowKey::Shared(entry.identity.clone()),
             Self::Serial(profile, _) => RowKey::Serial(profile.id),
             Self::Local(profile, _) => RowKey::Local(profile.id),
             Self::Group { path, .. } => RowKey::Group((*path).to_owned()),
+            Self::SharedGroup { path, .. } => RowKey::SharedGroup(path.to_lowercase()),
         }
     }
 }
@@ -178,10 +186,13 @@ impl ConnectionWindow {
     }
 
     pub(super) fn visible_row_keys(&self) -> Vec<RowKey> {
-        self.visible_rows(self.visible_entries())
-            .iter()
-            .map(VisualRow::key)
-            .collect()
+        let entries = self.visible_entries();
+        let rows = if self.network_map.visible {
+            entries
+        } else {
+            self.visible_rows(entries)
+        };
+        rows.iter().map(VisualRow::key).collect()
     }
 
     pub(super) fn recent_entries(&self) -> Vec<VisualRow<'_>> {
@@ -197,7 +208,7 @@ impl ConnectionWindow {
         });
         let shared = self
             .shared_entries()
-            .filter_map(|entry| Some((entry.last_used_at?, VisualRow::Shared(entry))));
+            .filter_map(|entry| Some((entry.last_used_at?, VisualRow::Shared(entry, 0))));
         let mut recent = Vec::with_capacity(RECENT_LIMIT);
         // Keep the bounded combined selection before applying search. Equal
         // timestamps retain the original order, with local rows before shared.
@@ -223,15 +234,19 @@ impl ConnectionWindow {
                     VisualRow::Connection(connection, _) => search.manager(connection),
                     VisualRow::Serial(profile, _) => search.serial(profile),
                     VisualRow::Local(profile, _) => search.local(profile),
-                    VisualRow::Shared(entry) => search.manager(&entry.connection),
-                    VisualRow::Group { .. } => false,
+                    VisualRow::Shared(entry, _) => search.manager(&entry.connection),
+                    VisualRow::Group { .. } | VisualRow::SharedGroup { .. } => false,
                 })
                 .collect();
         }
         self.visible_connections()
             .into_iter()
             .map(|connection| VisualRow::Connection(connection, 0))
-            .chain(self.visible_shared().into_iter().map(VisualRow::Shared))
+            .chain(
+                self.visible_shared()
+                    .into_iter()
+                    .map(|entry| VisualRow::Shared(entry, 0)),
+            )
             .chain(
                 self.visible_serial()
                     .into_iter()
@@ -246,9 +261,6 @@ impl ConnectionWindow {
     }
 
     pub(super) fn visible_rows<'a>(&'a self, entries: Vec<VisualRow<'a>>) -> Vec<VisualRow<'a>> {
-        if !matches!(self.scope, Scope::All | Scope::Group(_)) {
-            return entries;
-        }
         let mut profiles = Vec::new();
         let mut shared = Vec::new();
         for row in entries {
@@ -256,13 +268,92 @@ impl ConnectionWindow {
                 VisualRow::Connection(..) | VisualRow::Serial(..) | VisualRow::Local(..) => {
                     profiles.push(row)
                 }
-                VisualRow::Shared(_) => shared.push(row),
-                VisualRow::Group { .. } => unreachable!("visible entries contain connections only"),
+                VisualRow::Shared(entry, _) => shared.push(entry),
+                VisualRow::Group { .. } | VisualRow::SharedGroup { .. } => {
+                    unreachable!("visible entries contain connections only")
+                }
             }
         }
         let mut rows = self.tree_rows(profiles);
-        rows.extend(shared);
+        if shared.is_empty() {
+            return rows;
+        }
+        shared.sort_by_cached_key(|entry| entry.connection.name.to_lowercase());
+        let mut tree = SharedTree::default();
+        for entry in shared {
+            tree.insert(entry);
+        }
+        let collapsed = |path: &str| self.shared_collapsed.contains(&path.to_lowercase());
+        if self.scope == Scope::Teamwork {
+            tree.append_children(0, &mut rows, collapsed);
+        } else {
+            tree.append_row(0, &mut rows, collapsed);
+        }
         rows
+    }
+}
+
+#[derive(Default)]
+struct SharedTree<'a> {
+    path: &'a str,
+    children: BTreeMap<String, SharedTree<'a>>,
+    entries: Vec<&'a teamwork::Entry>,
+    count: usize,
+}
+
+impl<'a> SharedTree<'a> {
+    fn insert(&mut self, entry: &'a teamwork::Entry) {
+        let mut folder = self;
+        let mut end = 0;
+        folder.count += 1;
+        for name in entry.group.split('/').filter(|name| !name.is_empty()) {
+            end += name.len();
+            let path = &entry.group[..end];
+            end += 1;
+            folder = folder
+                .children
+                .entry(name.to_lowercase())
+                .or_insert_with(|| Self {
+                    path,
+                    ..Self::default()
+                });
+            folder.count += 1;
+        }
+        folder.entries.push(entry);
+    }
+
+    fn append_row(
+        &self,
+        indent: usize,
+        rows: &mut Vec<VisualRow<'a>>,
+        is_collapsed: impl Fn(&str) -> bool + Copy,
+    ) {
+        let collapsed = is_collapsed(self.path);
+        rows.push(VisualRow::SharedGroup {
+            path: self.path,
+            indent,
+            count: self.count,
+            collapsed,
+        });
+        if !collapsed {
+            self.append_children(indent + 1, rows, is_collapsed);
+        }
+    }
+
+    fn append_children(
+        &self,
+        indent: usize,
+        rows: &mut Vec<VisualRow<'a>>,
+        is_collapsed: impl Fn(&str) -> bool + Copy,
+    ) {
+        for child in self.children.values() {
+            child.append_row(indent, rows, is_collapsed);
+        }
+        rows.extend(
+            self.entries
+                .iter()
+                .map(|&entry| VisualRow::Shared(entry, indent)),
+        );
     }
 }
 
