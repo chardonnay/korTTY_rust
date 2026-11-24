@@ -181,6 +181,7 @@ pub enum Setting {
     PreviousAppDesign,
     NextAppDesign,
     DesignAnimations,
+    ChatColorProfile,
     PasteWarning,
     LargePasteWarning,
     PasteLineDelay,
@@ -285,6 +286,7 @@ impl Setting {
         Self::PreviousAppDesign,
         Self::NextAppDesign,
         Self::DesignAnimations,
+        Self::ChatColorProfile,
         Self::PasteWarning,
         Self::LargePasteWarning,
         Self::PasteLineDelay,
@@ -389,6 +391,7 @@ impl Setting {
             Self::PreviousAppDesign => "Previous design",
             Self::NextAppDesign => "Next design",
             Self::DesignAnimations => "Enable design animations",
+            Self::ChatColorProfile => "Chat color profile",
             Self::PasteWarning => "Warn about line breaks and control characters",
             Self::LargePasteWarning => "Warn about pastes larger than",
             Self::PasteLineDelay => "Pause between pasted lines",
@@ -504,7 +507,8 @@ impl Setting {
             Self::AppDesign
             | Self::PreviousAppDesign
             | Self::NextAppDesign
-            | Self::DesignAnimations => Section::Appearance,
+            | Self::DesignAnimations
+            | Self::ChatColorProfile => Section::Appearance,
             Self::AgentDesign => Section::AgentDesign,
             Self::ApplicationUpdates | Self::ApplicationUpdateInterval => Section::Updates,
             Self::SftpParallel
@@ -607,6 +611,7 @@ impl Setting {
             Self::PreviousAppDesign => "previous app design",
             Self::NextAppDesign => "next app design",
             Self::DesignAnimations => "animation reduced motion transitions",
+            Self::ChatColorProfile => "AI Chat Swarm palette theme",
             Self::PasteWarning => {
                 "paste safety protection multiline bracketed escape bidi confirmation"
             }
@@ -802,6 +807,7 @@ pub enum Message {
     Theme(window::Id, theme_settings::Edit),
     Design(window::Id, Design),
     DesignAnimations(window::Id, bool),
+    ChatColorProfile(window::Id, super::chat_appearance::Profile),
     AgentDesignCatalog(window::Id, agent_design_settings::Edit),
     AgentDesignName(window::Id, agent_design_name::Action),
     ApplicationUpdates(window::Id, bool),
@@ -923,6 +929,9 @@ impl Draft {
         }
         if edit.appearance.animations != before.appearance.animations {
             current.appearance.animations = edit.appearance.animations;
+        }
+        if edit.appearance.chat_color_profile != before.appearance.chat_color_profile {
+            current.appearance.chat_color_profile = edit.appearance.chat_color_profile;
         }
         if edit.ai_agent_design != before.ai_agent_design {
             current.ai_agent_design = edit.ai_agent_design;
@@ -1624,6 +1633,7 @@ impl Workspace {
             | Message::Export(id, _)
             | Message::Design(id, _)
             | Message::DesignAnimations(id, _)
+            | Message::ChatColorProfile(id, _)
             | Message::AgentDesignCatalog(id, _)
             | Message::ApplicationUpdates(id, _)
             | Message::ApplicationUpdateInterval(id, _)
@@ -1821,6 +1831,10 @@ impl Workspace {
             }
             Message::DesignAnimations(_, enabled) if dialog.section == Section::Appearance => {
                 dialog.draft.preferences.appearance.animations = Some(enabled);
+                dialog.problem = None;
+            }
+            Message::ChatColorProfile(_, profile) if dialog.section == Section::Appearance => {
+                dialog.draft.preferences.appearance.chat_color_profile = Some(profile);
                 dialog.problem = None;
             }
             Message::EditorCaret(_, edit) if dialog.section == Section::Editor => {
@@ -4743,6 +4757,7 @@ mod tests {
 
     #[test]
     fn app_design_save_is_atomic_and_keeps_terminal_and_editor_colors() {
+        use super::super::chat_appearance::Profile;
         use super::super::chrome::{Action, Message as ChromeMessage};
         use crate::terminal_theme::{Id, Preset};
 
@@ -4756,21 +4771,28 @@ mod tests {
         let terminal = workspace.window_settings.terminal_appearance();
         let editor = workspace.editor_content_theme();
         let original = workspace.window_theme(owner);
+        let original_chat = workspace.chat_palette();
         let _ = workspace.update_chrome(ChromeMessage::Invoke(owner, Action::AppearanceSettings));
         let dialog = workspace.settings.0.as_ref().unwrap();
         assert_eq!(dialog.section, Section::Appearance);
         let id = dialog.id;
         assert!(workspace.settings_view(id).is_some());
         let _ = workspace.update_settings(Message::Design(id, Design::AmberCrt));
+        let _ = workspace.update_settings(Message::ChatColorProfile(id, Profile::Ocean));
         let _ =
             workspace.save_settings_to(id, |_| Err(std::io::Error::other("test write failure")));
         assert_eq!(workspace.window_theme(owner), original);
         assert_eq!(workspace.window_theme(other), original);
+        assert_eq!(workspace.chat_palette(), original_chat);
         assert!(workspace.settings.0.as_ref().unwrap().problem.is_some());
         let _ = workspace.update_settings(Message::Cancel(id));
         assert_eq!(
             workspace.window_settings.appearance.design(),
             Design::Normal
+        );
+        assert_eq!(
+            workspace.window_settings.appearance.chat_color_profile,
+            None
         );
 
         let _ = workspace.update_settings(Message::OpenAt(owner, Section::Appearance));
@@ -4778,6 +4800,7 @@ mod tests {
         let design = Design::AtlantaFxPrimerLight;
         let _ = workspace.update_settings(Message::Design(id, design));
         let _ = workspace.update_settings(Message::DesignAnimations(id, false));
+        let _ = workspace.update_settings(Message::ChatColorProfile(id, Profile::Paper));
         let mut random = [0; 8];
         getrandom::fill(&mut random).unwrap();
         let folder = std::env::temp_dir().join(format!(
@@ -4792,6 +4815,11 @@ mod tests {
         std::fs::remove_dir_all(folder).unwrap();
         assert_eq!(restored.appearance.design(), design);
         assert!(!restored.appearance.animations());
+        assert_eq!(restored.appearance.chat_color_profile, Some(Profile::Paper));
+        assert_eq!(
+            workspace.chat_palette(),
+            Profile::Paper.palette(&restored.themes)
+        );
         assert_eq!(workspace.window_settings, restored);
         let palette = design.palette().unwrap();
         for window in [owner, other] {
@@ -5755,9 +5783,11 @@ mod tests {
         let previous = measure("previous app design", Setting::PreviousAppDesign);
         let next = measure("Next design", Setting::NextAppDesign);
         let animations = measure("reduced motion", Setting::DesignAnimations);
+        let chat_color = measure("chat color profile", Setting::ChatColorProfile);
         assert!(picker.x + picker.width <= previous.x);
         assert!(previous.x + previous.width <= next.x);
         assert!(picker.y + picker.height < animations.y);
+        assert!(animations.y + animations.height < chat_color.y);
     }
 
     #[test]

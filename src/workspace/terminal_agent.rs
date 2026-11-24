@@ -873,15 +873,18 @@ impl Workspace {
                 reduced_motion,
                 self.panel_review(run_id, &state.runs[&run_id], Some(id)),
             ));
-        } else if let Some(view) = state.swarm_view(
-            id,
-            self.swarm_status_animated(id),
-            palette,
-            approvals,
-            self.swarm_web_available(id),
-            || self.automation_summary_providers(),
-        ) {
-            view.map(Message::Swarm)
+        } else if state.swarms.contains_key(&id) {
+            let chat_palette = self.chat_palette();
+            return state
+                .swarm_view(
+                    id,
+                    self.swarm_status_animated(id),
+                    chat_palette,
+                    approvals,
+                    self.swarm_web_available(id),
+                    || self.automation_summary_providers(),
+                )
+                .map(|view| chat_palette.wrap(view.map(Message::Swarm)));
         } else {
             state.runs.get(&id).filter(|run| !run.swarm)?.view(
                 palette,

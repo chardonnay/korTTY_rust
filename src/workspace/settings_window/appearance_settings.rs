@@ -4,6 +4,7 @@ use iced::{Alignment, Border, Element, Font, Length};
 use crate::terminal_theme::Scheme;
 
 use super::super::appearance::{Design, Preferences};
+use super::super::chat_appearance::Profile;
 use super::{Desktop, Dialog, Message, Setting, highlight_setting, highlighted};
 
 pub(super) fn view(dialog: &Dialog) -> Element<'_, Desktop> {
@@ -51,6 +52,16 @@ pub(super) fn view(dialog: &Dialog) -> Element<'_, Desktop> {
             checkbox(preferences.animations())
                 .label(Setting::DesignAnimations.label())
                 .on_toggle(move |enabled| Desktop::Settings(Message::DesignAnimations(id, enabled))),
+        ),
+        highlighted(
+            dialog,
+            Setting::ChatColorProfile,
+            row![
+                text(Setting::ChatColorProfile.label()),
+                pick_list(Profile::ALL, Some(preferences.chat_color_profile.unwrap_or_default()), move |profile| {
+                    Desktop::Settings(Message::ChatColorProfile(id, profile))
+                }).width(220),
+            ].spacing(8).align_y(Alignment::Center),
         ),
         container(column![
             text("Applies to app windows and dialogs. Terminal sessions and editor content keep their own color settings.")

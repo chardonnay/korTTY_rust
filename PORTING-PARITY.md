@@ -943,14 +943,31 @@ dialog for that comparison without terminal-window interaction.
 [Apple Silicon Settings tests](target/verification/20261124-appearance-search-macos.log)
 · [Windows ARM64 Settings tests](target/verification/20261124-appearance-search-windows-lld.log)
 
-Two preferences still need implementation. Java's Chat color profile
-offers Automatic (theme) and ten fixed palettes in the AI Chat and
-Swarm conversations. Each concrete palette has nine color slots,
-including separate code block and user message colors. The Java
-application font scale has a manual range of 80–160%. Automatic mode
-uses the primary display's logical height to choose 100%, 110%, 125% or
-140%. The application-scale path leaves terminal, editor and AI chat
-font sizes independent. The Rust Java backup adapter currently uses a
+Chat color profile is searchable in Settings → Appearance. Automatic
+(theme) follows the selected global terminal theme and its agent-panel
+colors. The ten fixed profiles and the automatic fallback retain all 99
+tagged Java values. AI Chat and Swarm read the current global profile
+when they render. It colors the conversation background, controls,
+transcript, code and user messages. The AI Chat toolbar saves its choice
+immediately. Settings applies its draft on Save, and Java backup import
+only fills an unset profile.
+[Rust palette and resolver](src/workspace/chat_appearance.rs)
+· [Rust AI Chat](src/workspace/terminal_ai.rs)
+· [Rust Swarm view](src/workspace/terminal_agent/swarm.rs)
+
+Windows ARM64 passed 118 focused Settings, AI Chat and Swarm tests.
+Apple Silicon passed 121 tests and strict application Clippy for all
+targets. The opt-in live OpenSSH fixture was ignored on macOS. The tests
+exercised saved settings, failed saves, the Java backup merge, independent
+highlights and the shared palette choice. Visual comparison in the
+running AI Chat and Swarm views remains open.
+[Apple Silicon chat color checks](target/verification/20261124-chat-color-profiles-macos-verified.log)
+· [Windows ARM64 chat color checks](target/verification/20261124-chat-color-profiles-windows-final.log)
+
+Application font scale remains open. Java has a manual range of 80–160%.
+Automatic mode uses the primary display's logical height to choose
+100%, 110%, 125% or 140%. The application-scale path leaves terminal,
+editor and AI chat font sizes independent. The Rust Java backup adapter currently uses a
 legacy manual UI font scale only as a fallback for Snippet Editor zoom.
 [Tagged Java Appearance page](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SettingsDialog.java)
 · [Tagged Java index](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SettingsSearchBar.java)

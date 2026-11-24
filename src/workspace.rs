@@ -48,6 +48,7 @@ mod backup_automatic;
 pub(crate) mod backup_data;
 mod backup_ui;
 mod bell;
+mod chat_appearance;
 mod chrome;
 pub(crate) use chrome::ToolIcon;
 pub(crate) use chrome::popup as native_popup;

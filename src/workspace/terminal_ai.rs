@@ -43,8 +43,9 @@ pub use automatic_rules::Outcome as RuleSuggestionOutcome;
 pub use learning::{RuleDestination, RuleOutcome};
 
 use super::{
-    Message as Desktop, PaneSession, Workspace, ai_quota as quota, saved_chats::store,
-    skill_classifier, ssh_access::SshTarget, tool_tabs,
+    Message as Desktop, PaneSession, Workspace, ai_quota as quota, chat_appearance,
+    saved_chats::store, skill_classifier, ssh_access::SshTarget, tab_titles::WindowSettings,
+    tool_tabs,
 };
 
 pub(super) const TITLE: &str = "AI Chat";
@@ -132,6 +133,7 @@ impl Action {
 pub enum Message {
     Recent(SessionId, Option<(String, bool)>),
     Profile(ProfileId),
+    ChatColorProfile(chat_appearance::Profile),
     ResponseLanguage(String),
     Context(text_editor::Action),
     Question(text_editor::Action),
@@ -1698,13 +1700,23 @@ impl Chat {
 
     fn view<'a>(
         &'a self,
-        config: Option<&Configuration>,
-        policy: &AiMemoryPolicy,
-        code_controls: &code_blocks::CodeControls,
-        remote_attachment_allowed: bool,
-        web_search_allowed: bool,
-        history: Option<&'a super::question_history::History>,
+        workspace: &'a Workspace,
+        id: window::Id,
+        palette: chat_appearance::Palette,
     ) -> Element<'a, Message> {
+        let config = workspace.ai_chat_configuration();
+        let config = config.as_deref();
+        let policy = &workspace.clipboard.policy.ai_memory;
+        let code_controls = &workspace.chat_code_controls(id, self);
+        let remote_attachment_allowed = workspace.remote_attachment_access(self).is_some();
+        let web_search_allowed = workspace.clipboard.policy.ai_web_search_allowed;
+        let history = self.prompt_history_root().and_then(|root| {
+            workspace
+                .terminal_question_history
+                .as_ref()
+                .filter(|(stored, _)| stored == root)
+                .map(|(_, history)| history)
+        });
         let allowed = config.is_some();
         if let Some(review) = &self.review
             && let Some(classification) = review
@@ -1759,17 +1771,26 @@ impl Chat {
             super::dialog_placement::escape::on_escape(editor, Message::CancelRule)
         } else if let Some(pending) = &self.pending {
             let body = column![
-                text("Assistant · receiving response").size(15),
+                text("Assistant · receiving response")
+                    .size(15)
+                    .color(palette.accent.color()),
                 (!pending.answer.is_empty())
                     .then(|| text(&pending.answer).size(self.conversation.font_size())),
                 (!pending.reasoning.is_empty()).then(|| column![
-                    text("Model reasoning").size(13),
-                    text(&pending.reasoning).size(self.conversation.font_size()),
+                    text("Model reasoning")
+                        .size(13)
+                        .color(palette.muted.color()),
+                    text(&pending.reasoning)
+                        .size(self.conversation.font_size())
+                        .color(palette.muted.color()),
                 ]
                 .spacing(6)),
             ]
             .spacing(12);
-            scrollable(body).height(Length::Fill).into()
+            scrollable(body)
+                .height(Length::Fill)
+                .style(move |theme, status| palette.scroll(theme, status))
+                .into()
         } else if let Some(review) = &self.review {
             let rule_preview = review.automatic.as_ref().filter(|rule| rule.showing);
             let included: usize = review
@@ -1864,22 +1885,34 @@ impl Chat {
                         list.push(
                             container(
                                 column![
-                                    (!turn.question().is_empty()).then(|| column![
-                                        text("You").size(13),
-                                        text(turn.question()).size(self.conversation.font_size()),
-                                        can_start_rule.then(|| button("Remember as a rule…")
-                                            .style(button::secondary)
-                                            .on_press(Message::RememberRule(index))),
-                                    ]
-                                    .spacing(6)),
+                                    (!turn.question().is_empty()).then(|| container(
+                                        container(
+                                            column![
+                                                text("You").size(13).color(palette.muted.color()),
+                                                text(turn.question())
+                                                    .size(self.conversation.font_size()),
+                                                can_start_rule.then(|| button(
+                                                    "Remember as a rule…"
+                                                )
+                                                .style(button::secondary)
+                                                .on_press(Message::RememberRule(index))),
+                                            ]
+                                            .spacing(6)
+                                        )
+                                        .padding([8, 12])
+                                        .style(move |_| palette.user())
+                                    )
+                                    .align_x(iced::alignment::Horizontal::Right)
+                                    .width(Length::Fill)),
                                     (!turn.answer().is_empty()).then(|| column![
-                                        text("Assistant").size(13),
+                                        text("Assistant").size(13).color(palette.accent.color()),
                                         code_blocks::answer_view(
                                             turn,
                                             &self.visuals,
                                             code_controls,
                                             self.code_actions_available(),
                                             self.conversation.font_size(),
+                                            palette,
                                         ),
                                         button("Copy answer").on_press(Message::Copy(index))
                                     ]
@@ -1888,7 +1921,9 @@ impl Chat {
                                     (!turn.web_sources().is_empty()).then(|| {
                                         turn.web_sources().iter().fold(
                                             column![
-                                                text("Web sources used for this reply").size(12)
+                                                text("Web sources used for this reply")
+                                                    .size(12)
+                                                    .color(palette.muted.color())
                                             ]
                                             .spacing(6),
                                             |sources, source| {
@@ -1896,17 +1931,25 @@ impl Chat {
                                             },
                                         )
                                     }),
-                                    turn.reasoning().map(|reasoning| column![
-                                        text("Model reasoning").size(13),
-                                        text(reasoning).size(self.conversation.font_size()),
-                                    ]
-                                    .spacing(6)),
+                                    turn.reasoning().map(|reasoning| container(
+                                        column![
+                                            text("Model reasoning")
+                                                .size(13)
+                                                .color(palette.muted.color()),
+                                            text(reasoning)
+                                                .size(self.conversation.font_size())
+                                                .color(palette.muted.color()),
+                                        ]
+                                        .spacing(6)
+                                    )
+                                    .padding(8)
+                                    .style(move |_| palette.code())),
                                 ]
                                 .spacing(6),
                             )
                             .padding(10)
                             .width(Length::Fill)
-                            .style(container::bordered_box),
+                            .style(move |_| palette.assistant()),
                         )
                     });
             let body: Element<'_, Message> = if self.turns.is_empty() {
@@ -1917,7 +1960,10 @@ impl Chat {
                     .height(Length::Fill)
                     .into()
             } else {
-                scrollable(transcript).height(Length::Fill).into()
+                scrollable(transcript)
+                    .height(Length::Fill)
+                    .style(move |theme, status| palette.scroll(theme, status))
+                    .into()
             };
             let prompt = if !self.turns.is_empty() && self.initial_context_chars == 0 {
                 "Enter a message"
@@ -1970,7 +2016,8 @@ impl Chat {
                         button("Clear prompt history").on_press(Message::ClearQuestions),
                     ].spacing(8)
                 }),
-                text_editor(&self.question).on_action(Message::Question).size(self.conversation.font_size()).height(90).placeholder(prompt),
+                text_editor(&self.question).on_action(Message::Question).size(self.conversation.font_size())
+                    .height(90).placeholder(prompt).style(move |_, status| palette.editor(status)),
             ].height(Length::Fill).spacing(8).into()
         };
         let save_form = self.save_title.as_ref().map(|title| {
@@ -2054,8 +2101,24 @@ impl Chat {
                     .map_or(TITLE, |saved| saved.title.as_str())
             )
             .size(19),
-            self.conversation
-                .toolbar(self.code_actions_available(), !self.turns.is_empty()),
+            row![
+                self.conversation
+                    .toolbar(self.code_actions_available(), !self.turns.is_empty()),
+                pick_list(
+                    chat_appearance::Profile::ALL,
+                    Some(
+                        workspace
+                            .window_settings
+                            .appearance
+                            .chat_color_profile
+                            .unwrap_or_default()
+                    ),
+                    Message::ChatColorProfile,
+                )
+                .width(170),
+            ]
+            .spacing(8)
+            .wrap(),
             content,
             self.conversation.attachment_view(
                 allowed
@@ -2298,23 +2361,34 @@ impl Workspace {
                 .into(),
             );
         }
-        let config = self.ai_chat_configuration();
+        let palette = self.chat_palette();
         Some(
-            chat.view(
-                config.as_deref(),
-                &self.clipboard.policy.ai_memory,
-                &self.chat_code_controls(id, chat),
-                self.remote_attachment_access(chat).is_some(),
-                self.clipboard.policy.ai_web_search_allowed,
-                chat.prompt_history_root().and_then(|root| {
-                    self.terminal_question_history
-                        .as_ref()
-                        .filter(|(stored, _)| stored == root)
-                        .map(|(_, history)| history)
-                }),
-            )
-            .map(move |message| Desktop::TerminalAi(id, message)),
+            palette.wrap(
+                chat.view(self, id, palette)
+                    .map(move |message| Desktop::TerminalAi(id, message)),
+            ),
         )
+    }
+
+    fn save_chat_color_profile(
+        &mut self,
+        id: window::Id,
+        profile: chat_appearance::Profile,
+        store: impl FnOnce(&WindowSettings) -> std::io::Result<()>,
+    ) {
+        if let Some(chat) = self.terminal_chats.get_mut(&id)
+            && !chat.agent_mask_unavailable
+            && self.window_settings.appearance.chat_color_profile != Some(profile)
+        {
+            let mut preferences = self.window_settings.clone();
+            preferences.appearance.chat_color_profile = Some(profile);
+            match store(&preferences) {
+                Ok(()) => self.window_settings = preferences,
+                Err(error) => {
+                    chat.notice = format!("Could not save the chat color profile ({error}).");
+                }
+            }
+        }
     }
 
     fn host_terminal_chat(&mut self, owner: window::Id, mut chat: Chat) -> Task<Desktop> {
@@ -2555,6 +2629,12 @@ impl Workspace {
         }
         if matches!(message, Message::Close) {
             return self.request_hosted_tool_close(id);
+        }
+        if let Message::ChatColorProfile(profile) = message {
+            self.save_chat_color_profile(id, profile, |preferences| {
+                crate::profile::window_settings_path().and_then(|path| preferences.save(&path))
+            });
+            return Task::none();
         }
         if let Message::Saved(token, SaveOutcome(result)) = message {
             if self
@@ -3788,6 +3868,52 @@ mod tests {
                 "default": id, "last_id": id
             }
         })).unwrap()
+    }
+
+    #[test]
+    fn chat_color_picker_changes_the_shared_palette_only_after_save() {
+        use chat_appearance::Profile;
+
+        let mut workspace = Workspace::default();
+        let configuration = config_for(7);
+        let first = window::Id::unique();
+        let second = window::Id::unique();
+        for id in [first, second] {
+            let mask =
+                Redactor::for_journal(Secrets::default().seal().unwrap(), Default::default());
+            let chat = Chat::new(&configuration, Action::Ask, "Context", mask, None).unwrap();
+            workspace.terminal_chats.insert(id, chat);
+        }
+        let auto = workspace.chat_palette();
+        workspace.save_chat_color_profile(first, Profile::Ocean, |_| {
+            Err(std::io::Error::other("fixture storage error"))
+        });
+        assert_eq!(workspace.chat_palette(), auto);
+        assert!(
+            workspace.terminal_chats[&first]
+                .notice
+                .contains("fixture storage error")
+        );
+
+        workspace.save_chat_color_profile(first, Profile::Ocean, |preferences| {
+            assert_eq!(
+                preferences.appearance.chat_color_profile,
+                Some(Profile::Ocean)
+            );
+            Ok(())
+        });
+        let current = workspace.chat_palette();
+        assert_eq!(
+            current,
+            Profile::Ocean.palette(&workspace.window_settings.themes)
+        );
+        assert!(workspace.terminal_ai_view(first).is_some());
+        assert!(workspace.terminal_ai_view(second).is_some());
+        workspace.terminal_chats.remove(&first);
+        workspace.save_chat_color_profile(first, Profile::Auto, |_| {
+            panic!("closed chat saved a palette")
+        });
+        assert_eq!(workspace.chat_palette(), current);
     }
 
     #[test]

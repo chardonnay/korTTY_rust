@@ -23,8 +23,9 @@ use crate::terminal_agent::swarm::{self as engine, Key, Queue, Status, Target, T
 
 use super::{
     Desktop, Message as RunMessage, Mode, Phase, ProfileChoice, Run, State, Workspace,
-    dialog_placement, mask, palette::Palette, request_review,
+    dialog_placement, mask, request_review,
 };
+use crate::workspace::chat_appearance::Palette;
 use crate::workspace::saved_chats::swarm::Record;
 use crate::workspace::terminal_ai::web;
 
@@ -409,6 +410,7 @@ impl Group {
         running: bool,
         web_available: bool,
         summary_profiles: Vec<AutomationSummaryProvider>,
+        palette: Palette,
     ) -> Column<'_, Message> {
         let conversation = self.conversation.as_ref();
         let draft = conversation.is_some_and(|chat| chat.record.is_draft());
@@ -475,7 +477,7 @@ impl Group {
                 });
         let mut view = column![].spacing(8).padding(12);
         view = if let Some(chat) = conversation {
-            view.push(chat.history(self.queue.is_none())).push(row![
+            view.push(chat.history(self.queue.is_none(), palette)).push(row![
                 (!chat.record.is_draft()).then(|| button("Rename…")
                     .on_press_maybe((!running && !self.closing && !chat.loading).then_some(Message::RenameConversation))),
                 text("Choose up to eight current saved SSH connections. Enter an absolute directory for each target.").size(13),
@@ -712,14 +714,14 @@ impl Group {
         &'a self,
         state: &'a State,
         surface: StatusSurface,
-        palette: Option<Palette>,
+        palette: Palette,
         approvals: impl Into<super::policy::Approvals>,
         web_available: bool,
         summary_profiles: Vec<AutomationSummaryProvider>,
     ) -> Element<'a, Message> {
         let approvals = approvals.into();
         let batch_allowed = approvals.batch;
-        let muted = palette.map(|palette| palette.muted.color());
+        let muted = Some(palette.muted.color());
         if let Some(save) = &self.save_name {
             let editing = !self.saving_conversation && !self.closing;
             let valid = editing && save.valid();
@@ -773,7 +775,7 @@ impl Group {
         {
             column![text("AI Swarm").size(22)].spacing(8).padding(12)
         } else {
-            self.setup_view(running, web_available, summary_profiles)
+            self.setup_view(running, web_available, summary_profiles, palette)
         };
         if let Some(queue) = &self.queue {
             let now = Instant::now();
@@ -808,8 +810,8 @@ impl Group {
                 } else {
                     item.status.label()
                 };
-                let status_color = palette.map(|palette| match item.status {
-                    Status::Failed | Status::Blocked => palette.error.color(),
+                let status_color = Some(match item.status {
+                    Status::Failed | Status::Blocked => palette.error(),
                     Status::Review | Status::Running => palette.accent.color(),
                     _ => palette.muted.color(),
                 });
@@ -870,7 +872,8 @@ impl Group {
                 let item = queue.rows().iter().find(|item| item.target.key == key);
                 let member = self.focused_member(state);
                 if let Some(item) = item {
-                    let heading = container(text(&item.target.label)).width(Length::Fill);
+                    let heading = container(text(&item.target.label).color(palette.accent.color()))
+                        .width(Length::Fill);
                     let heading = if item.transcript.is_empty() {
                         heading.id(surface.transcript())
                     } else {
@@ -896,6 +899,8 @@ impl Group {
                     view = view.push(
                         container(scrollable(text(&item.transcript)).height(Length::Fixed(150.0)))
                             .id(surface.transcript())
+                            .padding(8)
+                            .style(move |_| palette.code())
                             .width(Length::Fill),
                     );
                 }
@@ -914,8 +919,12 @@ impl Group {
                                     purpose,
                                     run.target.as_ref().map_or("", |target| target.directory())
                                 )),
-                                scrollable(text(command).font(iced::Font::MONOSPACE))
-                                    .height(Length::Fixed(75.0)),
+                                container(
+                                    scrollable(text(command).font(iced::Font::MONOSPACE))
+                                        .height(Length::Fixed(75.0))
+                                )
+                                .padding(8)
+                                .style(move |_| palette.code()),
                                 button("Approve for this target once").on_press_maybe(
                                     (!run.paused && !run.cancel.requested()).then_some(
                                         Message::Member(id, MemberAction::Approve(run.epoch))
@@ -1004,7 +1013,10 @@ impl Group {
                         .view(!running && !self.closing)
                         .map(|view| view.map(Message::Comparison))
                 }),
-            scrollable(view).id(surface.scroll()).height(Length::Fill),
+            scrollable(view)
+                .id(surface.scroll())
+                .height(Length::Fill)
+                .style(move |theme, status| palette.scroll(theme, status)),
             column![
                 text(&self.notice)
                     .size(13)
@@ -1059,7 +1071,7 @@ impl State {
         &self,
         id: window::Id,
         animate: bool,
-        palette: Option<Palette>,
+        palette: Palette,
         approvals: super::policy::Approvals,
         web_available: bool,
         summary_profiles: impl FnOnce() -> Vec<AutomationSummaryProvider>,

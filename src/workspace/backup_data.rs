@@ -1022,6 +1022,12 @@ pub(crate) fn portable_java_preferences(
     let appearance = appearance::Preferences {
         design: preference(root, "appDesign", &mut omitted, appearance::Design::from_id),
         animations: preference(root, "appDesignAnimationsEnabled", &mut omitted, java_flag),
+        chat_color_profile: preference(
+            root,
+            "chatColorProfileId",
+            &mut omitted,
+            super::chat_appearance::Profile::from_id,
+        ),
     };
     let snippet_alternative_count = preference(
         root,
@@ -1416,6 +1422,7 @@ pub(crate) fn portable_java_preferences(
         + usize::from(display.java_backup_defaults.interval.is_some())
         + usize::from(display.appearance.design.is_some())
         + usize::from(display.appearance.animations.is_some())
+        + usize::from(display.appearance.chat_color_profile.is_some())
         + usize::from(display.snippet_diagram_appearance.mode.is_some())
         + usize::from(display.snippet_diagram_appearance.background.is_some())
         + usize::from(display.snippet_structure.visible.is_some())
@@ -3012,14 +3019,16 @@ mod tests {
 
     #[test]
     fn java_application_appearance_import_preserves_explicit_native_defaults() {
-        let read = |design, animations| {
+        use super::super::chat_appearance::Profile;
+
+        let read = |design, animations, chat_profile| {
             let xml = format!(
-                "<globalSettings><appDesign>{design}</appDesign><appDesignAnimationsEnabled>{animations}</appDesignAnimationsEnabled></globalSettings>"
+                "<globalSettings><appDesign>{design}</appDesign><appDesignAnimationsEnabled>{animations}</appDesignAnimationsEnabled><chatColorProfileId>{chat_profile}</chatColorProfileId></globalSettings>"
             );
             portable_java_preferences(xml.as_bytes(), None).unwrap()
         };
-        let imported = read("ATLANTAFX_CUPERTINO_LIGHT", "false");
-        assert_eq!((imported.count, imported.omitted), (2, 0));
+        let imported = read("ATLANTAFX_CUPERTINO_LIGHT", "false", "midnight");
+        assert_eq!((imported.count, imported.omitted), (3, 0));
         let incoming = imported.contents.unwrap();
         let restore = |local: Option<&[u8]>| {
             let merged = merge_java_window_settings(local, &incoming, &Default::default())
@@ -3033,18 +3042,26 @@ mod tests {
             appearance::Design::AtlantaFxCupertinoLight
         );
         assert!(!fresh.appearance.animations());
+        assert_eq!(fresh.appearance.chat_color_profile, Some(Profile::Midnight));
 
         let local = WindowSettings::decode(br#"{"appearance":{"design":"normal"}}"#).unwrap();
         let serialized = serde_json::to_vec(&local).unwrap();
         let restored = restore(Some(&serialized));
         assert_eq!(restored.appearance.design(), appearance::Design::Normal);
         assert!(!restored.appearance.animations());
-        let restored = restore(Some(br#"{"appearance":{"animations":true}}"#));
+        assert_eq!(
+            restored.appearance.chat_color_profile,
+            Some(Profile::Midnight)
+        );
+        let restored = restore(Some(
+            br#"{"appearance":{"animations":true,"chat_color_profile":"auto"}}"#,
+        ));
         assert_eq!(
             restored.appearance.design(),
             appearance::Design::AtlantaFxCupertinoLight
         );
         assert!(restored.appearance.animations());
+        assert_eq!(restored.appearance.chat_color_profile, Some(Profile::Auto));
         let saved = serde_json::to_vec(&restored).unwrap();
         assert!(
             merge_java_window_settings(Some(&saved), &incoming, &Default::default())
@@ -3052,8 +3069,8 @@ mod tests {
                 .is_none()
         );
 
-        let invalid = read("unknown", "maybe");
-        assert_eq!((invalid.count, invalid.omitted), (0, 2));
+        let invalid = read("unknown", "maybe", "missing");
+        assert_eq!((invalid.count, invalid.omitted), (0, 3));
     }
 
     #[test]
