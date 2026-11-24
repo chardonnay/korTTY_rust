@@ -298,8 +298,20 @@ impl Draft {
         self.journal.view(view.journal_policy).map(Edit::Journal)
     }
 
-    pub(super) fn encoding_picker(&self) -> Element<'static, Edit> {
-        pick(TextEncoding::ALL, self.options.encoding, Edit::Encoding)
+    pub(super) fn encoding_picker(&self, keyboard: Option<Id>) -> Element<'static, Edit> {
+        let choices: Vec<_> = [Choice(None)]
+            .into_iter()
+            .chain(TextEncoding::ALL.map(|value| Choice(Some(value))))
+            .collect();
+        let picker = pick_list(choices, Some(Choice(self.options.encoding)), |choice| {
+            Edit::Encoding(choice.0)
+        })
+        .width(Length::Fill);
+        if let Some(id) = keyboard {
+            picker.keyboard_navigation(id).into()
+        } else {
+            picker.into()
+        }
     }
 
     pub(super) fn ai_view(
@@ -563,7 +575,7 @@ impl Draft {
                 "Terminal colors",
                 toggle(self.options.sgr_enabled, Edit::Colors)
             ),
-            combined.then(|| labeled("Text encoding", self.encoding_picker())),
+            combined.then(|| labeled("Text encoding", self.encoding_picker(None))),
             labeled(
                 "Initial columns",
                 text_input("Inherit", &self.columns).on_input(Edit::Columns)

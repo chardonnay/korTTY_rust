@@ -211,7 +211,10 @@ pub(crate) fn number_input<'a, Message: Clone + 'a>(
             .clamp(*bounds.start(), *bounds.end());
         (next != value).then(|| update(next.to_string()))
     };
+    let up = adjustment(step);
+    let down = adjustment(-step);
     let input = input
+        .vertical_steps(up.clone(), down.clone())
         .size(13)
         .line_height(text::LineHeight::Absolute(16.0.into()))
         .padding([7, 5])
@@ -221,7 +224,7 @@ pub(crate) fn number_input<'a, Message: Clone + 'a>(
             style.border.radius = style.border.radius.right(0);
             style
         });
-    let increment = number_step("▴", adjustment(step))
+    let increment = number_step("▴", up)
         .padding([1, 6])
         .width(26)
         .style(|theme, status| {
@@ -229,7 +232,7 @@ pub(crate) fn number_input<'a, Message: Clone + 'a>(
             style.border.radius = border::top_right(style.border.radius.top_right);
             style
         });
-    let decrement = number_step("▾", adjustment(-step))
+    let decrement = number_step("▾", down)
         .padding([1, 6])
         .width(26)
         .style(|theme, status| {

@@ -110,6 +110,7 @@ pub enum Message {
     Duplicate,
     Edit(Edit),
     FocusEditor(bool),
+    NavigateOsBadge(String),
     PasteTemporaryKey,
     TemporaryKeyPasted(u64, bool, crate::ssh_dialog::Password),
     Save,
@@ -1357,6 +1358,13 @@ impl ConnectionWindow {
             Message::FocusEditor(backwards) => {
                 if let Some(draft) = &self.draft {
                     return draft.focus_editor(backwards);
+                }
+            }
+            Message::NavigateOsBadge(reference)
+                if reference.is_empty() || self.valid_os_badge(Some(&reference)) =>
+            {
+                if let Some(draft) = &mut self.draft {
+                    return draft.navigate_badge_picker(reference);
                 }
             }
             Message::Edit(Edit::Terminal(terminal_overrides::Edit::AiSkillNavigate(id))) => {

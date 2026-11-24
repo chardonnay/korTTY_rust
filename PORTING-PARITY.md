@@ -1232,7 +1232,9 @@ The native Rust preview used the same synthetic destination and jump host.
 The desktop check compared field order and alignment, scrolled to the
 password and key-file controls, and kept Save reachable. The saved fixture
 contained the independently changed ports 2223 and 2224 and Windows-1252.
-Control widths and the timeout and retry steppers remain visual differences.
+Control widths differed in this comparison. The later
+[keyboard and control update](#november-24-ssh-editor-keyboard-and-disabled-jump-host)
+adds the timeout and retry steppers.
 [Windows ARM64 desktop verification](target/verification/20261124-ssh-connection-fields-windows-desktop.log)
 
 Apple Silicon passed 54 focused tests and strict Clippy. The widget
@@ -1240,6 +1242,38 @@ regression sends the destination and jump-host step actions to their own
 drafts. A second regression covers reselection while a temporary-key
 paste is pending.
 [Apple Silicon verification](target/verification/20261124-ssh-connection-fields-macos-native.log)
+
+## November 24 SSH editor keyboard and disabled jump host
+
+Timeout and retry use the same editable stepper as the SSH port.
+An unmodified Up or Down steps a focused numeric input and respects
+its bounds. Retries continue to accept zero for a single attempt.
+
+Jump Server shows disabled fields when the jump host is off. The
+current draft keeps its gateway settings if the user turns it back on
+before saving. Saving with the jump host off writes a direct connection.
+Disabled fields stay outside the tab order, and draft updates targeting
+the disabled jump host are ignored.
+
+Tab and Shift+Tab traverse enabled controls in Connection and Jump
+Server, and the form follows the focus when it scrolls. The authentication
+radio group uses the arrow keys. The OS symbol picker supports arrows,
+Home, End, Enter and Escape, including navigation to an offscreen symbol.
+[SSH editor](src/connection_window/form.rs)
+· [OS symbol picker](src/connection_window/os_badge.rs)
+
+Apple Silicon passed 56 focused tests and strict Clippy. The checks cover
+keyboard stepping for both port fields, retention of an unsaved jump
+configuration, and the focus transition from the disabled Jump Server
+toggle to Save.
+[Apple Silicon verification](target/verification/20261124-ssh-editor-keyboard-macos-retest.log)
+
+The native Windows ARM64 preview build passed and opened a private
+Connection Manager. Windows Graphics Capture reported
+`DXGI_ERROR_DEVICE_REMOVED` when capturing the private window. The
+desktop comparison and keyboard walkthrough remain open.
+[Windows ARM64 build](target/verification/20261124-ssh-editor-keyboard-windows-build-retest.log)
+· [Desktop check](target/verification/20261124-ssh-editor-keyboard-windows-desktop.md)
 
 ## November 24 Connection Manager Teamwork tree
 

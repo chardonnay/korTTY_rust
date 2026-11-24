@@ -441,7 +441,7 @@ impl ConnectionWindow {
             draft.view(
                 &choices,
                 &self.custom_badges,
-                self.editor_group_picker(Message::DraftGroup),
+                self.editor_group_picker(Message::DraftGroup, Some(draft.folder_picker_id())),
                 inherited,
             )
         };
@@ -457,7 +457,7 @@ impl ConnectionWindow {
                     .into()
             };
         let mut body = column![form].height(Length::Fill);
-        let ai_focus_scope = self.draft.as_ref().and_then(|draft| draft.ai_focus_scope());
+        let focus_scope = self.draft.as_ref().and_then(|draft| draft.focus_scope());
         if !self.confirming_close && !self.busy {
             let valid = if let Some(draft) = &self.local_draft {
                 draft.profile().is_ok()
@@ -477,7 +477,7 @@ impl ConnectionWindow {
             })
             .style(button::secondary)
             .on_press(Message::CancelEdit);
-            let (save, cancel) = if ai_focus_scope.is_some() {
+            let (save, cancel) = if focus_scope.is_some() {
                 use crate::workspace::dialog_design::keyboard_table::action;
                 (
                     action(save.into(), save_action, true),
@@ -497,7 +497,7 @@ impl ConnectionWindow {
                 .push(rule::horizontal(1))
                 .push(container(text(notice).size(13)).padding([8, 16]));
         }
-        let body = if let Some(root) = ai_focus_scope {
+        let body = if let Some(root) = focus_scope {
             container(body).id(root).height(Length::Fill).into()
         } else {
             body.into()
@@ -1496,15 +1496,19 @@ impl ConnectionWindow {
         &self,
         edit: fn(Option<String>) -> Msg,
     ) -> Element<'_, Msg> {
-        row![text("Folder").size(14), self.editor_group_picker(edit)]
-            .spacing(8)
-            .align_y(Alignment::Center)
-            .into()
+        row![
+            text("Folder").size(14),
+            self.editor_group_picker(edit, None)
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .into()
     }
 
     fn editor_group_picker<Msg: Clone + 'static>(
         &self,
         edit: fn(Option<String>) -> Msg,
+        keyboard: Option<iced::widget::Id>,
     ) -> Element<'_, Msg> {
         let options: Vec<_> = std::iter::once(GroupChoice(None))
             .chain(
@@ -1514,11 +1518,14 @@ impl ConnectionWindow {
             )
             .collect();
         let selected = GroupChoice(self.draft_group.clone());
-        pick_list(options, Some(selected), move |choice: GroupChoice| {
+        let picker = pick_list(options, Some(selected), move |choice: GroupChoice| {
             edit(choice.0)
-        })
-        .width(Length::Fill)
-        .into()
+        });
+        if let Some(id) = keyboard {
+            picker.width(300).keyboard_navigation(id).into()
+        } else {
+            picker.width(Length::Fill).into()
+        }
     }
 
     fn serial_row<'a>(&'a self, profile: &'a SerialProfile, indent: usize) -> Element<'a, Message> {

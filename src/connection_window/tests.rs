@@ -1265,7 +1265,8 @@ fn ssh_editor_journal_and_ai_tabs_keep_their_drafts_when_terminal_defaults_are_r
         &layout::Limits::new(Size::ZERO, compact),
     );
     let root = Layout::new(&node);
-    let form = root.children().next().unwrap().children().next().unwrap();
+    let body = root.children().next().unwrap();
+    let form = body.children().next().unwrap().children().next().unwrap();
     let tabs: Vec<_> = form
         .children()
         .nth(1)
@@ -1282,7 +1283,7 @@ fn ssh_editor_journal_and_ai_tabs_keep_their_drafts_when_terminal_defaults_are_r
         tabs.iter()
             .all(|tab| (tab.center().y - tabs[0].center().y).abs() < 1.0)
     );
-    let footer = root.children().nth(2).unwrap().bounds();
+    let footer = body.children().nth(2).unwrap().bounds();
     assert!(footer.height > 0.0 && footer.y + footer.height <= compact.height);
 
     for (named, modifiers, selected) in [
@@ -1380,7 +1381,7 @@ fn ssh_editor_ai_tab_moves_focus_and_assigns_skills_with_the_keyboard() {
     use crate::settings_search::test_input;
     use crate::terminal_agent::design::Choice;
     use iced::keyboard::{Key, key::Named};
-    use iced::{Element, Font, Renderer, Size, Theme};
+    use iced::{Font, Renderer, Size, Theme};
     use iced_runtime::{UserInterface, user_interface::Cache};
     use terminal_overrides::Edit as Terminal;
 
@@ -1402,35 +1403,7 @@ fn ssh_editor_ai_tab_moves_focus_and_assigns_skills_with_the_keyboard() {
             name: "Standard".into(),
         },
     ];
-    fn view<'a>(
-        window: &'a ConnectionWindow,
-        themes: &crate::terminal_theme::Themes,
-        designs: &[Choice],
-    ) -> Element<'a, Message, Theme, Renderer> {
-        window
-            .editor_view(ViewChoices {
-                passwords: &[],
-                passphrases: &[],
-                keys: &[],
-                temporary_keys: false,
-                vault_unlocked: false,
-                ai_profiles: &[],
-                java_ai_profiles: &[],
-                ai_skills: &[],
-                ai_agent_designs: designs,
-                highlighting: HighlightChoices::default(),
-                themes,
-                journal_policy: JournalEditorPolicy::default(),
-                incognito_allowed: true,
-                serial_allowed: true,
-                terminal_effects: None,
-                default_paste_warning: Default::default(),
-                minimum_paste_warning: PasteWarningMode::Off,
-                isolation: Default::default(),
-                local_isolation_default: Default::default(),
-            })
-            .unwrap()
-    }
+    let view = keyboard_editor_view;
     let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
     let compact = Size::new(900.0, 410.0);
     let mut cache = Cache::default();
@@ -1521,6 +1494,87 @@ fn ssh_editor_ai_tab_moves_focus_and_assigns_skills_with_the_keyboard() {
         reopened.get(id).unwrap().terminal.ai_skills,
         (9000..9019).collect::<Vec<_>>()
     );
+}
+
+fn keyboard_editor_view<'a>(
+    window: &'a ConnectionWindow,
+    themes: &crate::terminal_theme::Themes,
+    designs: &[crate::terminal_agent::design::Choice],
+) -> iced::Element<'a, Message> {
+    window
+        .editor_view(ViewChoices {
+            passwords: &[],
+            passphrases: &[],
+            keys: &[],
+            temporary_keys: false,
+            vault_unlocked: false,
+            ai_profiles: &[],
+            java_ai_profiles: &[],
+            ai_skills: &[],
+            ai_agent_designs: designs,
+            highlighting: HighlightChoices::default(),
+            themes,
+            journal_policy: JournalEditorPolicy::default(),
+            incognito_allowed: true,
+            serial_allowed: true,
+            terminal_effects: None,
+            default_paste_warning: Default::default(),
+            minimum_paste_warning: PasteWarningMode::Off,
+            isolation: Default::default(),
+            local_isolation_default: Default::default(),
+        })
+        .unwrap()
+}
+
+#[test]
+fn ssh_editor_skips_disabled_jump_controls_in_tab_order() {
+    use crate::settings_search::test_input;
+    use iced::keyboard::{Key, key::Named};
+    use iced::{Font, Renderer, Size, Theme};
+    use iced_runtime::{UserInterface, user_interface::Cache};
+
+    let profile = Profile::new();
+    Store::open(profile.path())
+        .unwrap()
+        .save(connection("Private test", ""))
+        .unwrap();
+    let mut window = ConnectionWindow::open(profile.path()).unwrap();
+    let _ = window.update(Message::EditSelected);
+    let _ = window.update(Message::Edit(Edit::Page(form::Page::JumpHost)));
+    let themes = crate::terminal_theme::Themes::default();
+    let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+    let mut interface = UserInterface::build(
+        keyboard_editor_view(&window, &themes, &[]),
+        Size::new(900.0, 420.0),
+        Cache::default(),
+        &mut renderer,
+    );
+    let tab = |interface: &mut UserInterface<'_, Message, Theme, Renderer>,
+               renderer: &mut Renderer| {
+        let messages = test_input::press(interface, renderer, Key::Named(Named::Tab), None);
+        assert!(matches!(messages.as_slice(), [Message::FocusEditor(false)]));
+        let focus = window.draft.as_ref().unwrap().focus_editor(false);
+        test_input::apply(interface, renderer, focus);
+    };
+    tab(&mut interface, &mut renderer);
+    let toggle = test_input::press(
+        &mut interface,
+        &mut renderer,
+        Key::Named(Named::Space),
+        None,
+    );
+    assert!(matches!(
+        toggle.as_slice(),
+        [Message::Edit(Edit::UseJump(true))]
+    ));
+    tab(&mut interface, &mut renderer);
+    let save = test_input::press(
+        &mut interface,
+        &mut renderer,
+        Key::Named(Named::Enter),
+        None,
+    );
+    assert!(matches!(save.as_slice(), [Message::Save]));
 }
 
 #[test]

@@ -181,9 +181,13 @@ traversal on macOS and Linux.
 The [SSH connection form update](PORTING-PARITY.md#november-24-ssh-connection-form-alignment)
 aligns destination, terminal options, organization, startup, and
 authentication fields with the Java Connection page. Destination and
-jump host have the same port stepper and separate username rows. Continue
-with the remaining controls and forms, including the timeout and retry
-steppers, the disabled Jump Server presentation and keyboard traversal.
+jump host have the same port stepper and separate username rows. The
+[SSH editor controls update](PORTING-PARITY.md#november-24-ssh-editor-keyboard-and-disabled-jump-host)
+adds timeout and retry steppers, a disabled Jump Server form and keyboard
+traversal for Connection and Jump Server. Apple Silicon passed the focused
+regressions and strict Clippy. The Windows ARM64 preview build passed, and
+the desktop walkthrough remains open after a Windows Graphics Capture
+failure. Continue with the remaining form layout and native comparisons.
 The [managed Journal requirement](PORTING-PARITY.md#november-24-managed-session-journal)
 locks the SSH editor's autostart control and starts capture on eligible
 terminal streams. A native Apple Silicon OpenSSH test covered automatic

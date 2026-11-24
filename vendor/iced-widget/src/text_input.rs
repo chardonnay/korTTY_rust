@@ -116,6 +116,7 @@ pub struct TextInput<
     on_input: Option<Box<dyn Fn(String) -> Message + 'a>>,
     on_paste: Option<Box<dyn Fn(String) -> Message + 'a>>,
     on_submit: Option<Message>,
+    vertical_steps: Option<(Option<Message>, Option<Message>)>,
     icon: Option<Icon<Renderer::Font>>,
     class: Theme::Class<'a>,
     last_status: Option<Status>,
@@ -147,6 +148,7 @@ where
             on_input: None,
             on_paste: None,
             on_submit: None,
+            vertical_steps: None,
             icon: None,
             class: Theme::default(),
             last_status: None,
@@ -200,6 +202,13 @@ where
     /// focused and the enter key is pressed, if `Some`.
     pub fn on_submit_maybe(mut self, on_submit: Option<Message>) -> Self {
         self.on_submit = on_submit;
+        self
+    }
+
+    /// Handles unmodified Up and Down on a focused input. A missing message
+    /// keeps the corresponding key at the current bound.
+    pub fn vertical_steps(mut self, up: Option<Message>, down: Option<Message>) -> Self {
+        self.vertical_steps = Some((up, down));
         self
     }
 
@@ -690,7 +699,9 @@ where
         let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
 
         operation.text_input(self.id.as_ref(), layout.bounds(), state);
-        operation.focusable(self.id.as_ref(), layout.bounds(), state);
+        if self.on_input.is_some() {
+            operation.focusable(self.id.as_ref(), layout.bounds(), state);
+        }
     }
 
     fn update(
@@ -905,12 +916,27 @@ where
                 text,
                 modified_key,
                 physical_key,
+                modifiers: event_modifiers,
                 ..
             }) => {
                 let state = state::<Renderer>(tree);
 
                 if let Some(focus) = &mut state.is_focused {
                     let modifiers = state.keyboard_modifiers;
+                    if let Some((up, down)) = &self.vertical_steps
+                        && self.on_input.is_some()
+                        && event_modifiers.is_empty()
+                        && let keyboard::Key::Named(
+                            direction @ (key::Named::ArrowUp | key::Named::ArrowDown),
+                        ) = key
+                    {
+                        let message = if *direction == key::Named::ArrowUp { up } else { down };
+                        if let Some(message) = message.clone() {
+                            shell.publish(message);
+                        }
+                        shell.capture_event();
+                        return;
+                    }
 
                     match key.to_latin(*physical_key) {
                         Some('c')
