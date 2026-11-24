@@ -144,12 +144,12 @@ pub(super) struct Entry {
     automatic_screenshot_ai_disabled: bool,
     without_ai: bool,
     automatic: Option<(SessionId, u64)>,
-    ssh: Option<SshCapture>,
+    reconnect: Option<ReconnectCapture>,
     capture_input: bool,
 }
 
 #[derive(Clone, Copy)]
-struct SshCapture {
+struct ReconnectCapture {
     target: ProbeTarget,
     reconnected: bool,
 }
@@ -518,7 +518,15 @@ impl Workspace {
     }
 
     fn journal_capture_allowed_for(&self, tab: &Tab) -> bool {
-        self.journal_allowed() && (!tab.incognito || self.journal_required())
+        if !self.journal_allowed() || (tab.incognito && !self.journal_required()) {
+            return false;
+        }
+        let serial = tab
+            .grid
+            .get(tab.primary)
+            .and_then(|id| self.sessions.get(id))
+            .is_some_and(|pane| pane.frame.serial.is_some());
+        !serial || (self.clipboard.policy.serial_allowed && !self.isolation_required())
     }
 
     fn journal_source(&self, tab: &Tab) -> Option<(SessionId, &PaneSession)> {
@@ -683,15 +691,16 @@ impl Workspace {
             return (None, Task::none());
         };
         let generation = pane.stream_generation;
-        let ssh = pane.ssh.as_ref().map(|_| SshCapture {
-            target: ProbeTarget {
-                session: source,
-                generation,
-            },
-            reconnected: false,
-        });
+        let reconnect =
+            (pane.ssh.is_some() || pane.frame.serial.is_some()).then_some(ReconnectCapture {
+                target: ProbeTarget {
+                    session: source,
+                    generation,
+                },
+                reconnected: false,
+            });
         let mut config = pane.journal_config;
-        config.capture_input &= !incognito;
+        config.capture_input &= !incognito && pane.frame.serial.is_none();
         config.ai_summaries &= !without_ai;
         if let Some(cap) = self
             .clipboard
@@ -705,6 +714,8 @@ impl Workspace {
             ssh.label()
         } else if let Some(local) = &pane.saved_local {
             local.display_name()
+        } else if let Some(serial) = &pane.saved_serial {
+            serial.name.clone()
         } else if let Some(serial) = &pane.frame.serial {
             serial.device.display().to_string()
         } else {
@@ -772,7 +783,7 @@ impl Workspace {
                 automatic_screenshot_ai_disabled: without_ai,
                 without_ai,
                 automatic: automatic.then_some((source, generation)),
-                ssh,
+                reconnect,
                 capture_input: config.capture_input,
             },
         );
@@ -830,9 +841,9 @@ impl Workspace {
             .and_then(|tab| self.journal_source(tab))
             .filter(|(id, pane)| {
                 let generation = pane.stream_generation;
-                match entry.ssh {
-                    Some(ssh) => {
-                        ssh.target
+                match entry.reconnect {
+                    Some(reconnect) => {
+                        reconnect.target
                             == ProbeTarget {
                                 session: *id,
                                 generation,
@@ -847,7 +858,7 @@ impl Workspace {
                 }
             })
         else {
-            if original.is_some() && entry.ssh.is_none() {
+            if original.is_some() && entry.reconnect.is_none() {
                 self.fail_journal(
                     tab_id,
                     "The original terminal session ended during startup.".into(),
@@ -863,7 +874,10 @@ impl Workspace {
             });
             pane.session.journal_isolation(local_process)
         };
-        let start = if entry.ssh.is_some_and(|ssh| ssh.reconnected) {
+        let start = if entry
+            .reconnect
+            .is_some_and(|reconnect| reconnect.reconnected)
+        {
             JournalAttachStart::Reconnected(isolation())
         } else if entry.automatic.is_some() {
             JournalAttachStart::Connected(isolation())
@@ -880,7 +894,7 @@ impl Workspace {
         );
         let (attachment, reply) = match result {
             Ok(result) => result,
-            Err(InputError::Closed) if entry.ssh.is_some() => return Task::none(),
+            Err(InputError::Closed) if entry.reconnect.is_some() => return Task::none(),
             Err(error) => {
                 let message = match error {
                     InputError::Busy => "The terminal is busy. Start the journal again.",
@@ -915,8 +929,8 @@ impl Workspace {
         })
     }
 
-    /// Only a committed reconnect may move an existing SSH journal to a new stream.
-    pub(super) fn rebind_ssh_journal(
+    /// Only a committed reconnect may move the journal to a replacement stream.
+    pub(super) fn rebind_reconnected_journal(
         &mut self,
         tab: u64,
         previous: (SessionId, u64),
@@ -926,10 +940,10 @@ impl Workspace {
             .journal_captures
             .get_mut(&tab)
             .filter(|entry| entry.capturing())
-            && let Some(ssh) = &mut entry.ssh
-            && (ssh.target.session, ssh.target.generation) == previous
+            && let Some(reconnect) = &mut entry.reconnect
+            && (reconnect.target.session, reconnect.target.generation) == previous
         {
-            *ssh = SshCapture {
+            *reconnect = ReconnectCapture {
                 target: ProbeTarget {
                     session: replacement.0,
                     generation: replacement.1,
@@ -962,8 +976,8 @@ impl Workspace {
                 session,
                 generation,
             });
-            let still_bound = match entry.ssh {
-                Some(ssh) => current == Some(ssh.target),
+            let still_bound = match entry.reconnect {
+                Some(reconnect) => current == Some(reconnect.target),
                 None => entry.automatic.is_none_or(|(id, generation)| {
                     primary.is_some_and(|(pane, stream, status)| {
                         id == pane
@@ -986,7 +1000,7 @@ impl Workspace {
             else {
                 continue;
             };
-            let ready = if entry.ssh.is_some() {
+            let ready = if entry.reconnect.is_some() {
                 current.filter(|target| self.sessions[&target.session].session.journal_available())
             } else {
                 current
@@ -1378,11 +1392,11 @@ impl Workspace {
                 return self.journal_probe_choice(owner, tab, ticket, choice);
             }
             Message::Attached(tab, run, id, generation, result) => {
-                let current_ssh = self.sessions.get(&id).is_some_and(|pane| {
+                let current_stream = self.sessions.get(&id).is_some_and(|pane| {
                     pane.stream_generation == generation && pane.session.journal_available()
                 });
                 if let Some(Entry {
-                    ssh,
+                    reconnect,
                     phase:
                         Phase::Active {
                             source: Some(source),
@@ -1394,13 +1408,13 @@ impl Workspace {
                     .get_mut(&tab)
                     .filter(|entry| entry.run == run)
                     && (source.id, source.generation) == (id, generation)
-                    && ssh.is_none_or(|ssh| {
-                        ssh.target
+                    && reconnect.is_none_or(|reconnect| {
+                        reconnect.target
                             == ProbeTarget {
                                 session: id,
                                 generation,
                             }
-                            && current_ssh
+                            && current_stream
                     })
                 {
                     match result {
@@ -1709,6 +1723,10 @@ impl Workspace {
     }
 }
 
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+#[path = "journal_capture_access/serial_tests.rs"]
+mod serial_tests;
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -1799,7 +1817,7 @@ mod tests {
                 automatic_screenshot_ai_disabled: false,
                 without_ai: false,
                 automatic: None,
-                ssh: None,
+                reconnect: None,
                 capture_input: false,
             },
         );
@@ -1909,7 +1927,7 @@ mod tests {
                 automatic_screenshot_ai_disabled: false,
                 without_ai: false,
                 automatic: None,
-                ssh: None,
+                reconnect: None,
                 capture_input: false,
             },
         );
@@ -2017,7 +2035,7 @@ mod tests {
                 automatic_screenshot_ai_disabled: false,
                 without_ai: false,
                 automatic: None,
-                ssh: None,
+                reconnect: None,
                 capture_input: false,
             },
         );
@@ -2219,7 +2237,7 @@ mod tests {
         let _ = workspace.sessions[&session].session.stop().recv_blocking();
     }
 
-    fn deliver_journal_attachment(workspace: &mut Workspace, attach: Task<Desktop>) {
+    pub(super) fn deliver_journal_attachment(workspace: &mut Workspace, attach: Task<Desktop>) {
         use iced::futures::StreamExt as _;
 
         let mut events = iced_runtime::task::into_stream(attach).unwrap();
@@ -2443,7 +2461,7 @@ mod tests {
                 automatic_screenshot_ai_disabled: false,
                 without_ai: false,
                 automatic: None,
-                ssh: None,
+                reconnect: None,
                 capture_input: false,
             },
         );

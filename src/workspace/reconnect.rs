@@ -360,10 +360,9 @@ impl Workspace {
         let minimum = self.clipboard.policy.minimum_isolation;
         let pane = target.pane(tab).expect("validated reconnect pane");
         let primary = tab.primary == pane;
-        let previous_ssh = old
-            .ssh
-            .as_ref()
-            .map(|_| (target.source, old.stream_generation));
+        let previous_stream = (target.source, old.stream_generation);
+        let previous_ssh = old.ssh.is_some();
+        let previous_serial = old.frame.serial.clone();
         let mirrored = self.tab_broadcast_active(tab) || self.multi_exec_member(target.source);
         let owns_tunnels = tab.tunnel_owner == Some(target.source);
         let (grid, font, baseline) = (old.grid, old.font, old.font_baseline);
@@ -391,10 +390,13 @@ impl Workspace {
             return Task::none();
         }
         let saved = next.ssh.as_ref().and_then(super::SshTarget::saved_id);
-        let replacement_ssh = next
-            .ssh
+        let same_serial_device = previous_serial
             .as_ref()
-            .map(|_| (candidate, next.stream_generation));
+            .zip(next.frame.serial.as_ref())
+            .is_some_and(|(old, next)| old.device == next.device);
+        let continues_journal = (previous_ssh && next.ssh.is_some())
+            || (same_serial_device && next.session.journal_available());
+        let replacement_stream = (candidate, next.stream_generation);
         let ibm = next.ibm_origin.clone();
         let can_mirror = next.frame.ibm.is_none();
         next.font = font;
@@ -446,8 +448,8 @@ impl Workspace {
         if window.notice.as_deref() == Some(RECONNECTING) {
             window.notice = None;
         }
-        if primary && let (Some(previous), Some(replacement)) = (previous_ssh, replacement_ssh) {
-            self.rebind_ssh_journal(target.tab, previous, replacement);
+        if primary && continues_journal {
+            self.rebind_reconnected_journal(target.tab, previous_stream, replacement_stream);
         }
         self.rebind_coding_agent_alias(target.source, candidate);
         if can_mirror {

@@ -223,20 +223,38 @@ mod tests {
 }
 
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
-mod unix_tests {
+pub(crate) fn serial_test_pair() -> io::Result<(std::fs::File, std::path::PathBuf)> {
     use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    use rustix::io::{FdFlags, fcntl_setfd};
+    use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+
+    // The serial actor opens the slave just as it opens a selected serial port.
+    let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY)?;
+    fcntl_setfd(&master, FdFlags::CLOEXEC)?;
+    grantpt(&master)?;
+    unlockpt(&master)?;
+    let name = ptsname(&master, Vec::new())?;
+    Ok((
+        std::fs::File::from(master),
+        std::path::PathBuf::from(OsStr::from_bytes(name.to_bytes())),
+    ))
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod unix_tests {
     use std::fs::File;
     use std::io::{Read, Write};
-    use std::os::unix::ffi::OsStrExt;
     use std::thread;
     use std::time::Instant;
 
     use kortty_terminal::Color;
     use rustix::event::{PollFd, PollFlags, Timespec, poll};
-    use rustix::io::{Errno, FdFlags, fcntl_setfd};
-    use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+    use rustix::io::Errno;
 
     use super::super::{Frame, InputError, MAX_INPUT_BYTES, Status, WRITE_QUEUE_SIZE};
+    use super::serial_test_pair as pty_pair;
     use super::*;
 
     const TIMEOUT: Duration = Duration::from_secs(5);
@@ -473,20 +491,6 @@ mod unix_tests {
             .collect::<String>()
             .trim_end()
             .into()
-    }
-
-    fn pty_pair() -> io::Result<(File, PathBuf)> {
-        // A real OS PTY pair serves as the test device, with the serial actor
-        // opening the slave exactly as it opens a user-selected serial path.
-        let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY)?;
-        fcntl_setfd(&master, FdFlags::CLOEXEC)?;
-        grantpt(&master)?;
-        unlockpt(&master)?;
-        let name = ptsname(&master, Vec::new())?;
-        Ok((
-            File::from(master),
-            PathBuf::from(OsStr::from_bytes(name.to_bytes())),
-        ))
     }
 
     fn expect_bytes(peer: &mut File, expected: &[u8]) -> io::Result<()> {

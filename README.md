@@ -262,9 +262,11 @@ For the session journal smoke test in an isolated profile, run `printf 'journal-
 
 Saved SSH, local-shell and serial profiles expose **Session journal** settings.
 **Start a journal on connect** starts a capture for the primary stream.
-A running SSH capture also continues across reconnects in the same tab.
+A running SSH capture continues across reconnects in the same tab. A
+serial capture continues when reconnecting to the same device path.
+Serial journaling currently supports profiles using the ANSI/DEC parser.
 Automatic terminal journals log the effective isolation at launch.
-After an SSH reconnect, the journal records the new stream's isolation.
+After an SSH or serial reconnect, the journal records the new stream's isolation.
 **Capture typed commands at recognized shell prompts** starts with the next
 shell-integration prompt and records confirmed physical input. Paste, mirrored
 input, password prompts and partial commands already in progress are excluded.

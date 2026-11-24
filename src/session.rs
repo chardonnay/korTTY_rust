@@ -37,6 +37,8 @@ mod paste;
 pub(crate) use journal::journal_output_observer;
 mod recording;
 mod serial;
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+pub(crate) use serial::serial_test_pair;
 mod shell_activity;
 mod typewriter;
 #[cfg(windows)]
@@ -2274,7 +2276,7 @@ fn run_session(
         return Ok(());
     }
     let logging = match &mut source {
-        StreamSource::Pty { .. } => {
+        StreamSource::Pty { .. } | StreamSource::Serial { .. } => {
             state.journal.secrets = crate::terminal_logging::Secrets::default().seal().ok();
             None
         }

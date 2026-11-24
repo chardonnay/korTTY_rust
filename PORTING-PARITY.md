@@ -1335,6 +1335,39 @@ backend label. Verify the label in journals produced by native sandboxed
 sessions as part of desktop acceptance.
 [Windows ARM64 verification](target/verification/20261124-journal-isolation-windows.log)
 
+## November 24 Serial session journals
+
+Serial sessions using the ANSI/DEC parser now expose the terminal's
+parsed output to the journal. A saved profile can enable automatic
+capture, and the managed journal requirement also applies to eligible
+serial tabs. The output uses the same masking rules as terminal journals
+for local shells and SSH. Local keyboard echo stays on the terminal
+display during live capture. Serial streams have no verified shell prompt
+for recording typed commands.
+
+The disconnected pane's Connect action uses the same reconnect commit
+as the terminal's Reconnect action. After the same device path is opened
+again, the existing journal records the reconnect and `isolation: none`
+before new live output. A failed replacement leaves the old journal
+waiting. A different device path finishes the previous journal and follows
+the new stream's capture settings.
+[Tagged Java serial connector](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/core/SerialTtyConnector.java)
+· [Rust journal binding](src/workspace/journal_capture_access.rs)
+· [Native virtual port test](src/workspace/journal_capture_access/serial_tests.rs)
+
+Apple Silicon passed 57 focused regressions, strict application and
+test-target Clippy, the application build and two OpenSSH reconnect
+regressions. The virtual-port journal test covers profile opt-in,
+mandatory incognito capture, masking, local echo, a failed reconnect and
+switching devices. Separate native tests cover the serial reconnect
+confirmation and port release.
+[Apple Silicon verification](target/verification/20261124-serial-journal-macos-final.log)
+
+Windows ARM64 passed 43 focused regressions, including restoration of
+serial settings and the journal lifecycle tests. The virtual serial
+transport case used an Apple Silicon pseudo-terminal.
+[Windows ARM64 verification](target/verification/20261124-serial-journal-windows-final.log)
+
 ## November 23 GGUF Configure sizing
 
 Java sizes the Configure grid to its path label. Rust now measures the

@@ -4071,10 +4071,16 @@ impl Workspace {
             return Task::none();
         }
         let replacement = if let Some(old) = pending.replace {
-            let Some((tab, pane, _)) = self.disconnected_serial_pane(window, old) else {
+            let Some((index, _, _)) = self.disconnected_serial_pane(window, old) else {
                 return Task::none();
             };
-            Some((tab, pane, old))
+            let Some(tab) = self.windows[&window].tabs[index].terminal() else {
+                return Task::none();
+            };
+            Some(reconnect::ReconnectTarget {
+                tab: tab.id,
+                source: old,
+            })
         } else {
             None
         };
@@ -4084,7 +4090,7 @@ impl Workspace {
             .and_then(|profile| profile.strict_terminal_mode);
         let strict = saved_strict.unwrap_or_else(|| {
             replacement
-                .and_then(|(_, _, old)| self.sessions.get(&old))
+                .and_then(|target| self.sessions.get(&target.source))
                 .is_some_and(PaneSession::reconnect_strict_escapes)
         });
         let session = match Session::start_serial_with_options(
@@ -4111,8 +4117,12 @@ impl Workspace {
         if let Some(state) = self.windows.get_mut(&window) {
             state.pending_serial = None;
         }
-        let new_id =
-            self.store_connected_session(session, grid, replacement.map(|(_, _, old)| old), font);
+        let new_id = self.store_connected_session(
+            session,
+            grid,
+            replacement.map(|target| target.source),
+            font,
+        );
         if let Some(saved) = &saved {
             self.saved_terminal_preferences
                 .remember_serial_highlight(saved);
@@ -4133,21 +4143,17 @@ impl Workspace {
         if let Some(effect) = effect {
             self.apply_terminal_effect_selection(new_id, effect);
         }
-        if let Some((tab, pane, old)) = replacement {
-            if let Some(slot) = self
-                .windows
-                .get_mut(&window)
-                .and_then(|window| window.tabs.get_mut(tab))
-                .and_then(TabEntry::terminal_mut)
-                .and_then(|tab| tab.grid.get_mut(pane))
-            {
-                *slot = new_id;
-                self.rebind_coding_agent_alias(old, new_id);
-                self.stop_session(old);
-            } else {
-                self.stop_session(new_id);
-            }
-        } else if let Some(target) = split {
+        if let Some(target) = replacement {
+            return self.start_reconnect_worker(
+                window,
+                target,
+                new_id,
+                None,
+                Default::default(),
+                None,
+            );
+        }
+        if let Some(target) = split {
             self.start_split_worker_with_effect(window, target, new_id, effect.is_none());
         } else {
             self.add_tab_with_privacy(window, new_id, incognito);
@@ -4155,7 +4161,10 @@ impl Workspace {
         if split.is_none() {
             self.refresh_connection_counts();
         }
-        self.record_serial_session_used(new_id)
+        Task::batch([
+            self.record_serial_session_used(new_id),
+            self.reconcile_journal_sources(),
+        ])
     }
 
     fn open_saved_serial(&mut self, window: window::Id, saved: SerialProfile) -> Task<Message> {
