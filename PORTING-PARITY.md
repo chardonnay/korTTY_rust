@@ -1221,6 +1221,32 @@ and a failed private stage.
 [Apple Silicon verification](target/verification/20261124-journal-replacement-streaming-macos-native.log)
 · [Windows ARM64 verification](target/verification/20261124-journal-replacement-streaming-windows.log)
 
+## November 24 streaming HTML journal bundles
+
+The HTML bundle exporter decodes unfiltered log parts directly into the
+private ZIP stage. It produces the bounded HTML preview during the same
+pass. A filtered export scans a part to find the matching records and
+opens an archive member only when at least one record qualifies. It
+rechecks the file stamp before the second pass and after reading. The
+second pass streams the retained records and their format envelope.
+Standalone Browser HTML needs only the preview pass.
+
+Decoded input, individual lines, and the archive byte and file counts
+have separate bounds. The archive stage is discarded when a source check,
+write or cancellation fails. The next rotation step aligns these bounds
+with the Java editor and Java XML import limits.
+[Capture part streaming](src/session_journal/capture/bundle.rs)
+· [ZIP publication](src/session_journal/export_output.rs)
+
+Windows ARM64 and Apple Silicon each passed 48 focused tests, with two
+manual fixture generators ignored. Apple Silicon also passed strict
+application and test-target Clippy. The tests cover retained format
+headers, exact decoded bytes, long unfiltered lines, the Java Zstandard
+fixture, capture rotation, cancellation, file replacement between filtered
+passes, and archive publication with encryption.
+[Apple Silicon verification](target/verification/20261124-journal-bundle-streaming-macos-verified.log)
+· [Windows ARM64 verification](target/verification/20261124-journal-bundle-streaming-windows.log)
+
 ## November 23 GGUF Configure sizing
 
 Java sizes the Configure grid to its path label. Rust now measures the

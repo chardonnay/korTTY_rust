@@ -1,6 +1,5 @@
 use std::cell::Cell;
 use std::fs;
-use std::io::Write as _;
 
 use flate2::write::GzEncoder;
 use ruzstd::encoding::{CompressionLevel, compress_to_vec};
@@ -46,14 +45,35 @@ struct Captured {
 }
 
 impl Captured {
-    fn emit(&mut self, output: Output<'_>) -> io::Result<()> {
-        match output {
-            Output::Part(part) => self
-                .parts
-                .push((part.name.to_owned(), part.bytes.to_owned())),
-            Output::Record(record) => self.records.push(record),
-        }
-        Ok(())
+    fn read(
+        &mut self,
+        source: &LocalSource,
+        count: u32,
+        selection: Option<Selection<'_>>,
+        mut budget: u64,
+    ) -> io::Result<Exported> {
+        let parts = &mut self.parts;
+        let records = &mut self.records;
+        export(
+            source,
+            ID,
+            count,
+            selection,
+            &mut budget,
+            &|| false,
+            Output {
+                members: Some(&mut |name, write| {
+                    let mut bytes = Vec::new();
+                    write(&mut bytes)?;
+                    parts.push((name.to_owned(), bytes));
+                    Ok(())
+                }),
+                record: &mut |record| {
+                    records.push(record);
+                    Ok(())
+                },
+            },
+        )
     }
 }
 
@@ -68,10 +88,7 @@ fn capture_bundle_decodes_the_pinned_java_long_window_and_keeps_the_cap() {
     fs::write(&part, JAVA_LONG_WINDOW).unwrap();
     let source = open_document(&fixture.journal).unwrap();
     let mut captured = Captured::default();
-    let exported = export(&source, ID, 1, None, &mut 2048, &|| false, |event| {
-        captured.emit(event)
-    })
-    .unwrap();
+    let exported = captured.read(&source, 1, None, 2048).unwrap();
     assert!(!exported.partial);
     assert_eq!(
         captured.parts,
@@ -90,12 +107,7 @@ fn capture_bundle_decodes_the_pinned_java_long_window_and_keeps_the_cap() {
     let mut excessive = JAVA_LONG_WINDOW.to_vec();
     excessive[5] = 0x89; // 144 MiB, beyond the bundle's allowed Java window.
     fs::write(part, excessive).unwrap();
-    assert!(
-        export(&source, ID, 1, None, &mut 2048, &|| false, |_| panic!(
-            "oversized window accepted"
-        ))
-        .is_err()
-    );
+    assert!(captured.read(&source, 1, None, 2048).is_err());
 }
 
 #[test]
@@ -146,10 +158,7 @@ fn capture_bundle_unfiltered_copies_exact_decoded_bytes_and_masks_preview() {
     .unwrap();
     let source = open_document(&fixture.journal).unwrap();
     let mut captured = Captured::default();
-    let exported = export(&source, ID, 3, None, &mut (1 << 20), &|| false, |event| {
-        captured.emit(event)
-    })
-    .unwrap();
+    let exported = captured.read(&source, 3, None, 1 << 20).unwrap();
     assert_eq!(exported.command_count, 1);
     assert!(exported.partial);
     assert!(exported.screenshot_refs.is_empty());
@@ -210,16 +219,7 @@ fn capture_bundle_filtered_parts_preserve_headers_and_apply_both_constraints() {
     };
     let source = open_document(&fixture.journal).unwrap();
     let mut captured = Captured::default();
-    let exported = export(
-        &source,
-        ID,
-        4,
-        Some(selection),
-        &mut (1 << 20),
-        &|| false,
-        |event| captured.emit(event),
-    )
-    .unwrap();
+    let exported = captured.read(&source, 4, Some(selection), 1 << 20).unwrap();
     assert!(exported.partial);
     assert_eq!(exported.command_count, 1);
     assert_eq!(
@@ -273,21 +273,14 @@ fn capture_bundle_reports_missing_parts_and_rejects_decode_limits_or_corruption(
     fs::write(&part, &encoded).unwrap();
     let source = open_document(&fixture.journal).unwrap();
     let mut captured = Captured::default();
-    assert!(
-        export(&source, ID, 3, None, &mut 1024, &|| false, |event| captured
-            .emit(event))
-        .is_err()
-    );
+    assert!(captured.read(&source, 3, None, 1024).is_err());
     assert!(captured.parts.is_empty() && captured.records.is_empty());
-    let exported = export(&source, ID, 3, None, &mut (1 << 20), &|| false, |event| {
-        captured.emit(event)
-    })
-    .unwrap();
+    let exported = captured.read(&source, 3, None, 1 << 20).unwrap();
     assert!(exported.partial);
     assert_eq!(captured.parts.len(), 1);
     assert_eq!(captured.parts[0].0, "session-log-3.json");
     fs::write(&part, &encoded[..encoded.len() - 4]).unwrap();
-    assert!(export(&source, ID, 3, None, &mut (1 << 20), &|| false, |_| Ok(())).is_err());
+    assert!(captured.read(&source, 3, None, 1 << 20).is_err());
 }
 
 #[test]
@@ -306,20 +299,95 @@ fn capture_bundle_cancels_between_records_and_refuses_foreign_part_headers() {
         None,
         &mut 2048,
         &|| stopped.get(),
-        |event| {
-            assert!(matches!(event, Output::Record(_)));
-            stopped.set(true);
-            Ok(())
+        Output {
+            members: None,
+            record: &mut |_| {
+                stopped.set(true);
+                Ok(())
+            },
         },
     );
     assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::Interrupted));
     fs::write(&part, original.replace(ID, "foreign-id")).unwrap();
     assert!(
-        export(&source, ID, 1, None, &mut 2048, &|| false, |_| panic!(
-            "foreign log output"
-        ))
+        export(
+            &source,
+            ID,
+            1,
+            None,
+            &mut 2048,
+            &|| false,
+            Output {
+                members: None,
+                record: &mut |_| panic!("foreign log output"),
+            }
+        )
         .is_err()
     );
     assert!(ScreenshotRef::parse("screenshots/../elsewhere.png").is_none());
     assert!(ScreenshotRef::parse("screenshots/shot-000001.ORIG.png").is_none());
+}
+
+#[test]
+fn capture_bundle_streams_an_oversized_unfiltered_line_and_continues_scanning() {
+    let fixture = Scratch::new();
+    let long = " ".repeat(2 * MAX_LINE_BYTES as usize);
+    let row =
+        format!("{{\"seq\":1,\"t\":\"{TIME}\",\"k\":\"out\",\"x\":\"after the long line\"}}\n");
+    let original = format!("{}{long}\n{row}{JSON_FOOTER}", header(1, Format::Json));
+    fs::write(fixture.journal.join("session-log.json"), &original).unwrap();
+    let source = open_document(&fixture.journal).unwrap();
+    let mut captured = Captured::default();
+    let result = captured.read(&source, 1, None, 3 * MAX_LINE_BYTES).unwrap();
+    assert!(result.partial);
+    assert_eq!(
+        captured.parts,
+        [("session-log.json".into(), original.into_bytes())]
+    );
+    assert_eq!(captured.records.len(), 1);
+    assert_eq!(captured.records[0].record.text, "after the long line");
+}
+
+#[test]
+fn capture_bundle_rejects_an_identical_replacement_between_filtered_passes() {
+    let fixture = Scratch::new();
+    let path = fixture.journal.join("session-log.json");
+    let row = format!("{{\"seq\":1,\"t\":\"{TIME}\",\"k\":\"out\"}}\n");
+    let original = format!("{}{row}{JSON_FOOTER}", header(1, Format::Json));
+    fs::write(&path, &original).unwrap();
+    let source = open_document(&fixture.journal).unwrap();
+    let ranges = Ranges::new([(Some(1), None)]);
+    let mut replaced = false;
+    let mut records = 0;
+    let error = export(
+        &source,
+        ID,
+        1,
+        Some(Selection {
+            ranges: &ranges,
+            matches_time: &|_| true,
+        }),
+        &mut 2048,
+        &|| false,
+        Output {
+            members: Some(&mut |_, write| {
+                fs::rename(&path, path.with_extension("previous"))?;
+                fs::write(&path, &original)?;
+                replaced = true;
+                let mut bytes = Vec::new();
+                let result = write(&mut bytes);
+                assert!(bytes.is_empty());
+                result
+            }),
+            record: &mut |_| {
+                records += 1;
+                Ok(())
+            },
+        },
+    )
+    .err()
+    .expect("the replaced log must invalidate the export");
+    assert!(replaced);
+    assert_eq!(records, 1);
+    assert!(error.to_string().contains("changed"));
 }

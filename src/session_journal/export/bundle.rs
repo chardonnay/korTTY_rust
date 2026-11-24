@@ -9,7 +9,7 @@ use roxmltree::Node;
 
 use crate::private_files::Directory;
 
-use super::super::capture::bundle as capture;
+use super::super::capture::bundle::{self as capture, MemberData, WriteMember};
 use super::super::viewer::screenshot::open_published_image;
 use super::super::{DOCUMENT, MAX_PNG_BYTES};
 use super::{
@@ -23,8 +23,6 @@ mod xml;
 const MAX_CAPTURE_INPUT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_SCREENSHOT_REFERENCES: usize = 4096;
 const MAX_INLINE_PNG_BYTES: usize = 24 * 1024 * 1024;
-
-type WriteMember<'a> = dyn FnMut(&str, &[u8]) -> io::Result<()> + 'a;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BundleStats {
@@ -41,12 +39,21 @@ impl super::Snapshot {
         &self,
         options: &Options,
         links_allowed: bool,
-        emit: impl FnMut(&str, &[u8]) -> io::Result<()>,
+        mut emit: impl FnMut(&str, &[u8]) -> io::Result<()>,
         cancelled: &dyn Fn() -> bool,
     ) -> io::Result<BundleStats> {
         check_cancelled(cancelled)?;
         self.select_for_export(&options.filter, None, cancelled)?
-            .write_html_bundle(options, links_allowed, emit, cancelled)
+            .write_html_bundle(
+                options,
+                links_allowed,
+                |name, write| {
+                    let mut bytes = Vec::new();
+                    write(&mut bytes)?;
+                    emit(name, &bytes)
+                },
+                cancelled,
+            )
     }
 }
 
@@ -57,7 +64,7 @@ impl Selection<'_> {
         &self,
         options: &Options,
         links_allowed: bool,
-        mut emit: impl FnMut(&str, &[u8]) -> io::Result<()>,
+        mut emit: impl FnMut(&str, &mut MemberData<'_>) -> io::Result<()>,
         cancelled: &dyn Fn() -> bool,
     ) -> io::Result<BundleStats> {
         let (_, stats) = self.render_html(options, links_allowed, Some(&mut emit), cancelled)?;
@@ -116,18 +123,15 @@ impl Selection<'_> {
             selection,
             &mut capture_budget,
             cancelled,
-            |output| match output {
-                capture::Output::Part(part) => match &mut archive {
-                    Some(emit) => emit(part.name, part.bytes),
-                    None => Ok(()),
-                },
-                capture::Output::Record(row) => {
+            capture::Output {
+                members: archive.as_deref_mut(),
+                record: &mut |row| {
                     log.push(
                         &row.record,
                         row.screenshot.as_ref().map(capture::ScreenshotRef::as_str),
                     );
                     Ok(())
-                }
+                },
             },
         )?;
         if captured.partial {
@@ -189,7 +193,7 @@ impl Selection<'_> {
                     match &mut screenshots {
                         html::Screenshots::Relative(paths) => {
                             let emit = archive.as_mut().expect("archive renderer");
-                            emit(path, bytes)?;
+                            emit(path, &mut |output| output.write_all(bytes))?;
                             paths.insert(path.to_owned());
                         }
                         html::Screenshots::Inline(urls) => {
@@ -211,7 +215,9 @@ impl Selection<'_> {
             let published_xml =
                 xml::rewrite(original, &document, &nodes, selected, options, &stats)?;
             check_cancelled(cancelled)?;
-            emit(DOCUMENT, published_xml.as_bytes())?;
+            emit(DOCUMENT, &mut |output| {
+                output.write_all(published_xml.as_bytes())
+            })?;
         }
         let page = html::render(
             snapshot,
@@ -224,7 +230,9 @@ impl Selection<'_> {
         )?;
         check_cancelled(cancelled)?;
         if let Some(emit) = archive {
-            emit("journal.html", page.as_bytes())?;
+            emit("journal.html", &mut |output| {
+                output.write_all(page.as_bytes())
+            })?;
         }
         snapshot.identity.require_document(source.file())?;
         snapshot.open_current_source()?;

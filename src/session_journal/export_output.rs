@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fmt;
-use std::io::{self, Cursor, Seek, Write};
+use std::io::{self, BufWriter, Cursor, Seek, Write};
 use std::path::PathBuf;
 
 use zeroize::Zeroizing;
@@ -16,6 +16,7 @@ use crate::snippets::{
     recipients::Choice,
 };
 
+use super::capture::bundle::MemberData;
 use super::export::{Markdown, Options, Selection, Snapshot, TopicSelection};
 use super::{MAX_CATALOG_ROWS, check_path};
 
@@ -439,14 +440,24 @@ impl Batch<'_> {
             Some(password) => files.with_aes_encryption(AesMode::Aes256, password),
             None => files,
         };
-        let mut write_member = |name: &str, bytes: &[u8]| -> io::Result<()> {
+        let mut write_member = |name: &str, write: &mut MemberData<'_>| -> io::Result<()> {
             check_cancelled(self.cancelled)?;
             if !name.split('/').all(valid_component) || !members.insert(name.to_lowercase()) {
                 return Err(invalid("Invalid or duplicate journal archive member name"));
             }
-            budget.include_file(bytes.len())?;
+            budget.include_file(0)?;
             zip.start_file(name, files)?;
-            write_bytes(&mut zip, bytes, self.cancelled)
+            let member = ArchiveMember {
+                output: CancelWriter {
+                    file: &mut zip,
+                    cancelled: self.cancelled,
+                },
+                budget: &mut budget,
+            };
+            let mut member = BufWriter::with_capacity(64 * 1024, member);
+            let result = write(&mut member).and_then(|()| member.flush());
+            check_cancelled(self.cancelled)?;
+            result
         };
         let mut journals = journals.into_iter();
         for _ in 0..self.selected_count {
@@ -501,18 +512,24 @@ impl Batch<'_> {
                         &self.options.branding,
                         self.cancelled,
                     )?;
-                    write_member(&format!("{stem}.pdf"), &pdf.bytes)?;
+                    write_member(&format!("{stem}.pdf"), &mut |output| {
+                        write_bytes(output, &pdf.bytes, self.cancelled)
+                    })?;
                     pdf.skipped_assets
                 }
                 Format::Markdown => {
                     let folder = asset_folder(&stem)?;
                     let markdown = selection.render(self.options, &folder)?;
-                    write_member(&format!("{stem}.md"), markdown.text.as_bytes())?;
+                    write_member(&format!("{stem}.md"), &mut |output| {
+                        write_bytes(output, markdown.text.as_bytes(), self.cancelled)
+                    })?;
                     for asset in markdown.assets {
                         if !valid_component(&asset.name) {
                             return Err(invalid("Invalid journal export asset name"));
                         }
-                        write_member(&format!("{folder}/{}", asset.name), &asset.bytes)?;
+                        write_member(&format!("{folder}/{}", asset.name), &mut |output| {
+                            write_bytes(output, &asset.bytes, self.cancelled)
+                        })?;
                     }
                     markdown.skipped_assets
                 }
@@ -520,11 +537,11 @@ impl Batch<'_> {
                     let stats = selection.write_html_bundle(
                         self.options,
                         self.links_allowed,
-                        |name, bytes| {
+                        |name, write| {
                             if self.selected_count == 1 {
-                                write_member(name, bytes)
+                                write_member(name, write)
                             } else {
-                                write_member(&format!("{stem}/{name}"), bytes)
+                                write_member(&format!("{stem}/{name}"), write)
                             }
                         },
                         self.cancelled,
@@ -577,14 +594,42 @@ impl Budget {
     }
 
     fn include_file(&mut self, size: usize) -> io::Result<()> {
+        self.check_bytes(size)?;
         self.files = self.files.saturating_add(1);
-        self.bytes = self.bytes.saturating_add(size);
-        if self.bytes > MAX_BATCH_BYTES || self.files > MAX_BATCH_FILES {
-            return Err(invalid(
-                "The journal export exceeds the 128 MiB or 4096 file limit",
-            ));
+        if self.files > MAX_BATCH_FILES {
+            return Err(batch_limit());
+        }
+        self.bytes += size;
+        Ok(())
+    }
+
+    fn check_bytes(&self, size: usize) -> io::Result<()> {
+        if self.bytes.saturating_add(size) > MAX_BATCH_BYTES {
+            return Err(batch_limit());
         }
         Ok(())
+    }
+}
+
+fn batch_limit() -> io::Error {
+    invalid("The journal export exceeds the 128 MiB or 4096 file limit")
+}
+
+struct ArchiveMember<'a, W> {
+    output: CancelWriter<'a, W>,
+    budget: &'a mut Budget,
+}
+
+impl<W: Write> Write for ArchiveMember<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.budget.check_bytes(bytes.len())?;
+        let written = self.output.write(bytes)?;
+        self.budget.bytes += written;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.flush()
     }
 }
 
@@ -736,7 +781,7 @@ impl<W: Write> Write for CancelWriter<'_, W> {
 }
 
 fn write_bytes(
-    output: &mut impl Write,
+    output: &mut (impl Write + ?Sized),
     bytes: &[u8],
     cancelled: &dyn Fn() -> bool,
 ) -> io::Result<()> {
