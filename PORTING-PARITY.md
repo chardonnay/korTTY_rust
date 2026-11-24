@@ -1134,6 +1134,41 @@ Windows ARM64 and Apple Silicon each passed 40 focused tests. Apple
 Silicon also passed strict Clippy for the application and test targets.
 [Apple Silicon verification](target/verification/20261124-journal-editor-macos-verified.log)
 · [Windows ARM64 verification](target/verification/20261124-journal-editor-windows-verified.log)
+
+## November 24 SSH connection AI editor
+
+The saved SSH editor follows Java's order for the profile, execution
+switch, connection memory, design and skill list. Profile and design
+controls use the same column. The design remains visible in a read-only
+field when agent execution is disabled for the connection. Available
+profiles are ordered by name and an unavailable assignment stays in the
+picker for that profile.
+[Tagged Java connection editor](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ConnectionEditDialog.java)
+· [Rust connection editor](src/connection_window/terminal_overrides.rs)
+
+The scrollable skill list groups connection-targeted skills first and
+sorts each group by name. The search checks the displayed label,
+description and tags. Agent-targeted skills can be assigned explicitly.
+Disabled skills remain identifiable and ineligible for runtime prompts
+while disabled. Hidden or deleted assignments survive a save and may
+be removed explicitly in the Rust editor.
+[Native skill inventory](src/ai_manager/skills.rs)
+
+The Windows comparison used the released Java v2.26.0 dialog under
+x86-64 emulation and an isolated Rust ARM64 preview. Both listed the
+connection-targeted Zebra before Atlas and Beacon. A description-only
+search for `release ledger` found Atlas in both. In Rust, `worksheet`
+found Beacon by its tag. Saving while that filter was active retained
+the newly assigned Atlas, the previous Zebra and the unavailable
+assignment. A separate fixture with execution disabled showed the
+current design in the read-only field.
+[Windows ARM64 preview build](target/verification/20261124-connection-ai-editor-windows-build-final.log)
+
+Windows ARM64 and Apple Silicon each passed 46 focused tests. Apple
+Silicon also passed strict Clippy. The tests covered skill order,
+metadata matching and disabled-skill eligibility.
+[Apple Silicon verification](target/verification/20261124-connection-ai-editor-macos-final.log)
+· [Windows ARM64 verification](target/verification/20261124-connection-ai-editor-windows-tests.log)
 [Windows ARM64 preview build](target/verification/20261124-connection-editor-tabs-windows-preview.log)
 · [Windows ARM64 opt-in tests](target/verification/20261124-connection-editor-tabs-windows-opt-in.log)
 

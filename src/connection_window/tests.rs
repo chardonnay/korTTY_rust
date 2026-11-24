@@ -1132,7 +1132,7 @@ fn ssh_editor_journal_and_ai_tabs_keep_their_drafts_when_terminal_defaults_are_r
             vault_unlocked: false,
             ai_profiles: &[],
             java_ai_profiles: &[],
-            ai_skills: &[(17, "Release check".into())],
+            ai_skills: &[],
             ai_agent_designs: &[],
             highlighting: HighlightChoices::default(),
             themes: &themes,

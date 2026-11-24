@@ -266,8 +266,9 @@ pub(crate) use memory::prompt::{MemoryPrompt, Origin as MemoryOrigin};
 pub(crate) use profiles::Message as ProfileMessageForTest;
 pub(crate) use skills::statistics::Surface as SkillUsageSurface;
 pub(crate) use skills::{
-    Options as SkillRuleOptions, SavedSkillRule, SkillCandidate, SkillGuidance, SkillRuleProposal,
-    SkillRuleTarget, SkillSelection, SkillUsageReceipt,
+    ConnectionChoice as ConnectionSkillChoice, Options as SkillRuleOptions, SavedSkillRule,
+    SkillCandidate, SkillGuidance, SkillRuleProposal, SkillRuleTarget, SkillSelection,
+    SkillUsageReceipt,
 };
 
 pub(crate) fn shutdown_skill_statistics() {
@@ -1397,6 +1398,10 @@ impl Configuration {
 
     pub(crate) fn connection_skill_choices(&self) -> Vec<(u64, String)> {
         self.skills.choices()
+    }
+
+    pub(crate) fn connection_editor_skill_choices(&self) -> Vec<ConnectionSkillChoice<'_>> {
+        self.skills.connection_editor_choices()
     }
 
     pub(crate) fn snippet_skill_choices(&self) -> Vec<(u64, String)> {

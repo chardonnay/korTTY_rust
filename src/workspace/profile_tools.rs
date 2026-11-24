@@ -497,9 +497,11 @@ impl Workspace {
                     })
                     .collect()
             });
-            let ai_skills = self
-                .ai_configuration()
-                .map_or_else(Vec::new, |config| config.connection_skill_choices());
+            let skill_config = self.ai_configuration();
+            let ai_skills = skill_config.as_deref().map_or_else(
+                Vec::new,
+                crate::ai_manager::Configuration::connection_editor_skill_choices,
+            );
             let ai_agent_designs = self
                 .window_settings
                 .ai_agent_designs

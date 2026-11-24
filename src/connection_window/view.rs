@@ -43,7 +43,7 @@ pub(crate) struct ViewChoices<'a> {
     pub(crate) vault_unlocked: bool,
     pub(crate) ai_profiles: &'a [(Option<u64>, ProfileRef, String)],
     pub(crate) java_ai_profiles: &'a [(crate::ai_manager::JavaProfileSource, ProfileRef, String)],
-    pub(crate) ai_skills: &'a [(u64, String)],
+    pub(crate) ai_skills: &'a [crate::ai_manager::ConnectionSkillChoice<'a>],
     pub(crate) ai_agent_designs: &'a [AgentDesignChoice],
     pub(crate) highlighting: HighlightChoices<'a>,
     pub(crate) themes: &'a Themes,

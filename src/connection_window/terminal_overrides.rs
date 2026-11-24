@@ -1,6 +1,8 @@
 use std::fmt;
 
-use iced::widget::{button, checkbox, column, container, pick_list, row, text, text_input};
+use iced::widget::{
+    button, checkbox, column, container, keyed_column, pick_list, row, scrollable, text, text_input,
+};
 use iced::{Element, Length};
 use kortty_terminal::TextEncoding;
 
@@ -56,6 +58,7 @@ pub(super) struct Draft {
     colors: [String; 20],
     journal: journal_settings::Draft,
     ai_skill_search: String,
+    ai_skill_search_revision: u64,
 }
 
 impl Draft {
@@ -73,6 +76,7 @@ impl Draft {
             options: options.clone(),
             journal: journal_settings::Draft::new(options.journal),
             ai_skill_search: String::new(),
+            ai_skill_search_revision: 0,
             font: options.font_family.clone().unwrap_or_default(),
             size: options
                 .font_size
@@ -187,6 +191,7 @@ impl Draft {
             Edit::OpenMemory => return false,
             Edit::AiSkillSearch(value) => {
                 self.ai_skill_search = value.chars().take(160).collect();
+                self.ai_skill_search_revision = self.ai_skill_search_revision.wrapping_add(1);
                 return false;
             }
             Edit::AiSkill(id, enabled) => {
@@ -280,9 +285,18 @@ impl Draft {
         view: &ViewChoices<'_>,
         ssh_profile: Option<u64>,
     ) -> Element<'_, Edit> {
-        let skills = view.ai_skills;
-        let (ai_choices, selected) =
+        let ssh = ssh_profile.is_some();
+        let (mut ai_choices, mut selected) =
             ai_profile_choices(view.ai_profiles, self.options.ai_profile.as_ref());
+        if ssh {
+            ai_choices[0].1 = "Use default profile".into();
+            ai_choices[1..].sort_by_cached_key(|item| item.1.to_lowercase());
+            if selected.0.is_none() {
+                selected = ai_choices[0].clone();
+            } else if !ai_choices.contains(&selected) {
+                ai_choices.push(selected.clone());
+            }
+        }
         let java_ai_profile = self.options.java_ai_profile.as_ref().map(|hint| {
             let target = hint.source().and_then(|source| {
                 view.java_ai_profiles
@@ -333,62 +347,111 @@ impl Draft {
                 designs.push(unavailable.clone());
                 Some(unavailable)
             });
-        let design: Element<'_, Edit> = if ssh_profile.is_some() && self.options.ai_agent_disabled {
-            text(selected_design.map_or_else(|| "Use default".into(), |choice| choice.name))
-                .style(text::secondary)
-                .into()
+        let design: Element<'_, Edit> = if ssh && self.options.ai_agent_disabled {
+            container(row![
+                text(selected_design.map_or_else(|| "Use default".into(), |choice| choice.name))
+                    .width(Length::Fill)
+                    .size(13)
+                    .style(text::secondary),
+                text("▾").size(13).style(text::secondary),
+            ])
+            .padding(6)
+            .width(Length::Fill)
+            .style(container::bordered_box)
+            .into()
         } else {
             pick_list(designs, selected_design, |choice| {
                 Edit::AiAgentDesign((!choice.id.is_empty()).then_some(choice.id))
             })
             .width(Length::Fill)
+            .text_size(13)
             .into()
         };
-        let mut choices = column![
-            labeled(
-                "AI chat profile",
-                pick_list(ai_choices, Some(selected), |choice| Edit::AiProfile(
-                    choice.0
-                ))
-                .width(Length::Fill)
-            ),
-            java_ai_profile,
-            checkbox(self.options.ai_agent_disabled)
-                .label("Disable terminal AI agent execution for this connection")
-                .on_toggle(Edit::AiAgentDisabled),
-            ssh_profile.map(|id| column![
-                button("Connection memory…").on_press_maybe((id != 0).then_some(Edit::OpenMemory)),
-                (id == 0).then(|| text("Save the connection to open its memory.").size(13)),
+        let profile = pick_list(ai_choices, Some(selected), |choice| {
+            Edit::AiProfile(choice.0)
+        })
+        .width(Length::Fill);
+        let agent_disabled = checkbox(self.options.ai_agent_disabled)
+            .label("Disable terminal AI agent execution for this connection")
+            .on_toggle(Edit::AiAgentDisabled);
+        let choices = if let Some(id) = ssh_profile {
+            column![
+                text("AI profile").size(13),
+                profile.text_size(13),
+                java_ai_profile,
+                ai_hint("A stored profile assignment is kept if the profile becomes unavailable."),
+                agent_disabled.text_size(13),
+                ai_hint("Ask and other AI chat features remain available when agent execution is disabled."),
+                button("Edit connection memory…").on_press_maybe((id != 0).then_some(Edit::OpenMemory)),
+                if id == 0 {
+                    ai_hint("Save the connection to open its memory.")
+                } else {
+                    ai_hint("Connection memory provides rules for AI requests on this connection.")
+                },
+                text("AI agent design").size(13),
+                design,
+                ai_hint("Choose how agent runs appear in this connection."),
+                text("Connection skills").size(13),
+                ai_hint("Assign skills to this connection. Skills scoped to connections only apply where assigned."),
             ]
-            .spacing(4)),
-            labeled("AI agent design", design),
-            text("Assigned AI skills").size(14),
-        ]
-        .spacing(8);
-        if skills.is_empty() && self.options.ai_skills.is_empty() {
+            .spacing(8)
+        } else {
+            column![
+                labeled("AI chat profile", profile),
+                java_ai_profile,
+                agent_disabled,
+                labeled("AI agent design", design),
+                text("Assigned AI skills").size(14),
+            ]
+            .spacing(8)
+        };
+        self.ai_skill_list(choices, view.ai_skills, ssh)
+    }
+
+    fn ai_skill_list<'a>(
+        &'a self,
+        choices: iced::widget::Column<'a, Edit>,
+        skills: &[crate::ai_manager::ConnectionSkillChoice<'_>],
+        ssh: bool,
+    ) -> Element<'a, Edit> {
+        let skills = skills
+            .iter()
+            .filter(|choice| ssh || choice.available_to_quick_connect());
+        if skills.clone().next().is_none() && self.options.ai_skills.is_empty() {
             return choices
                 .push(text("No skills available").style(text::secondary))
                 .into();
         }
         let query = self.ai_skill_search.trim().to_lowercase();
         let matches = |name: &str| name.to_lowercase().contains(&query);
-        choices = choices.push(
+        let choices = choices.push(
             text_input("Find skills", &self.ai_skill_search)
                 .on_input(Edit::AiSkillSearch)
                 .width(Length::Fill),
         );
         let mut skill_rows: Vec<Element<'_, Edit>> = Vec::new();
-        for (id, name) in skills.iter().filter(|(_, name)| matches(name)) {
-            let id = *id;
+        for choice in skills.clone().filter(|choice| {
+            if ssh {
+                choice.matches(&query)
+            } else {
+                matches(choice.name())
+            }
+        }) {
+            let id = choice.id;
+            let name = if ssh {
+                choice.label()
+            } else {
+                choice.name().to_owned()
+            };
             skill_rows.push(
                 checkbox(self.options.ai_skills.contains(&id))
-                    .label(name.clone())
+                    .label(name)
                     .on_toggle(move |enabled| Edit::AiSkill(id, enabled))
                     .into(),
             );
         }
         for &id in &self.options.ai_skills {
-            if !skills.iter().any(|(available, _)| *available == id) {
+            if !skills.clone().any(|choice| choice.id == id) {
                 let label = format!("Unavailable skill {id}");
                 if matches(&label) {
                     skill_rows.push(
@@ -403,7 +466,18 @@ impl Draft {
         if skill_rows.is_empty() {
             skill_rows.push(text("No matching skills").style(text::secondary).into());
         }
-        choices.push(column(skill_rows).spacing(5)).into()
+        let rows = column(skill_rows).spacing(5);
+        if ssh {
+            let list =
+                container(scrollable(container(rows).width(Length::Fill).padding(8)).height(200))
+                    .width(Length::Fill)
+                    .style(container::bordered_box);
+            choices
+                .push(keyed_column![(self.ai_skill_search_revision, list)])
+                .into()
+        } else {
+            choices.push(rows).into()
+        }
     }
 
     pub(super) fn view(&self, view: &ViewChoices<'_>, combined: bool) -> Element<'_, Edit> {
@@ -779,6 +853,10 @@ fn labeled<'a>(label: &'static str, control: impl Into<Element<'a, Edit>>) -> El
         .align_y(iced::Alignment::Center)
         .spacing(8)
         .into()
+}
+
+fn ai_hint(label: &'static str) -> iced::widget::Text<'static> {
+    text(label).size(13).style(text::secondary)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
