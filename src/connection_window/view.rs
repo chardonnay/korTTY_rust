@@ -834,7 +834,7 @@ impl ConnectionWindow {
         let profiles = self.store.connections();
         let shared_count = self.shared_entries().count();
         let mut items = column![
-            heading("Library"),
+            sidebar_heading("Library"),
             self.scope_item(
                 Scope::All,
                 Icon::ViewList,
@@ -859,15 +859,8 @@ impl ConnectionWindow {
                 self.recent_entries().len(),
                 0
             ),
-            self.scope_item(
-                Scope::Teamwork,
-                Icon::Teamwork,
-                "Teamwork connections",
-                shared_count,
-                0
-            ),
         ]
-        .spacing(2);
+        .spacing(1);
         if self.open_counts.is_some() {
             items = items.push(
                 self.scope_item(
@@ -889,6 +882,10 @@ impl ConnectionWindow {
                             .local_profiles()
                             .iter()
                             .filter(|entry| self.open_count(entry.id) > 0)
+                            .count()
+                        + self
+                            .shared_entries()
+                            .filter(|entry| self.shared_open_count(entry.identity()) > 0)
                             .count(),
                     0,
                 ),
@@ -899,12 +896,13 @@ impl ConnectionWindow {
             profiles
                 .iter()
                 .map(|entry| entry.id)
-                .chain(self.store.serial_profiles().iter().map(|entry| entry.id)),
+                .chain(self.store.serial_profiles().iter().map(|entry| entry.id))
+                .chain(self.store.local_profiles().iter().map(|entry| entry.id)),
         );
         let mut folders: Vec<_> = self.store.groups().collect();
         folders.sort_by_cached_key(|path| path.to_lowercase());
         if !folders.is_empty() {
-            items = items.push(heading("Folders"));
+            items = items.push(sidebar_heading("Folders"));
             for path in folders {
                 let item = self.scope_item(
                     Scope::Group(path.to_owned()),
@@ -927,7 +925,7 @@ impl ConnectionWindow {
         if !tags.is_empty() {
             let chips = tags
                 .into_iter()
-                .fold(row![].spacing(5), |chips, (key, label)| {
+                .fold(row![].spacing(6), |chips, (key, label)| {
                     let scope = Scope::Tag(key);
                     chips.push(
                         button(chip(Icon::Tag, label))
@@ -942,12 +940,26 @@ impl ConnectionWindow {
                             })),
                     )
                 });
-            items = items.push(heading("Tags")).push(chips.wrap());
+            items = items.push(sidebar_heading("Tags")).push(chips.wrap());
         }
-        scrollable(items.padding(8))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
+        items = items
+            .push(sidebar_heading("Teamwork"))
+            .push(self.scope_item(
+                Scope::Teamwork,
+                Icon::Teamwork,
+                "Teamwork connections",
+                shared_count,
+                0,
+            ));
+        scrollable(items.padding(iced::Padding {
+            top: 6.0,
+            bottom: 10.0,
+            left: 6.0,
+            right: 6.0,
+        }))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
     }
 
     fn scope_item<'a>(
@@ -960,7 +972,6 @@ impl ConnectionWindow {
     ) -> Element<'a, Message> {
         button(
             row![
-                space::horizontal().width((indent * 14) as u32),
                 icon.widget(17, true),
                 text(label)
                     .size(14)
@@ -968,12 +979,17 @@ impl ConnectionWindow {
                     .wrapping(text::Wrapping::None),
                 text(count.to_string()).size(12).style(text::secondary),
             ]
-            .spacing(7)
+            .spacing(8)
             .align_y(Alignment::Center),
         )
         .style(selectable(self.scope == scope))
         .width(Length::Fill)
-        .padding([5, 7])
+        .padding(iced::Padding {
+            top: 4.0,
+            bottom: 4.0,
+            left: 8.0 + indent as f32 * 16.0,
+            right: 8.0,
+        })
         .clip(true)
         .on_press_maybe(self.can_browse().then_some(Message::Scope(scope)))
         .into()
@@ -1259,6 +1275,7 @@ impl ConnectionWindow {
         } else if let Some(entry) = self.selected_shared() {
             let endpoint = &entry.connection.login.endpoint;
             let blocked = entry.connection.blocked_server(&self.server_access);
+            let open = self.shared_open_count(entry.identity());
             column![
                 text(&entry.connection.name).size(21),
                 row![Icon::Teamwork.widget(17, true), text("Shared (Teamwork)")].spacing(6),
@@ -1267,6 +1284,7 @@ impl ConnectionWindow {
                     endpoint.username, endpoint.host, endpoint.port
                 )),
                 text(format!("Source  {}", entry.source())).size(13),
+                fact("Open tabs", open.to_string()),
                 blocked.map(|(host, port)| text(server_policy_note(host, port)).size(13)),
                 entry.last_used_at.map(|millis| {
                     let when = jiff::Timestamp::from_millisecond(millis as i64).map_or_else(
@@ -1379,6 +1397,7 @@ impl ConnectionWindow {
         let endpoint = &entry.connection.login.endpoint;
         let key = RowKey::Shared(entry.identity.clone());
         let blocked = entry.connection.blocked_server(&self.server_access);
+        let open = self.shared_open_count(entry.identity());
         let name = text(&entry.connection.name)
             .size(15)
             .wrapping(text::Wrapping::None);
@@ -1401,6 +1420,7 @@ impl ConnectionWindow {
                 self.store
                     .is_teamwork_favorite(entry.identity())
                     .then(|| Icon::Star.widget(16, true)),
+                (open > 0).then(|| text(format!("{open} open")).size(12)),
                 blocked.map(|(host, port)| blocked_server_badge(host, port)),
             ]
             .align_y(Alignment::Center)
@@ -2011,6 +2031,25 @@ fn favorite_tool(favorite: bool, enabled: bool) -> Element<'static, Message> {
         },
         enabled.then_some(Message::ToggleFavorite),
     )
+}
+
+fn sidebar_heading(label: &'static str) -> Element<'static, Message> {
+    container(
+        text(label)
+            .size(12)
+            .style(text::secondary)
+            .font(iced::Font {
+                weight: iced::font::Weight::Bold,
+                ..iced::Font::DEFAULT
+            }),
+    )
+    .padding(iced::Padding {
+        top: 10.0,
+        bottom: 3.0,
+        left: 8.0,
+        right: 8.0,
+    })
+    .into()
 }
 
 fn heading<'a>(label: impl text::IntoFragment<'a>) -> Element<'a, Message> {

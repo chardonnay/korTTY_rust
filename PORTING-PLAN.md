@@ -203,10 +203,13 @@ masking in an incognito tab. The [isolation entry](PORTING-PARITY.md#november-24
 records the effective startup or replacement stream isolation. Verify the
 rotation settings in native desktop editors, including managed values and
 rotation across a reconnect.
-The Manager's separate
-Teamwork sidebar group and editor form alignment remain open. The earlier
-Windows desktop check covered the three-pane Manager, its Map view, opening
-the editor and navigating between editor tabs.
+The [Teamwork sidebar update](PORTING-PARITY.md#november-24-connection-manager-teamwork-sidebar)
+places Teamwork after the library, folders and tags, and includes non-incognito
+Teamwork sessions in Open now. The expandable Teamwork branch in the
+results tree, the authentication bar placement within the center pane,
+and the remaining editor form alignment still need work.
+Compare the Manager and its sidebar on macOS and Linux at the Java
+reference scale.
 
 The AI Manager now uses the Java window size, a search overlay, underlined
 primary tabs and General subpages. The profile form retains its four

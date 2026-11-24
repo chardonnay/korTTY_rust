@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,7 +7,7 @@ use iced::{Element, Size, Task, window};
 use kortty_vault::Secret;
 
 use crate::connection_store::{Connection, LocalProfile, SerialProfile, Store};
-use crate::connection_window::{self, ConnectionWindow, CredentialChoice, ViewChoices};
+use crate::connection_window::{self, ConnectionWindow, CredentialChoice, OpenCounts, ViewChoices};
 use crate::profile;
 use crate::ssh_dialog::LoginTarget;
 use crate::terminal_effects::Effect;
@@ -268,27 +268,33 @@ impl Workspace {
         if self.connection_managers.is_empty() {
             return;
         }
-        let mut counts = BTreeMap::new();
+        let mut counts = OpenCounts::default();
         for tab in self
             .windows
             .values()
             .flat_map(|window| window.terminal_tabs())
             .filter(|tab| !tab.incognito)
         {
-            let connections: BTreeSet<_> = tab
-                .grid
-                .iter()
-                .filter_map(|(_, id)| {
-                    let pane = self.sessions.get(id)?;
-                    pane.ssh
-                        .as_ref()
-                        .and_then(SshTarget::saved_id)
-                        .or_else(|| pane.saved_serial.as_ref().map(|profile| profile.id))
-                        .or_else(|| pane.saved_local.as_ref().map(|profile| profile.id))
-                })
-                .collect();
-            for id in connections {
-                *counts.entry(id).or_default() += 1;
+            let mut saved = BTreeSet::new();
+            let mut teamwork = BTreeSet::new();
+            for pane in tab.grid.iter().filter_map(|(_, id)| self.sessions.get(id)) {
+                if let Some(shared) = &pane.teamwork_ssh {
+                    teamwork.insert(shared.identity());
+                } else if let Some(id) = pane
+                    .ssh
+                    .as_ref()
+                    .and_then(SshTarget::saved_id)
+                    .or_else(|| pane.saved_serial.as_ref().map(|profile| profile.id))
+                    .or_else(|| pane.saved_local.as_ref().map(|profile| profile.id))
+                {
+                    saved.insert(id);
+                }
+            }
+            for id in saved {
+                *counts.saved.entry(id).or_default() += 1;
+            }
+            for id in teamwork {
+                *counts.teamwork.entry(id.clone()).or_default() += 1;
             }
         }
         for manager in self.connection_managers.values_mut() {

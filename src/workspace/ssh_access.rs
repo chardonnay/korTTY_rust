@@ -280,6 +280,10 @@ impl fmt::Display for DefaultEncoding {
 }
 
 impl TeamworkSelection {
+    pub(super) fn identity(&self) -> &teamwork::Identity {
+        self.route.identity()
+    }
+
     pub(super) fn connection(&self) -> &Connection {
         &self.connection
     }

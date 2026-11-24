@@ -1178,6 +1178,36 @@ covers enforced policy behavior. Rotation limits remain in the porting plan.
 [Tagged Java editor](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ConnectionEditDialog.java)
 · [Rust editor](src/connection_window/form.rs)
 
+## November 24 Connection Manager Teamwork sidebar
+
+Java v2.26.0 places Teamwork in its own sidebar section after Library,
+Folders and Tags. Rust follows this order, with the same folder indentation
+step and separate section headings. A Teamwork entry remains available
+when its shared count is zero. Sidebar folder counts include local shell
+profiles.
+[Tagged Java sidebar implementation](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/ConnectionManagerDialog.java#L857)
+· [Tagged Java screenshot](https://github.com/chardonnay/korTTY/blob/v2.26.0/app-docs/screenshots/main/connection-manager.png)
+· [Rust manager view](src/connection_window/view.rs)
+
+The Library's Open now filter includes Teamwork sessions by source-qualified
+identity. Each open tab contributes once per profile, even when the tab has
+multiple panes for that profile. Incognito tabs and locally hidden Teamwork
+entries stay outside the filter. The list row and inspector show the
+current open-tab count for a shared entry.
+[Workspace count collection](src/workspace/profile_tools.rs)
+
+The native Windows ARM64 preview matched the tagged Java screenshot's
+sidebar order with two local and two shared connections. Selecting Teamwork
+showed the two shared groups. The shared inspector showed its open-tab
+count, the local subfolder and shared tag filtered the expected rows, and
+Open now showed an empty list before any connection was opened.
+[Windows ARM64 desktop verification](target/verification/20261124-connection-manager-teamwork-windows-desktop.log)
+
+Apple Silicon passed 44 focused tests and strict Clippy. The regressions
+cover the Teamwork sidebar action, folder drops, hidden entries in Open
+now, and removal from Open now when the last non-incognito tab closes.
+[Apple Silicon verification](target/verification/20261124-connection-manager-teamwork-macos-native.log)
+
 ## November 24 SSH connection AI keyboard
 
 The AI page accepts Tab and Shift+Tab between available controls,

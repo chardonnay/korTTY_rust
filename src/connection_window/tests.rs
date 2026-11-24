@@ -594,7 +594,7 @@ fn teamwork_favorites_toggle_mixed_selection_and_filter_the_map_and_pdf() {
     let primary_row = RowKey::Shared(primary.clone());
     let mut manager = ConnectionWindow::open(profile.path()).unwrap();
     manager.set_teamwork(catalog.clone(), None);
-    manager.set_open_counts(BTreeMap::new());
+    manager.set_open_counts(OpenCounts::default());
     assert_eq!(manager.favorite_count(), 1);
 
     let _ = manager.update(Message::Select(local));
@@ -604,7 +604,7 @@ fn teamwork_favorites_toggle_mixed_selection_and_filter_the_map_and_pdf() {
     let _ = manager.update(Message::OpenTreeContext(primary_row.clone(), Point::ORIGIN));
     assert_eq!(manager.selected_connection_ids(), vec![local]);
     assert!(manager.selection.contains(&primary_row));
-    manager.set_open_counts(BTreeMap::new());
+    manager.set_open_counts(OpenCounts::default());
     complete_persisted(
         &mut manager,
         Message::TreeContext(Context::Activate(Page::Root, 0)),
@@ -688,6 +688,16 @@ fn teamwork_hide_confirms_separately_and_excludes_hidden_rows_from_every_scope()
 
     let mut manager = ConnectionWindow::open(profile.path()).unwrap();
     manager.set_teamwork(catalog.clone(), None);
+    manager.set_open_counts(OpenCounts {
+        saved: BTreeMap::from([(local, 1)]),
+        teamwork: BTreeMap::from([(identity.clone(), 2)]),
+    });
+    let _ = manager.update(Message::Scope(Scope::Open));
+    assert_eq!(
+        manager.visible_row_keys(),
+        [RowKey::Connection(local), shared.clone()]
+    );
+    let _ = manager.update(Message::Scope(Scope::All));
     assert!(!manager.can_restore_teamwork());
     manager.set_teamwork_available(true);
     assert!(manager.can_restore_teamwork());
@@ -716,6 +726,7 @@ fn teamwork_hide_confirms_separately_and_excludes_hidden_rows_from_every_scope()
         (Scope::Teamwork, 0),
         (Scope::Favorites, 1),
         (Scope::Recent, 1),
+        (Scope::Open, 1),
         (Scope::Tag("prod".into()), 1),
     ] {
         let _ = manager.update(Message::Scope(scope));
@@ -920,11 +931,14 @@ fn library_navigation_and_search_never_leave_a_hidden_connection_connectable() {
         let _ = window.update(Message::Scope(scope));
         assert_eq!(window.selected().map(|entry| entry.id), Some(web));
     }
-    window.set_open_counts(BTreeMap::from([(web, 2)]));
+    window.set_open_counts(OpenCounts {
+        saved: BTreeMap::from([(web, 2)]),
+        ..OpenCounts::default()
+    });
     let _ = window.update(Message::Scope(Scope::Open));
     assert_eq!(window.selected().map(|entry| entry.id), Some(web));
     assert_eq!(window.open_count(web), 2);
-    window.set_open_counts(BTreeMap::new());
+    window.set_open_counts(OpenCounts::default());
     assert!(window.selected().is_none());
 }
 
@@ -1651,15 +1665,9 @@ fn connection_manager_pointer_drags_accept_local_folders_and_refuse_teamwork_sou
         .children()
         .next()
         .unwrap();
-    let sidebar_destination = sidebar
-        .children()
-        .next()
-        .unwrap()
-        .children()
-        .last()
-        .unwrap()
-        .bounds()
-        .center();
+    let sidebar_rows: Vec<_> = sidebar.children().next().unwrap().children().collect();
+    let sidebar_destination = sidebar_rows[sidebar_rows.len() - 3].bounds().center();
+    let sidebar_teamwork = sidebar_rows.last().unwrap().bounds().center();
     let row_point = |key| {
         rows.children()
             .nth(row_index(&key))
@@ -1703,6 +1711,31 @@ fn connection_manager_pointer_drags_accept_local_folders_and_refuse_teamwork_sou
             .iter()
             .all(|message| !matches!(message, Message::TreeMove(..)))
     );
+    assert!(
+        drag(start, sidebar_teamwork)
+            .iter()
+            .all(|message| !matches!(message, Message::TreeMove(..)))
+    );
+    let mut messages = Vec::new();
+    for event in [
+        mouse::Event::ButtonPressed(mouse::Button::Left),
+        mouse::Event::ButtonReleased(mouse::Button::Left),
+    ] {
+        view.as_widget_mut().update(
+            &mut tree,
+            &Event::Mouse(event),
+            layout,
+            mouse::Cursor::Available(sidebar_teamwork),
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &node.bounds(),
+        );
+    }
+    assert!(matches!(
+        messages.as_slice(),
+        [Message::Scope(Scope::Teamwork)]
+    ));
 }
 
 #[test]

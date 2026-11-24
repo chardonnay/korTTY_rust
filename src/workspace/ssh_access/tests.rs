@@ -309,6 +309,64 @@ fn teamwork_ssh_requires_fresh_authentication_and_keeps_the_source_route_through
 }
 
 #[test]
+fn connection_manager_lists_teamwork_sessions_only_while_a_non_private_tab_is_open() {
+    use crate::connection_window::{ConnectionWindow, Message as Manager, Scope};
+    use crate::workspace::profile_tools::ConnectionManager;
+
+    let fixture = TeamworkFixture::new();
+    let catalog = fixture.catalog("shared.example");
+    let selection = fixture.selection(&catalog);
+    let identity = selection.identity().clone();
+    let mut workspace = Workspace::default();
+    let (owner, _) = workspace.open_window(false);
+    let manager = window::Id::unique();
+    let mut connections = ConnectionWindow::open(fixture.0.join("connections.json")).unwrap();
+    connections.set_teamwork(catalog, None);
+    let _ = connections.update(Manager::Scope(Scope::Open));
+    workspace
+        .connection_managers
+        .insert(manager, ConnectionManager::new(owner, connections));
+
+    let open = |workspace: &mut Workspace, incognito| {
+        let session = workspace.store_session(
+            Session::disconnected_ibm(crate::session::IbmKind::Tn3270e),
+            GridSize::default(),
+            FONT,
+        );
+        let pane = workspace.sessions.get_mut(&session).unwrap();
+        pane.ssh = Some(
+            SshTarget::from_imported_route(
+                selection.connection().login.endpoint.clone(),
+                None,
+                IsolationLevel::None,
+            )
+            .unwrap(),
+        );
+        pane.teamwork_ssh = Some(selection.clone());
+        workspace.add_tab_with_privacy(owner, session, incognito);
+        workspace.refresh_connection_counts();
+        workspace.windows[&owner].tab().unwrap().id
+    };
+    let selectable = |workspace: &mut Workspace| {
+        let window = &mut workspace
+            .connection_managers
+            .get_mut(&manager)
+            .unwrap()
+            .window;
+        let _ = window.update(Manager::SelectShared(identity.clone()));
+        window
+            .selected_shared()
+            .is_some_and(|entry| entry.identity() == &identity)
+    };
+    open(&mut workspace, true);
+    assert!(!selectable(&mut workspace));
+    let visible = open(&mut workspace, false);
+    assert!(selectable(&mut workspace));
+    let _ = workspace.update(WorkspaceMessage::CloseTab(owner, visible));
+    assert!(!selectable(&mut workspace));
+}
+
+#[test]
 fn teamwork_reconnect_requires_the_original_shared_route_and_fresh_authentication() {
     let fixture = TeamworkFixture::new();
     let catalog = fixture.catalog("shared.example");

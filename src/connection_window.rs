@@ -143,6 +143,12 @@ pub enum Scope {
     Tag(String),
 }
 
+#[derive(Clone, Default, PartialEq, Eq)]
+pub(crate) struct OpenCounts {
+    pub(crate) saved: BTreeMap<u64, usize>,
+    pub(crate) teamwork: BTreeMap<teamwork::Identity, usize>,
+}
+
 impl Message {
     pub(crate) fn opens_connection_memory(&self) -> bool {
         matches!(
@@ -362,7 +368,7 @@ pub struct ConnectionWindow {
     network_map: network_map::State,
     folder_moves: folder_moves::History,
     collapsed: BTreeSet<String>,
-    open_counts: Option<BTreeMap<u64, usize>>,
+    open_counts: Option<OpenCounts>,
     draft: Option<Draft>,
     serial_draft: Option<serial::Draft>,
     local_draft: Option<local::Draft>,
@@ -604,6 +610,7 @@ impl ConnectionWindow {
                 let in_scope = match &self.scope {
                     Scope::All | Scope::Teamwork => true,
                     Scope::Favorites => self.store.is_teamwork_favorite(entry.identity()),
+                    Scope::Open => self.shared_open_count(entry.identity()) > 0,
                     Scope::Tag(tag) => entry.connection.tag.to_lowercase() == *tag,
                     _ => false,
                 };
@@ -992,7 +999,7 @@ impl ConnectionWindow {
         self.reconcile_selection();
     }
 
-    pub fn set_open_counts(&mut self, counts: BTreeMap<u64, usize>) {
+    pub(crate) fn set_open_counts(&mut self, counts: OpenCounts) {
         if self.open_counts.as_ref() != Some(&counts) {
             self.open_counts = Some(counts);
             self.reconcile_selection();
@@ -1033,7 +1040,15 @@ impl ConnectionWindow {
     fn open_count(&self, id: u64) -> usize {
         self.open_counts
             .as_ref()
-            .and_then(|counts| counts.get(&id))
+            .and_then(|counts| counts.saved.get(&id))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn shared_open_count(&self, id: &teamwork::Identity) -> usize {
+        self.open_counts
+            .as_ref()
+            .and_then(|counts| counts.teamwork.get(id))
             .copied()
             .unwrap_or(0)
     }
