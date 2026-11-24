@@ -8,6 +8,35 @@ use super::{Config, DirectoryMode, Format, Policy, Prepared, Warning};
 use crate::snippets::tests::Profile;
 
 #[test]
+fn an_existing_java_size_review_can_restore_the_supported_limit() {
+    use super::{Edit, Form, JavaReview};
+
+    let defaults = Config::default();
+    let mut fields = defaults.java_fields();
+    fields.max_mib = 256;
+    let imported = Config::from_java(
+        fields,
+        JavaReview {
+            source_max_mib: Some(1000),
+            ..JavaReview::default()
+        },
+    )
+    .unwrap();
+    let mut form = Form::new(imported);
+    form.update(Edit::UseJavaMaxSize);
+    let reviewed = form.config().unwrap();
+    assert_eq!(reviewed.java_fields().max_mib, 1000);
+    assert!(!reviewed.enabled());
+    assert!(reviewed.java_review().is_none());
+
+    form.update(Edit::Enabled(true));
+    form.update(Edit::Size("1001".into()));
+    assert!(form.config().is_err());
+    form.update(Edit::Size("1000".into()));
+    assert_eq!(form.config().unwrap().java_fields().max_mib, 1000);
+}
+
+#[test]
 fn java_logging_uses_a_legacy_file_parent_only_after_explicit_review() {
     use super::{Edit, Form, JavaReview};
 

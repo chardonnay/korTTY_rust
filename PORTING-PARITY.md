@@ -1322,6 +1322,34 @@ entry into the owned editor and adds the tab color selector.
 [Font and presentation controls](src/connection_window/terminal_overrides/ssh_style.rs)
 · [Color picker](src/connection_window/color_picker.rs)
 
+## November 24 terminal logfile size limit
+
+The connection editor and writer accept log sizes up to 1,000 MiB. A
+rotated file is closed with its JSON or XML footer before compression. A
+bounded worker publishes gzip archives while the writer continues on the
+next part. Reaching the shutdown deadline or compression backlog leaves
+complete plain parts readable. The source is removed after successful
+archive publication.
+
+The viewer keeps a sparse line index for both plain and compressed logs.
+Compressed data is decoded into a private temporary file that is discarded
+on close or cancellation. Plain and gzip views and unchanged exports accept
+the new limit. An existing connection with a pending Java size can adopt
+that value on the Terminal Logging page.
+
+The boundary fixture writes a 1,000 MiB logfile, verifies the next active
+part and the published gzip archive, opens both the compressed log and its
+plain export, and cancels while the compressor is reading. The original
+plain file stays complete and no partial archive remains. Another fixture
+pages and searches a compressed image with more than two million lines.
+The boundary fixture passed natively on Apple Silicon and Windows ARM64.
+Apple Silicon passed 82 focused tests and strict Clippy, and Windows ARM64
+passed 77 focused tests. The large-file fixture ran separately on both
+platforms.
+[Terminal writer](src/terminal_logging/writer.rs)
+· [Logfile viewer and export](src/logfile_window/document.rs)
+· [Logging review](src/terminal_logging/interchange.rs)
+
 ## November 24 Java terminal logging XML
 
 Java connection imports and portable Java backup restore carry the
@@ -1340,9 +1368,9 @@ JAXB fixture exercises the JSON format, metadata, legacy file path and
 directory adoption and activation, and the portable export. The tagged
 Java JAXB model read all nine fields from that native export. Apple Silicon
 passed 111 focused tests and strict Clippy, including portable backup
-staging and a capture into the explicitly adopted directory. The current
-native size ceiling remains 256 MiB, and the editor keeps the original
-Java value visible for review.
+staging and a capture into the explicitly adopted directory. At this
+checkpoint the native size ceiling was 256 MiB, and the editor kept the
+original Java value for review. The follow-up above raises the ceiling.
 [Java XML import](src/connection_store/import/kortty.rs)
 · [XML export](src/connection_export/xml.rs)
 · [Review and native field mapping](src/terminal_logging/interchange.rs)

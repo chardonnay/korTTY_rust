@@ -219,9 +219,12 @@ folder on Windows. Windows ARM64 confirmed the chooser's starting folder,
 cancellation and selection of the existing directory. Bring the same
 directory chooser and disabled-field layout to the compact Quick Connect
 section.
-Java permits 1,000 MiB per log file. Rust validates 256 MiB and bounds
-gzip input to that size. Verify rotation, gzip publication, cancellation
-and viewer loading at the Java limit before raising the native size limit.
+The [1,000 MiB terminal logfile update](PORTING-PARITY.md#november-24-terminal-logfile-size-limit)
+matches the Java size range. Rotated files are closed before background
+gzip publication. The viewer indexes plain logs and streams compressed
+images into a private temporary file. The compatibility test exercises
+rotation, cancelled compression, plain and gzip viewing, and export at the
+limit.
 Java log names include the sanitized connection name. Rust names use a
 session identifier. Align new names and their preview while retaining
 support for reading and rotating existing logs.
@@ -229,8 +232,8 @@ The [terminal logging XML update](PORTING-PARITY.md#november-24-java-terminal-lo
 maps the Java `logConfig` record during direct import and portable Java backup
 restore. A request to enable logging and a Java path are stored for explicit
 review on the Terminal Logging page. A native absolute legacy file path can
-suggest its parent directory. The Rust size limit still applies, and the
-review retains any out-of-range Java value.
+suggest its parent directory. The review retains any out-of-range Java
+value and lets the user adopt a now-supported size from older imports.
 The [managed Journal requirement](PORTING-PARITY.md#november-24-managed-session-journal)
 locks the SSH editor's autostart control and starts capture on eligible
 terminal streams. A native Apple Silicon OpenSSH test covered automatic

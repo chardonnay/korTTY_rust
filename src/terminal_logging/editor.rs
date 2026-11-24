@@ -86,7 +86,10 @@ impl Form {
             && (self.config.enabled
                 || matches!(
                     edit,
-                    Edit::Enabled(_) | Edit::UseJavaFolder | Edit::DismissJavaReview
+                    Edit::Enabled(_)
+                        | Edit::UseJavaFolder
+                        | Edit::UseJavaMaxSize
+                        | Edit::DismissJavaReview
                 ))
     }
 
@@ -219,6 +222,8 @@ impl Form {
             );
         }
         let adopt = (eligible && review.folder().is_some()).then_some(Edit::UseJavaFolder);
+        let adopt_size =
+            (eligible && review.usable_max_size().is_some()).then_some(Edit::UseJavaMaxSize);
         let dismiss = eligible.then_some(Edit::DismissJavaReview);
         Some(
             details
@@ -226,6 +231,8 @@ impl Form {
                     row![
                         (review.folder().is_some())
                             .then(|| review_action("Use suggested directory", adopt)),
+                        (review.usable_max_size().is_some())
+                            .then(|| review_action("Use Java file size", adopt_size)),
                         review_action("Dismiss imported suggestion", dismiss),
                     ]
                     .spacing(8),

@@ -32,6 +32,12 @@ pub(crate) struct JavaReview {
 }
 
 impl JavaReview {
+    pub(super) fn usable_max_size(&self) -> Option<u16> {
+        u16::try_from(self.source_max_mib?)
+            .ok()
+            .filter(|size| (1..=MAX_LOG_MIB).contains(size))
+    }
+
     pub(super) fn validate(&self) -> io::Result<()> {
         if !valid_path_text(&self.source_path) {
             return Err(io::Error::new(
@@ -145,5 +151,16 @@ impl Config {
                 self.java_review = None;
             }
         }
+    }
+
+    pub(super) fn adopt_java_max_size(&mut self) -> Option<u16> {
+        let review = self.java_review.as_mut()?;
+        let size = review.usable_max_size()?;
+        self.max_mib = size;
+        review.source_max_mib = None;
+        if *review == JavaReview::default() {
+            self.java_review = None;
+        }
+        Some(size)
     }
 }

@@ -92,11 +92,11 @@ fn java_terminal_logging_round_trips_settings_and_dormant_review() {
     assert!(fields.include_username);
     assert!(!fields.compress && !fields.rotate_daily);
     assert_eq!(fields.retention_days, 45);
-    assert_eq!(fields.max_mib, 256);
+    assert_eq!(fields.max_mib, 1000);
     assert!(!fields.enabled && fields.folder.is_empty());
     let review = profile.logging.java_review().unwrap();
     assert!(review.enable_requested);
-    assert_eq!(review.source_max_mib, Some(1000));
+    assert_eq!(review.source_max_mib, None);
     assert_eq!(
         review.source_path,
         r"Z:\fixture\Terminal & Ops\ssh-log.json"

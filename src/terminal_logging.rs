@@ -17,7 +17,8 @@ pub(crate) use editor::{Action as EditorAction, ManagedFields, pick_folder};
 pub(crate) use interchange::{JavaFields, JavaReview};
 pub(crate) use policy::Policy;
 
-const MAX_LOG_MIB: u16 = 256;
+pub(crate) const MAX_LOG_MIB: u16 = 1000;
+pub(crate) const MAX_LOG_BYTES: u64 = MAX_LOG_MIB as u64 * 1024 * 1024;
 const MAX_RETENTION_DAYS: u16 = 3650;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
@@ -115,7 +116,7 @@ impl Config {
         if !(1..=MAX_LOG_MIB).contains(&self.max_mib) || self.retention_days > MAX_RETENTION_DAYS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Use a log size of 1–256 MiB and retention of 0–3650 days.",
+                format!("Use a log size of 1–{MAX_LOG_MIB} MiB and retention of 0–3650 days."),
             ));
         }
         if let Some(review) = &self.java_review {
@@ -166,6 +167,7 @@ pub(crate) enum Edit {
     Username(bool),
     Directory(DirectoryMode),
     UseJavaFolder,
+    UseJavaMaxSize,
     DismissJavaReview,
 }
 
@@ -194,7 +196,7 @@ impl Form {
             }
             Edit::Format(value) => self.config.format = value,
             Edit::Size(value)
-                if value.len() <= 3 && value.bytes().all(|byte| byte.is_ascii_digit()) =>
+                if value.len() <= 4 && value.bytes().all(|byte| byte.is_ascii_digit()) =>
             {
                 self.size = value
             }
@@ -208,6 +210,11 @@ impl Form {
             Edit::Username(value) => self.config.include_username = value,
             Edit::Directory(value) => self.config.directory_mode = value,
             Edit::UseJavaFolder => self.config.adopt_java_folder(),
+            Edit::UseJavaMaxSize => {
+                if let Some(size) = self.config.adopt_java_max_size() {
+                    self.size = size.to_string();
+                }
+            }
             Edit::DismissJavaReview => self.config.java_review = None,
             _ => {}
         }

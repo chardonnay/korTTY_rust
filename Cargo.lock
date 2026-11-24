@@ -2893,6 +2893,7 @@ dependencies = [
  "kortty-windowing",
  "latex-rust",
  "lopdf",
+ "memchr",
  "num-bigint",
  "pbkdf2 0.12.2",
  "pdf-writer",
