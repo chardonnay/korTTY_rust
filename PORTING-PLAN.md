@@ -47,7 +47,7 @@ equipment remain user-deferred.
    suite on this candidate. [Candidate checks and cleanup](target/verification/20261125-agent-setup-paused-notes.md) · [Previous complete application run](PORTING-PARITY.md#november-25-interactive-run-model-web-rounds)
 
    ```sh
-   KORTTY_SCRATCH_PARENT="$TMPDIR" bash scripts/with-scratch.sh --zsh-tests \
+   bash scripts/with-scratch.sh --zsh-tests \
      python3 scripts/cargo-native.py test --locked -p kortty --bin kortty --features dialog-preview
    ```
 
