@@ -147,8 +147,10 @@ mod tests {
 
     #[test]
     fn names_and_tool_scopes_are_validated_after_default_resolution() {
-        let mut defaults = Defaults::default();
-        defaults.tavily_label = "reviewed-search".into();
+        let mut defaults = Defaults {
+            tavily_label: "reviewed-search".into(),
+            ..Defaults::default()
+        };
         let settings = defaults.resolve(&Settings::new(Mode::Tavily)).unwrap();
         assert!(settings.review().contains("reviewed-search"));
         // Runtime-only labels must never turn into a profile-local override.
@@ -167,8 +169,10 @@ mod tests {
 
     #[test]
     fn searxng_base_url_is_a_configuration_gate_not_a_page_endpoint() {
-        let mut defaults = Defaults::default();
-        defaults.searxng_plugin = "mcp/global-search".into();
+        let mut defaults = Defaults {
+            searxng_plugin: "mcp/global-search".into(),
+            ..Defaults::default()
+        };
         let mut profile = Settings::new(Mode::Searxng);
         profile.searxng_page = Some(super::super::SearxngPageSettings {
             endpoint: "https://pages.example.com/mcp".into(),

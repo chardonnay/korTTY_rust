@@ -108,30 +108,6 @@ fn require_call_mask(
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn model_tool_mask_checks_raw_numbers_and_decoded_json_strings() {
-        let mask = knowledge_review::Mask::new(
-            Redactor::for_journal(Secrets::default().seal().unwrap(), Default::default()),
-            Some(Zeroizing::new("98765432109876".into())),
-            None,
-        );
-        for arguments in [
-            r#"{"query":"public fixture", "extra":98765432109876}"#,
-            r#"{"query":"public fixture", "extra":"\u00398765432109876"}"#,
-            r#"{"query":"public fixture", "extra":{"98765432109876":true}}"#,
-        ] {
-            let call: local_ai::tools::Call = serde_json::from_value(serde_json::json!({
-                "id":"mask-fixture", "type":"function", "function":{"name":"web_search","arguments":arguments}
-            })).unwrap();
-            assert!(require_call_mask(&mask, &call).is_err(), "{arguments}");
-        }
-    }
-}
-
 impl Workspace {
     pub(in crate::workspace::terminal_agent) fn begin_model_tool(
         &self,
@@ -348,5 +324,29 @@ impl Workspace {
         }
         review.model_tool = Some(tool);
         Ok(task)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_tool_mask_checks_raw_numbers_and_decoded_json_strings() {
+        let mask = knowledge_review::Mask::new(
+            Redactor::for_journal(Secrets::default().seal().unwrap(), Default::default()),
+            Some(Zeroizing::new("98765432109876".into())),
+            None,
+        );
+        for arguments in [
+            r#"{"query":"public fixture", "extra":98765432109876}"#,
+            r#"{"query":"public fixture", "extra":"\u00398765432109876"}"#,
+            r#"{"query":"public fixture", "extra":{"98765432109876":true}}"#,
+        ] {
+            let call: local_ai::tools::Call = serde_json::from_value(serde_json::json!({
+                "id":"mask-fixture", "type":"function", "function":{"name":"web_search","arguments":arguments}
+            })).unwrap();
+            assert!(require_call_mask(&mask, &call).is_err(), "{arguments}");
+        }
     }
 }
