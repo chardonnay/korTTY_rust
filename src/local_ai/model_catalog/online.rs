@@ -29,7 +29,8 @@ pub(crate) struct Pending {
 #[derive(Clone, Debug)]
 pub(crate) struct Completion {
     pub(crate) catalog: Option<Catalog>,
-    pub(crate) warning: Option<String>,
+    // Carry only status across the UI boundary; error text can contain private data.
+    pub(crate) refresh_failed: bool,
 }
 
 pub(crate) struct Cancel(Arc<AtomicBool>, Agent);
@@ -66,16 +67,19 @@ pub(crate) fn start(
                 authorize: &authorize,
             };
             let repository = Repository::new(&root, trust);
-            let (accepted, warning) = match refresh(&repository, &agent, guard) {
-                Ok(catalog) => (Some(catalog), None),
-                Err(error) => (None, Some(error.to_string())),
+            let (accepted, refresh_failed) = match refresh(&repository, &agent, guard) {
+                Ok(catalog) => (Some(catalog), false),
+                Err(_) => (None, true),
             };
             let cached = repository.load_cached().ok().flatten();
             let catalog = [accepted, cached]
                 .into_iter()
                 .flatten()
                 .max_by_key(Catalog::sequence);
-            let _ = send.try_send(Completion { catalog, warning });
+            let _ = send.try_send(Completion {
+                catalog,
+                refresh_failed,
+            });
         })
         .map_err(|error| format!("Could not start the AI catalog refresh ({error})."))?;
     Ok(Pending { reply, cancel })
@@ -268,8 +272,50 @@ mod tests {
     use std::cell::Cell;
     use std::io::{BufRead as _, Write as _};
 
+    use base64::Engine as _;
+    use ed25519_dalek::{Signer as _, SigningKey};
+
     use super::*;
     use crate::local_ai::test_support::{accept, fixture_http_response, listener, wire_request};
+
+    #[test]
+    fn ai_catalog_online_omits_private_errors_and_preserves_cached_catalog() {
+        let key = SigningKey::from_bytes(&[0x31; 32]);
+        let trust = Trust(key.verifying_key());
+        for cached in [false, true] {
+            for private_error in [
+                "authorization failed: password=catalog-private-fixture",
+                "https://example.test/asset?token=catalog-private-fixture\nforged log entry",
+            ] {
+                let scratch = tempfile::tempdir().unwrap();
+                if cached {
+                    let signature = format!(
+                        "ed25519:{}",
+                        super::super::STANDARD.encode(key.sign(super::super::BOOTSTRAP).to_bytes())
+                    );
+                    Repository::new(scratch.path(), trust)
+                        .accept(super::super::BOOTSTRAP, signature.as_bytes(), || Ok(()))
+                        .unwrap();
+                }
+                let pending = start(scratch.path().into(), trust, move || {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        private_error,
+                    ))
+                })
+                .unwrap();
+                let completion = pending.reply.recv_blocking().unwrap();
+                assert!(completion.refresh_failed);
+                assert_eq!(
+                    completion.catalog.as_ref(),
+                    cached.then_some(super::super::bootstrap())
+                );
+                let diagnostic = format!("{completion:?}");
+                assert!(!diagnostic.contains("catalog-private-fixture"));
+                assert!(!diagnostic.contains("forged log entry"));
+            }
+        }
+    }
 
     #[test]
     fn ai_catalog_online_pins_release_and_cdn_redirects() {

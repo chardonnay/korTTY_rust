@@ -110,9 +110,9 @@ impl Workspace {
                     .reply
                     .recv()
                     .await
-                    .unwrap_or_else(|_| model_catalog::online::Completion {
+                    .unwrap_or(model_catalog::online::Completion {
                         catalog: None,
-                        warning: Some("The AI catalog worker stopped.".into()),
+                        refresh_failed: true,
                     })
             },
             |result| Desktop::AiManager(Message::ModelCatalogFinished(result)),
@@ -129,8 +129,8 @@ impl Workspace {
         if !self.ai_features_enabled() || !self.clipboard.policy.ai_model_downloads_allowed() {
             return Task::none();
         }
-        if let Some(warning) = result.warning {
-            eprintln!("kortty: {warning}");
+        if result.refresh_failed {
+            eprintln!("kortty: The AI catalog refresh failed.");
         }
         if let Some(catalog) = result.catalog {
             self.adopt_ai_model_catalog(catalog);
