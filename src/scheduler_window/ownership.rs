@@ -79,7 +79,10 @@ impl Route {
                 .and_then(Store::open)
                 .map_err(|_| CHANGED)?;
             let saved = store.get(self.reference.id).ok_or(CHANGED)?;
-            if &saved.login != login || &saved.jump != jump {
+            if !saved.login.same_execution_identity(login)
+                || saved.jump.as_ref().map(|login| login.execution_identity())
+                    != jump.as_ref().map(|login| login.execution_identity())
+            {
                 return Err(CHANGED);
             }
             if saved.incognito || store.connection_requires_isolation(saved) {
@@ -460,6 +463,7 @@ mod tests {
 
     fn saved_login(host: &str) -> SavedLogin {
         SavedLogin {
+            preferences: Default::default(),
             endpoint: LoginTarget {
                 host: host.into(),
                 port: 22,

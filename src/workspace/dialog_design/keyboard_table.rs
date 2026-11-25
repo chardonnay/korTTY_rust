@@ -25,6 +25,18 @@ pub(crate) fn view<'a, Message: 'a>(
     })
 }
 
+pub(crate) fn view_with_id<'a, Message: 'a>(
+    content: Element<'a, Message>,
+    id: Id,
+    on_key: impl Fn(&Key, keyboard::Modifiers, bool) -> TableKey<Message> + 'a,
+) -> Element<'a, Message> {
+    Element::new(Table {
+        content,
+        on_key,
+        id: Some(id),
+    })
+}
+
 pub(crate) fn action<'a, Message: Clone + 'a>(
     content: Element<'a, Message>,
     message: Option<Message>,

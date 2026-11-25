@@ -30,6 +30,10 @@ mod chat_terminal_actions;
 mod code_text_language;
 mod document_find;
 mod file_chooser;
+mod general_defaults;
+#[cfg(test)]
+mod general_keyboard_tests;
+mod internet;
 pub(crate) mod java_knowledge;
 pub(crate) mod java_models;
 pub(crate) use local::ModelConfigurationKind;
@@ -486,6 +490,11 @@ impl Default for Configuration {
 #[serde(default, deny_unknown_fields)]
 struct General {
     features_enabled: bool,
+    confirm_before_send: bool,
+    agent_debug_messages: bool,
+    agent_runtime_messages: bool,
+    #[serde(skip_serializing_if = "local_ai::web_search::McpDefaults::is_default")]
+    internet: local_ai::web_search::McpDefaults,
     timeout_minutes: u16,
     code_text_language: CodeTextLanguage,
     chat_terminal_actions: ChatTerminalActions,
@@ -526,6 +535,10 @@ impl Default for General {
     fn default() -> Self {
         Self {
             features_enabled: true,
+            confirm_before_send: true,
+            agent_debug_messages: false,
+            agent_runtime_messages: false,
+            internet: Default::default(),
             timeout_minutes: 1,
             code_text_language: CodeTextLanguage::default(),
             chat_terminal_actions: ChatTerminalActions::default(),
@@ -853,6 +866,7 @@ impl Configuration {
             return Err(invalid("Invalid AI settings version or request timeout"));
         }
         self.profiles.validate().map_err(invalid)?;
+        self.general.internet.validate().map_err(invalid)?;
         self.general.agent_shortcut.validate().map_err(invalid)?;
         self.local.validate().map_err(invalid)?;
         self.java_journal_profiles.validate()?;
@@ -1458,6 +1472,18 @@ impl Configuration {
         self.general.chat_terminal_actions
     }
 
+    pub(crate) fn agent_debug_messages(&self) -> bool {
+        self.general.agent_debug_messages
+    }
+
+    pub(crate) fn agent_runtime_messages(&self) -> bool {
+        self.general.agent_runtime_messages
+    }
+
+    pub(crate) fn confirm_before_send(&self) -> bool {
+        self.general.confirm_before_send
+    }
+
     pub(crate) fn agent_shortcut_aliases(&self) -> Option<shortcut::Aliases> {
         self.general.agent_shortcut.enabled_aliases()
     }
@@ -1868,6 +1894,18 @@ impl Configuration {
                 .policy_authority_fingerprint()
         })?;
         let profile = self.profiles.profile(id)?;
+        let base = if profile.lm_web.is_some() && !self.general.internet.is_default() {
+            hash_agent_profile_revision(
+                &serde_json::to_vec(&(
+                    "kortty global Internet defaults v1",
+                    base,
+                    &self.general.internet,
+                ))
+                .ok()?,
+            )?
+        } else {
+            base
+        };
         let base = if profile.ordinary_lm_studio_auto() {
             let binding = self.transport_for(profile).ok()?.lm_studio_auto_binding()?;
             let bytes =
@@ -2358,7 +2396,13 @@ impl Configuration {
             self.terminal_chat_transport(id)
         }
         .ok()?;
-        Some((profile, entry.destination().ok()?, entry.lm_web.clone()))
+        let settings = entry
+            .lm_web
+            .as_ref()
+            .map(|settings| self.general.internet.resolve(settings))
+            .transpose()
+            .ok()?;
+        Some((profile, entry.destination().ok()?, settings))
     }
 
     fn selected_transport(
@@ -2571,11 +2615,17 @@ impl GeneralSection {
     fn for_setting(setting: search::Setting) -> Self {
         use search::{ImportedGeneral, Setting};
         match setting {
+            Setting::Internet(_) => Self::Internet,
             Setting::GlobalTimeout
+            | Setting::SecurityProfile
+            | Setting::ClearSecurityProfile
+            | Setting::SnippetInstructions
+            | Setting::SnippetAlternatives
             | Setting::CodeTextLanguage
             | Setting::JournalSemanticSearch
             | Setting::ImportedGeneral(ImportedGeneral::JournalSearch) => Self::Defaults,
             Setting::AgentShortcut
+            | Setting::AgentHistoryLimit
             | Setting::AgentShortcutName
             | Setting::AgentShortcutCase
             | Setting::AgentTriage
@@ -2633,7 +2683,14 @@ pub(crate) enum Message {
     Find,
     Help,
     Features(bool),
+    ConfirmBeforeSend(bool),
+    AgentDebugMessages(bool),
+    AgentRuntimeMessages(bool),
+    Internet(internet::Field, String),
     Timeout(String),
+    AgentHistoryLimit(String),
+    SnippetInstructions(bool),
+    SnippetAlternatives(u8),
     CodeTextLanguage(CodeTextLanguage),
     ChatTerminalActions(ChatTerminalActions),
     ShowAgentSetup(bool),
@@ -2795,6 +2852,7 @@ pub(crate) struct Dialog {
     profile_dir: PathBuf,
     general: General,
     timeout: String,
+    shared_defaults: crate::workspace::ai_general_defaults::State,
     profiles: profiles::Editor,
     profile_policy: ProfilePolicy,
     managed_triage: Option<crate::terminal_agent::planning::TriageMode>,
@@ -2810,6 +2868,7 @@ pub(crate) struct Dialog {
     local_section: LocalSection,
     search: String,
     search_id: Id,
+    general_focus_scope: Id,
     search_selection: usize,
     search_scroll: Id,
     search_row: Id,
@@ -2825,6 +2884,95 @@ pub(crate) struct Dialog {
 }
 
 impl Dialog {
+    pub(crate) fn focus_general_next(&self, backwards: bool) -> Option<Task<Message>> {
+        use iced::advanced::widget::operation::{Operation, Outcome, focusable, scope};
+        if self.page != Page::General
+            || self.setup.is_some()
+            || (!self.search.is_empty() && self.close_token.is_none())
+        {
+            return None;
+        }
+        struct FocusAt {
+            target: Option<usize>,
+            current: usize,
+        }
+        impl Operation for FocusAt {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+
+            fn focusable(
+                &mut self,
+                _id: Option<&Id>,
+                _bounds: iced::Rectangle,
+                state: &mut dyn focusable::Focusable,
+            ) {
+                if self.target == Some(self.current) {
+                    state.focus();
+                } else {
+                    state.unfocus();
+                }
+                self.current += 1;
+            }
+        }
+        struct FocusCycle {
+            total: usize,
+            focused: Option<usize>,
+            backwards: bool,
+        }
+        impl Operation for FocusCycle {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+
+            fn focusable(
+                &mut self,
+                _id: Option<&Id>,
+                _bounds: iced::Rectangle,
+                state: &mut dyn focusable::Focusable,
+            ) {
+                if state.is_focused() {
+                    self.focused = Some(self.total);
+                }
+                self.total += 1;
+            }
+
+            fn finish(&self) -> Outcome<()> {
+                let target = (self.total > 0).then(|| match (self.focused, self.backwards) {
+                    (Some(0) | None, true) => self.total - 1,
+                    (Some(index), true) => index - 1,
+                    (Some(index), false) => (index + 1) % self.total,
+                    (None, false) => 0,
+                });
+                Outcome::Chain(Box::new(FocusAt { target, current: 0 }))
+            }
+        }
+        let cycle = scope(
+            self.general_focus_scope.clone(),
+            FocusCycle {
+                total: 0,
+                focused: None,
+                backwards,
+            },
+        );
+        Some(iced_runtime::task::effect(iced_runtime::Action::widget(
+            cycle,
+        )))
+    }
+
+    fn general_action<'a>(
+        &self,
+        content: impl Into<Element<'a, Message>>,
+        message: Option<Message>,
+    ) -> Element<'a, Message> {
+        let content = content.into();
+        if self.page == Page::General {
+            dialog_design::keyboard_table::action(content, message, true)
+        } else {
+            content
+        }
+    }
+
     pub(crate) fn set_selection_modifiers(&mut self, modifiers: iced::keyboard::Modifiers) {
         self.local.set_selection_modifiers(modifiers);
     }
@@ -2840,6 +2988,7 @@ impl Dialog {
             profile_dir: profile.clone(),
             general: saved.general.clone(),
             timeout: saved.general.timeout_minutes.to_string(),
+            shared_defaults: crate::workspace::ai_general_defaults::State::load(&profile),
             profiles: {
                 let mut profiles = profiles::Editor::new(saved.profiles.clone());
                 profiles.install_model_catalog(saved.model_catalog.clone());
@@ -2874,6 +3023,7 @@ impl Dialog {
             local_section: LocalSection::default(),
             search: String::new(),
             search_id: Id::unique(),
+            general_focus_scope: Id::unique(),
             search_selection: 0,
             search_scroll: Id::unique(),
             search_row: Id::unique(),
@@ -2942,7 +3092,8 @@ impl Dialog {
     }
 
     pub(crate) fn dirty(&self) -> bool {
-        self.general != self.saved.general
+        self.shared_defaults.dirty()
+            || self.general != self.saved.general
             || self.timeout != self.saved.general.timeout_minutes.to_string()
             || self.profiles.catalog() != &self.saved.profiles
             || self.profiles.draft_dirty()
@@ -3379,6 +3530,27 @@ impl Dialog {
                     self.memory.invalidate_cleanup();
                 }
                 return self.refresh_lm_studio_metadata();
+            }
+            Message::AgentHistoryLimit(value) if editable => {
+                self.shared_defaults.set_history_limit(value);
+            }
+            Message::AgentDebugMessages(value) if editable => {
+                self.general.agent_debug_messages = value;
+            }
+            Message::AgentRuntimeMessages(value) if editable => {
+                self.general.agent_runtime_messages = value;
+            }
+            Message::Internet(field, value) if editable && self.profiles.web_search_allowed() => {
+                field.set(&mut self.general.internet, value);
+            }
+            Message::ConfirmBeforeSend(value) if editable => {
+                self.general.confirm_before_send = value;
+            }
+            Message::SnippetInstructions(value) if editable => {
+                self.shared_defaults.set_instructions(value);
+            }
+            Message::SnippetAlternatives(value) if editable => {
+                self.shared_defaults.set_alternatives(value);
             }
             Message::Timeout(value) if editable => {
                 self.timeout = value.chars().filter(char::is_ascii_digit).take(4).collect();
@@ -3878,6 +4050,12 @@ impl Dialog {
                         self.saved = saved;
                         self.memory.mark_saved();
                         self.local.mark_saved();
+                        let shared_warning = self.shared_defaults.save(&self.profile_dir);
+                        let warning = match (warning, shared_warning) {
+                            (Some(a), Some(b)) => Some(format!("{a} {b}")),
+                            (Some(warning), None) | (None, Some(warning)) => Some(warning),
+                            (None, None) => None,
+                        };
                         warning.map_or_else(
                             || "AI settings saved.".into(),
                             |warning| format!("AI settings saved. {warning}"),
@@ -3969,6 +4147,9 @@ impl Dialog {
                     }
                     ImportedGeneral::AgentShortcut => self.saved.java_agent_shortcut.is_some(),
                 }
+            }
+            search::Target::Setting(search::Setting::ClearSecurityProfile) => {
+                self.local_state.profile(local::Role::Security).is_some()
             }
             search::Target::Setting(search::Setting::Embedding) => {
                 self.local_state.uses_manual_embedding()
@@ -4359,6 +4540,10 @@ impl Dialog {
     }
 
     fn save(&mut self, vault: Option<&VaultWindow>) -> Task<Message> {
+        if !self.shared_defaults.valid() {
+            self.notice = "Enter a prompt history limit from 5 to 100.".into();
+            return self.open_page(search::Target::Setting(search::Setting::AgentHistoryLimit));
+        }
         let snapshot = (|| {
             let timeout_minutes = self
                 .timeout
@@ -4370,7 +4555,13 @@ impl Dialog {
                 return Err("Correct the AI Memory token budget first.".to_owned());
             }
             self.general.agent_shortcut.validate()?;
+            self.general.internet.validate()?;
             let policy = ClipboardPolicy::load();
+            if (!self.profiles.web_search_allowed() || !policy.ai_web_search_allowed)
+                && self.general.internet != self.saved.general.internet
+            {
+                return Err("Managed policy blocks changes to Internet access defaults.".to_owned());
+            }
             self.profiles
                 .catalog()
                 .require_policy_changes(&self.saved.profiles, &policy)
@@ -4388,6 +4579,12 @@ impl Dialog {
                 version: VERSION,
                 general: General {
                     timeout_minutes,
+                    internet: if policy.ai_web_search_allowed && self.profiles.web_search_allowed()
+                    {
+                        self.general.internet.normalized()
+                    } else {
+                        self.general.internet.clone()
+                    },
                     ..self.general.clone()
                 },
                 profiles,
@@ -5070,7 +5267,10 @@ impl Dialog {
         }
         let search = container(container(search).max_width(640)).center_x(Length::Fill);
         let tabs = scrollable(row(Page::ALL.into_iter().map(|page| {
-            dialog_design::primary_tab(page.title(), page == self.page, Message::Page(page))
+            self.general_action(
+                dialog_design::primary_tab(page.title(), page == self.page, Message::Page(page)),
+                Some(Message::Page(page)),
+            )
         })))
         .direction(scrollable::Direction::Horizontal(
             scrollable::Scrollbar::new()
@@ -5175,22 +5375,31 @@ impl Dialog {
         )
         .width(Length::Fill)
         .max_height(MAX_NOTICE_HEIGHT);
+        let close = (!self.busy()).then(|| self.child_close_message().unwrap_or(Message::Close));
+        let save = (self.editable()
+            && !self.busy()
+            && !self.local.busy()
+            && self.request.is_none()
+            && self.dirty())
+        .then_some(Message::Save);
         let footer = row![
-            (!child_form_open).then(|| button(text("Manual").size(13))
-                .style(button::text)
-                .on_press(Message::Help)),
+            (!child_form_open).then(|| self.general_action(
+                button(text("Manual").size(13))
+                    .style(button::text)
+                    .on_press(Message::Help),
+                Some(Message::Help),
+            )),
             notice,
             self.request
                 .as_ref()
                 .map(|_| button("Cancel request").on_press(Message::CancelRequest)),
-            (!child_form_open).then(|| button(
-                container(text("Close").size(13)).center_x(Length::Fill)
-            )
-            .width(76)
-            .padding([7, 5])
-            .style(dialog_design::secondary_button)
-            .on_press_maybe(
-                (!self.busy()).then(|| { self.child_close_message().unwrap_or(Message::Close) })
+            (!child_form_open).then(|| self.general_action(
+                button(container(text("Close").size(13)).center_x(Length::Fill))
+                    .width(76)
+                    .padding([7, 5])
+                    .style(dialog_design::secondary_button)
+                    .on_press_maybe(close.clone()),
+                close,
             )),
         ]
         .spacing(8)
@@ -5225,20 +5434,16 @@ impl Dialog {
             content,
             (!child_form_open && self.page != Page::Profiles).then(|| row![
                 space::horizontal(),
-                button(
-                    container(text(if self.saving { "Saving…" } else { "Save" }).size(13))
-                        .center_x(Length::Fill)
-                )
-                .style(dialog_design::secondary_button)
-                .width(78)
-                .padding([7, 5])
-                .on_press_maybe(
-                    (self.editable()
-                        && !self.busy()
-                        && !self.local.busy()
-                        && self.request.is_none()
-                        && self.dirty())
-                    .then_some(Message::Save)
+                self.general_action(
+                    button(
+                        container(text(if self.saving { "Saving…" } else { "Save" }).size(13))
+                            .center_x(Length::Fill)
+                    )
+                    .style(dialog_design::secondary_button)
+                    .width(78)
+                    .padding([7, 5])
+                    .on_press_maybe(save.clone()),
+                    save,
                 ),
             ]
             .padding(6)),
@@ -5280,6 +5485,11 @@ impl Dialog {
                 .height(Length::Fill),
         ]
         .height(Length::Fill);
+        let body = if self.page == Page::General {
+            general_defaults::shortcuts(body.into())
+        } else {
+            body.into()
+        };
         if self.close_token.is_some() {
             iced::widget::stack![
                 body,
@@ -5288,8 +5498,14 @@ impl Dialog {
                         column![
                             text("Discard unsaved AI Manager changes?").size(18),
                             row![
-                                button("Keep editing").on_press(Message::CloseAnswer(false)),
-                                button("Discard").style(button::danger).on_press_maybe(
+                                self.general_action(
+                                    button("Keep editing").on_press(Message::CloseAnswer(false)),
+                                    Some(Message::CloseAnswer(false))
+                                ),
+                                self.general_action(
+                                    button("Discard").style(button::danger).on_press_maybe(
+                                        (!self.busy()).then_some(Message::CloseAnswer(true))
+                                    ),
                                     (!self.busy()).then_some(Message::CloseAnswer(true))
                                 ),
                             ]
@@ -5300,11 +5516,12 @@ impl Dialog {
                     )
                     .center(Length::Fill)
                     .style(container::dark)
+                    .id(self.general_focus_scope.clone())
                 )
             ]
             .into()
         } else {
-            body.into()
+            container(body).id(self.general_focus_scope.clone()).into()
         }
     }
 
@@ -5325,6 +5542,7 @@ impl Dialog {
                 Some(self.general.code_text_language),
                 Message::CodeTextLanguage,
             )
+            .keyboard_navigation(self.revealed.control_id(search::Setting::CodeTextLanguage))
             .dismiss_on_escape()
         } else {
             text(self.general.code_text_language.to_string()).into()
@@ -5339,6 +5557,7 @@ impl Dialog {
             )
             .width(188)
             .text_size(13)
+            .keyboard_navigation(self.revealed.control_id(terminal_actions_setting))
             .dismiss_on_escape()
         } else {
             text(self.general.chat_terminal_actions.to_string()).into()
@@ -5352,6 +5571,7 @@ impl Dialog {
                 Some(run_presentation),
                 Message::AgentRunPresentation,
             )
+            .keyboard_navigation(self.revealed.control_id(run_presentation_setting))
             .dismiss_on_escape()
         } else {
             text(run_presentation.to_string()).into()
@@ -5364,6 +5584,7 @@ impl Dialog {
                     Some(triage),
                     Message::AgentTriage,
                 )
+                .keyboard_navigation(self.revealed.control_id(triage_setting))
                 .dismiss_on_escape()
             } else if self.managed_triage.is_some() {
                 text(format!("{triage} (managed by policy)")).into()
@@ -5385,13 +5606,45 @@ impl Dialog {
             case = case.on_toggle(Message::AgentShortcutCaseInsensitive);
             show_setup = show_setup.on_toggle(Message::ShowAgentSetup);
         }
+        let features = self.revealed.keyboard_action(
+            Features,
+            features,
+            self.editable()
+                .then_some(Message::Features(!self.general.features_enabled)),
+            false,
+        );
+        let enabled = self.revealed.keyboard_action(
+            shortcut_setting,
+            enabled,
+            self.editable()
+                .then_some(Message::AgentShortcutEnabled(!shortcut.enabled)),
+            false,
+        );
+        let case = self.revealed.keyboard_action(
+            shortcut_case,
+            case,
+            self.editable()
+                .then_some(Message::AgentShortcutCaseInsensitive(
+                    !shortcut.case_insensitive,
+                )),
+            false,
+        );
+        let show_setup = self.revealed.keyboard_action(
+            setup_setting,
+            show_setup,
+            self.editable()
+                .then_some(Message::ShowAgentSetup(!self.general.show_agent_setup)),
+            false,
+        );
         let tab_row = row(GeneralSection::ALL.into_iter().map(|section| {
             let selected = self.general_section == section;
-            button(text(section.title()).size(13))
-                .padding([7, 14])
-                .style(move |theme, status| dialog_design::tab(theme, status, selected))
-                .on_press(Message::GeneralSection(section))
-                .into()
+            self.general_action(
+                button(text(section.title()).size(13))
+                    .padding([7, 14])
+                    .style(move |theme, status| dialog_design::tab(theme, status, selected))
+                    .on_press(Message::GeneralSection(section)),
+                Some(Message::GeneralSection(section)),
+            )
         }));
         let page: Element<'_, Message> = match self.general_section {
             GeneralSection::Features => column![
@@ -5403,11 +5656,45 @@ impl Dialog {
                     ].spacing(8),
                 ],
                 iced::widget::rule::horizontal(1),
+            self.revealed.wrap(search::Setting::ConfirmBeforeSend,
+                column![
+                    self.revealed.keyboard_action(
+                        search::Setting::ConfirmBeforeSend,
+                        checkbox(self.general.confirm_before_send)
+                            .label(search::Setting::ConfirmBeforeSend.title())
+                            .on_toggle_maybe(self.editable().then_some(Message::ConfirmBeforeSend)),
+                        self.editable().then_some(Message::ConfirmBeforeSend(!self.general.confirm_before_send)),
+                        false,
+                    ),
+                    text("When off, Summarize, Summarize Recent Output and Solve Problem can send their initial terminal selection directly. Ask and follow-up questions still open the editor. Files, included memory, web tools and configured CLI requests still require review.").size(12),
+                ].spacing(6),
+            ),
             self.revealed.wrap(
                 terminal_actions_setting,
                 row![text("AI chat code blocks in the terminal:").size(13).width(212), terminal_actions]
                     .align_y(Alignment::Center)
                     .wrap(),
+            ),
+            iced::widget::rule::horizontal(1),
+            self.revealed.wrap(search::Setting::AgentDebugMessages,
+                self.revealed.keyboard_action(
+                    search::Setting::AgentDebugMessages,
+                    checkbox(self.general.agent_debug_messages)
+                        .label(search::Setting::AgentDebugMessages.title())
+                        .on_toggle_maybe(self.editable().then_some(Message::AgentDebugMessages)),
+                    self.editable().then_some(Message::AgentDebugMessages(!self.general.agent_debug_messages)),
+                    false,
+                ),
+            ),
+            self.revealed.wrap(search::Setting::AgentRuntimeMessages,
+                self.revealed.keyboard_action(
+                    search::Setting::AgentRuntimeMessages,
+                    checkbox(self.general.agent_runtime_messages)
+                        .label(search::Setting::AgentRuntimeMessages.title())
+                        .on_toggle_maybe(self.editable().then_some(Message::AgentRuntimeMessages)),
+                    self.editable().then_some(Message::AgentRuntimeMessages(!self.general.agent_runtime_messages)),
+                    false,
+                ),
             ),
             ].spacing(10).into(),
             GeneralSection::Agent => column![
@@ -5422,25 +5709,45 @@ impl Dialog {
                     .spacing(12).align_y(Alignment::Center).wrap(),
             ),
             self.revealed.wrap(search::Setting::AgentConfirmation,
-                checkbox(self.general.agent_confirm_mutating).label("Require approval for mutating Agent command sets")
-                    .on_toggle_maybe(self.editable().then_some(Message::AgentConfirmMutating))),
+                self.revealed.keyboard_action(
+                    search::Setting::AgentConfirmation,
+                    checkbox(self.general.agent_confirm_mutating).label("Require approval for mutating Agent command sets")
+                        .on_toggle_maybe(self.editable().then_some(Message::AgentConfirmMutating)),
+                    self.editable().then_some(Message::AgentConfirmMutating(!self.general.agent_confirm_mutating)),
+                    false,
+                )),
             text("When unchecked, a command review can explicitly approve future ordinary commands for that run and target. Managed confirmation policy overrides this choice. Elevation and password requests keep their separate approvals.").size(13),
             self.saved.java_agent_confirm_mutating.map(|enabled| self.revealed.wrap(
                 search::Setting::ImportedGeneral(ImportedGeneral::AgentConfirmation),
                 row![
                     text(format!("Imported from Java: command confirmation {}", if enabled { "on" } else { "off" })).size(13),
-                    button("Use imported confirmation preference").on_press_maybe(self.editable().then_some(Message::AdoptJavaAgentConfirmation)),
+                    self.revealed.keyboard_action(
+                        search::Setting::ImportedGeneral(ImportedGeneral::AgentConfirmation),
+                        button("Use imported confirmation preference").on_press_maybe(self.editable().then_some(Message::AdoptJavaAgentConfirmation)),
+                        self.editable().then_some(Message::AdoptJavaAgentConfirmation),
+                        true,
+                    ),
                 ].spacing(8).wrap(),
             )),
             self.revealed.wrap(search::Setting::AgentExecution,
-                checkbox(self.general.agent_execution_enabled).label("Allow Agent command execution")
-                    .on_toggle_maybe(self.editable().then_some(Message::AgentExecutionEnabled))),
+                self.revealed.keyboard_action(
+                    search::Setting::AgentExecution,
+                    checkbox(self.general.agent_execution_enabled).label("Allow Agent command execution")
+                        .on_toggle_maybe(self.editable().then_some(Message::AgentExecutionEnabled)),
+                    self.editable().then_some(Message::AgentExecutionEnabled(!self.general.agent_execution_enabled)),
+                    false,
+                )),
             text("Disabling execution blocks Agent Run, executing AI Swarm and scheduled Agent diagnostics. Ask, planning and ordinary snippets remain available, subject to policy. Existing Agent operations stop when their permissions are rechecked.").size(13),
             self.saved.java_agent_execution_enabled.map(|enabled| self.revealed.wrap(
                 search::Setting::ImportedGeneral(ImportedGeneral::AgentExecution),
                 row![
                     text(format!("Imported from Java: Agent execution {}", if enabled { "on" } else { "off" })).size(13),
-                    button("Use imported execution preference").on_press_maybe(self.editable().then_some(Message::AdoptJavaAgentExecution)),
+                    self.revealed.keyboard_action(
+                        search::Setting::ImportedGeneral(ImportedGeneral::AgentExecution),
+                        button("Use imported execution preference").on_press_maybe(self.editable().then_some(Message::AdoptJavaAgentExecution)),
+                        self.editable().then_some(Message::AdoptJavaAgentExecution),
+                        true,
+                    ),
                 ].spacing(8).wrap(),
             )),
             column![
@@ -5457,7 +5764,12 @@ impl Dialog {
                         text(format!("Imported from Java · command: {} · ignore case: {}",
                             imported.name.as_deref().unwrap_or("not specified"),
                             imported.case_insensitive.map_or("not specified", |value| if value { "on" } else { "off" }))).size(13),
+                        self.revealed.keyboard_action(
+                        search::Setting::ImportedGeneral(ImportedGeneral::AgentShortcut),
                         button("Use imported command preferences").on_press_maybe(self.editable().then_some(Message::AdoptJavaAgentShortcut)),
+                        self.editable().then_some(Message::AdoptJavaAgentShortcut),
+                        true,
+                    ),
                         text("Adoption preserves whether terminal agent shortcuts are enabled. Save to apply the name to local and SSH shell prompts.").size(13),
                     ].spacing(4),
                 )),
@@ -5471,8 +5783,34 @@ impl Dialog {
                     text("When unchecked, a submitted Run or Ask alias with a task can skip setup when the required details are available. Run still opens the environment probe review.").size(13),
                 ].spacing(6),
             ),
+            self.agent_history_limit_view(),
             ].spacing(10).into(),
             GeneralSection::Defaults => column![
+            self.revealed.wrap(
+                search::Setting::SecurityProfile,
+                row![
+                    text("Security-check profile:").size(13).width(212),
+                    container(local::profile_role_picker(
+                        &self.local_state, self.profiles.catalog(), local::Role::Security,
+                        self.editable(), &self.revealed, search::Setting::SecurityProfile,
+                    ).map(Message::Local)).width(Length::Fill),
+                    self.revealed.action(
+                        search::Setting::ClearSecurityProfile,
+                        self.revealed.keyboard_action(
+                            search::Setting::ClearSecurityProfile,
+                            button("Clear").on_press_maybe(
+                                (self.editable() && self.local_state.profile(local::Role::Security).is_some())
+                                    .then_some(Message::Local(local::Message::Role(local::Role::Security, None))),
+                            ),
+                            (self.editable() && self.local_state.profile(local::Role::Security).is_some())
+                                .then_some(Message::Local(local::Message::Role(local::Role::Security, None))),
+                            true,
+                        ),
+                    ),
+                ].spacing(8).align_y(Alignment::Center),
+            ),
+            text("Dedicated AI profile for snippet security checks. Use default to follow the regular profile selection.").size(12),
+            iced::widget::rule::horizontal(1),
             self.revealed.wrap(
                 GlobalTimeout,
                 row![text(GlobalTimeout.title()), self.revealed.input(GlobalTimeout, self.editable(), timeout)]
@@ -5486,22 +5824,30 @@ impl Dialog {
                     .align_y(Alignment::Center)
                     .wrap(),
             ),
-            self.revealed.wrap(search::Setting::JournalSemanticSearch, checkbox(self.general.journal_semantic_search)
-                .label("Use local semantic ranking when preparing cross-journal questions")
-                .on_toggle_maybe(self.editable().then_some(Message::JournalSemanticSearch))),
+            self.snippet_defaults_view(),
+            self.revealed.wrap(search::Setting::JournalSemanticSearch,
+                self.revealed.keyboard_action(
+                    search::Setting::JournalSemanticSearch,
+                    checkbox(self.general.journal_semantic_search).label("Use local semantic ranking when preparing cross-journal questions")
+                        .on_toggle_maybe(self.editable().then_some(Message::JournalSemanticSearch)),
+                    self.editable().then_some(Message::JournalSemanticSearch(!self.general.journal_semantic_search)),
+                    false,
+                )),
             text("Preparing a cross-journal question sends its masked text and new or changed search cards to the configured local embedding model. Lexical ranking is used if no model is available. Answer requests still require review.").size(13),
             self.saved.java_journal_semantic_search.map(|enabled| self.revealed.wrap(
                 search::Setting::ImportedGeneral(ImportedGeneral::JournalSearch),
                 row![
                     text(format!("Imported from Java: semantic search {}", if enabled { "on" } else { "off" })).size(13),
-                    button("Use imported search preference").on_press_maybe(self.editable().then_some(Message::AdoptJavaJournalSemanticSearch)),
+                    self.revealed.keyboard_action(
+                        search::Setting::ImportedGeneral(ImportedGeneral::JournalSearch),
+                        button("Use imported search preference").on_press_maybe(self.editable().then_some(Message::AdoptJavaJournalSemanticSearch)),
+                        self.editable().then_some(Message::AdoptJavaJournalSemanticSearch),
+                        true,
+                    ),
                 ].spacing(8).wrap(),
             )),
             ].spacing(10).into(),
-            GeneralSection::Internet => column![
-                text("Internet access is configured per profile. Open the model section of a supported profile to review its web search options.").size(13),
-                button("Open Profiles").style(button::secondary).on_press(Message::Page(Page::Profiles)),
-            ].spacing(10).into(),
+            GeneralSection::Internet => self.internet_view(),
         };
         column![
             container(tab_row)
@@ -5824,7 +6170,13 @@ mod tests {
             let mut tree = Tree::new(view.as_widget());
             let limits = layout::Limits::new(Size::ZERO, Size::new(width, 480.0));
             let node = view.as_widget_mut().layout(&mut tree, &renderer, &limits);
-            let body = Layout::new(&node).children().nth(1).unwrap();
+            let body = Layout::new(&node)
+                .children()
+                .next()
+                .unwrap()
+                .children()
+                .nth(1)
+                .unwrap();
             let stack = body.children().nth(1).unwrap();
             let page = stack.children().next().unwrap();
             let tabs = page.children().next().unwrap();
@@ -6966,7 +7318,13 @@ mod tests {
             &renderer,
             &layout::Limits::new(Size::ZERO, size),
         );
-        let body = Layout::new(&node).children().nth(1).unwrap();
+        let body = Layout::new(&node)
+            .children()
+            .next()
+            .unwrap()
+            .children()
+            .nth(1)
+            .unwrap();
         let mut children = body.children();
         let content = children.nth(1).unwrap().bounds();
         let footer = children.next().unwrap();

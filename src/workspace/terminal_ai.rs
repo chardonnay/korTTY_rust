@@ -1,4 +1,4 @@
-//! Terminal selection requests and temporary, explicitly reviewed AI conversations.
+//! Terminal selection requests and temporary AI conversations with scoped review.
 
 pub(in crate::workspace) mod agent_follow_up;
 pub(super) mod attachment;
@@ -7,6 +7,7 @@ mod automatic_rule_ledger;
 mod automatic_rules;
 mod code_blocks;
 mod conversation;
+mod direct;
 mod knowledge;
 mod learning;
 mod learning_view;
@@ -131,6 +132,7 @@ impl Action {
 
 #[derive(Clone)]
 pub enum Message {
+    Open(Action),
     Recent(SessionId, Option<(String, bool)>),
     Profile(ProfileId),
     ChatColorProfile(chat_appearance::Profile),
@@ -888,6 +890,7 @@ pub struct StreamReply {
 
 pub(super) struct Chat {
     action: Action,
+    direct_initial: Option<Arc<Configuration>>,
     choices: Vec<Choice>,
     profile: ProfileId,
     policy_selection: Option<ProfileRef>,
@@ -1077,6 +1080,7 @@ impl Chat {
         };
         Ok(Self {
             action,
+            direct_initial: None,
             choices,
             profile,
             policy_selection,
@@ -1214,6 +1218,7 @@ impl Chat {
         };
         Ok(Self {
             action: Action::Ask,
+            direct_initial: None,
             choices,
             profile,
             policy_selection: Self::saved_policy(config, &summary.profile),
@@ -2307,6 +2312,9 @@ impl Workspace {
             let mut chat = Chat::with_cli_preference(
                 &config, action, context, redactor, preferred, allow_cli,
             )?;
+            if action != Action::Ask && !config.confirm_before_send() {
+                chat.direct_initial = Some(Arc::clone(&config));
+            }
             chat.source_pane = Some(session);
             chat.source_stream = Some(pane.stream_generation);
             chat.knowledge_root = crate::profile::root().ok();
@@ -2393,9 +2401,15 @@ impl Workspace {
 
     fn host_terminal_chat(&mut self, owner: window::Id, mut chat: Chat) -> Task<Desktop> {
         self.prepare_hosted_chat(&mut chat);
+        let direct = chat.direct_initial.is_some();
         let id = window::Id::unique();
         self.terminal_chats.insert(id, chat);
-        self.host_tool(owner, tool_tabs::Kind::AiChat, id)
+        let opened = self.host_tool(owner, tool_tabs::Kind::AiChat, id);
+        if direct {
+            opened.chain(Task::done(Desktop::TerminalAi(id, Message::Review)))
+        } else {
+            opened
+        }
     }
 
     fn prepare_hosted_chat(&mut self, chat: &mut Chat) {
@@ -2520,6 +2534,31 @@ impl Workspace {
     }
 
     pub(super) fn update_terminal_ai(&mut self, id: window::Id, message: Message) -> Task<Desktop> {
+        if let Message::Open(action) = message {
+            return if self.palette_can_open(id)
+                && let Some(session) = self
+                    .windows
+                    .get(&id)
+                    .and_then(|window| window.tab())
+                    .and_then(|tab| tab.focused_session())
+            {
+                self.open_terminal_ai(id, session, action)
+            } else {
+                Task::none()
+            };
+        }
+        let preparing = matches!(
+            message,
+            Message::Review | Message::MemoryFinished(..) | Message::QuotaFinished(..)
+        );
+        if !preparing && let Some(chat) = self.terminal_chats.get_mut(&id) {
+            chat.direct_initial = None;
+        }
+        let task = self.update_terminal_ai_notified(id, message);
+        task.chain(self.continue_direct_terminal_request(id))
+    }
+
+    fn update_terminal_ai_notified(&mut self, id: window::Id, message: Message) -> Task<Desktop> {
         if matches!(
             message,
             Message::Review

@@ -8,7 +8,7 @@ use std::time::Instant;
 use rustix::{fs, process};
 use zeroize::Zeroizing;
 
-use super::super::runner::{COMMAND_LIMIT, Cancel, Captured, Outcome, POLL, Status};
+use super::super::runner::{COMMAND_LIMIT, Cancel, Captured, Outcome, OutputStream, POLL, Status};
 use super::{Shell, exit_status};
 
 pub(super) fn run(
@@ -25,8 +25,8 @@ pub(super) fn run(
     for pipe in [stdout.as_fd(), stderr.as_fd()] {
         fs::fcntl_setfl(pipe, fs::fcntl_getfl(pipe)? | fs::OFlags::NONBLOCK)?;
     }
-    let mut stdout = Output::new(&mut stdout);
-    let mut stderr = Output::new(&mut stderr);
+    let mut stdout = Output::new(&mut stdout, cancel, OutputStream::Stdout);
+    let mut stderr = Output::new(&mut stderr, cancel, OutputStream::Stderr);
     let deadline = Instant::now() + COMMAND_LIMIT;
     let mut exit = None;
     let status = loop {
@@ -54,6 +54,8 @@ pub(super) fn run(
         }
     };
     drop(process);
+    cancel.output(OutputStream::Stdout, &stdout.captured, true);
+    cancel.output(OutputStream::Stderr, &stderr.captured, true);
     Ok(Outcome {
         status,
         stdout: stdout.captured,
@@ -145,15 +147,19 @@ impl Drop for Process {
 
 struct Output<'a, R> {
     reader: &'a mut R,
+    cancel: &'a Cancel,
+    stream: OutputStream,
     captured: Captured,
     done: bool,
     failed: bool,
 }
 
 impl<'a, R: Read> Output<'a, R> {
-    fn new(reader: &'a mut R) -> Self {
+    fn new(reader: &'a mut R, cancel: &'a Cancel, stream: OutputStream) -> Self {
         Self {
             reader,
+            cancel,
+            stream,
             captured: Captured::default(),
             done: false,
             failed: false,
@@ -167,7 +173,10 @@ impl<'a, R: Read> Output<'a, R> {
         let mut buffer = Zeroizing::new([0; 8192]);
         match self.reader.read(&mut buffer[..]) {
             Ok(0) => self.done = true,
-            Ok(count) => self.captured.push(&buffer[..count]),
+            Ok(count) => {
+                self.captured.push(&buffer[..count]);
+                self.cancel.output(self.stream, &self.captured, false);
+            }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => return true,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return false,
             Err(_) => self.failed = true,

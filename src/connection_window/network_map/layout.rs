@@ -450,6 +450,7 @@ mod tests {
 
     fn login(host: &str, port: u16) -> SavedLogin {
         SavedLogin {
+            preferences: Default::default(),
             endpoint: LoginTarget {
                 host: host.into(),
                 port,

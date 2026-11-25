@@ -54,8 +54,8 @@ struct SecurityRevision {
 impl From<&Connection> for SecurityRevision {
     fn from(connection: &Connection) -> Self {
         Self {
-            login: connection.login.clone(),
-            jump: connection.jump.clone(),
+            login: connection.login.execution_identity(),
+            jump: connection.jump.as_ref().map(SavedLogin::execution_identity),
             incognito: connection.incognito,
             isolation: connection.isolation,
             startup: connection.startup,
@@ -465,6 +465,7 @@ mod tests {
             name: "Saved target".into(),
             tag: String::new(),
             login: SavedLogin {
+                preferences: Default::default(),
                 endpoint: LoginTarget {
                     host: "target.example.test".into(),
                     port: 22,

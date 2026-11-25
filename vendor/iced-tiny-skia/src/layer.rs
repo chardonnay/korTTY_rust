@@ -20,15 +20,28 @@ fn text_visible_bounds(text: &Text) -> Option<Rectangle> {
             ..
         } => Some(*clip_bounds * *transformation),
         Text::Cached {
-            align_x: core::text::Alignment::Right,
+            align_x,
+            align_y,
             bounds,
             clip_bounds,
             ..
-        } => Rectangle {
-            x: bounds.x - bounds.width,
-            ..*bounds
+        } => {
+            // Cached text positions are alignment anchors, not top-left corners.
+            // Include the pixels above/left of an anchor when invalidating a frame.
+            let x = match align_x {
+                core::text::Alignment::Center => bounds.x - bounds.width / 2.0,
+                core::text::Alignment::Right => bounds.x - bounds.width,
+                _ => bounds.x,
+            };
+            let y = match align_y {
+                core::alignment::Vertical::Center => {
+                    bounds.y - bounds.height / 2.0
+                }
+                core::alignment::Vertical::Bottom => bounds.y - bounds.height,
+                core::alignment::Vertical::Top => bounds.y,
+            };
+            Rectangle { x, y, ..*bounds }.intersection(clip_bounds)
         }
-        .intersection(clip_bounds),
         _ => text.visible_bounds(),
     }
 }
@@ -294,8 +307,13 @@ impl Layer {
                             // Editor equality only compares font and dimensions. Parked
                             // tabs keep both buffers alive, so their identities must also
                             // match before retaining the previous frame's pixels.
-                            let same_buffer = match (editor_a.upgrade(), editor_b.upgrade()) {
-                                (Some(a), Some(b)) => std::ptr::eq(a.buffer(), b.buffer()),
+                            let same_buffer = match (
+                                editor_a.upgrade(),
+                                editor_b.upgrade(),
+                            ) {
+                                (Some(a), Some(b)) => {
+                                    std::ptr::eq(a.buffer(), b.buffer())
+                                }
                                 _ => false,
                             };
                             if !same_buffer {
@@ -477,6 +495,176 @@ impl<T> Item<T> {
             Item::Live(item) => std::slice::from_ref(item),
             Item::Group(group, _, _) => group.as_slice(),
             Item::Cached(cache, _, _) => cache,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Renderer;
+    use crate::core::Renderer as _;
+    use crate::core::text::Renderer as _;
+    use crate::core::{Font, Size, alignment};
+    use crate::graphics::Viewport;
+
+    fn cached_label(
+        renderer: &mut Renderer,
+        position: Point,
+        horizontal: core::text::Alignment,
+        vertical: alignment::Vertical,
+        clip: Rectangle,
+    ) {
+        renderer.fill_text(
+            core::Text {
+                content: "Own process".to_owned(),
+                bounds: Size::new(130.0, 20.0),
+                size: 16.0.into(),
+                line_height: core::text::LineHeight::Absolute(20.0.into()),
+                font: Font::DEFAULT,
+                align_x: horizontal,
+                align_y: vertical,
+                shaping: core::text::Shaping::Advanced,
+                wrapping: core::text::Wrapping::None,
+            },
+            position,
+            Color::BLACK,
+            clip,
+        );
+    }
+
+    #[test]
+    fn cached_text_respects_its_local_clip() {
+        let viewport = Viewport::with_physical_size(Size::new(300, 180), 1.0);
+        let full = Rectangle::with_size(viewport.logical_size());
+        let clip =
+            Rectangle::new(Point::new(20.0, 20.0), Size::new(260.0, 60.0));
+        let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+        renderer.reset(full);
+        cached_label(
+            &mut renderer,
+            Point::new(25.0, 78.0),
+            core::text::Alignment::Left,
+            alignment::Vertical::Center,
+            clip,
+        );
+        let mut pixels = tiny_skia::Pixmap::new(300, 180).unwrap();
+        let mut mask = tiny_skia::Mask::new(300, 180).unwrap();
+        renderer.draw(
+            &mut pixels.as_mut(),
+            &mut mask,
+            &viewport,
+            &[full],
+            Color::WHITE,
+        );
+        let white = pixels.pixels()[0];
+        assert!(pixels.pixels().iter().any(|pixel| *pixel != white));
+        for y in 80..180 {
+            assert!(
+                pixels.pixels()[y * 300..(y + 1) * 300]
+                    .iter()
+                    .all(|pixel| *pixel == white),
+                "cached label escaped below its clip at row {y}"
+            );
+        }
+    }
+
+    #[test]
+    fn cached_text_incremental_scroll_matches_a_full_repaint() {
+        for scale in [1.0, 2.0] {
+            for (horizontal, x) in [
+                (core::text::Alignment::Left, 25.0),
+                (core::text::Alignment::Center, 150.0),
+                (core::text::Alignment::Right, 275.0),
+            ] {
+                for (vertical, y) in [
+                    (alignment::Vertical::Top, 98.0),
+                    (alignment::Vertical::Center, 112.0),
+                    (alignment::Vertical::Bottom, 118.0),
+                ] {
+                    let width = (300.0 * scale) as u32;
+                    let height = (220.0 * scale) as u32;
+                    let viewport = Viewport::with_physical_size(
+                        Size::new(width, height),
+                        scale,
+                    );
+                    let full = Rectangle::with_size(viewport.logical_size());
+                    let clip = Rectangle::new(
+                        Point::new(20.0, 20.0),
+                        Size::new(260.0, 90.0),
+                    );
+                    let mut renderer =
+                        Renderer::new(Font::DEFAULT, 16.0.into());
+                    renderer.reset(full);
+                    cached_label(
+                        &mut renderer,
+                        Point::new(x, y),
+                        horizontal,
+                        vertical,
+                        clip,
+                    );
+                    let previous = renderer.layers().to_vec();
+                    let mut actual =
+                        tiny_skia::Pixmap::new(width, height).unwrap();
+                    let mut mask = tiny_skia::Mask::new(width, height).unwrap();
+                    renderer.draw(
+                        &mut actual.as_mut(),
+                        &mut mask,
+                        &viewport,
+                        &[full],
+                        Color::WHITE,
+                    );
+                    let white = actual.pixels()[0];
+                    assert!(
+                        actual.pixels().iter().any(|pixel| *pixel != white),
+                        "fixture text must be visible"
+                    );
+
+                    renderer.reset(full);
+                    cached_label(
+                        &mut renderer,
+                        Point::new(x, 180.0),
+                        horizontal,
+                        vertical,
+                        clip,
+                    );
+                    let damage = damage::group(
+                        damage::diff(
+                            &previous,
+                            renderer.layers(),
+                            |layer| vec![layer.bounds],
+                            Layer::damage,
+                        ),
+                        full,
+                    );
+                    renderer.draw(
+                        &mut actual.as_mut(),
+                        &mut mask,
+                        &viewport,
+                        &damage,
+                        Color::WHITE,
+                    );
+                    let mut expected =
+                        tiny_skia::Pixmap::new(width, height).unwrap();
+                    renderer.draw(
+                        &mut expected.as_mut(),
+                        &mut mask,
+                        &viewport,
+                        &[full],
+                        Color::WHITE,
+                    );
+                    let different = actual
+                        .pixels()
+                        .iter()
+                        .zip(expected.pixels())
+                        .filter(|(a, b)| a != b)
+                        .count();
+                    assert_eq!(
+                        different, 0,
+                        "stale pixels after {horizontal:?}/{vertical:?} scroll at scale {scale}"
+                    );
+                }
+            }
         }
     }
 }

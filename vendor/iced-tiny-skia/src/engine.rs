@@ -531,13 +531,15 @@ impl Engine {
                 shaping,
                 clip_bounds: local_clip_bounds,
             } => {
-                let physical_bounds = *local_clip_bounds * transformation;
-
-                if !clip_bounds.intersects(&physical_bounds) {
+                let Some(clip_bounds) = clip_bounds
+                    .intersection(&(*local_clip_bounds * transformation))
+                else {
                     return;
-                }
+                };
 
-                let clip_mask = clip_mask.clip(clip_bounds, physical_bounds);
+                // The local clip limits the painted glyphs, not their bounds.
+                // In particular, aligned labels can straddle its edges.
+                let clip_mask = Some(clip_mask.viewport(clip_bounds));
 
                 self.text_pipeline.draw_cached(
                     content,

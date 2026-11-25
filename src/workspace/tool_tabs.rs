@@ -382,7 +382,7 @@ impl Workspace {
                 self.remove_project_file(tool.instance);
             }
             Kind::Snippets => return self.remove_hosted_snippets(tool.instance),
-            Kind::Scheduler => self.remove_hosted_scheduler(tool.instance),
+            Kind::Scheduler => return self.remove_hosted_scheduler(tool.instance),
             Kind::TerminalEffects => {
                 self.effect_dialogs.remove(&tool.instance);
             }

@@ -16,6 +16,7 @@ use crate::ssh_dialog::{LoginTarget, normalize_host, unsafe_text};
 use crate::ssh_tunnel::Destination;
 use crate::terminal_effects::Selection;
 
+mod auth_preferences;
 mod color;
 pub(crate) mod custom_os_badges;
 pub(crate) mod import;
@@ -23,6 +24,7 @@ mod library;
 pub(crate) use library::{JavaGroupColor, JavaGroupIsolation};
 mod local;
 mod os_badge;
+pub(crate) mod protocol;
 mod terminal;
 mod window_geometry;
 pub(crate) use terminal::{
@@ -272,6 +274,22 @@ pub struct SavedLogin {
     pub auth: Auth,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub keyboard_interactive: bool,
+    #[serde(default, skip_serializing_if = "AuthPreferences::is_empty")]
+    pub(crate) preferences: AuthPreferences,
+}
+
+/// Inactive editor choices, never an authentication fallback. Secrets stay in the vault.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct AuthPreferences {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) password: Option<String>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) key_file: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) passphrase: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) keyboard_interactive: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -579,6 +597,7 @@ impl SavedLogin {
                 "keyboard-interactive login cannot also be a follow-up",
             ));
         }
+        self.preferences.validate()?;
         Ok(())
     }
 }
@@ -662,6 +681,8 @@ struct Document {
     serial_profiles: Vec<SerialProfile>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     local_profiles: Vec<LocalProfile>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    protocol_history: BTreeMap<u64, protocol::History>,
     approvals: BTreeMap<u64, TunnelPlan>,
     #[serde(default, skip_serializing_if = "Library::is_empty")]
     library: Library,
@@ -675,6 +696,7 @@ impl Default for Document {
             connections: Vec::new(),
             serial_profiles: Vec::new(),
             local_profiles: Vec::new(),
+            protocol_history: BTreeMap::new(),
             approvals: BTreeMap::new(),
             library: Library::default(),
         }
@@ -712,6 +734,27 @@ impl Document {
             }
         }
         self.library.validate(&seen)?;
+        for (id, history) in &self.protocol_history {
+            let active = self
+                .connections
+                .iter()
+                .find(|profile| profile.id == *id)
+                .map(|_| protocol::Kind::Ssh)
+                .or_else(|| {
+                    self.local_profiles
+                        .iter()
+                        .find(|profile| profile.id == *id)
+                        .map(|_| protocol::Kind::Local)
+                })
+                .or_else(|| {
+                    self.serial_profiles
+                        .iter()
+                        .find(|profile| profile.id == *id)
+                        .map(|_| protocol::Kind::Serial)
+                })
+                .ok_or_else(|| invalid("protocol history has no active profile"))?;
+            history.validate(*id, active)?;
+        }
         if self.approvals.len() > self.connections.len()
             || self.approvals.iter().any(|(id, approval)| {
                 approval.rules.is_empty()
@@ -1260,6 +1303,7 @@ impl Store {
             .local_profiles
             .retain(|entry| !ids.contains(&entry.id));
         candidate.approvals.retain(|id, _| !ids.contains(id));
+        candidate.protocol_history.retain(|id, _| !ids.contains(id));
         self.commit(candidate)
     }
 
@@ -1316,6 +1360,7 @@ impl Store {
         self.save_entry(connection, group, |_, _| {})
     }
 
+    #[cfg(test)]
     pub(crate) fn save_in_group_with_badge(
         &mut self,
         connection: Connection,
@@ -1387,6 +1432,7 @@ impl Store {
             .retain(|entry| !ids.contains(&entry.id));
         candidate.approvals.retain(|id, _| !ids.contains(id));
         candidate.library.remove_connections(&ids);
+        candidate.protocol_history.retain(|id, _| !ids.contains(id));
         self.commit(candidate)
     }
 

@@ -33,6 +33,7 @@ impl Drop for TestProfile {
 
 fn login(host: &str, auth: Auth) -> SavedLogin {
     SavedLogin {
+        preferences: Default::default(),
         endpoint: LoginTarget {
             host: host.into(),
             port: 22,

@@ -1714,6 +1714,7 @@ mod tests {
                 name: "Fixture target".into(),
                 tag: String::new(),
                 login: SavedLogin {
+                    preferences: Default::default(),
                     endpoint: LoginTarget {
                         host: "127.0.0.1".into(),
                         port,

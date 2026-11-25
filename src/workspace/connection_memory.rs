@@ -44,15 +44,14 @@ impl Workspace {
         if let Some(id) = self.connection_memory_for_editor(editor) {
             return window::gain_focus(id);
         }
-        let Some(profile) = self
+        let Some((profile_id, name)) = self
             .connection_managers
             .get(&manager)
-            .and_then(|manager| manager.window.saved_ssh_editor_profile())
+            .and_then(|manager| manager.window.saved_editor_identity())
         else {
             return Task::none();
         };
-        let name = profile.name.clone();
-        let scope = Scope::connection(profile.id, name.clone());
+        let scope = Scope::connection(profile_id, name.clone());
         let root = match crate::profile::root() {
             Ok(root) => root,
             Err(error) => {

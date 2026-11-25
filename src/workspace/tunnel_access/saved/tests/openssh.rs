@@ -754,6 +754,7 @@ fn openssh_reopen_closed_ssh_verifies_the_pin_and_starts_a_fresh_saved_session()
             name: "Local OpenSSH fixture".into(),
             tag: String::new(),
             login: SavedLogin {
+                preferences: Default::default(),
                 endpoint: server.login.clone(),
                 auth: Auth::KeyFile {
                     path: directory.0.join("client"),

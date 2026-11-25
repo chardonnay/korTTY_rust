@@ -95,6 +95,7 @@ fn swarm_scheduler_handoff_preserves_saved_targets_and_blocks_route_changes() {
                 name: host.into(),
                 tag: String::new(),
                 login: SavedLogin {
+                    preferences: Default::default(),
                     endpoint: LoginTarget {
                         host: host.into(),
                         port: 22,

@@ -160,6 +160,7 @@ impl Store {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn save_local(&mut self, profile: LocalProfile) -> io::Result<u64> {
         let group = self.group_of(profile.id).map(str::to_owned);
         self.save_local_in_group(profile, group.as_deref())

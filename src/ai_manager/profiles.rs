@@ -791,7 +791,7 @@ impl Profile {
             if !self.allows_lm_studio_mcp() || !self.trusts_credential() || self.tavily_search {
                 return Err("Choose one search mode and trust the LM Studio endpoint.".into());
             }
-            settings.validate()?;
+            settings.validate_inheritable()?;
             if settings.mode.uses_plugin() && credential.is_none() {
                 return Err(
                     "Enter the LM Studio API token environment variable for this plugin.".into(),
@@ -1949,6 +1949,10 @@ impl Editor {
         }
     }
 
+    pub(super) fn web_search_allowed(&self) -> bool {
+        !self.web_search_denied
+    }
+
     pub(super) fn wizard_open(&self) -> bool {
         self.wizard.is_some()
     }
@@ -2002,12 +2006,14 @@ impl Editor {
     pub(super) fn replace(&mut self, catalog: Catalog) {
         let selection = self.selected;
         let section = self.section;
+        let web_search_denied = self.web_search_denied;
         let reserved_id = self.reserved_id;
         let managed_models = std::mem::take(&mut self.managed_models);
         let mlx_models = std::mem::take(&mut self.mlx_models);
         let mut usage = std::mem::take(&mut self.usage);
         usage.reset_for_catalog();
         *self = Self::new(catalog);
+        self.web_search_denied = web_search_denied;
         self.managed_models = managed_models;
         self.mlx_models = mlx_models;
         self.usage = usage;

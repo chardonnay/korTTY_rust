@@ -4,6 +4,113 @@ use iced::{Alignment, Font};
 
 pub(in crate::workspace) mod java;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Program {
+    Editor,
+    Rsync,
+}
+
+impl Program {
+    pub(super) const ALL: [Self; 2] = [Self::Editor, Self::Rsync];
+
+    pub(super) fn setting(self) -> Setting {
+        match self {
+            Self::Editor => Setting::SftpExternalEditor,
+            Self::Rsync => Setting::SftpRsyncProgram,
+        }
+    }
+
+    fn value(self, settings: &WindowSettings) -> &str {
+        match self {
+            Self::Editor => &settings.sftp_external_editor,
+            Self::Rsync => &settings.job_scheduler_rsync_program,
+        }
+    }
+
+    pub(super) fn set(self, settings: &mut WindowSettings, path: String) {
+        if path.len() <= 4096 {
+            match self {
+                Self::Editor => settings.sftp_external_editor = path,
+                Self::Rsync => settings.job_scheduler_rsync_program = path,
+            }
+        }
+    }
+
+    pub(super) fn valid(self, settings: &WindowSettings) -> bool {
+        WindowSettings::valid_sftp_program(self.value(settings))
+    }
+
+    fn view(self, dialog: &Dialog) -> Element<'_, Desktop> {
+        let id = dialog.id;
+        let setting = self.setting();
+        let input = dialog.reveal_input(
+            setting,
+            true,
+            text_input(
+                "Absolute native executable path",
+                self.value(&dialog.draft.preferences),
+            )
+            .size(13)
+            .on_input(move |path| Desktop::Settings(Message::SftpProgram(id, self, path)))
+            .width(Length::Fill)
+            .style(super::super::dialog_design::form_input),
+        );
+        let browse_action = dialog
+            .sftp_program_picker
+            .is_none()
+            .then_some(Desktop::Settings(Message::SftpBrowseProgram(id, self)));
+        let browse = dialog_design::keyboard_table::action_with_id(
+            button(text("Browse…").size(13))
+                .on_press_maybe(browse_action.clone())
+                .into(),
+            browse_action,
+            true,
+            Some(widget::Id::new(match self {
+                Self::Editor => "sftp-editor-browse",
+                Self::Rsync => "sftp-rsync-browse",
+            })),
+        );
+        highlighted(
+            dialog,
+            setting,
+            column![
+                labeled(
+                    setting,
+                    row![input, browse]
+                        .spacing(10)
+                        .align_y(Alignment::Center)
+                        .width(Length::Fill)
+                ),
+                (!self.valid(&dialog.draft.preferences)).then(|| help(
+                    "Enter an absolute executable path without arguments, or leave it blank."
+                )),
+            ]
+            .spacing(5),
+        )
+    }
+}
+
+pub(super) fn pick_program(
+    owner: window::Id,
+    program: Program,
+    settings: &WindowSettings,
+) -> Task<Option<std::path::PathBuf>> {
+    let path = std::path::PathBuf::from(program.value(settings));
+    window::run(owner, move |owner| {
+        let picker = rfd::AsyncFileDialog::new()
+            .set_parent(owner)
+            .set_title(program.setting().label());
+        let picker = if let Some(parent) = path.parent().filter(|parent| parent.is_absolute()) {
+            picker.set_directory(parent)
+        } else {
+            picker
+        };
+        picker.pick_file()
+    })
+    .then(Task::future)
+    .map(|file| file.map(|file| file.path().to_owned()))
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum Number {
     Idle,
@@ -127,8 +234,11 @@ impl Numbers {
         let bounds = number.bounds(policy);
         let edit = enabled
             .then_some(move |input| Desktop::Settings(Message::SftpNumber(id, number, input)));
-        let input =
-            dialog.reveal_input(setting, enabled, text_input("", value).on_input_maybe(edit));
+        let input = dialog.reveal_input(
+            setting,
+            enabled,
+            text_input("", value).size(13).on_input_maybe(edit),
+        );
         let problem = invalid.map(|_| {
             help(format!(
                 "Enter a whole number from {} to {}.",
@@ -162,6 +272,7 @@ impl Workspace {
                 Some(effective_conflict_default),
                 move |value| Desktop::Settings(Message::SftpConflictDefault(id, value)),
             )
+            .text_size(13)
             .into()
         } else {
             text(effective_conflict_default.to_string()).into()
@@ -178,6 +289,7 @@ impl Workspace {
             Setting::SftpArchive,
             true,
             text_input("Current remote directory", &archive.remote_directory)
+                .size(13)
                 .on_input(move |path| Desktop::Settings(Message::SftpArchiveDirectory(id, path)))
                 .width(250)
                 .style(super::super::dialog_design::form_input),
@@ -186,6 +298,7 @@ impl Workspace {
             heading("SFTP Manager Settings"),
             highlighted(dialog, Setting::SftpIdle,
                 checkbox(preferences.sftp_idle_minutes.is_some()).label(Setting::SftpIdle.label())
+                    .text_size(13)
                     .on_toggle(move |enabled| Desktop::Settings(Message::SftpIdleEnabled(id, enabled)))),
             dialog.sftp_numbers.view(dialog, Number::Idle, conflict_policy),
             help("Applies to detached windows and tabs. A project timeout takes precedence. Active transfers, reviews and remote editors keep the connection open."),
@@ -198,13 +311,19 @@ impl Workspace {
             ].spacing(5)),
             highlighted(dialog, Setting::SftpResume,
                 checkbox(preferences.sftp_resume_partial_transfers).label(Setting::SftpResume.label())
+                    .text_size(13)
                     .on_toggle_maybe(allowed.then_some(move |enabled| Desktop::Settings(Message::SftpResume(id, enabled))))),
             highlighted(dialog, Setting::SftpKeepPartial,
                 checkbox(preferences.sftp_keep_partial_on_cancel).label(Setting::SftpKeepPartial.label())
+                    .text_size(13)
                     .on_toggle_maybe((allowed && preferences.sftp_resume_partial_transfers).then_some(move |enabled| Desktop::Settings(Message::SftpKeepPartial(id, enabled))))),
             (!allowed).then(|| help("File transfers are disabled by policy.")),
             (allowed && cap < crate::sftp_window::parallel::MAX_PARALLEL).then(|| help(format!("Organization limit · {cap} parallel {}", if cap == 1 { "transfer" } else { "transfers" }))),
             help("Attached SSH sessions use at most two transfer lanes. Transfers to the same destination stay ordered. Turning off resume releases retained partial transfers."),
+            rule::horizontal(1),
+            heading("External Editor"),
+            Program::Editor.view(dialog),
+            help("Choose the native program used for remote files. Review its executable and arguments in Edit in External Editor before use. Leave blank to use the editor selected there."),
             rule::horizontal(1),
             heading("ZIP Creation Settings"),
             highlighted(dialog, Setting::SftpArchive, column![
@@ -214,13 +333,27 @@ impl Workspace {
             dialog.sftp_numbers.view(dialog, Number::Compression, conflict_policy),
             help("Leave the path empty to use the current remote directory. Compression 0 stores files as-is and 9 applies the strongest compression."),
             rule::horizontal(1),
+            heading("Rsync (Scheduler)"),
+            Program::Rsync.view(dialog),
+            help("Used for new Scheduler jobs. Existing jobs keep their reviewed executable. Review each job's executable, SSH route and transfer before use."),
+            rule::horizontal(1),
             dialog.sftp_xml.view(allowed, cap).map(move |action| Desktop::Settings(Message::SftpXml(id, action))),
-        ].spacing(10).into()
+        ].spacing(10).max_width(540).into()
     }
 }
 
 fn labeled<'a>(setting: Setting, field: impl Into<Element<'a, Desktop>>) -> Element<'a, Desktop> {
-    row![text(setting.label()).width(220), field.into()]
+    let (label, width) = match setting {
+        Setting::SftpIdleMinutes => ("Timeout (minutes):", 110),
+        Setting::SftpParallel => ("Parallel transfers:", 110),
+        Setting::SftpConflictDefault => ("When the target already exists:", 185),
+        Setting::SftpExternalEditor => ("Editor executable:", 110),
+        Setting::SftpRsyncProgram => ("Rsync binary path:", 120),
+        Setting::SftpArchive => ("Default ZIP path:", 110),
+        Setting::SftpArchiveCompression => ("Default compression (0–9):", 185),
+        _ => (setting.label(), 220),
+    };
+    row![text(label).size(13).width(width), field.into()]
         .align_y(Alignment::Center)
         .spacing(10)
         .into()
@@ -228,7 +361,7 @@ fn labeled<'a>(setting: Setting, field: impl Into<Element<'a, Desktop>>) -> Elem
 
 fn heading(title: &'static str) -> Element<'static, Desktop> {
     text(title)
-        .size(16)
+        .size(14)
         .font(Font {
             weight: iced::font::Weight::Bold,
             ..Font::DEFAULT
@@ -238,8 +371,8 @@ fn heading(title: &'static str) -> Element<'static, Desktop> {
 
 fn help(value: impl Into<String>) -> Element<'static, Desktop> {
     text(value.into())
-        .size(13)
-        .width(420)
+        .size(12)
+        .width(525)
         .style(text::secondary)
         .into()
 }
@@ -247,6 +380,112 @@ fn help(value: impl Into<String>) -> Element<'static, Desktop> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sftp_executable_settings_search_cancel_save_reopen_and_picker_tickets() -> std::io::Result<()>
+    {
+        let scratch = crate::snippets::tests::Profile::new();
+        let path = scratch.0.join("window-settings.json");
+        let editor = if cfg!(windows) {
+            r"C:\Editors\native.exe"
+        } else {
+            "/Applications/Editor.app/Contents/MacOS/editor"
+        };
+        let rsync = if cfg!(windows) {
+            r"C:\Tools\rsync.exe"
+        } else {
+            "/opt/local/bin/rsync"
+        };
+        let mut workspace = Workspace::default();
+        workspace.window_settings.save(&path)?;
+        let original = std::fs::read(&path)?;
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.update_settings(Message::OpenAt(owner, Section::Font));
+        let dialog = workspace.settings.0.as_mut().unwrap();
+        let id = dialog.id;
+        for (query, setting) in [
+            ("external editor executable", Setting::SftpExternalEditor),
+            ("rsync executable", Setting::SftpRsyncProgram),
+        ] {
+            dialog.search = query.into();
+            assert_eq!(
+                dialog
+                    .search_results(true, &workspace.clipboard.policy)
+                    .next(),
+                Some(SearchTarget::Setting(setting))
+            );
+        }
+        let _ = dialog.reveal_result(Setting::SftpExternalEditor);
+        assert_eq!(dialog.section, Section::Sftp);
+        let _ = workspace.update_settings(Message::SftpProgram(id, Program::Editor, editor.into()));
+        let _ = workspace.update_settings(Message::Cancel(id));
+        assert_eq!(std::fs::read(&path)?, original);
+        assert!(workspace.window_settings.sftp_external_editor.is_empty());
+
+        let _ = workspace.update_settings(Message::OpenAt(owner, Section::Sftp));
+        let id = workspace.settings.0.as_ref().unwrap().id;
+        let ticket = std::sync::Arc::new(());
+        workspace.settings.0.as_mut().unwrap().sftp_program_picker =
+            Some((Program::Rsync, ticket.clone()));
+        let _ = workspace.update_settings(Message::SftpProgramPicked(id, ticket.clone(), None));
+        assert!(
+            workspace
+                .settings
+                .0
+                .as_ref()
+                .unwrap()
+                .draft
+                .preferences
+                .job_scheduler_rsync_program
+                .is_empty()
+        );
+        // A result from a cancelled chooser must not replace a later manual edit.
+        let _ = workspace.update_settings(Message::SftpProgram(id, Program::Rsync, rsync.into()));
+        let _ = workspace.update_settings(Message::SftpProgramPicked(
+            id,
+            ticket,
+            Some(std::path::PathBuf::from(editor)),
+        ));
+        let _ = workspace.update_settings(Message::SftpProgram(
+            id,
+            Program::Editor,
+            "relative-editor".into(),
+        ));
+        let _ = workspace.save_settings_to(id, |_| panic!("relative executable must not save"));
+        assert_eq!(
+            workspace.settings.0.as_ref().unwrap().revealed,
+            Some(Setting::SftpExternalEditor)
+        );
+        let _ = workspace.update_settings(Message::SftpProgram(id, Program::Editor, editor.into()));
+        let _ = workspace.save_settings_to(id, |settings| settings.save(&path));
+        workspace.window_settings = WindowSettings::read(&path)?;
+        let _ = workspace.update_settings(Message::OpenAt(owner, Section::Sftp));
+        let settings = &workspace.settings.0.as_ref().unwrap().draft.preferences;
+        assert_eq!(settings.sftp_external_editor, editor);
+        assert_eq!(settings.job_scheduler_rsync_program, rsync);
+        assert!(!scratch.0.join("sftp-external-editor.json").exists());
+        assert!(!scratch.0.join("job-rsync-reviews.json").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn sftp_executable_settings_merge_preserves_concurrent_changes() {
+        let initial = Draft {
+            preferences: WindowSettings::default(),
+            restore: None,
+            backup: BackupPreferences::default(),
+        };
+        let mut edited = initial.clone();
+        edited.preferences.sftp_external_editor = "chosen editor".into();
+        let mut current = initial.preferences.clone();
+        current.job_scheduler_rsync_program = "concurrent rsync choice".into();
+        let merged = edited.merge_preferences(&initial, current, &ClipboardPolicy::default());
+        assert_eq!(merged.sftp_external_editor, "chosen editor");
+        assert_eq!(
+            merged.job_scheduler_rsync_program,
+            "concurrent rsync choice"
+        );
+    }
 
     #[test]
     fn sftp_archive_preferences_merge_independent_fields_and_validate_on_save() {
@@ -379,7 +618,9 @@ mod tests {
         ] {
             dialog.search = query.into();
             assert_eq!(
-                dialog.search_results(true).next(),
+                dialog
+                    .search_results(true, &workspace.clipboard.policy)
+                    .next(),
                 Some(SearchTarget::Setting(expected))
             );
         }

@@ -343,6 +343,7 @@ mod tests {
                 name: "Control fixture".into(),
                 tag: String::new(),
                 login: SavedLogin {
+                    preferences: Default::default(),
                     endpoint: LoginTarget {
                         host: "fixture.invalid".into(),
                         port: 2222,

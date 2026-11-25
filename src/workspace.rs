@@ -40,6 +40,7 @@ use crate::terminal_view::{self, SearchHighlight, Selection, TerminalView};
 use crate::vault_window::VaultWindow;
 
 mod ai_access;
+pub(crate) mod ai_general_defaults;
 pub(crate) mod ai_quota;
 mod appearance;
 mod application_updates;
@@ -382,6 +383,7 @@ pub enum Message {
     Sftp(window::Id, sftp_window::Message),
     OpenScheduler(window::Id),
     Scheduler(window::Id, scheduler_window::Message),
+    SchedulerTargets(window::Id, scheduler_window::target_picker::Event),
     SaveSchedulerJournalDivider,
     OpenSnippets(window::Id),
     Snippets(window::Id, crate::snippet_window::Message),
@@ -560,6 +562,7 @@ pub struct Workspace {
     scheduler: Option<SchedulerWindow>,
     scheduler_owners: HashMap<window::Id, window::Id>,
     scheduler_views: HashMap<window::Id, scheduler_window::SchedulerView>,
+    scheduler_target_windows: HashMap<window::Id, scheduler_access::target_picker::Window>,
     scheduler_journal_divider_save: Option<(std::time::Instant, Option<window::Id>)>,
     journal_live_log_height_save: Option<(std::time::Instant, window::Id)>,
     scheduler_workers: usize,
@@ -679,6 +682,7 @@ struct RestoredLayout {
 }
 
 struct PaneSession {
+    saved_runtime: Option<Box<profile_tools::RuntimePreferences>>,
     quick_ai: Option<crate::connection_store::AiAssignments>,
     quick_appearance: Option<crate::connection_store::TerminalOverrides>,
     restored_output: Option<zeroize::Zeroizing<String>>,
@@ -749,6 +753,8 @@ enum LocalLaunchView {
         Option<Option<crate::terminal_effects::Selection>>,
         Option<crate::connection_store::TerminalAppearance>,
         Option<(u64, PathBuf)>,
+        bool,
+        Option<crate::terminal_logging::Config>,
     ),
     Existing(GridSize, Option<Appearance>),
 }
@@ -776,6 +782,7 @@ struct PendingIbm {
 }
 
 struct PendingSerial {
+    logging: Option<crate::terminal_logging::Config>,
     form: SerialDialog,
     saved: Option<SerialProfile>,
     replace: Option<SessionId>,
@@ -1136,6 +1143,7 @@ impl Workspace {
         }
         if let Some(title) = self
             .quick_connect_title(id)
+            .or_else(|| self.scheduler_target_title(id))
             .or_else(|| self.highlight_title(id))
             .or_else(|| self.known_hosts_title(id))
             .or_else(|| self.ssh_keys_title(id))
@@ -1936,6 +1944,7 @@ impl Workspace {
                 self.remove_coding_agent_alias_dialogs(id);
                 self.journal_summary_progress_closed(id);
                 self.ai_manager_child_closed(id);
+                self.scheduler_target_closed(id);
                 let placed = self.finish_placed_dialog_closed(id);
                 let manager = self.connection_window_closed(id).unwrap_or_else(Task::none);
                 let memory = self.connection_memory_closed(id);
@@ -1995,6 +2004,7 @@ impl Workspace {
                 ]);
             }
             Message::Window(id, window::Event::Unfocused) => {
+                self.scheduler_target_modifiers(id, Modifiers::empty());
                 self.cancel_unfocused_inline_completion(id);
                 if let Some(surface) = self.snippets.get_mut(&id) {
                     surface.window.dismiss_tab_context();
@@ -2119,6 +2129,7 @@ impl Workspace {
             Message::LocalDock(id, message) => return self.update_local_dock(id, message),
             Message::RemoteDock(id, message) => {
                 if let remote_dock::Message::Modifiers(modifiers) = &message {
+                    self.scheduler_target_modifiers(id, *modifiers);
                     self.ascii_art_modifiers(id, *modifiers);
                     self.logfile_modifiers(id, *modifiers);
                     self.journal_modifiers(id, *modifiers);
@@ -2710,6 +2721,9 @@ impl Workspace {
             Message::Sftp(id, message) => return self.update_sftp(id, message),
             Message::OpenScheduler(id) => return self.show_scheduler(id),
             Message::Scheduler(id, message) => return self.update_scheduler(id, message),
+            Message::SchedulerTargets(id, event) => {
+                return self.update_scheduler_targets(id, event);
+            }
             Message::SaveSchedulerJournalDivider => {
                 return self.save_scheduler_journal_divider_when_ready();
             }
@@ -3469,9 +3483,10 @@ impl Workspace {
                 ) {
                     Ok(id) => id,
                     Err(error)
-                        if security
-                            .as_ref()
-                            .is_some_and(|settings| settings.saved_profile.is_some()) =>
+                        if error.kind() != std::io::ErrorKind::PermissionDenied
+                            && security
+                                .as_ref()
+                                .is_some_and(|settings| settings.saved_profile.is_some()) =>
                     {
                         let grid = self.configured_initial_grid(profile, None, *initial_size);
                         let session = Session::closed_local(
@@ -3632,6 +3647,15 @@ impl Workspace {
                     })
             })
             .transpose()?;
+        if let Some(local) = &local {
+            let runtime = self.saved_terminal_preferences.resolve_local(local, None)?;
+            if runtime.settings.incognito {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "The saved connection is now incognito; open it explicitly instead of restoring it.",
+                ));
+            }
+        }
         self.launch_local_session(profile, font, saved, view, strict, local)
     }
 
@@ -3676,6 +3700,34 @@ impl Workspace {
                 "Managed policy could not be applied. Sessions are locked.",
             ));
         }
+        let source = match &view {
+            LocalLaunchView::QuickConnect(_, _, Some((_, path)), _, _) => Some(path.as_path()),
+            _ => None,
+        };
+        let quick_logging = match &view {
+            LocalLaunchView::QuickConnect(_, _, _, _, logging) => logging.clone(),
+            _ => None,
+        };
+        let requested_privacy = matches!(&view, LocalLaunchView::QuickConnect(_, _, _, true, _));
+        let mut runtime = local
+            .as_ref()
+            .map(|local| self.saved_terminal_preferences.resolve_local(local, source))
+            .transpose()?;
+        if let Some(logging) = quick_logging {
+            runtime
+                .get_or_insert_with(Default::default)
+                .settings
+                .logging = logging;
+        }
+        if let Some(runtime) = &mut runtime {
+            runtime.settings.incognito |= requested_privacy;
+            self.validate_native_privacy(runtime)?;
+        }
+        if requested_privacy && !self.clipboard.policy.incognito_allowed {
+            return Err(std::io::Error::other(
+                "Managed policy blocks this incognito connection.",
+            ));
+        }
         let settings = if let Some(local) = &local {
             profile = local.profile().ok_or_else(|| {
                 std::io::Error::new(
@@ -3684,7 +3736,7 @@ impl Workspace {
                 )
             })?;
             let quick_source = match &view {
-                LocalLaunchView::QuickConnect(_, _, Some((id, path))) => {
+                LocalLaunchView::QuickConnect(_, _, Some((id, path)), _, _) => {
                     Some((*id, path.as_path()))
                 }
                 _ => None,
@@ -3699,7 +3751,10 @@ impl Workspace {
             && self.window_settings.automatic_local_shell_integration()
             && self.window_settings.prompt_navigation_enabled
             && shell_integration::supports_marks(profile);
-        let terminal = local.as_ref().map(|profile| &profile.terminal);
+        let terminal = runtime
+            .as_ref()
+            .map(|runtime| &runtime.settings.terminal)
+            .or_else(|| local.as_ref().map(|profile| &profile.terminal));
         let saved_strict = terminal.and_then(|settings| settings.strict_terminal_mode);
         let strict =
             saved_strict.unwrap_or(strict || settings.isolation == IsolationLevel::Sandbox);
@@ -3710,7 +3765,7 @@ impl Workspace {
                 None,
                 None,
             ),
-            LocalLaunchView::QuickConnect(effect, style, _) => (
+            LocalLaunchView::QuickConnect(effect, style, _, _, _) => (
                 self.configured_initial_grid(profile, terminal, InitialTerminalSize::default()),
                 None,
                 effect,
@@ -3719,7 +3774,12 @@ impl Workspace {
             LocalLaunchView::Existing(grid, appearance) => (grid, appearance, None, None),
         };
         let effect = effect_override
-            .unwrap_or_else(|| local.as_ref().and_then(|profile| profile.terminal_effect))
+            .unwrap_or_else(|| {
+                runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.settings.terminal_effect)
+                    .or_else(|| local.as_ref().and_then(|profile| profile.terminal_effect))
+            })
             .filter(|selection| self.allowed_terminal_effect(selection.effect));
         let quick_appearance = quick_style.map(|style| style.display_overrides(terminal));
         let appearance = appearance.unwrap_or_else(|| {
@@ -3728,21 +3788,31 @@ impl Workspace {
         let appearance = effect.map_or(appearance, |selection| {
             selection.effect.appearance(appearance)
         });
-        let session = Session::start_local_with_strict(
+        let incognito = requested_privacy
+            || runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.settings.incognito);
+        let logging = self.native_logging(
+            runtime.as_ref(),
+            incognito,
+            local
+                .as_ref()
+                .map_or("Local shell", |local| local.name.as_str()),
+            "local",
+        );
+        let session = Session::start_local_with_logging(
             grid,
             profile,
             options,
             self.window_settings.prompt_navigation_enabled,
             appearance,
+            logging,
             crate::session::StreamOptions {
                 strict_escapes: Some(strict),
                 encoding: terminal.and_then(|settings| settings.encoding),
                 scrollback: self.terminal_scrollback(terminal),
             },
         )?;
-        if let Some(local) = &local {
-            self.saved_terminal_preferences.remember_local(local);
-        }
         let id = self.store_session(
             session,
             grid,
@@ -3754,11 +3824,11 @@ impl Workspace {
         pane.saved_strict_escapes = saved_strict.is_some();
         pane.local_security = Some(settings);
         pane.local_use_pending = local.as_ref().is_some_and(|profile| profile.id != 0);
-        pane.journal_config = local
-            .as_ref()
-            .map(|profile| profile.terminal.journal)
+        pane.journal_config = terminal
+            .map(|terminal| terminal.journal)
             .unwrap_or_default();
         pane.saved_local = local.filter(|profile| profile.id != 0);
+        pane.saved_runtime = runtime.map(Box::new);
         pane.quick_appearance = quick_appearance;
         if effect.is_some() {
             self.apply_terminal_effect_selection(id, effect);
@@ -3797,6 +3867,7 @@ impl Workspace {
         self.sessions.insert(
             session_id,
             PaneSession {
+                saved_runtime: None,
                 quick_ai: None,
                 quick_appearance: None,
                 restored_output: None,
@@ -3900,6 +3971,15 @@ impl Workspace {
         command_timestamps: Option<bool>,
         connection_group: Option<String>,
     ) {
+        let runtime = self
+            .sessions
+            .get(&session)
+            .and_then(|pane| pane.saved_runtime.as_deref());
+        let incognito = incognito || runtime.is_some_and(|runtime| runtime.settings.incognito);
+        let command_timestamps = command_timestamps
+            .or_else(|| runtime.and_then(|runtime| runtime.settings.command_timestamps));
+        let connection_group =
+            connection_group.or_else(|| runtime.and_then(|runtime| runtime.group.clone()));
         if let Some(anchor) = self
             .windows
             .get(&id)
@@ -4005,6 +4085,7 @@ impl Workspace {
         state.pending_ssh = None;
         state.notice = None;
         state.pending_serial = Some(PendingSerial {
+            logging: None,
             form,
             saved,
             replace,
@@ -4069,31 +4150,72 @@ impl Workspace {
             .as_ref()
             .filter(|saved| saved.matches(&connection, profile))
             .cloned();
-        let effect = effect.or_else(|| {
-            saved
-                .as_ref()
-                .and_then(|profile| profile.terminal_effect)
-                .map(Some)
-        });
-        let quick_appearance = style
-            .or_else(|| {
-                saved
-                    .as_ref()
-                    .and_then(|profile| profile.appearance.as_deref().cloned())
-            })
-            .map(|appearance| appearance.display_overrides(None));
         let font = pending.font;
         let split = pending.split;
-        if let Some(target) = split
-            && let Err(reason) = self.split_connection_privacy(window, target, false)
+        let replace = pending.replace;
+        let logging = pending.logging.clone();
+        let mut runtime = match saved
+            .as_ref()
+            .map(|profile| self.saved_terminal_preferences.resolve_serial(profile))
+            .transpose()
         {
-            if let Some(state) = self.windows.get_mut(&window) {
-                state.pending_serial = None;
+            Ok(runtime) => runtime,
+            Err(error) => {
+                self.notice(window, error.to_string());
+                return Task::none();
             }
-            self.notice(window, reason.into());
+        };
+        if let Some(logging) = logging {
+            runtime
+                .get_or_insert_with(Default::default)
+                .settings
+                .logging = logging;
+        }
+        let incognito = incognito
+            || replace
+                .and_then(|id| {
+                    let state = self.windows.get(&window)?;
+                    let (index, _) = state.pane_location(id)?;
+                    Some(state.tabs[index].terminal()?.incognito)
+                })
+                .unwrap_or(false)
+            || runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.settings.incognito);
+        let incognito = if let Some(target) = split {
+            match self.split_connection_privacy(window, target, incognito) {
+                Ok(value) => value,
+                Err(reason) => {
+                    self.notice(window, reason.into());
+                    return Task::none();
+                }
+            }
+        } else {
+            incognito
+        };
+        if incognito && !self.clipboard.policy.incognito_allowed {
+            self.notice(
+                window,
+                "Managed policy blocks this incognito connection.".into(),
+            );
             return Task::none();
         }
-        let replacement = if let Some(old) = pending.replace {
+        if let Some(runtime) = &runtime {
+            let isolation = self.serial_runtime_isolation(runtime);
+            if isolation != IsolationLevel::None {
+                self.notice(window, format!("This serial connection requires {isolation}; the serial transport cannot provide it in this build."));
+                return Task::none();
+            }
+        }
+        let terminal = runtime.as_ref().map(|runtime| &runtime.settings.terminal);
+        let effect = effect.or_else(|| {
+            runtime
+                .as_ref()
+                .and_then(|runtime| runtime.settings.terminal_effect)
+                .map(Some)
+        });
+        let quick_appearance = style.map(|appearance| appearance.display_overrides(terminal));
+        let replacement = if let Some(old) = replace {
             let Some((index, _, _)) = self.disconnected_serial_pane(window, old) else {
                 return Task::none();
             };
@@ -4107,25 +4229,32 @@ impl Workspace {
         } else {
             None
         };
-        let grid = initial_grid(profile);
-        let saved_strict = saved
-            .as_ref()
-            .and_then(|profile| profile.strict_terminal_mode);
+        let grid = self.configured_initial_grid(profile, terminal, InitialTerminalSize::default());
+        let saved_strict = terminal.and_then(|terminal| terminal.strict_terminal_mode);
         let strict = saved_strict.unwrap_or_else(|| {
             replacement
                 .and_then(|target| self.sessions.get(&target.source))
                 .is_some_and(PaneSession::reconnect_strict_escapes)
         });
-        let session = match Session::start_serial_with_options(
+        let logging = self.native_logging(
+            runtime.as_ref(),
+            incognito,
+            saved
+                .as_ref()
+                .map_or("Serial port", |profile| profile.name.as_str()),
+            &connection.device.to_string_lossy(),
+        );
+        let session = match Session::start_serial_with_logging(
             connection,
             grid,
             profile,
             self.window_settings.prompt_navigation_enabled,
-            self.terminal_base_appearance(quick_appearance.as_ref()),
+            self.terminal_base_appearance(quick_appearance.as_ref().or(terminal)),
+            logging,
             crate::session::StreamOptions {
                 strict_escapes: Some(strict),
                 encoding: Some(self.window_settings.serial_default_encoding),
-                scrollback: self.window_settings.scrollback_config(),
+                scrollback: self.terminal_scrollback(terminal),
             },
         ) {
             Ok(session) => session,
@@ -4146,19 +4275,15 @@ impl Workspace {
             replacement.map(|target| target.source),
             font,
         );
-        if let Some(saved) = &saved {
-            self.saved_terminal_preferences
-                .remember_serial_highlight(saved);
-        }
         if let Some(pane) = self.sessions.get_mut(&new_id) {
             pane.strict_escapes = strict;
             pane.saved_strict_escapes = saved_strict.is_some();
             pane.serial_use_pending = saved.is_some();
-            pane.journal_config = saved
-                .as_ref()
-                .map(|profile| profile.journal)
+            pane.journal_config = terminal
+                .map(|terminal| terminal.journal)
                 .unwrap_or_default();
             pane.saved_serial = saved;
+            pane.saved_runtime = runtime.map(Box::new);
             pane.quick_ai = ai;
             pane.quick_appearance = quick_appearance;
         }
@@ -4225,6 +4350,7 @@ impl Workspace {
             return Task::none();
         };
         state.pending_serial = Some(PendingSerial {
+            logging: None,
             form: SerialDialog::new(id, saved.connection.clone(), profile),
             saved: Some(saved),
             replace: None,
@@ -4846,6 +4972,9 @@ impl Workspace {
         }
         if let Some(close) = self.request_scheduler_close(id) {
             return close;
+        }
+        if self.scheduler_target_title(id).is_some() {
+            return self.close_scheduler_targets(id);
         }
         if let Some(editor) = self.editors.get_mut(&id)
             && !editor.may_close()
@@ -6253,6 +6382,16 @@ impl Workspace {
     }
 
     fn window_owner_dialog(&self, owner: window::Id) -> Option<(window::Id, Message)> {
+        if let Some((id, _)) = self
+            .scheduler_target_windows
+            .iter()
+            .find(|(_, child)| child.parent == owner && !child.closing)
+        {
+            return Some((
+                *id,
+                Message::SchedulerTargets(*id, scheduler_window::target_picker::Event::Focus),
+            ));
+        }
         if let Some(manager) = self.connection_manager_for_owner(owner) {
             return self
                 .connection_manager_modal(manager)
@@ -6417,6 +6556,9 @@ impl Workspace {
     }
 
     fn view_window(&self, id: window::Id) -> Element<'_, Message> {
+        if let Some(view) = self.scheduler_target_view(id) {
+            return view;
+        }
         if let Some(view) = self.terminal_effect_dialog_view(id) {
             return view;
         }

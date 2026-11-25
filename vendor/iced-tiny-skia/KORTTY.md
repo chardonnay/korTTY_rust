@@ -29,3 +29,10 @@ paints the group's layers into a temporary transparent pixmap and blends
 that pixmap once. This keeps the internal overlap of text, geometry and
 backgrounds intact. A group contributes its clipped bounds to the damage
 calculation while the fade is active.
+
+Cached text intersects its own clip with the current layer and damage clip
+before painting glyphs. Its damage bounds account for horizontal and vertical
+alignment anchors, including centered labels and right-aligned selector arrows.
+This prevents text outside a scrolled page and stale glyphs after moving aligned
+labels across its clip boundary. Pixel regressions compare incremental and full
+repaints across text alignments at 1× and 2× scale.

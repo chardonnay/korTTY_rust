@@ -195,12 +195,12 @@ impl Workspace {
         })
     }
 
-    pub(in crate::workspace) fn terminal_overrides(
-        &self,
-        pane: &PaneSession,
-    ) -> Option<&TerminalOverrides> {
-        if let Some(local) = &pane.saved_local {
-            return self.saved_terminal_preferences.local_terminal(local.id);
+    pub(in crate::workspace) fn terminal_overrides<'a>(
+        &'a self,
+        pane: &'a PaneSession,
+    ) -> Option<&'a TerminalOverrides> {
+        if let Some(runtime) = self.native_runtime(pane) {
+            return Some(&runtime.settings.terminal);
         }
         self.saved_terminal_preferences.terminal(pane.ssh.as_ref()?)
     }
@@ -644,7 +644,7 @@ mod tests {
             .store_saved_local_session_in_view(
                 profile.clone(),
                 None,
-                super::super::LocalLaunchView::QuickConnect(Some(None), None, None),
+                super::super::LocalLaunchView::QuickConnect(Some(None), None, None, false, None),
             )
             .unwrap();
         assert!(workspace.pane_effect(cleared).is_none());

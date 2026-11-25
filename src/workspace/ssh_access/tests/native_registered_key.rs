@@ -103,6 +103,7 @@ fn openssh_registered_copy_reaches_kitty_desktop_session() {
             name: "Registered SSH fixture".into(),
             tag: String::new(),
             login: SavedLogin {
+                preferences: Default::default(),
                 endpoint,
                 auth: Auth::StoredKey(id),
                 keyboard_interactive: false,
@@ -300,6 +301,7 @@ fn openssh_saved_temporary_key_authenticates_terminal_and_sftp() {
         name: "Temporary key fixture".into(),
         tag: String::new(),
         login: SavedLogin {
+            preferences: Default::default(),
             endpoint,
             auth: Auth::TemporaryKey {
                 credential: Some(credential),

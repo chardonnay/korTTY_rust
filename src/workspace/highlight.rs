@@ -521,10 +521,7 @@ fn clock() -> BoxStream<'static, Desktop> {
 
 impl Workspace {
     fn saved_highlight_set<'a>(&'a self, pane: &'a super::PaneSession) -> Option<&'a str> {
-        pane.saved_serial
-            .as_ref()
-            .and_then(|profile| self.saved_terminal_preferences.serial_highlight(profile.id))
-            .or_else(|| self.terminal_overrides(pane)?.highlight_set.as_deref())
+        self.terminal_overrides(pane)?.highlight_set.as_deref()
     }
 
     pub(super) fn commit_highlight_preferences(

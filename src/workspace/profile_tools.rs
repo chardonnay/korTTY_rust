@@ -26,11 +26,14 @@ mod color_editor;
 #[cfg(test)]
 mod connection_manager_tests;
 pub(super) mod connection_overview;
+mod runtime;
+#[cfg(all(test, unix))]
+mod runtime_tests;
 pub(super) mod teamwork_restore;
 mod terminal_preferences;
 mod tunnel_editor;
 pub(super) mod vault_modal;
-pub(super) use terminal_preferences::SavedTerminalPreferences;
+pub(super) use terminal_preferences::{RuntimePreferences, SavedTerminalPreferences};
 
 #[derive(Default)]
 pub(super) struct ConnectionUsage {
@@ -73,6 +76,8 @@ enum ConnectionLaunch {
     Teamwork(TeamworkSelection, bool),
     Serial(SerialProfile),
     Local(Box<LocalProfile>),
+    LocalInNewWindow(Box<LocalProfile>),
+    SerialInNewWindow(SerialProfile),
 }
 
 enum UsedConnection {
@@ -216,6 +221,12 @@ impl Workspace {
             }
             Some(ConnectionLaunch::Serial(profile)) => self.open_saved_serial(owner, profile),
             Some(ConnectionLaunch::Local(profile)) => self.open_saved_local(owner, *profile),
+            Some(ConnectionLaunch::LocalInNewWindow(profile)) => {
+                self.open_saved_local_in_new_window(owner, *profile)
+            }
+            Some(ConnectionLaunch::SerialInNewWindow(profile)) => {
+                self.open_saved_serial_in_new_window(owner, profile)
+            }
             None => window::gain_focus(owner),
         })
     }
@@ -581,12 +592,14 @@ impl Workspace {
                 keys: &self.ssh_key_choices,
                 temporary_keys: self.quick_temporary_key_enabled(),
                 vault_unlocked: self.vault.as_ref().is_some_and(VaultWindow::is_unlocked),
+                temporary_key_vault: self.vault.as_ref(),
                 ai_profiles: &ai_profiles,
                 java_ai_profiles: &java_ai_profiles,
                 incognito_allowed: self.clipboard.policy.incognito_allowed,
                 serial_allowed: self.serial_profiles_allowed(),
                 terminal_effects: effects.as_deref(),
                 default_paste_warning: self.window_settings.paste_warning,
+                default_paste_line_delay_ms: self.window_settings.paste_line_delay_ms,
                 minimum_paste_warning: self.clipboard.policy.minimum_paste_warning,
                 isolation: (
                     self.window_settings
@@ -921,7 +934,10 @@ impl Workspace {
         };
         use connection_window::{Edit, Message as Profile};
         if let Some((child, _)) = self.connection_editor_child(editor)
-            && !matches!(message, Profile::TerminalLogFolderPicked(..))
+            && !matches!(
+                message,
+                Profile::TerminalLogFolderPicked(..) | Profile::PrivateKeyPicked(..)
+            )
         {
             return window::gain_focus(child);
         }
@@ -946,6 +962,21 @@ impl Workspace {
                 Message::ConnectionEditor(
                     editor,
                     Profile::TerminalLogFolderPicked(ticket.clone(), path),
+                )
+            });
+        }
+        if let Profile::BrowsePrivateKey(jump) = message {
+            let Some((ticket, path)) = self
+                .connection_managers
+                .get_mut(&id)
+                .and_then(|manager| manager.window.start_private_key_picker(jump))
+            else {
+                return Task::none();
+            };
+            return connection_window::pick_private_key(editor, path).map(move |path| {
+                Message::ConnectionEditor(
+                    editor,
+                    Profile::PrivateKeyPicked(ticket.clone(), jump, path),
                 )
             });
         }
@@ -979,7 +1010,7 @@ impl Workspace {
     ) -> Task<Message> {
         use connection_window::{Edit, Message as Profile};
         let message = match message {
-            Profile::TemporarySaveCompleted(reply) => {
+            Profile::CredentialSaveCompleted(reply) => {
                 let Some((vault, result)) = reply.take() else {
                     return Task::none();
                 };
@@ -1006,6 +1037,7 @@ impl Workspace {
                 Profile::Completed(_)
                     | Profile::TemporaryKeyPasted(..)
                     | Profile::Serial(crate::serial_dialog::Message::Ports(..))
+                    | Profile::Serial(crate::serial_dialog::Message::Focus(_))
             )
         {
             return window::gain_focus(dialog);
@@ -1061,7 +1093,7 @@ impl Workspace {
                 }
                 Task::none()
             }
-            Profile::Save if manager.window.temporary_save_needs_vault() => {
+            Profile::Save if manager.window.credential_save_needs_vault() => {
                 if manager.window.has_pending_temporary_key() && !self.quick_temporary_key_enabled()
                 {
                     self.connection_managers
@@ -1078,7 +1110,7 @@ impl Workspace {
                         .expect("current manager")
                         .window
                         .set_notice(
-                            "Unlock the vault before changing the saved temporary SSH key.".into(),
+                            "Unlock the vault before saving passwords, passphrases or temporary SSH keys.".into(),
                         );
                     return Task::none();
                 };
@@ -1087,7 +1119,7 @@ impl Workspace {
                     .get_mut(&id)
                     .expect("current manager")
                     .window
-                    .save_connection_with_temporary_key(vault)
+                    .save_connection_with_credentials(vault)
                     .map(move |message| Message::Connections(id, message))
             }
             Profile::SaveTeamworkAuth if !editing => self.save_teamwork_auth(id),
@@ -1100,6 +1132,11 @@ impl Workspace {
             Profile::ExportConnections => self.show_connection_manager_export(id),
             Profile::ImportConnections => self.show_connection_import(id),
             Profile::NewSerial if !self.serial_profiles_allowed() => Task::none(),
+            Profile::Protocol(crate::connection_store::protocol::Kind::Serial)
+                if !self.serial_profiles_allowed() =>
+            {
+                Task::none()
+            }
             Profile::ManageOsBadges if manager.window.can_import_connections() => {
                 self.show_os_badge_manager(id)
             }
@@ -1118,6 +1155,20 @@ impl Workspace {
                 Task::none()
             }
             Profile::ConnectInNewWindow if !editing && self.windows.contains_key(&owner) => {
+                if let Some(profile) = manager.window.selected_local().cloned() {
+                    return self.close_connection_manager(
+                        id,
+                        false,
+                        Some(ConnectionLaunch::LocalInNewWindow(Box::new(profile))),
+                    );
+                }
+                if let Some(profile) = manager.window.selected_serial().cloned() {
+                    return self.close_connection_manager(
+                        id,
+                        false,
+                        Some(ConnectionLaunch::SerialInNewWindow(profile)),
+                    );
+                }
                 let Some(connection) = manager.window.selected() else {
                     return Task::none();
                 };
@@ -1166,7 +1217,9 @@ impl Workspace {
                         ConnectionLaunch::Teamwork(selection, _) => Some(selection.connection()),
                         ConnectionLaunch::Serial(_)
                         | ConnectionLaunch::Local(_)
-                        | ConnectionLaunch::SshInNewWindow(_) => None,
+                        | ConnectionLaunch::SshInNewWindow(_)
+                        | ConnectionLaunch::LocalInNewWindow(_)
+                        | ConnectionLaunch::SerialInNewWindow(_) => None,
                     };
                     if let Some((host, port)) = connection.and_then(|connection| {
                         connection.blocked_server(self.clipboard.policy.server_access())

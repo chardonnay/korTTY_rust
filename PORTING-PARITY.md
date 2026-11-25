@@ -1322,6 +1322,107 @@ entry into the owned editor and adds the tab color selector.
 [Font and presentation controls](src/connection_window/terminal_overrides/ssh_style.rs)
 · [Color picker](src/connection_window/color_picker.rs)
 
+## November 24 SFTP executable settings and macOS desktop
+
+Priority 1 continues from worktree base `35f6d99`. Settings → SFTP now places
+**External editor executable** after Transfers and **Rsync executable** after
+ZIP creation. Both have independent search targets and owned native file
+choosers. Paths are validated as absolute native executable paths without shell
+arguments. Empty preferences retain the existing program-selection workflows.
+Editor arguments remain in the native external-editor review. A different
+Settings editor path cannot reuse the old executable approval. The rsync path
+prefills new Scheduler jobs; existing jobs retain their own reviewed executable
+and route. Saving Settings creates neither editor nor rsync execution approval.
+
+### macOS desktop check
+
+All work in this continuation ran on this Apple Silicon desktop, macOS 27.2.1
+(26B131). The native Rust Normal design was inspected in English with an isolated
+profile. The desktop walkthrough verified the initially disabled timeout at 10,
+the transfer controls, external editor before ZIP creation, and rsync after ZIP
+creation. Both executable fields were found through search, including from a
+newly opened Font page. Enter focused the exact field. Save and reopen retained
+`/usr/bin/vi` and `/usr/bin/rsync`; changing the editor draft to `/usr/bin/false`
+and cancelling retained the saved value. Restart restored both paths. The
+native rsync chooser opened in `/usr/bin`, retained the path on Cancel, and
+accepted `/usr/bin/rsync`. Tab followed by Space opens Browse after the focused
+search result. An installed test policy capped parallel transfers at one: the field displayed 1, ignored typing, and showed the organization-limit note; search kept focus on the search field for this disabled control. The page scrolls independently of the reachable Save/Cancel row.
+[Initial desktop view](target/verification/20261124-sftp-macos-rust-initial.png)
+· [Saved values and search target](target/verification/20261124-sftp-macos-rust-saved.png)
+· [Managed parallel limit](target/verification/20261124-sftp-macos-rust-managed-one.png)
+· [Final native build](target/verification/20261124-sftp-macos-rust-final.png)
+
+The first native run exposed a pre-existing AppKit crash: the terminal text-drop
+hook changed a live Winit NSWindow's class. AppKit then rejected the window
+identity while resigning key focus, and accessibility queries timed out. A
+controlled debugger run that skipped that class change survived the same dialog
+open. The fix adds only the three inherited drag selectors to Winit's window
+class, preserving each live object's class and the original non-text drag
+forwarding. Helper-class registration is synchronized. The corrected application
+opened, accepted native file chooser sheets, saved, cancelled and restarted on
+this desktop. A regression checks retained object identity and selector binding.
+
+The focused application suite passed **112 tests**, including executable
+selection, independent preference merge, search, Cancel, Save/reopen, stale
+chooser rejection and route-bound rsync approval. Strict Clippy passed for
+`kortty` and `kortty-macos` with all targets. The macOS crate's nine-test suite
+passed again after synchronizing helper registration, with no duplicate-class
+warning. This is focused validation, not a full workspace/release run.
+
+### Java reference and Windows ARM64 check
+
+The official macOS ARM64 and Windows x64 Java v2.26.0 archives were downloaded
+to this desktop and matched the release API's SHA-256 digests. The tagged
+`SettingsDialog.java` matches the local reference source byte for byte. The
+original macOS package launcher exited before showing a window here. A small
+isolated starter using the package's unchanged application and JavaFX classes
+and the installed JDK 25 opened the original SettingsDialog with Normal design
+and English labels. Computer Use denied access to this Java test app, so its
+interactive visual comparison is **not accepted**. The original reference jars
+were not modified; only the temporary JVM launcher was locally signed for its
+preview bundle.
+
+After the user confirmed that korTTY already had Computer Use permission, the
+regular original app was tried as well. The macOS ZIP had flattened 63 symbolic
+links in the JVM legal files, invalidating the signed resource seal. Recreating
+those exact links from the signed CodeResources metadata restored a successful
+deep, strict codesign verification without resigning or changing the original
+executable or jars. The regular app then started with an isolated profile, but
+Computer Use still rejected it with `Computer Use was not approved to use
+korTTY`. No paired visual comparison is claimed for either starter.
+
+The initial Windows access attempt reached OpenSSH for Windows 9.5.
+Authentication for the requested account failed and RDP was unavailable.
+The later PowerShell transcript identified the existing desktop account,
+which accepted the same SSH key. The subsequent desktop comparison is
+recorded below, followed by the live priority-1 external-edit and rsync checks.
+Reference archives and their SHA-256 file are retained under
+`target/verification/reference/`. Temporary application copies and profiles
+were removed after stopping and waiting for the owned processes. The development
+Cargo profile was cleaned (3.7 GiB removed); final disk use was 376 MiB for the
+checkout including 323 MiB under target. A LaunchServices retry had created a
+new default-profile directory outside the isolated run. Its six files were
+verified against their exact names, sizes and creation/modification times, then
+removed to restore the initially absent directory. No existing user profile was
+removed. The two owned crash reports were cleaned after recording their cause.
+
+### Access recheck after the permission update
+
+The continuation rechecked both prerequisites. SSH still rejected the explicit
+ED25519 key for the initial Windows account (exit 255). The regular Java v2.26.0 app
+again passed deep, strict codesign verification after restoring the 63 signed
+links, but Computer Use again returned `Computer Use was not approved to use
+korTTY`. The owned Java process was stopped and waited for (exit 143), and its
+private run directory was removed. No Rust rebuild or repeated application test
+was needed for this unchanged implementation.
+
+A local verification helper, `target/verification/setup-windows-test-key.ps1`,
+was prepared to resolve the reported missing key file. It requires an elevated
+PowerShell and the public key as a parameter, determines whether `codex` is a
+local administrator, preserves existing keys, and selects the corresponding
+OpenSSH key file and permissions. It has not been executed or verified on
+Windows. The direct Windows dialog comparison remains pending.
+
 ## November 24 SFTP settings layout and search
 
 The SFTP Settings page follows the Java ordering for inactivity,
@@ -21949,3 +22050,2000 @@ or `LOCALAPPDATA` on Windows to the private test directory for that process.
 [sith-changelog]: https://github.com/chardonnay/SithTermFX/blob/8b02de38b7c6396f1af2558b0b00477cfb9a2871/CHANGELOG.md
 [handoff-ci]: https://github.com/chardonnay/korTTY_rust/actions/runs/42430876231
 [head-ci]: https://github.com/chardonnay/korTTY_rust/actions/runs/42431985985
+
+### Windows ARM64 comparison continuation
+
+The test desktop runs Windows 11 Pro ARM64, build 26300. The native Rust
+build has PE machine `AA64`. The official Java v2.26.0 Windows package has
+machine `8664` and runs under Windows x64
+emulation. Both use English labels, Normal design, a 1120 × 1112 outer window
+and the same 5120 × 2160 desktop. The viewer renders without scaling. No global
+display settings, firewall rules or SSH keys were changed by this test.
+
+A temporary signed portable UltraVNC 1.8.3.2 server listened only on
+`127.0.0.1:15900`, with a random test password and file transfer disabled. It
+ran in the existing interactive account, without installing a service. A local
+noVNC 1.6.0 viewer connected through the authenticated SSH tunnel; all desktop
+interaction and screenshots used Computer Use. The official portable archive
+matched the vendor's SHA-256 digest. The temporary scheduled tasks, processes,
+private profiles and extracted copies belong to this run and are removed after
+verification.
+
+The Java fixture instantiates the original `SettingsDialog` from unchanged
+release JARs using the package's bundled JVM. Its private launcher loads and
+saves with `GlobalSettingsManager` and initializes `PolicyManager` and
+`PolicyClamp`. This checks the original dialog and persisted field values;
+full-application service restart and notification hooks are outside this fixture.
+The reference search discovers both sections from an unopened SFTP page. Enter
+on the rsync result focuses its input; the first external-editor result targets
+the section heading. The native rsync chooser opens and Cancel returns to the
+form. Save stores the test paths in XML, restart restores them, and an editor
+draft changed to `write.exe` then cancelled reopens as the saved `notepad.exe`.
+
+A valid installed private policy with `rule.sftp.max-parallel-transfers = 1`
+makes the parallel field display 1 and ignore typing. The unchecked idle timeout
+displays 10 and also ignores typing. The same policy state was observed in the
+initial Rust desktop build. The Java reference accepts an editor command and
+arguments; Rust retains an executable-only preference with arguments in the
+native execution review. `C:\Tools\rsync.exe` is a persistence fixture, not an
+installed rsync executable or a claim of a completed transfer.
+
+The first paired view exposed oversized Rust labels and full-width fields:
+rsync was initially below the visible form. The SFTP form now has a 540-pixel
+maximum width, compact labels and typography, and the same section order as
+Java. The changed design was built and tested again on this macOS desktop.
+Both executable fields are visible; entering paths, cancelling the owned native
+chooser, Tab/Space activation, Save and restoration after restart succeeded.
+The final native Windows build passed with the regular compact development
+profile. Its SFTP and external-editor source hashes match this worktree. Both
+search entries were found on Font before SFTP was opened; Enter focused each
+input. Normal tab-menu navigation also reopened SFTP. Tab then Space opened the
+owned Windows picker; Cancel retained the value and selecting a file updated
+the correct field. The disabled timeout stayed 10 and the managed parallel
+field stayed 1 after input attempts. Save stored both paths and `/tmp`; a full
+process restart restored them. Changing both drafts to `write.exe` and
+`other.exe`, cancelling, and restarting again restored the saved choices. Saving
+Settings created no `sftp-external-editor.json` approval. New-job rsync defaults
+and the unchanged approval requirement passed the native regression cases.
+
+The paired final views show both executable inputs at once. Rust keeps its
+separate execution-review explanation, an editor Browse button and the existing
+Java transfer-settings import/export controls below rsync. This is acceptance of
+the changed SFTP settings and interactions, not a claim that every framework
+control style or a complete live transfer workflow has reached parity.
+
+The native Windows focused groups passed **298 SFTP tests**, **75 rsync
+tests** and **4 external-editor tests**, with no failures; the groups overlap.
+Ten SFTP and fourteen rsync cases were ignored on this target. The first run
+exposed a fixture without Windows' required `.exe` suffix and an installed GUI
+policy being discovered by the test executable. The fixture now retains its
+spaces with a valid suffix, and GUI executable/policy copies are outside Cargo's
+target directory. Both previously failing cases passed. For this targeted retry,
+only the application's test-package debug data was disabled to avoid repeating
+the very large native PDB link. The same target directory was used, and the GUI
+build uses the unchanged compact development profile. These regressions do not
+claim a live rsync transfer or a complete remote external-edit cycle.
+
+[Java reference view](target/verification/20261124-sftp-windows-java-final.jpg)
+· [Final native Rust view after Cancel/restart](target/verification/20261124-sftp-windows-rust-final.jpg)
+· [Retested compact macOS layout](target/verification/20261124-sftp-macos-rust-compact.jpg)
+· [Continuation record](target/verification/20261124-sftp-layout-continuation.json)
+
+The Windows cleanup stopped and waited for the owned programs, removed all five
+temporary scheduled tasks and the private run directory, and verified zero
+remaining viewer listeners or owned processes. `cargo clean --profile dev` in
+the explicit private target directory removed 6.3 GiB. The local SSH tunnel,
+viewer processes and private viewer directory were also stopped, waited for and
+removed. The final macOS development cleanup removed 2.5 GiB. Native Windows
+logs and both final full-view screenshots are retained on this macOS desktop;
+no shared-folder copies were used. Reference archives and checksums remain in
+`target/verification/reference/`. Final checkout size is approximately 394 MiB,
+including 341 MiB under target. Live external-edit writeback and an actual
+reviewed rsync transfer remain the next priority-1 acceptance step.
+
+
+### November 24 native macOS SFTP executable live-use acceptance
+
+Priority 1 passed on this Apple Silicon macOS desktop using the current worktree,
+the regular compact development profile and the shared Cargo target directory.
+All application interaction, TextEdit editing and screenshots used Computer Use.
+The fixture used a fresh private application profile, an ephemeral loopback-only
+OpenSSH server, ED25519 authentication and a pre-pinned host key. It exercised
+real SSH/SFTP and native rsync processes, with both endpoints on this desktop;
+it does not establish live-transfer acceptance on Windows or a production host.
+
+The SFTP Settings editor executable was `/usr/bin/open`. The separate native
+review displayed its SHA-256 and the literal arguments `-W`, `-a`, `TextEdit`,
+`{file}` before **Approve and save**. **Edit externally** downloaded the selected
+remote file into a private local copy and opened it in TextEdit. Computer Use
+replaced its text and saved the document. With automatic upload unchecked,
+korTTY detected the stable local change and enabled **Upload observed save**.
+The action finished with **Uploaded to the original remote file**. Independent
+byte comparison confirmed all 84 edited bytes at that exact remote path and
+preserved mode `0644`. The before/after SHA-256 values are in the result record.
+The owned TextEdit document was closed; the existing TextEdit process and other
+user documents were preserved.
+
+The first isolated remote path was under `/private/tmp`. External writeback
+correctly refused its world-writable ancestor with **External editor upload
+requires owner-controlled remote directories**. The complete successful fixture
+was rerun under the private macOS temporary directory, using
+`KORTTY_SCRATCH_PARENT="$TMPDIR" bash scripts/with-scratch.sh ...`. Its ancestor
+chain was verified as owner/root controlled without group/other write access.
+No remote-directory protection was disabled.
+
+The desktop's `/usr/bin/rsync` is Apple's openrsync and does not meet the native
+workflow's rsync 3.4.1-or-later requirement. A private native rsync 3.5.2 was built
+from the [official source archive](https://download.samba.org/pub/rsync/src/rsync-3.5.2.tar.gz)
+without global installation. The HTTPS-downloaded archive and its computed
+SHA-256 are retained under `target/verification/reference/`; a detached vendor
+signature was not verified. Optional OpenSSL, IDN, xxhash, zstd and lz4 support
+was disabled for this file-transfer fixture, with included popt.
+
+Saving its path in SFTP Settings seeded a new Scheduler **rsync · Upload new
+file** action. The native transfer review displayed the executable digest,
+saved connection, pinned host key, exact source/destination, 262,318-byte size
+and source digest. After **Approve**, **Save** and **Run now**, the journal
+reported **Successful** and **Uploaded 262318 verified bytes via native rsync
+and SSH**. Independent comparison found identical source and destination bytes:
+`f76400b85a4383346c937c4bd1b3ece014c382e35af2825aada0ef3b26702062`.
+The server recorded exactly one `rsync --server -se.LsfxCIvu` invocation.
+
+Changing the saved job's executable to `/usr/bin/rsync` removed the approval;
+a manual run was **Blocked** with **Approve the exact rsync executable and saved
+SSH routes**. No second server-side rsync command ran. Changing the global
+editor preference from `/usr/bin/open` to `/usr/bin/true` caused **Edit
+externally** to reopen **Approve an external editor**, with empty arguments and
+**Review executable** required. The changed program was not approved or launched.
+
+[Result hashes and assertions](target/verification/20261124-priority1-live-results.json)
+· [Editor executable review](target/verification/20261124-priority1-editor-review.jpg)
+· [Saved TextEdit document](target/verification/20261124-priority1-textedit-saved.jpg)
+· [Completed SFTP writeback](target/verification/20261124-priority1-editor-uploaded.jpg)
+· [rsync transfer review](target/verification/20261124-priority1-rsync-review.jpg)
+· [Successful native journal](target/verification/20261124-priority1-rsync-success.jpg)
+· [Renewed editor review](target/verification/20261124-priority1-editor-reapproval.jpg)
+· [Blocked rsync after program change](target/verification/20261124-priority1-rsync-reapproval.jpg)
+
+The fixture stopped and waited for its owned app and OpenSSH processes. The
+scratch wrappers removed the temporary profiles, keys, extracted rsync sources,
+native test binaries, staged editor copies and both run directories. The test
+listeners no longer accept connections. Existing user processes and profiles
+were preserved. Compact application/server/build logs, reviewed job snapshots,
+assertions and screenshots remain in `target/verification/`. Development-profile
+cleanup removed 2.5 GiB after all builds finished. No release package was built.
+Final disk usage is 397 MiB for the checkout, including 344 MiB under target.
+No `kortty.*` run directories remained in either external temporary parent.
+
+
+### November 25 Security keyboard and layout continuation
+
+The full porting-plan goal is active. Windows testing is deferred at the user's
+request while the test desktop is reinstalled; no later macOS result implies
+Windows acceptance.
+
+This pass used the native Apple Silicon desktop with private profiles and the
+original macOS ARM64 Java v2.26.0 package. Its restored signed symlinks and package
+signature were verified before loading the unchanged release JARs in a private
+JavaFX Settings fixture on the installed JDK 25. The original Security page
+provided the section order, typography and Cancel-before-Save reference. Its
+temporary-key checkbox was toggled with the pointer and reset using Space.
+The captured normal Java window is 1120 × 1108 pixels; Rust is 1120 × 1112.
+This is a dialog fixture comparison, not a complete Java service-startup test.
+
+Rust Security now uses smaller bold headings and compact explanatory text with
+bounded wrapping. Its native automatic-unlock workflow and policy checks are
+retained. The page was separated into `security_settings.rs`. Enabled password,
+temporary-key and action controls expose keyboard focus and Space activation.
+Disabled controls do not acquire an activation handler. The shared Settings
+footer now puts Cancel before Save and makes both actions keyboard accessible.
+
+The native application verified these behaviors:
+
+- Search found the temporary-key option from the unopened Font page.
+- Tab reached Change master password, the startup-password switch and the
+  temporary-key switch. Space toggled both switches in the private draft.
+- Tab/Space saved the temporary-key choice. On reopening, toggling it back and
+  activating the visibly focused Cancel action retained the saved value.
+- Saving `Own process` isolation and the enabled temporary-key preference, then
+  restarting the actual application process, restored both values. The settings
+  file independently confirmed those values and a disabled startup-password
+  requirement. No user vault or device credential was created or changed.
+- With no vault in the fixture, automatic-unlock configuration remained disabled.
+
+All **108 focused Settings tests passed**, including two new keyboard tests that
+exercise actual widget focus/events, draft cancellation and managed-policy
+refusal. Strict application Clippy with all targets and `dialog-preview` passed;
+the native GUI build passed with the standard compact development profile.
+Pre-existing vendor deprecation warnings and the Apple linker unwind-size warning
+were observed. No warning suppression or alternate build profile was added.
+
+Compact acceptance is **not complete**. At 850 × 712 the page scrolls and both
+footer actions remain available, but after resizing and scrolling an old
+`Own process` label remains below the page viewport near the footer. The attached
+capture records this rendering defect for the next pass. Font/control appearance
+still needs comparison; this check does not establish pixel parity or cover
+vault unlock, expired temporary keys, key replacement, other dialogs or Windows.
+
+[Desktop assertions](target/verification/20261125-security-desktop.json)
+· [Java reference](target/verification/20261125-security-java-reference.jpg)
+· [Rust before](target/verification/20261124-security-rust-before.jpg)
+· [Rust keyboard focus](target/verification/20261125-security-rust-keyboard.jpg)
+· [Restored values after restart](target/verification/20261125-security-rust-restarted.jpg)
+· [Compact top](target/verification/20261125-security-rust-compact-top.jpg)
+· [Recorded rendering defect](target/verification/20261125-security-rust-resize-artifact.jpg)
+· [Focused tests](target/verification/20261124-security-settings-tests.log)
+· [Strict Clippy](target/verification/20261124-security-clippy.log)
+· [Native build](target/verification/20261124-security-build.log)
+
+The fixture controllers stopped and waited for their Java and Rust processes,
+then removed their private profiles, package extractions, launchers and classes.
+The development profile was cleaned after the checks. Compact logs, assertions,
+screenshots and the already retained reference archive remain in the worktree.
+
+
+### November 25 cached labels at viewport edges
+
+The shared tiny-skia renderer now corrects the Security resize/scroll artifact
+recorded in the preceding checkpoint. Two independent errors affected cached
+labels such as a pick list's current value and arrow:
+
+- Painting compared the local clip with the layer clip but did not apply their
+  intersection. Glyphs could be painted outside a scroll viewport.
+- Damage bounds treated the text position as a top-left corner, although cached
+  text uses alignment anchors. Centered or bottom-aligned glyphs above that
+  position could remain after the control moved outside the viewport.
+
+Painting now always applies the intersected clip through the existing reusable
+mask. Damage calculation accounts for horizontal and vertical alignment before
+intersecting the text bounds with the local clip. The change retains incremental
+damage and does not replace it with unconditional full-window redraws.
+
+New raster regressions failed before the change: a centered label escaped below
+its clip at row 80, and an incremental scroll left 729 stale pixels. Both passed
+afterward. The incremental test compares actual pixel buffers with a complete
+repaint for left/center/right and top/center/bottom alignment at 1× and 2× scale
+(18 combinations). It verifies that the initial text is visible before moving
+it across the clip boundary. All six renderer tests and strict renderer Clippy
+passed. The application rebuilt with the normal compact development profile.
+
+On this native macOS desktop, the corrected application opened a private
+persisted 850 × 712 Settings window with temporary keys enabled and `Own process`
+isolation. Computer Use opened Security through search, scrolled to both ends,
+zoomed to the full desktop and restored the compact window, then repeated the
+scroll. The earlier label below the page viewport was absent. The popup was
+also opened and dismissed in the 850 × 716 preliminary run without leaving
+text behind. Both footer actions stayed available. These are the observed
+renderer checks, not completion of every Security or cross-platform UI case.
+
+[Failing regressions before the fix](target/verification/20261125-cached-text-before.log)
+· [Passing regressions](target/verification/20261125-cached-text-after.log)
+· [Full renderer tests](target/verification/20261125-renderer-tests.log)
+· [Strict renderer Clippy](target/verification/20261125-renderer-clippy.log)
+· [Native build](target/verification/20261125-renderer-gui-build.log)
+· [Original defect](target/verification/20261125-security-rust-resize-artifact.jpg)
+· [Corrected 850 × 712 view](target/verification/20261125-renderer-fixed-850x712.jpg)
+· [Verification record](target/verification/20261125-renderer-fix.json)
+
+The owned native processes were stopped and waited for; their private profiles,
+launchers and scratch directories were removed. Development cleanup removed
+2.6 GiB. Windows testing remains deferred by the user. Continue the remaining
+Security typography and default-isolation keyboard checks before the other
+primary dialogs; no full-dialog or full-port completion is claimed here.
+
+
+### November 25 Security search and SSH editor navigation
+
+All checks in this continuation ran on the current native Apple Silicon macOS
+desktop (macOS 27.2.1, build 26B131). Windows tests remain deferred by the user
+while the Windows desktop is reinstalled. This checkpoint does not extend the
+older Windows evidence to these changes.
+
+Security search now focuses its enabled action or switch; managed controls do
+not acquire an actionable focus target. The default-isolation pick list opts
+into keyboard navigation and limits its choices to the managed minimum. On the
+native desktop, search → Enter → Space toggled the temporary-key switch. Cancel
+preserved its saved true value. The same search workflow opened the isolation
+menu; Down/Enter selected process isolation. Tab traversed Cancel then Save, and
+keyboard Save plus restart retained both preferences. No real credential vault
+or device-unlock credential was changed by this GUI fixture.
+
+The SSH editor's Journal page now participates in the editor focus scope. Its
+switches accept Space, disabled controls are skipped, and numeric controls keep
+the existing bounds and managed rotation limit. The editor footer places Cancel
+(or Discard draft) before Save. Switching pages resets the prior page's scroll
+and focus; this corrects the observed clipped AI profile label when entering AI
+from a scrolled page. The existing native typed-input opt-in default remains.
+
+The Java comparison used the original signed v2.26.0 macOS ARM64 package's JARs
+with local JDK 25, English and Normal design in a private fixture. The release
+package signature was verified before launch. Its actual ConnectionEditDialog
+was shown, rather than a rewritten visual mock. The requested 860-pixel width
+was constrained to an observed 1044 × 722 outer window. Rust was opened through
+Connections → Manage Connections → Edit and compared at that same outer size.
+All eight tabs were captured. The Java fixture is not full acceptance through
+the Java Connection Manager; its observed disabled tunnel controls are not
+claimed as a live tunnel test.
+
+Native Rust checks covered 860 × 722, 1044 × 722 and 640 × 462 outer windows.
+The Journal page accepted Tab/Space to enable capture and typed input, then
+Tab/Up to change the summary interval to one minute. A cancelled draft left the
+saved profile unchanged. In the corrected build, keyboard Save persisted the
+three enabled switches and interval. After restart at minimum size, those values
+were visible. A keyboard change from 25 to 26 MiB was cancelled, and the stored
+value remained 25. The compact editor's hidden AI tab was reached with Ctrl+Tab;
+its first label and fixed footer were visible. In the reference-sized final
+build, entering AI from the bottom of Terminal Settings also started at the top.
+
+Validation passed:
+
+- 111 focused Settings tests, including search focus, managed controls and the
+  isolation selector's keyboard path.
+- 71 focused Connection Manager tests; the default suite has one ignored
+  OpenSSH-dependent fixture. The Journal regressions exercise disabled options,
+  keyboard switches and numeric limits. Editor tests cover Cancel-before-Save
+  traversal on Jump Server, Logging, Journal and AI.
+- The ignored temporary-key fixture was explicitly run with real `ssh-keygen`:
+  one test passed. It checks encrypted persistence, vault reopen, replacement
+  with removal of the old reference, and removal of the replacement. This is a
+  model/vault regression, not desktop expiry or live SSH route acceptance.
+- Formatting, strict application Clippy for all targets with `dialog-preview`,
+  the native build, and `git diff --check` passed. An initial type mismatch in a
+  new test helper was corrected before the successful final checks.
+
+[Settings tests](target/verification/20261125-navigation-settings-tests.log)
+· [Final Connection Manager tests](target/verification/20261125-primary-final-connection-tests.log)
+· [Explicit temporary-key lifecycle](target/verification/20261125-primary-key-lifecycle.log)
+· [Final Clippy](target/verification/20261125-primary-final-clippy.log)
+· [Final native build](target/verification/20261125-primary-final-build.log)
+· [Observed comparison and remaining differences](target/verification/20261125-primary-dialogs-observations.md)
+· [Save/Cancel assertions](target/verification/20261125-navigation-state.json)
+· [Source and binary hashes](target/verification/20261125-primary-builds.json)
+· [Image dimensions](target/verification/20261125-primary-image-sizes.json)
+· [Java Journal keyboard reference](target/verification/20261125-ssh-java-journal-keyboard.jpg)
+· [Corrected AI page](target/verification/20261125-ssh-final-ai-top-1044.jpg)
+· [Journal after restart at minimum size](target/verification/20261125-ssh-final-journal-restart-640.jpg)
+· [Compact AI page](target/verification/20261125-ssh-final-ai-640.jpg)
+
+Remaining visual reconciliation includes label/help typography and spacing,
+protocol-specific connection groups, jump authentication layout and route help,
+and terminal paste/advanced-option groups. Timeout/retry and jump-username
+default differences need a disposition against the existing native contracts.
+Other primary dialogs and the wider native acceptance matrix remain open; this
+checkpoint is not a declaration of full-dialog or full-port completion.
+
+All owned Java/Rust processes were stopped and waited for. Private profiles,
+keys, extracted packages, launchers, the JVM performance file and scratch runs
+were removed. `cargo clean --profile dev` removed 6,945 files (3.6 GiB). No
+`kortty.*` scratch directories remained in either inspected temporary root.
+Compact evidence and the original reference archives remain. Disk use after
+cleanup was 401 MiB for the checkout, including 348 MiB in `target`.
+[Cleanup record](target/verification/20261125-primary-cleanup.json)
+
+
+### November 25 private-key choosers and new-profile defaults
+
+The saved SSH editor now provides a native private-key file chooser for both
+its target and jump-host login. Browse is keyboard accessible, owned by the
+editor window and disabled with the surrounding controls. Closing the chooser
+returns focus to the same button. The result edits only the current path; it
+does not import a key, connect or grant an execution approval. Separate request
+tokens reject duplicates and stale callbacks after page, authentication, login
+or jump-state changes. Invalid paths and cancelled or busy requests leave the
+draft unchanged.
+
+The Jump Server page adopts the reference's enable label, a 98-pixel label column,
+a compact field group and route help. It retains native vault passphrases,
+registered keys and keyboard-interactive authentication. The new Browse actions
+use a secondary button style. Full SSH dialog design parity remains open.
+
+The defaults audit used exact blobs from tag `v2.26.0` (`b235d91f20356`), because
+the local Java checkout had advanced beyond that tag. Java's new profile has a
+15-second timeout and four total connection attempts, despite its `retryCount`
+name. Native new saved SSH drafts now use those values. Existing profiles keep
+their recorded options, including the legacy 8/0 default for omitted data;
+general transport and Quick Connect defaults are unchanged. A new jump host
+starts with an empty username. Saving a login with an empty username remains possible;
+connection-time validation requires the username. Java's blank target-username
+fallback is `root`, matching the native target default.
+
+The native tests ran on this Apple Silicon macOS desktop, in English and Normal
+design. The Java reference was the original signed macOS ARM64 v2.26.0 package,
+loaded through the disposable reference harness. Both Java Browse actions opened
+real native file panels and were cancelled. Java's accessibility tree reported
+those buttons disabled even while pointer activation worked; those flags alone
+cannot establish a disabled-control result.
+
+The native editor was reached through Connections → Manage Connections → Edit.
+At 1044 × 722, a private target key was selected and the whole draft discarded;
+both saved paths stayed unchanged. A subsequent edit selected distinct files
+`selected key` and `jump selected key` for the two logins, then saved. The exact
+stored paths were checked. Both files were generated disposable Ed25519 keys.
+No SSH connection was opened by this GUI fixture.
+
+After restart at 640 × 462, both filenames remained visible in their respective
+fields. Tab/Enter opened the target chooser; Escape cancelled it and restored
+focus. Disabling the jump host disabled Browse, and clicking it opened no panel.
+Discarding the disabled-state draft retained the saved jump login and both key
+paths. A separate new-profile dialog showed 15/4 and an empty jump username;
+discarding it left exactly one saved test profile. The existing profile still
+showed its original 8/0 values.
+
+Verification passed: formatting, strict application Clippy for all targets,
+the native build, 76 focused Connection Manager tests, and the explicitly run
+OpenSSH temporary-key lifecycle test. The latter checks encrypted persistence,
+reopen, replacement and removal using real `ssh-keygen`; it is not live route
+or desktop expiry acceptance. Initial lifetime/test-order compile errors and a
+test that incorrectly required a username at Save rather than Connect were
+corrected before the final checks. Their diagnostic logs remain with the run.
+
+[Native fixture and scope](target/verification/20261125-key-picker.md)
+· [Tagged reference contracts](target/verification/20261125-key-picker-reference-contracts.json)
+· [Final tests](target/verification/20261125-key-picker-final-connection-tests.log)
+· [Explicit key lifecycle](target/verification/20261125-key-picker-lifecycle.log)
+· [Final Clippy](target/verification/20261125-key-picker-final-clippy.log)
+· [Final build](target/verification/20261125-key-picker-final-build.log)
+· [State assertions](target/verification/20261125-key-picker-state.json)
+· [Source and binary hashes](target/verification/20261125-key-picker-build.json)
+· [Java Jump Server](target/verification/20261125-key-picker-java-jump.jpg)
+· [Compact target chooser](target/verification/20261125-key-picker-final-target-640.jpg)
+· [Compact jump chooser](target/verification/20261125-key-picker-final-jump-640.jpg)
+· [Disabled Browse](target/verification/20261125-key-picker-final-disabled-640.jpg)
+
+All owned GUI processes exited and the private profiles, generated keys,
+launchers and extracted package were removed. The run's JVM performance and
+font-CSS files were also checked outside the private directory and were gone
+after exit. The retained harness now explicitly routes Java temporary files into
+its scratch directory and disables the JVM performance file on repeat runs;
+those JVM flags passed a separate local startup check. Development cleanup
+removed 6,944 files (3.6 GiB). No `kortty.*` scratch directories remained in either
+inspected temporary root. Disk use was 402 MiB for the checkout, including
+349 MiB in `target`; compact evidence and original reference archives remain.
+[Cleanup record](target/verification/20261125-key-picker-cleanup.json)
+
+Windows acceptance remains deferred at the user's request. Remaining work in
+milestone 2 includes the broader authentication/terminal-settings presentation,
+Quick Connect, the Scheduler route chooser, and live key-expiry and route-change
+workflows. This bounded checkpoint does not mark the full port complete.
+
+
+### November 25 terminal settings and paste inheritance
+
+The saved SSH editor's Terminal Settings page now follows the Java section
+order: appearance source and appearance, terminal behavior and isolation, then
+terminal effects. Native supplementary settings follow those sections behind
+an explicit expansion button. Label sizes, spacing and control widths are
+aligned with the reference. At 640 × 462 the paste checkbox and number input
+wrap, while the fixed footer and remaining controls stay reachable.
+
+A connection's own paste pause is independent of its appearance source. Turning
+the override off displays the current global value; turning it back on restores
+the draft value. Zero is an explicit override, distinct from inheritance.
+An empty enabled override is rejected. Terminal-effect speed controls remain
+visible but ignore input when no enabled effect is selected. A small opt-in
+Slider API implements that disabled behavior without changing existing sliders.
+The effect picker now supports keyboard selection.
+
+Verification ran on this Apple Silicon macOS desktop with private profiles.
+The original signed macOS ARM64 Java v2.26.0 package supplied the reference
+classes, shown at 1044 × 722. The isolated Java dialog harness lacks the full
+application singleton: its paste default is 0 ms and its effect list contains
+only None. The native profile used 125 ms to distinguish inheritance and zero;
+active native effects were tested separately. This is a bounded comparison,
+not full Java application or Windows acceptance.
+
+The native GUI preserved a 15-point appearance draft across source toggles,
+changed paste 125 → 135 with Tab/Up, retained a typed 250 across off/on, selected
+Amber CRT '90 with the keyboard, and saved 250 ms plus speed 1.75 independently
+of global appearance. Restart showed the saved values. Discarding edits left
+them unchanged. At minimum size, an explicit zero and None effect survived
+Save/restart; disabling the pause restored 125 ms and removed the override on
+Save. Disabled speed controls ignored pointer and attempted text input.
+
+Formatting, strict all-target application Clippy with `dialog-preview`, the
+native build, 79 focused Connection Manager tests and two effect-control tests
+passed. The Connection Manager suite has one OpenSSH-dependent ignored test;
+it was not rerun in this pass. Initial import and generic-inference compile
+errors in the new test harness were corrected before the successful checks.
+
+[Desktop steps and limitations](target/verification/20261125-terminal-settings-observations.md)
+· [Source and environment](target/verification/20261125-terminal-settings-source.json)
+· [Persistence assertions](target/verification/20261125-terminal-settings-state.json)
+· [Connection tests](target/verification/20261125-terminal-settings-connection-tests.log)
+· [Effect tests](target/verification/20261125-terminal-settings-effect-tests.log)
+· [Clippy](target/verification/20261125-terminal-settings-clippy.log)
+· [Build](target/verification/20261125-terminal-settings-build.log)
+· [Java terminal behavior](target/verification/20261125-terminal-settings-java-behavior.jpg)
+· [Native terminal behavior](target/verification/20261125-terminal-settings-native-global-own-pause.jpg)
+· [Compact behavior](target/verification/20261125-terminal-settings-native-compact-behavior.jpg)
+· [Zero after restart](target/verification/20261125-terminal-settings-native-zero-restart.jpg)
+
+Section-heading font rendering still differs visibly from Java. Remaining
+editor typography, protocol/authentication presentation, Quick Connect,
+Scheduler route selection and the wider acceptance gates remain open. Windows
+verification remains user-deferred. This checkpoint does not complete milestone
+2 or the port. Owned GUI processes and scratch profiles were removed; build-cache
+cleanup and retained checksums are recorded in the linked cleanup evidence.
+[Cleanup](target/verification/20261125-terminal-settings-cleanup.json)
+
+
+### November 25 authentication sources and dialog fonts
+
+The native saved SSH editor now presents stored credentials, stored SSH keys,
+key file and passphrase in a stable order. Password and registered-key choices
+select the corresponding authentication directly, without an intermediate
+source-mode picker. Inactive fields remain visible and reject changes. The
+key-file draft survives switching sources within the current edit; choosing a
+registered key or returning to a file has model and keyboard regressions.
+
+Basic field labels use 13 px text and the reference's 148 px label column.
+Name, username and tag use the observed wider fields; the host and port stay
+together at compact size. A shared installed sans-serif choice removes the
+observed monospaced bold-heading fallback in Security, Terminal Settings and
+AI Manager tabs. The native desktop checked each affected heading family.
+
+The signed Java v2.26.0 reference and native application were observed at
+1044 × 722. Native checks also used 640 × 462 on this Apple Silicon macOS
+desktop. Java was loaded through the isolated dialog harness; it was not a full
+Java application run. All credentials, files and profile data were generated
+inside the private run directory.
+
+The native GUI opened the fixture vault from the password row, unlocked it and
+returned to the existing editor. Selecting the fixture password with Down/Enter
+copied its username and saved only the vault ID. After restart with the vault
+locked, that ID remained represented; unlocking restored its display name.
+A later edit saved the disposable key path and selected passphrase ID. Both
+survived restart at minimum size. Switching to password disabled key fields;
+clicking disabled Browse opened no panel. Discarding this draft retained the
+saved key authentication. The fixed footer and wrapped authentication choices
+remained reachable.
+
+Formatting, strict application Clippy for all targets, native build and 205
+focused tests passed: 83 Connection Manager, 111 Settings, nine SSH-dialog and
+two effect-control tests. One OpenSSH-dependent Connection Manager test remained
+ignored; this pass did not rerun it. The initial missing test-only font import
+was fixed before final validation.
+
+[Detailed desktop observations](target/verification/20261125-auth-layout-observations.md)
+· [Source and environment](target/verification/20261125-auth-layout-source.json)
+· [Persistence assertions](target/verification/20261125-auth-layout-state.json)
+· [Connection tests](target/verification/20261125-auth-layout-connection-tests.log)
+· [Settings tests](target/verification/20261125-auth-layout-security-tests.log)
+· [SSH-dialog tests](target/verification/20261125-auth-layout-startup-tests.log)
+· [Effect tests](target/verification/20261125-auth-layout-effect-tests.log)
+· [Clippy](target/verification/20261125-auth-layout-clippy.log)
+· [Build](target/verification/20261125-auth-layout-build.log)
+· [Java authentication](target/verification/20261125-auth-layout-java-key.jpg)
+· [Native authentication](target/verification/20261125-auth-layout-native-key.jpg)
+· [Locked reference after restart](target/verification/20261125-auth-layout-native-locked-restart.jpg)
+· [Compact key fields](target/verification/20261125-auth-layout-native-compact-key.jpg)
+· [Corrected Terminal Settings heading](target/verification/20261125-auth-layout-native-terminal-heading.jpg)
+
+Full editor parity remains open. Protocol conversion and inline password or
+passphrase entry are not implemented in the saved SSH editor. An inactive
+file-key path is not persisted when another authentication family is saved;
+this existing data-model limitation was observed after password Save/restart.
+Registered-key source selection was verified with model/keyboard tests, not a
+real registered-key desktop fixture. Remaining sizing, the other primary dialogs
+and live key-expiry/route-change acceptance are still pending. Windows testing
+remains user-deferred. This checkpoint does not complete milestone 2 or the port.
+
+Owned processes, generated keys, the encrypted fixture vault, launchers and
+extracted reference package were removed. Build-cache cleanup and retained
+checksums are recorded with the run.
+[Cleanup](target/verification/20261125-auth-layout-cleanup.json)
+
+### November 25 retained authentication preferences
+
+Saved SSH logins now retain inactive ordinary private-key paths, password and
+passphrase vault references, and the keyboard-interactive follow-up choice.
+Active authentication remains authoritative. The optional preferences contain
+no plaintext secrets and are omitted when empty, preserving legacy encoding.
+Incomplete inactive file paths can survive an edit; active file authentication
+still requires a valid absolute path. Temporary-key cleanup remains unchanged,
+matching the tagged Java converter's explicit removal of inactive temporary
+keys.
+
+Scheduler route hashes and execution comparisons exclude these editor-only
+preferences. Credential-free exports omit them. Native backup and startup
+restore preserve them and require the referenced vault. Regression tests cover
+both restore merge modes and confirm that execution resolves only the active
+credential.
+
+On this native Apple Silicon macOS desktop, the editor switched from a file key
+with a passphrase to a vault password, saved, restarted and restored the file
+key without re-entry. A second restart at 640 × 462 retained the password
+reference. Cancel preserved the complete saved login; Save restored the prior
+password login, including the inactive file and passphrase. The normal editor
+was 1044 × 722. The fixture vault, keys and profiles were private disposable
+test data. This is editor persistence acceptance, not live SSH acceptance.
+
+Formatting, strict all-target application Clippy with `dialog-preview`, native
+build and the full parallel application suite passed: 4,349 tests passed and
+200 were ignored. The explicitly selected OpenSSH temporary-key lifecycle test
+also passed. Three existing AI tests needed bounded handling of the global
+model-operation gate or the existing exclusive AI test guard. The initial
+failures, isolated reproductions and final successful run are retained. Those
+changes are confined to test modules; recorded checksums bind the GUI to the
+unchanged production source.
+
+[Desktop steps and verification details](target/verification/20261125-auth-preferences-observations.md)
+· [Source and environment](target/verification/20261125-auth-preferences-source.json)
+· [Persistence assertions](target/verification/20261125-auth-preferences-state.json)
+· [Full application suite](target/verification/20261125-auth-preferences-application-tests.log)
+· [Temporary-key lifecycle](target/verification/20261125-auth-preferences-temporary-key-lifecycle.log)
+· [Clippy](target/verification/20261125-auth-preferences-clippy.log)
+· [Build](target/verification/20261125-auth-preferences-build.log)
+· [Password after restart](target/verification/20261125-auth-preferences-password-restart.jpg)
+· [Restored file key](target/verification/20261125-auth-preferences-key-restored.jpg)
+· [Compact restored password](target/verification/20261125-auth-preferences-compact-password-restored.jpg)
+· [Tagged Java contract](target/verification/20261125-auth-preferences-java-contract.json)
+
+Inline secret entry, protocol conversion, remaining sizing, the other primary
+dialogs and live key-expiry/route-change acceptance remain open. The tagged
+Java target password field is not consumed by its save converter, unlike the
+jump-server password and key passphrase; future inline-entry work must record
+this reference gap. Windows verification remains user-deferred. This checkpoint
+does not complete milestone 2 or the full port.
+
+Owned GUI processes, generated keys, the encrypted fixture vault and extracted
+Java package were removed. Development artifacts were cleaned after all
+checks. Compact evidence and the original reference archives are retained.
+[Cleanup](target/verification/20261125-auth-preferences-cleanup.json)
+
+### November 25 inline passwords and passphrases
+
+The saved SSH editor now accepts masked password and private-key passphrase
+input for both target and jump host. The native vault stores each new value
+as a separate encrypted credential. Existing credentials remain unchanged.
+Draft buffers are bounded, zeroizing and redacted in debug output. Stored
+connections contain IDs, including for inactive authentication preferences.
+Empty inputs preserve the selected reference, even after a typed replacement
+is erased. Choosing another stored source clears the replacement draft.
+
+The shared credential-save path requires an unlocked vault and preserves
+temporary-key replacement cleanup. Regression tests cover encrypted storage,
+restart, unchanged shared credentials, inactive references, disabled jump
+drafts, failed batches and stale connection publication. They also verify
+that an empty replacement does not remove the prior selection.
+
+The signed Java v2.26.0 dialog and native editor were compared on this macOS
+desktop at 1044 × 722. Native checks additionally used 640 × 462. They covered
+masked typing, locked-vault Save, unlock and return to the existing draft,
+target and jump password Save, file-key passphrase Save, restart, erased
+replacement and compact Cancel. A standalone verifier decrypted both passwords
+and both passphrases and matched their exact input bytes. The vault contained
+exactly six entries: two original fixtures and four additions. The connection
+file contained none of the entered plaintext.
+
+The Java target password field is not consumed by its save converter; native
+input intentionally provides working encrypted persistence. Java's file-key
+passphrase converter trims whitespace and its jump page supports unencrypted
+key files. Native retains exact credential bytes and supports a jump file-key
+passphrase. These are recorded differences, not claims of identical behavior.
+
+Formatting, strict application Clippy for all targets with `dialog-preview`,
+native build and the full parallel application suite passed: 4,355 passed,
+200 ignored. The explicit OpenSSH temporary-key lifecycle test passed. An
+initial new test attempted a disabled edit and was corrected; its failure
+and the final successful run are retained. The final GUI check additionally
+verified the corrected Password label and Cancel. Checksums identify the
+earlier GUI build and the final source and binary.
+
+[Desktop observations](target/verification/20261125-inline-credentials-observations.md)
+· [Source and environment](target/verification/20261125-inline-credentials-source.json)
+· [State assertions](target/verification/20261125-inline-credentials-state.json)
+· [Full application suite](target/verification/20261125-inline-credentials-application-tests.log)
+· [Exact decrypted values](target/verification/20261125-inline-credentials-vault-final.log)
+· [Temporary-key lifecycle](target/verification/20261125-inline-credentials-temporary-key-lifecycle.log)
+· [Native password input](target/verification/20261125-inline-credentials-native-password-draft.png)
+· [Locked-vault Save](target/verification/20261125-inline-credentials-native-locked-save.png)
+· [After restart](target/verification/20261125-inline-credentials-native-password-restart.png)
+· [Compact jump passphrase](target/verification/20261125-inline-credentials-native-compact-jump-passphrase.png)
+· [Final Password choice](target/verification/20261125-inline-credentials-native-final-password-choice.png)
+
+This is editor and vault acceptance, not live SSH authentication with the
+fixture values. Protocol conversion, remaining primary dialogs and live
+key-expiry/route-change acceptance remain open. Windows tests remain
+user-deferred during reinstallation. This checkpoint does not complete
+milestone 2 or the full port. Owned GUI processes and private fixture data
+were removed; the development build cache was cleaned after verification.
+[Cleanup](target/verification/20261125-inline-credentials-cleanup.json)
+
+### November 25 protocol storage foundation
+
+Native storage now supports an explicit atomic publication of one active
+protocol profile and up to two validated inactive variants. Conversion keeps
+the profile ID, group, favorite and usage history. A real protocol change
+removes the old tunnel approval; an unchanged active SSH tunnel plan retains
+its approval when only an inactive variant changes. A stale store revision or
+foreign profile identity cannot overwrite the current record. Deleting the
+profile or its group also removes its inactive variants.
+
+Normal terminal and Scheduler lookups still see only active profiles. Native
+backups preserve inactive variants, and restore checks include their SSH vault
+and registered-key dependencies. Inline-credential rollback also considers
+retained SSH references before removing an addition.
+
+Formatting, strict all-target application Clippy with `dialog-preview`, and
+the full parallel application suite passed on this Apple Silicon macOS
+desktop: 4,361 passed and 200 ignored. Six new regressions cover conversion
+through all three supported protocols with intervening reopen, identity and
+library preservation, approvals, stale/foreign rejection, cleanup, private
+backup validation and retained-vault dependencies. The explicit OpenSSH
+temporary-key lifecycle test also passed. Initial lint/format corrections and
+the pre-refinement stopped run remain separately named in the evidence.
+
+The protocol picker is **not connected to this storage path yet**. This is a
+backend checkpoint, not GUI conversion or full dialog-parity acceptance. No
+GUI changed in this pass. The next step is one editor flow preserving common
+settings and unsaved per-protocol drafts, with native desktop Save/Cancel,
+restart and stale-revision checks. Temporary dead-code expectations identify
+the APIs awaiting that integration. Windows testing remains user-deferred.
+
+[Scope and regression details](target/verification/20261125-protocol-storage-observations.md)
+· [Source and test binary](target/verification/20261125-protocol-storage-source.json)
+· [Application suite](target/verification/20261125-protocol-storage-application-tests.log)
+· [Temporary-key lifecycle](target/verification/20261125-protocol-storage-temporary-key-lifecycle.log)
+· [Clippy](target/verification/20261125-protocol-storage-clippy.log)
+· [Recorded worktree patch](target/verification/20261125-protocol-storage-worktree.patch)
+· [Cleanup](target/verification/20261125-protocol-storage-cleanup.json)
+
+### November 25 unified protocol editor
+
+Formatting, strict all-target application Clippy, the native GUI build and the
+full parallel application suite passed: 4,368 passed and 200 ignored.
+The explicit OpenSSH temporary-key lifecycle test also passed.
+
+The saved-connection editor now switches between SSH, local shell and serial
+within the same eight-tab form. It retains inactive protocol values and common
+editor settings, publishes one active profile with a stable identity, and
+freezes the opening store revision to reject conflicting changes. Pending SSH
+passwords, passphrases and temporary keys use the existing encrypted-vault
+workflow when saving another active protocol. Ordinary SSH saves avoid a
+redundant common-settings copy.
+
+Native checks on this macOS desktop used 1044 × 722 and 640 × 462. They covered
+SSH → local → serial → SSH with restarts, exact local arguments, masked password
+entry, locked-vault feedback and return to the draft, keyboard protocol
+selection, and Cancel after editing all three variants. The complete store
+remained byte-for-byte unchanged after cancellation. A new local draft became
+valid before entering an SSH host. A standalone verifier decrypted the one new
+password and compared exact bytes; exactly three vault entries remained,
+including the two original fixture entries. No serial hardware was connected.
+
+The original signed Java v2.26.0 macOS package supplied local and serial dialog
+references. Native currently shows protocol-specific fields only for the
+active protocol, while Java keeps the inactive rows visible and disabled.
+Those rows, labels and sizes still need alignment. Common settings preserved
+for local/serial profiles also need a runtime-consumer audit before claiming
+that all are applied by each transport. This is a functional editor checkpoint,
+not complete primary-dialog or whole-port acceptance. Windows tests remain
+user-deferred during reinstall.
+
+[Desktop observations](target/verification/20261125-protocol-editor-observations.md)
+· [Source and validation](target/verification/20261125-protocol-editor-source.json)
+· [State assertions](target/verification/20261125-protocol-editor-state.json)
+· [Full application suite](target/verification/20261125-protocol-editor-application-tests.log)
+· [Exact decrypted password](target/verification/20261125-protocol-editor-vault-check.log)
+· [Native local restart](target/verification/20261125-protocol-editor-local-restart.png)
+· [Native serial compact restart](target/verification/20261125-protocol-editor-serial-compact-restart.png)
+· [Restored SSH credential](target/verification/20261125-protocol-editor-restored-ssh-compact.png)
+· [New local without SSH host](target/verification/20261125-protocol-editor-new-local-no-host.png)
+· [Java local reference](target/verification/20261125-protocol-editor-java-local.png)
+· [Java serial reference](target/verification/20261125-protocol-editor-java-serial.png)
+
+Owned fixture applications and profiles were removed. The development cache
+was cleaned after verification; source and executable hashes remain in the
+evidence. [Cleanup](target/verification/20261125-protocol-editor-cleanup.json)
+
+### November 25 protocol field layout
+
+Formatting, strict all-target application Clippy and the complete native
+application suite passed: 4,372 passed, 200 ignored. The explicitly selected
+OpenSSH temporary-key lifecycle test passed as well.
+
+The unified editor keeps inactive local and serial rows visible and disabled,
+and also retains the complete disabled SSH authentication section for other
+protocols. The Shell selector includes custom commands; explicit argument rows
+remain available. Protocol/Shell widths, serial labels and 13-point controls
+now follow the original Java v2.26.0 macOS reference more closely.
+
+Native desktop checks at 1044 × 722 and 640 × 462 covered mouse selection followed
+by Tab, skipping inactive fields, adding/removing arguments, switching a custom
+command to a preset and back within one draft, serial refresh, baud selection,
+DTR/local-echo keyboard toggles, Save/restart and Cancel. Local arguments retained
+exact spaces and Unicode. Serial ID 1 saved 38400 baud, DTR off, RTS on and local
+echo on; cancelling a later 57600 edit left the complete store byte-identical.
+No serial device was opened.
+
+The checks found and corrected three focus problems: mouse-opened selectors did
+not own keyboard focus; inserting an argument moved the focused control; and
+port refresh temporarily removed its control. The refresh follow-up also exposed
+a workspace modal guard that redirected the focus reply. Focus now returns to
+the right owner, while stale scan replies, automatic scans and another active
+protocol do not request it. Separate hashes identify the intermediate GUI builds
+that exposed these defects and the final build.
+
+[Desktop observations](target/verification/20261125-protocol-layout-observations.md)
+· [Source/build hashes](target/verification/20261125-protocol-layout-source.json)
+· [State assertions](target/verification/20261125-protocol-layout-state.json)
+· [Full application suite](target/verification/20261125-protocol-layout-application-tests.log)
+· [Argument focus](target/verification/20261125-protocol-layout-argument-focus-final.png)
+· [Refresh focus](target/verification/20261125-protocol-layout-refresh-focus-final.png)
+· [Compact refresh](target/verification/20261125-protocol-layout-compact-refresh-focus.png)
+· [Disabled authentication](target/verification/20261125-protocol-layout-compact-disabled-authentication.png)
+
+This is bounded layout and keyboard acceptance. Native explicit argv editing,
+the system-default shell choice and additional authentication modes remain
+intentional differences. Common runtime settings still need the linked audit;
+this checkpoint does not complete all primary dialogs or the port. Windows
+remains user-deferred during reinstall.
+[Runtime audit](target/verification/20261125-protocol-layout-runtime-audit.md)
+
+All owned fixture processes and directories were removed. The development
+cache was cleaned after the final checks. [Cleanup](target/verification/20261125-protocol-layout-cleanup.json)
+
+
+## November 25 common local and serial runtime settings
+
+The saved common editor settings now reach local and serial session startup.
+The runtime cache binds settings to the active transport identity and rejects
+stale launches after a protocol conversion. A running pane retains its original
+snapshot when that identity is replaced. Local and serial output use the
+terminal logger's existing masking and finalization path. Incognito suppresses
+logfiles and usage capture, including inherited private launch paths. An old
+project cannot automatically restart a local connection changed to incognito.
+A required serial process/sandbox level is refused explicitly because no
+isolated serial worker is implemented.
+
+The Connection Manager's local and serial inspectors now offer Connect and
+Connect in New Window. Native macOS checks at 1240 × 792 and 940 × 600 verified
+both inspectors. New-window launches produced 980 × 670 content windows while
+normal Connect used the existing window. The configured terminal colors,
+multiline paste review/cancellation and close confirmation were visible. The
+private local profile displayed its Incognito marker and remained absent from
+recent usage (only IDs 2 and 1 were present) and from logfiles. The local logfile
+contained 143 bytes and the two serial logfiles 3,326 bytes; all test markers
+were masked. This is a PTY serial test, not physical equipment acceptance.
+
+Eight native runtime tests passed after correcting the test fixtures' missing
+custom log folders. Formatting, strict application Clippy and the native build
+passed. The full application suite passed 4,380 tests with 200 regular skips;
+the explicit OpenSSH temporary-key lifecycle test also passed. The requested
+native window position and maximized state were not independently measured in
+this pass. Windows remains user-deferred;
+the primary-dialog, migration, transfer and release gates are still open.
+
+[Detailed observations](target/verification/20261125-native-runtime-observations.md)
+· [Runtime tests](target/verification/20261125-native-runtime-runtime-tests.log)
+· [Masked log payloads](target/verification/20261125-native-runtime-gui-logs.json)
+· [Source snapshot](target/verification/20261125-native-runtime-source.json)
+
+
+The final source hashes matched the GUI/test snapshot. All owned GUI processes
+and external scratch directories were gone after verification. Development
+cleanup removed 3.6 GiB; the checkout uses 417 MiB including 363 MiB in `target`.
+[Cleanup record](target/verification/20261125-native-runtime-cleanup.json)
+
+## November 25 Quick Connect layout and native logging
+
+The tagged Java v2.26.0 Quick Connect dialog was run from the verified macOS
+ARM64 package on this desktop. The native dialog now keeps the SSH, local and
+serial fields in a stable order with inactive controls visible. It uses the
+reference label/selector widths, authentication alignment, section order and
+Load Project / Cancel / Connect footer. Native authentication options, exact
+argument editing, SFTP and IBM extensions remain deliberate differences.
+The original reference window measured 750 × 762 including its title bar.
+Final native checks covered 750 × 730 and 700 × 400 content sizes.
+
+The desktop verified protocol and custom-shell selection, automatic focus on
+new arguments, keyboard removal, focused-control scrolling, recent-button
+focus, Escape and return to the owner. The compact native log-folder chooser
+returned the selected private directory to the current local draft. Cancelling
+the edited drafts left the entire connection store byte-identical. The first
+pass exposed authentication alignment, disabled-field colors, footer widths
+and overflowing recent labels; the final screenshots verify the corrections.
+
+Quick Connect now carries distinct SSH/local/serial log drafts through startup
+and saves native log settings atomically with a new profile. A real local
+`/bin/sh` command displayed its first test line and wrote a 150-byte plain log.
+An owned macOS serial PTY displayed its first test line and wrote a 159-byte
+log. Its peer received the exact 19-byte reply, including CR. Both saved
+profiles reopened with their separate enabled folders and uncompressed format
+after restarting the app. These live checks used the first preview; the final
+preview repeated layout, keyboard, chooser and cancellation checks. Source and
+binary snapshots distinguish the two. This does not verify physical serial
+hardware, modem lines or flow control.
+
+Twenty focused Quick Connect tests passed, including real local/serial output,
+selected emulation, independent drafts, keyboard argument editing and refusal
+of logging edits/profile saves for private native connections. Formatting,
+strict application Clippy and all 4,385 application tests passed, with 200
+regular skips. The explicit OpenSSH temporary-key lifecycle test also passed.
+An initial new test-fixture ownership error was corrected before the accepted
+run. That final test-only correction does not change the GUI runtime source.
+
+The serial tab's separate close confirmation could not be clicked through CUA
+(`noWindowsAvailable`); the fixture controller stopped and waited for its
+owned process instead. No successful GUI-close result is claimed for that
+attempt. Broader appearance/effect/provider acceptance, expired temporary keys,
+route replacement, Linux and the user-deferred Windows checks remain open.
+
+[Detailed observations](target/verification/20261125-quick-connect-notes.md)
+· [Final compact GUI](target/verification/20261125-quick-connect-final-compact-arguments.png)
+· [Accepted tests](target/verification/20261125-quick-connect-accepted-application.log)
+· [Accepted source](target/verification/20261125-quick-connect-accepted-source.json)
+· [Cancellation hashes](target/verification/20261125-quick-connect-cancel.json)
+
+The next Scheduler comparison is also recorded on this desktop: Java presents
+an owned tree with server and group selection; Rust embeds its current
+checkbox list inside the Job form. Two native selections were cancelled
+without saving or running a job. The baseline records the fixture differences
+and does not claim that the picker port is complete.
+[Scheduler baseline](target/verification/20261125-scheduler-picker-baseline.json)
+
+Owned preview processes, profiles, external scratch directories and preview-only
+preferences are removed. Development cleanup removed 3.6 GiB. The checkout uses
+420 MiB including 367 MiB in `target`. Final checks found no remaining owned
+preview process or `/private/tmp/kortty.*` directory. Details are in the
+[cleanup record](target/verification/20261125-quick-connect-cleanup.json).
+
+
+## November 25 Scheduler target selection
+
+The Java v2.26.0 target-selection dialog was run from the signature-verified
+macOS ARM64 package on this desktop. Its tagged source is
+[`JobSchedulerTargetSelectionDialog.java`](https://raw.githubusercontent.com/chardonnay/korTTY/v2.26.0/src/main/java/de/kortty/ui/JobSchedulerTargetSelectionDialog.java).
+The native implementation now opens an owned tree window instead of the
+inline checkbox list. Both fixtures used the same two routes under Fleet and
+Fleet/Staging. Normal Java content measured 720 × 560; compact Java content
+was requested at 500 × 340. The native window was verified at those content
+sizes. Tree density, typography and native title bars are not pixel-identical.
+
+The picker preselects saved routes/groups and retains hidden selections while
+filtering by name, host or group. Local groups and source-qualified Teamwork
+roots share the tree model. Existing connection warnings remain visible in
+row details. Apply replaces the selected set, validates current routes and
+group membership, retains unchanged reviewed member order, and uses the
+existing approval invalidation path for actual changes. A separate job Save
+still publishes the draft. Cancel discards only picker state.
+
+Native GUI checks covered single and multiple selections, Cmd+A, filtering,
+Shift ranges, collapse/expand, Space toggling, Tab and Escape, search-to-tree
+focus, double-click application, and return to both standalone and hosted
+owners. The first GUI pass exposed an ArrowDown handler that returned focus
+to the first row. It now belongs to the search input; subsequent Down presses
+move through the tree. A second correction removed an inner button that
+consumed double clicks. The final build repeated search → Down → Down,
+selected-row double-click and return to the hosted Scheduler. Focus operations
+are scoped to the individual picker, including when two pickers contain the
+same route identity. Repeated arrow events have widget regression coverage;
+physical held-key repetition is not separately claimed.
+
+A disabled, non-recurring job was saved with route 1. Cancel preserved its
+complete file byte-for-byte. Selecting only route 2 and saving replaced route
+1. Changing the owned fixture's host while the old route was selected caused
+`An explicitly selected SSH connection changed. Select it again.` The saved
+job stayed unchanged until explicit reselection and Save. Restart restored the
+new host and selection. Double-clicking route 1 later saved exactly that route;
+the final unchanged selection did not alter the stored job. The journal and
+run map remained empty: no fixture job was executed.
+
+This checkpoint does not complete the whole Scheduler gate. The compact
+hosted parent can shrink its job list to the header when its wrapped toolbar
+and status text consume the left pane. That layout is the next runnable case.
+Live overlapping/source-qualified Teamwork groups, expired credentials,
+execution after live route replacement and renewed rsync approval remain
+separate checks. Windows remains user-deferred during reinstallation.
+
+[Detailed observations](target/verification/20261125-scheduler-picker-progress.md)
+· [Java normal](target/verification/20261125-scheduler-picker-live-java.png)
+· [Java compact](target/verification/20261125-scheduler-picker-compact-java.png)
+· [Final native normal](target/verification/20261125-scheduler-picker-delivery-normal.png)
+· [Native compact](target/verification/20261125-scheduler-picker-final-compact.png)
+· [Final keyboard focus](target/verification/20261125-scheduler-picker-delivery-keyboard.png)
+· [Saved disabled job](target/verification/20261125-scheduler-picker-delivery-jobs.json)
+· [Final source and binary](target/verification/20261125-scheduler-picker-delivery-source.json)
+
+
+Formatting, strict application Clippy, the native build and `git diff --check`
+passed. The focused model suite passed 222 tests, the owned-window regression
+passed, and all 4,392 application tests passed with 200 regular skips. The
+explicit temporary-key editor test also passed using disposable OpenSSH
+`ssh-keygen` keys. This last test verifies vault publication/replacement/removal;
+it is not a new live server-authentication test.
+[Verification summary](target/verification/20261125-scheduler-picker-verified.json)
+· [Application tests](target/verification/20261125-scheduler-picker-verified-application.log)
+
+
+All owned preview processes and external scratch directories were removed.
+Development cleanup removed 3.6 GiB; the checkout uses 422 MiB, including
+369 MiB in `target`. The final source hashes matched the GUI/test snapshot.
+[Cleanup record](target/verification/20261125-scheduler-picker-cleanup.json)
+
+
+## November 25 compact Scheduler parent layout
+
+The original Java v2.26.0 Scheduler parent was run on this macOS desktop from
+the signature-verified ARM64 package. Its normal window measured 1360 × 828
+including the title bar. Requesting 700 × 440 content yielded 1173 × 468 because
+the reference form imposed a wider minimum. The reference fixture supplied
+private managers and an empty job store without starting scheduler threads.
+This comparison covers layout; it does not establish Java execution behavior.
+
+The Rust parent now caps its action/status section at 45% of the available
+height and scrolls it separately, preserving the job list above it. Short
+sections retain their natural height. Long action labels and the menu-status
+checkbox wrap to the pane. A horizontal table viewport keeps column headers
+and rows aligned while allowing readable minimum column widths. Scope-limited
+Tab traversal reaches the job table, available actions, page tabs, text inputs
+and Close. Up/Down/Home/End select and reveal jobs. Ctrl+Tab stays available for
+the existing window/tab navigation. Save and execution actions retain their
+existing handlers and validation.
+
+Intermediate native checks used 18 disabled, non-recurring jobs. The hosted
+1000 × 672 window retained multiple list rows while the action/status section
+scrolled. End selected and revealed the last job; Tab and Enter reached Save.
+A renamed job persisted. Keep editing retained an unsaved draft; Discard changes
+closed its tab without replacing the saved name. Restart and standalone
+700 × 440 content restored the saved job. The store retained all 18 definitions,
+with empty journal and run maps. No fixture job executed.
+
+The minimum-size pass exposed clipped long actions and narrow columns. The
+next build verified wrapped buttons and a draggable horizontal scrollbar;
+headers and rows moved together. The final source reserves space for the
+vertical scrollbar so it cannot cover checkbox text. The final native build
+repeated the 700 × 440 and 1360 × 800 content checks. It also fixes the selected
+last row dropping below the viewport when Save adds a status line: Save now
+reveals the selected row after layout. Both final sizes showed the complete
+saved row and readable status. All 18 fixture jobs remained disabled, with no
+journal or run entries. The final source and copied GUI binary hashes matched.
+
+Two long CUA session resets interrupted capture sequences. Fresh snapshots
+confirmed the completed actions before any continuation; no unobserved action
+was counted as successful. The native app was quit and the fixture controller
+stopped and waited for its owned processes. The temporary reference, app copies
+and profiles were then removed by the wrapper.
+
+[Detailed observations](target/verification/20261125-scheduler-layout-notes.md)
+· [Java reference record](target/verification/20261125-scheduler-layout-reference.json)
+· [Hosted list](target/verification/20261125-scheduler-layout-hosted.jpg)
+· [Keyboard Save](target/verification/20261125-scheduler-layout-hosted-keyboard-save.jpg)
+· [Retained jobs](target/verification/20261125-scheduler-layout-hosted-jobs.json)
+· [Horizontal scrollbar](target/verification/20261125-scheduler-layout-horizontal-scroll.jpg)
+
+
+Formatting, the final native build and strict application Clippy passed.
+Both new regressions passed: long/wrapped status leaves room for job rows, and
+job arrows/actions preserve keyboard semantics including Ctrl+Tab. All 4,394
+application tests passed with 200 regular skips. Earlier compile/test fixture
+failures remain in intermediate logs and are not counted as accepted results.
+[Accepted summary](target/verification/20261125-scheduler-layout-verified.json)
+· [Application tests](target/verification/20261125-scheduler-layout-verified-application.log)
+· [Final compact Save](target/verification/20261125-scheduler-layout-verified-compact-save.jpg)
+· [Final normal Save](target/verification/20261125-scheduler-layout-verified-normal-save.jpg)
+· [Final source](target/verification/20261125-scheduler-layout-verified-source.json)
+
+
+All owned GUI processes and scratch directories are gone. Development cleanup
+reported `Removed 7070 files, 3.6GiB total`. Final disk usage:
+
+```text
+424M	.
+371M	target
+```
+
+[Cleanup record](target/verification/20261125-scheduler-layout-cleanup.json)
+
+
+## November 25 native key rotation and renewed rsync approval
+
+This macOS desktop ran a private target and jump OpenSSH server with separate
+host and client keys. The native Scheduler recorded blocked attempts for a
+locked vault and an expired one-minute temporary key. The Journal showed the
+full explanations. Rotating only the target credential caused the saved route
+to be rejected until reselected; the remaining expired jump credential then
+blocked the attempt independently. Rotating the jump credential required a
+fresh selection again. These were fixture vault mutations while the app was
+closed, followed by real GUI review and execution; they do not claim GUI
+private-key paste acceptance in every editor.
+
+After explicit review of the rsync executable digest, both host pins, paths and
+source digest, the native GUI uploaded 258,802 bytes. A further target rotation
+used different key material. The old route was blocked; reselecting the route
+removed its approval, and an unlocked-vault attempt still required approval.
+Only after Review / Approve / Save did the same transfer succeed again. Both
+receiver copies matched SHA-256
+`1ae5b95885ca9d53cbc72fa26d11f0ce1aa8bb40a1bd68d84e491f789d564010`.
+The first owned receiver was removed after retaining its digest so the second
+attempt remained a new-file upload. Server logs confirm two distinct accepted
+target client keys and the separate replacement jump key. No initial expired
+client key was accepted. The job remained disabled and non-recurring.
+
+The macOS OpenSSH test fixtures previously rejected their own key files because
+`/private/tmp` is a writable ancestor. A local OpenSSH-client diagnostic proved
+the cause. Fixture configuration now uses a fixed `/bin/cat` key reader with
+StrictModes retained; Linux keeps the previous file-based fixture setup. The
+optional Scheduler rsync fixture uses the reviewed native program on both
+sides and preserves SFTP dispatch. These are test-support changes only.
+
+The corrected automatic two-hop Scheduler/rsync test passed, including exact
+client-key fingerprints, changed/locked authority, an explicitly selected direct route and file
+bytes. The independently executed project-reconnect test passed after a real
+one-minute expiry. Broader final regression results follow below.
+
+[Detailed record](target/verification/20261125-native-key-notes.md)
+· [GUI and wire evidence](target/verification/20261125-native-key-gui-verified.json)
+· [Expiry detail](target/verification/20261125-native-key-expired-journal.jpg)
+· [Renewed-approval result](target/verification/20261125-native-key-rsync-renewed-success.jpg)
+· [Accepted Scheduler test](target/verification/20261125-native-key-accepted-scheduler-rsync.log)
+
+
+Final verification passed: both selected temporary-key tests, all 20 native
+OpenSSH integration tests, and 4,394 application tests with 200 regular skips.
+Strict Clippy passed for the application and OpenSSH integration target, and
+formatting passed. The real expiry test completed after 63.23 seconds. The
+OpenSSH suite also verified external text editing with conflict, mode, link and
+channel checks. Its positive directory fixture ran under macOS's native private
+temporary parent; it did not bypass owner-control checks. The PTY test retained
+its denied-request debug trace and used normal session logs for accepted
+channels so debug text could not interfere with its byte protocol.
+[Final verification](target/verification/20261125-native-key-accepted.json)
+· [OpenSSH integration](target/verification/20261125-native-key-openssh-final-integration.log)
+· [Real expiry](target/verification/20261125-native-key-accepted-real-expiry.log)
+· [Fixture source snapshot](target/verification/20261125-native-key-source.json)
+
+
+All owned GUI/test processes and scratch directories were removed. Development
+cleanup reported `Removed 7960 files, 3.7GiB total`. Required archives and compact evidence remain.
+Final disk usage:
+
+```text
+426M	.
+373M	target
+```
+
+[Cleanup record](target/verification/20261125-native-key-cleanup.json)
+
+### November 25 saved temporary-key editor feedback
+
+The native saved-connection editor no longer describes every retained key
+reference as available. It now distinguishes a locked vault from an available
+key and from an expired, missing or wrong-account key. The availability check
+uses the existing vault expiry and exact host/port/account validation. It does
+not copy a private key or renew its lifetime. Pending replacements retain the
+message explaining that Save will verify and store the pasted key.
+
+All checks ran on this Apple Silicon macOS desktop. The verified original
+Java v2.26.0 connection editor was opened alongside the native application.
+The Java form has password and private-file-key authentication; Rust's
+saved-temporary-key controls remain an extension in the corresponding form.
+This comparison establishes the surrounding form structure, not an identical
+Java temporary-key editor.
+
+The 1044 × 722 native dialog showed locked-vault, available, genuinely expired
+one-minute-key and changed-host feedback. Discard restored the original
+endpoint. A name-only Save survived an application restart, preserved all
+three saved login records and left the encrypted vault byte-for-byte unchanged.
+At 640 × 462, the missing-reference message wrapped above reachable actions
+and footer buttons. Tab reached the overflow navigation control and Escape
+closed the unchanged draft. The private test profile and reference app were
+stopped and removed after capture.
+
+Verification passed formatting, strict application Clippy, the separately
+invoked real-key persistence/replacement/removal test, and 4,395 application
+tests with 200 regular skips. The native GUI binary and changed source hashes
+are recorded. The initial build visibility error was corrected; the final
+build and accepted logs are separate from the retained failed build log.
+
+Entering and submitting a new private authentication key through the GUI is
+not claimed here. Computer Use requires user handoff for a changed credential.
+That manual interaction remains open; backend replacement and Scheduler
+rotation acceptance are separate verified paths. Windows tests remain deferred
+by the user during reinstallation.
+
+- [Report](target/verification/20261125-key-editor-notes.md)
+- [Native GUI checks](target/verification/20261125-key-editor-gui.json)
+- [Save and vault comparison](target/verification/20261125-key-editor-save-verified.json)
+- [Automated results](target/verification/20261125-key-editor-checks.json)
+- [Verified source and binary](target/verification/20261125-key-editor-source.json)
+- [Cleanup](target/verification/20261125-key-editor-cleanup.json)
+
+### November 25 Window settings search and native geometry
+
+Window Settings now exposes separate search destinations for terminal-output
+restoration, the 100–5000 output-line limit, Width, Height, X Position and
+Y Position. The native maximized option and available imported session settings
+also have their own destinations. The import result is absent when the current
+policy leaves no applicable proposal. The geometry search labels match the
+observed Java labels; longer fixed-window terms remain aliases.
+
+Search/Enter now focuses Window switches, the startup selector, the icon-size
+slider and each editable number. Managed or otherwise disabled controls remain
+non-editable. Output lines use a numeric field with step buttons and keyboard
+steps, matching the Java control type. Invalid output lines and geometry values
+bring Save back to the specific field. The Window page is in `window_page.rs`,
+with smaller headings/help text, denser spacing and paired Size and Position
+rows that wrap at narrower widths.
+
+All desktop checks used this Apple Silicon macOS desktop. The unchanged Java
+v2.26.0 release JARs were loaded from the signature-verified macOS ARM64 package.
+Its normal Settings window measured 1120 × 1108, alongside Rust at 1120 × 1112.
+A Java request for 850 × 712 was constrained to 1120 × 988. Rust was also checked
+at 850 × 712; this does not establish equal minimum sizes or whole-dialog parity.
+
+The private native profiles verified:
+
+- A cold-page search found output lines from Font, before opening Window.
+- Search/Enter/Space activated output restoration and the dashboard switch.
+- 5001 was rejected on Save. 1234 was accepted and survived process restart.
+- Search selected Height independently. Cancel discarded 901 and retained 800.
+- In the compact dialog, Up changed output lines to 1235; the imported-settings
+  search action staged 1400. Escape and reopen retained the saved 1234.
+- Compact search selected Width; Up changed only that field to 1201. Escape
+  retained width 1200 and disabled fixed geometry.
+- The final normal and compact profiles used identical native binary bytes.
+  Geometry rows, scrolling and the fixed footer were inspected on both.
+
+The focused Settings suite passed 115 tests, including the new switch/selector,
+number, disabled-control, validation and wide/narrow geometry checks.
+The initial test expectations were corrected to include the added search
+results and to distinguish an intentionally disabled field from a focused
+editable control. Initial failed logs are retained separately.
+
+An unrelated full-suite failure exposed the managed-model test's assumption
+that the shared worker was immediately available. The direct test and full
+rerun passed. The test now handles the documented busy result with the same
+bounded retry used by adjacent tests, without changing production removal.
+Final validation passed formatting, strict application Clippy, 115 Settings
+tests and all 4,399 application tests (200 regular skips). Cleanup and the
+accepted logs are recorded in the linked report.
+
+The native transparency control's keyboard and Save/Cancel behavior remains
+a separate check, as do the remaining Settings and AI Manager pages. Windows
+runs remain user-deferred during reinstallation.
+
+- [Report](target/verification/20261125-settings-search-notes.md)
+- [Native desktop evidence and image dimensions](target/verification/20261125-settings-search-gui.json)
+- [Save and Cancel assertions](target/verification/20261125-settings-search-save-cancel.json)
+- [Window field inventory](target/verification/20261125-settings-search-field-map.json)
+- [Automated checks](target/verification/20261125-settings-search-final-checks.json)
+- [Verified source and binary](target/verification/20261125-settings-search-source.json)
+- [Cleanup](target/verification/20261125-settings-search-cleanup.json)
+
+
+### November 25 native transparency Settings
+
+The existing native Settings slider immediately changed and saved the live
+percentage, even after Cancel. This was reproduced with a private profile:
+20% became 71% after a pointer edit and Cancel. The control now edits the
+Settings draft. Save commits it after a successful preferences write. Cancel
+and failed writes preserve the live value, and an untouched draft preserves
+an independent quick-menu change. Both commit paths share the existing Windows
+surface activation helper; macOS/Linux retain their existing new-window hint.
+
+Search/Enter focuses the slider. Arrow keys step by one percentage point,
+Home selects 0% and End selects 100%. Three new tests exercise draft isolation,
+failed Save, exact keyboard dispatch and preservation of a separate quick-menu
+change. These are semantic and widget tests, not Windows runtime acceptance.
+
+All GUI checks ran on this Apple Silicon macOS desktop. The signature-verified
+Java v2.26.0 Settings dialog returned no match for transparency, so this is a
+native extension. At 1120 × 1112, pointer and keyboard edits were cancelled
+without changing the stored 20%; a subsequent 21% Save survived reopen and
+restart. At 850 × 712, Home/End showed 0%/100%; Escape and reopen restored 21%.
+The compact row and footer remained reachable. The final disposable profile
+was saved to 0% and restarted for an independent quick-menu probe.
+
+CUA reported `noWindowsAvailable` for main-window coordinate clicks, including
+that opaque restart. Native menu actions and Settings clicks worked. The
+live quick-menu test remains open; its regression tests passed. Windows GUI
+and runtime checks remain user-deferred during reinstallation.
+
+Formatting, strict application Clippy, all 118 Settings tests, four surface
+tests and all 4,402 application tests passed (200 regular skips). The copied
+apps, extracted reference and private profiles were removed; all owned GUI
+processes were stopped and waited for, then development artifacts were cleaned.
+
+- [Report](target/verification/20261125-transparency-notes.md)
+- [GUI evidence and limitations](target/verification/20261125-transparency-gui.json)
+- [Reproduced baseline](target/verification/20261125-transparency-baseline.json)
+- [Automated checks](target/verification/20261125-transparency-final-checks.json)
+- [Clippy](target/verification/20261125-transparency-clippy.json)
+- [Source and binary hashes](target/verification/20261125-transparency-source.json)
+- [Cleanup](target/verification/20261125-transparency-cleanup.json)
+
+
+### November 25 AI Manager General keyboard navigation
+
+The native General search could reveal a switch while leaving focus in Search.
+The original Java v2.26.0 dialog focused its case checkbox and language selector.
+Native General now focuses seven switches, four selectors and four available
+imported-preference actions. Space changes the focused switch; the selectors
+retain their keyboard menus and Escape dismissal. Search alone does not edit
+or adopt a value. Read-only controls and policy-managed triage remain locked.
+
+General's primary/section tabs and Save/Close actions now participate in
+keyboard traversal. Tab and Shift+Tab wrap within the Manager's scope. A close
+review excludes the underlying form and supports both boundaries even when a
+search query remains open. Other Manager pages retain their current key routes.
+
+All desktop checks ran on this Apple Silicon macOS desktop. Final native
+checks at 760 × 512 exercised both review boundaries, Keep editing and Discard
+with an unfinished search, plus keyboard-only Save. Independent JSON inspection
+and a 980 × 672 restart retained timeout 14, English, semantic search enabled
+and the existing case preference, with shortcuts still disabled. The same
+binary exercised the unfinished-search review in a hosted Manager inside a
+1000 × 672 main window. Discard closed only that tool tab. The reference Java
+fixture used signature-verified original release JARs; its missing application
+service prevents a claim about Java Save/restart in this comparison.
+
+Six new Manager regressions cover exact switch/selector dispatch, read-only and
+managed controls, explicit imported-preference adoption, field/Save traversal
+and the review's forward/backward boundary. A seventh regression checks the
+active standalone/hosted route and rejects another window. Existing overflow
+and long-notice layout assertions were retained through the new scope container.
+Final verification passed formatting, strict application Clippy, 425 Manager
+tests (12 regular skips) and 4,409 application tests (200 regular skips).
+
+The private GUI apps, profiles and extracted reference copies were stopped,
+waited for and removed. Development artifacts were cleaned after verification.
+The 30-control Java General inventory retains unresolved and alternate-location
+work; this does not close the remaining Manager/Settings or cross-platform
+matrix. Windows tests remain user-deferred during reinstallation.
+
+- [Report](target/verification/20261125-ai-general-notes.md)
+- [Final desktop checks](target/verification/20261125-ai-general-complete-gui.json)
+- [Reference field inventory](target/verification/20261125-ai-general-field-map.json)
+- [Accepted results](target/verification/20261125-ai-general-complete-results.json)
+- [Source and binary hashes](target/verification/20261125-ai-general-complete-source.json)
+- [Cleanup](target/verification/20261125-ai-general-complete-cleanup.json)
+
+
+### November 25 General security profile and field reconciliation
+
+General / Defaults now exposes Security-check profile and Clear using the same
+picker, draft and stored role as Local AI. Search supports keyboard selection
+and clearing; read-only dialogs cannot change the role. The ordinary text and
+default profiles are preserved. A saved dedicated role continues to drive the
+existing snippet security-review/fix selection path.
+
+The pinned Java v2.26.0 General source now has a complete 30-control mapping.
+Eleven controls have direct native counterparts, three exist at other native
+locations and sixteen retain functional or mapping gaps. The remaining global
+confirmation, debug/runtime, credential, MCP integration and automatic-tool
+preferences remain open; alternate placement is not whole-dialog parity.
+
+Desktop GUI checks compared the original Java release with native 980 × 672,
+760 × 512 and hosted 1000 × 672 layouts. General Save, Clear, reopen, shared
+Local AI draft changes, discard and restart were inspected. Independent profile
+reads confirmed security profile 12 or the cleared value and unchanged text
+profile 11. No AI request was sent. The Java fixture cannot verify Java Save.
+Local AI search focus during asynchronous inventory loading remains a separate
+open path. Windows verification remains user-deferred during reinstallation.
+
+Formatting, strict Clippy, all 428 Manager tests (12 regular skips) and all
+4,412 application tests (200 regular skips) passed. The three new regressions
+cover search/select/clear, read-only behavior and persisted runtime selection.
+Owned GUI processes and private profiles were removed; development artifacts
+were cleaned. Both external scratch inventories are empty.
+
+- [Report](target/verification/20261125-general-security-notes.md)
+- [Complete field reconciliation](target/verification/20261125-general-reconciliation.json)
+- [Desktop evidence](target/verification/20261125-general-security-gui.json)
+- [Automated checks](target/verification/20261125-general-security-final-checks.json)
+- [Current Clippy](target/verification/20261125-general-security-current-clippy.json)
+
+- [Accepted results](target/verification/20261125-general-security-results.json)
+- [Source and binary hashes](target/verification/20261125-general-security-source.json)
+- [Cleanup](target/verification/20261125-general-security-cleanup.json)
+
+
+### November 25 shared General defaults
+
+General / Terminal agent now exposes the existing 5–100 prompt-history limit.
+General / Defaults exposes optional snippet instructions and 1–10 alternatives.
+The controls share window settings and the private prompt-history store with
+their existing native pages. Changes remain drafts until Save. Shared snippet
+fields rebase when untouched and reject conflicting edits; the existing exact
+history snapshot prevents a changed list from being truncated. Each store keeps
+its atomic write. A partial failure is visible and leaves its unsaved draft.
+No duplicate value was added to the AI configuration schema.
+
+The original Java v2.26.0 dialog confirmed placement and defaults (20, false, 3).
+All native GUI work ran on this macOS desktop: normal 980 × 672, compact 760 × 512
+and hosted 1000 × 672. General and Settings exchanged saved snippet values in both
+directions. General trimmed eight fixture prompts to five; increasing the limit
+preserved those five. The existing Agent Recent prompts view read the General
+limit and saved seven; General showed seven after restart. Invalid 101 was
+rejected. Compact and hosted saves, discard and restart passed. No AI request or
+Agent environment probe was started. The private local terminal was closed.
+
+A focused text input could consume Cmd+S as text. General now uses the existing
+pre-input dialog key wrapper for Save, Find and Close. The regression supplies
+command events with printable text. The fixed binary was tested on the desktop.
+
+Final formatting and strict Clippy passed, as did two navigation regressions,
+six focused store tests, 431 Manager tests (12 regular skips) and all 4,421
+application tests (200 regular skips). Earlier fixture and obsolete Tab-order
+failures are retained with their corrections; no assertions were removed.
+All owned GUI processes, private profiles and extracted reference copies were
+removed. Development artifacts were cleaned; both external scratch inventories
+are empty. Windows remains user-deferred during reinstallation. Sixteen General
+fields still have functional or mapping gaps; this is not whole-plan completion.
+
+- [Report](target/verification/20261125-shared-defaults-notes.md)
+- [Updated field reconciliation](target/verification/20261125-shared-defaults-reconciliation.json)
+- [Accepted results](target/verification/20261125-shared-defaults-results.json)
+- [Desktop evidence](target/verification/20261125-shared-defaults-gui.json)
+- [Current source and binary hashes](target/verification/20261125-shared-defaults-source.json)
+- [Cleanup](target/verification/20261125-shared-defaults-cleanup.json)
+
+
+### November 25 terminal confirmation and native AI actions
+
+General / Features & safety now exposes the default-on terminal confirmation
+preference. Saving off permits one initial Summarize, Summarize Recent Output or
+Solve Problem request to use the ordinary sender. The one-shot intent is bound
+to the original configuration and source. Edits, changed profiles or policy,
+source loss and cancellation revoke it; memory and quota preparation must
+finish first. Ask and follow-up turns retain the composer. Files, included
+memory, web context and configured CLI requests retain visible review. The
+native help explains these additional gates; Java's automatic-attachment direct
+submission is not claimed equivalent.
+
+The native AI menu now exposes all four terminal text actions. Availability and
+dispatch reuse the current pane's selection and policy checks, and existing
+native action identifiers remain unchanged. This gives keyboard access where
+the desktop automation tool cannot click the main terminal surface.
+
+The original Java v2.26.0 release and native GUI were inspected on this macOS
+desktop. Native 980 × 672 and 760 × 512 checks covered search, default review,
+saved direct submission, discard, restart and re-enabling review. The loopback
+fixture recorded exactly one request and the displayed reply; the synthetic
+password was masked. Re-enabling confirmation produced no second request. The
+final rebuilt executable matched the GUI-tested executable byte-for-byte.
+Only private test profiles and a controlled loopback responder were used.
+Windows remains user-deferred. Debug/runtime controls and the remaining global
+Internet-access controls are still open.
+
+Final formatting and strict application Clippy passed, together with seven
+direct-request tests, one native-menu test, 432 Manager tests (12 regular skips)
+and all 4,430 application tests (200 regular skips). All owned GUI processes and
+private run directories were removed. Cleaning development artifacts removed
+3.6 GiB; both external scratch inventories are empty.
+
+- [Report](target/verification/20261125-direct-confirmation-notes.md)
+- [Updated field reconciliation](target/verification/20261125-direct-confirmation-reconciliation.json)
+- [Desktop evidence](target/verification/20261125-direct-confirmation-gui.json)
+- [Wire checks](target/verification/20261125-direct-confirmation-wire-check.json)
+- [Automated checks](target/verification/20261125-direct-confirmation-final-checks.json)
+- [Source and binary hashes](target/verification/20261125-direct-confirmation-source.json)
+
+- [Accepted results](target/verification/20261125-direct-confirmation-results.json)
+- [Cleanup](target/verification/20261125-direct-confirmation-cleanup.json)
+
+
+### November 25 Agent message preferences and bounded diagnostics
+
+General / Features & safety now exposes Java's default-off debug and runtime
+preferences after the chat terminal actions and separator. Saved drafts support
+search, keyboard activation and read-only guards. New live Agent runs snapshot
+the defaults; setup overrides are frozen once the run starts. Ask forces runtime
+off and disables the switch. The pinned Java v2.26.0 source stores/copies runtime
+but has no presentation consumer; no extra native runtime effect is claimed.
+
+Optional debug previews and completed captured output use the canonical masked
+strings. A bounded diagnostic collection remains separate from model context
+and journal evidence. Activity histories show it only when enabled/nonempty,
+with a height derived from the available viewport. Finished-run snapshots remask
+and retain it with the original switches. Java's individual running output chunks
+remain a functional gap; completed captures do not establish streaming parity.
+
+All GUI work used this macOS desktop and original Java v2.26.0 reference. Native
+Manager 980 × 672, 760 × 512 and hosted 1000 × 672 checks covered defaults, search,
+Save, discard and restart. Independent profile reads confirmed the saved values.
+A private live run showed the diagnostic area after its explicitly reviewed fixed
+read-only probe. Hosted Ask showed debug on and runtime disabled/off. Another
+local run turned both switches off for that run, retained canonical probe output
+and suppressed extra debug messages while the global true/true values persisted.
+Both runs were cancelled at model review; no model request was sent. The Agent
+window resize attempt had no observed effect and is not compact acceptance.
+
+Formatting, strict application Clippy, the native build, 10 diagnostic-filter
+tests (two regular skips), 433 Manager tests (12 regular skips) and all 4,434
+application tests (200 regular skips) passed. Four regressions are new. Source and
+GUI executable hashes matched throughout. Owned processes and private profiles
+were removed; development artifacts were cleaned after all checks. Both external
+scratch inventories are empty. Streaming diagnostics, the remaining Agent GUI
+matrix and user-deferred Windows acceptance remain open.
+
+- [Report](target/verification/20261125-agent-messages-notes.md)
+- [Reference trace](target/verification/20261125-agent-messages-reference-trace.log)
+- [Updated field reconciliation](target/verification/20261125-agent-messages-reconciliation.json)
+- [Desktop evidence](target/verification/20261125-agent-messages-gui.json)
+- [Accepted results](target/verification/20261125-agent-messages-results.json)
+- [Source and binary hashes](target/verification/20261125-agent-messages-source.json)
+- [Cleanup](target/verification/20261125-agent-messages-cleanup.json)
+
+
+### November 25 live Agent diagnostics
+
+The stored debug preference now drives a command-scoped observer on existing
+bounded captures. Local Unix/Windows, direct SSH, tagged isolated SSH and saved
+SSH routes use the same capture/cancellation paths. Windows decoding selects OEM
+fallback before observed text conversion; native Windows tests remain user-
+deferred. The nonblocking bounded queue contains only masked complete-line
+snapshots. Managed replacement rules retain completion-only disclosure; invalid
+registered secrets with controls stay invalid. Native output budgets and
+password-authentication output withholding remain deliberate limits.
+
+The UI requires the current run epoch, original source and current policy.
+Cancellation freezes the current tail; completion replaces it with the canonical
+masked capture. Model and journal evidence remain separate. Live previews keep
+the latest bounded text, follow the tail and reserve a short viewport under
+finished-run controls. Display-only trimming prevents a trailing blank line from
+hiding the last message in that viewport.
+
+All GUI work ran on this macOS desktop. The exact accepted 820 × 652 Agent build
+reviewed one loopback model request and the resulting fixture command explicitly.
+While that command waited for an owned release marker, stdout, stderr and the
+split synthetic password masked as password=*** were visible without scrolling.
+After marker release the next request review contained final stdout and masked
+output. The run was cancelled at that review without a second model request.
+The stopped view kept the final diagnostic line visible. Earlier viewport
+failures and corrected fixture assumptions remain in the evidence.
+
+Final formatting, strict application Clippy and the native build passed. Twelve
+diagnostic-filter tests, three mask tests and two runner tests passed. The
+explicit native OpenSSH test passed both direct and process-worker cases and
+verified a new command over the original connection after channel cancellation.
+Four ordinary regressions and that explicitly selected SSH regression are new.
+The repeated full parallel application suite passed all 4,438 tests with 201
+regular skips, including the SSH test independently run above.
+
+The first full parallel run had one existing Quick Connect test observe empty
+output for six seconds. An isolated recheck and 24 repetitions (up to eight
+concurrent processes), followed by the full parallel recheck, passed without
+source changes. Its cause remains unresolved. No production change or weaker
+assertion was introduced for it; retain this native reliability concern.
+
+Owned GUI processes, recorded child processes and all private run directories
+were stopped/waited for and removed. Cleaning development artifacts removed
+3.6 GiB. Both external scratch inventories are empty. Existing package/reference
+archives were preserved. The remaining Agent designs/compact acceptance,
+user-deferred Windows tests and broader porting gates remain open.
+
+- [Report](target/verification/20261125-live-diagnostics-notes.md)
+- [Updated field reconciliation](target/verification/20261125-live-diagnostics-reconciliation.json)
+- [Accepted desktop checks](target/verification/20261125-live-diagnostics-accepted-live-check.json)
+- [Accepted results and earlier timeout disposition](target/verification/20261125-live-diagnostics-results.json)
+- [Current source and binary hashes](target/verification/20261125-live-diagnostics-accepted-source.json)
+- [Cleanup](target/verification/20261125-live-diagnostics-cleanup.json)
+
+### November 25 native short-command output and test-profile isolation
+
+The macOS PTY reader retains a startup slave descriptor until its initially
+buffered output is drained. Identical native before/after tests reproduced
+empty output without the patch and verified the complete bytes with it, using
+both reader APIs. Resize, zero-length reads, EOF and successful exit are covered.
+This protects the first read; it does not qualify every later output timing.
+
+The first full suite passed 4,435 tests and failed three Teamwork Scheduler
+cases. A separate reproduction established that the Quick Connect test had
+saved its Sandbox preference into the shared test profile. Teamwork's refusal
+was correct. Both Quick Connect cases now use a private child profile while
+retaining real persistence and same-process eight-thread PTY concurrency.
+The following three-case Teamwork/restore check passes with the surrounding
+profile unchanged. Production Teamwork validation was not modified.
+
+Formatting, strict PTY and application Clippy, the native build, all 36 ordinary
+PTY tests, explicitly selected Seatbelt containment and 256-launch stress runs
+passed. The final full parallel application suite passed all 4,438 tests with
+202 regular skips; its new ignored concurrency case was explicitly run. The
+earlier six-second Quick Connect timeout remains causally unassigned. Its
+unchanged deadline now reports session status, grid, PID and working directory.
+
+On this macOS desktop, the actual Quick Connect dialog reviewed and launched
+printf and cat with Own process isolation. Both retained the expected visible
+output after exit code 0. cat used a filename and directory with spaces. The
+copied GUI binary matches the accepted build hash. All three owned tabs and the
+private app were closed, their processes and run directory are gone, and both
+external scratch inventories are empty. Development cleanup removed 3.7 GiB;
+451 MiB remains in the checkout including 398 MiB in target. Package/reference
+archives and checksums were preserved. Windows remains user-deferred. The
+remaining Agent designs, General Internet controls and overall plan remain open.
+
+- [Report and limits](target/verification/20261125-quick-startup-notes.md)
+- [Accepted checks](target/verification/20261125-quick-startup-accepted-checks.json)
+- [Before/after regression hashes](target/verification/20261125-quick-delayed-marker-baseline.json)
+- [Profile pollution reproduction](target/verification/20261125-quick-profile-pollution-before.json)
+- [Profile isolation verification](target/verification/20261125-quick-profile-isolation-after.json)
+- [Native desktop observations](target/verification/20261125-quick-startup-gui-accepted.json)
+- [Source and binary hashes](target/verification/20261125-quick-startup-source.json)
+- [Results](target/verification/20261125-quick-startup-results.json)
+- [Cleanup](target/verification/20261125-quick-startup-cleanup.json)
+- [Evidence checksums](target/verification/20261125-quick-startup-evidence.sha256)
+
+### November 25 global MCP defaults
+
+General → Internet access now stores the Tavily and Bright Data server labels
+and global Brave Search, SearXNG and Toolpack plugin IDs. Blank profile IDs inherit
+the saved global value; explicit profile IDs retain their override. The effective
+label or ID appears in the existing request review and reaches the LM Studio
+request. Changing globals invalidates older profile/web review fingerprints.
+Missing or invalid inherited IDs fail closed; exact Toolpack tool names remain
+required. The runtime-only server label is not serialized into a profile override.
+
+Labels permit Unicode text and spaces. Java String.isBlank and String.trim
+semantics preserve a non-breaking space, use the built-in label for a blank
+EM-space and trim ordinary edge spaces. Five saved native values exactly matched
+the getters of GlobalSettings from the original v2.26.0 macOS package. Native
+inputs retain a 4,096 raw UTF-8 byte budget, reject controls and retain the existing
+mcp/server-name plugin syntax. This is bounded compatibility, not unlimited Java
+input acceptance. Default globals remain omitted from saved JSON, preserving
+legacy profile revisions until a non-default is used.
+
+This desktop verified invalid-plugin Save refusal, all five keyboard edits,
+Unicode persistence, a restart at requested 700 × 500 geometry, search by the
+LM Studio Toolpack alias, and a further normalized save. The dialog clamps its
+minimum width; screenshot canvases may include both owned windows. A managed
+allow-internet=false policy kept fields disabled and values unchanged through two
+saves. The initial GUI run exposed editor replacement dropping that UI lock after
+Save; the editor now preserves it, with direct-message and native regressions.
+The independent fresh-policy Save check remains in place.
+
+Formatting, strict application Clippy, build, 437 Manager tests and nine focused
+MCP tests passed. An explicitly selected ignored test verified seven real HTTP
+requests to a private native loopback fixture: all five integrations and refusal
+of a stale Tavily label and Brave plugin provider. Only that subprocess received
+synthetic fixture credentials. The final full parallel application suite passed
+4,445 tests with 203 regular skips. The GUI copy matches the accepted build hash.
+These checks do not qualify installed LM Studio or public search services.
+
+All owned Java/native processes and shell tabs were stopped and waited for;
+private run directories and the owned Python bytecode cache were removed.
+Development cleanup removed 3.6 GiB. Both external scratch inventories are empty;
+the checkout uses 456 MiB, including 402 MiB in target. Prior evidence manifests
+remain valid; retained package/reference archives and checksums are unchanged.
+
+The General reconciliation now has 22 native counterparts out of 30. Three
+encrypted global keys and their three clear toggles, the global direct SearXNG URL
+and Agent always-offer-web preference remain open. Java global-field migration,
+installed-service acceptance, remaining Agent designs and the overall plan remain
+open. All Windows tests remain user-deferred during reinstallation; the host was
+not probed in this continuation.
+
+- [Report and limits](target/verification/20261125-internet-defaults-notes.md)
+- [Field reconciliation](target/verification/20261125-internet-defaults-reconciliation.json)
+- [Original Java reference](target/verification/20261125-internet-defaults-reference.json)
+- [Native desktop acceptance](target/verification/20261125-internet-defaults-contract-gui-accepted.json)
+- [Source and binary hashes](target/verification/20261125-internet-defaults-source.json)
+- [Results](target/verification/20261125-internet-defaults-results.json)
+- [Cleanup](target/verification/20261125-internet-defaults-cleanup.json)
+- [Evidence checksums](target/verification/20261125-internet-defaults-evidence.sha256)
+
+### November 25 global SearXNG configuration prerequisite
+
+General → Internet access now saves the global SearXNG URL. The integration
+requires a nonblank value as well as its effective plugin ID. Existing profiles
+need this setup step before web review becomes available; saved profiles and
+their independent page-reading endpoint are preserved. Changing the global URL
+invalidates earlier web scopes. README describes the prerequisite and routing.
+
+The immutable v2.26.0 source and the actual original package's configuration class
+confirm that Java normalizes and checks this value for presence. It does not use
+it as a direct HTTP destination. Search routing still uses the configured
+LM Studio plugin; native page requests still use the separate reviewed endpoint.
+This resolves the earlier open question about that field's semantics. Native
+likewise does not parse this metadata as a request endpoint. It retains the
+4096 raw UTF-8 byte bound and control-character rejection. Original Java tests
+verified blank/EM-space refusal, edge-space normalization and acceptance of
+non-endpoint setup text at its configuration gate.
+
+On this desktop, the original Java field was captured in its Internet tab. The
+native normal dialog verified search, keyboard input, discard and a normalized
+save with the same URL as the original Java model. Restart at requested 700 × 500
+geometry retained the settings; minimum width clamps to 760. A compact edit saved
+another normalized URL, and scrolling reached the remaining fields. Managed
+allow-internet=false kept the URL disabled and values unchanged after two saves.
+The normal/compact/save/restart/policy checks were also repeated using the exact
+final binary. Discard belongs to the initial GUI series. Java preview GUI Save
+was disabled; the actual model proof is separate.
+
+The first full suite passed 4,445 cases and failed two Scheduler cases because
+the required URL had been inserted into a neighboring Tavily test fixture rather
+than the shared SearXNG helper. The correction moved that test metadata; production
+validation was unchanged. The final recheck passed 12 regular Scheduler execution
+tests (eight skips), 438 Manager tests (12 skips), ten MCP tests (two skips), five
+Web review tests and the explicitly selected loopback wire test. Its seven HTTP
+requests also verified that the global setup URL is absent from request payloads.
+Format, strict application Clippy and build passed. The final parallel application
+suite passed all 4,447 tests with 203 regular skips. The accepted GUI copy matches
+that final build hash. Public services and installed LM Studio are not qualified.
+
+Both GUI series' owned processes and six shell tabs were stopped and waited for.
+Private roots are gone and both external scratch inventories are empty. Dev
+cleanup removed 3.6 GiB; disk usage is 458 MiB checkout / 405 MiB target. Six
+preceding evidence manifests still validate. Package/reference archives and
+checksums were preserved. General now has 23 bounded native counterparts out of
+30; encrypted global keys and clear toggles, Agent always-offer-web, Java global
+migration, remaining Agent designs and broader porting gates remain open. Windows
+tests remain user-deferred during reinstallation and were not probed.
+
+- [Report and limits](target/verification/20261125-searxng-global-notes.md)
+- [Pinned Java source contract](target/verification/20261125-searxng-global-reference.json)
+- [Actual original Java-model checks](target/verification/20261125-searxng-global-java-model.json)
+- [Updated field reconciliation](target/verification/20261125-searxng-global-reconciliation.json)
+- [Final native acceptance](target/verification/20261125-searxng-global-accepted-gui-accepted.json)
+- [Source and binary hashes](target/verification/20261125-searxng-global-source.json)
+- [Results and initial failure disposition](target/verification/20261125-searxng-global-results.json)
+- [Cleanup](target/verification/20261125-searxng-global-cleanup.json)
+- [Evidence checksums](target/verification/20261125-searxng-global-evidence.sha256)
+
+### November 25 Agent Design desktop naming, layout and navigation
+
+This macOS desktop opened the actual v2.26.0 Agent Design chooser from the
+checksum-verified original package and the native chooser with private profiles.
+Java and native New/Duplicate/Rename selected the complete name suggestion and
+retained Unicode names. Immediate standalone saves recorded the custom default.
+The native same-profile restart retained names and IDs; deletion cancellation
+kept the custom default, and confirmed deletion restored Standard. Java likewise
+restored Standard, represented by an absent saved default ID. A separate compact
+Java launch restored its original saved XML into a disposable profile and showed
+the retained Unicode name. Java's compact size had to be set after showing the
+dialog; the first pre-show size attempt did not take effect. Bounds include
+different decorations, so equal-height or pixel-identical frames are not claimed.
+
+The native compact Description heading was clipped. The inventory now keeps a
+minimum width beside the preview, and stacks above it in narrow Settings windows.
+Normal 1200 × 662, dedicated compact 940 × 480, Settings 800 × 600 and minimum
+620 × 450 client-size fixtures were inspected here. Full headings, wrapped
+actions, naming prompt ownership and reachable previews/options were verified.
+The existing outer scroll and footer keep native controls reachable; Java's
+940 × 480 outer window clips some lower content.
+
+Mouse and Down selected previews without persisting them. End revealed another
+problem: the inner module list moved, while the selected last row stayed below
+the visible outer viewport. Navigation now reveals the inner row and then its
+translated position in the page. A real-widget regression checks both layouts.
+Final native minimum and compact dialogs verified visible End and Home targets.
+Space activated Adaptive dock on Standard, creating the full-name custom copy
+without changing the built-in or default. Its name and arrangement persisted
+through a normal restart. README documents keyboard navigation and the stacked
+preview location.
+
+The initial width-only source passed 137 design and all 4,447 application tests.
+The final source passed formatting, strict application Clippy, build, its new
+navigation regression, 138 design tests and all 4,448 application tests with
+203 ordinary skips. Final compact/normal and minimum GUI copies match the final
+build hash. Stage-specific screenshots and source hashes remain separate.
+
+The open combination picker also showed its description tooltip over the first
+menu item. This was reproduced and retained as the next correction. Escape in
+that reproduction closed the chooser, and a following Cmd+W closed the owned
+shell; verify popup-only Escape semantics with that fix. The chooser acceptance
+therefore remains partial. This isolated sample preview does not qualify the
+remaining live Agent activity/module/runtime matrix, configured services or
+connection-specific overrides. Existing native-only modules and Floating are
+not presented as Java built-ins. Windows tests remain user-deferred and were
+not probed.
+
+All eleven owned application processes and eight shell sessions were stopped
+and waited for. The aggregate private run directory and nested runs are gone;
+both external scratch inventories are empty. Dev cleanup removed 3.6 GiB.
+Disk usage is 464 MiB checkout / 410 MiB target. Seven preceding evidence
+manifests still validate. Source, user profiles, shared toolchains, unrelated
+processes and retained package/reference archives and checksums were preserved.
+
+- [Report and remaining checks](target/verification/20261125-agent-designs-desktop-notes.md)
+- [Pinned original reference](target/verification/20261125-agent-designs-desktop-reference.json)
+- [Desktop observations](target/verification/20261125-agent-designs-desktop-gui-accepted.json)
+- [Final source and binary hashes](target/verification/20261125-agent-designs-desktop-final-source.json)
+- [Results](target/verification/20261125-agent-designs-desktop-results.json)
+- [Remaining picker issue](target/verification/20261125-agent-designs-desktop-remaining-picker-tooltip.jpg)
+- [Cleanup](target/verification/20261125-agent-designs-desktop-cleanup.json)
+- [Evidence checksums](target/verification/20261125-agent-designs-desktop-evidence.sha256)
+
+### November 25 Agent Design combination picker and Escape
+
+The native combination picker now opts into the existing keyboard menu support.
+Tab and Enter open it, navigation keys select a row, and Enter applies the choice.
+Escape closes its open menu before the dialog receives a subsequent Escape. The
+original v2.26.0 AgentDesignPluginManagerDialog was opened from the verified
+macOS archive on this desktop: Escape retained its owner and End/Enter selected
+Classic. The native Floating preset remains an existing extension.
+
+Moving the hint above the picker alone was insufficient. The first candidate
+overlapped the introduction because it was transparent. An opaque candidate
+worked in the separate normal and compact windows, but its hint covered Floating
+when minimum Settings opened the menu upward. Both stages are retained as
+superseded evidence. The final picker opts into Tooltip::hide_on_content_overlay:
+its hint yields to the menu in either direction and returns after dismissal.
+Other tooltips retain their default behavior. A draw-observing widget regression
+checks both menu positions, the default behavior and restoration after Escape.
+A second real-editor regression checks menu-first Escape and keyboard selection.
+
+The final binary was inspected here at 1200 × 662 and 940 × 480 client sizes,
+and in 620 × 450 Settings. All menu entries remained readable. Normal Tab/Enter,
+End/Enter, mouse selection, compact Down/Enter, minimum End/Enter, hint restoration
+and subsequent dialog closing were verified. All three copies match the final
+binary hash. These checks use the isolated sample preview; they do not dispatch
+the displayed sample command or qualify the live Agent activity/module matrix.
+
+Formatting, strict application Clippy, build, both picker regressions, 140 design
+tests and all 4,450 application tests passed, with 203 ordinary skips. The initial
+new overlay test had an incorrect Shell import; its failed compile is retained
+separately and corrected in the verified source. README is included in the final
+source snapshot because the application embeds it.
+
+All eight owned app processes were reaped and seven owned shells closed. The
+aggregate and nested private runs are gone; both external scratch inventories
+are empty. Dev cleanup removed 3.6 GiB. Disk usage is 469 MiB checkout / 416 MiB
+target. Eight previous manifests still validate all 605 recorded artifacts.
+Windows remains user-deferred and was not probed. The full porting goal stays
+active, including the remaining live runtime, Settings and platform gates.
+
+- [Report](target/verification/20261125-agent-picker-notes.md)
+- [Desktop observations](target/verification/20261125-agent-picker-gui-accepted.json)
+- [Verified source and binary hashes](target/verification/20261125-agent-picker-verified-source.json)
+- [Results](target/verification/20261125-agent-picker-results.json)
+- [Upward-opening menu](target/verification/20261125-agent-picker-verified-minimum-upward-open.jpg)
+- [Cleanup](target/verification/20261125-agent-picker-cleanup.json)
+- [Evidence checksums](target/verification/20261125-agent-picker-evidence.sha256)
+
+### November 25 Agent automatic web-tool contract audit
+
+The actual Java v2.26.0 AI Manager showed its unchecked Internet option, its
+explanatory tooltip, and on/off toggling on this macOS desktop. The private form
+was reset; save/restart was not tested. The saved model defaults false. Pinned
+source traces the setting through the service factory into direct Tavily tool
+instances and their OpenAI-compatible and embedded delegates. MCP integrations
+have a separate path.
+
+The original OpenAI-compatible service passed 26 deterministic cases with 32
+loopback model requests and seven in-process fixture tool executions. Both
+search and extraction definitions were offered when eligible, results returned
+under their call IDs, unknown tools returned failed metadata, at most three
+calls executed from one response, and only two executable rounds preceded a
+final request without tools. Vision and missing integration excluded offering.
+The preference extends eligibility for Agent task prompts; it does not enable
+every ordinary local prompt. A context-only URL did not enable a local task.
+
+The native decision JSON does not carry Java's User task line. Native request
+messages lack the tool fields and the strict text stream rejects tool calls;
+the existing web review is a separately initiated operation. This is a missing
+transport/review workflow, rather than a boolean-only settings gap. No native
+control was counted as implemented. General remains 23 of 30; the seven open
+controls, migration and installed-service acceptance remain open. The next
+implementation must preserve real offering and result rounds as well as native
+authority checks, and cover interactive, planning/Swarm and scheduled routes.
+
+Only the original service and fixture loop were executed. Tavily methods were
+replaced in process; no external search, installed model, embedded runtime or
+native automatic-tool implementation is claimed. Native Rust/README hashes still
+match the previous 4,450-test checkpoint, so that unchanged suite was not rerun.
+The first probe compile had a missing enum import; the failed log is retained
+and the corrected 26-case probe passed. All private runs and classes were
+removed. Windows remains user-deferred and was not probed.
+
+- [Remaining implementation and acceptance contract](PORTING-AGENT-WEB-TOOLS.md)
+- [Report](target/verification/20261125-agent-web-offer-notes.md)
+- [Original wire](target/verification/20261125-agent-web-offer-original-wire.json)
+- [Source trace and hashes](target/verification/20261125-agent-web-offer-reference.json)
+- [Cleanup](target/verification/20261125-agent-web-offer-cleanup.json)
+- [Checksums](target/verification/20261125-agent-web-offer-evidence.sha256)
+
+### November 25 typed native web-tool turns
+
+The native model client now exposes a typed single-turn Agent boundary. Its
+explicit web request can offer web_search/web_extract and carry assistant calls
+plus ordered tool results. Ordinary Agent requests use that boundary without a
+tool offer. The plain nonstreaming path rejects actual unsolicited calls and
+preserves valid empty tool arrays; streaming behavior remains unchanged.
+
+Call IDs, function kinds and JSON argument objects are validated. Reused or
+ambiguous IDs and incomplete/out-of-order results fail before a continuation is
+sent. Histories are capped at 96 KiB, complete encoded requests at 256 KiB, and
+returned batches at three proposals with an explicit omitted count. A final
+request may include the limit-error group while withholding further tools. This
+is a bounded transcript API; the two-executable-round orchestrator is still open.
+
+The path uses the existing transport, model/lease validation, request deadlines,
+credential handling, compatibility retry and per-turn usage accounting. Internet
+policy and the caller guard are checked around model dispatch/publication.
+Truncated responses and credential echoes fail without producing altered tool
+proposals. Other wire protocols get an explicit unsupported disposition for this
+direct-tool API. Signed embedded runtime and installed-service acceptance remain
+open.
+
+All twelve new tests ran here with real loopback HTTP. They cover search/page
+call framing, final omission, limits, unknown names, duplicate/replayed and
+malformed calls, history identity, authority revocation, cancellation, JSON-mode
+refusal, the existing thinking retry, output-limit usage, credential echoes and
+text-only compatibility. The retained wire passed five comparisons with the
+original service: tool names and argument schemas, auto selection/JSON mode,
+assistant/tool role sequence, ordered result IDs and final tool omission.
+No Tavily provider or model-selected web action was dispatched.
+
+The final source passed formatting, strict application Clippy and all 4,462
+application tests, with 203 ordinary skips. Source and test-executable hashes
+were captured before dev cleanup. Earlier closure-type and test-variable compile
+errors are retained separately. The preceding candidate was deliberately stopped
+to preserve empty-array text compatibility; only final-prefixed checks qualify
+this source.
+
+The General count stays 23 of 30. The typed API is not yet connected to Agent
+web reviews/execution, eligibility, round orchestration, aggregate usage or
+Scheduler grants. The preference and migration remain open. This checkpoint
+adds no GUI design; all tests ran on this macOS desktop. Windows remains
+user-deferred and was not probed. The full porting goal remains active.
+
+Dev cleanup removed 2.6 GiB. Private run directories and both external scratch
+inventories are empty; no standalone GUI fixture was launched. Ten previous
+manifests still validate all 729 artifacts. Disk usage is 471 MiB checkout /
+417 MiB target. Sources, profiles, toolchains, unrelated processes and retained
+package/reference archives and checksums were preserved.
+
+- [Transport report and next integration](target/verification/20261125-web-tool-turns-notes.md)
+- [Final source and test-executable hashes](target/verification/20261125-web-tool-turns-final-source.json)
+- [Actual native HTTP requests](target/verification/20261125-web-tool-turns-final-wire.json)
+- [Original/native comparison](target/verification/20261125-web-tool-turns-original-comparison.json)
+- [Results](target/verification/20261125-web-tool-turns-results.json)
+- [Cleanup](target/verification/20261125-web-tool-turns-cleanup.json)
+- [Checksums](target/verification/20261125-web-tool-turns-evidence.sha256)
+
+## November 25 interactive Run model web rounds
+
+Interactive Run decisions now offer the typed direct web tools when the original
+task matches the verified Java default signal-word/URL heuristic and the selected
+profile permits direct Tavily. Each proposed query or exact page uses the
+existing editable review before dispatch and a separate masked-excerpt approval
+before continuation. Ordered results include approved input/source context or
+explicit declined/unsupported/round-limit errors. Cancellation, expiry and a
+closed review abort the worker. Full raw arguments and decoded strings/keys,
+assistant text and call identity must pass masking. Review serials and provider
+tickets reject late actions and results; approved-result authority remains live
+through subsequent model requests. Two executable rounds, three-call batches
+and result/context/history/request limits bound the loop. Schema repair retains
+history and the execution budget, and model usage aggregates across requests.
+
+Nine new regressions, all 4,471 application tests (203 ordinary skips), format,
+strict application Clippy and the native dialog-preview build pass. Two failed
+actor candidates are retained separately: the fixture first dropped its pending
+quota task, then used the old pre-dispatch epoch. The final actor completes quota
+review and uses the current worker epoch. Only final-prefixed results qualify
+the accepted frozen source.
+
+This macOS desktop verified normal and compact content sizes of 1100 × 760 and
+800 × 500. The normal run edited a public query, approved search and page
+excerpts separately, and displayed the final answer and 24 aggregate tokens.
+After restart, the compact run approved search evidence and declined the exact
+page proposal, then completed at 24 tokens. A further compact run cancelled its
+held proposal and stopped at 12 tokens without a continuation. Five actual
+loopback model requests retain ordered call/result IDs and the edited input.
+The provider output was an explicitly enabled debug-only fixture; no Tavily HTTP
+or installed/signed runtime was exercised. These checks do not establish Ask,
+Plan/triage, Swarm, Scheduler or saved always-offer preference acceptance. The
+General count remains 23 of 30. Windows stays user-deferred and was not probed.
+
+The new tool-review controls fit both sizes. The existing compact Setup clips
+its bottom actions, especially with finished-run export available; its retained
+screenshot is the next layout correction. Pause/resume presentation still needs
+direct desktop coverage. The full porting goal remains active.
+
+Both owned shell tabs were closed before the two app processes were stopped and
+waited; their child lists were empty. The local fixture server stopped and its
+thread joined. Private runs and both external scratch inventories are empty.
+Dev cleanup removed 3.6 GiB; disk use is 474 MiB checkout / 420 MiB target.
+Eleven previous manifests still validate 767 artifacts. Sources, user profiles,
+shared toolchains, unrelated processes and retained archives/checksums remain.
+
+- [Report and open acceptance](target/verification/20261125-web-rounds-notes.md)
+- [Final checks](target/verification/20261125-web-rounds-results.json)
+- [Desktop observations](target/verification/20261125-web-rounds-gui-observations.json)
+- [Actual model HTTP requests](target/verification/20261125-web-rounds-gui-model-wire.json)
+- [Compact Setup clipping](target/verification/20261125-web-rounds-compact-setup.png)
+- [Cleanup](target/verification/20261125-web-rounds-cleanup.json)
+- [Checksums](target/verification/20261125-web-rounds-evidence.sha256)

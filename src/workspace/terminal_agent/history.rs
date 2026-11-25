@@ -141,6 +141,21 @@ impl State {
 }
 
 impl Workspace {
+    pub(in crate::workspace) fn refresh_agent_history_defaults(&mut self, snapshot: &Snapshot) {
+        for run in self.terminal_agents.runs.values_mut() {
+            let history = &mut run.history;
+            if history.visible
+                && history.pending.is_none()
+                && !history.clearing
+                && history.limit() == Some(history.snapshot.limit)
+            {
+                history.snapshot = snapshot.clone();
+                history.limit = snapshot.limit.to_string();
+                history.notice = "Prompt history limit updated in AI Manager.".into();
+            }
+        }
+    }
+
     pub(super) fn agent_history_action(
         &self,
         id: window::Id,

@@ -36,7 +36,16 @@ impl Target {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Setting {
     Features,
+    ConfirmBeforeSend,
+    AgentDebugMessages,
+    AgentRuntimeMessages,
+    Internet(super::internet::Field),
     GlobalTimeout,
+    SecurityProfile,
+    ClearSecurityProfile,
+    AgentHistoryLimit,
+    SnippetInstructions,
+    SnippetAlternatives,
     CodeTextLanguage,
     ChatTerminalActions,
     AgentShortcut,
@@ -69,7 +78,16 @@ impl Setting {
     fn page(self) -> Page {
         match self {
             Self::Features
+            | Self::ConfirmBeforeSend
+            | Self::AgentDebugMessages
+            | Self::AgentRuntimeMessages
+            | Self::Internet(_)
             | Self::GlobalTimeout
+            | Self::SecurityProfile
+            | Self::ClearSecurityProfile
+            | Self::AgentHistoryLimit
+            | Self::SnippetInstructions
+            | Self::SnippetAlternatives
             | Self::CodeTextLanguage
             | Self::ChatTerminalActions
             | Self::AgentShortcut
@@ -98,7 +116,16 @@ impl Setting {
     pub(super) fn title(self) -> &'static str {
         match self {
             Self::Features => "Enable AI features",
+            Self::AgentDebugMessages => "Show Agent debug messages",
+            Self::AgentRuntimeMessages => "Show Agent runtime messages",
+            Self::Internet(field) => field.title(),
+            Self::ConfirmBeforeSend => "Show confirmation before sending terminal AI requests",
             Self::GlobalTimeout => "Global request timeout (minutes)",
+            Self::SecurityProfile => "Security-check profile",
+            Self::ClearSecurityProfile => "Clear security-check profile",
+            Self::AgentHistoryLimit => "Recent agent prompt limit",
+            Self::SnippetInstructions => "Allow additional instructions in snippets",
+            Self::SnippetAlternatives => "Alternative solutions per request",
             Self::CodeTextLanguage => "Default code text language",
             Self::ChatTerminalActions => "AI chat code blocks in the terminal",
             Self::AgentShortcut => "Enable terminal agent shortcuts",
@@ -131,7 +158,18 @@ impl Setting {
     fn keywords(self) -> &'static str {
         match self {
             Self::Features => "safety enable disable",
+            Self::AgentDebugMessages => "agent diagnostic command output transcript messages",
+            Self::AgentRuntimeMessages => "agent runtime messages run defaults",
+            Self::Internet(field) => field.keywords(),
+            Self::ConfirmBeforeSend => {
+                "confirm before send summarize recent output solve problem request review"
+            }
             Self::GlobalTimeout => "limits timeouts",
+            Self::SecurityProfile => "snippet security review dedicated AI profile",
+            Self::ClearSecurityProfile => "snippet security review use default profile",
+            Self::AgentHistoryLimit => "agent input history size recent prompts 5 100",
+            Self::SnippetInstructions => "snippet AI additional instructions prompt",
+            Self::SnippetAlternatives => "snippet AI alternative solution count",
             Self::CodeTextLanguage => "snippet script comments output messages translation",
             Self::ChatTerminalActions => "actions insert run copy save",
             Self::AgentShortcut => "agent ask plan alias input OSC 133",
@@ -1709,8 +1747,16 @@ impl ProfileSetting {
 pub(super) fn targets(profile: Option<&profiles::Profile>) -> impl Iterator<Item = Target> {
     let targets = [
         Setting::Features,
+        Setting::ConfirmBeforeSend,
+        Setting::AgentDebugMessages,
+        Setting::AgentRuntimeMessages,
         Setting::JournalSemanticSearch,
         Setting::GlobalTimeout,
+        Setting::SecurityProfile,
+        Setting::ClearSecurityProfile,
+        Setting::AgentHistoryLimit,
+        Setting::SnippetInstructions,
+        Setting::SnippetAlternatives,
         Setting::CodeTextLanguage,
         Setting::ChatTerminalActions,
         Setting::AgentShortcut,
@@ -1723,6 +1769,11 @@ pub(super) fn targets(profile: Option<&profiles::Profile>) -> impl Iterator<Item
         Setting::ShowAgentSetup,
     ]
     .into_iter()
+    .chain(
+        super::internet::Field::ALL
+            .into_iter()
+            .map(Setting::Internet),
+    )
     .chain(
         ImportedGeneral::ALL
             .into_iter()
@@ -1902,6 +1953,29 @@ impl Reveal {
     ) -> iced::widget::TextInput<'a, Message> {
         let target = (editable && self.setting == Some(setting)).then_some(&self.input);
         crate::settings_search::mark_input(input, target)
+    }
+
+    pub(super) fn control_id(&self, setting: Setting) -> Id {
+        if self.setting == Some(setting) {
+            self.input.clone()
+        } else {
+            Id::from(format!("ai-manager-{setting:?}"))
+        }
+    }
+
+    pub(super) fn keyboard_action<'a, Message: Clone + 'a>(
+        &self,
+        setting: Setting,
+        content: impl Into<Element<'a, Message>>,
+        message: Option<Message>,
+        accept_enter: bool,
+    ) -> Element<'a, Message> {
+        crate::workspace::dialog_design::keyboard_table::action_with_id(
+            content.into(),
+            message,
+            accept_enter,
+            Some(self.control_id(setting)),
+        )
     }
 
     pub(super) fn apply<Message: 'static>(&self) -> Task<Message> {
@@ -2627,7 +2701,6 @@ mod tests {
         for (query, setting) in [
             ("global request timeout", Setting::GlobalTimeout),
             ("base command name", Setting::AgentShortcutName),
-            ("ignore command name case", Setting::AgentShortcutCase),
             (
                 "max selection characters",
                 Setting::Profile(ProfileSetting::SelectionLimit),

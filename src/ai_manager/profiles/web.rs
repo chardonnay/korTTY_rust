@@ -326,10 +326,11 @@ impl Editor {
                         reveal,
                         WebSetting::Plugin,
                         editable,
-                        text_input("Installed plugin ID (mcp/server-name)", &settings.plugin)
-                            .on_input_maybe(
-                                editable.then_some(|id| Message::Web(Action::Plugin(id))),
-                            ),
+                        text_input(
+                            "Blank uses the global ID; mcp/server-name overrides it",
+                            &settings.plugin,
+                        )
+                        .on_input_maybe(editable.then_some(|id| Message::Web(Action::Plugin(id)))),
                     ));
                 }
                 if mode == McpMode::Toolpack {

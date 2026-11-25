@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 use iced::widget::svg::{Handle, Svg};
 
 #[derive(Clone, Copy)]
-pub(in crate::connection_window) enum Icon {
+pub(crate) enum Icon {
     AddServer,
     Edit,
     Duplicate,
@@ -66,7 +66,7 @@ impl Icon {
         Self::Restore,
     ];
 
-    pub(super) fn widget<'a>(self, size: u32, enabled: bool) -> Svg<'a> {
+    pub(crate) fn widget<'a>(self, size: u32, enabled: bool) -> Svg<'a> {
         Svg::new(self.cached_handle(enabled))
             .width(size)
             .height(size)

@@ -102,6 +102,14 @@ impl Workspace {
             return Ok(Task::none());
         }
         match message {
+            Message::DebugMessages(enabled) if run.phase == Phase::Setup => {
+                run.diagnostics.debug_enabled = enabled;
+            }
+            Message::RuntimeMessages(enabled)
+                if run.phase == Phase::Setup && run.mode != Mode::Ask =>
+            {
+                run.diagnostics.runtime_enabled = enabled;
+            }
             Message::AutoApproveRoot(enabled) if run.phase == Phase::Setup => {
                 run.auto_approve_root = enabled;
             }
@@ -330,6 +338,16 @@ impl Workspace {
                 }
                 run.target = Some(RunTarget::Saved(review));
                 run.review_initial_command()?;
+            }
+            Message::Diagnostic(epoch, update)
+                if epoch == run.epoch
+                    && !run.cancel.requested()
+                    && matches!(run.phase, Phase::Probe | Phase::Running | Phase::Elevated) =>
+            {
+                let dispatch = self.agent_dispatch_policy(run)?;
+                dispatch.check_with(&self.clipboard.policy)?;
+                dispatch.check()?;
+                run.diagnostics.update_output(epoch, &update);
             }
             Message::Progress(epoch, progress) => self.agent_model_progress(run, epoch, progress),
             Message::Decision(epoch, report)
@@ -737,8 +755,10 @@ impl Workspace {
         if let Some(proposal) = proposal {
             run.final_evidence.start(epoch, &proposal);
         }
-        let cancel = run.cancel.clone();
-        Ok(Task::perform(
+        let (cancel, updates) =
+            run.diagnostics
+                .start_output(epoch, run.cancel.clone(), run.redactor.clone());
+        let completion = Task::perform(
             async move {
                 let (send, receive) = async_channel::bounded(1);
                 let worker = std::thread::Builder::new()
@@ -779,7 +799,16 @@ impl Workspace {
                 })
             },
             move |result| Desktop::TerminalAgent(id, Message::Command(epoch, result)),
-        ))
+        );
+        Ok(match updates {
+            Some(updates) => Task::batch([
+                completion,
+                Task::run(updates, move |update| {
+                    Desktop::TerminalAgent(id, Message::Diagnostic(epoch, update))
+                }),
+            ]),
+            None => completion,
+        })
     }
 
     pub(super) fn mask_https_agent_input(&self, run: &mut Run) -> Result<(), String> {
@@ -855,6 +884,24 @@ impl Workspace {
             && !run.cancel.requested()
             && run.ai_cancel.is_some()
             && self.agent_model_current(run).is_ok();
+        if let Progress::WebTool(proposal) = progress {
+            if current {
+                if let Some(mut review) = run.model_review.take() {
+                    if let Err(error) =
+                        self.begin_model_tool(run, &mut review, Arc::clone(&proposal))
+                    {
+                        proposal.reject(&error);
+                        run.notice = error;
+                    }
+                    run.model_review = Some(review);
+                } else {
+                    proposal.reject("The Agent model review is unavailable.");
+                }
+            } else {
+                proposal.reject("The Agent model tool request is no longer current.");
+            }
+            return;
+        }
         let (permit, notice) = match progress {
             Progress::Repairing(initial, permit) => (
                 permit,
@@ -869,6 +916,7 @@ impl Workspace {
                         .then_some("Retrying without the provider's JSON response format…"),
                 )
             }
+            Progress::WebTool(_) => unreachable!(),
         };
         if let Some(notice) = notice
             && permit.try_send(()).is_ok()
@@ -1256,11 +1304,14 @@ impl Run {
         } else {
             ""
         };
-        self.record(format!(
+        let entry = format!(
             "{status}\nstdout\n{}\nstderr\n{}{limited}",
             bounded(&stdout),
             bounded(&stderr)
-        ));
+        );
+        self.diagnostics.clear_output();
+        self.diagnostics.record(&entry);
+        self.record(entry);
         self.bind_activity_step(step);
         if matches!(self.purpose, Purpose::Agent(_)) && !self.cancel.requested() {
             self.final_evidence

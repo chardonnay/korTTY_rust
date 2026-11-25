@@ -3912,6 +3912,46 @@ fn vault_and_managed_key_are_restored_as_one_replacement() {
 }
 
 #[test]
+fn inactive_authentication_survives_native_backup_and_startup_restore() {
+    use crate::connection_store::{Auth, Store};
+
+    let source = Scratch::new();
+    Directory::open(&source.0, false)
+        .unwrap()
+        .private_child("vault", true)
+        .unwrap();
+    let master = b"inactive-auth-backup-fixture";
+    let mut vault = Vault::create(source.0.join("vault/vault.bin"), master).unwrap();
+    let credential = vault
+        .save(
+            CredentialInput {
+                label: "Inactive passphrase".into(),
+                kind: CredentialKind::KeyPassphrase,
+                ..Default::default()
+            },
+            Secret::new("fixture secret".into()),
+        )
+        .unwrap();
+    drop(vault);
+    let (mut store, id) = save_fixture_connection(&source.0, "inactive.example");
+    let mut connection = store.get(id).unwrap().clone();
+    connection.login.preferences.key_file = "unfinished relative key".into();
+    connection.login.preferences.passphrase = Some(credential.clone());
+    store.save(connection.clone()).unwrap();
+    for mode in [RestoreMode::Replace, RestoreMode::KeepExisting] {
+        let target = Scratch::new();
+        queue_with_mode(&target.0, data::collect(&source.0).unwrap(), mode, false).unwrap();
+        let _lease = ProfileLease::acquire(&target.0, || false).unwrap();
+        let restored = Store::open(target.0.join(CONNECTIONS)).unwrap();
+        let login = &restored.get(id).unwrap().login;
+        assert_eq!(login.preferences, connection.login.preferences);
+        assert_eq!(login.auth, Auth::Prompt);
+        let vault = Vault::unlock(target.0.join("vault/vault.bin"), master).unwrap();
+        assert_eq!(vault.secret(&credential), Some("fixture secret"));
+    }
+}
+
+#[test]
 fn keep_existing_replay_adds_missing_independent_files_and_retains_late_collisions() {
     let source = Scratch::new();
     let mut snippets = crate::snippets::Library::open(source.0.join("snippets.json")).unwrap();
@@ -4087,6 +4127,7 @@ fn save_fixture_connection(root: &Path, host: &str) -> (crate::connection_store:
             name: "Fixture connection".into(),
             tag: String::new(),
             login: SavedLogin {
+                preferences: Default::default(),
                 endpoint: LoginTarget {
                     host: host.into(),
                     port: 22,

@@ -22,7 +22,11 @@ pub(super) struct WebAuthority {
 }
 
 impl WebAuthority {
-    fn capture(scope: &web::Scope, workspace: &Workspace, authority: &Authority) -> Self {
+    pub(super) fn capture(
+        scope: &web::Scope,
+        workspace: &Workspace,
+        authority: &Authority,
+    ) -> Self {
         let search = scope.search_credential_env();
         let provider_credentials = search
             .into_iter()
@@ -55,7 +59,7 @@ impl WebAuthority {
         self.scope.require_current()
     }
 
-    fn mask(
+    pub(super) fn mask(
         &self,
         run: &Run,
         vault: Option<&VaultWindow>,
@@ -82,7 +86,7 @@ impl WebAuthority {
         ))
     }
 
-    fn require_current(&self, workspace: &Workspace) -> Result<(), String> {
+    pub(super) fn require_current(&self, workspace: &Workspace) -> Result<(), String> {
         if !workspace.clipboard.policy.ai_web_search_allowed
             || !self.vault.ptr_eq(&workspace.vault_change_revision())
         {
@@ -93,6 +97,9 @@ impl WebAuthority {
 }
 
 impl Lookup {
+    pub(super) fn scope(&self) -> &web::Scope {
+        &self.scope
+    }
     pub(super) fn new(authority: &Authority, run: &Run, allowed: bool) -> Option<Self> {
         let scope = web::Scope::new(
             Some(&authority.config),

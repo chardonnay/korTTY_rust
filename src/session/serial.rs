@@ -88,6 +88,26 @@ impl Session {
         appearance: impl Into<Appearance>,
         stream: super::StreamOptions,
     ) -> io::Result<Self> {
+        Self::start_serial_with_logging(
+            connection,
+            grid,
+            profile,
+            prompt_navigation_enabled,
+            appearance,
+            None,
+            stream,
+        )
+    }
+
+    pub(crate) fn start_serial_with_logging(
+        connection: SerialConnection,
+        grid: GridSize,
+        profile: TerminalProfile,
+        prompt_navigation_enabled: bool,
+        appearance: impl Into<Appearance>,
+        logging: Option<Box<crate::terminal_logging::Prepared>>,
+        stream: super::StreamOptions,
+    ) -> io::Result<Self> {
         connection.validate()?;
         let encoding = connection.encoding.or(stream.encoding).unwrap_or_default();
         Self::start_stream(
@@ -95,6 +115,7 @@ impl Session {
                 connection: Arc::new(connection),
                 connect: true,
                 encoding,
+                logging,
             },
             grid,
             profile,
@@ -118,6 +139,7 @@ impl Session {
                 connection: Arc::new(connection),
                 connect: false,
                 encoding,
+                logging: None,
             },
             grid,
             profile,

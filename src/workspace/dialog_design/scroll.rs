@@ -5,6 +5,12 @@ pub(crate) fn reveal_row<Message>(list: Id, row: Id) -> Task<Message> {
     iced_runtime::task::effect(iced_runtime::Action::widget(Reveal::new(list, Some(row))))
 }
 
+pub(crate) fn reveal_nested_row<Message>(list: Id, inner: Id, row: Id) -> Task<Message> {
+    let mut reveal = Reveal::new(list, Some(row));
+    reveal.inner = Some(inner);
+    iced_runtime::task::effect(iced_runtime::Action::widget(reveal))
+}
+
 pub(crate) fn reveal_focused<Message>(scope: Id, list: Id) -> Task<Message> {
     iced_runtime::task::effect(iced_runtime::Action::widget(operation::scope(
         scope,
@@ -17,6 +23,8 @@ struct Reveal {
     row: Option<Id>,
     viewport: Option<(Rectangle, Rectangle, Vector)>,
     row_bounds: Option<Rectangle>,
+    inner: Option<Id>,
+    inner_translation: Vector,
 }
 
 impl Reveal {
@@ -26,6 +34,8 @@ impl Reveal {
             row,
             viewport: None,
             row_bounds: None,
+            inner: None,
+            inner_translation: Vector::ZERO,
         }
     }
 }
@@ -60,16 +70,22 @@ impl Operation for Reveal {
         translation: Vector,
         _state: &mut dyn operation::Scrollable,
     ) {
+        if self.inner.is_some() && id == self.inner.as_ref() {
+            self.inner_translation = translation;
+        }
         if id == Some(&self.list) {
             self.viewport = Some((bounds, content, translation));
         }
     }
 
     fn finish(&self) -> operation::Outcome<()> {
-        let (Some((viewport, content, translation)), Some(row)) = (self.viewport, self.row_bounds)
+        let (Some((viewport, content, translation)), Some(mut row)) =
+            (self.viewport, self.row_bounds)
         else {
             return operation::Outcome::None;
         };
+        // Widget operations report row bounds before the inner scroll offset.
+        row.y -= self.inner_translation.y;
         let top = viewport.y + translation.y;
         let offset = if row.y < top || row.height > viewport.height {
             row.y

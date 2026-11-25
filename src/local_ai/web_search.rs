@@ -14,8 +14,8 @@ mod mcp;
 mod page;
 mod searxng;
 pub(crate) use mcp::{
-    Credentials as McpCredentials, Mode as McpMode, SearxngPageSettings, Settings as McpSettings,
-    ToolOutput,
+    Credentials as McpCredentials, Defaults as McpDefaults, MAX_DEFAULT_BYTES, Mode as McpMode,
+    SearxngPageSettings, Settings as McpSettings, ToolOutput,
 };
 pub(crate) use page::{MAX_PAGE_URL_BYTES, PageUrl};
 

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::profile::{SavedPosition, WindowPlacement};
 
-/// Private desktop preference for a standalone window launched from a saved SSH entry.
+/// Private desktop preference for a standalone window launched from a saved connection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WindowGeometry {

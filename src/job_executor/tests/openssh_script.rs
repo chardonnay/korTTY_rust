@@ -110,14 +110,26 @@ impl Sshd {
                     .replace('"', "\\\"")
             )
         };
+        // macOS OpenSSH rejects /private/tmp as an AuthorizedKeysFile ancestor.
+        // Keep StrictModes and read this fixture's fixed key through a trusted command.
+        let authorized = if cfg!(target_os = "macos") {
+            format!(
+                "AuthorizedKeysFile none\nAuthorizedKeysCommand /bin/cat {}\nAuthorizedKeysCommandUser {user}\n",
+                quote_path(&user_key.with_extension("pub")),
+            )
+        } else {
+            format!(
+                "AuthorizedKeysFile {}\n",
+                quote_path(&user_key.with_extension("pub"))
+            )
+        };
         fs::write(
             &config,
             format!(
-                "HostKey {}\nAuthorizedKeysFile {}\nAllowUsers {user}\n\
+                "HostKey {}\n{authorized}AllowUsers {user}\n\
              PasswordAuthentication no\nKbdInteractiveAuthentication no\nPubkeyAuthentication yes\n\
              UsePAM no\nStrictModes yes\nLogLevel DEBUG2\nPrintMotd no\nPrintLastLog no\nPermitTTY yes\nSubsystem sftp internal-sftp\n",
                 quote_path(&host),
-                quote_path(&user_key.with_extension("pub")),
             ),
         )
         .unwrap();
@@ -190,6 +202,7 @@ impl Sshd {
 
     fn saved_login(&self, passphrase: Option<String>) -> SavedLogin {
         SavedLogin {
+            preferences: Default::default(),
             endpoint: LoginTarget {
                 host: "127.0.0.1".into(),
                 port: self.port,
@@ -302,6 +315,7 @@ fn privileged_fixture_route() -> (Connection, Vec<(Endpoint, HostKey)>) {
         name: "Privileged transfer fixture".into(),
         tag: String::new(),
         login: SavedLogin {
+            preferences: Default::default(),
             endpoint: LoginTarget {
                 host: host.clone(),
                 port: address.port(),
@@ -975,6 +989,7 @@ fn openssh_scheduler_uses_copied_registered_key_and_blocks_changed_jump_before_d
     fs::copy(&jump.user_key, &target.user_key).unwrap();
 
     let registered = |server: &Sshd, key| SavedLogin {
+        preferences: Default::default(),
         auth: Auth::StoredKey(key),
         ..server.saved_login(None)
     };

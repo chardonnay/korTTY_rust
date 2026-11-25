@@ -58,11 +58,15 @@ mod logging_settings;
 mod quick_select_settings;
 mod search_input;
 mod section_tabs;
+mod security_settings;
 pub(super) mod sftp_settings;
 mod snippet_editor_settings;
 mod startup_settings;
 mod theme_settings;
+#[cfg(test)]
+mod transparency_tests;
 mod video_settings;
+mod window_page;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -202,6 +206,8 @@ pub enum Setting {
     SftpArchiveCompression,
     SftpIdle,
     SftpIdleMinutes,
+    SftpExternalEditor,
+    SftpRsyncProgram,
     InitialTerminalSize,
     SerialDefaultEncoding,
     SshDefaultEncoding,
@@ -252,7 +258,15 @@ pub enum Setting {
     SandboxAvailability,
     RememberGeometry,
     RememberDashboard,
+    RestoreOutput,
+    RestoreOutputLines,
+    ImportedSessionRestore,
     FixedGeometry,
+    FixedWidth,
+    FixedHeight,
+    FixedX,
+    FixedY,
+    FixedMaximized,
     ToolWindowTabs,
     ConnectionColorBorder,
     SplitPaneFocusRing,
@@ -312,6 +326,8 @@ impl Setting {
         Self::SftpArchiveCompression,
         Self::SftpIdle,
         Self::SftpIdleMinutes,
+        Self::SftpExternalEditor,
+        Self::SftpRsyncProgram,
         Self::InitialTerminalSize,
         Self::SerialDefaultEncoding,
         Self::SshDefaultEncoding,
@@ -362,7 +378,15 @@ impl Setting {
         Self::SandboxAvailability,
         Self::RememberGeometry,
         Self::RememberDashboard,
+        Self::RestoreOutput,
+        Self::RestoreOutputLines,
+        Self::ImportedSessionRestore,
         Self::FixedGeometry,
+        Self::FixedWidth,
+        Self::FixedHeight,
+        Self::FixedX,
+        Self::FixedY,
+        Self::FixedMaximized,
         Self::ToolWindowTabs,
         Self::ConnectionColorBorder,
         Self::SplitPaneFocusRing,
@@ -420,6 +444,8 @@ impl Setting {
             Self::AutomaticLocalShellIntegration => "Allow automatic integration for local shells",
             Self::CommandTimestamps => "Show command timestamps",
             Self::RemoteSidebar => "Remote files sidebar",
+            Self::SftpExternalEditor => "External editor executable",
+            Self::SftpRsyncProgram => "Rsync executable",
             Self::SftpParallel => "Parallel file transfers",
             Self::SftpResume => "Resume interrupted transfers",
             Self::SftpKeepPartial => "Keep the partial file when a transfer is cancelled",
@@ -485,6 +511,14 @@ impl Setting {
             Self::RememberGeometry => "Remember window geometry",
             Self::RememberDashboard => "Remember dashboard state",
             Self::FixedGeometry => "Use fixed window geometry",
+            Self::FixedWidth => "Width",
+            Self::FixedHeight => "Height",
+            Self::FixedX => "X Position",
+            Self::FixedY => "Y Position",
+            Self::FixedMaximized => "Start maximized",
+            Self::RestoreOutput => "Also restore the output of each terminal pane (encrypted)",
+            Self::RestoreOutputLines => "Lines of output per pane",
+            Self::ImportedSessionRestore => "Use imported session settings",
             Self::ToolWindowTabs => "Open tool windows as tabs",
             Self::ConnectionColorBorder => "Frame the terminal in its connection's tab color",
             Self::SplitPaneFocusRing => "Frame the split pane the keyboard is in",
@@ -536,7 +570,9 @@ impl Setting {
             | Self::SftpArchive
             | Self::SftpArchiveCompression
             | Self::SftpIdle
-            | Self::SftpIdleMinutes => Section::Sftp,
+            | Self::SftpIdleMinutes
+            | Self::SftpExternalEditor
+            | Self::SftpRsyncProgram => Section::Sftp,
             Self::PasteWarning
             | Self::LargePasteWarning
             | Self::PasteLineDelay
@@ -594,6 +630,14 @@ impl Setting {
             | Self::RememberGeometry
             | Self::RememberDashboard
             | Self::FixedGeometry
+            | Self::FixedWidth
+            | Self::FixedHeight
+            | Self::FixedX
+            | Self::FixedY
+            | Self::FixedMaximized
+            | Self::RestoreOutput
+            | Self::RestoreOutputLines
+            | Self::ImportedSessionRestore
             | Self::ToolWindowTabs
             | Self::ConnectionColorBorder
             | Self::SplitPaneFocusRing
@@ -646,6 +690,10 @@ impl Setting {
             Self::AutomaticLocalShellIntegration => "shell integration local startup wrapper",
             Self::CommandTimestamps => "terminal time gutter command date",
             Self::RemoteSidebar => "sftp ssh folder dock left right hidden",
+            Self::SftpExternalEditor => {
+                "sftp external editor command executable path program remote files"
+            }
+            Self::SftpRsyncProgram => "sftp scheduler rsync executable binary path program",
             Self::SftpParallel => {
                 "sftp simultaneous parallel uploads downloads transfer queue channels"
             }
@@ -756,7 +804,15 @@ impl Setting {
             }
             Self::RememberGeometry => "startup normal bounds size position maximized",
             Self::RememberDashboard => "startup show hide dashboard state navigation dock",
-            Self::FixedGeometry => "startup width height fixed window position dimensions",
+            Self::FixedGeometry => "startup fixed window geometry dimensions",
+            Self::FixedWidth => "startup fixed window size horizontal pixels width geometry",
+            Self::FixedHeight => "startup fixed window size vertical pixels height geometry",
+            Self::FixedX => "startup fixed window horizontal position coordinates geometry",
+            Self::FixedY => "startup fixed window vertical position coordinates geometry",
+            Self::FixedMaximized => "startup maximize window geometry",
+            Self::RestoreOutput => "session restore terminal output encrypted scrollback",
+            Self::RestoreOutputLines => "session restore output lines limit history scrollback",
+            Self::ImportedSessionRestore => "Java session restore migration preferences adoption",
             Self::ToolWindowTabs => "management manager separate embedded presentation",
             Self::ConnectionColorBorder => "connection color border environment frame",
             Self::SplitPaneFocusRing => "active split pane focus ring border outline",
@@ -844,6 +900,7 @@ pub enum Message {
     LargePasteWarning(window::Id, u8),
     PasteLineDelay(window::Id, u16),
     ToolbarIconSize(window::Id, u16),
+    Transparency(window::Id, u8),
     ToolbarIconSizeSaved(window::Id, Result<(), String>),
     Video(window::Id, video_settings::Edit),
     VideoSaved(
@@ -872,6 +929,9 @@ pub enum Message {
     SftpConflictDefault(window::Id, ConflictDefault),
     SftpArchiveDirectory(window::Id, String),
     SftpIdleEnabled(window::Id, bool),
+    SftpProgram(window::Id, sftp_settings::Program, String),
+    SftpBrowseProgram(window::Id, sftp_settings::Program),
+    SftpProgramPicked(window::Id, std::sync::Arc<()>, Option<std::path::PathBuf>),
     TerminalColumns(window::Id, String),
     TerminalRows(window::Id, String),
     SerialDefaultEncoding(window::Id, TextEncoding),
@@ -900,7 +960,7 @@ pub enum Message {
     ClipboardRead(window::Id, bool),
     Restore(window::Id, RestoreMode),
     RestoreOutput(window::Id, bool),
-    RestoreOutputLines(window::Id, u16),
+    RestoreOutputLinesInput(window::Id, String),
     UseJavaSessionRestore(window::Id),
     KeyBinding(window::Id, Edit),
     Backup(window::Id, backup::Edit),
@@ -933,6 +993,9 @@ impl Draft {
     ) -> WindowSettings {
         let edit = &self.preferences;
         let before = &initial.preferences;
+        if edit.terminal_transparency != before.terminal_transparency {
+            current.terminal_transparency = edit.terminal_transparency.min(100);
+        }
         if edit.key_bindings != before.key_bindings {
             current.key_bindings = edit.key_bindings.clone();
         }
@@ -1123,6 +1186,16 @@ impl Draft {
         {
             current.sftp_conflict_default = edit.sftp_conflict_default;
         }
+        if edit.sftp_external_editor != before.sftp_external_editor {
+            current
+                .sftp_external_editor
+                .clone_from(&edit.sftp_external_editor);
+        }
+        if edit.job_scheduler_rsync_program != before.job_scheduler_rsync_program {
+            current
+                .job_scheduler_rsync_program
+                .clone_from(&edit.job_scheduler_rsync_program);
+        }
         if edit.sftp_idle_minutes != before.sftp_idle_minutes {
             current.sftp_idle_minutes = edit.sftp_idle_minutes;
         }
@@ -1226,6 +1299,7 @@ struct Dialog {
     sandbox_availability: Option<String>,
     installed_sftp_conflict_policy: SftpConflictPolicy,
     sftp_numbers: sftp_settings::Numbers,
+    sftp_program_picker: Option<(sftp_settings::Program, std::sync::Arc<()>)>,
     sftp_xml: sftp_settings::java::Exchange,
     initial_highlighting: highlight::Preferences,
     highlighting: highlight::Preferences,
@@ -1244,6 +1318,7 @@ struct Dialog {
     font_size_input: Option<String>,
     editor_cursor_color_input: Option<String>,
     silence_seconds_input: Option<String>,
+    restore_output_lines_input: Option<String>,
     terminal_columns_input: Option<String>,
     terminal_rows_input: Option<String>,
     toolbar_icon_size: Option<u16>,
@@ -1272,13 +1347,24 @@ impl Dialog {
         self.saving_toolbar_icon_size
             || self.saving_logging
             || self.saving_video
+            || self.sftp_program_picker.is_some()
             || self.sftp_xml.busy()
             || self.themes.exchanging().is_some()
     }
 
-    fn search_results(&self, has_transparency: bool) -> impl Iterator<Item = SearchTarget> {
+    fn search_results(
+        &self,
+        has_transparency: bool,
+        policy: &ClipboardPolicy,
+    ) -> impl Iterator<Item = SearchTarget> {
         search_targets(&self.search, |setting| match setting {
             Setting::Restore => self.draft.restore.is_some(),
+            Setting::ImportedSessionRestore => !self
+                .draft
+                .preferences
+                .java_session_restore
+                .available(self.draft.restore.is_some(), policy)
+                .is_empty(),
             Setting::Transparency => has_transparency,
             _ => true,
         })
@@ -1289,6 +1375,7 @@ impl Dialog {
         if section == Section::Sftp {
             self.installed_sftp_conflict_policy = SftpConflictPolicy::load();
         }
+        self.sftp_program_picker = None;
         if section != Section::Backup {
             self.backup.close_browser();
         }
@@ -1383,7 +1470,19 @@ impl Dialog {
         ])
     }
 
-    fn reveal_invalid_input(&mut self) -> Option<Task<Desktop>> {
+    fn reveal_invalid_input(&mut self, policy: &ClipboardPolicy) -> Option<Task<Desktop>> {
+        if let Some(setting) = self.startup.first_problem() {
+            self.problem = None;
+            return Some(self.reveal_result(setting));
+        }
+        if self.restore_output_lines_input.is_some()
+            && self.draft.preferences.restore_output.enabled
+            && policy.problem.is_none()
+            && policy.session_restore_output.is_none()
+        {
+            self.problem = None;
+            return Some(self.reveal_result(Setting::RestoreOutputLines));
+        }
         if self.terminal_columns_input.is_some() || self.terminal_rows_input.is_some() {
             self.problem = None;
             return Some(self.reveal(Setting::InitialTerminalSize));
@@ -1426,6 +1525,33 @@ impl Dialog {
 pub(super) struct Settings(Option<Dialog>);
 
 impl Settings {
+    pub(super) fn rebase_snippet_defaults(
+        &mut self,
+        values: super::ai_general_defaults::SnippetValues,
+    ) {
+        let Some(dialog) = &mut self.0 else {
+            return;
+        };
+        if dialog.draft.preferences.snippet_ai_additional_instructions
+            == dialog
+                .initial
+                .preferences
+                .snippet_ai_additional_instructions
+        {
+            dialog.draft.preferences.snippet_ai_additional_instructions = Some(values.instructions);
+            dialog
+                .initial
+                .preferences
+                .snippet_ai_additional_instructions = Some(values.instructions);
+        }
+        if dialog.draft.preferences.snippet_alternative_count
+            == dialog.initial.preferences.snippet_alternative_count
+        {
+            dialog.draft.preferences.snippet_alternative_count = Some(values.alternatives);
+            dialog.initial.preferences.snippet_alternative_count = Some(values.alternatives);
+        }
+    }
+
     pub(super) fn logging_preparing(&self) -> Option<(window::Id, window::Id)> {
         self.0
             .as_ref()
@@ -1550,6 +1676,7 @@ impl Workspace {
                 | Message::ToolbarIconSizeSaved(..)
                 | Message::LoggingPrepared(..)
                 | Message::VideoSaved(..)
+                | Message::SftpProgramPicked(..)
                 | Message::Theme(
                     _,
                     theme_settings::Edit::Java(theme_settings::exchange::Action::Finished(..))
@@ -1702,6 +1829,7 @@ impl Workspace {
             | Message::LargePasteWarning(id, _)
             | Message::PasteLineDelay(id, _)
             | Message::ToolbarIconSize(id, _)
+            | Message::Transparency(id, _)
             | Message::Startup(id, _)
             | Message::TemporarySshKey(id, _)
             | Message::DefaultIsolation(id, _)
@@ -1721,6 +1849,9 @@ impl Workspace {
             | Message::SftpConflictDefault(id, _)
             | Message::SftpArchiveDirectory(id, _)
             | Message::SftpIdleEnabled(id, _)
+            | Message::SftpProgram(id, _, _)
+            | Message::SftpBrowseProgram(id, _)
+            | Message::SftpProgramPicked(id, _, _)
             | Message::TerminalColumns(id, _)
             | Message::TerminalRows(id, _)
             | Message::SerialDefaultEncoding(id, _)
@@ -1749,7 +1880,7 @@ impl Workspace {
             | Message::ClipboardRead(id, _)
             | Message::Restore(id, _)
             | Message::RestoreOutput(id, _)
-            | Message::RestoreOutputLines(id, _)
+            | Message::RestoreOutputLinesInput(id, _)
             | Message::UseJavaSessionRestore(id)
             | Message::KeyBinding(id, _)) => (id, message),
         };
@@ -1761,9 +1892,10 @@ impl Workspace {
             .0
             .as_ref()
             .filter(|dialog| dialog.id == id)
-            .and_then(|dialog| self.windows.get(&dialog.owner))
-            .and_then(|window| self.transparency_controls(window))
-            .is_some();
+            .is_some_and(|dialog| {
+                super::transparency::platform_candidate()
+                    && self.windows.contains_key(&dialog.owner)
+            });
         if let Some(child) = self.highlight_rules_for_settings(id) {
             return window::gain_focus(child);
         }
@@ -1797,7 +1929,7 @@ impl Workspace {
             }
             Message::SearchStep(_, direction) => {
                 let last = dialog
-                    .search_results(has_transparency)
+                    .search_results(has_transparency, &self.clipboard.policy)
                     .count()
                     .saturating_sub(1);
                 dialog.search_selection = dialog
@@ -1814,7 +1946,7 @@ impl Workspace {
             }
             Message::SearchChoose(_) => {
                 let choice = dialog
-                    .search_results(has_transparency)
+                    .search_results(has_transparency, &self.clipboard.policy)
                     .nth(dialog.search_selection);
                 return choice
                     .map_or_else(Task::none, |target| dialog.reveal_search_target(target));
@@ -1827,7 +1959,7 @@ impl Workspace {
             }
             Message::Reveal(_, target) => {
                 return if dialog
-                    .search_results(has_transparency)
+                    .search_results(has_transparency, &self.clipboard.policy)
                     .any(|result| result == target)
                 {
                     dialog.reveal_search_target(target)
@@ -2011,6 +2143,12 @@ impl Workspace {
                 dialog.draft.preferences.paste_line_delay_ms =
                     value.min(crate::connection_store::MAX_PASTE_LINE_DELAY_MS);
             }
+            Message::Transparency(_, percent)
+                if dialog.section == Section::Window
+                    && super::transparency::platform_candidate() =>
+            {
+                dialog.draft.preferences.terminal_transparency = percent.min(100);
+            }
             Message::ToolbarIconSize(_, size) if dialog.section == Section::Window => {
                 let size = size.clamp(*TOOLBAR_ICON_SIZE.start(), *TOOLBAR_ICON_SIZE.end());
                 dialog.toolbar_icon_size =
@@ -2143,6 +2281,31 @@ impl Workspace {
                     .editable()
                 {
                     dialog.draft.preferences.sftp_conflict_default = preference;
+                }
+            }
+            Message::SftpProgram(_, program, path) if dialog.section == Section::Sftp => {
+                dialog.sftp_program_picker = None;
+                program.set(&mut dialog.draft.preferences, path);
+            }
+            Message::SftpBrowseProgram(_, program)
+                if dialog.section == Section::Sftp && dialog.sftp_program_picker.is_none() =>
+            {
+                let ticket = std::sync::Arc::new(());
+                dialog.sftp_program_picker = Some((program, ticket.clone()));
+                return sftp_settings::pick_program(id, program, &dialog.draft.preferences).map(
+                    move |path| {
+                        Desktop::Settings(Message::SftpProgramPicked(id, ticket.clone(), path))
+                    },
+                );
+            }
+            Message::SftpProgramPicked(_, ticket, path) => {
+                if let Some((program, pending)) = &dialog.sftp_program_picker
+                    && std::sync::Arc::ptr_eq(pending, &ticket)
+                {
+                    if let Some(path) = path.and_then(|path| path.to_str().map(str::to_owned)) {
+                        program.set(&mut dialog.draft.preferences, path);
+                    }
+                    dialog.sftp_program_picker = None;
                 }
             }
             Message::SftpIdleEnabled(_, enabled) if dialog.section == Section::Sftp => {
@@ -2306,7 +2469,11 @@ impl Workspace {
                             &mut preferences.ai_agent_design,
                             Edit::NavigateModule(module),
                         );
-                        return agent_design_settings::reveal_module(id, module);
+                        return agent_design_settings::reveal_module(
+                            id,
+                            module,
+                            dialog.page_scroll.clone(),
+                        );
                     }
                     Edit::NavigatePreview(token, key)
                         if dialog.agent_design.preview_log_enabled(preferences) =>
@@ -2407,15 +2574,25 @@ impl Workspace {
                     && self.clipboard.policy.session_restore_output.is_none() =>
             {
                 dialog.draft.preferences.restore_output.enabled = enabled;
+                if !enabled {
+                    dialog.restore_output_lines_input = None;
+                }
             }
-            Message::RestoreOutputLines(_, lines)
+            Message::RestoreOutputLinesInput(_, mut value)
                 if dialog.section == Section::Window
                     && dialog.draft.preferences.restore_output.enabled
                     && self.clipboard.policy.problem.is_none()
-                    && self.clipboard.policy.session_restore_output.is_none()
-                    && session_restore::OutputPreferences::LINES.contains(&lines) =>
+                    && self.clipboard.policy.session_restore_output.is_none() =>
             {
-                dialog.draft.preferences.restore_output.lines = lines;
+                if let Ok(lines) = value.parse::<u16>()
+                    && session_restore::OutputPreferences::LINES.contains(&lines)
+                {
+                    dialog.draft.preferences.restore_output.lines = lines;
+                    dialog.restore_output_lines_input = None;
+                } else {
+                    value.truncate(value.floor_char_boundary(8));
+                    dialog.restore_output_lines_input = Some(value);
+                }
             }
             Message::UseJavaSessionRestore(_) if dialog.section == Section::Window => {
                 let imported = dialog.draft.preferences.java_session_restore;
@@ -2426,6 +2603,7 @@ impl Workspace {
                             &mut dialog.draft.restore,
                             &mut dialog.draft.preferences.restore_output,
                         );
+                    dialog.restore_output_lines_input = None;
                     dialog.problem = None;
                 } else {
                     dialog.problem = Some(
@@ -2523,6 +2701,7 @@ impl Workspace {
             sandbox_availability: None,
             installed_sftp_conflict_policy: SftpConflictPolicy::load(),
             sftp_numbers: sftp_settings::Numbers::default(),
+            sftp_program_picker: None,
             sftp_xml: sftp_settings::java::Exchange::default(),
             initial_highlighting: highlighting.clone(),
             highlighting,
@@ -2541,6 +2720,7 @@ impl Workspace {
             font_size_input: None,
             editor_cursor_color_input: None,
             silence_seconds_input: None,
+            restore_output_lines_input: None,
             terminal_columns_input: None,
             terminal_rows_input: None,
             toolbar_icon_size: None,
@@ -2632,7 +2812,7 @@ impl Workspace {
         let Some(dialog) = self.settings.dialog_mut(id) else {
             return Task::none();
         };
-        if let Some(reveal) = dialog.reveal_invalid_input() {
+        if let Some(reveal) = dialog.reveal_invalid_input(&self.clipboard.policy) {
             return reveal;
         }
         dialog.installed_sftp_conflict_policy = SftpConflictPolicy::load();
@@ -2860,7 +3040,7 @@ impl Workspace {
         let sftp_conflict_policy = dialog
             .installed_sftp_conflict_policy
             .restrict(&self.clipboard.policy);
-        if let Some(reveal) = dialog.reveal_invalid_input() {
+        if let Some(reveal) = dialog.reveal_invalid_input(&self.clipboard.policy) {
             return reveal;
         }
         if let Some(reveal) = dialog.reveal_invalid_sftp_number(sftp_conflict_policy) {
@@ -3002,11 +3182,39 @@ impl Workspace {
                 return Task::none();
             }
         };
+        let snippet_conflict = (draft.preferences.snippet_ai_additional_instructions
+            != initial.preferences.snippet_ai_additional_instructions
+            && self.window_settings.snippet_ai_additional_instructions
+                != initial.preferences.snippet_ai_additional_instructions)
+            || (draft.preferences.snippet_alternative_count
+                != initial.preferences.snippet_alternative_count
+                && self.window_settings.snippet_alternative_count
+                    != initial.preferences.snippet_alternative_count);
+        if snippet_conflict {
+            dialog.problem = Some("Snippet defaults changed in AI Manager. Reopen Settings to review them before saving.".into());
+            return Task::none();
+        }
         let mut next = draft.merge_preferences(
             initial,
             self.window_settings.clone(),
             &self.clipboard.policy,
         );
+        if let Some(program) = sftp_settings::Program::ALL
+            .into_iter()
+            .find(|program| !program.valid(&next))
+        {
+            if let Some(dialog) = self.settings.dialog_mut(id) {
+                dialog.select_section(Section::Sftp);
+                dialog.search.clear();
+                dialog.revealed = Some(program.setting());
+                dialog.problem = Some(
+                    "Enter an absolute executable path without arguments, or leave it blank."
+                        .into(),
+                );
+                return dialog.reveal_result(program.setting());
+            }
+            return Task::none();
+        }
         if !next.sftp_archive.valid() {
             if let Some(dialog) = self.settings.dialog_mut(id) {
                 dialog.select_section(Section::Sftp);
@@ -3085,6 +3293,7 @@ impl Workspace {
             self.apply_clipboard_write(false);
         }
         let mut geometry = Task::none();
+        let mut transparency = Task::none();
         if preferences_changed {
             let saved = self
                 .settings
@@ -3149,7 +3358,10 @@ impl Workspace {
             }
             let agent_animations_changed =
                 next.agent_animations() != self.window_settings.agent_animations();
+            let previous_transparency = self.window_settings.terminal_transparency;
             self.window_settings = next;
+            self.sync_ai_general_snippet_defaults();
+            transparency = self.activate_transparency(previous_transparency);
             self.sync_quick_temporary_key_preference();
             if agent_animations_changed {
                 self.refresh_agent_inline_animations();
@@ -3161,6 +3373,10 @@ impl Workspace {
                 self.sync_open_scrollback();
             }
             self.refresh_sftp_preferences();
+            if let Some(scheduler) = self.scheduler.as_mut() {
+                scheduler
+                    .set_rsync_program(self.window_settings.job_scheduler_rsync_program.clone());
+            }
             if detection_changed || dock_changed {
                 self.reconcile_coding_agent_docks();
             }
@@ -3219,7 +3435,7 @@ impl Workspace {
                     dialog.problem =
                         Some(format!("Could not save keyword highlighting ({error})."));
                 }
-                return Task::batch([restore, sidebar, journals, geometry]);
+                return Task::batch([restore, sidebar, journals, geometry, transparency]);
             }
         }
         let complete = if backup != self.backup_preferences
@@ -3255,7 +3471,7 @@ impl Workspace {
         } else {
             self.finish_toolbar_settings(id)
         };
-        Task::batch([restore, sidebar, journals, geometry, complete])
+        Task::batch([restore, sidebar, journals, geometry, transparency, complete])
     }
 
     pub(super) fn settings_view(&self, id: window::Id) -> Option<Element<'_, Desktop>> {
@@ -3326,8 +3542,11 @@ impl Workspace {
         let transparency = self
             .windows
             .get(&dialog.owner)
-            .and_then(|window| self.transparency_controls(window));
-        let mut matches = dialog.search_results(transparency.is_some()).peekable();
+            .filter(|_| super::transparency::platform_candidate())
+            .map(|window| window_page::transparency_control(dialog, window));
+        let mut matches = dialog
+            .search_results(transparency.is_some(), &self.clipboard.policy)
+            .peekable();
         let mut input = stack![search_input::view(
             text_input(
                 "Search settings… (e.g. font size, proxy, backup)",
@@ -3551,34 +3770,44 @@ impl Workspace {
                 .into()
             }
         };
-        let footer = row![space::horizontal()]
-            .spacing(10)
-            .align_y(Alignment::Center)
-            .push(
-                button(container(text("Save").size(13)).center_x(Length::Fill))
-                    .width(76)
-                    .padding([7, 5])
-                    .on_press_maybe(
-                        ((!dialog.backup.browsing()
-                            || self.clipboard.policy.backup.directory.is_some())
-                            && !dialog.logging.browsing_unmanaged(
-                                self.clipboard.policy.app_logging.directory().is_some(),
-                                self.clipboard
-                                    .policy
-                                    .terminal_logging
-                                    .journal_directory()
-                                    .is_some(),
-                            ))
-                        .then(|| msg(Message::Save(id))),
-                    ),
-            )
-            .push(
+        let can_save = (!dialog.backup.browsing()
+            || self.clipboard.policy.backup.directory.is_some())
+            && !dialog.logging.browsing_unmanaged(
+                self.clipboard.policy.app_logging.directory().is_some(),
+                self.clipboard
+                    .policy
+                    .terminal_logging
+                    .journal_directory()
+                    .is_some(),
+            );
+        let save = can_save.then(|| msg(Message::Save(id)));
+        let cancel = msg(Message::Cancel(id));
+        let footer = row![
+            space::horizontal(),
+            dialog_design::keyboard_table::action_with_id(
                 button(container(text("Cancel").size(13)).center_x(Length::Fill))
                     .width(76)
                     .padding([7, 5])
                     .style(button::secondary)
-                    .on_press(msg(Message::Cancel(id))),
-            );
+                    .on_press(cancel.clone())
+                    .into(),
+                Some(cancel),
+                true,
+                Some(widget::Id::new("settings-cancel")),
+            ),
+            dialog_design::keyboard_table::action_with_id(
+                button(container(text("Save").size(13)).center_x(Length::Fill))
+                    .width(76)
+                    .padding([7, 5])
+                    .on_press_maybe(save.clone())
+                    .into(),
+                save,
+                true,
+                Some(widget::Id::new("settings-save")),
+            ),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center);
         let footer = column![
             dialog.problem.as_deref().map(|error| text(error).size(14)),
             footer
@@ -4045,413 +4274,6 @@ impl Workspace {
             .spacing(12)
             .into()
     }
-
-    fn security_settings_page(&self, dialog: &Dialog) -> Element<'static, Desktop> {
-        let id = dialog.id;
-        let policy = &self.clipboard.policy;
-        let require_password = policy.require_master_password
-            || dialog.draft.preferences.startup.require_master_password;
-        let password_editable = policy.problem.is_none() && !policy.require_master_password;
-        let minimum = policy.minimum_isolation;
-        let isolation = dialog
-            .draft
-            .preferences
-            .default_session_isolation
-            .unwrap_or_default()
-            .max(minimum);
-        let allowed = IsolationLevel::ALL
-            .into_iter()
-            .filter(|level| *level >= minimum)
-            .collect::<Vec<_>>();
-        let isolation_control: Element<'_, Desktop> =
-            if policy.problem.is_some() || allowed.len() == 1 {
-                text(isolation.to_string()).into()
-            } else {
-                pick_list(allowed, Some(isolation), move |level| {
-                    Desktop::Settings(Message::DefaultIsolation(id, level))
-                })
-                .into()
-            };
-        let imported = dialog.draft.preferences.java_security;
-        let vault_path = profile::vault_path().ok();
-        let vault_exists = vault_path
-            .as_ref()
-            .is_some_and(|path| Vault::exists(path).unwrap_or(false));
-        let startup_unlock = vault_path
-            .as_ref()
-            .and_then(|path| Vault::startup_unlock_state(path).ok());
-        let (automatic_status, automatic_action, enable) = match startup_unlock {
-            Some(StartupUnlockState::Enabled) => (
-                if require_password {
-                    "Enabled on this device. The startup password requirement takes precedence."
-                } else {
-                    "Enabled on this device."
-                },
-                "Disable automatic unlock",
-                false,
-            ),
-            Some(StartupUnlockState::RemovalPending) => (
-                "Disabled. The device credential still needs to be removed.",
-                "Retry credential removal",
-                false,
-            ),
-            Some(StartupUnlockState::Disabled) => (
-                if !vault_exists {
-                    "Create a credential vault before enabling automatic unlock."
-                } else {
-                    "The device’s credential store can unlock your vault when kortty starts."
-                },
-                "Configure automatic unlock…",
-                true,
-            ),
-            None => (
-                "The automatic unlock setting could not be read.",
-                "Configure automatic unlock…",
-                true,
-            ),
-        };
-        let can_set_automatic =
-            startup_unlock.is_some() && (!enable || (vault_exists && password_editable));
-        column![
-            text("Master password").size(18),
-            text("Your master password unlocks the local credential vault.").size(13),
-            highlighted(
-                dialog,
-                Setting::ChangeMasterPassword,
-                dialog_design::secondary_action("Change master password…")
-                    .on_press(Desktop::Settings(Message::ChangeMasterPassword(id))),
-            ),
-            rule::horizontal(1),
-            highlighted(
-                dialog,
-                Setting::StartupMasterPassword,
-                column![
-                    checkbox(require_password)
-                        .label(Setting::StartupMasterPassword.label())
-                        .on_toggle_maybe(password_editable.then_some(move |enabled| {
-                            Desktop::Settings(Message::Startup(
-                                id,
-                                startup_settings::Edit::MasterPassword(enabled),
-                            ))
-                        })),
-                    if policy.require_master_password {
-                        text("Managed by your organization.").size(13)
-                    } else if policy.problem.is_some() {
-                        text("The startup setting is locked until the policy can be read.").size(13)
-                    } else {
-                        text("Takes effect the next time korTTY starts.").size(13)
-                    },
-                ]
-                .spacing(5),
-            ),
-            highlighted(
-                dialog,
-                Setting::AutomaticVaultUnlock,
-                column![
-                    text(Setting::AutomaticVaultUnlock.label()),
-                    text(automatic_status).size(13),
-                    dialog_design::secondary_action(automatic_action).on_press_maybe(
-                        can_set_automatic.then_some(Desktop::Settings(Message::AutomaticVaultUnlock(id, enable)))
-                    ),
-                ]
-                .spacing(5),
-            ),
-            rule::horizontal(1),
-            text("Temporary SSH keys").size(18),
-            text("Use temporary private keys in Quick Connect and saved SSH profiles. Quick Connect keeps the key in memory for its selected lifetime.").size(13),
-            highlighted(
-                dialog,
-                Setting::TemporarySshKey,
-                checkbox(dialog.draft.preferences.temporary_ssh_key_enabled)
-                    .label(Setting::TemporarySshKey.label())
-                    .on_toggle_maybe(policy.problem.is_none().then_some(move |enabled| {
-                        Desktop::Settings(Message::TemporarySshKey(id, enabled))
-                    })),
-            ),
-            imported.temporary_ssh_keys.map(|enabled| {
-                row![
-                    text(if enabled { "Java backup · Enabled" } else { "Java backup · Disabled" }).size(13),
-                    dialog_design::secondary_action("Use Java setting").on_press_maybe(
-                        (policy.problem.is_none() && enabled != dialog.draft.preferences.temporary_ssh_key_enabled)
-                            .then_some(Desktop::Settings(Message::TemporarySshKey(id, enabled)))
-                    ),
-                ].spacing(8).align_y(Alignment::Center)
-            }),
-            rule::horizontal(1),
-            text("Session isolation").size(18),
-            text("Set the default for new local and SSH sessions. Saved profiles and folders can specify their own level in Connection Manager.").size(13),
-            highlighted(
-                dialog,
-                Setting::DefaultIsolation,
-                row![
-                    text(Setting::DefaultIsolation.label()),
-                    isolation_control,
-                ].spacing(8).align_y(Alignment::Center),
-            ),
-            imported.default_isolation.map(|level| {
-                row![
-                    text(if level < minimum {
-                        format!("Java backup · {level} · Below the managed minimum")
-                    } else {
-                        format!("Java backup · {level}")
-                    }).size(13),
-                    dialog_design::secondary_action("Use Java setting").on_press_maybe(
-                        (policy.problem.is_none() && level >= minimum
-                            && dialog.draft.preferences.default_session_isolation != Some(level))
-                            .then_some(Desktop::Settings(Message::DefaultIsolation(id, level)))
-                    ),
-                ].spacing(8).align_y(Alignment::Center)
-            }),
-            (minimum != IsolationLevel::None).then(|| text(format!("Managed minimum · {minimum}")).size(13)),
-            highlighted(dialog, Setting::SandboxAvailability, text(dialog.sandbox_availability.clone().unwrap_or_else(|| "Checking sandbox availability…".into())).size(13)),
-            (isolation == IsolationLevel::Sandbox).then(|| text("Set an absolute sandbox workspace for local shells in Session security.").size(13)),
-        ]
-        .spacing(12)
-        .into()
-    }
-
-    fn window_settings_page<'a>(
-        &self,
-        dialog: &'a Dialog,
-        transparency: Option<Element<'a, Desktop>>,
-    ) -> Element<'a, Desktop> {
-        let id = dialog.id;
-        let icon_size = dialog
-            .toolbar_icon_size
-            .unwrap_or_else(|| self.chrome.toolbar_icon_size());
-        let startup = dialog.draft.preferences.startup;
-        let mut page = column![
-            text("Window Settings").size(18),
-            highlighted(
-                dialog,
-                Setting::ToolbarIconSize,
-                row![
-                    text(Setting::ToolbarIconSize.label()).width(122),
-                    toolbar_size_scale(id, icon_size),
-                    text(format!("{icon_size} px")).width(48),
-                    self.toolbar_icon_preview(icon_size),
-                ]
-                .spacing(8)
-                .align_y(Alignment::Center),
-            ),
-            highlighted(
-                dialog,
-                Setting::RememberGeometry,
-                checkbox(startup.remember_geometry)
-                    .label(Setting::RememberGeometry.label())
-                    .on_toggle(move |enabled| Desktop::Settings(Message::Startup(id, startup_settings::Edit::RememberGeometry(enabled)))),
-            ),
-            text("Restore the last size and position of main windows and native dialogs, and the maximized state of main windows.").size(13),
-            highlighted(
-                dialog,
-                Setting::RememberDashboard,
-                checkbox(startup.remember_dashboard)
-                    .label(Setting::RememberDashboard.label())
-                    .on_toggle(move |enabled| Desktop::Settings(Message::Startup(id, startup_settings::Edit::RememberDashboard(enabled)))),
-            ),
-            text("Open the dashboard if it was visible when the last window closed.").size(13),
-            highlighted(
-                dialog,
-                Setting::ToolWindowTabs,
-                checkbox(dialog.draft.preferences.open_tool_windows_as_tabs)
-                    .label(Setting::ToolWindowTabs.label())
-                    .on_toggle(move |enabled| {
-                        Desktop::Settings(Message::ToolWindowTabs(id, enabled))
-                    }),
-            ),
-            text("Takes effect the next time you open a supported tool. The tab opens in the window whose menu you used.")
-                .size(13),
-            rule::horizontal(1),
-            text("Tabs").size(16),
-            highlighted(
-                dialog,
-                Setting::ConnectionColorBorder,
-                column![
-                    tooltip(
-                        checkbox(dialog.draft.preferences.connection_color_border_enabled)
-                            .label(Setting::ConnectionColorBorder.label())
-                            .on_toggle(move |enabled| Desktop::Settings(Message::ConnectionColorBorder(id, enabled))),
-                        text("The colored dot on the tab stays visible either way."),
-                        tooltip::Position::Bottom,
-                    ),
-                    text("For colored connections, the frame takes 3 px per side. Switching it resizes open terminals.")
-                        .size(13),
-                ].spacing(3),
-            ),
-            highlighted(
-                dialog,
-                Setting::SplitPaneFocusRing,
-                tooltip(
-                    checkbox(dialog.draft.preferences.split_pane_focus_ring_enabled)
-                        .label(Setting::SplitPaneFocusRing.label())
-                        .on_toggle(move |enabled| Desktop::Settings(Message::SplitPaneFocusRing(id, enabled))),
-                    text("Shows the pane with keyboard focus and dims the frame when focus moves outside the pane."),
-                    tooltip::Position::Bottom,
-                ),
-            ),
-            highlighted(
-                dialog,
-                Setting::ShellTitles,
-                checkbox(dialog.draft.preferences.tab_title_from_shell_enabled)
-                    .label(Setting::ShellTitles.label())
-                    .on_toggle(move |enabled| Desktop::Settings(Message::ShellTitles(id, enabled))),
-            ),
-            text("Hover over a tab to see the connection it belongs to.").size(13),
-            highlighted(
-                dialog,
-                Setting::RecentTabs,
-                checkbox(dialog.draft.preferences.tab_switch_most_recent_first)
-                    .label(Setting::RecentTabs.label())
-                    .on_toggle(move |enabled| Desktop::Settings(Message::RecentTabs(id, enabled))),
-            ),
-            text("Uses Ctrl on macOS too. The order is kept while this window is open.").size(13),
-            rule::horizontal(1),
-            text("Session Restore").size(16),
-        ];
-        page = match (
-            dialog.draft.restore,
-            self.clipboard.policy.session_restore_mode,
-        ) {
-            (Some(_), Some(mode)) => page.push(highlighted(
-                dialog,
-                Setting::Restore,
-                column![
-                    row![
-                        text(format!("{}:", Setting::Restore.label())).width(128),
-                        text(RestoreChoice(mode).to_string()),
-                    ]
-                    .spacing(8)
-                    .align_y(Alignment::Center),
-                    text("Managed by your organization.").size(13),
-                ]
-                .spacing(4),
-            )),
-            (Some(mode), None) => page.push(highlighted(
-                dialog,
-                Setting::Restore,
-                row![
-                    text(format!("{}:", Setting::Restore.label())).width(128),
-                    pick_list(
-                        RestoreMode::ALL.map(RestoreChoice),
-                        Some(RestoreChoice(mode)),
-                        move |choice| { Desktop::Settings(Message::Restore(id, choice.0)) }
-                    ),
-                ]
-                .spacing(8)
-                .align_y(Alignment::Center),
-            )),
-            (None, _) => page.push(text("Session recovery is unavailable.").size(14)),
-        };
-        let output = dialog.draft.preferences.restore_output;
-        let managed = self.clipboard.policy.session_restore_output;
-        let enabled = managed.unwrap_or(output.enabled);
-        let editable = self.clipboard.policy.problem.is_none() && managed.is_none();
-        let lines: Element<'_, Desktop> = if editable && enabled {
-            slider(
-                session_restore::OutputPreferences::LINES,
-                output.lines,
-                move |lines| Desktop::Settings(Message::RestoreOutputLines(id, lines)),
-            )
-            .width(180)
-            .into()
-        } else {
-            space::horizontal().width(0).into()
-        };
-        page = page.push(
-            column![
-                checkbox(enabled)
-                    .label("Restore terminal output (encrypted)")
-                    .on_toggle_maybe(editable.then_some(move |enabled| {
-                        Desktop::Settings(Message::RestoreOutput(id, enabled))
-                    })),
-                row![
-                    text(format!("Lines of output per pane · {}", output.lines)),
-                    lines
-                ]
-                .spacing(8)
-                .align_y(Alignment::Center),
-                managed
-                    .is_some()
-                    .then(|| text("Managed by your organization.").size(13)),
-                text("Saving and restoring output requires an unlocked credential vault.").size(13),
-            ]
-            .spacing(6),
-        );
-        let imported = dialog
-            .draft
-            .preferences
-            .java_session_restore
-            .available(dialog.draft.restore.is_some(), &self.clipboard.policy);
-        if !imported.is_empty() {
-            page = page.push(
-                column![
-                    text("Imported Java session settings").size(14),
-                    imported
-                        .mode
-                        .map(|mode| text(format!("Startup mode · {mode}")).size(13)),
-                    imported.output.map(|enabled| text(if enabled {
-                        "Restore encrypted terminal output"
-                    } else {
-                        "Keep terminal output restoration off"
-                    })
-                    .size(13)),
-                    imported
-                        .lines
-                        .map(|lines| text(format!("Lines per pane · {lines}")).size(13)),
-                    button("Use imported settings")
-                        .on_press(Desktop::Settings(Message::UseJavaSessionRestore(id))),
-                ]
-                .spacing(4),
-            );
-        }
-        page = page.push(rule::horizontal(1)).push(highlighted(
-            dialog,
-            Setting::FixedGeometry,
-            dialog
-                .startup
-                .view(startup, dialog.input_target(Setting::FixedGeometry, true))
-                .map(move |edit| Desktop::Settings(Message::Startup(id, edit))),
-        ));
-        if let Some(controls) = transparency {
-            page = page.push(rule::horizontal(1)).push(highlighted(
-                dialog,
-                Setting::Transparency,
-                controls,
-            ));
-        }
-        page.spacing(12).into()
-    }
-}
-
-fn toolbar_size_scale(id: window::Id, size: u16) -> Element<'static, Desktop> {
-    const MAJOR_TICK: usize = 8;
-    let min = *TOOLBAR_ICON_SIZE.start();
-    let ticks = TOOLBAR_ICON_SIZE.fold(row![], |ticks, mark| {
-        let major = usize::from(mark - min).is_multiple_of(MAJOR_TICK);
-        ticks.push(
-            container(rule::vertical(1))
-                .center_x(Length::Fill)
-                .height(if major { 6 } else { 3 }),
-        )
-    });
-    let labels = TOOLBAR_ICON_SIZE
-        .step_by(MAJOR_TICK)
-        .fold(row![], |mut labels, mark| {
-            if mark != min {
-                labels = labels.push(space::horizontal());
-            }
-            labels.push(text(mark.to_string()).size(11).font(iced::Font::MONOSPACE))
-        });
-    column![
-        slider(TOOLBAR_ICON_SIZE, size, move |size| Desktop::Settings(
-            Message::ToolbarIconSize(id, size)
-        ))
-        .step(1_u16),
-        container(ticks).padding([0, 5]),
-        labels,
-    ]
-    .width(260)
-    .into()
 }
 
 fn update_grid_dimension(
@@ -4798,6 +4620,60 @@ fn save_preferences(preferences: &WindowSettings) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_snippet_defaults_rebase_an_untouched_settings_dialog() {
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.update_settings(Message::OpenAt(owner, Section::SnippetEditor));
+        workspace.settings.rebase_snippet_defaults(
+            super::super::ai_general_defaults::SnippetValues {
+                instructions: true,
+                alternatives: 8,
+            },
+        );
+        let dialog = workspace.settings.0.as_ref().unwrap();
+        assert_eq!(dialog.draft.preferences.snippet_alternative_count, Some(8));
+        assert_eq!(
+            dialog.initial.preferences.snippet_alternative_count,
+            Some(8)
+        );
+        assert!(
+            dialog
+                .draft
+                .preferences
+                .snippet_ai_additional_instructions()
+        );
+    }
+
+    #[test]
+    fn shared_snippet_defaults_reject_stale_settings_edits() {
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.update_settings(Message::OpenAt(owner, Section::SnippetEditor));
+        let id = workspace.settings.for_owner(owner).unwrap();
+        let _ = workspace.update_settings(Message::SnippetAlternativeCount(id, 6));
+        workspace.window_settings.snippet_alternative_count = Some(8);
+        workspace.settings.rebase_snippet_defaults(
+            super::super::ai_general_defaults::SnippetValues {
+                instructions: false,
+                alternatives: 8,
+            },
+        );
+        let _ = workspace.save_settings_to(id, |_| panic!("stale defaults reached persistence"));
+        assert!(
+            workspace
+                .settings
+                .0
+                .as_ref()
+                .unwrap()
+                .problem
+                .as_ref()
+                .unwrap()
+                .contains("changed in AI Manager")
+        );
+        assert_eq!(workspace.window_settings.snippet_alternative_count, Some(8));
+    }
 
     #[test]
     fn settings_keep_their_owner_and_route_close_requests_until_dismissed() {
@@ -5191,7 +5067,12 @@ mod tests {
         assert_eq!(search_matches("o").count(), 0);
         assert_eq!(
             search_matches("WÍNDOW restORE").collect::<Vec<_>>(),
-            [Setting::Restore]
+            [
+                Setting::Restore,
+                Setting::RestoreOutputLines,
+                Setting::ImportedSessionRestore,
+                Setting::RestoreOutput
+            ]
         );
         assert_eq!(
             search_matches("osc 133").collect::<Vec<_>>(),
@@ -5865,7 +5746,9 @@ mod tests {
         let _ = workspace.update_settings(Message::Search(id, "Fónt!".into()));
         let dialog = workspace.settings.0.as_ref().unwrap();
         assert_eq!(
-            dialog.search_results(false).next(),
+            dialog
+                .search_results(false, &workspace.clipboard.policy)
+                .next(),
             Some(SearchTarget::Page(Section::Font))
         );
         let _ = workspace.update_settings(Message::SearchChoose(id));
@@ -5915,7 +5798,7 @@ mod tests {
                     .0
                     .as_ref()
                     .unwrap()
-                    .search_results(false)
+                    .search_results(false, &workspace.clipboard.policy)
                     .next(),
                 Some(SearchTarget::Setting(setting)),
             );
@@ -6061,7 +5944,7 @@ mod tests {
 
         for (query, setting) in [
             ("terminal font size", Setting::FontSize),
-            ("fixed geometry", Setting::FixedGeometry),
+            ("fixed window width", Setting::FixedWidth),
         ] {
             let _ = workspace.update_settings(Message::Search(id, query.into()));
             let mut interface = UserInterface::build(

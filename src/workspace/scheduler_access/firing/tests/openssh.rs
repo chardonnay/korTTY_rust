@@ -1596,6 +1596,7 @@ fn save_pinned_target(
             name: "OpenSSH firing fixture".into(),
             tag: String::new(),
             login: SavedLogin {
+                preferences: Default::default(),
                 endpoint,
                 auth: Auth::KeyFile {
                     path: key,

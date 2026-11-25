@@ -335,6 +335,7 @@ mod tests {
                 name: "Reviewed fixture".into(),
                 tag: String::new(),
                 login: SavedLogin {
+                    preferences: Default::default(),
                     endpoint: LoginTarget {
                         host: "fixture.example".into(),
                         port: 22,

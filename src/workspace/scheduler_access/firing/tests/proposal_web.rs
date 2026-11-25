@@ -288,7 +288,8 @@ fn fresh_scheduled_web_evidence_is_reviewed_and_bound_to_one_firing() {
     profile::set_runtime_root(root.clone());
     let (model, _) = test_support::listener();
     let (ssh, _) = test_support::listener();
-    let config: Configuration = serde_json::from_value(json!({"profiles": {"profiles": [{
+    let config: Configuration = serde_json::from_value(json!({
+        "profiles": {"profiles": [{
         "id": 1, "name": "Local LM Studio", "model": "fixture:local",
         "connection_mode": "lm-studio", "trusted_local_endpoint": true,
         "endpoint": model.local_addr().unwrap().to_string(), "lm_web": {"mode": "tavily"}
@@ -794,7 +795,9 @@ pub(super) fn unattended_workspace_for_probe(
 ) -> (Workspace, window::Id, u64, PathBuf) {
     std::fs::create_dir(root).unwrap();
     profile::set_runtime_root(root.to_owned());
-    let config: Configuration = serde_json::from_value(json!({"profiles": {"profiles": [{
+    let config: Configuration = serde_json::from_value(json!({
+        "general":{"internet":{"searxng_url":"https://search.example.com/"}},
+        "profiles": {"profiles": [{
         "id": 1, "name": "Local LM Studio", "model": "fixture:local",
         "connection_mode": "lm-studio", "trusted_local_endpoint": true,
         "endpoint": model.local_addr().unwrap().to_string(), "lm_web": web,

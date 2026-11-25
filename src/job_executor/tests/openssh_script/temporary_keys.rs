@@ -140,6 +140,7 @@ fn openssh_scheduler_temporary_keys_authenticate_the_exact_target_and_jump() {
         resolve(&reference, profile, Some(&vault), true),
         pins.clone(),
     );
+    assert_logins(traces, [&jump, &target]);
     assert_eq!(
         completed.outcome,
         RunOutcome::Failed {
@@ -148,10 +149,37 @@ fn openssh_scheduler_temporary_keys_authenticate_the_exact_target_and_jump() {
         "{:?}",
         completed.detail
     );
-    assert_logins(traces, [&jump, &target]);
 
     if let Some(program) = std::env::var_os("KORTTY_RSYNC_TEST_PROGRAM") {
         let program = PathBuf::from(program).canonicalize().unwrap();
+        // Use the reviewed native rsync on the fixture server as well. The
+        // macOS system rsync does not support the client's secluded arguments.
+        let script = root.join("native-rsync-server.sh");
+        let mut directory = String::new();
+        crate::scheduler_window::script::shell_quote(
+            &mut directory,
+            program.parent().unwrap().to_str().unwrap(),
+        );
+        let sftp = [
+            "/usr/libexec/sftp-server",
+            "/usr/libexec/openssh/sftp-server",
+            "/usr/lib/openssh/sftp-server",
+        ]
+        .into_iter()
+        .find(|path| Path::new(path).is_file())
+        .expect("native SFTP fixture server");
+        fs::write(
+            &script,
+            format!(
+                "case \"$SSH_ORIGINAL_COMMAND\" in\n  internal-sftp) exec {sftp} ;;\nesac\nPATH={directory}:$PATH\nexport PATH\nexec /bin/sh -c \"$SSH_ORIGINAL_COMMAND\"\n"
+            ),
+        )
+        .unwrap();
+        let mut config = fs::OpenOptions::new()
+            .append(true)
+            .open(&target.config)
+            .unwrap();
+        writeln!(config, "ForceCommand /bin/sh \"{}\"", script.display()).unwrap();
         assert!(PathBuf::from(std::env::var_os("KORTTY_RSYNC_TEST_BRIDGE").unwrap()).is_file());
         let content = b"scheduled rsync through separately authorized temporary SSH keys\n";
         let source = root.join("fixture-source");

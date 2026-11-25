@@ -13,7 +13,7 @@ const MAX_ARGUMENTS: usize = 127;
 
 #[derive(Clone, Debug)]
 pub enum Edit {
-    Custom(bool),
+    SelectShell(Option<LocalShell>),
     Directory(String),
     Isolation(LocalIsolation),
     Program(String),
@@ -22,13 +22,41 @@ pub enum Edit {
     RemoveArgument(usize),
 }
 
-#[derive(Default)]
 pub(super) struct Draft {
+    shell_picker: iced::widget::Id,
+    program_field: iced::widget::Id,
+    argument_fields: Vec<iced::widget::Id>,
     custom: bool,
     directory: String,
     isolation: LocalIsolation,
     program: String,
     arguments: Vec<String>,
+}
+
+impl Default for Draft {
+    fn default() -> Self {
+        Self {
+            shell_picker: iced::widget::Id::unique(),
+            program_field: iced::widget::Id::unique(),
+            argument_fields: Vec::new(),
+            custom: false,
+            directory: String::new(),
+            isolation: LocalIsolation::default(),
+            program: String::new(),
+            arguments: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ShellChoice(Option<LocalShell>);
+impl std::fmt::Display for ShellChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(shell) => shell.fmt(f),
+            None => f.write_str("Custom command"),
+        }
+    }
 }
 
 impl Draft {
@@ -48,12 +76,17 @@ impl Draft {
             draft.program.clone_from(program);
             draft.arguments = arguments.to_vec();
         }
+        draft.argument_fields = draft
+            .arguments
+            .iter()
+            .map(|_| iced::widget::Id::unique())
+            .collect();
         draft
     }
 
     pub(super) fn update(&mut self, edit: Edit) {
         match edit {
-            Edit::Custom(custom) => self.custom = custom,
+            Edit::SelectShell(shell) => self.custom = shell.is_none(),
             Edit::Directory(directory) if directory.len() <= 4096 => self.directory = directory,
             Edit::Isolation(isolation) => self.isolation = isolation,
             Edit::Program(program) if self.custom && program.len() <= 8192 => {
@@ -61,6 +94,7 @@ impl Draft {
             }
             Edit::AddArgument if self.custom && self.arguments.len() < MAX_ARGUMENTS => {
                 self.arguments.push(String::new());
+                self.argument_fields.push(iced::widget::Id::unique());
             }
             Edit::Argument(index, value) if self.custom && value.len() <= 8192 => {
                 if let Some(argument) = self.arguments.get_mut(index) {
@@ -69,8 +103,23 @@ impl Draft {
             }
             Edit::RemoveArgument(index) if self.custom && index < self.arguments.len() => {
                 self.arguments.remove(index);
+                self.argument_fields.remove(index);
             }
             _ => {}
+        }
+    }
+
+    pub(super) fn edited_focus(&self, edit: &Edit) -> Option<iced::widget::Id> {
+        match edit {
+            Edit::AddArgument => self.argument_fields.last().cloned(),
+            Edit::RemoveArgument(index) => Some(
+                self.argument_fields
+                    .get(index.saturating_sub(1))
+                    .cloned()
+                    .unwrap_or_else(|| self.program_field.clone()),
+            ),
+            Edit::SelectShell(None) => Some(self.program_field.clone()),
+            _ => None,
         }
     }
 
@@ -106,7 +155,7 @@ impl Dialog {
             command: self.local.command(),
             working_directory: (!directory.is_empty()).then(|| PathBuf::from(directory)),
             shell_integration: self.shell_integration,
-            emulation: self.ssh.profile().term_name().into(),
+            emulation: self.local_emulation.term_name().into(),
             terminal_effect: saved.and_then(|saved| saved.terminal_effect),
             terminal: saved.map_or_else(Default::default, |saved| saved.terminal.clone()),
         };
@@ -119,7 +168,9 @@ impl Dialog {
 
 impl Workspace {
     pub(super) fn quick_local_view<'a>(&self, dialog: &'a Dialog) -> Element<'a, Message> {
+        use crate::workspace::dialog_design::{keyboard_table, secondary_button};
         let draft = &dialog.local;
+        let enabled = dialog.protocol == super::Protocol::Local;
         let folder = dialog.selected_local.and_then(|id| {
             let store = dialog.store.as_ref()?;
             store
@@ -131,89 +182,139 @@ impl Workspace {
             folder,
             self.clipboard.policy.minimum_isolation,
         );
+        let mut shells = available_local_shells();
+        if !shells.contains(&dialog.local_shell) {
+            shells.push(dialog.local_shell);
+        }
+        let selected = ShellChoice((!draft.custom).then_some(dialog.local_shell));
+        let shell: Element<'a, Message> = if enabled {
+            pick_list(
+                shells
+                    .into_iter()
+                    .map(|v| ShellChoice(Some(v)))
+                    .chain(std::iter::once(ShellChoice(None)))
+                    .collect::<Vec<_>>(),
+                Some(selected),
+                |v| Message::Local(Edit::SelectShell(v.0)),
+            )
+            .width(180)
+            .text_size(13)
+            .keyboard_navigation(draft.shell_picker.clone())
+            .on_open(Message::FocusWidget(draft.shell_picker.clone()))
+            .into()
+        } else {
+            button(row![
+                text(selected.to_string())
+                    .size(13)
+                    .width(iced::Length::Fill),
+                text("▾").size(13)
+            ])
+            .width(180)
+            .style(secondary_button)
+            .into()
+        };
         let mut fields = column![
+            labeled("Shell", shell),
             labeled(
-                "",
-                checkbox(draft.custom)
-                    .label("Run a custom program")
-                    .on_toggle(|custom| Message::Local(Edit::Custom(custom))),
-            ),
-            labeled(
-                "Starting directory",
-                text_input("Absolute path (optional)", &draft.directory)
-                    .on_input(|path| Message::Local(Edit::Directory(path))),
-            ),
-            labeled(
-                "Session isolation",
-                pick_list(LocalIsolation::ALL, Some(draft.isolation), |value| {
-                    Message::Local(Edit::Isolation(value))
-                })
-            ),
-            text(format!("Effective isolation · {isolation} · {source}")).size(13),
-        ]
-        .spacing(8);
-        if draft.custom {
-            fields = fields.push(labeled(
-                "Executable",
+                "Custom command",
                 text_input("Executable path or name", &draft.program)
-                    .on_input(|program| Message::Local(Edit::Program(program))),
-            ));
+                    .style(crate::workspace::dialog_design::form_input)
+                    .size(13)
+                    .id(draft.program_field.clone())
+                    .on_input_maybe(
+                        (enabled && draft.custom).then_some(|v| Message::Local(Edit::Program(v)))
+                    )
+            ),
+        ]
+        .spacing(10);
+        if draft.custom {
             for (index, argument) in draft.arguments.iter().enumerate() {
                 fields = fields.push(labeled(
-                    "",
+                    "Argument",
                     row![
-                        text_input(&format!("Argument {}", index + 1), argument)
-                            .on_input(move |value| Message::Local(Edit::Argument(index, value))),
-                        button("Remove").on_press(Message::Local(Edit::RemoveArgument(index))),
+                        text_input("Exact argument", argument)
+                            .style(crate::workspace::dialog_design::form_input)
+                            .size(13)
+                            .id(draft.argument_fields[index].clone())
+                            .on_input_maybe(
+                                enabled
+                                    .then_some(move |v| Message::Local(Edit::Argument(index, v)))
+                            ),
+                        keyboard_table::action(
+                            button(text("Remove").size(13))
+                                .on_press_maybe(
+                                    enabled.then_some(Message::Local(Edit::RemoveArgument(index)))
+                                )
+                                .into(),
+                            enabled.then_some(Message::Local(Edit::RemoveArgument(index))),
+                            true
+                        ),
                     ]
                     .spacing(8),
                 ));
             }
+            let add = (enabled && draft.arguments.len() < MAX_ARGUMENTS)
+                .then_some(Message::Local(Edit::AddArgument));
             fields = fields.push(labeled(
                 "",
-                button("Add argument").on_press_maybe(
-                    (draft.arguments.len() < MAX_ARGUMENTS)
-                        .then_some(Message::Local(Edit::AddArgument)),
+                keyboard_table::action(
+                    button(text("Add argument").size(13))
+                        .on_press_maybe(add.clone())
+                        .into(),
+                    add,
+                    true,
                 ),
             ));
-        } else {
-            let mut shells = available_local_shells();
-            if !shells.contains(&dialog.local_shell) {
-                shells.push(dialog.local_shell);
-            }
-            fields = fields.push(labeled(
-                "Shell",
-                pick_list(shells, Some(dialog.local_shell), Message::LocalShell),
-            ));
         }
-        let command = draft.command();
-        let integration = self.quick_shell_integration_for_command(
-            dialog.local_emulation,
-            draft.shell(dialog.local_shell),
-            command.as_deref(),
-            Some(isolation),
-        );
         fields = fields.push(labeled(
-            "Shell integration",
-            checkbox(dialog.shell_integration)
-                .label("Add shell integration automatically")
-                .on_toggle_maybe(
-                    (dialog.shell_integration || integration.is_ok())
-                        .then_some(Message::ShellIntegration),
-                ),
+            "Start directory",
+            text_input("Absolute path (optional)", &draft.directory)
+                .style(crate::workspace::dialog_design::form_input)
+                .size(13)
+                .on_input_maybe(enabled.then_some(|v| Message::Local(Edit::Directory(v)))),
         ));
-        if let Err(reason) = integration {
-            fields = fields.push(text(reason).size(13));
-        }
-        if dialog.selected_local.is_some() {
-            fields = fields.push(button("Use an unsaved shell").on_press(Message::AdHocLocal));
-        }
-        if let Some(profile) = dialog.local_profile() {
-            if let Err(error) = profile.validate() {
-                fields = fields.push(text(error.to_string()).size(13));
+        if enabled {
+            fields = fields
+                .push(labeled(
+                    "Session isolation",
+                    pick_list(LocalIsolation::ALL, Some(draft.isolation), |v| {
+                        Message::Local(Edit::Isolation(v))
+                    })
+                    .text_size(13),
+                ))
+                .push(text(format!("Effective isolation · {isolation} · {source}")).size(12));
+            let command = draft.command();
+            let integration = self.quick_shell_integration_for_command(
+                dialog.local_emulation,
+                draft.shell(dialog.local_shell),
+                command.as_deref(),
+                Some(isolation),
+            );
+            fields = fields.push(labeled(
+                "Shell integration",
+                checkbox(dialog.shell_integration)
+                    .label("Add shell integration automatically")
+                    .text_size(13)
+                    .on_toggle_maybe(
+                        (dialog.shell_integration || integration.is_ok())
+                            .then_some(Message::ShellIntegration),
+                    ),
+            ));
+            if let Err(reason) = integration {
+                fields = fields.push(text(reason).size(12));
             }
-        } else {
-            fields = fields.push(text("This saved shell no longer exists.").size(13));
+            if dialog.selected_local.is_some() {
+                fields = fields.push(
+                    button(text("Use an unsaved shell").size(13)).on_press(Message::AdHocLocal),
+                );
+            }
+            if let Some(profile) = dialog.local_profile() {
+                if let Err(error) = profile.validate() {
+                    fields = fields.push(text(error.to_string()).size(12));
+                }
+            } else {
+                fields = fields.push(text("This saved shell no longer exists.").size(12));
+            }
         }
         fields.into()
     }
@@ -228,8 +329,42 @@ mod tests {
     use super::*;
     use crate::workspace::quick_connect::{Protocol, Store};
 
+    fn private_profile(name: &str) -> bool {
+        const PROFILE: &str = "KORTTY_QUICK_LOCAL_TEST_PROFILE";
+        if let Some(root) = std::env::var_os(PROFILE) {
+            crate::profile::set_runtime_root(PathBuf::from(root));
+            return true;
+        }
+        // Connecting also persists appearance defaults. Keep that real write
+        // and the fixture's Sandbox preference out of sibling tests' profile.
+        let scratch = crate::snippets::tests::Profile::new();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--include-ignored", "--nocapture"])
+            .env(PROFILE, &scratch.0)
+            .env("TMPDIR", &scratch.0)
+            .env("TMP", &scratch.0)
+            .env("TEMP", &scratch.0)
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success() && String::from_utf8_lossy(&child.stdout).contains("1 passed"),
+            "{}\n{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        false
+    }
+
     #[test]
     fn quick_local_shell_runs_with_edited_arguments_and_directory_without_changing_the_profile() {
+        if private_profile(
+            "workspace::quick_connect::local::tests::quick_local_shell_runs_with_edited_arguments_and_directory_without_changing_the_profile",
+        ) {
+            check_local_shell();
+        }
+    }
+
+    fn check_local_shell() {
         use crate::session_security::IsolationLevel;
         let scratch = crate::snippets::tests::Profile::new();
         let directory = scratch.0.join("quick launch");
@@ -327,7 +462,13 @@ mod tests {
             }
             assert!(
                 Instant::now() < deadline,
-                "Local command output: {output:?}"
+                "Local command output: {output:?}; status: {:?}; grid: {}x{}; cells: {}; PID: {:?}; directory: {:?}",
+                frame.status,
+                frame.screen.columns,
+                frame.screen.rows,
+                frame.screen.cells.len(),
+                pane.session.local_shell_pid(),
+                settings.working_directory,
             );
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -341,5 +482,32 @@ mod tests {
             original.command.as_ref().unwrap().last().unwrap(),
             "original.txt"
         );
+        let preferences = crate::workspace::tab_titles::WindowSettings::read(
+            &crate::profile::window_settings_path().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            preferences.default_session_isolation,
+            Some(IsolationLevel::Sandbox)
+        );
+    }
+
+    #[test]
+    #[ignore = "native PTY concurrency investigation; run explicitly on the test desktop"]
+    fn quick_local_short_commands_survive_same_process_concurrency() {
+        if !private_profile(
+            "workspace::quick_connect::local::tests::quick_local_short_commands_survive_same_process_concurrency",
+        ) {
+            return;
+        }
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..32 {
+                        check_local_shell();
+                    }
+                });
+            }
+        });
     }
 }

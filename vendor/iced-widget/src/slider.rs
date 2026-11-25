@@ -91,6 +91,7 @@ where
     default: Option<T>,
     on_change: Box<dyn Fn(T) -> Message + 'a>,
     on_release: Option<Message>,
+    disabled: bool,
     width: Length,
     height: f32,
     class: Theme::Class<'a>,
@@ -138,6 +139,7 @@ where
             shift_step: None,
             on_change: Box::new(on_change),
             on_release: None,
+            disabled: false,
             width: Length::Fill,
             height: Self::DEFAULT_HEIGHT,
             class: Theme::default(),
@@ -161,6 +163,12 @@ where
     /// the default on_change message could create too many events.
     pub fn on_release(mut self, on_release: Message) -> Self {
         self.on_release = Some(on_release);
+        self
+    }
+
+    /// Disables pointer, touch, wheel, and keyboard interaction without hiding the slider.
+    pub fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
         self
     }
 
@@ -253,6 +261,11 @@ where
         _viewport: &Rectangle,
     ) {
         let state = tree.state.downcast_mut::<State>();
+        if self.disabled {
+            state.is_dragging = false;
+            self.status = Some(Status::Active);
+            return;
+        }
 
         let mut update = || {
             let current_value = self.value;
@@ -530,6 +543,9 @@ where
         _viewport: &Rectangle,
         _renderer: &Renderer,
     ) -> mouse::Interaction {
+        if self.disabled {
+            return mouse::Interaction::default();
+        }
         let state = tree.state.downcast_ref::<State>();
 
         if state.is_dragging {

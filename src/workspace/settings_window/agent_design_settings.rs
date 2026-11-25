@@ -23,6 +23,8 @@ use crate::workspace::terminal_agent::design::{
 use super::{Desktop, Message, agent_design_name::Operation as NameOperation};
 
 mod module_table;
+#[cfg(test)]
+mod picker_overlay_tests;
 mod preview;
 
 const TABLE_TEXT_SIZE: f32 = 13.0;
@@ -389,12 +391,15 @@ impl Editor {
                 pick_list(choices, display_choice, move |choice| msg(Edit::Select(
                     choice.id
                 )))
+                .keyboard_navigation(combination_picker_id(id))
                 .width(260)
                 .text_size(13),
                 text(Preset::from_id(selected).map_or("Custom combination", Preset::description))
                     .size(13),
-                tooltip::Position::Bottom,
-            ),
+                tooltip::Position::Top,
+            )
+            .hide_on_content_overlay(true)
+            .style(container::rounded_box),
             option(
                 "New",
                 catalog
@@ -449,12 +454,41 @@ impl Editor {
                 .wrap()
             });
 
-        let mut last_role = "";
-        let modules = column(
-            Module::choices()
-                .into_iter()
-                .enumerate()
-                .map(|(index, module)| {
+        let delay = preferences.agent_status_auto_hide_seconds();
+        use crate::workspace::dialog_design::number_step;
+        let options = row![
+            text("Hide the status bar after a run (seconds, 0 = keep):").size(13),
+            text_input(
+                "0–60",
+                self.delay_input.as_deref().unwrap_or(&delay.to_string())
+            )
+            .width(52)
+            .size(13)
+            .on_input(move |input| msg(Edit::AutoHideInput(input))),
+            column![
+                number_step(
+                    "▴",
+                    (delay < *AUTO_HIDE_SECONDS.end()).then(|| msg(Edit::AutoHide(delay + 1)))
+                ),
+                number_step("▾", (delay > 0).then(|| msg(Edit::AutoHide(delay - 1)))),
+            ],
+            checkbox(
+                preferences
+                    .ai_agent_design_reduced_animations
+                    .unwrap_or_default()
+            )
+            .size(17)
+            .text_size(13)
+            .label("Reduce animations")
+            .on_toggle(move |reduced| msg(Edit::ReducedAnimations(reduced))),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center)
+        .wrap();
+        let center = responsive(move |size| {
+            let mut last_role = "";
+            let modules = column(Module::choices().into_iter().enumerate().map(
+                |(index, module)| {
                     let mut changed = layout;
                     module.apply(&mut changed);
                     let active = changed == layout;
@@ -491,82 +525,63 @@ impl Editor {
                         crate::workspace::dialog_design::table_row(theme, selected, index % 2 != 0)
                     })
                     .into()
-                }),
-        );
-        let table = column![
-            container(
+                },
+            ));
+            let table = column![
+                container(
+                    row![
+                        container(text("Active").size(TABLE_TEXT_SIZE).font(TABLE_HEADER_FONT))
+                            .center_x(54),
+                        rule::vertical(1),
+                        module_row("Role", "No.", "Design".into(), "Description", true),
+                    ]
+                    .align_y(Alignment::Center)
+                )
+                .height(26)
+                .center_y(26)
+                .style(crate::workspace::dialog_design::header),
+                container(
+                    scrollable(modules)
+                        .id(module_list_id(id))
+                        .spacing(2)
+                        .height(Length::Fill)
+                )
+                .style(crate::workspace::dialog_design::sidebar),
+            ]
+            .height(420);
+            let table = module_table::view(
+                table.into(),
+                self.preview_module,
+                custom || catalog.can_duplicate(),
+                selected,
+                msg,
+            );
+            let preview = preview::view(
+                &self.demo,
+                self.preview_layout(catalog, preset),
+                dock,
+                delay,
+                !preferences.agent_animations(),
+                self.show_preview_options,
+                id,
+            );
+            const GAP: f32 = 12.0;
+            const TABLE_MIN_WIDTH: f32 = 470.0;
+            const PREVIEW_MIN_WIDTH: f32 = 280.0;
+            if size.width < TABLE_MIN_WIDTH + PREVIEW_MIN_WIDTH + GAP {
+                column![table, preview].spacing(GAP).into()
+            } else {
+                let table_width = ((size.width - GAP) * 7.0 / 15.0).max(TABLE_MIN_WIDTH);
                 row![
-                    container(text("Active").size(TABLE_TEXT_SIZE).font(TABLE_HEADER_FONT))
-                        .center_x(54),
-                    rule::vertical(1),
-                    module_row("Role", "No.", "Design".into(), "Description", true),
+                    container(table).width(table_width),
+                    container(preview).width(Length::Fill),
                 ]
-                .align_y(Alignment::Center)
-            )
-            .height(26)
-            .center_y(26)
-            .style(crate::workspace::dialog_design::header),
-            container(
-                scrollable(modules)
-                    .id(module_list_id(id))
-                    .spacing(2)
-                    .height(Length::Fill)
-            )
-            .style(crate::workspace::dialog_design::sidebar),
-        ]
-        .height(420);
-        let table = module_table::view(
-            table.into(),
-            self.preview_module,
-            custom || catalog.can_duplicate(),
-            selected,
-            msg,
-        );
-        let delay = preferences.agent_status_auto_hide_seconds();
-        use crate::workspace::dialog_design::number_step;
-        let options = row![
-            text("Hide the status bar after a run (seconds, 0 = keep):").size(13),
-            text_input(
-                "0–60",
-                self.delay_input.as_deref().unwrap_or(&delay.to_string())
-            )
-            .width(52)
-            .size(13)
-            .on_input(move |input| msg(Edit::AutoHideInput(input))),
-            column![
-                number_step(
-                    "▴",
-                    (delay < *AUTO_HIDE_SECONDS.end()).then(|| msg(Edit::AutoHide(delay + 1)))
-                ),
-                number_step("▾", (delay > 0).then(|| msg(Edit::AutoHide(delay - 1)))),
-            ],
-            checkbox(
-                preferences
-                    .ai_agent_design_reduced_animations
-                    .unwrap_or_default()
-            )
-            .size(17)
-            .text_size(13)
-            .label("Reduce animations")
-            .on_toggle(move |reduced| msg(Edit::ReducedAnimations(reduced))),
-        ]
-        .spacing(10)
-        .align_y(Alignment::Center)
-        .wrap();
-        let preview = preview::view(
-            &self.demo,
-            self.preview_layout(catalog, preset),
-            dock,
-            delay,
-            !preferences.agent_animations(),
-            self.show_preview_options,
-            id,
-        );
-        let center = row![
-            container(table).width(Length::FillPortion(7)),
-            container(preview).width(Length::FillPortion(8)),
-        ]
-        .spacing(12);
+                .spacing(GAP)
+                .into()
+            }
+        })
+        .height(Length::Shrink);
+
         let dock_options = self.show_preview_options.then(|| {
             row![
                 text("Agent panel placement").size(13),
@@ -707,15 +722,19 @@ fn module_list_id(id: window::Id) -> Id {
     Id::from(format!("agent-design-modules/{id:?}"))
 }
 
+fn combination_picker_id(id: window::Id) -> Id {
+    Id::from(format!("agent-design-combination/{id:?}"))
+}
+
 fn module_row_id(id: window::Id, module: Module) -> Id {
     Id::from(format!("agent-design-modules/{id:?}/{module:?}"))
 }
 
-pub(super) fn reveal_module(id: window::Id, module: Module) -> Task<Desktop> {
-    crate::workspace::coding_agents::roster_scroll::reveal_row(
-        module_list_id(id),
-        module_row_id(id, module),
-    )
+pub(super) fn reveal_module(id: window::Id, module: Module, page: Id) -> Task<Desktop> {
+    use crate::workspace::dialog_design::scroll::{reveal_nested_row, reveal_row};
+    let list = module_list_id(id);
+    let row = module_row_id(id, module);
+    reveal_row(list.clone(), row.clone()).chain(reveal_nested_row(page, list, row))
 }
 
 pub(super) fn focus_preview(id: window::Id, page: Id, backwards: bool) -> Task<Desktop> {
@@ -733,6 +752,197 @@ pub(super) fn focus_preview(id: window::Id, page: Id, backwards: bool) -> Task<D
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn combination_picker_dismisses_before_the_dialog_and_selects_with_the_keyboard() {
+        use iced::advanced::widget::{Operation, Tree, operation};
+        use iced::advanced::{Layout as WidgetLayout, clipboard, layout};
+        use iced::keyboard::{self, Key, Location, Modifiers, key};
+        use iced::{Event, Point, Rectangle, Renderer, Theme, event, mouse};
+        use iced_runtime::{UserInterface, user_interface::Cache};
+
+        struct PickerBounds(Id, Option<Rectangle>);
+        impl Operation for PickerBounds {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&Id>,
+                bounds: Rectangle,
+                _: &mut dyn operation::Focusable,
+            ) {
+                if id == Some(&self.0) {
+                    self.1 = Some(bounds);
+                }
+            }
+        }
+        let key = |named| {
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key: Key::Named(named),
+                modified_key: Key::Named(named),
+                physical_key: key::Physical::Unidentified(key::NativeCode::Unidentified),
+                location: Location::Standard,
+                modifiers: Modifiers::empty(),
+                text: None,
+                repeat: false,
+            })
+        };
+        let id = window::Id::unique();
+        let editor = Editor::default();
+        let preferences = WindowSettings::default();
+        let size = Size::new(940.0, 480.0);
+        let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+        let mut view = crate::workspace::dialog_placement::escape::on_escape(
+            editor.view(&preferences, id),
+            Desktop::Settings(Message::Escape(id)),
+        );
+        let mut tree = Tree::new(view.as_widget());
+        let node = view.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, size),
+        );
+        let mut bounds = PickerBounds(combination_picker_id(id), None);
+        view.as_widget_mut()
+            .operate(&mut tree, WidgetLayout::new(&node), &renderer, &mut bounds);
+        let picker = bounds.1.expect("focusable combination picker").center();
+        let mut ui: UserInterface<'_, Desktop, Theme, Renderer> =
+            UserInterface::build(view, size, Cache::default(), &mut renderer);
+        let mut dispatch = |event, cursor: Option<Point>| {
+            let mut messages = Vec::new();
+            let (_, statuses) = ui.update(
+                &[event],
+                cursor.map_or(mouse::Cursor::Unavailable, mouse::Cursor::Available),
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            assert_eq!(statuses, [event::Status::Captured]);
+            messages
+        };
+        let click = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        assert!(dispatch(click.clone(), Some(picker)).is_empty());
+        assert!(dispatch(key(key::Named::Escape), None).is_empty());
+        assert!(matches!(
+            dispatch(key(key::Named::Escape), None).as_slice(),
+            [Desktop::Settings(Message::Escape(surface))] if *surface == id
+        ));
+        assert!(dispatch(click, Some(picker)).is_empty());
+        assert!(dispatch(key(key::Named::End), None).is_empty());
+        assert!(matches!(
+            dispatch(key(key::Named::Enter), None).as_slice(),
+            [Desktop::Settings(Message::AgentDesignCatalog(surface, Edit::Select(choice)))]
+                if *surface == id && choice == Preset::Floating.id()
+        ));
+    }
+
+    #[test]
+    fn keyboard_module_reveal_keeps_the_row_inside_both_scroll_viewports() {
+        use iced::advanced::widget::{Operation, Tree, operation};
+        use iced::advanced::{Layout as WidgetLayout, layout};
+        use iced::futures::{StreamExt, executor::block_on};
+        use iced::{Rectangle, Renderer, Vector};
+
+        struct Position {
+            page: Id,
+            list: Id,
+            row: Id,
+            viewport: Rectangle,
+            row_bounds: Rectangle,
+            page_scroll: Vector,
+            list_scroll: Vector,
+        }
+        impl Operation for Position {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
+                if id == Some(&self.row) {
+                    self.row_bounds = bounds;
+                }
+            }
+            fn scrollable(
+                &mut self,
+                id: Option<&Id>,
+                bounds: Rectangle,
+                _: Rectangle,
+                translation: Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                if id == Some(&self.page) {
+                    self.viewport = bounds;
+                    self.page_scroll = translation;
+                }
+                if id == Some(&self.list) {
+                    self.list_scroll = translation;
+                }
+            }
+        }
+
+        for (width, height) in [(940.0, 280.0), (620.0, 240.0)] {
+            let id = window::Id::unique();
+            let page = Id::unique();
+            let preferences = WindowSettings::default();
+            let module = Module::Arrangement(Arrangement::Adaptive);
+            let editor = Editor {
+                preview_module: Some(module),
+                ..Default::default()
+            };
+            let renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+            let mut view: Element<'_, Desktop> = scrollable(editor.view(&preferences, id))
+                .id(page.clone())
+                .height(Length::Fill)
+                .into();
+            let mut tree = Tree::new(view.as_widget());
+            let node = view.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(width, height)),
+            );
+            let mut apply = |operation: &mut dyn Operation| {
+                view.as_widget_mut().operate(
+                    &mut tree,
+                    WidgetLayout::new(&node),
+                    &renderer,
+                    operation,
+                );
+            };
+            let mut position = Position {
+                page: page.clone(),
+                list: module_list_id(id),
+                row: module_row_id(id, module),
+                viewport: Rectangle::default(),
+                row_bounds: Rectangle::default(),
+                page_scroll: Vector::ZERO,
+                list_scroll: Vector::ZERO,
+            };
+            apply(&mut position);
+            assert!(position.row_bounds.y > position.viewport.y + position.viewport.height);
+            let mut actions =
+                iced_runtime::task::into_stream(reveal_module(id, module, page)).unwrap();
+            while let Some(iced_runtime::Action::Widget(mut operation)) = block_on(actions.next()) {
+                loop {
+                    apply(operation.as_mut());
+                    let operation::Outcome::Chain(next) = operation.finish() else {
+                        break;
+                    };
+                    operation = next;
+                }
+            }
+            apply(&mut position);
+            let top = position.row_bounds.y - position.page_scroll.y - position.list_scroll.y;
+            assert!(
+                top >= position.viewport.y - 0.5,
+                "{width} × {height}: {top}"
+            );
+            assert!(
+                top + position.row_bounds.height
+                    <= position.viewport.y + position.viewport.height + 0.5,
+                "{width} × {height}: {top}"
+            );
+        }
+    }
 
     #[test]
     fn module_description_fits_its_measured_width_and_preserves_utf8() {

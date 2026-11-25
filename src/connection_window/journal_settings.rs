@@ -5,7 +5,7 @@ use crate::session_journal::{
     ConnectionConfig, DEFAULT_PART_LIMIT, MAX_CONNECTION_JOURNAL_PARTS, MAX_PART_MIB,
     MAX_SUMMARY_MINUTES,
 };
-use crate::workspace::dialog_design::number_input;
+use crate::workspace::dialog_design::{keyboard_table, number_input};
 
 const LABEL_WIDTH: f32 = 260.0;
 const INPUT_WIDTH: f32 = 96.0;
@@ -146,20 +146,24 @@ impl Draft {
             row![label, input].spacing(10).align_y(Alignment::Center)
         };
         column![
-            checkbox(enabled)
+            keyboard_table::action(checkbox(enabled)
                 .label("Enable session journal for this connection")
                 .text_size(13)
-                .on_toggle_maybe((policy.allowed && !policy.required).then_some(Edit::Auto)),
+                .on_toggle_maybe((policy.allowed && !policy.required).then_some(Edit::Auto))
+                .into(),
+                (policy.allowed && !policy.required).then_some(Edit::Auto(!enabled)), false),
             rule::horizontal(1),
             column![
-                checkbox(self.settings.capture_input)
+                keyboard_table::action(checkbox(self.settings.capture_input)
                     .label("Capture typed commands at recognized shell prompts")
                     .text_size(13)
-                    .on_toggle_maybe(options_editable.then_some(Edit::Input)),
-                checkbox(policy.summaries_allowed && self.settings.ai_summaries)
+                    .on_toggle_maybe(options_editable.then_some(Edit::Input)).into(),
+                    options_editable.then_some(Edit::Input(!self.settings.capture_input)), false),
+                keyboard_table::action(checkbox(policy.summaries_allowed && self.settings.ai_summaries)
                     .label("Generate AI summaries")
                     .text_size(13)
-                    .on_toggle_maybe(summary_editable.then_some(Edit::Summaries)),
+                    .on_toggle_maybe(summary_editable.then_some(Edit::Summaries)).into(),
+                    summary_editable.then_some(Edit::Summaries(!self.settings.ai_summaries)), false),
                 field(
                     "Summary interval (min, 0 = global default)",
                     interval_editable,
@@ -230,6 +234,128 @@ fn bounded(raw: &str, min: u32, max: u32) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings_search::test_input;
+    use iced::advanced::widget::operation::focusable;
+    use iced::advanced::widget::{Operation, operation};
+    use iced::keyboard::{Key, key::Named};
+    use iced::{Font, Renderer, Size};
+    use iced_runtime::{Action, UserInterface, task, user_interface::Cache};
+
+    fn next(interface: &mut UserInterface<'_, Edit, iced::Theme, Renderer>, renderer: &Renderer) {
+        test_input::apply(
+            interface,
+            renderer,
+            task::effect(Action::widget(focusable::focus_next())),
+        );
+    }
+
+    #[test]
+    fn keyboard_reaches_enabled_journal_options_and_skips_disabled_options() {
+        let mut draft = Draft::new(ConnectionConfig::default());
+        let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+        {
+            let mut interface = UserInterface::build(
+                draft.view(Policy::default()),
+                Size::new(820.0, 600.0),
+                Cache::default(),
+                &mut renderer,
+            );
+            next(&mut interface, &renderer);
+            let messages = test_input::press(
+                &mut interface,
+                &mut renderer,
+                Key::Named(Named::Space),
+                None,
+            );
+            assert!(matches!(messages.as_slice(), [Edit::Auto(true)]));
+            // Only the enable switch participates while the journal is off.
+            let mut count = operation::map(focusable::count(), |count| {
+                assert_eq!(count.total, 1);
+            });
+            interface.operate(&renderer, &mut count);
+            assert!(matches!(count.finish(), operation::Outcome::Some(())));
+        }
+        draft.update(Edit::Auto(true));
+        let mut interface = UserInterface::build(
+            draft.view(Policy::default()),
+            Size::new(820.0, 600.0),
+            Cache::default(),
+            &mut renderer,
+        );
+        next(&mut interface, &renderer);
+        next(&mut interface, &renderer);
+        assert!(matches!(
+            test_input::press(
+                &mut interface,
+                &mut renderer,
+                Key::Named(Named::Space),
+                None
+            )
+            .as_slice(),
+            [Edit::Input(true)]
+        ));
+        next(&mut interface, &renderer);
+        assert!(matches!(
+            test_input::press(
+                &mut interface,
+                &mut renderer,
+                Key::Named(Named::Space),
+                None
+            )
+            .as_slice(),
+            [Edit::Summaries(false)]
+        ));
+        next(&mut interface, &renderer);
+        assert!(
+            matches!(test_input::press(&mut interface, &mut renderer, Key::Named(Named::ArrowUp), None).as_slice(), [Edit::Interval(value)] if value == "1")
+        );
+    }
+
+    #[test]
+    fn keyboard_skips_managed_switches_and_respects_the_rotation_limit() {
+        let draft = Draft::new(ConnectionConfig::default());
+        let policy = Policy {
+            required: true,
+            summaries_allowed: false,
+            max_parts: Some(20),
+            ..Policy::default()
+        };
+        let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+        let mut interface = UserInterface::build(
+            draft.view(policy),
+            Size::new(820.0, 600.0),
+            Cache::default(),
+            &mut renderer,
+        );
+        next(&mut interface, &renderer);
+        assert!(matches!(
+            test_input::press(
+                &mut interface,
+                &mut renderer,
+                Key::Named(Named::Space),
+                None
+            )
+            .as_slice(),
+            [Edit::Input(true)]
+        ));
+        next(&mut interface, &renderer);
+        assert!(
+            matches!(test_input::press(&mut interface, &mut renderer, Key::Named(Named::ArrowUp), None).as_slice(), [Edit::PartSize(value)] if value == "26")
+        );
+        next(&mut interface, &renderer);
+        assert!(
+            test_input::press(
+                &mut interface,
+                &mut renderer,
+                Key::Named(Named::ArrowUp),
+                None
+            )
+            .is_empty()
+        );
+        assert!(
+            matches!(test_input::press(&mut interface, &mut renderer, Key::Named(Named::ArrowDown), None).as_slice(), [Edit::Parts(value)] if value == "19")
+        );
+    }
 
     #[test]
     fn journal_rotation_editor_keeps_java_sized_values() {

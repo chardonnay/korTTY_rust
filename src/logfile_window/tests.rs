@@ -71,6 +71,7 @@ fn saved_log_folders_are_discovered_once_and_protect_manual_entries() {
                 name: name.into(),
                 tag: String::new(),
                 login: SavedLogin {
+                    preferences: Default::default(),
                     endpoint: LoginTarget {
                         host: "example.test".into(),
                         port: 22,

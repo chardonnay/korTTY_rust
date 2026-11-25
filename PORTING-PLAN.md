@@ -1,38 +1,418 @@
 # Remaining Java-to-Rust porting plan
 
-Porting plan reconciled on 2026-11-24. This plan tracks the scope agreed in
+Reviewed against the porting worktree on 2026-11-25. The agreed scope is in
 [HANDOFF.md](HANDOFF.md). The [parity record](PORTING-PARITY.md) identifies the
-source and environment for earlier checks. Paths under `target/verification/`
-are local to the checkout that ran the tests. Historical logs referenced
-by this plan are available in the original main checkout when absent from
-the porting worktree.
+revisions, environments and results of completed checks. Raw logs and images
+under `target/verification/` are local to the producing checkout. Older artifact
+paths shown as code identify files to retrieve onto this desktop when needed.
 
 ## Current result and actionable backlog
 
-**Java v2.26.0 parity remains partial.** On November 24 the tagged Java
-reference was `b235d91f2035`, Rust `origin/main` was `91de908a`
-(PR #35), and the porting branch had 39 further commits through
-`b1a2ed68`. The SFTP Settings changes are also present in the worktree
-and await visual acceptance. The [last full three-platform test run](PORTING-PARITY.md#november-23-full-native-workspace-tests)
-covers `ab5b101e`. Later results cover the features named in each record.
+**Parity with Java v2.26.0 is partial.** The Java reference is
+`b235d91f2035`. This checkpoint builds on `82fac4bea8ee` (PR #37).
+The last recorded complete three-platform workspace
+suites ran on `ab5b101e`. Later native checks cover the application or feature
+named in each record. [Three-platform workspace results](PORTING-PARITY.md#november-23-full-native-workspace-tests)
+
+### Current test availability
+
+Run every macOS check, including new GUI designs, on this Apple Silicon desktop.
+The user deferred all Windows testing while the test desktop is reinstalled.
+Resume Windows ARM64 checks once the user makes the test desktop available.
+Earlier Windows comparisons retain their original scope and revision.
+Track native Wayland and X11 separately. Real IBM/HP systems and physical serial
+equipment remain user-deferred.
 
 ### Next milestones in priority order
 
-| Order | Deliverable | Completion check |
+| Order and status | Deliverable | Completion check |
 | --- | --- | --- |
-| **1** | **Finish Settings → SFTP on Windows ARM64 (D4/V2).** Compare the running Rust page with Java at the same size, theme and scale. Add the two missing Settings entries for the external editor and the Scheduler rsync executable in their Java positions. Connect them to the existing native program reviews. | Both entries are discoverable from an unopened page. Check keyboard focus, Cancel, Save and reopen. Compare the disabled timeout and managed parallel-transfer limit in both applications. Verify that choosing an executable still requires the applicable approval before use. Record the paired views and results. [SFTP Settings evidence](PORTING-PARITY.md#november-24-sftp-settings-layout-and-search) |
-| **2** | **Finish the primary dialogs (D2/D4/A2/B4/Q1).** Start with Security, the Connection Manager and its SSH editor, Quick Connect and the Scheduler route picker. Continue with Settings and AI Manager search, model dialogs and the Agent Design chooser. | Replace a target or jump-host key, reopen the job, reselect the route and renew its rsync approval. Check locked-vault and expired-key feedback. For each changed dialog, compare normal and compact sizes, keyboard navigation, owner focus and Save/Cancel with Java. [Dialog inventory](#gui-dialog-design-parity) · [Scheduled key verification](PORTING-PARITY.md#scheduled-ssh-and-rsync-with-temporary-keys) |
-| **3** | **Make Java data migration predictable (M1/P1).** Start with a tagged backup containing connections and folders, credential references, and Scheduler jobs. Resolve the remaining settings, conflicting identities and action options against the importer. | Restore into both a fresh profile and one with colliding records. Reopen after restart and verify stable identities, preserved local choices, visible omissions and disabled imported jobs until review. Record a disposition for each remaining field or option. [Field and identity audit](#remaining-field-and-identity-audit) |
-| **4** | **Finish file transfers and Scheduler execution (T2–T4/Q1/Q2).** Exercise deployed OpenSSH and sudo for recurring transfers, recovery and route changes. Then implement the requested Agent/Swarm scheduling extension for live Teamwork connections and groups using the existing shared-route checks. | Verify bytes and receiver identity after first creation, repeat firing, interruption and renewed approval. For the extension, run an approved shared target and group, then change membership or a pin and verify the old approval is refused. Java's Scheduler uses locally configured connections. [Transfer contracts](#file-operation-contracts-to-preserve) · [Teamwork scope](#implemented-workflows-awaiting-acceptance-and-requested-extensions) |
-| **5** | **Close the remaining functional and native desktop cases (V1–V5).** Start with configured AI providers, signed GGUF/MLX runtimes and knowledge-store recovery. Finish remaining dialog comparisons, editor and diagram workflows, notification activation, window and pane movement, journal viewing, recording playback and terminal checks. | Record each workflow on the applicable native desktop. Identify the pane activated by a coding-agent notification, reopen persisted data, check exports, and complete the software comparisons for all 21 emulations. Track Wayland and X11 separately. [Native acceptance matrix](#native-acceptance-and-release-gates) |
-| **6** | **Qualify one release candidate (U4/V6/V7).** After fixes and security findings have a disposition, use one source revision for the local native suites and distributable packages. | Record formatting, strict Clippy, full tests and release builds by target. Verify checksums, installation, upgrade, removal, packaged sandboxing, signatures, macOS notarization, stapling and Gatekeeper. Record same-host startup, idle memory and p95 input latency. [Release gates](#native-acceptance-and-release-gates) |
+| **1 — complete** | **SFTP external editor and rsync executable (D4/V2).** A direct Windows ARM64 comparison with Java v2.26.0 covered both Settings fields, Browse, Cancel, Save/restart and disabled controls. | On this Mac, after TextEdit saved the local copy, the app wrote the 84 edited bytes back to the original SFTP path with mode `0644`. An explicitly reviewed rsync upload matched all 262,318 bytes at the receiver. Changing either configured executable required fresh review. [macOS live transfer evidence](PORTING-PARITY.md#november-24-native-macos-sftp-executable-live-use-acceptance) · [Windows ARM64 dialog comparison](PORTING-PARITY.md#windows-arm64-comparison-continuation) |
+| **2 — next** | **Finish the primary dialogs (D2/D4/A2/B4/Q1).** Start with desktop acceptance of compact Agent Setup and Pause/Resume. Then cover the remaining Agent, AI Manager, Settings, Connection Manager, Quick Connect and Scheduler cases. | Compare changed flows with Java at normal and compact sizes. Check keyboard access, focus returning to the owner, draft retention and Save/Cancel/restart where applicable. [Next verification on this Mac](#next-verification-on-this-mac) · [Dialog inventory](#gui-dialog-design-parity) |
+| **3 — open** | **Make Java data migration predictable (M1/P1).** Start with a tagged backup containing connections and folders, credential references, and Scheduler jobs. Resolve the remaining settings, conflicting identities and action options against the importer. | Restore into both a fresh profile and one with colliding records. Reopen after restart and verify stable identities, preserved local choices, visible omissions and disabled imported jobs until review. Record a disposition for each remaining field or option. [Field and identity audit](#remaining-field-and-identity-audit) |
+| **4 — open** | **Finish file transfers and Scheduler execution (T2–T4/Q1/Q2).** Exercise deployed OpenSSH and sudo for recurring transfers, recovery and route changes. Then implement the requested Agent/Swarm scheduling extension for live Teamwork connections and groups using the existing shared-route checks. | Verify bytes and receiver identity after first creation, repeat firing, interruption and renewed approval. For the extension, run an approved shared target and group, then change membership or a pin and verify the old approval is refused. Java's Scheduler uses locally configured connections. [Transfer contracts](#file-operation-contracts-to-preserve) · [Teamwork scope](#implemented-workflows-awaiting-acceptance-and-requested-extensions) |
+| **5 — open** | **Close the remaining functional and native desktop cases (V1–V5).** Start with configured AI providers, signed GGUF/MLX runtimes and knowledge-store recovery. Finish remaining dialog comparisons, editor and diagram workflows, notification activation, window and pane movement, journal viewing, recording playback and terminal checks. | Record each workflow on the applicable native desktop. Identify the pane activated by a coding-agent notification, reopen persisted data, check exports, and complete the software comparisons for all 21 emulations. Track Wayland and X11 separately. [Native acceptance matrix](#native-acceptance-and-release-gates) |
+| **6 — open** | **Qualify one release candidate (U4/V6/V7).** After fixes and security findings have a disposition, use one source revision for the local native suites and distributable packages. | Record formatting, strict Clippy, full tests and release builds by target. Verify checksums, installation, upgrade, removal, packaged sandboxing, signatures, macOS notarization, stapling and Gatekeeper. Record same-host startup, idle memory and p95 input latency. [Release gates](#native-acceptance-and-release-gates) |
 
-**Start the external work alongside milestone 1.** Refresh the locked SSH
-and OpenPGP dependency audit and arrange the independent SSH review. Obtain
-native Windows x64 and Intel macOS coverage, and line up configured AI
-providers and signed runtimes for their respective checks. Record any
-unavailable prerequisite against its gate and continue the next runnable
-case. Real IBM/HP systems and physical serial equipment remain user-deferred.
+### Next verification on this Mac
+
+1. **Recheck the compact Agent Setup candidate.** The November 25 candidate
+   manifest records 1,635 inputs before PR #37 was incorporated
+   (`src/**/*.rs`, `Cargo.toml`, `Cargo.lock` and `README.md`).
+   The scrollable body and fixed footer passed formatting, test
+   compilation, strict application Clippy, a native build and one Iced layout
+   test covering 18 combinations. The previous application suite passed 4,471
+   tests with 203 ignored. The run for this candidate stopped on user pause
+   (exit 143), before a full result or desktop acceptance. Run the application
+   suite on this candidate. [Candidate checks and cleanup](target/verification/20261125-agent-setup-paused-notes.md) · [Previous complete application run](PORTING-PARITY.md#november-25-interactive-run-model-web-rounds)
+
+   ```sh
+   KORTTY_SCRATCH_PARENT="$TMPDIR" bash scripts/with-scratch.sh --zsh-tests \
+     python3 scripts/cargo-native.py test --locked -p kortty --bin kortty --features dialog-preview
+   ```
+
+2. **Exercise Setup and Pause/Resume in the running app.** Check a fresh Setup
+   and one with a finished run available for export. At 1100 × 760 and 800 × 500
+   content size, reach the prompt, scroll the body and activate the footer,
+   including Close. Check the minimum 640 × 400 layout. Pause and resume first
+   with an edited tool proposal awaiting approval, then with fetched excerpts
+   awaiting review. Verify the same call and draft or result are restored and
+   dispatch or model continuation occurs only after its corresponding approval.
+   Retain window evidence and the loopback request sequence. Clean owned
+   processes, fixtures and build artifacts as specified in [AGENTS.md](AGENTS.md).
+3. **Continue the unverified dialog cases.** Interactive Run already passed
+   reviewed model-driven web rounds on this Mac. Ask, Plan/triage, Swarm,
+   Scheduler approvals and the saved always-offer setting still need work.
+   AI Manager General has native counterparts for 23 of 30 Java controls.
+   The remaining seven are the global Tavily, Bright Data and Brave credentials,
+   their three Clear controls and the always-offer checkbox. Next dialog cases
+   also include live Agent activity designs, Profiles/wizard/model search, the
+   main-window transparency quick-menu click and manual replacement-key entry.
+   [Agent web-tool contract](PORTING-AGENT-WEB-TOOLS.md) · [General field inventory](target/verification/20261125-searxng-global-reconciliation.json) · [Transparency desktop checks](PORTING-PARITY.md#november-25-native-transparency-settings) · [Saved-key editor](PORTING-PARITY.md#november-25-saved-temporary-key-editor-feedback)
+
+The compact Scheduler parent and target picker have macOS desktop evidence.
+With the vault rotated while the app was closed, the running Scheduler rejected
+old routes, required reselection and fresh approval, and uploaded 258,802
+verified bytes twice through a pinned jump host. This was a manually fired,
+non-recurring job. Manual entry of a replacement credential, recurring transfers
+and checks on the outstanding platforms have separate acceptance cases.
+[Scheduler parent](PORTING-PARITY.md#november-25-compact-scheduler-parent-layout) · [Key rotation and rsync approval](PORTING-PARITY.md#november-25-native-key-rotation-and-renewed-rsync-approval)
+
+The release gates still require a refreshed locked SSH and OpenPGP dependency
+audit, independent SSH review, configured AI providers, signed-runtime
+acceptance, Intel macOS and native Windows x64 evidence. Record and qualify a
+single release revision across the applicable targets. This checkout currently
+has no package under `target/dist/`. [Evidence by revision](#current-evidence-and-distribution) · [Release gates](#native-acceptance-and-release-gates)
+
+### November 25 primary-dialog checkpoints on macOS
+
+The November 25 pass aligned Security heading/help sizes and spacing, added
+keyboard access to its actions and switches, and placed the Settings footer's
+Cancel and Save actions in the Java order with keyboard activation. Native
+macOS verified toggling, saved-draft cancellation and persistence across restart;
+108 focused Settings tests and strict application Clippy passed.
+
+The stale isolation label below the page viewport is fixed in the shared
+software renderer. Cached text now honors its local clip, and damage calculation
+includes the pixels above/left of alignment anchors. Six renderer tests, strict
+renderer Clippy and native 850 × 712 resize/scroll verification passed.
+[Renderer correction](PORTING-PARITY.md#november-25-cached-labels-at-viewport-edges)
+
+The follow-up completed Security search-to-control focus and keyboard access
+to the isolation selector. Native Save, Cancel and restart checks passed. The
+SSH editor now supports Journal keyboard navigation, places Cancel before Save,
+and clears the previous page's scroll/focus when switching tabs. All eight
+editor tabs were compared at the Java reference's actual 1044 × 722 size; native
+checks also covered 860 × 722 and the 640 × 462 minimum window. This is bounded
+acceptance, not whole-editor design parity. The focused suites passed 111
+Settings tests and 71 Connection Manager tests. The explicitly run
+OpenSSH temporary-key lifecycle test also passed.
+[Security and editor follow-up](PORTING-PARITY.md#november-25-security-search-and-ssh-editor-navigation)
+
+The next continuation added owned native private-key Browse actions for both
+target and jump host, with stale-result protection and keyboard focus return.
+The Jump Server label, field alignment and route help now follow the reference.
+New saved SSH drafts use Java's 15-second timeout and four total attempts; a new
+jump host starts without a username. Existing profiles and general transport
+settings keep their values. Native 1044 × 722 and 640 × 462 checks verified key
+selection, Cancel, Save/restart and disabled Browse. All 76 focused Connection
+Manager tests and the explicit temporary-key lifecycle test passed.
+[Private-key chooser and defaults](PORTING-PARITY.md#november-25-private-key-choosers-and-new-profile-defaults)
+
+The terminal-settings continuation now follows the Java section order and
+control widths, with a separate global/own paste pause and permanently visible,
+properly disabled effect speed controls. Native 1044 × 722 and 640 × 462 checks
+verified keyboard editing, retained drafts, Save/Cancel/restart, explicit zero
+and restored inheritance. All 79 focused Connection Manager tests and two
+effect-control tests passed, together with strict application Clippy.
+[Terminal settings and paste inheritance](PORTING-PARITY.md#november-25-terminal-settings-and-paste-inheritance)
+
+The authentication continuation aligns the primary SSH fields and keeps stored
+credentials, registered keys, key files and passphrases in a stable order.
+Source selection now changes the saved authentication directly. This desktop
+verified password selection after unlocking the private fixture vault, return
+to the existing editor, Save/restart, key/passphrase persistence, disabled
+controls and compact cancellation. Installed sans-serif fonts corrected the
+observed bold-heading fallback in Terminal Settings, Security and AI tabs.
+83 Connection Manager, 111 Settings, nine SSH-dialog and two effect tests passed.
+[Authentication layout and vault return](PORTING-PARITY.md#november-25-authentication-sources-and-dialog-fonts)
+
+The next continuation stores inactive ordinary file-key paths and vault references
+separately from the active login. The macOS desktop verified password → key →
+password across restarts, including compact Save/Cancel. Existing temporary-key
+cleanup is preserved, and inactive editor data is excluded from execution
+identities. Native backup and credential-free export handling have regressions.
+The full parallel application suite passed 4,349 tests, with 200 regular skips;
+the explicitly selected OpenSSH temporary-key lifecycle test also passed.
+Three existing tests now coordinate contention for global model-operation and
+AI-worker limits without changing production limits.
+[Retained authentication preferences](PORTING-PARITY.md#november-25-retained-authentication-preferences)
+
+The inline continuation adds masked password and file-key passphrase inputs
+for target and jump host. New entries are encrypted in the native vault;
+existing credentials remain unchanged. Native desktop checks covered locked
+Save, vault return, restart, erased replacements and compact Cancel. Four
+entered values were decrypted and compared byte-for-byte, with exactly six
+fixture vault entries including the two originals. The final full parallel
+regression passed 4,355 tests with 200 regular skips; the explicit OpenSSH
+temporary-key lifecycle test passed as well. The initial new test fixture was
+corrected because it attempted an edit while the jump host was disabled.
+The tagged Java editor persists the jump-server password and file-key
+passphrase, but its target password field is not read by the save converter.
+The native implementation deliberately supplies working persistence rather
+than copying that reference gap.
+[Inline credential verification](PORTING-PARITY.md#november-25-inline-passwords-and-passphrases)
+
+The protocol picker now uses one eight-tab editor for SSH, local shell and
+serial profiles. The desktop verified SSH → local → serial → SSH with a stable
+ID, preserved inactive values, private-vault save/return, restart and compact
+640 × 462 operation. Changing all three variants and cancelling left the whole
+store byte-for-byte unchanged. A new local draft is valid without an SSH host.
+The full parallel application suite passed 4,368 tests, with 200 regular skips.
+The explicit OpenSSH temporary-key lifecycle test also passed.
+Shared editor settings are retained even where the active native profile does
+not represent them. That retention does not establish runtime parity for every
+shared setting. The original store revision remains frozen throughout editing,
+and save uses the atomic protocol publication with credential rollback.
+
+The layout continuation now keeps inactive local, serial and SSH authentication
+fields visible and disabled. It aligns the protocol/Shell widths and serial
+control labels and sizes, and puts custom commands in the Shell selector.
+Native 1044 × 722 and 640 × 462 checks verified mixed mouse/keyboard selection,
+argument add/remove, port refresh focus, serial checkboxes, Save/restart and
+byte-identical Cancel. The found focus defects were corrected and documented.
+Formatting, strict Clippy and 4,372 application tests passed; 200 regular skips
+remain. The explicit OpenSSH temporary-key lifecycle test also passed.
+[Protocol field layout](PORTING-PARITY.md#november-25-protocol-field-layout)
+
+The common-settings continuation now applies saved local/serial presentation,
+scrollback, paste warning, tab color, timestamps and terminal logging before
+stream output is consumed. It rejects stale transport identities and keeps the
+original live-pane snapshot after protocol conversion. Incognito is applied
+before logging and usage capture; an old project cannot restart a connection
+that has become private. Serial process/sandbox requirements fail closed.
+Both inspectors expose explicit new-window launches with saved geometry.
+Native 1240 × 792 / 940 × 600 checks verified the actions, separate 980 × 670
+content windows, paste cancellation, close confirmation, masked local/serial
+logs and the private profile's absence from logs and recent usage. Formatting,
+strict Clippy, the native build, all eight runtime tests and 4,380 application
+tests passed (200 regular skips); the explicit temporary-key test also passed.
+The requested window position and maximized behavior remain separate native
+acceptance cases.
+[Common runtime verification](PORTING-PARITY.md#november-25-common-local-and-serial-runtime-settings)
+
+Quick Connect now keeps the primary protocol fields in the Java order, with
+inactive values visible, fixed selector widths and the reference footer order.
+This desktop verified the final 750 × 730 and 700 × 400 content layouts,
+keyboard focus/scrolling, argument add/remove, the owned log-folder chooser,
+and unchanged-store cancellation. Real local and PTY serial launches captured
+their first output; both saved profiles restored their separate log settings
+after restart. Twenty focused tests, strict Clippy, formatting and all 4,385
+application tests passed (200 regular skips), together with the explicit
+OpenSSH temporary-key test. This is bounded Quick Connect acceptance, not full
+dialog or physical serial parity.
+[Quick Connect verification](PORTING-PARITY.md#november-25-quick-connect-layout-and-native-logging)
+
+The Scheduler route picker now opens an owned server/group tree, with search,
+preselection, replacement, keyboard navigation and double-click acceptance. Formatting, strict Clippy, 222 focused tests,
+the owned-window regression and all 4,392 application tests passed (200 regular
+skips); the explicit temporary-key editor test also passed.
+Native macOS checks covered normal and compact sizes, standalone and hosted
+owners, unchanged-store cancellation, Save/restart and rejection of a route
+changed while the picker was open. The final build also verified scoped focus
+and double-click return. This is bounded target-picker acceptance; the parent
+Scheduler and live shared-route execution still have separate open checks.
+[Scheduler target selection](PORTING-PARITY.md#november-25-scheduler-target-selection)
+
+The parent Scheduler now preserves the job list when actions and status text
+wrap. A separate scrolling action area, readable horizontal table, scoped
+keyboard navigation and row reveal after Save passed native hosted, 700 × 440
+and 1360 × 800 checks. Eighteen disabled fixture jobs survived Save, discarded
+edits and restart without a run. Formatting, strict Clippy, two layout/keyboard
+regressions and all 4,394 application tests passed (200 regular skips). This is
+bounded parent-layout acceptance, not whole-Scheduler parity.
+[Parent layout](PORTING-PARITY.md#november-25-compact-scheduler-parent-layout)
+
+Native Scheduler checks now cover locked and expired credentials, independent
+target/jump-key replacement, reopening and reselection, invalidation of a
+previously saved rsync approval, and two explicitly reviewed 258,802-byte
+uploads through the replacement keys. The real one-minute project-reconnect
+expiry test also passed. Final verification passed 20 native OpenSSH integration
+tests and 4,394 application tests (200 regular skips), with strict Clippy.
+These GUI rotations used fixture vault setup while
+the app was closed; they do not establish every credential-editing interaction.
+[Native key and approval verification](PORTING-PARITY.md#november-25-native-key-rotation-and-renewed-rsync-approval)
+
+The saved temporary-key editor now checks the unlocked vault and exact SSH
+account before reporting a key as available. Native 1044 × 722 and 640 × 462
+checks covered locked, expired, missing and changed-target feedback, discard,
+Save and restart. A name-only save preserved every saved login and the vault
+bytes. Strict Clippy, the real key replacement/removal persistence test and all
+4,395 application tests passed (200 regular skips).
+[Saved-key editor verification](PORTING-PARITY.md#november-25-saved-temporary-key-editor-feedback)
+
+Window Settings now has separate search destinations for output restoration,
+its line limit and the four geometry fields. Search focuses the corresponding
+switch, number or selector. Native checks covered Save/restart, rejected input,
+Cancel, normal size and 850 × 712 layout. The Java fixture constrained its
+requested compact size to 1120 × 988. Rust's smaller layout is additional
+coverage, not equal minimum-size parity. Formatting, strict Clippy, 115 Settings
+tests and all 4,399 application tests passed (200 regular skips).
+[Window search and layout](PORTING-PARITY.md#november-25-window-settings-search-and-native-geometry)
+
+Native transparency Settings now stages its changes until Save. The reproduced
+Cancel persistence bug is fixed, search focuses the slider, and arrow/Home/End
+keys update only the draft. Desktop checks at 1120 × 1112 and 850 × 712 verified
+Cancel, Save and restart. Formatting, strict Clippy, 118 Settings tests, four
+surface tests and all 4,402 application tests passed (200 regular skips).
+[Transparency Settings verification](PORTING-PARITY.md#november-25-native-transparency-settings)
+
+AI Manager General now gives its seven switches, four selectors and four
+imported-preference actions keyboard focus after search. Tab/Shift+Tab wrap
+within General and its close review, including with an unfinished search.
+Native normal, compact and hosted checks verified Save, discard and restart.
+Formatting, strict Clippy, 425 Manager tests and all 4,409 application tests
+passed (12 and 200 regular skips respectively).
+[General keyboard verification](PORTING-PARITY.md#november-25-ai-manager-general-keyboard-navigation)
+
+At the shared-defaults checkpoint, 14 of the 30 Java General controls had
+direct native counterparts. General's
+prompt-history limit, snippet instructions and alternative count now share the
+existing stores with Recent prompts and Settings. Native normal, compact and
+hosted workflows verified save, discard, boundaries, restart and both directions
+of the shared settings. General command keys are handled before focused text
+inputs consume them. Formatting, strict Clippy, two navigation tests, six focused
+store tests, 431 Manager tests and all 4,421 application tests passed. Windows
+acceptance remains user-deferred.
+[Shared General defaults](PORTING-PARITY.md#november-25-shared-general-defaults)
+
+The terminal confirmation preference now supports one-shot initial text actions
+through the ordinary masked sender. Ask, follow-up turns and requests including
+files, memory, web context or a configured CLI retain visible review. The four
+terminal AI actions also have native AI menu entries with the existing focused
+selection and policy checks. Desktop checks verified default review, direct
+submission, discard, restart, compact Save and restoration of review. This adds
+a fifteenth native General control with explicit limits on Java attachment
+parity. Windows acceptance remains user-deferred.
+[Terminal confirmation](PORTING-PARITY.md#november-25-terminal-confirmation-and-native-ai-actions)
+
+General now exposes both default-off Agent message preferences after the chat
+terminal actions. New live runs snapshot their defaults and allow setup-only
+overrides; Ask forces runtime off. Completed masked debug captures have their
+own bounded display and do not change model/journal evidence. Native normal,
+compact and hosted Manager checks passed, together with real probe runs showing
+and suppressing debug messages. Java's running output chunks remain a functional
+gap; the pinned runtime flag has no presentation consumer. There are now seventeen
+native General controls, with the explicit diagnostic and earlier request-review
+differences retained. Formatting, strict Clippy, 433 Manager and all 4,434
+application tests passed. Windows remains user-deferred.
+[Agent message preferences](PORTING-PARITY.md#november-25-agent-message-preferences-and-bounded-diagnostics)
+
+The live diagnostic continuation now observes the existing bounded command
+captures on local, direct SSH, isolated SSH and saved-route paths. Only masked
+complete-line snapshots reach the UI; managed replacement rules retain their
+completion gate. Current epoch, source and policy checks reject late/revoked
+updates. This desktop verified explicitly reviewed running stdout/stderr,
+split-token masking, automatic tail following, completion and the short stopped
+viewport. Real OpenSSH verified direct/process-worker streaming and use of the
+same connection after command cancellation. Formatting, strict Clippy, focused
+regressions and the repeated full parallel suite passed 4,438 application tests
+(201 regular skips; the new SSH test was explicitly run). A prior six-second
+Quick Connect output timeout did not reproduce in the isolated recheck, 24 more
+repetitions or that full recheck. Its cause remains unresolved; retain it as a
+native acceptance concern. This does not close the remaining Agent GUI matrix.
+[Live diagnostics](PORTING-PARITY.md#november-25-live-agent-diagnostics)
+
+The native reliability continuation independently reproduced short-program
+output loss when macOS closes a PTY before its first read. A startup slave
+descriptor now protects buffered output until the first empty read. Identical
+before/after regressions cover both reader APIs, resize, EOF and successful
+exit. The continuation also isolated the Quick Connect test's real preference
+write after proving that its Sandbox default caused three following Teamwork
+tests to reject authentication correctly. Both 256-launch same-process runs,
+36 ordinary PTY tests, explicit Seatbelt containment, formatting, strict Clippy
+and the final full parallel suite of 4,438 application tests passed. This
+desktop's actual Quick Connect dialog launched printf and cat, including paths
+with spaces, and retained both outputs after exit code 0. The original isolated
+six-second timeout is not causally identified; status, grid, PID and directory
+diagnostics now accompany its unchanged assertion.
+[Short-command acceptance](PORTING-PARITY.md#november-25-native-short-command-output-and-test-profile-isolation)
+
+Five global Internet defaults now configure the two per-request MCP labels and
+three inherited plugin IDs. Explicit profile overrides remain unchanged; changing
+the globals invalidates prior web reviews. Native normal/compact, keyboard,
+Save/restart and policy-locked saves passed on this desktop. Unicode and blank
+normalization match five getters from the actual Java v2.26.0 model. The reviewed
+loopback fixture verified seven requests, including two rejected stale providers.
+Formatting, strict Clippy, 437 Manager and all 4,445 application tests passed.
+At that checkpoint 22 of 30 General controls had native counterparts. The
+global SearXNG URL was the next control verified on this Mac.
+[Global MCP defaults](PORTING-PARITY.md#november-25-global-mcp-defaults)
+
+The global SearXNG URL is now persisted and required for that integration, taking
+the bounded General mapping to 23 of 30 controls. An immutable source trace and
+the actual original Java configuration class establish that this is a setup
+prerequisite, not a direct HTTP destination. Plugin routing and the independent
+profile page endpoint remain unchanged. This desktop verified search, keyboard
+input, discard, normalized Save/restart, compact scrolling and policy-locked
+saves. The final build repeated the native save/restart/policy checks and passed
+12 regular Scheduler execution tests, 438 Manager tests and all 4,447 application
+tests, with format and strict application Clippy clean. Existing SearXNG profiles
+need the global URL before web review; README now documents this setup step.
+[SearXNG prerequisite](PORTING-PARITY.md#november-25-global-searxng-configuration-prerequisite)
+
+The native Agent Design continuation now verifies selected naming prompts,
+Unicode names, duplicate/rename, immediate default persistence, same-profile
+restart, deletion cancellation and Standard fallback on this desktop against
+the actual Java chooser. It fixes the clipped compact Description heading and
+keyboard navigation that revealed an inner row without revealing its outer
+viewport. Normal, compact, stacked and minimum-size native views were exercised;
+Space created the expected owned copy without changing Standard. Format, strict
+application Clippy, 138 design tests and all 4,448 application tests passed.
+That run reproduced a tooltip overlapping the combination picker and Escape
+closing the chooser. The following checkpoint verified both corrections.
+[Agent Design desktop continuation](PORTING-PARITY.md#november-25-agent-design-desktop-naming-layout-and-navigation)
+
+The combination picker now enables keyboard navigation and yields Escape to its
+open menu. Its opaque hint is suppressed while that menu is open, including the
+upward-opening list in minimum Settings. This desktop verified normal, compact
+and minimum views against the original Java interaction; the final source passed
+two picker regressions, 140 design tests and all 4,450 application tests. Eight
+owned app processes and seven shells were closed; private runs and dev artifacts
+were removed. The live Agent activity/module matrix remains open.
+[Combination picker and Escape](PORTING-PARITY.md#november-25-agent-design-combination-picker-and-escape)
+
+An original-service audit now fixes the contract for the missing always-offer-web
+preference: it controls model-side direct Tavily tools, and requires a native
+tool-aware completion/review loop before its checkbox can work. Twenty-six
+original-service cases verified 32 loopback model requests, both tool types,
+three-call and two-round bounds, and eligibility edge cases. That audit found
+missing native tool definitions/results and a text stream that rejects tool
+calls. The General count stays 23 of 30. The remaining implementation
+and acceptance scopes are recorded in the [Agent web-tool contract](PORTING-AGENT-WEB-TOOLS.md).
+
+The native single-turn transport now has typed tool proposals and ordered
+call/result history, bounded arguments/history/requests, explicit final tool
+omission, and guard/credential/policy checks. Twelve transport tests and five
+original/native framing comparisons pass, as do all 4,462 application tests,
+formatting and strict application Clippy. Ordinary Agent requests keep tools
+absent and reject actual unsolicited calls; empty arrays remain valid. Reviews,
+provider dispatch, two-round orchestration, usage aggregation and the saved
+preference remained pending at that transport checkpoint. No additional General
+control was counted as complete.
+
+Interactive Run now connects those proposals to the existing query/page and
+masked-excerpt reviews. Original-task eligibility, two executable rounds,
+three-call batches, result/context limits, ordered declined/unsupported results,
+usage aggregation and repair history are covered by nine new regressions. The
+full application suite passes 4,471 tests with 203 regular skips; format, strict
+application Clippy and the native build pass. This macOS desktop verified edited
+search, exact-page review, excerpt publication, decline and cancellation in
+normal and compact windows. Five actual loopback model requests are retained;
+provider output was an explicit debug fixture, not a real Tavily request.
+Ask, triage/planning, Swarm, Scheduler scopes and the saved preference remain
+pending. The General count remains 23 of 30.
+[Interactive Run web rounds](PORTING-PARITY.md#november-25-interactive-run-model-web-rounds)
 
 ### Implementation baseline
 
@@ -110,7 +490,7 @@ records the broader comparison with the tagged Java release.
 
 | Area | Remaining change | Completion check |
 | --- | --- | --- |
-| D4 · SFTP executable settings | The tagged SFTP page places the external-editor command after Transfers and the rsync executable after ZIP creation. Rust offers program selection during file editing and job review. Add the corresponding Settings controls with searchable labels and route their choices through those workflows. | Verify the initial values, Cancel and persistence across restart. Exercise external editing and a reviewed rsync job with the selected programs. Changing the choice must trigger the applicable review. [Tagged Settings dialog](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SettingsDialog.java#L2464-L2540) · [Rust Settings page](src/workspace/settings_window/sftp_settings.rs) · [External editor](src/sftp_window/external_edit.rs) · [Rsync job](src/scheduler_window/rsync.rs) |
+| D4 · SFTP executable settings | The external-editor executable follows Transfers and the rsync executable follows ZIP creation. Both Settings fields are searchable and have owned native choosers. Editor selection requires a matching native review; rsync selection seeds new job drafts without approving execution. The macOS and Windows ARM64 desktops verified discovery, Save, Cancel, restart and keyboard Browse; the Windows comparison used the original Java dialog. Native macOS live-transfer acceptance is complete. | The selected editor saved and returned an actual remote file, and the selected rsync executable completed an explicitly reviewed transfer. Both program-change reviews were verified. [Live-use record](PORTING-PARITY.md#november-24-native-macos-sftp-executable-live-use-acceptance). [Tagged Settings dialog](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/SettingsDialog.java#L2464-L2540) · [Rust Settings page](src/workspace/settings_window/sftp_settings.rs) · [External editor](src/sftp_window/external_edit.rs) · [Rsync job](src/scheduler_window/rsync.rs) |
 | D4 · Searchable controls | Compare the remaining Java Settings and AI Manager pages, subpages and labeled controls with the Rust search inventory. The [Knowledge Stores toolbar](PORTING-PARITY.md#november-24-knowledge-stores-toolbar-search), [Local Models runtime and GGUF import controls](PORTING-PARITY.md#november-24-local-models-toolbar-search), [Appearance controls](PORTING-PARITY.md#november-24-appearance-inventory), and [SFTP settings](PORTING-PARITY.md#november-24-sftp-settings-layout-and-search) have independent search targets. | Verify that controls on a page that has never been opened are discoverable, and that navigation reveals the exact control with the current page state and policy. |
 
 The [November 23 review](PORTING-PARITY.md#november-23-dialog-parity-review)
@@ -160,11 +540,10 @@ work. [Desktop comparison](PORTING-PARITY.md#november-22-java-dialog-design-on-w
 
 The SFTP worktree changes implement editable timeout, parallel-transfer and
 ZIP compression controls and search targets. The Windows ARM64 and Apple
-Silicon logs each report 108 focused tests passed. The tagged Windows x64
-Java dialog was rendered on the Windows ARM64 host. A paired view of the
-running Rust page is still outstanding there. Capture it before closing
-the Windows comparison, then repeat on macOS and Linux. Milestone 1 also
-covers the missing executable settings.
+Silicon logs initially reported 108 focused tests passed. The subsequent
+paired Windows ARM64 comparison and macOS compact-layout recheck completed
+executable settings acceptance, followed by real macOS editor writeback and
+reviewed rsync transfer. Linux desktop comparison remains under V2.
 [SFTP Settings evidence](PORTING-PARITY.md#november-24-sftp-settings-layout-and-search)
 
 Resources exposes a JVM launch profile and its heap limit. Rust already
@@ -176,8 +555,10 @@ specifying a Resources page. [Host memory](src/host_memory.rs)
 The Security page offers the imported global isolation and Quick Connect
 temporary-key choices for explicit adoption. Windows ARM64 verified the
 managed display, below-minimum rejection and folder review presentation.
-Exercise the Save and restart flow for reviewed choices and repeat it on
-the other native desktops. Continue the [saved temporary-key desktop checks](PORTING-PARITY.md#november-23-native-saved-temporary-ssh-keys).
+This Mac also verified search, keyboard activation, Save, Cancel and restart
+for the native isolation and temporary-key options. Exercise adoption of the
+imported values and the remaining platform cases. [macOS Security checks](PORTING-PARITY.md#november-25-security-search-and-ssh-editor-navigation)
+
 Java Privacy manages analytics consent and the date and version of that
 decision. Rust validates the shared `allow-telemetry` policy field, and
 Java backup restore drops telemetry consent. [Policy validation](src/clipboard_policy.rs)
@@ -215,8 +596,9 @@ jump host have the same port stepper and separate username rows. The
 adds timeout and retry steppers, a disabled Jump Server form and keyboard
 traversal for Connection and Jump Server. Apple Silicon passed the focused
 regressions and strict Clippy. Windows ARM64 passed the focused regressions
-and preview build. The desktop walkthrough remains open after a Windows
-Graphics Capture failure.
+and preview build. The Windows walkthrough stopped at a Graphics Capture failure.
+This Mac subsequently verified the target and jump file-key choosers, saved
+paths after restart, Cancel and disabled Browse. [macOS editor checks](PORTING-PARITY.md#november-25-private-key-choosers-and-new-profile-defaults)
 The [Window Geometry page](PORTING-PARITY.md#november-24-ssh-editor-window-geometry)
 now groups size and position steppers and keeps disabled controls visible.
 Compare both geometry states and keyboard traversal on the native desktops.
@@ -250,8 +632,10 @@ directory in the connection draft. The
 uses the same owned chooser and shows the directory, format, and gzip
 settings while logging is disabled. Windows ARM64 verified both the
 disabled controls and a saved profile's enabled values, cancellation,
-and selection of a different directory. Compare this compact section
-and the native chooser on macOS and Linux desktops.
+and selection of a different directory. The November 25 macOS check covered
+the compact section, the native chooser and real local/serial logging with
+saved-profile restart. Linux comparison remains open, and new Windows checks
+remain user-deferred.
 The [1,000 MiB terminal logfile update](PORTING-PARITY.md#november-24-terminal-logfile-size-limit)
 matches the Java size range. Rotated files are closed before background
 gzip publication. The viewer indexes plain logs and streams compressed
@@ -379,16 +763,8 @@ decreases before admitting growth in inventory order. Skipped folders
 continue to count with their saved manifests. Folder preview rows
 distinguish unchanged files from files to be indexed, in the Status column.
 Align the remaining control styling and source actions.
-[Windows ARM64 source table comparison](target/verification/20261123-dialog-tables-windows-arm64-desktop.md)
-[Windows ARM64 mixed source comparison](target/verification/20261123-knowledge-source-updates-windows-arm64-desktop.md)
-[Windows ARM64 folder update comparison](target/verification/20261123-knowledge-folders-windows-arm64-desktop.md)
-[Windows ARM64 inventory layout comparison](target/verification/20261123-knowledge-table-layout-windows-arm64-desktop.md)
-[Windows ARM64 source selection comparison](target/verification/20261123-knowledge-selection-windows-arm64-desktop.md)
-[Windows ARM64 automatic source status comparison](target/verification/20261123-automatic-sources-windows-arm64-desktop.md)
-[Windows ARM64 source control comparison](target/verification/20261123-inventory-actions-windows-arm64-desktop.md)
-[Windows ARM64 advanced source comparison](target/verification/20261123-advanced-dialog-windows-arm64-desktop.md)
-[Windows ARM64 source size comparison](target/verification/20261123-source-stepper-windows-arm64-desktop.md)
-[Desktop verification](target/verification/20261123-knowledge-spinner-windows-arm64-desktop.md)
+[Windows ARM64 source inventory and control comparisons](PORTING-PARITY.md#november-22-ai-manager-and-agent-design-on-windows-arm64)
+
 Skills places preferences and the Local/External switch next to the
 editor. Memory groups entry and Markdown actions beneath the selected
 view. Local Models places the runtime inventory above the installed
@@ -446,14 +822,8 @@ compared the same long path against the Java desktop, saved from the narrow
 form, and verified private copy, external reference and cancellation from
 the native import review. Verify split-model reattachment and both responses
 to the matching-runtime offer in the desktop.
-[Windows ARM64 model inventory comparison](target/verification/20261123-model-inventory-windows-arm64-desktop.md)
-[Windows ARM64 native model picker and sorting](target/verification/20261123-model-picker-windows-arm64-desktop.md)
-[Windows ARM64 model selection and group actions](target/verification/20261123-model-selection-windows-arm64-desktop.md)
-[Windows ARM64 runtime dialogs](target/verification/20261123-runtime-review-windows-arm64-desktop.md)
-[Windows ARM64 installed model table](target/verification/20261123-mixed-model-windows-arm64-desktop.md)
-[Windows ARM64 model group actions](target/verification/20261123-model-batch-windows-arm64-desktop.md)
-[Windows ARM64 local model default](target/verification/20261123-model-default-windows-arm64-desktop.md)
-[Windows ARM64 model configuration](target/verification/20261123-model-config-windows-arm64-desktop.md#ai-manager)
+[Windows ARM64 model and runtime comparisons](PORTING-PARITY.md#november-22-ai-manager-and-agent-design-on-windows-arm64) · [GGUF import and backend review](PORTING-PARITY.md#november-23-gguf-import-and-backend-review)
+
 Agent Design now opens
 as a standalone dialog with a module table and adjacent sample. Changing
 a built-in creates a custom copy named from the built-in's full name.
@@ -499,15 +869,9 @@ ANSI terminal cells. Blocks in the terminal show the action-step count and
 compact token usage. The summary wraps at words within the terminal cell
 width. Continue comparing the presentation of each module around the shared
 sample.
-[Windows ARM64 Side timeline comparison](target/verification/20261123-agent-timeline-windows-arm64-desktop.md)
-[Windows ARM64 Metro comparison](target/verification/20261123-metro-layout-windows-arm64-desktop.md)
-[Windows ARM64 module selection comparison](target/verification/20261123-inventory-actions-windows-arm64-desktop.md#agent-design)
-[Windows ARM64 module keyboard verification](target/verification/20261123-advanced-dialog-windows-arm64-desktop.md#agent-design-keyboard)
-[Windows ARM64 preview control comparison](target/verification/20261123-source-stepper-windows-arm64-desktop.md#agent-design)
-[Windows ARM64 Plan and execution comparison](target/verification/20261123-model-config-windows-arm64-desktop.md#agent-design)
 [AI dialog comparison](PORTING-PARITY.md#november-22-ai-manager-and-agent-design-on-windows-arm64)
 
-For standalone Windows previews, build the development application with
+When the user makes the Windows desktop available again, build standalone previews with
 `cargo rustc --locked -p kortty --bin kortty --features dialog-preview -- -C linker=rust-lld`.
 Run `scripts/preview-windows-dialog.ps1` with `-Dialog settings-sftp` to
 open the SFTP page directly. The other selectors are `settings`,
@@ -539,21 +903,21 @@ feature is opt-in and its startup command is available in debug builds.
 | D4/P1 · Vault startup | An explicit profile opt-in stores the current derived vault key in the protected device credential store. Startup authenticates the vault, falls back to the password prompt on failure, and checks both managed and personal password requirements. Native credential-store fixtures on Windows ARM64 and Fedora ARM64 verified rotation, reopen and removal. Apple Silicon passed the vault and startup suites. | Exercise Security through an actual restart on each native desktop. Include interactive Keychain access with a signed macOS app, the installed Flatpak Secret portal and a managed startup policy set after opting in. [Startup unlock checkpoint](PORTING-PARITY.md#november-23-native-vault-startup-unlock) |
 | D2/P1 · Session isolation and reconnect | Effective isolation appears in the folder and connection editors. Windows ARM64 verified saved local-shell recovery with inherited and managed Sandbox choices. The native Apple Silicon fixture verified saved SSH and Teamwork reconnect over pinned direct OpenSSH. | Exercise a fresh local launch, unavailable sandbox feedback, desktop reconnect and a live jump-host reconnect. Repeat the applicable desktop checks on macOS and Linux. [Windows desktop checks](PORTING-PARITY.md#november-23-windows-isolation-dialogs-and-launches) · [OpenSSH reconnect checks](PORTING-PARITY.md#november-23-saved-and-teamwork-ssh-reconnect) |
 | D2/D4 · Quick Connect temporary keys | The saved Security opt-in enables in-memory temporary authentication for interactive SSH and SFTP, with destination validation, expiry and retry. | Use a disposable key for a live SSH and SFTP login, retry after expiry, and disable the option while a form or retry holds a key. [Quick Connect checkpoint](PORTING-PARITY.md#november-23-quick-connect-temporary-ssh-keys) |
-| D2 · Saved temporary keys | Connection Manager stores the key, expiry, and exact account and destination in the encrypted vault. The login form uses an unexpired saved key with optional automatic selection or accepts a replacement for that attempt. A pinned Apple Silicon OpenSSH fixture verified locked-vault rejection and SSH and SFTP after unlocking. | Exercise the desktop editor, locked unrelated saves, reconnection on expiry and after replacement, and the isolated SSH worker. Check Quick Connect's in-memory paths separately. [Saved temporary-key checkpoint](PORTING-PARITY.md#november-23-native-saved-temporary-ssh-keys) |
+| D2 · Saved temporary keys | Connection Manager binds each saved key to its expiry, account and destination. This Mac verified SSH and SFTP after unlock and the editor's locked, available, expired, missing and changed-endpoint feedback. A name-only save survived restart with the vault contents preserved. | Enter and submit a replacement private key in the native editor during a manual handoff. Exercise locked unrelated saves, interactive reconnect after expiry or replacement, the isolated SSH worker and Quick Connect's in-memory path. [Transport checks](PORTING-PARITY.md#november-23-native-saved-temporary-ssh-keys) · [Native editor checks](PORTING-PARITY.md#november-25-saved-temporary-key-editor-feedback) |
 | D2/M1 · Java temporary-key backup restore | Credential review decrypts compatible keys into a sealed vault transaction and binds each reference to an exact eligible new profile and route. Apple Silicon verified an imported key after startup restore by authenticating to pinned OpenSSH and downloading the exact SFTP fixture bytes. | Exercise Review SSH Credentials and Merge on Restart on native desktops. Verify the displayed omissions, subsequent expiry and the login response after an account change. [Java restore checkpoint](PORTING-PARITY.md#november-23-java-temporary-ssh-key-restore) |
 | D2 · Project reconnect with a temporary key | A restored project pane can use an exact saved profile with an eligible temporary key when automatic selection is active. The Apple Silicon fixture verified retry after vault unlock over pinned OpenSSH, preservation of the tab and deferral after key expiry. | Exercise the native desktop attention bar, automatic retry after unlock, and expired-key review with an existing project and its saved jump route. [Project reconnect checkpoint](PORTING-PARITY.md#november-23-project-reconnect-with-temporary-ssh-keys) |
-| Q1/Q2 · Scheduler and rsync with temporary keys | Saved jobs bind eligible temporary keys to the target and jump logins. The shared native transport checks permission before using each key. Portable backups remove the binding and disable the job. Fedora ARM64 verified an exact-byte rsync download across a pinned jump host. | Exercise job save and route reselection after replacing a key in native Scheduler dialogs. Repeat the applicable rsync and managed-policy cases for the remaining native platforms. [Scheduled temporary-key checks](PORTING-PARITY.md#scheduled-ssh-and-rsync-with-temporary-keys) |
+| Q1/Q2 · Scheduler and rsync with temporary keys | Saved jobs bind target and jump credentials separately. Portable backups remove the binding and disable the job. Fedora ARM64 verified a download through a pinned jump host. This Mac verified locked and expired keys, route reselection after vault rotation, old approval invalidation and reviewed uploads from a non-recurring job. | Exercise recurring firings, protected receivers, recovery and the remaining platform and managed-policy cases in milestone 4. [Fedora transfer](PORTING-PARITY.md#scheduled-ssh-and-rsync-with-temporary-keys) · [macOS rotation and reviewed uploads](PORTING-PARITY.md#november-25-native-key-rotation-and-renewed-rsync-approval) |
 | B4 · GGUF Configure styling | The measured path width, compact two-column form, joined numeric controls and fixed actions follow the tagged Java layout. [Configure checkpoint](PORTING-PARITY.md#november-23-gguf-configure-sizing) | Compare the same layout with the platform theme on the remaining native desktops. |
 | D4 · Search matching | Settings and AI Manager use the shared Java matching and ranking rules for visible page and control names, aliases, duplicate suppression and the 40-result limit. Available controls are filtered before ranking. Imported model IDs remain selectable when their normalized names collide. | Compare result labels, ranking and keyboard and pointer navigation against the tagged dialogs on native desktops. [Search matching checkpoint](PORTING-PARITY.md#november-23-settings-search-matching) |
 | A2 · Copying a command step's output | **Copy output** uses all masked stdout and stderr retained for the selected step within the existing capture limits. The compact preview still shows the last eight lines. Retained runs use the same action and clipboard policy. | Verify both streams, a line longer than 320 characters and redaction in the native clipboard for live and retained runs. [Step-copy checkpoint](PORTING-PARITY.md#november-23-complete-masked-step-copy) |
 | B5 · Knowledge source status | Completed source outcomes and problem counts are restored with the existing index metadata. Windows ARM64 confirmed manual and automatic missing-file results after a process restart, preserved index metadata and automatic recovery of the repaired file. The desktop review recognized the restored manual file. The manual recovery test indexed it and checked the unchanged sibling after reopening the Manager. | Complete the Windows desktop manual indexing flow after repair. Repeat the desktop restart and recovery paths on the other supported native platforms. [Source outcome checkpoint](PORTING-PARITY.md#november-23-knowledge-source-outcomes) |
-| A2 · Naming Agent designs | New, Duplicate and Rename use owned prompts with the suggested text selected. Modifying a built-in creates a custom copy with the full preset name and a numeric suffix. The catalog keeps stable IDs and the Settings entry keeps changes in the active draft. | Verify the final compact prompt on Windows ARM64 against Java. Check Rename, deletion, saved names after restart and owner focus on the native desktops. [Naming checkpoint](PORTING-PARITY.md#november-23-agent-design-naming) |
+| A2 · Naming Agent designs | New, Duplicate and Rename use owned prompts with the suggested text selected. Modifying a built-in creates a custom copy with the full preset name and a numeric suffix. The catalog keeps stable IDs and the Settings entry keeps changes in the active draft. This macOS desktop verified Unicode naming, owner return, same-profile restart, deletion cancellation/fallback and keyboard activation against the actual Java chooser. Compact headings and nested keyboard reveal are corrected. | Fix the reproduced combination-picker tooltip overlap and check popup-only Escape. Complete the remaining live activity/module matrix, connection overrides and user-deferred Windows ARM64 comparison. [Desktop continuation](PORTING-PARITY.md#november-25-agent-design-desktop-naming-layout-and-navigation) · [Earlier naming checkpoint](PORTING-PARITY.md#november-23-agent-design-naming) |
 | B4 · GGUF import and backend review | A native multi-file selection opens a private-copy or external-reference review. Windows ARM64 verified both storage choices with the native picker and checked that Cancel preserved the registrations. The manual entry and detached-model reattachment paths remain available. Saving an incompatible backend offers the existing signed-runtime review. | Repeat the storage choices on the remaining desktops. Exercise reattachment of a split model and both backend responses in the desktop. Verify runtime readiness with a compatible signed package. [GGUF checkpoint](PORTING-PARITY.md#november-23-gguf-import-and-backend-review) |
 | A2 · Terminal Agent | The design presenters and earlier-run selection paths are implemented. The Log Table shows sortable typed step metadata and a live Duration column that adopts the measured result at completion. A double-click opens the selected masked output or the finished answer. Live step and answer details allow read-only selection and policy-checked partial copying. A right-click offers step actions on retained rows and run actions on the answer or table background, including Earlier runs. Export all finished runs remains available while a different run is active. The export review fixes the selection when it opens. New rows flash for 900 ms and running rows use a 120 ms spinner. Reduced animations keeps the running marker still, omits the flash and updates elapsed time once per second. Reviewed model requests create a running row and update it with the accepted response metadata. An outstanding command review has a masked, read-only Approval row that is removed when the review ends. | The live table, detached history and Settings preview support focused keyboard navigation. Ctrl+Shift+F6 focuses the visible table in the active terminal pane. Tab reaches the detached table and scrolls the Settings preview into view. With live table focus, the Context Menu key or unassigned Shift+F10 opens the selected row's actions. Fedora ARM64 X11 verified focus, row selection, opening details, the keyboard step menu and source terminal input isolation in a docked table. Open details receive more of the dock height, with model usage in a compact scrollable summary. Fedora ARM64 X11 verified Tab entry, row details, exact output copying and reattachment in detached history. It also verified that the Settings preview reveals the table and selected sample output with the keyboard. Verify the keyboard paths on the other native desktops. Columns fit the viewport above font-scaled minimum widths. Verify resizing and numeric alignment on native desktops. Chronological tables follow new rows at the bottom and preserve the reading position when reviewing older activity. Scrolling up exposes Latest activity without selecting a row. Fedora ARM64 X11 verified stable reading through command approvals and continued following after Latest activity. Fixed column headers stay visible during vertical scrolling and follow the data cells horizontally. Column dividers adjust widths within the fitted table. Fedora ARM64 X11 verified Step sorting in both directions, fixed headings while scrolling vertically and horizontally, divider dragging and sort retention after resizing. Verify these paths on the other native desktops. Exercise the narrow viewport, elapsed time, sorting, selected output, approval-row lifecycle, step actions and motion preferences. Verify the decision and repair rows with a configured provider. Exercise the terminal context menu and the keyboard and pointer paths for the Log Table menus and run/step controls on native desktops. Switch runs, copy individual outputs, export one or all finished runs and open an unsaved step as a snippet. |
 | D4 · AI Manager search | The search reveals provider presets, CLI and MiniMax fields, reviewed HTTPS options, usage quota and cost, and the Web search controls exposed by the active provider and policy. The profile wizard searches its reachable steps using the same validation as Next. General search reveals the shortcut toggle, alias name, case preference and retained Java settings individually. The Profiles search reveals connection and CLI tests, model discovery and inventory refresh, imported model mapping and the active deletion review. Local AI search opens the relevant Profile roles, Local runtime or Hugging Face subtab and reveals the matching control. Runtime repair searches its signed-package fields and compatible release controls. The search highlights active signed-runtime cancellation and pause, the separate keep and discard actions, and the open llama.cpp runtime removal review. Selecting one of these results preserves the operation or review. Knowledge Store search follows the selected backend, source options and embedding mode, and reveals active folder reviews, source file size edits, store removal controls, profile bindings, Agent availability and embedding consent. Local Models search reaches Hugging Face and the managed GGUF and Apple MLX workflows, including model selection, runtime controls, configuration and active reviews. Imported GGUF and MLX settings can be found by name, format or registry ID. The result highlights the matching row and leaves review and adoption explicit. Memory search reveals imported preferences, active Markdown and entry editor actions, history restore and external file review controls. Skills search reveals the library filter and sort, the direct Java-style Providers entry point, available editor fields and actions, eligible Java preference suggestions, and the fields and actions of the open provider editor. | Select a control by keyboard and mouse, verify its page, scroll position and highlight, and preserve editor-local Find in Skills and Memory. Native widget tests verify keyboard focus and draft retention for GGUF and MLX controls and MLX runtime download policy. Exercise search from a partially completed wizard, repair or model review and verify draft retention and cancellation on native desktops. |
 | B4 · Hugging Face model browser | Rust loads additional pages, sorts metadata and resolves missing sizes for the RAM filter. Apple Silicon offers All formats, GGUF and MLX with independent continuations. Review MLX package fixes the commit, exact sizes and SHA-256 digests. Download and register validates the complete directory through the native MLX registry. Paused MLX downloads can be found, reviewed, resumed or discarded after restart. | Exercise continuation, sorting, RAM filtering, format changes, review, installation and recovery in the native desktop. The native transfer has passed a live pause, resume and registration test against a pinned public Hub package. [Java browser](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/LocalModelManagerPane.java#L803) · [Rust MLX Hub transfer](src/local_ai/managed_models/huggingface/mlx/download.rs) |
 | D2 · Connection folders | Drag writable SSH and serial rows to a local folder in the tree or sidebar. List and map share successive Undo. | Exercise native pointer gestures across the list, sidebar and map, reverse two saved moves and check read-only Teamwork entries. |
-| Q1 · Scheduler target picker | The job editor can filter saved SSH connections and groups by name, host or group path and apply a batch to one draft. | Exercise the picker on native desktops with an individual target, overlapping groups and a source-qualified Teamwork group. Verify search, reviewed order and cancellation. |
+| Q1 · Scheduler target picker | An owned server/group tree preselects and filters targets. This Mac verified normal and compact standalone/hosted ownership, keyboard and double-click selection, Save/restart, Cancel and stale-route rejection. The compact parent also passed job-list scrolling, keyboard editing and discard checks. | Complete the remaining parent pages, overlapping source-qualified Teamwork groups and the other native desktops. Preserve reviewed order and route validation. [Target picker](PORTING-PARITY.md#november-25-scheduler-target-selection) · [Compact parent](PORTING-PARITY.md#november-25-compact-scheduler-parent-layout) |
 | T2 · SFTP | The Local and Server panes review and clean up regular transfer parts in the displayed folder. Current-process stages are reserved during transfer and checked again before removal. | Exercise the confirmation and cancellation on native desktops. Verify protected deletion over a configured SSH route, including a replacement during review and a partial failure. |
 | D4 · Logfile Manager | Saved connections' existing log folders appear before their first logging session. Manual and logger-discovered origins are tracked independently. | Check deduplication when two connections share a folder, registration by the logger and forgetting a manually added folder. |
 | U1 · Update prompts | About offers a version-specific skip and a reminder on the next local day. Successful verified publication suppresses that version's automatic prompt. Startup and periodic prompts have separate repeat limits, and manual checks can still show the version. | Exercise the native About dialog and background notices across restart against a configured managed feed and an owner-published stable release. |
@@ -1083,9 +1447,10 @@ The broader release audit also confirmed these workflow differences:
   Optional startup unlock and reviewed Java temporary-key restore are
   implemented. Eligible saved local SSH profiles support unattended
   temporary keys for Scheduler and rsync, including a distinct jump-host
-  key. Native key replacement and route reselection remain open.
-  [Scheduled key checks](PORTING-PARITY.md#scheduled-ssh-and-rsync-with-temporary-keys)
-  · [Backup review and login checks](#implemented-features-with-outstanding-checks)
+  key. After fixture vault rotation this Mac verified native route reselection,
+  renewed approval and successful rsync. Manual replacement-key entry in the
+  connection editor remains open. [Scheduler rotation](PORTING-PARITY.md#november-25-native-key-rotation-and-renewed-rsync-approval)
+  · [Backup review and editor checks](#implemented-features-with-outstanding-checks)
 - **D5/A4 — Coding-agent indicators.** Native badges exist on macOS and
   Windows. Linux emits a persistent LauncherEntry D-Bus counter with an
   installed desktop entry. The native bus and count lifecycle have a
@@ -1132,13 +1497,24 @@ user executable.
 
 ### Current evidence and distribution
 
-The November 17 Apple Silicon ZIP described below was built from
+The November 25 review verified all 243 SHA-256 entries in the six local
+manifests for priority 1, global SearXNG, the original Agent web-tool offer,
+typed tool turns, interactive Run rounds and compact Agent Setup. The two
+latest application source manifests differ in the Setup view and its new
+layout test within their recorded scope. Both application snapshots used
+development builds. The review also identified 74 historical artifact paths absent from
+this checkout, including the November 19 Windows ZIP and its sidecar. Archived
+results below identify their tested revisions. [Last completed application checks](target/verification/20261125-web-rounds-results.json) · [Setup candidate and cleanup](target/verification/20261125-agent-setup-paused-notes.md)
+
+The historical November 17 Apple Silicon ZIP described below was built from
 `af1c17601ffa2f32c3aade762b13eca1727c0d6f0c826a631844d7d94baf65ed`
 on base `8fdb5d4`. Subsequent Journal, Scheduler, SFTP, desktop and snippet
 results cover the individual scopes below and in the parity record.
 
 | Snapshot and platform | Retained result | Limit of the result |
 | --- | --- | --- |
+| November 25 compact Agent Setup candidate, this Mac | A scrollable body keeps the actions below it. Format, test compilation, one layout regression over 18 combinations, strict application Clippy and the debug build passed. [Source manifest](target/verification/20261125-agent-setup-paused-source.json) · [Check results](target/verification/20261125-agent-setup-paused-checks.json) | The full application run ended on pause (wrapper exit 143). The desktop fixture stopped before its first model request. Setup and Pause/Resume desktop acceptance are open. |
+| November 25 interactive Agent Run, this Mac | The previous application suite passed 4,471 tests with 203 ignored. Normal and compact desktop runs recorded five loopback model requests across approval, decline and cancellation. [Desktop and suite evidence](PORTING-PARITY.md#november-25-interactive-run-model-web-rounds) | Run used a debug provider fixture. Real Tavily, installed services, signed runtimes and other Agent routes require their own evidence. |
 | PR #35, `ab5b101e`, native ARM64 | Full workspace suites passed on Windows (4,804 tests), Apple Silicon (4,909) and Fedora (4,953). All three passed formatting and strict workspace Clippy. [Native test record](PORTING-PARITY.md#november-23-full-native-workspace-tests) | Covers the tested source revision. Package verification, remaining interactive desktop checks and independent SSH review stay open. |
 | November 23 Knowledge Store restart, Windows ARM64 | Manual review and automatic sync each recorded a missing file. A separate process showed both stored outcomes and retained Last indexed times without rescanning. Automatic recovery changed only the repaired row. [Source outcome evidence](PORTING-PARITY.md#november-23-knowledge-source-outcomes) | Uses a bounded synthetic loopback embedding service. Configured provider, Qdrant and other native desktop acceptance remain open. |
 | November 23 compact GGUF Configure and import review, Windows ARM64 | A native development build passed. The serial AI Manager local suite passed 141 tests with six ignored. The desktop comparison checked one-line paths in Java and Rust, scrolling and Save at a narrow width, and each storage choice plus cancellation from the native file picker. [Configure evidence](PORTING-PARITY.md#november-23-gguf-configure-sizing) · [Import evidence](PORTING-PARITY.md#november-23-gguf-import-and-backend-review) | Uses synthetic GGUF registrations. Native split reattachment and the backend offer with an active signed runtime remain open. |
@@ -1148,24 +1524,24 @@ results cover the individual scopes below and in the parity record.
 | PR #8 head `fb8870149949`, November 18 | Full native suites and release builds passed on Windows ARM64 (4,371 passed, 95 ignored), Apple Silicon (4,474 passed, 208 ignored) and Fedora ARM64 (4,524 passed, 269 ignored). Checksums, architecture and packaged CLI startup passed on all three. The Mac ZIP passed ad hoc signature verification. [PR verification](https://github.com/chardonnay/korTTY_rust/pull/8) | Covers the tested PR head. Subsequent worktree changes require a new candidate. |
 | November 19 Windows ARM64 | The [portable release](PORTING-PARITY.md#november-19-windows-arm64-portable-release) and matching full suite cover source fingerprint `64f505367778`. The subsequent [Agent Design desktop run](PORTING-PARITY.md#agent-design-module-preview-and-status-preferences) used a development executable with SHA-256 prefix `3efbe2807fba`. | The later desktop run covers the Agent interactions recorded there. |
 | PR #7 merge, `e3c1760` | Windows, Ubuntu and macOS passed their configured tests and release staging. [GitHub Actions](https://github.com/chardonnay/korTTY_rust/actions/runs/44106367721) | Covers the merged revision. |
-| Post-merge Journal HTTPS binding (F1) | Four opt-in TLS cases passed on each of Windows ARM64, Apple Silicon and Fedora ARM64, alongside the regular Journal tests at the recorded revisions. [Windows](target/verification/20261117-journal-credential-windows-lld.log) · [Apple Silicon](target/verification/20261117-journal-credential-native-final-macos.log) · [Fedora](target/verification/20261117-journal-language-native-fedora-lld.log) | Configured provider and packaged desktop acceptance remain open. |
-| November 18 snippet alternatives | Fedora ARM64 passed 35 focused tests. Windows ARM64 passed app and test-target Clippy. [Fedora](target/verification/20261118-snippet-alternatives-fedora.log) · [Windows](target/verification/20261118-snippet-alternatives-windows.log) | Covers the imported count, candidate handling and reviewed assistant paths. Live provider and GUI acceptance remain open. |
+| Post-merge Journal HTTPS binding (F1) | Four opt-in TLS cases passed on each of Windows ARM64, Apple Silicon and Fedora ARM64, alongside the regular Journal tests at the recorded revisions. [Apple Silicon and Windows](PORTING-PARITY.md#reviewed-journal-credentials-after-pr-7) · [Fedora follow-up](PORTING-PARITY.md#scheduler-diagram-preferences-after-pr-7) | Configured provider and packaged desktop acceptance remain open. |
+| November 18 snippet alternatives | Fedora ARM64 passed 35 focused tests. Windows ARM64 passed app and test-target Clippy. [Native snippet checks](PORTING-PARITY.md#selectable-snippet-alternatives) | Covers the imported count, candidate handling and reviewed assistant paths. Live provider and GUI acceptance remain open. |
 | Pre-merge PR preparation, Windows ARM64, Rust 1.99.1 | `cargo fmt --all --check` and `cargo clippy --locked --workspace --all-targets -- -D warnings` passed. | Static checks on that revision. |
 | `af1c17601ffa`, Apple Silicon | 612 regular Journal tests passed, with 12 ignored; two opt-in loopback TLS question/summary tests passed separately. The release ZIP passed checksum, ARM64, strict ad hoc app/SSH worker signatures and CLI startup. Separate Seatbelt and packaged backup-startup checks passed. | Targeted application tests; no new full workspace, desktop GUI acceptance, Developer ID signing or notarization. |
 | `af1c17601ffa`, Fedora ARM64 | One regular loopback TLS selection test passed, with two ignored; both opt-in TLS fixtures passed separately with TLS 1.3. | Targeted tests, not a full suite or a Fedora release package. |
 | `af1c17601ffa`, Windows ARM64 | `cargo check --locked -p kortty --tests` passed. | Compilation only; no execution of the latest Journal tests on Windows. |
 | `e75aff4df394`, Apple Silicon | This earlier full workspace run passed 4,332 tests, with zero failures and 198 ignored. | Earlier full-analysis snapshot; later source changes require a new suite. |
 
-Evidence: [PR preparation Clippy](target/verification/20261117-pr-current-833377bc5b-windows-clippy-final.log),
-[Mac package source context](target/verification/20261117-native-journal-loopback-tls-macos-af1c17601ffa-source-context.txt),
-[source manifest](target/verification/20261117-native-journal-loopback-tls-macos-af1c17601ffa-source.sha256),
-[Mac Journal tests](target/verification/20261117-native-journal-loopback-tls-macos-af1c17601ffa-tests.log),
-[Mac package checks](target/verification/20261117-native-journal-loopback-tls-macos-af1c17601ffa-package.log),
-[Mac isolation and startup checks](target/verification/20261117-native-journal-loopback-tls-macos-af1c17601ffa-scale.log),
-[Fedora regular tests](target/verification/20261117-native-journal-loopback-tls-fedora-lld-af1c17601ffa-tests.log),
-[Fedora TLS fixtures](target/verification/20261117-native-journal-loopback-tls-fedora-lld-af1c17601ffa-scale.log),
-[Windows compilation](target/verification/20261117-native-journal-loopback-tls-windows-af1c17601ffa.log)
-and [earlier full workspace run](target/verification/20261117-native-full-analysis-default-macos-e75aff4df394-tests.log).
+Archived verification files include PR preparation Clippy (`20261117-pr-current-833377bc5b-windows-clippy-final.log`),
+Mac package source context (`20261117-native-journal-loopback-tls-macos-af1c17601ffa-source-context.txt`),
+source manifest (`20261117-native-journal-loopback-tls-macos-af1c17601ffa-source.sha256`),
+Mac Journal tests (`20261117-native-journal-loopback-tls-macos-af1c17601ffa-tests.log`),
+Mac package checks (`20261117-native-journal-loopback-tls-macos-af1c17601ffa-package.log`),
+Mac isolation and startup checks (`20261117-native-journal-loopback-tls-macos-af1c17601ffa-scale.log`),
+Fedora regular tests (`20261117-native-journal-loopback-tls-fedora-lld-af1c17601ffa-tests.log`),
+Fedora TLS fixtures (`20261117-native-journal-loopback-tls-fedora-lld-af1c17601ffa-scale.log`),
+Windows compilation (`20261117-native-journal-loopback-tls-windows-af1c17601ffa.log`)
+and earlier full workspace run (`20261117-native-full-analysis-default-macos-e75aff4df394-tests.log`).
 
 The November 17 Apple Silicon ZIP measured 41,292,554 bytes and had SHA-256
 `988a378e3f02fbc1e94b002ae461356a858510f5a3ea301bb2f4a23e0af0da48`.
@@ -1182,21 +1558,21 @@ checksum, architecture and strict signature checks after extraction.
 Its SSH worker has the App Sandbox entitlement. The publisher signing and
 notarization checks under V7 still apply. Fedora ARM64 used 26 build jobs
 for 91 passing archive and filesystem tests on the same source snapshot.
-[Source manifest](target/verification/20261116-native-macos-951c74d138ba-source.sha256),
-[Mac build](target/verification/20261116-native-macos-951c74d138ba-release.log),
-[Mac tests](target/verification/20261116-native-macos-951c74d138ba-tests.log),
-[Mac package](target/verification/20261116-native-macos-951c74d138ba-package.log)
-and [Fedora tests](target/verification/20261116-native-current-fedora-tests.log).
+Source manifest (`20261116-native-macos-951c74d138ba-source.sha256`),
+Mac build (`20261116-native-macos-951c74d138ba-release.log`),
+Mac tests (`20261116-native-macos-951c74d138ba-tests.log`),
+Mac package (`20261116-native-macos-951c74d138ba-package.log`)
+and Fedora tests (`20261116-native-current-fedora-tests.log`).
 
 The test follow-up uses a private receiver directory for the reviewed archive
 copy, representable timestamps for Chain admission, and an archive integration
 test name that runs on Windows without an elevation request. Apple Silicon
 again passed all 4,246 workspace tests with 186 ignored. The opt-in native
 Seatbelt test also passed. Fedora passed the six named archive reuse fixtures.
-[Updated source manifest](target/verification/20261116-native-macos-55867a98d73d-source.sha256),
-[Mac rerun](target/verification/20261116-native-macos-55867a98d73d-tests.log),
-[Seatbelt](target/verification/20261116-native-macos-55867a98d73d-seatbelt.log)
-and [Fedora archive reuse](target/verification/20261116-native-current-fedora-archive-reuse.log).
+Updated source manifest (`20261116-native-macos-55867a98d73d-source.sha256`),
+Mac rerun (`20261116-native-macos-55867a98d73d-tests.log`),
+Seatbelt (`20261116-native-macos-55867a98d73d-seatbelt.log`)
+and Fedora archive reuse (`20261116-native-current-fedora-archive-reuse.log`).
 
 The final Apple Silicon rerun reproduced the workspace result at 20 Cargo
 jobs and eight test threads. The `--zsh-tests` wrapper now gives tests a
@@ -1204,8 +1580,8 @@ private fallback profile. Subprocess fixtures with their own home directories
 continue to exercise the native profile path. The rerun observed
 window-settings output in the private profile and verified the default
 window-settings file's identity and metadata before and after the suite.
-[Isolated test suite](target/verification/20261116-native-macos-87e84b8bc81f-tests.log)
-and [profile verification](target/verification/20261116-native-macos-87e84b8bc81f-profile.log).
+Isolated test suite (`20261116-native-macos-87e84b8bc81f-tests.log`)
+and profile verification (`20261116-native-macos-87e84b8bc81f-profile.log`).
 
 Windows ARM64 passed 654 component tests in the workspace run and 3,493
 application tests in a separate rerun. These results include 85 ignored
@@ -1216,9 +1592,9 @@ scheduling failure and twelve passing isolated repeats. The reconnect
 fixture now waits for a CMD prompt on the actual anchor row. The updated
 reconnect test passed twelve consecutive runs and the full application
 harness.
-[Windows build and components](target/verification/20261116-native-current-windows-final.log),
-[isolated LM Studio tests](target/verification/20261116-native-current-windows-repeat-tests.log)
-and [application suite](target/verification/20261116-native-current-windows-app-verified.log).
+Windows build and components (`20261116-native-current-windows-final.log`),
+isolated LM Studio tests (`20261116-native-current-windows-repeat-tests.log`)
+and application suite (`20261116-native-current-windows-app-verified.log`).
 
 PR #4 at `590acff495710843614c60028e347361beb0734e` passed formatting,
 strict workspace Clippy, workspace tests, release builds and package staging
@@ -1243,17 +1619,17 @@ Windows local publication and migration regressions also passed. Verify the
 remaining native target cases and editing, approval and reapproval in native
 Scheduler windows. Complete package acceptance under V7, including clean-system
 installation and signing.
-[Fedora OpenSSH record](target/verification/20261115-pr4-rsync-fedora-native.log)
-and [sudo record](target/verification/20261115-pr4-rsync-fedora-sudo.log).
-[Windows OpenSSH record](target/verification/20261115-pr4-merged-rsync-windows-pinned.log)
-and [Windows local regression record](target/verification/20261115-pr4-merged-rsync-windows-local.log).
+Fedora OpenSSH record (`20261115-pr4-rsync-fedora-native.log`)
+and sudo record (`20261115-pr4-rsync-fedora-sudo.log`).
+Windows OpenSSH record (`20261115-pr4-merged-rsync-windows-pinned.log`)
+and Windows local regression record (`20261115-pr4-merged-rsync-windows-local.log`).
 
 An earlier application-suite checkpoint on 2026-11-15 passed
 3,556 tests on Fedora ARM64 and 3,450 on Windows ARM64. The first Windows
 run had a report-cancellation cleanup failure, followed by 30 isolated passes
 and a successful full retry. Strict Clippy and an Apple Silicon cross-check
 passed for that recorded source, which preceded the direct local file receiver.
-See the [recurring sudo rsync record](target/verification/20261115-recurring-sudo-rsync-acceptance.md).
+See the recurring sudo rsync record (`20261115-recurring-sudo-rsync-acceptance.md`).
 
 After resuming implementation on 2026-11-14, the Windows ARM64 application
 suite passed **3,328 tests with zero failures and 62 ignored**. Updated
@@ -1272,7 +1648,7 @@ Application Clippy, formatting and the Apple Silicon application-test
 cross-compilation check passed. These are application counts, not a new full
 workspace or native Mac run. Installed LM Studio desktop acceptance remains
 open. See the [LM Studio loopback checkpoint](PORTING-PARITY.md#lm-studio-auto-over-localhost-and-loopback-https)
-and its [verification record](target/verification/20261114-lm-studio-loopback-windows-arm64.txt).
+and its verification record (`20261114-lm-studio-loopback-windows-arm64.txt`).
 
 The checks below describe **earlier source snapshots**. The November 13
 Windows ARM64 size-optimized package measured 81,262,080 bytes (77.50 MiB)
@@ -1280,8 +1656,8 @@ for `kortty.exe`; its source predates the current AI and migration changes.
 The Apple Silicon signature, notarization, Gatekeeper, Seatbelt and packaged
 SSH evidence also applies only to its recorded package. Rebuild the current
 working tree and repeat the affected V7 checks before distributing it.
-See the [Windows package record](target/verification/20261113-windows-arm64-release-size-optimized.md)
-and [Mac notarization record](target/verification/20261112-macos-notary.md).
+See the Windows package record (`20261113-windows-arm64-release-size-optimized.md`)
+and Mac notarization record (`20261112-macos-notary.md`).
 
 The [Step 4 implementation](PORTING-PARITY.md#interactive-swarm-reviewed-ai-providers-and-persistent-indexes)
 covers saved Swarm rounds, reviewed Agent and Terminal Chat provider paths,
@@ -1289,7 +1665,7 @@ local tokenizers, and knowledge and journal persistence. Native Windows ARM64
 passed 3,340 workspace tests with 54 ignored. Clippy passed on Windows and as
 a macOS ARM64 cross-check. The Windows PDF helper fixture passed at the new
 input boundary. See the
-[verification record](target/verification/20261112-step4-ai-workflows.md).
+verification record (`20261112-step4-ai-workflows.md`).
 
 The [Step 3 implementation](PORTING-PARITY.md#sftp-file-operations-and-server-only-archives)
 covers the attached-session lane cap, resume and cancellation preferences,
@@ -1300,14 +1676,14 @@ replacement regressions. The Fedora archive helper suite passed 17 tests
 and Clippy. Fedora also passed native OpenSSH file editing and both
 scheduled rsync directions with the application bridge. Native desktop and
 installed-helper acceptance remain open in T1–T4 and Q2. See the
-[verification record](target/verification/20261112-step3-file-operations.md).
+verification record (`20261112-step3-file-operations.md`).
 
 The [Step 2 implementation](PORTING-PARITY.md#connection-input-settings-and-managed-policy)
 covers connection input overrides, Control and MCP policy, SFTP transfer
 restrictions, the managed application update feed, and encrypted recovery
 output. Native Windows ARM64 workspace verification passed 3,316 tests
 with 54 ignored. Clippy and the macOS ARM64 cross-check passed. See the
-[verification record](target/verification/20261112-step2-connection-policy.md).
+verification record (`20261112-step2-connection-policy.md`).
 
 The D1/A1 checkpoint records **3,305 passing Windows workspace tests
 and 53 ignored tests across 67 test summaries**. This includes **2,713 passing
@@ -1320,7 +1696,7 @@ passed; the Fedora PTY subset recorded **29 passed and 4 ignored**, with Clippy
 passing. These are automated execution checks, not a completed manual GUI matrix.
 
 See [the shell/Agent checkpoint](PORTING-PARITY.md#local-shell-integration-and-terminal-agent-recognition)
-and its [verification record](target/verification/20261112-shell-integration-agent.md).
+and its verification record (`20261112-shell-integration-agent.md`).
 The earlier automation/SFTP checkpoint recorded **2,694 passing
 application-binary tests and 49 ignored tests**. Its private Windows ARM64 GUI
 checks covered the managed AI default, colliding personal profile IDs,
@@ -1328,21 +1704,18 @@ policy-locked SFTP preferences and the corrected Settings tab scrollbar.
 
 See [the recorded checkpoint](PORTING-PARITY.md#scoped-automation-capture-and-sftp-conflict-settings)
 and the local
-[verification record](target/verification/20261112-automation-journal-and-sftp-policy.md).
+verification record (`20261112-automation-journal-and-sftp-policy.md`).
 A real SSH conflict under the managed choice and a successful scheduled
 command under an installed automation-capture denial still need acceptance.
 
 The November 12 Windows ARM64 static-CRT ZIP passed a private-profile test
 covering Control ping, one restored PowerShell pane, graceful exit and
-cleanup. That ZIP and its checksum are retained in the original main
-checkout under `target/dist/kortty-0.1.0-aarch64-pc-windows-msvc-20261112-shell-agent/`.
-The [shell and Agent checkpoint](PORTING-PARITY.md#local-shell-integration-and-terminal-agent-recognition)
-records the retention exception for the earlier archive in that checkout.
-The porting worktree holds the November 19 package. On November 22 its
-SHA-256 matched both its sidecar and the November 19 record.
-[November 19 verification](PORTING-PARITY.md#november-19-windows-arm64-portable-release)
-· [Retained ARM64 ZIP](target/dist/kortty-0.1.0-aarch64-pc-windows-msvc/kortty-0.1.0-aarch64-pc-windows-msvc.zip)
-· [SHA-256 sidecar](target/dist/kortty-0.1.0-aarch64-pc-windows-msvc/kortty-0.1.0-aarch64-pc-windows-msvc.zip.sha256).
+cleanup. The original checkout recorded its archive under
+`target/dist/kortty-0.1.0-aarch64-pc-windows-msvc-20261112-shell-agent/`.
+The subsequent November 19 Windows ARM64 ZIP matched its recorded SHA-256
+and sidecar on November 22. The November 25 review found neither archive in
+this worktree. [November 12 shell and Agent checkpoint](PORTING-PARITY.md#local-shell-integration-and-terminal-agent-recognition)
+· [November 19 package and checksum record](PORTING-PARITY.md#november-19-windows-arm64-portable-release)
 The current source checkpoint awaits packaging under V7. The x64 ZIP still
 needs a current build and verification. The exact executable and
 configuration used in the user's originally reported failing session have
@@ -1419,12 +1792,11 @@ Windows ARM64 passed 606 Journal tests (10 ignored) and all four TLS cases
 after the cache follow-up. Apple Silicon passed 612 Journal tests (12 ignored)
 and all four TLS cases, including the removal and retry checks, on source manifest
 `bf19c116594c8be69026e5d63ccee8295847e4c37f81c7326cb285e0063cbad7`.
-See the [Windows test record](target/verification/20261117-journal-credential-windows-lld.log)
-and the [macOS test record](target/verification/20261117-journal-credential-native-final-macos.log).
+[Windows and macOS test record](PORTING-PARITY.md#reviewed-journal-credentials-after-pr-7)
 Fedora ARM64 passed 614 Journal tests (12 ignored), 206 Scheduler tests, the
 diagram import fixture and all four TLS cases on the later source manifest
 `94e140faf0376a978b7ccfb46f22ba8626b115a39d2e71a920f1ca84ddfbdc23`.
-[Fedora record](target/verification/20261117-journal-language-native-fedora-lld.log).
+[Fedora record](PORTING-PARITY.md#scheduler-diagram-preferences-after-pr-7).
 The implementation and focused native regressions for F1 are complete.
 Configured-provider desktop acceptance remains under V5 and current release
 packages under V7.
@@ -1671,7 +2043,9 @@ See the [local shell preset checkpoint](PORTING-PARITY.md#native-local-shell-pre
 Quick Connect also accepts a custom executable, individual arguments and a
 starting directory. Selecting a saved shell loads its launch settings for
 one-use edits. Saving as a new connection creates a separate profile.
-Verify the controls and reopening on native desktops. See the
+The November 25 macOS pass verified keyboard editing, argument add/remove,
+a real custom command, saved-profile restart and unchanged-store cancellation
+at normal and compact sizes. Other native desktops remain open. See the
 [Quick Connect local shell checkpoint](PORTING-PARITY.md#quick-connect-local-shell-commands-and-directories).
 
 Evidence for the completed D2/D3 work includes
@@ -1690,7 +2064,7 @@ an English answer. Keep this difference visible when comparing transcripts.
 | ID | State and implemented coverage | Remaining work |
 | --- | --- | --- |
 | A1 | Implementation + acceptance. Built-in Run/Ask/Plan, reviewed local/SSH execution, skills/quota, bounded history, opt-in `agent` aliases, Tab completion, sudo/vault challenges and mirror holds exist. PowerShell/CMD integration and per-pane setup/status now ship in source. Native ConPTY PowerShell 5.1/CMD and Fedora SSH Agent routes passed. Permitted terminal AI initializes an in-memory SSH credential mask independently of capture, including incognito, without enabling logging. R `src/workspace/terminal_agent/shortcut.rs`, `src/workspace/ssh_access.rs`, `src/session/shell_activity.rs`, `crates/pty/src/shell_integration.rs`. | The inline root-bypass option and grant revocation passed targeted native macOS/Fedora tests; automatic read-only dispatch and inline per-run confirmation passed targeted native macOS/Fedora tests. Verify remaining supported shells, native desktops and current packages. The sandboxed SSH manual password flow passed on Fedora Wayland and X11. Verify the manual flow and local system sudo on macOS, and exercise history and run controls, mirror release, changed targets, and revocation. Direct custom Bash, Zsh, Fish, PowerShell and CMD profiles can use the Agent with validated interactive startup flags and a reviewed native runner. Verify the custom profiles in live desktop panes. See the diagnostic contract below. |
-| A2 | Implementation, acceptance and bounded audit. Planning stages, design module IDs d01–d20, docking/status/approval placement, inline history, picture-in-picture, usage/repair display, seven activity export formats and Agent-to-Chat/Journal links exist. The worktree includes the in-pane Spotlight prompt with entry and submission transitions, compact step progress, animated toast entry, countdown, fade and collapse, Orbit and the Adaptive Dock countdown. A chooser switches between retained runs in the same pane from status, history and the terminal context menu. Up to five finished runs remain available after the Activity window closes, bound to the original non-private stream. The standalone editor creates a custom copy on module activation and writes committed edits and display preferences immediately. General Settings applies its draft on Save. Java restore fills both unset preferences independently. Windows ARM64 verified the earlier Settings workflow, live d14 display and cancellation, d19 layering and detach/reattach, and d20 pane resizing. [Spotlight and status checkpoint](PORTING-PARITY.md#november-20-terminal-agent-spotlight-and-status) | Verify the d06 layout and bound approvals in a live desktop run. Align the design naming flows and copy all retained masked output for the selected step. [Completion checks](#confirmed-implementation-work) Verify reopening finished runs and earlier-run selection and the contextual run and step actions. Verify Spotlight focus and profile selection, the timed displays with reduced motion and auto-hide disabled, the remaining d14 interactions, and live d19 run following. Verify inline selection and Kitty row mapping, exports, linked Journal cards, live provider usage/repair and native desktop behavior across platforms. |
+| A2 | Implementation, acceptance and bounded audit. Planning stages, design module IDs d01–d20, docking/status/approval placement, inline history, picture-in-picture, usage/repair display, seven activity export formats and Agent-to-Chat/Journal links exist. The worktree includes the in-pane Spotlight prompt with entry and submission transitions, compact step progress, animated toast entry, countdown, fade and collapse, Orbit and the Adaptive Dock countdown. A chooser switches between retained runs in the same pane from status, history and the terminal context menu. Up to five finished runs remain available after the Activity window closes, bound to the original non-private stream. The standalone editor creates a custom copy on module activation and writes committed edits and display preferences immediately. General Settings applies its draft on Save. Java restore fills both unset preferences independently. Windows ARM64 verified the earlier Settings workflow, live d14 display and cancellation, d19 layering and detach/reattach, and d20 pane resizing. [Spotlight and status checkpoint](PORTING-PARITY.md#november-20-terminal-agent-spotlight-and-status) | Verify the d06 layout and bound approvals in a live desktop run. This macOS desktop verified naming, duplicate/rename/default persistence and the combination picker in normal, compact and minimum Settings views. [Picker and Escape](PORTING-PARITY.md#november-25-agent-design-combination-picker-and-escape) Copy all retained masked output for the selected step. [Completion checks](#confirmed-implementation-work) Verify reopening finished runs and earlier-run selection and the contextual run and step actions. Verify Spotlight focus and profile selection, the timed displays with reduced motion and auto-hide disabled, the remaining d14 interactions, and live d19 run following. Verify inline selection and Kitty row mapping, exports, linked Journal cards, live provider usage/repair and native desktop behavior across platforms. |
 | A3 | Acceptance + bounded audit. Live and saved targets, named pre-run saved SSH drafts, completed interactive rounds with renaming, reviewed continuation, connection groups and working-directory metadata, history search, Markdown/text/PDF export, saved journal defaults, estimate and journal links are implemented. A batch review binds one approval to the displayed ordinary commands and target identities. R `src/workspace/terminal_agent/swarm.rs` and its `batch.rs`/`comparison.rs`/`conversation.rs`. | Verify native renaming, selection, batch review and revocation, comparison, failure isolation, workflow drafts and continuation over pinned SSH. Evaluate Java's standing batch policy and incognito target scope against native authority requirements. Saved follow-up uses reviewed saved SSH routes. |
 | A4 | Acceptance. All eight pinned Agent verbs, events, wait/start/rename and `notification.show` have native Control/CLI routes. Windows socket backpressure and native notification submission have evidence. | Native visible delivery and exact focus/target routing, stale agents, moved splits, timeouts and losses across desktops. Admission/native submission receipts alone do not prove a displayed notice or activation. |
 | A5 | Acceptance. Explicit `control-api = "allow"` starts the listener and locks the setting while retaining the personal preference. The parser normalizes feature keys and values. MCP stdio keeps its independent opt-in, retains its write tools preference while disabled, and gates writes on effective policy and consent. Masked reads, reconnect identity guards and managed MCP denial exist. | Verify managed activation, lock display and relaxation on native desktops. Complete affirmative write consent and invalidation across those desktops. P1 owns shared policy acceptance. |
@@ -1805,12 +2179,10 @@ exact output reached the desktop clipboard in each run. The terminal grid
 and ring position stayed fixed. On Windows ARM64 the user saw the list
 animate in a live terminal and used **Copy output** on the command step.
 Verify the exact system clipboard result and reduced-motion workflow on
-Windows, and repeat both desktop workflows on macOS. The earlier
-102-test runs on Windows ARM64 and Apple Silicon predate the expanded
-Orbit step-menu regression. Rerun that regression on the current source.
-It checks the application's internal clipboard. The Windows run stopped
-during compilation and produced no result for this test.
-[Orbit progress and placement](PORTING-PARITY.md#orbit-progress-and-terminal-placement)
+Windows, and repeat both desktop workflows on macOS. The November 25 macOS
+application suite passed the expanded Orbit step-menu regression, which
+checks the application's internal clipboard. The original Windows attempt
+stopped during compilation. [Orbit desktop evidence](PORTING-PARITY.md#orbit-progress-and-terminal-placement) · [macOS application test log](target/verification/20261125-web-rounds-final-application.log)
 
 The d04 Frosted Glass HUD shows typed progress, model usage and the current
 step in the lower-right corner of its terminal. The blur samples the rendered
@@ -2409,7 +2781,7 @@ SearXNG profiles can configure a direct Streamable HTTP MCP endpoint for
 `web_url_read`. Java's saved site URL describes the search service. Review the
 separate MCP endpoint explicitly in Rust after migration. The published
 SearXNG MCP 2.10.1 server passed authenticated search and page-read checks on
-Windows ARM64 with a local backend. [Provider verification](target/verification/20261114-searxng-published-provider-windows-arm64.txt).
+Windows ARM64 with a local backend. Provider verification (`20261114-searxng-published-provider-windows-arm64.txt`).
 Full desktop acceptance with an operated SearXNG instance remains open.
 Automation journals keep Internet access disabled.
 Journal settings support per-direction line limits, a context-token budget,
@@ -2441,7 +2813,7 @@ profiles. Native desktop and configured-provider acceptance remain open.
 
 | ID | State and implemented coverage | Remaining work |
 | --- | --- | --- |
-| S1 | Implementation, acceptance and reduced-editor scope. Rust, Python, shell, Markdown, AsciiDoc, Dockerfile, SQL, Perl, Ruby, Lua, PowerShell, Java, Groovy, JavaScript and TypeScript structure scanners exist. Python recognizes `with … as`, `except … as`, unpacking and initial augmented assignments and classifies `dict()` and `tuple()` bindings. Lua syntax and completion, LuaJIT detection, and reviewed native format and syntax actions are implemented. | The adjustable library/editor divider remembers its preferred ratio across resizes and restarts. Verify the live divider on native desktops. The multi-language completion list and opt-in inline AI suggestions are implemented. Review remaining language-specific completion cases and verify preview, acceptance and dismissal in the native editor. Verify native jumps after edits, nested scopes, repeated names, Unicode, placeholders, and editor tool review, cancellation and SFTP save. Verify discovery and launch from Finder or Dock. The [Step 5 product audit](target/verification/20261112-step5-product-audits.md) records the reference structure cases. |
+| S1 | Implementation, acceptance and reduced-editor scope. Rust, Python, shell, Markdown, AsciiDoc, Dockerfile, SQL, Perl, Ruby, Lua, PowerShell, Java, Groovy, JavaScript and TypeScript structure scanners exist. Python recognizes `with … as`, `except … as`, unpacking and initial augmented assignments and classifies `dict()` and `tuple()` bindings. Lua syntax and completion, LuaJIT detection, and reviewed native format and syntax actions are implemented. | The adjustable library/editor divider remembers its preferred ratio across resizes and restarts. Verify the live divider on native desktops. The multi-language completion list and opt-in inline AI suggestions are implemented. Review remaining language-specific completion cases and verify preview, acceptance and dismissal in the native editor. Verify native jumps after edits, nested scopes, repeated names, Unicode, placeholders, and editor tool review, cancellation and SFTP save. Verify discovery and launch from Finder or Dock. The [Step 5 product audit](PORTING-PARITY.md#local-terminal-isolation-and-bounded-parity-audits) records the reference structure cases. |
 | S2 | Implementation and acceptance. Explicit reviewed completion, improvement, correction, translation, descriptions, selectable snippet alternatives and security actions exist, including description-only Apply/Undo, compact and embedded commands, and reviewed HTTPS and CLI assistance. Standalone Security Check offers per-finding selection and optional migration. Unsupported or unavailable local source tools can open reviewed AI formatting or an advisory syntax review. | Complete the remaining assistant controls and completion behavior described below. Verify configured providers and native selection boundaries, changed source, alternative choice and preview, discard/undo, original-profile reruns and explicit clipboard review on each desktop. |
 | S3 | Implementation and acceptance. Hardening, validation, script headers, optional language migration, optional modularization, durable selective publication/recovery and workflow diagrams exist. Manual split planning and per-module generation use reviewed HTTPS or CLI alongside local and managed profiles. Outbound reviews bind the saved source, profile, credential context and current job, and are renewed after restart. Single-snippet and folder analyses accept saved CLI profiles. After a saved HTTPS or CLI analysis, the opt-in follow-up opens a separate split preview for that exact report and profile. | Verify actual configured providers, native optional-chain/option-only flow, language eligibility, migration before selected changes, collisions, cancellation, selected-file publication and restart recovery. |
 | S4 | Resolved. Pinned Java project/folder Apply uses task-local preview state and saves accepted files without durable project Apply/POST records. | No new durable folder Apply/POST implementation is required for confirmed parity. Existing single-snippet durable recovery/POST and S3 modularization remain in scope. |
@@ -2644,7 +3016,7 @@ See [scheduled AI Memory and journal fact checks](PORTING-PARITY.md#scheduled-ai
 | T2 | Implementation + acceptance. Durable single-file downloads/new uploads, reviewed replacement-upload resume, folder child retry and recovery exist. Settings and Java SFTP preference interchange include `sftpResumePartialTransfers` (default on) and dependent `sftpKeepPartialOnCancel` (default off). Turning resume off releases retained offers and history pins and changes waiting retries to fresh copies. The Local and Server panes offer reviewed cleanup of regular part files with active-stage protection. [SFTP cleanup parity](PORTING-PARITY.md#november-20-sftp-transfer-part-cleanup) | Verify the cleanup controls in native desktops and protected server cleanup on configured routes. Verify live Java preference exchange, native Linux/macOS interruption and restart, real parallel-lane retries and remote cancellation cleanup after a lost connection. Remote stage removal requires verification of the authenticated route and stage ownership. |
 | T3 | Implementation + acceptance. Browser child-queue folder merge, selective retry, regular-file source links, changed-file batches, destination-only removal and same-server copy exist. Ordinary browser/Scheduler download inheritance and P1's transfer-policy separation are implemented. One-use Windows and Unix Scheduler downloads and ordinary login-owned private remote replacement uploads have reviewed publication, recovery and content-bound approval. Ordinary recurring Calendar and Chain SFTP replacement is implemented in both directions. Protected single-file replacement supports one-use and recurring approval; protected folder transfers support one-use and bounded recurring approval for existing or initially vacant receivers. | Verify extension absence without client-payload fallback, collisions, foreign-owner writes and changed destinations. Verify recurring first publication into vacant protected receivers through the installed helper and configured native routes; retain and verify the implemented file and existing-folder approvals. Ordinary recurring Calendar and Chain replacement already passed pinned OpenSSH fixtures; verify native approval and reapproval. Identify reference-required destinations outside the supported ownership, mode and extended-ACL boundaries and implement their metadata and recovery contract. |
 | T4 | Implementation + acceptance. Native text and external file editing, browser **Open image**, Linux guarded elevated text writeback, and reviewed AI comparison with editable presets, three selectable draft comparison pairs and local/unsaved snippet drafts exist. A review can publish a new draft file to a chosen canonical directory on the same authenticated server connection. Local draft replacement reviews an existing target, can create a new `.bak`, and can replace the compared right local file and refresh the exact pair. The right server file or another selected existing server file can be replaced through the checked native Linux, macOS or Windows helper with optional `.bak` and preservation of supported access metadata. Replacing either compared file reloads the exact pair. Local and SFTP file editors offer reviewed AI workflows that use the originating saved connection profile when available. An explicit picker choice persists across actions. J `ui/SFTPManagerTab.java`, R `src/sftp_window/worker.rs`, `src/sftp_window/compare/ai.rs`, `crates/ssh/src/sftp/edit.rs`. | Verify the implemented AppKit Copy drag-out from the file manager and terminal sidebar, including cancellations, revoked transfers and staging lifetime. Verify native UI and configured providers, close/reconnect, bounded masked streaming, cancellation and publication. Verify the native macOS and Windows helpers via direct and isolated SSH. Retain Linux coverage. Verify the pair picker and existing-file chooser in the native window. Verify native image opening, editor launch/writeback/disconnect/recovery and elevated writeback with a real authorized sudo account. |
-| T5 | Acceptance + bounded audit. Local PTY sandbox launch paths use Linux Landlock/seccomp, macOS Seatbelt and Windows Process Security Environments. Fedora ARM64 local-shell and worker containment, installed Flatpak local-shell containment, Windows ARM64 ConPTY containment, and native Apple Silicon Seatbelt and packaged SSH isolation passed. Windows uses CMD with Win32k lockdown and rejects the Windows PowerShell preset in sandbox mode. | Run local-shell and packaged SSH fixtures on native macOS Intel and Windows x64, including interactive behavior and containment. Track broader Windows shell compatibility. Direct, process-isolated and jump RSA passed on Apple Silicon. V6 still tracks the external review and active dependency advisories. See the [native Mac verification](target/verification/20261112-step6-macos.md). |
+| T5 | Acceptance + bounded audit. Local PTY sandbox launch paths use Linux Landlock/seccomp, macOS Seatbelt and Windows Process Security Environments. Fedora ARM64 local-shell and worker containment, installed Flatpak local-shell containment, Windows ARM64 ConPTY containment, and native Apple Silicon Seatbelt and packaged SSH isolation passed. Windows uses CMD with Win32k lockdown and rejects the Windows PowerShell preset in sandbox mode. | Run local-shell and packaged SSH fixtures on native macOS Intel and Windows x64, including interactive behavior and containment. Track broader Windows shell compatibility. Direct, process-isolated and jump RSA passed on Apple Silicon. V6 still tracks the external review and active dependency advisories. See the [Apple Silicon verification](PORTING-PARITY.md#native-apple-silicon-release-acceptance). |
 | T6 | Acceptance, hardware deferred. Saved serial connections, encodings, grouping/tags/favorites/pins, mixed library actions and import/export exist. | Native Manager selection/actions/interchange. Physical break/modem/flow-control tests remain user-deferred under V4. Serial library organization is no longer an implementation gap. |
 
 Java drag transfers and global archive defaults are in `ui/SFTPManagerTab.java`,
@@ -2913,7 +3285,7 @@ Agent and native-tool outputs against their own review scopes.
 | Q1 | Implementation + acceptance. The job editor supports searchable multi-selection of saved SSH connections and source-qualified groups. A batch rechecks the selected routes, expands group descendants and removes duplicate targets before changing the draft. [Scheduler picker parity](PORTING-PARITY.md#november-20-scheduler-target-picker) Missing-only SFTP sync, one-use/standing/cascade/predecessor reviews, multi-target Agent/Swarm, per-round approval, comparison and saved follow-up exist. Read-only and iterative scheduled Swarms admit up to sixteen reviewed target workflows and queue the remainder of up to 32 routes. Windows and Unix have a one-use reviewed changed-file download path. Ordinary uploads can replace reviewed private files owned by the remote login. Recurring approval can explicitly authorize replacements in either direction within the firing budget. rsync supports reviewed regular-file and directory transfer on Unix and Windows, including literal batches and mixed file and folder projections. Each combined route stages and verifies one tree with named or contents placement, scoped mirror deletion and recovery. Existing downloads support protected local folders and regular files on Linux, macOS and Windows. Direct file replacement supports one-use and recurring approval, with explicit distinct local paths for grouped routes. Recurring single and mixed existing-directory plans bind calendar and Chain occurrences, a reviewed receiver per route, and aggregate byte, entry and removal limits. Recurring Linux uploads use the protected v3 helper. Passwordless elevation uses a fixed Linux helper for direct and combined transfers, including guarded existing-directory upload and download. | Verify Teamwork scheduler and rsync jobs over native OpenSSH. Verify protected operations on shared routes and add shared-route support to Agent/Swarm approvals. Verify native recovery of abandoned private rsync staging after forced helper termination. Verify native larger Swarm runs over pinned SSH with configured providers, cancellation, journal/report/reopen and saved group refresh and reapproval after membership changes. Verify the implemented recurring file replacement paths on native desktops. Verify the implemented recurring vacant-folder progression under T3 through deployed native routes and address reference-required remote destinations outside the supported upload scope. Fedora verified ordinary SFTP Calendar and Chain starts through pinned OpenSSH. Verify configured deployments and remaining native editor paths for combined passwordless transfers. Passwordless standing rsync covers existing protected remote files and remote or local directories. Fedora verified recurring direct-file downloads with ordinary and passwordless pinned OpenSSH. Windows verified the one-use direct-file receiver over pinned OpenSSH. Confirm native approval and recovery and verify the remaining platform cases. Fedora verified first publication and replacement at vacant Linux server file and directory receivers through ordinary and passwordless routes. Verify disjoint and shared file and directory hierarchies and imported group layout through native Scheduler review and adoption. Verify merge, mirror and recurring approval through native desktop interaction. Verify deletion scope, recurrence, cascade and expiry, groups and batches on Windows and native macOS. |
 | Q2 | Implementation + acceptance. Elevated command/script/snippet, reviewed new-file/new-tree transfers, one-use and bounded recurring protected file replacement in both directions, one-use and recurring protected folder transfers with confirmed vacant-to-existing receiver progression, desktop outcomes and independently approved HTTPS webhooks exist. Typed Linux sudo actions cover mkdir, octal and explicit-class symbolic chmod, numeric chown, regular-file and recursive folder copy to vacant paths, no-replace file/folder rename and protected deletion. The Scheduler can resolve names through a bounded read-only command on one pinned saved route. Explicit acceptance stores the UID or GID. Recursive operations support up to 128 total entries. The browser and Scheduler support server-only ZIP, TAR, TAR.BZ2 and 7z creation with reviewed output UID, GID and ordinary mode through the updated helper. Ordinary Scheduler jobs can create vault-backed AES-256 ZIP and verify and publish an optional local copy using the same SSH session. An opt-in Linux workflow supports ordinary same-path archive updates, ZIP Add, fresh TAR output and recovery for the remote and local files. A separately installed Linux helper supports these archive formats and AES-256 ZIP through a path-constrained Scheduler sudo route with either an explicit passwordless review or a separately reviewed vault password. An administrator download root can permit a local copy of its newly published archive through the same command channel. | Ordinary SFTP symbolic permissions require a canonical path and the server's no-follow `lsetstat` extension. Verify symbolically computed ordinary modes through the descriptor-held sudo path with an authorized SSH route. Verify recurring vacant-folder progression, existing-folder standing approval, durable pending state and native recovery through the installed helper and native Scheduler windows. Verify the installed folder helper through a configured native Scheduler route. Verify recurring file replacements and reapproval from native Scheduler windows against a deployed helper. Verify native adoption of restored Java sudo staging drafts. Fedora verified ordinary and sudo client update fixtures and the Java archive layouts. Verify a configured desktop route with the installed helper. Verify the optional protected archive copy with pinned SSH, configured download roots, revocation and local publication. The native pinned client and the installed V2 helper passed separate Fedora checks, including actual sudo/PAM in an isolated test account. Verify deployment on a saved desktop route. Verify archive output metadata through the installed helper and live pinned SSH. The privileged route retains root-owned private output, consistent with Java's archive sudo controls. Verify named ownership over a live native SSH route, the installed archive helper under transfer denial, real authorized sudo, Windows/macOS publication, configured webhooks and live desktop delivery. J `jobscheduler/JobSchedulerJobRunner.java`, R `src/job_executor/remote/privileged.rs`. |
 | Q3 | Acceptance. Per-target Session Journals, capture revocation independent of execution, closing summaries, retention, estimates/totals, result links and Java retention-preference XML exist. | Native viewer/details/estimate/options and import/export dialogs, actual run/provider outcomes and target lifecycle. Verify a successful scheduled command under installed capture denial while existing retention continues. Java JAXB 0/37/3650 round trips already exist. |
-| P1 | Acceptance + bounded audit. Managed Control activation, SFTP separation, update feed, encrypted recovery output, scoped AI restrictions, protected/provisioned models, custom headers, automation capture and managed SFTP conflict defaults exist. Startup supports managed and personal password requirements and optional device-local vault unlock. The shared `allow-telemetry` Boolean is accepted for compatibility. Scoped `rule.ai-memory.statistics` controls local collection. | Verify the [device credential flow](PORTING-PARITY.md#november-23-native-vault-startup-unlock) on each native desktop. Verify the stricter host-pin lock contract, native worker enforcement, scoped precedence and revocation, SMB sources, signed protected inference and macOS protected-cache restart. See the [field audit](target/verification/20261112-step5-policy-audit.md) for the earlier snapshot. |
+| P1 | Acceptance + bounded audit. Managed Control activation, SFTP separation, update feed, encrypted recovery output, scoped AI restrictions, protected/provisioned models, custom headers, automation capture and managed SFTP conflict defaults exist. Startup supports managed and personal password requirements and optional device-local vault unlock. The shared `allow-telemetry` Boolean is accepted for compatibility. Scoped `rule.ai-memory.statistics` controls local collection. | Verify the [device credential flow](PORTING-PARITY.md#november-23-native-vault-startup-unlock) on each native desktop. Verify the stricter host-pin lock contract, native worker enforcement, scoped precedence and revocation, SMB sources, signed protected inference and macOS protected-cache restart. See the [field audit](PORTING-PARITY.md#local-terminal-isolation-and-bounded-parity-audits) for the earlier snapshot. |
 | R1 | Acceptance. Native/tiled playback, visible IBM recording, Java JSONL/GZIP import/export, legacy plain JSONL import, and reviewed WebM/VP9 and MKV/FFV1 exports exist. Java reader compatibility and both Fedora codecs have evidence. | Native wide/resize/synchronized playback and approved encoder execution/cancellation/cleanup on Windows/macOS. Java recording interchange and video export are no longer implementation gaps. |
 
 ### Concrete policy work and residual schema audit
@@ -2966,7 +3338,7 @@ Evidence includes
 The additive importer handles individual fields. The November 18 check
 compared the 346 top-level non-static fields in the tagged
 `GlobalSettings.java` with the 42 readers in the
-[November 17 inventory](target/verification/20261117-java-global-field-triage.json)
+[November 17 inventory](PORTING-PARITY.md#agent-command-confirmation-and-per-run-continuation-after-pr-7)
 and the six additional Rust modules in `src/workspace/backup_data/`.
 The check looked for each exact field name as a quoted string before the
 first `#[cfg(test)]` in each of the 48 files. It found 197 names and left
@@ -3098,20 +3470,20 @@ search coverage.
   Appearance, Terminal log and Terminal Effect sections. Java restore
   fills unset `quickConnectExpandedSections` and last effect speed.
   The effect picker applies an available effect and fractional speed
-  to new terminal sessions and can save them with new SSH and serial
+  to new terminal sessions and can save them with new SSH, local shell and serial
   profiles. Connection Manager can edit effects on saved local shell and
   serial profiles. The korTTY XML interchange preserves both with their
   fractional speeds. An explicit quick launch choice takes precedence over
   the saved or source pane effect. Verify the rendered effects and pinned
   SSH launches on native desktops. The separate Quick Connect AI section
   selects an available profile and connection skills for the new pane.
-  New SSH and serial profiles can save the selection. Verify desktop
+  New SSH, local shell and serial profiles can save the selection. Verify desktop
   selection, reopening, and the reviewed request with a configured provider.
 - Quick Connect offers theme, font family and size, foreground and background
   colors, and the terminal-color switch. It remembers the last appearance
   and imports the supported fields of Java `lastQuickConnectTerminalSettings`
   when the Rust preference is unset. Supported appearance values can travel
-  with new SSH and serial profiles. Verify rendered colors, font controls
+  with new SSH, local shell and serial profiles. Verify rendered colors, font controls
   and reopening on native desktops.
 - Java `aiDiffDialogSummaryDividerPosition` fills the unset native
   summary divider. Alternative and migration reviews and staged snippet
@@ -3197,7 +3569,7 @@ search coverage.
   duplicate fields are reported separately. Apple Silicon and Fedora ARM64
   passed the three new fixtures, 340 AI Manager tests, 147 profile-backup tests
   and 246 Agent tests. Windows ARM64 application/test Clippy passed. The
-  [four-field semantic audit](target/verification/20261117-java-skill-field-audit.json)
+  [four-field semantic audit](PORTING-PARITY.md#java-ai-skill-preferences-after-pr-7)
   records the exact mappings and pinned reference. Native desktop/cross-host
   adoption and complete field-by-field reconciliation remain open. See the
   skill-preferences entry in PORTING-PARITY.md.
@@ -3311,7 +3683,7 @@ search coverage.
   view or restart. Auto follows the native system theme. Verify import,
   native interaction and export on the remaining targets. Windows ARM64
   passed both focused preference tests and 207 Scheduler tests (one ignored).
-  [Scheduler record](target/verification/20261117-scheduler-diagram-windows-suite.log).
+  [Scheduler record](PORTING-PARITY.md#scheduler-diagram-preferences-after-pr-7).
 - The Scheduler journal's table/detail divider accepts the saved Java
   position when the native field is unset. Rust starts at 72 percent for a
   fresh profile, clamps drags between 20 and 90 percent, and saves the position
@@ -3536,7 +3908,7 @@ search coverage.
   preserves a native choice and trims Java's saved text. Apple Silicon passed
   the valid/invalid, replay and precedence fixture together with 613 Journal,
   206 Scheduler and four TLS tests. Windows ARM64 application/test Clippy
-  passed. [Native record](target/verification/20261117-journal-language-native-macos.log).
+  passed. [Native record](PORTING-PARITY.md#scheduler-diagram-preferences-after-pr-7).
 - Complete the remaining global-field inventory. Distinguish portable
   preferences from machine paths, transient geometry/history, provider
   secrets and execution/clipboard/Control/MCP consent. Explicit native
@@ -3812,7 +4184,7 @@ Publisher packages and clean-system acceptance remain in V7.
 Existing results close only their recorded build/platform/conditions.
 Cross-compilation, loopback fixtures and emulation must be labelled as such.
 External prerequisites do not turn implemented workflows into absent features.
-The [Step 6 checkpoint](target/verification/20261112-step6-release.md) links
+The Step 6 checkpoint (`20261112-step6-release.md`) links
 the recorded platform, package and audit evidence from its earlier snapshot.
 
 | Gate | Remaining evidence |
@@ -3822,7 +4194,7 @@ the recorded platform, package and audit evidence from its earlier snapshot.
 | V3 | Windows ARM64 already has measured activation of the exact inactive Gemini split and original window. Complete native macOS permission/display/activation, Linux compositor-qualified delivery, and moved/closed/modal/revoked/stale targets on each backend. General and programmatic notices need their own cases. |
 | V4 | All 21 emulations exist. Complete GUI/key/reply/charset/mode/resize/reflow and supported Scheduler comparisons per profile. Restore the pinned SithTermFX checkout before fixture regeneration. Verify audible Windows/Linux bell and retain documented Wyse differences. Real TN3270/TN5250, HP application/device and physical serial break/modem/flow-control remain explicitly user-deferred. |
 | V5 | Enabled real providers and signed runtimes, every AI Manager section hosted/detached, editor source jumps after edits, seven bounded diagram families, clicks after zoom, full SVG/PNG/PDF beyond the viewport, retained analyses after restart and consent/cancellation at mutation boundaries. Include current A/B/S/J changes. |
-| V6 | The separate SSH source review led to two transport fixes with native wire regressions. Apple Silicon passed the packaged App Sandbox, changed pin, tampered helper, approved tunnel, cancellation and jump fixtures. Resolve the recorded `crypto-bigint` and OpenPGP RSA findings after refreshing the dependency audit, obtain external independent review, and complete native Windows x64 and macOS Intel packaged isolation. Keep the SFTP external replacement race as a separate hardening risk. See the [SSH audit](target/verification/20261112-step6-ssh-audit.md). |
+| V6 | The separate SSH source review led to two transport fixes with native wire regressions. Apple Silicon passed the packaged App Sandbox, changed pin, tampered helper, approved tunnel, cancellation and jump fixtures. Resolve the recorded `crypto-bigint` and OpenPGP RSA findings after refreshing the dependency audit, obtain external independent review, and complete native Windows x64 and macOS Intel packaged isolation. Keep the SFTP external replacement race as a separate hardening risk. See the [SSH audit record](PORTING-PARITY.md#native-apple-silicon-release-acceptance). |
 | V7 | Merge CI passed for `e3c1760` on Windows, macOS and Ubuntu. The November 19 Windows ARM64 ZIP passed checksum, payload, startup, restart and packaged LPAC worker readiness verification. Its exact source also passed 4,526 native workspace tests with 96 ignored and passed strict workspace Clippy. [Windows portable release](PORTING-PARITY.md#november-19-windows-arm64-portable-release) PR #8 recorded the November 18 full native suites and release builds on Windows ARM64, Apple Silicon and Fedora ARM64 at `fb8870149949`, including ad hoc signature verification on the Mac. These runs predate the current worktree. Build the release candidate from one fixed revision, run the full suites and native gates, and verify clean installation, upgrade, removal, signatures and macOS notarization, stapling and Gatekeeper. Measure same-host startup, idle memory and p95 input latency, including 5K macOS. [Source and package evidence](#current-evidence-and-distribution) |
 
 Forwarding currently permits thirteen concurrent streams and four remote listener

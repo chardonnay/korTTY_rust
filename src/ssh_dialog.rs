@@ -15,6 +15,7 @@ use crate::connection_store::{Auth, Connection, SavedLogin};
 use crate::session_security::IsolationLevel;
 use crate::ssh_worker::sandbox_available;
 
+mod quick_connect;
 mod temporary_key;
 pub use temporary_key::TemporaryKey;
 
@@ -211,6 +212,7 @@ impl fmt::Display for KeyChoice {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    Focus(widget::Id),
     Target(LoginMessage),
     Jump(LoginMessage),
     UseJump(bool),
@@ -340,6 +342,7 @@ impl StartupFields {
                 label_width,
                 "SSH keepalive",
                 pick_list(modes, Some(self.keepalive), KeepAliveEdit::Mode)
+                    .text_size(13)
                     .keyboard_navigation(picker_id)
             ),
             self.keepalive.0.is_some().then(|| labeled(
@@ -373,7 +376,11 @@ impl StartupFields {
         )
     }
 
-    pub(crate) fn editor_view(&self, label_width: f32) -> Element<'_, (StartupField, String)> {
+    pub(crate) fn editor_view(
+        &self,
+        label_width: f32,
+        enabled: bool,
+    ) -> Element<'_, (StartupField, String)> {
         use crate::workspace::dialog_design::number_input;
 
         let timeout = |value| (StartupField::Timeout, value);
@@ -381,19 +388,19 @@ impl StartupFields {
         Self::startup_view(
             label_width,
             number_input(
-                text_input("1–300", &self.seconds).on_input(timeout),
+                text_input("1–300", &self.seconds).on_input_maybe(enabled.then_some(timeout)),
                 &self.seconds,
                 1..=300,
                 1,
-                Some(timeout),
+                enabled.then_some(timeout),
                 54.0,
             ),
             number_input(
-                text_input("0–20", &self.attempts).on_input(retry),
+                text_input("0–20", &self.attempts).on_input_maybe(enabled.then_some(retry)),
                 &self.attempts,
                 0..=20,
                 1,
-                Some(retry),
+                enabled.then_some(retry),
                 54.0,
             ),
         )
@@ -652,7 +659,8 @@ impl SshDialog {
                     jump.clear_password();
                 }
             }
-            Message::Connect
+            Message::Focus(_)
+            | Message::Connect
             | Message::OpenVault
             | Message::PasteTemporaryKey
             | Message::Isolation(_)
@@ -750,20 +758,6 @@ impl SshDialog {
         };
         draft.validate()?;
         Ok(draft)
-    }
-
-    pub fn identity_view(&self, label_width: f32) -> Element<'_, Message> {
-        self.target
-            .identity_view(self.can_connect(), Message::Target, label_width)
-    }
-
-    pub fn authentication_view(
-        &self,
-        label_width: f32,
-        keys: &[KeyChoice],
-    ) -> Element<'_, Message> {
-        self.target
-            .authentication_view(self.can_connect(), Message::Target, label_width, keys)
     }
 
     pub fn options_view(&self, label_width: f32, keys: &[KeyChoice]) -> Element<'_, Message> {
@@ -1440,6 +1434,7 @@ impl LoginForm {
             }
         };
         Ok(SavedLogin {
+            preferences: Default::default(),
             endpoint,
             auth,
             keyboard_interactive: self.keyboard_interactive
@@ -1601,7 +1596,7 @@ fn labeled<'a, M: 'a>(
     label: &'a str,
     field: impl Into<Element<'a, M>>,
 ) -> Element<'a, M> {
-    row![text(label).width(label_width), field.into()]
+    row![text(label).size(13).width(label_width), field.into()]
         .spacing(8)
         .align_y(Alignment::Center)
         .into()
@@ -1620,6 +1615,7 @@ mod tests {
         };
         let credential = "b".repeat(32);
         let saved = SavedLogin {
+            preferences: Default::default(),
             endpoint,
             auth: Auth::TemporaryKey {
                 credential: Some(credential.clone()),
@@ -1871,6 +1867,7 @@ mod tests {
             name: "Saved test".into(),
             tag: String::new(),
             login: SavedLogin {
+                preferences: Default::default(),
                 endpoint,
                 auth: Auth::VaultPassword("reference".into()),
                 keyboard_interactive: false,

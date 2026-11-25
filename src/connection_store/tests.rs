@@ -26,12 +26,13 @@ impl Drop for TestDir {
     }
 }
 
-fn connection() -> Connection {
+pub(super) fn connection() -> Connection {
     Connection {
         id: 0,
         name: "Production test".into(),
         tag: "test".into(),
         login: SavedLogin {
+            preferences: Default::default(),
             endpoint: LoginTarget {
                 host: "server.test.".into(),
                 port: 2222,
@@ -449,6 +450,26 @@ fn saved_blank_usernames_and_independent_authentication_references_round_trip() 
         endpoint.username = username.into();
         assert!(endpoint.validate_saved().is_err());
     }
+}
+
+#[test]
+fn inactive_authentication_round_trips_through_the_store_without_becoming_active() {
+    let profile = TestDir::new();
+    let mut store = profile.store();
+    let mut entry = connection();
+    entry.login.auth = Auth::Prompt;
+    entry.login.preferences = super::AuthPreferences {
+        key_file: "unfinished relative key path".into(),
+        passphrase: Some("inactive-passphrase".into()),
+        ..Default::default()
+    };
+    let expected = entry.login.clone();
+    let id = store.save(entry).unwrap();
+    let reopened = profile.store();
+    let login = &reopened.get(id).unwrap().login;
+    assert_eq!(login, &expected);
+    assert!(matches!(login.auth.active(), ActiveAuth::Prompt));
+    assert!(login.auth.requires_interactive());
 }
 
 #[test]

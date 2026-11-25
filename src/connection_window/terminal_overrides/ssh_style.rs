@@ -15,7 +15,7 @@ use crate::connection_window::{
     form,
 };
 
-const LABEL_WIDTH: f32 = 116.0;
+const LABEL_WIDTH: f32 = 100.0;
 const FIELD_WIDTH: f32 = 200.0;
 const JAVA_FAMILIES: [&str; 5] = [
     "Monospaced",
@@ -67,6 +67,7 @@ impl Draft {
                 |choice| Edit::SshTheme(choice.choice.value, choice.scheme),
             )
             .width(FIELD_WIDTH)
+            .text_size(13)
             .keyboard_navigation(self.style_theme_picker.clone())
             .into()
         } else {
@@ -140,6 +141,7 @@ impl Draft {
             |family| Edit::FontFamily(family.0.unwrap_or_default()),
         )
         .width(FIELD_WIDTH)
+        .text_size(13)
         .menu_height(280)
         .keyboard_navigation(self.style_font_picker.clone())
         .into()
@@ -299,7 +301,7 @@ fn field<'a>(label: &'static str, control: impl Into<Element<'a, Edit>>) -> Elem
 }
 
 fn labeled<'a, M: 'a>(label: &'static str, control: Element<'a, M>) -> Element<'a, M> {
-    row![text(label).size(14).width(LABEL_WIDTH), control]
+    row![text(label).size(13).width(LABEL_WIDTH), control]
         .spacing(8)
         .align_y(Alignment::Center)
         .into()
@@ -311,6 +313,7 @@ fn input<'a>(
     edit: Option<fn(String) -> Edit>,
 ) -> Element<'a, Edit> {
     text_input(placeholder, value)
+        .size(13)
         .width(FIELD_WIDTH)
         .style(dialog_design::form_input)
         .on_input_maybe(edit)
@@ -324,7 +327,7 @@ fn quantity<'a>(
     edit: Option<fn(String) -> Edit>,
 ) -> Element<'a, Edit> {
     number_input(
-        text_input(placeholder, value).on_input_maybe(edit),
+        text_input(placeholder, value).size(13).on_input_maybe(edit),
         value,
         bounds,
         1,
@@ -353,10 +356,13 @@ fn color<'a>(index: usize, value: &str, default: Option<Rgb>, own: bool) -> Elem
 }
 
 fn read_only_picker<'a>(value: String) -> Element<'a, Edit> {
-    button(row![text(value).width(Length::Fill), text("▾")].align_y(Alignment::Center))
-        .width(FIELD_WIDTH)
-        .style(dialog_design::secondary_button)
-        .into()
+    button(
+        row![text(value).size(13).width(Length::Fill), text("▾").size(13)]
+            .align_y(Alignment::Center),
+    )
+    .width(FIELD_WIDTH)
+    .style(dialog_design::secondary_button)
+    .into()
 }
 
 fn font_choices(selected: Option<&str>, installed: &[String]) -> Vec<Choice<String>> {
@@ -390,6 +396,7 @@ fn enum_picker<'a, T: Copy + Eq + fmt::Display + 'a, const N: usize>(
             .chain(values.map(|value| Choice(Some(value))))
             .collect();
         pick_list(choices, Some(Choice(current)), move |choice| edit(choice.0))
+            .text_size(13)
             .width(FIELD_WIDTH)
             .keyboard_navigation(id)
             .into()

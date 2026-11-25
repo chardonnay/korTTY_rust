@@ -660,6 +660,7 @@ fn ssh_profile(
         name: name.to_owned(),
         tag: String::new(),
         login: SavedLogin {
+            preferences: Default::default(),
             endpoint: LoginTarget {
                 host,
                 port,

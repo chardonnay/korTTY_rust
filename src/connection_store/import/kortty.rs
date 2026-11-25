@@ -1038,6 +1038,7 @@ fn jump(node: Node<'_, '_>) -> io::Result<Option<(SavedLogin, bool)>> {
     };
     Ok(Some((
         SavedLogin {
+            preferences: Default::default(),
             endpoint,
             auth: auth(jump)?,
             keyboard_interactive: false,

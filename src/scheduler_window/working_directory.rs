@@ -488,6 +488,7 @@ mod tests {
             name: "Scheduler browse fixture".into(),
             tag: String::new(),
             login: SavedLogin {
+                preferences: Default::default(),
                 endpoint: LoginTarget {
                     host: address.ip().to_string(),
                     port: address.port(),
