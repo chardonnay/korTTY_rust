@@ -3920,8 +3920,9 @@ fn inactive_authentication_survives_native_backup_and_startup_restore() {
         .unwrap()
         .private_child("vault", true)
         .unwrap();
-    let master = b"inactive-auth-backup-fixture";
-    let mut vault = Vault::create(source.0.join("vault/vault.bin"), master).unwrap();
+    let mut master = Zeroizing::new([0_u8; 32]);
+    getrandom::fill(&mut *master).unwrap();
+    let mut vault = Vault::create(source.0.join("vault/vault.bin"), &master[..]).unwrap();
     let credential = vault
         .save(
             CredentialInput {
@@ -3946,7 +3947,7 @@ fn inactive_authentication_survives_native_backup_and_startup_restore() {
         let login = &restored.get(id).unwrap().login;
         assert_eq!(login.preferences, connection.login.preferences);
         assert_eq!(login.auth, Auth::Prompt);
-        let vault = Vault::unlock(target.0.join("vault/vault.bin"), master).unwrap();
+        let vault = Vault::unlock(target.0.join("vault/vault.bin"), &master[..]).unwrap();
         assert_eq!(vault.secret(&credential), Some("fixture secret"));
     }
 }
