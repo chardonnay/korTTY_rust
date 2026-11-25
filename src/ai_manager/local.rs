@@ -5093,13 +5093,20 @@ impl SaveIndexes {
     }
 }
 
-fn profile_roles(
+pub(super) fn profile_role_picker(
     state: &State,
     profiles: &Catalog,
+    role: Role,
     editable: bool,
     reveal: &Reveal,
+    setting: Setting,
 ) -> Element<'static, Message> {
-    let options: Vec<_> = std::iter::once(Choice(None, "Use default".into()))
+    let default_label = if setting == Setting::SecurityProfile {
+        "Use default profile"
+    } else {
+        "Use default"
+    };
+    let options: Vec<_> = std::iter::once(Choice(None, default_label.into()))
         .chain(
             profiles
                 .role_choices()
@@ -5110,44 +5117,53 @@ fn profile_roles(
                         .map(|reference| Choice(Some(reference), name))
                 }),
         )
+        .chain(
+            profiles
+                .role_specific_choices(role)
+                .filter_map(|(id, name)| Some(Choice(Some(profiles.profile_reference(id)?), name))),
+        )
         .collect();
+    let selected = match state.profile(role) {
+        None => options.first().cloned(),
+        Some(reference) => profiles
+            .resolve_profile_reference(reference)
+            .and_then(|id| profiles.profile_reference(id))
+            .and_then(|reference| {
+                options
+                    .iter()
+                    .find(|option| option.0.as_ref() == Some(&reference))
+            })
+            .cloned(),
+    };
+    if editable {
+        pick_list(options, selected, move |choice| {
+            Message::Role(role, choice.0)
+        })
+        .placeholder("Selected profile unavailable")
+        .width(Length::Fill)
+        .text_size(13)
+        .keyboard_navigation(reveal.control_id(setting))
+        .dismiss_on_escape()
+    } else {
+        text(selected.map_or_else(|| "Selected profile unavailable".into(), |choice| choice.1))
+            .size(13)
+            .into()
+    }
+}
+
+fn profile_roles(
+    state: &State,
+    profiles: &Catalog,
+    editable: bool,
+    reveal: &Reveal,
+) -> Element<'static, Message> {
     let mut content = column![text("Choose which profile handles each AI role.").size(13)]
         .spacing(8)
         .width(Length::Fill);
     for role in Role::ALL {
-        let mut options = options.clone();
-        options.extend(
-            profiles
-                .role_specific_choices(role)
-                .filter_map(|(id, name)| Some(Choice(Some(profiles.profile_reference(id)?), name))),
-        );
-        let selected = match state.profile(role) {
-            None => options.first().cloned(),
-            Some(reference) => profiles
-                .resolve_profile_reference(reference)
-                .and_then(|id| profiles.profile_reference(id))
-                .and_then(|reference| {
-                    options
-                        .iter()
-                        .find(|option| option.0.as_ref() == Some(&reference))
-                })
-                .cloned(),
-        };
-        let picker: Element<'_, Message> = if editable {
-            pick_list(options, selected, move |choice| {
-                Message::Role(role, choice.0)
-            })
-            .placeholder("Selected profile unavailable")
-            .width(Length::Fill)
-            .text_size(13)
-            .dismiss_on_escape()
-        } else {
-            text(selected.map_or_else(|| "Selected profile unavailable".into(), |choice| choice.1))
-                .size(13)
-                .into()
-        };
-        content =
-            content.push(reveal.wrap(Setting::Role(role), preference_field(role.label(), picker)));
+        let setting = Setting::Role(role);
+        let picker = profile_role_picker(state, profiles, role, editable, reveal, setting);
+        content = content.push(reveal.wrap(setting, preference_field(role.label(), picker)));
     }
     content.into()
 }
@@ -5653,9 +5669,23 @@ mod tests {
         };
         let mut manager = Manager::new(Arc::new(config), profile.0.clone(), Vec::new(), true, None);
 
-        let _task = manager.update(ManagerMessage::Page(Page::Knowledge));
-
-        assert_eq!(manager.local.selected, Some(0));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let _task = manager.update(ManagerMessage::Page(Page::Knowledge));
+            assert_eq!(manager.local.selected, Some(0));
+            if manager.local.busy() {
+                break;
+            }
+            assert_eq!(
+                manager.local.status.as_deref(),
+                Some("A managed local model operation is already running")
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the global model operation did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert_eq!(
             manager.local.status.as_deref(),
             Some("Reading managed models…")

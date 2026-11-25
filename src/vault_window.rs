@@ -896,6 +896,14 @@ impl VaultWindow {
             .map_err(|_| "Could not load the saved temporary SSH key.")
     }
 
+    pub(crate) fn has_temporary_ssh_key(&self, id: &str, endpoint: &LoginTarget) -> bool {
+        self.vault.as_ref().is_some_and(|vault| {
+            vault
+                .temporary_ssh_key(id, (&endpoint.host, endpoint.port, &endpoint.username))
+                .is_some()
+        })
+    }
+
     pub(crate) fn environment_usage(&self, id: &str) -> Option<usize> {
         Some(
             self.vault

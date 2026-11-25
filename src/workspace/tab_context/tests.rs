@@ -479,6 +479,7 @@ fn saved_tab_group_changes_only_when_the_connection_folder_changes() {
                 name: "A saved connection".into(),
                 tag: String::new(),
                 login: SavedLogin {
+                    preferences: Default::default(),
                     endpoint: login.clone(),
                     auth: Auth::Prompt,
                     keyboard_interactive: false,

@@ -71,6 +71,7 @@ pub(super) fn configure_sftp_preferences(
     });
     state.configure_idle_timeout(settings.sftp_idle_minutes, project_idle);
     state.configure_archive_preferences(&settings.sftp_archive);
+    state.set_external_editor_preference(&settings.sftp_external_editor);
 }
 
 fn sftp_project_shareable(

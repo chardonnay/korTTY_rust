@@ -77,6 +77,7 @@ fn openssh_reconnect_keeps_saved_and_teamwork_isolation() {
                 name: "Saved isolation fixture".into(),
                 tag: String::new(),
                 login: SavedLogin {
+                    preferences: Default::default(),
                     endpoint: endpoint.clone(),
                     auth: Auth::KeyFile {
                         path: client.clone(),
@@ -211,6 +212,7 @@ fn openssh_incognito_terminal_enforces_masked_journal() {
             name: "Managed journal fixture".into(),
             tag: String::new(),
             login: SavedLogin {
+                preferences: Default::default(),
                 endpoint,
                 auth: Auth::KeyFile {
                     path: client,

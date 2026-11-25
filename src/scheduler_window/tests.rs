@@ -6,7 +6,7 @@ use kortty_jobs::{DependencyMode, Job};
 
 use super::*;
 
-fn grouped_connection(host: &str) -> crate::connection_store::Connection {
+pub(super) fn grouped_connection(host: &str) -> crate::connection_store::Connection {
     use crate::connection_store::{Auth, Connection, SavedLogin};
     use crate::ssh_dialog::LoginTarget;
     Connection {
@@ -14,6 +14,7 @@ fn grouped_connection(host: &str) -> crate::connection_store::Connection {
         name: host.into(),
         tag: String::new(),
         login: SavedLogin {
+            preferences: Default::default(),
             endpoint: LoginTarget {
                 host: host.into(),
                 port: 22,
@@ -692,14 +693,17 @@ fn scheduler_target_picker_filters_and_applies_a_reviewed_batch_atomically() {
     let action = reopened.selected_job().unwrap().action();
     assert_eq!(
         action.targets().map(|target| target.id).collect::<Vec<_>>(),
-        [primary, selected, descendant]
+        [selected, primary, descendant]
     );
     let groups = action.target_groups.as_ref().unwrap();
     assert_eq!(
         groups.groups,
         [ConnectionGroup::from(parent), ConnectionGroup::from(child)]
     );
-    assert_eq!(groups.explicit[1].target.host, "replacement.example.test");
+    // Clearing the picker removes the old explicit target. It is still
+    // reached through the selected parent group, after the new explicit one.
+    assert_eq!(groups.explicit.len(), 1);
+    assert_eq!(groups.explicit[0].target.host, "replacement.example.test");
 }
 
 #[test]
@@ -3541,6 +3545,7 @@ fn check_scheduled_agent_editor_saves_exact_probe_approval(profile_ref: ProfileR
         name: "Diagnostic target".into(),
         tag: String::new(),
         login: SavedLogin {
+            preferences: Default::default(),
             endpoint: LoginTarget {
                 host: "example.test".into(),
                 port: 22,
@@ -7107,6 +7112,7 @@ fn scheduler_persists_a_reviewed_saved_route_without_authentication_details() {
         name: "Target profile".into(),
         tag: String::new(),
         login: SavedLogin {
+            preferences: Default::default(),
             endpoint: LoginTarget {
                 host: "target.example.test.".into(),
                 port: 22,
@@ -7430,5 +7436,117 @@ fn native_form_reopens_stable_snippet_link_and_missing_library_does_not_break_ot
             .command_for_exec(Some(window.runtime.snippet_path()))
             .unwrap_err(),
         "The linked snippet is missing"
+    );
+}
+
+#[test]
+fn scheduler_picker_replaces_preselected_targets_and_keeps_cancel_private() {
+    use target_picker::{Choice, Event};
+    let scratch = Profile::temporary();
+    let mut store = ConnectionStore::open(scratch.0.join("connections.json")).unwrap();
+    let first = store.save(grouped_connection("first.example")).unwrap();
+    let second = store.save(grouped_connection("second.example")).unwrap();
+    let mut app = TestWindow::open(scratch.file()).unwrap();
+    app.runtime.set_connections(Some(&store));
+    let choice = |app: &TestWindow, id| {
+        app.runtime
+            .connection_choices
+            .iter()
+            .find(|choice| {
+                choice
+                    .reference()
+                    .is_some_and(|reference| reference.id == id)
+            })
+            .unwrap()
+            .clone()
+    };
+    app.update(Message::ConnectionSelected(choice(&app, first)));
+    app.update(Message::TargetPicker(Event::Open));
+    assert!(
+        app.view.draft.target_picker.as_ref().unwrap().selected()
+            == [Choice::Connection(choice(&app, first))]
+    );
+    app.update(Message::TargetPicker(Event::Clear));
+    app.update(Message::TargetPicker(Event::Select(
+        Choice::Connection(choice(&app, second)),
+        true,
+    )));
+    app.update(Message::TargetPicker(Event::Close));
+    assert!(
+        app.view
+            .draft
+            .selected_picker_targets(&app.runtime.connection_choices)
+            == [Choice::Connection(choice(&app, first))]
+    );
+    app.update(Message::TargetPicker(Event::Open));
+    app.update(Message::TargetPicker(Event::Clear));
+    app.update(Message::TargetPicker(Event::Select(
+        Choice::Connection(choice(&app, second)),
+        true,
+    )));
+    app.update(Message::TargetPicker(Event::Apply));
+    assert!(app.view.draft.target_picker.is_none());
+    assert!(
+        app.view
+            .draft
+            .selected_picker_targets(&app.runtime.connection_choices)
+            == [Choice::Connection(choice(&app, second))]
+    );
+}
+
+#[test]
+fn scheduler_picker_tree_keeps_filtered_ancestors_and_keyboard_ranges() {
+    use iced::keyboard::{Modifiers, key::Named};
+    use target_picker::{Choice, Event};
+    let scratch = Profile::temporary();
+    let mut store = ConnectionStore::open(scratch.0.join("connections.json")).unwrap();
+    let root = store.create_group(None, "Fleet").unwrap();
+    let child = store.create_group(Some(&root), "Staging").unwrap();
+    store
+        .save_in_group(grouped_connection("leaf.example"), Some(&child))
+        .unwrap();
+    let mut app = TestWindow::open(scratch.file()).unwrap();
+    app.runtime.set_connections(Some(&store));
+    app.update(Message::TargetPicker(Event::Open));
+    app.update(Message::TargetPicker(Event::Search("leaf.example".into())));
+    let rows = app.view.draft.target_picker.as_ref().unwrap().rows(
+        &app.runtime.connection_choices,
+        &app.runtime.connection_group_choices,
+        &app.runtime.connection_group_paths,
+    );
+    assert_eq!(rows.len(), 3);
+    assert!(rows[0].choice == Some(Choice::Group(root.into())));
+    assert!(rows[1].choice == Some(Choice::Group(child.into())));
+    assert_eq!(rows[2].depth, 2);
+    app.update(Message::TargetPicker(Event::Click(
+        rows[0].choice.clone().unwrap(),
+    )));
+    app.update(Message::TargetPicker(Event::RowKey(
+        rows[0].key.clone(),
+        Named::End,
+        Modifiers::SHIFT,
+    )));
+    assert_eq!(
+        app.view
+            .draft
+            .target_picker
+            .as_ref()
+            .unwrap()
+            .selected()
+            .len(),
+        3
+    );
+    app.update(Message::TargetPicker(Event::Search(String::new())));
+    app.update(Message::TargetPicker(Event::Expand(rows[0].key.clone())));
+    let picker = app.view.draft.target_picker.as_ref().unwrap();
+    assert_eq!(
+        picker
+            .rows(
+                &app.runtime.connection_choices,
+                &app.runtime.connection_group_choices,
+                &app.runtime.connection_group_paths
+            )
+            .len(),
+        1
     );
 }

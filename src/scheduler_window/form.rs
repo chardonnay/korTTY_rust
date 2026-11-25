@@ -327,6 +327,10 @@ impl Default for Draft {
 }
 
 impl Draft {
+    pub(super) fn prefill_rsync_program(&mut self, program: &str) {
+        self.rsync_program = program.to_owned();
+    }
+
     pub(super) fn from_swarm_handoff(handoff: super::SwarmHandoff) -> Result<Self, String> {
         let super::SwarmHandoff {
             name,
@@ -2395,13 +2399,39 @@ impl Draft {
         })
     }
 
+    pub(super) fn selected_picker_targets(
+        &self,
+        choices: &[ConnectionChoice],
+    ) -> Vec<super::target_picker::Choice> {
+        use super::target_picker::Choice;
+        let source = self.target_selection();
+        source
+            .explicit
+            .into_iter()
+            .map(|reference| {
+                let name = choices
+                    .iter()
+                    .find_map(|choice| match choice {
+                        ConnectionChoice::Saved {
+                            reference: current,
+                            name,
+                        } if current.same_identity(&reference) => Some(name.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| reference.target.label());
+                Choice::Connection(ConnectionChoice::Saved { reference, name })
+            })
+            .chain(source.groups.into_iter().map(Choice::Group))
+            .collect()
+    }
+
     pub(super) fn can_choose_saved_targets(&self) -> bool {
         self.imported_route().is_none()
             && !self.has_imported_privileged()
             && !self.has_unresolved_imported_ai()
     }
 
-    pub(super) fn add_selected_targets(
+    pub(super) fn set_selected_targets(
         &mut self,
         choices: &[super::target_picker::Choice],
         store: &ConnectionStore,
@@ -2409,7 +2439,11 @@ impl Draft {
     ) -> Result<bool, &'static str> {
         use super::target_picker::Choice;
 
-        let mut source = self.target_selection();
+        let mut source = TargetGroups {
+            group_order: self.target_selection().group_order,
+            groups: Vec::new(),
+            explicit: Vec::new(),
+        };
         for choice in choices {
             match choice {
                 Choice::Connection(choice) => {
@@ -2449,6 +2483,9 @@ impl Draft {
         if targets.len() > 1 && !self.allows_additional_agent_targets() {
             return Err("Choose per-start proposals before adding more AI Agent targets");
         }
+        source
+            .group_order
+            .retain(|id| targets.iter().any(|target| target.id == *id));
         Ok(self.set_group_selection(source, targets, false))
     }
 
@@ -3267,14 +3304,12 @@ impl Draft {
             self.can_choose_saved_targets().then(|| {
                 use super::target_picker::Event;
 
-                let control: Element<'_, Message> = if let Some(picker) = &self.target_picker {
-                    picker.view(connections, connection_groups, &runtime.connection_group_paths, runtime.can_edit())
-                } else {
-                    button("Choose multiple saved targets…").on_press_maybe(
-                        (runtime.can_edit() && (connections.len() > 1 || !connection_groups.is_empty()))
-                            .then_some(Message::TargetPicker(Event::Open)),
-                    ).into()
-                };
+                let message = (runtime.can_edit() && (connections.len() > 1 || !connection_groups.is_empty()))
+                    .then_some(Message::TargetPicker(Event::Open));
+                let control = crate::workspace::dialog_design::keyboard_table::action(
+                    button("Choose multiple saved targets…").on_press_maybe(message.clone()).into(),
+                    message, true,
+                );
                 form_row("Saved targets", control)
             }),
             (self.imported_route().is_none() && !self.has_imported_privileged()
@@ -5375,5 +5410,75 @@ fn java_group_rsync_adoption_prefills_route_layout_without_approval() {
         assert_eq!(actual, expected);
         assert!(transfer.approval.is_none() && transfer.routes[0].approval.is_none());
         assert!(!root.exists());
+    }
+}
+
+#[cfg(test)]
+mod executable_settings_tests {
+    use super::super::*;
+    use super::*;
+
+    #[test]
+    fn sftp_executable_settings_seed_new_rsync_jobs_without_approval() {
+        let profile = tempfile::tempdir().unwrap();
+        let mut runtime = SchedulerWindow::open(profile.path().join("jobs.json")).unwrap();
+        runtime.set_rsync_program("native-rsync-choice".into());
+        let mut view = runtime.new_view();
+        assert_eq!(view.draft.rsync_program, "native-rsync-choice");
+        assert!(view.draft.rsync_approval.is_none());
+        runtime.update_view(
+            &mut view,
+            Message::Edit(Field::RsyncProgram, "explicit job choice".into()),
+        );
+        runtime.set_rsync_program("later default".into());
+        assert_eq!(view.draft.rsync_program, "explicit job choice");
+        runtime.update_view(&mut view, Message::New);
+        assert_eq!(view.draft.rsync_program, "later default");
+        assert!(view.draft.rsync_approval.is_none());
+    }
+}
+
+#[cfg(test)]
+mod target_selection_tests {
+    use super::*;
+
+    #[test]
+    fn reselecting_a_group_retains_its_reviewed_member_order() {
+        use crate::scheduler_window::{connection::SharedTargets, target_picker::Choice};
+        let scratch = crate::snippets::tests::Profile::new();
+        let mut store = ConnectionStore::open(scratch.0.join("connections.json")).unwrap();
+        let group = store.create_group(None, "Fleet").unwrap();
+        let a = store
+            .save_in_group(
+                crate::scheduler_window::tests::grouped_connection("a.example"),
+                Some(&group),
+            )
+            .unwrap();
+        let b = store
+            .save_in_group(
+                crate::scheduler_window::tests::grouped_connection("b.example"),
+                Some(&group),
+            )
+            .unwrap();
+        let mut draft = Draft {
+            target_groups: Some(TargetGroups {
+                groups: vec![group.clone().into()],
+                explicit: Vec::new(),
+                group_order: vec![b, a],
+            }),
+            connection: Some(store.get(b).unwrap().into()),
+            additional_connections: vec![store.get(a).unwrap().into()],
+            ..Default::default()
+        };
+        assert!(
+            !draft
+                .set_selected_targets(
+                    &[Choice::Group(group.into())],
+                    &store,
+                    &SharedTargets::default()
+                )
+                .unwrap()
+        );
+        assert_eq!(draft.target_groups.unwrap().group_order, vec![b, a]);
     }
 }

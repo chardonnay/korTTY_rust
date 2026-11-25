@@ -1,9 +1,14 @@
-use iced::widget::{button, checkbox, column, pick_list, row, scrollable, text, text_input};
+use iced::widget::{
+    button, checkbox, column, container, pick_list, row, scrollable, text, text_input,
+};
 use iced::{Element, Length, window};
 
 use crate::terminal_agent::design::Approval;
 
 use super::{Message, Mode, Phase, Purpose, Run, State, engine, palette, request_review};
+
+#[cfg(test)]
+mod tests;
 
 impl Run {
     pub(super) fn view<'a>(
@@ -37,7 +42,11 @@ impl Run {
             self.phase,
             Phase::PlanReady | Phase::PlanImplementationReview | Phase::PlanHandedOff
         ) && self.plan.is_some();
-        let reviewing_model = self.phase == Phase::ModelReview;
+        let reviewing_model = self.phase == Phase::ModelReview
+            || self
+                .model_review
+                .as_ref()
+                .is_some_and(|review| review.model_tool_active());
         let body_size = if plan_view {
             self.fonts.plan
         } else {
@@ -114,6 +123,9 @@ impl Run {
                 column![
                     pick_list(self.profiles.as_slice(), self.profile().cloned(), Message::Profile),
                     text_input("Describe your task", &self.goal).on_input(Message::Goal).size(body_size),
+                    checkbox(self.diagnostics.debug_enabled).label("Show Agent debug messages").on_toggle(Message::DebugMessages),
+                    checkbox(self.diagnostics.runtime_enabled).label("Show Agent runtime messages")
+                        .on_toggle_maybe((self.mode != Mode::Ask).then_some(Message::RuntimeMessages)),
                     (self.mode == Mode::Run).then(|| checkbox(self.auto_approve_root).label("Auto-approve commands, including sudo, for this run (root=true)").on_toggle(Message::AutoApproveRoot)),
                     (self.mode == Mode::Run).then(|| checkbox(self.confirm_every_command).label("Confirm every command in this run").on_toggle(Message::ConfirmEveryCommand)),
                     text(match self.mode {
@@ -160,8 +172,10 @@ impl Run {
             page = page.push(text(&self.history.notice).size(13));
         }
 
-        let show_activity =
-            !reviewing_model && !showing_plan && !self.presentation.activity.collapsed;
+        let show_activity = self.phase != Phase::Setup
+            && !reviewing_model
+            && !showing_plan
+            && !self.presentation.activity.collapsed;
         if show_activity && self.design.approval == Approval::BelowActivity {
             page = page.push(super::design::history_view(
                 self,
@@ -403,10 +417,10 @@ impl Run {
             page = page.push(handoff);
         }
         let notice_color = palette::notice_color(palette, self.phase);
-        page.push(text(&self.notice).size(13).style(move |_| text::Style {
+        let notice = text(&self.notice).size(13).style(move |_| text::Style {
             color: notice_color,
-        }))
-        .push(
+        });
+        let actions = container(
             row![
                 button(if self.paused {
                     "Resume"
@@ -435,7 +449,17 @@ impl Run {
             .spacing(8)
             .wrap(),
         )
-        .into()
+        .id("terminal-agent-actions");
+        if self.phase == Phase::Setup {
+            column![
+                scrollable(page).height(Length::Fill),
+                column![notice, actions].spacing(8).padding(12),
+            ]
+            .height(Length::Fill)
+            .into()
+        } else {
+            page.push(notice).push(actions).into()
+        }
     }
 
     pub(super) fn model_review_view(
@@ -443,6 +467,15 @@ impl Run {
         request_height: Length,
     ) -> Option<Element<'_, request_review::Message>> {
         use request_review::{Classification, Message as Review};
+
+        if self.phase.deciding()
+            && let Some(review) = &self.model_review
+        {
+            return review.model_tool_view(
+                self.epoch,
+                !self.paused && !self.closing && !self.cancel.requested(),
+            );
+        }
 
         if self.phase != Phase::ModelReview {
             return None;

@@ -1,13 +1,13 @@
 //! Incoming file-independent text drops on AppKit terminal windows.
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, ProtocolObject, Sel};
-use objc2::{msg_send, sel};
+use objc2::{ClassType as _, msg_send, sel};
 use objc2_app_kit::{
     NSDragOperation, NSDraggingInfo, NSFilenamesPboardType, NSPasteboard, NSPasteboardTypeFileURL,
     NSPasteboardTypeString, NSView, NSWindow,
@@ -17,8 +17,9 @@ use raw_window_handle::{RawWindowHandle, WindowHandle};
 
 use crate::tab_drag::client_point;
 
-const CLASS_NAME: &str = "KorttyTextDropWindow";
+const CLASS_NAME: &str = "KorttyTextDropMethods";
 const MAX_TEXT_BYTES: usize = 64 * 1024;
+static METHOD_CLASS: OnceLock<Option<&'static AnyClass>> = OnceLock::new();
 
 struct Registration {
     enabled: AtomicBool,
@@ -35,6 +36,7 @@ impl Watch {
 }
 
 thread_local! {
+    static ORIGINAL_CLASS: OnceCell<&'static AnyClass> = const { OnceCell::new() };
     static TARGETS: RefCell<HashMap<usize, Weak<Registration>>> = RefCell::new(HashMap::new());
 }
 
@@ -52,11 +54,10 @@ pub fn watch(
     let window = view.window()?;
     let object: &AnyObject = &window;
     let parent = object.class();
-    let class = text_window_class(parent)?;
-    if class != parent {
-        // SAFETY: The subclass adds no instance storage and extends the exact current class.
-        unsafe { AnyObject::set_class(object, class) };
+    if parent.name() != "WinitWindow" {
+        return None;
     }
+    install_text_methods(parent)?;
     let registration = Arc::new(Registration {
         enabled: AtomicBool::new(false),
         notify: Box::new(notify),
@@ -73,27 +74,73 @@ pub fn watch(
     Some(Watch(registration))
 }
 
-fn text_window_class(parent: &'static AnyClass) -> Option<&'static AnyClass> {
-    if let Some(class) = AnyClass::get(CLASS_NAME) {
-        return (class == parent || class.superclass() == Some(parent)).then_some(class);
-    }
-    let mut builder = ClassBuilder::new(CLASS_NAME, parent)?;
-    // SAFETY: These implementations use the AppKit destination selector signatures.
-    unsafe {
-        builder.add_method(
+fn install_text_methods(parent: &'static AnyClass) -> Option<()> {
+    ORIGINAL_CLASS.with(|original| {
+        if let Some(base) = original.get() {
+            return (parent.superclass() == Some(*base)).then_some(());
+        }
+        let base = parent.superclass()?;
+        let selectors = [
             sel!(draggingEntered:),
-            dragging_entered as extern "C" fn(_, _, _) -> _,
-        );
-        builder.add_method(
             sel!(draggingUpdated:),
-            dragging_updated as extern "C" fn(_, _, _) -> _,
-        );
-        builder.add_method(
             sel!(performDragOperation:),
-            perform_drag as extern "C" fn(_, _, _) -> _,
-        );
-    }
-    Some(builder.register())
+        ];
+        // Only add to Winit's own class when these methods are inherited. Never
+        // replace another component's direct implementation.
+        if selectors.iter().any(|selector| {
+            parent.instance_method(*selector).map(std::ptr::from_ref)
+                != base.instance_method(*selector).map(std::ptr::from_ref)
+        }) {
+            return None;
+        }
+        let methods = text_method_class()?;
+        for selector in selectors {
+            let method = methods.instance_method(selector)?;
+            // SAFETY: The helper class verifies these exact AppKit signatures.
+            // Both classes are permanent, and installation runs on the main thread.
+            // Adding methods preserves each live NSWindow's class and AppKit caches.
+            let added = unsafe {
+                let method = std::ptr::from_ref(method).cast();
+                objc2::ffi::class_addMethod(
+                    std::ptr::from_ref(parent).cast_mut().cast(),
+                    selector.as_ptr(),
+                    Some(objc2::ffi::method_getImplementation(method)?),
+                    objc2::ffi::method_getTypeEncoding(method),
+                )
+            };
+            if !added {
+                return None;
+            }
+        }
+        original.set(base).ok()?;
+        Some(())
+    })
+}
+
+fn text_method_class() -> Option<&'static AnyClass> {
+    *METHOD_CLASS.get_or_init(|| {
+        let parent = NSWindow::class();
+        if let Some(class) = AnyClass::get(CLASS_NAME) {
+            return (class == parent || class.superclass() == Some(parent)).then_some(class);
+        }
+        let mut builder = ClassBuilder::new(CLASS_NAME, parent)?;
+        // SAFETY: These implementations use the AppKit destination selector signatures.
+        unsafe {
+            builder.add_method(
+                sel!(draggingEntered:),
+                dragging_entered as extern "C" fn(_, _, _) -> _,
+            );
+            builder.add_method(
+                sel!(draggingUpdated:),
+                dragging_updated as extern "C" fn(_, _, _) -> _,
+            );
+            builder.add_method(
+                sel!(performDragOperation:),
+                perform_drag as extern "C" fn(_, _, _) -> _,
+            );
+        }
+        Some(builder.register())
+    })
 }
 
 fn key(window: &NSWindow) -> usize {
@@ -145,7 +192,7 @@ fn allows_copy(info: &ProtocolObject<dyn NSDraggingInfo>) -> bool {
 }
 
 fn original_class() -> Option<&'static AnyClass> {
-    AnyClass::get(CLASS_NAME)?.superclass()
+    ORIGINAL_CLASS.with(|original| original.get().copied())
 }
 
 fn text_operation(window: &NSWindow, info: &ProtocolObject<dyn NSDraggingInfo>) -> NSDragOperation {
@@ -255,9 +302,39 @@ mod tests {
     #[test]
     fn destination_selectors_match_the_appkit_window_abi() {
         let parent = super::NSWindow::class();
-        let subclass = super::text_window_class(parent).unwrap();
+        let subclass = super::text_method_class().unwrap();
         assert_eq!(subclass.superclass(), Some(parent));
         assert_eq!(subclass.instance_size(), parent.instance_size());
+    }
+
+    #[test]
+    fn installing_drop_methods_preserves_live_object_class_and_inherited_identity() {
+        use objc2::rc::Retained;
+        use objc2::runtime::ClassBuilder;
+        use objc2::{msg_send_id, sel};
+        use objc2_foundation::{NSObject, NSObjectProtocol as _};
+
+        let base = NSObject::class();
+        let class = ClassBuilder::new("KorttyTextDropIdentityFixture", base)
+            .unwrap()
+            .register();
+        // SAFETY: This private fixture adds no ivars and inherits NSObject's initializer.
+        let object: Retained<NSObject> = unsafe { msg_send_id![class, new] };
+        assert_eq!(object.class(), class);
+        super::install_text_methods(class).unwrap();
+        assert_eq!(object.class(), class);
+        assert!(object.isKindOfClass(base));
+        assert_eq!(super::original_class(), Some(base));
+        let installed = class.instance_method(sel!(draggingEntered:)).unwrap();
+        let helper = super::text_method_class()
+            .unwrap()
+            .instance_method(sel!(draggingEntered:))
+            .unwrap();
+        assert!(std::ptr::fn_addr_eq(
+            installed.implementation(),
+            helper.implementation()
+        ));
+        super::install_text_methods(class).unwrap();
     }
 
     #[test]

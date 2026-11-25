@@ -39,6 +39,7 @@ pub(crate) mod runtime_index;
 pub(crate) mod runtime_package;
 mod streaming;
 mod tokenizer;
+pub(crate) mod tools;
 mod usage;
 mod usage_store;
 pub(crate) mod web_search;
@@ -1667,20 +1668,54 @@ impl Client {
         deadline: Instant,
         before_dispatch: impl FnMut() -> Result<(), String>,
     ) -> (Result<String, Error>, Option<CompletionLimit>) {
+        let (result, stop) = self.complete_agent_turn_before_guarded(
+            system,
+            input,
+            None,
+            response_format,
+            deadline,
+            before_dispatch,
+        );
+        (result.and_then(tools::Reply::into_text), stop)
+    }
+
+    /// Completes one model turn. Tool calls are proposals; the caller owns their reviews.
+    pub(crate) fn complete_agent_turn_before_guarded(
+        &self,
+        system: &str,
+        input: &str,
+        web: Option<tools::Request<'_>>,
+        response_format: bool,
+        deadline: Instant,
+        before_dispatch: impl FnMut() -> Result<(), String>,
+    ) -> (Result<tools::Reply, Error>, Option<CompletionLimit>) {
         let mut stop = None;
         let result = self.with_completion(|attempt| {
             attempt.agent_completion = Some(AgentCompletion::default());
-            let result = self.complete_messages_inner(
-                &[
-                    RequestMessage::text("system", system),
-                    RequestMessage::text("user", input),
-                ],
-                response_format,
-                Some(deadline),
-                false,
-                before_dispatch,
-                attempt,
-            );
+            let messages = [
+                RequestMessage::text("system", system),
+                RequestMessage::text("user", input),
+            ];
+            let result = match web {
+                Some(web) => self.complete_web_turn(
+                    &messages,
+                    web,
+                    response_format,
+                    deadline,
+                    before_dispatch,
+                    attempt,
+                ),
+                None => self
+                    .complete_messages_inner(
+                        &messages,
+                        response_format,
+                        Some(deadline),
+                        false,
+                        before_dispatch,
+                        attempt,
+                    )
+                    .map(tools::Reply::Answer),
+            };
             stop = attempt
                 .agent_completion
                 .take()
@@ -2228,7 +2263,9 @@ impl Client {
             reasoning_effort,
             chat_template_kwargs,
             thinking: thinking.then_some(Thinking { kind: "disabled" }),
-            messages,
+            messages: RequestMessages::Text(messages),
+            tools: None,
+            tool_choice: None,
             response_format: (response_format && !mlx).then_some(ResponseFormat {
                 kind: "json_object",
             }),
@@ -2471,6 +2508,7 @@ impl Client {
         };
         let answer = if !require_complete {
             let choice = first_choice::<String>(&bytes, &mut attempt.usage)?;
+            choice.message.require_text_only()?;
             if let Some(metadata) = &mut attempt.agent_completion
                 && choice.finish_reason.as_ref().and_then(Value::as_str) == Some("length")
             {
@@ -2482,6 +2520,7 @@ impl Client {
                 .ok_or(Error::Invalid("missing message content"))?
         } else {
             let choice = first_choice::<Value>(&bytes, &mut attempt.usage)?;
+            choice.message.require_text_only()?;
             if choice.finish_reason.as_ref().and_then(Value::as_str) == Some("length") {
                 return Err(Error::Invalid("model output reached its token limit"));
             }
@@ -2839,7 +2878,25 @@ struct Choice<T> {
 
 #[derive(Deserialize)]
 struct ChatMessage<T> {
+    role: Option<String>,
     content: Option<T>,
+    tool_calls: Option<Vec<tools::Call>>,
+    function_call: Option<Value>,
+}
+
+impl<T> ChatMessage<T> {
+    fn require_text_only(&self) -> Result<(), Error> {
+        if self
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| !calls.is_empty())
+            || self.function_call.is_some()
+        {
+            Err(Error::Invalid("unexpected tool call in text completion"))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -2863,9 +2920,36 @@ struct Request<'a> {
     chat_template_kwargs: Option<mlx_models::TemplateArguments<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<Thinking>,
-    messages: &'a [RequestMessage<'a>],
+    messages: RequestMessages<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<tools::Definitions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<ResponseFormat>,
+}
+
+enum RequestMessages<'a> {
+    Text(&'a [RequestMessage<'a>]),
+    Web(&'a [RequestMessage<'a>], &'a [tools::Message]),
+}
+
+impl Serialize for RequestMessages<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let (initial, history): (&[_], &[_]) = match self {
+            Self::Text(messages) => (messages, &[]),
+            Self::Web(initial, history) => (initial, history),
+        };
+        let mut sequence = serializer.serialize_seq(Some(initial.len() + history.len()))?;
+        for message in initial {
+            sequence.serialize_element(message)?;
+        }
+        for message in history {
+            sequence.serialize_element(message)?;
+        }
+        sequence.end()
+    }
 }
 
 impl Request<'_> {

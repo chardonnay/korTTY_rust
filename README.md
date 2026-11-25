@@ -42,9 +42,27 @@ The main view adopts the Java groups **Terminal**, **Tools**, and **Settings** i
 
 **Manage Connections…** opens a Connection Manager for the current main window. Another main window can open its own manager and keep its own selection, search and edit draft. The connection editor and exchange dialogs belong to the manager that opened them. After the manager closes, **Connect** or **SFTP** opens the selected connection in that manager's main window.
 
+The saved SSH editor accepts a new **Password** or private-key **Passphrase** for the target and jump server. Unlock the Credential Vault before saving new values. Each new value creates a separate encrypted vault entry; existing credentials remain unchanged. Empty fields retain the selected stored value, including when you type a replacement and erase it before saving. Selecting another stored credential replaces the typed draft. Cancel discards typed values. Ordinary inactive key paths and credential choices remain available when you switch authentication methods and reopen the editor.
+
+The saved-connection editor's **Protocol** selector switches between SSH,
+local shell and serial in the same dialog. Inactive protocol fields stay visible
+and disabled. The Shell selector includes custom commands and preserves their
+arguments when you switch to a preset and back. Save keeps the connection's identity
+and retains its other protocol settings for a later switch. Only the selected
+protocol is available for connection. New local profiles do not require an SSH
+host. Cancel discards changes to every protocol in the current draft. New SSH
+passwords still require an unlocked vault when saving as a local or serial profile.
+
+Saved local and serial connections apply their common terminal presentation,
+scrollback, tab color, paste warning, command timestamps and logging preferences
+at launch. Incognito suppresses terminal logfiles and connection usage history.
+A connection that becomes incognito must be opened explicitly; an old project
+cannot automatically restart it. Serial connections reject requested process
+or sandbox isolation because the serial transport cannot provide those modes.
+
 Choose **Map** above the connection list to generate a network plan from the current search and scope. The plan shows this computer, folder zones, saved hosts and external jump hosts. **Jump routes** and **Tunnels** control their layers separately. **Fit** resets the zoom to the available space. Selecting a host also selects it in the inspector. Double-click a connection to connect, or drag a saved SSH connection onto a folder zone to move it. **Undo** reverses the last move when the connection and destination still match.
 
-A saved SSH connection can set its own **Window geometry**. Select **Connect in New Window** in the Connection Manager to use its size, position and maximized state. The desktop can constrain the size and position. The setting is kept in the private connection catalogue and is also read from private Java connection XML. Portable connection exports and duplicates use the default geometry.
+A saved SSH, local or serial connection can set its own **Window geometry**. Select **Connect in New Window** in the Connection Manager to use its size, position and maximized state. The desktop can constrain the size and position. The setting is kept in the private connection catalogue and is also read from private Java connection XML. Portable connection exports and duplicates use the default geometry.
 
 In **Map**, choose **PDF…** to export the current view. Set the title and A4 orientation, then choose a destination. The PDF includes jump routes and follows the **Tunnels** switch. Map text stays searchable and zones and routes stay sharp when printed. Large zones continue onto subsequent pages between node rows. OS symbols appear both on the map and in its PDF.
 
@@ -482,6 +500,15 @@ In the `@` scope, shared connections show **Shared (Teamwork)** next to their so
 
 **Quick Connect** contains the tabs **Individual Connection** and **Open Group**. SSH and SFTP use the common login fields with host, port, user, and authentication. The dialog also offers local shell, serial port, and both IBM connectors. For a new SSH connection, **Save connection** can save the profile. Typed passwords and passphrases remain in the login process. The profile stores the identifier of a selected vault login if needed. The host key check remains mandatory. The search for saved profiles understands substrings and `*`. Enter accepts the first match. The quick accesses show the most recently successfully opened saved connections. **Open Group** starts the saved SSH connections of the selected folder one after another. Entries that require a typed password are skipped.
 
+Quick Connect keeps the SSH, local-shell and serial fields in a fixed order;
+fields for the other protocols remain visible and disabled. Select **Custom
+command** in **Shell** to enter a program and separate exact arguments. The
+**Terminal log** section is available for SSH, local and serial sessions, with
+separate drafts for each protocol. Saving a new local or serial connection
+retains its log settings. Incognito disables logging and saving new native
+profiles. Tab navigation reveals the focused form control while the action
+buttons remain outside the scrolling form.
+
 **Connections → Manage Connections…** opens the connection management with library, tree, and inspector. Folders, tags, favorites, and recently used profiles are managed in the connection store. New Rust versions read existing profiles. Older Rust builds cannot open a file with the new library field.
 
 **Configuration → Global Settings** contains the ported tabs **Font**, **Colors**, **Themes**, **Appearance**, **Terminal**, **Backup**, **Logging**, **Export**, **Window**, and **Keyboard** with search, save, and cancel. **Font** offers installed font families and sizes from 8 to 72 pt with live preview. Under **Terminal**, warning mode and size threshold for pasting are available. A managed minimum warning level remains effective. **Window** contains the transparency preview. Under **Keyboard**, the shortcut of a menu action can be recorded, removed, or reset. Conflicts lock **Save**. Saved shortcuts apply immediately in the work areas and appear in the window menu and in the toolbar hints. The macOS system menu retains its own shortcuts. **Tools → JobScheduler** shows the job table on the left and **Job**, **Action**, and **Journal** on the right. The two splitters change the pane sizes. The journal search supports multiple search terms and `*`.
@@ -736,6 +763,15 @@ server pane. The preview supports zoom, with a 16 MiB input limit and an
 8 megapixel decoded limit. Server images follow the in-app file view policy.
 
 **External editor settings…** lets you approve a native executable and its literal arguments for this device. Select a regular remote file up to 2 MiB and use **Edit externally…** to review the path, executable, and optional automatic upload of stable saves. The editor opens a private local copy with the original bytes. Use **Upload observed save** for a manual upload. The original SFTP connection, checked contents, and protected remote path must still match before writeback. If a conflict or connection loss stops upload, keep the private copy or save it to a new local path. External editing is available in regular SFTP windows.
+
+**Settings → SFTP** includes an **External editor executable** field after Transfers
+and an **Rsync executable** field after ZIP creation. Enter an absolute native
+executable path or use **Browse…**. Editor arguments remain in the external
+editor review; choosing or saving a path does not approve execution. A changed
+editor path requires a matching executable review before opening another file.
+An empty editor field uses the editor selected in that review. The rsync path
+prefills new Scheduler jobs; existing jobs retain their own executable and
+route-bound approval. Changes to a job's program still require its native review.
 
 **Edit as root…** uses the approved external editor and the original authenticated connection to a Linux host with `/usr/bin/sudo` and `/usr/bin/python3`. Review the exact path and host key before reading. Direct SSH and the isolated SSH worker support passwordless sudo, an entered password, or a matching exact-account sudo credential from the unlocked vault. The isolated worker opens a dedicated channel for the fixed file helper and verifies its protocol greeting before forwarding file data when a password is used. Review each local save separately before publishing it. The helper checks a root-owned regular file with a single link and protected ancestry, verifies the original bytes and metadata, and publishes from a private stage on the same filesystem. It preserves the owner, group, permissions and supported extended attributes. Conflicts and uncertain publication retain the private local copy for recovery. Managed policy can disable this workflow with `[rule.features] sftp-sudo-edit = "deny"`.
 
@@ -1691,6 +1727,10 @@ Turn off **Show terminal agent setup for submitted aliases** to start Run and As
 
 **Preview a module** tries a single role in the selected combination. **Reset preview** returns to the combination. The sample shows the selected history, status, approval, and arrangement. In Adaptive Dock, the sample terminal size can be changed independently of the workspace.
 
+With the module table focused, Up/Down, Home and End preview a row; Space activates it. Changing a built-in creates your own copy. In narrow Settings windows, scroll below the module table to reach the sample preview.
+
+Use Tab to focus the combination picker and Enter to open it. Arrow keys, Home and End select an option; Enter applies it. Escape closes the open list before it closes the dialog.
+
 The status display stays for six seconds after a run by default. Set a delay from 0 to 60 seconds in **AI Agent Design**. Zero keeps the status visible. The activity history remains accessible after the status disappears. **View → AI Agent Panel → Show or Hide Status Bar** changes visibility for the current run. **Reduce Agent design animations** keeps the demo and live status timing and disables decorative motion in the Agent preview and terminal presentation.
 
 Docked history layouts place activity beside or below the terminal. Select an
@@ -1766,6 +1806,8 @@ Follow-up questions have their own preview and carry a bounded conversation hist
 Managed installations can set `ai-chat = "deny"` under `[rule.features]` to disable terminal AI actions and Saved Chats independently of other AI tools. The highest matching user, group, or global tier sets the rule. Denial wins within a tier, and the master AI switch still applies.
 
 In **AI Manager → Profiles → Connection**, select **Web search**. Direct Tavily uses `TAVILY_API_KEY`. LM Studio profiles can also use Tavily MCP, Bright Data MCP, Brave Search MCP, SearXNG MCP, or a configured Toolpack. Configure the selected integration in LM Studio and enter its plugin ID when requested. Toolpack requires an explicit list of allowed tool names. **Search web…** shows the exact masked query and reviewed destination and tools before dispatch. **Use excerpts in next AI review** includes the masked excerpts in a separate model preview. Saved Chat answers retain available source titles and URLs without query parameters or fragments. Searches are disabled in incognito chats. Managed installations can block searches with `[rule.ai-profiles] allow-internet = false`.
+
+**General → Internet access** stores the Tavily/Bright Data MCP server labels and global Brave Search, SearXNG and Toolpack plugin IDs. Blank profile IDs inherit the global ID; an explicit profile ID keeps its override. Changes require renewed web review. SearXNG also requires **Global SearXNG URL**, including for an existing profile. Record the base URL of the service configured in LM Studio. The plugin selects the search server; this setup URL is not a direct request destination and does not replace the separate page-reading endpoint below.
 
 Choose **Read a webpage** on a profile with Tavily, Bright Data MCP, or a configured SearXNG MCP page endpoint. Enter a public HTTP or HTTPS URL and review it after query parameters and fragments are removed. **Request page** sends the reviewed URL to Tavily Extract, Bright Data `scrape_as_markdown`, or SearXNG `web_url_read`. Tavily and Bright Data use their search provider key. For SearXNG, enable **Read webpages through a SearXNG MCP endpoint** in the profile and enter the full Streamable HTTP endpoint. Use HTTPS or a numeric loopback HTTP address. A server that requires a bearer token uses the optional local environment variable. KorTTY labels the requested URL in a SearXNG result. The server can serve cached or redirected content. Review the masked excerpt before including it in a model request. [Tavily Extract](https://docs.tavily.com/documentation/api-reference/endpoint/extract) · [Bright Data MCP tools](https://docs.brightdata.com/products/mcp-server/tools) · [SearXNG MCP configuration](https://github.com/ihor-sokoliuk/mcp-searxng/blob/main/docs/client-configurations.md)
 
@@ -2667,6 +2709,8 @@ For the desktop smoke test of **Scheduler**, save a job with `printf 'scheduled\
 **SFTP · Ownership and permissions** verifies the requested UID, GID and exact POSIX mode. The server must support `lsetstat@openssh.com`. **SFTP · Copy on server** copies a regular file or a directory tree with up to 4,096 entries and 1 GiB of file data. Files are published privately under a new name. Directories are created privately. Symlinks and special files are rejected. A partially created target is mentioned in the session journal. This requires the server to provide `copy-data`, `hardlink@openssh.com`, and a file system with hard links. File contents remain on the server. The OpenSSH test above checks an actual group change, a multi-block copy, and protection against target collisions.
 
 **SFTP · Permanently delete** deletes regular files and empty directories. Re-enter the absolute path for confirmation. Recursive deletion requires a separate selection and checks up to 4,096 entries before the first modification. Symlinks and special files are rejected. The verification steps above cover single and tree deletions, denied targets, and partial deletions. SFTP v3 performs the path check and the deletion separately.
+
+**Choose multiple saved targets…** opens an owned server/group selection window. The current job's explicit connections and groups are selected initially. Search filters by name, host or group while preserving the selection; matching connections keep their group ancestors visible. Click selects one row, Cmd-click on macOS (Ctrl-click elsewhere) toggles rows, and Shift-click selects a range. Arrow keys move through the tree; Left/Right collapse or expand groups, Space toggles a target, and Cmd/Ctrl+A selects visible targets within the selection limit. **Select** replaces the job draft's target selection after rechecking current routes and group membership. **Cancel** and Escape discard the selection edits. The job is saved separately, and changed routes still require explicit reselection and review.
 
 A scheduler job can use up to eight stored SSH profiles with optional jump hosts in sequence. The job file contains the profile IDs and confirmed routes. All routes are verified before the first connection is established. Each target undergoes its own host key check before login. The session journal contains a result per target. Aborting prevents further connections. Profile and vault changes take effect on the next run because a started job resolves its credentials at the beginning. A changed route must be selected again. Interactive logins and profiles with their own isolation or incognito mode remain locked for jobs. Local downloads and terminal recordings are limited to one target. Password jobs cannot request a terminal recording. The OpenSSH tests check, among other things, vault keys, jump hosts, host key changes, mixed multi-target results, SFTP on multiple targets, and aborting before the next target.
 

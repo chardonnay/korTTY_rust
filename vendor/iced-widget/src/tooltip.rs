@@ -76,6 +76,7 @@ pub struct Tooltip<
     gap: f32,
     padding: f32,
     snap_within_viewport: bool,
+    hide_on_content_overlay: bool,
     delay: Duration,
     class: Theme::Class<'a>,
 }
@@ -103,6 +104,7 @@ where
             gap: 0.0,
             padding: Self::DEFAULT_PADDING,
             snap_within_viewport: true,
+            hide_on_content_overlay: false,
             delay: Duration::ZERO,
             class: Theme::default(),
         }
@@ -131,6 +133,13 @@ where
     /// Sets whether the [`Tooltip`] is snapped within the viewport.
     pub fn snap_within_viewport(mut self, snap: bool) -> Self {
         self.snap_within_viewport = snap;
+        self
+    }
+
+    /// Hides the hint while the content has an overlay, such as an open menu.
+    #[must_use]
+    pub fn hide_on_content_overlay(mut self, hide: bool) -> Self {
+        self.hide_on_content_overlay = hide;
         self
     }
 
@@ -339,6 +348,10 @@ where
             viewport,
             translation,
         );
+
+        if self.hide_on_content_overlay && content.is_some() {
+            return content;
+        }
 
         let tooltip = if let State::Open { cursor_position } = *state {
             Some(overlay::Element::new(Box::new(Overlay {

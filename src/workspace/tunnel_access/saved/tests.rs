@@ -36,6 +36,7 @@ fn connection(endpoint: LoginTarget, bind: SocketAddr, port: u16) -> Connection 
         name: "Tunnel test".into(),
         tag: String::new(),
         login: SavedLogin {
+            preferences: Default::default(),
             endpoint,
             auth: Auth::Prompt,
             keyboard_interactive: false,

@@ -17,6 +17,7 @@ fn fixture() -> Connection {
         name: "Ops, \"Berlin\" & <Staging>".into(),
         tag: "kept & escaped".into(),
         login: SavedLogin {
+            preferences: Default::default(),
             endpoint: LoginTarget {
                 host: "server.example".into(),
                 port: 2222,
@@ -26,6 +27,7 @@ fn fixture() -> Connection {
             keyboard_interactive: false,
         },
         jump: Some(SavedLogin {
+            preferences: Default::default(),
             endpoint: LoginTarget {
                 host: "jump.example".into(),
                 port: 22,
@@ -73,6 +75,34 @@ fn fixture() -> Connection {
         paste_warning: Some(PasteWarningMode::Always),
         window_geometry: None,
         terminal: Default::default(),
+    }
+}
+
+#[test]
+fn credential_free_exports_omit_inactive_authentication_preferences() {
+    let original = fixture();
+    let mut modified = original.clone();
+    modified.login.preferences = crate::connection_store::AuthPreferences {
+        password: Some("INACTIVE_PASSWORD_REFERENCE".into()),
+        key_file: "INACTIVE_PRIVATE_KEY_PATH".into(),
+        passphrase: Some("INACTIVE_PASSPHRASE_REFERENCE".into()),
+        ..Default::default()
+    };
+    for format in Format::ALL {
+        let original_entries = [Entry {
+            connection: &original,
+            group: "",
+            os_badge: None,
+        }];
+        let modified_entries = [Entry {
+            connection: &modified,
+            group: "",
+            os_badge: None,
+        }];
+        assert_eq!(
+            encode(format, &original_entries).unwrap(),
+            encode(format, &modified_entries).unwrap()
+        );
     }
 }
 

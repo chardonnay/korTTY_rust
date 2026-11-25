@@ -68,6 +68,14 @@ impl State {
 }
 
 impl Workspace {
+    pub(super) fn sync_ai_general_snippet_defaults(&mut self) {
+        if let Some((_, dialog)) = &mut self.ai_manager.surface {
+            dialog.install_snippet_defaults(super::ai_general_defaults::SnippetValues::from(
+                &self.window_settings,
+            ));
+        }
+    }
+
     pub(super) fn start_ai_model_catalog_refresh(&mut self) -> Task<Desktop> {
         if !self.ai_features_enabled()
             || !self.clipboard.policy.ai_model_downloads_allowed()
@@ -649,6 +657,12 @@ impl Workspace {
                 && matches!(key, Key::Character(value) if value.eq_ignore_ascii_case(letter))
         };
         let dialog = &self.ai_manager.surface.as_ref()?.1;
+        if *key == Key::Named(Named::Tab) && (modifiers.is_empty() || modifiers == Modifiers::SHIFT)
+        {
+            return dialog
+                .focus_general_next(modifiers.shift())
+                .map(|task| task.map(move |event| wrap(target, event)));
+        }
         let event = if *key == Key::Named(Named::Escape) {
             ai_manager::Message::Escape
         } else if command("f") {
@@ -802,6 +816,7 @@ impl Workspace {
         let task = dialog
             .update_with_vault(event, self.vault.as_ref())
             .map(move |event| wrap(id, event));
+        let (snippet_defaults, history_defaults) = dialog.take_shared_default_updates();
         let dialog_changed = if let Some(child) = self.ai_manager.child
             && child_height(dialog).is_none()
         {
@@ -811,6 +826,14 @@ impl Workspace {
             self.open_ai_manager_child(id)
         };
         let task = dialog_changed.chain(task);
+        if let Some(values) = snippet_defaults {
+            self.window_settings.snippet_ai_additional_instructions = Some(values.instructions);
+            self.window_settings.snippet_alternative_count = Some(values.alternatives);
+            self.settings.rebase_snippet_defaults(values);
+        }
+        if let Some(snapshot) = history_defaults {
+            self.refresh_agent_history_defaults(&snapshot);
+        }
         if let Some(previous_vision) = previous_vision {
             if configuration_changed && !projection_only {
                 self.invalidate_snippet_apply_requests();
@@ -1197,6 +1220,61 @@ mod tests {
         assert!(!workspace.windows.contains_key(&owner));
         assert!(workspace.windows.contains_key(&remaining));
         assert!(workspace.ai_features_enabled());
+    }
+
+    #[test]
+    fn general_tab_navigation_is_scoped_to_the_active_manager_window_or_tab() {
+        use crate::settings_search::test_input;
+        use iced::{Font, Renderer};
+        use iced_runtime::{UserInterface, user_interface::Cache};
+
+        for hosted in [false, true] {
+            let profile = crate::snippets::tests::Profile::new();
+            let mut workspace = Workspace::default();
+            workspace.window_settings.open_tool_windows_as_tabs = hosted;
+            let (owner, _) = workspace.open_window(false);
+            let (other, _) = workspace.open_window(false);
+            let mut dialog = Dialog::new(
+                Arc::clone(&workspace.ai_manager.config),
+                profile.0.clone(),
+                Vec::new(),
+                true,
+                None,
+            );
+            let _ = dialog.update(ai_manager::Message::Search(
+                "default code text language".into(),
+            ));
+            let reveal = dialog.update(ai_manager::Message::SearchChoose);
+            let _ = workspace.open_ai_manager_surface(owner, dialog);
+            let id = workspace.ai_manager_id().unwrap();
+            let key = Key::Named(Named::Tab);
+            assert!(
+                workspace
+                    .ai_manager_shortcut(other, &key, Modifiers::empty())
+                    .is_none()
+            );
+            let focus = workspace
+                .ai_manager_shortcut(if hosted { owner } else { id }, &key, Modifiers::empty())
+                .unwrap();
+            let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+            let mut ui = UserInterface::build(
+                workspace.ai_manager_view(id).unwrap(),
+                Size::new(760.0, 480.0),
+                Cache::default(),
+                &mut renderer,
+            );
+            test_input::apply(
+                &mut ui,
+                &renderer,
+                reveal.map(move |message| wrap(id, message)),
+            );
+            test_input::apply(&mut ui, &renderer, focus);
+            let messages =
+                test_input::press(&mut ui, &mut renderer, Key::Named(Named::Space), Some(" "));
+            assert!(
+                matches!(messages.as_slice(), [Desktop::AiManager(Message::Dialog(target, event))] if *target == id && matches!(event.as_ref(), ai_manager::Message::SnippetInstructions(true)))
+            );
+        }
     }
 
     #[test]

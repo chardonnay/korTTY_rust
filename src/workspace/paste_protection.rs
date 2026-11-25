@@ -38,8 +38,14 @@ impl Workspace {
     pub(super) fn paste_warning_for(&self, session: SessionId) -> WarningMode {
         self.sessions
             .get(&session)
-            .and_then(|pane| pane.ssh.as_ref())
-            .and_then(|target| self.saved_terminal_preferences.paste_warning(target))
+            .and_then(|pane| {
+                self.native_runtime(pane)
+                    .and_then(|runtime| runtime.settings.paste_warning)
+                    .or_else(|| {
+                        self.saved_terminal_preferences
+                            .paste_warning(pane.ssh.as_ref()?)
+                    })
+            })
             .unwrap_or(self.window_settings.paste_warning)
             .max(self.clipboard.policy.minimum_paste_warning)
     }
@@ -188,6 +194,7 @@ mod tests {
             name: "Lab".into(),
             tag: String::new(),
             login: SavedLogin {
+                preferences: Default::default(),
                 endpoint: login.clone(),
                 auth: Auth::Prompt,
                 keyboard_interactive: false,

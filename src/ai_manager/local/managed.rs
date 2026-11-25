@@ -2255,8 +2255,21 @@ mod tests {
         edited.name = "Beta edited after review".into();
         registry.configure(edited.clone()).unwrap();
 
-        let outcome = manager.update(ManagerMessage::Local(Managed(Message::Remove)));
-        let mut outcomes = iced_runtime::task::into_stream(outcome).unwrap();
+        // Parallel tests share the process-wide managed-model worker slot.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut outcomes = loop {
+            let outcome = manager.update(ManagerMessage::Local(Managed(Message::Remove)));
+            if let Some(outcomes) = iced_runtime::task::into_stream(outcome) {
+                break outcomes;
+            }
+            assert_eq!(
+                manager.local.status.as_deref(),
+                Some("A managed local model operation is already running")
+            );
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let _ = manager.update(ManagerMessage::Local(Managed(Message::AskRemoval)));
+        };
         while manager.local.busy() {
             let Some(iced_runtime::Action::Output(event)) = block_on(outcomes.next()) else {
                 panic!("expected the model removal result");
@@ -2591,8 +2604,25 @@ mod tests {
             root.join(second).to_str().unwrap().into(),
         ))));
         let complete = |manager: &mut Manager, action: Message| {
-            let task = manager.update(ManagerMessage::Local(Managed(action)));
-            assert!(manager.local.busy(), "{:?}", manager.local.status);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let task = loop {
+                let task = manager.update(ManagerMessage::Local(Managed(action.clone())));
+                if manager.local.busy() {
+                    break task;
+                }
+                assert_eq!(
+                    manager.local.status.as_deref(),
+                    Some("A managed local model operation is already running")
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the global model operation did not finish"
+                );
+                if matches!(action, Message::Remove) {
+                    let _ = manager.update(ManagerMessage::Local(Managed(Message::AskRemoval)));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
             let mut outcomes = iced_runtime::task::into_stream(task).unwrap();
             while manager.local.busy() {
                 let Some(iced_runtime::Action::Output(event)) = block_on(outcomes.next()) else {

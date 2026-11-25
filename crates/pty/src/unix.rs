@@ -199,6 +199,8 @@ impl Control {
             .write(true)
             .custom_flags(libc::O_NOCTTY)
             .open(&slave_name)?;
+        #[cfg(target_os = "macos")]
+        let startup_slave = slave.try_clone()?;
         set_size(master_fd, size, 0, 0)?;
 
         let (wake, signal) = UnixStream::pair()?;
@@ -319,6 +321,8 @@ impl Control {
         let reader = PtyReader {
             file: Arc::clone(&output),
             signal: read_signal,
+            #[cfg(target_os = "macos")]
+            startup_slave: Some(startup_slave),
         };
         let writer = PtyWriter {
             file: Arc::clone(&input),
@@ -449,6 +453,11 @@ fn native_startup(
 pub struct PtyReader {
     file: SharedFile,
     signal: UnixStream,
+    // Darwin flushes unread output when the final slave closes. Keep startup
+    // bytes alive until the reader has drained them, even if the child exits
+    // before the session can schedule its first read.
+    #[cfg(target_os = "macos")]
+    startup_slave: Option<File>,
 }
 
 impl PtyReader {
@@ -457,6 +466,11 @@ impl PtyReader {
         let file = self.file.lock().unwrap_or_else(|err| err.into_inner());
         match file.as_ref() {
             Some(mut file) => match file.read(buffer) {
+                #[cfg(target_os = "macos")]
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    self.startup_slave.take();
+                    Err(err)
+                }
                 Err(err) if err.raw_os_error() == Some(libc::EIO) => Ok(0),
                 result => result,
             },
@@ -474,6 +488,16 @@ impl Read for PtyReader {
         let Some(mut file) = file.as_ref() else {
             return Ok(0);
         };
+        #[cfg(target_os = "macos")]
+        while self.startup_slave.is_some() {
+            match file.read(buffer) {
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    self.startup_slave.take();
+                }
+                result => return result,
+            }
+        }
         while ready(file.as_raw_fd(), self.signal.as_raw_fd(), libc::POLLIN)? {
             match file.read(buffer) {
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,

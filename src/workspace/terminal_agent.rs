@@ -33,6 +33,7 @@ mod binding;
 mod clarification;
 mod cursor;
 pub(super) mod design;
+mod diagnostics;
 mod execution_slot;
 mod final_evidence;
 mod finished_runs;
@@ -126,6 +127,9 @@ pub enum Message {
     ApproveRemaining(u64),
     PanelReview(design::PanelReviewAction),
     ConfirmEveryCommand(bool),
+    DebugMessages(bool),
+    Diagnostic(u64, Arc<diagnostics::Update>),
+    RuntimeMessages(bool),
     AutoApproveRoot(bool),
     Clarification(clarification::Message),
     Implement(u64),
@@ -316,6 +320,7 @@ struct Run {
     learned_sudo: Option<crate::terminal_logging::RedactionSecrets>,
     notice: String,
     activity: VecDeque<String>,
+    diagnostics: diagnostics::State,
     activity_steps: HashMap<usize, u64>,
     journal_commands: HashMap<usize, Option<Arc<AtomicBool>>>,
     swarm_conclusion: Option<String>,
@@ -504,6 +509,7 @@ impl Run {
             learned_sudo: None,
             notice: String::new(),
             activity: VecDeque::new(),
+            diagnostics: diagnostics::State::default(),
             activity_steps: HashMap::new(),
             journal_commands: HashMap::new(),
             swarm_conclusion: None,
@@ -605,6 +611,7 @@ impl Run {
         }
         self.phase = phase;
         if phase.finished() {
+            self.diagnostics.freeze_output();
             self.ask_file.cancel = None;
             self.probe_reviewed = false;
             self.auto_approve_root = false;
@@ -642,6 +649,7 @@ impl Run {
 
     fn record_command(&mut self, preview: String, probe: bool) -> Option<Arc<AtomicBool>> {
         let dispatch = (self.swarm && !probe).then(|| Arc::new(AtomicBool::new(false)));
+        self.diagnostics.record(&preview);
         self.record(preview);
         if self.swarm {
             self.journal_commands.insert(
@@ -656,6 +664,7 @@ impl Run {
         self.auto_approve_root = false;
         self.revoke_command_approval();
         self.cancel.request();
+        self.diagnostics.freeze_output();
         self.ai_cancel = None;
         self.ask_file.cancel = None;
         self.model_review = None;
@@ -1327,6 +1336,9 @@ impl Workspace {
             ),
             redactor,
         });
+        if let Some(config) = self.ai_configuration() {
+            run.diagnostics = diagnostics::State::configured(&config, mode);
+        }
         run.profile_pending = profile_pending;
         run.ask_file.filename = ask_filename;
         run.fonts = font::Sizes::load(&self.window_settings);

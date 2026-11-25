@@ -32,6 +32,8 @@ const TITLE: &str = "Quick Connect";
 mod ai;
 mod appearance;
 mod local;
+mod logging;
+mod navigation;
 mod view;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -72,7 +74,7 @@ pub enum Protocol {
 impl fmt::Display for Protocol {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::Ssh => "SSH (TCP)",
+            Self::Ssh => "SSH over TCP/IP",
             Self::Local => "Local Shell",
             Self::Serial => "Serial",
             Self::Sftp => "SFTP",
@@ -98,6 +100,8 @@ impl Protocol {
 
 #[derive(Clone, Debug)]
 pub enum Message {
+    Navigate(bool),
+    FocusWidget(iced::widget::Id),
     Loaded(Result<Store, String>),
     Saved(Result<(Store, u64), String>),
     Query(String),
@@ -118,7 +122,6 @@ pub enum Message {
     EffectSpeed(String),
     AiProfile(Option<crate::ai_manager::ProfileRef>),
     AiSkill(u64, bool),
-    LocalShell(LocalShell),
     Local(local::Edit),
     ShellIntegration(bool),
     AdHocLocal,
@@ -142,6 +145,14 @@ pub enum Message {
 }
 
 pub(super) struct Dialog {
+    focus_scope: iced::widget::Id,
+    form_scroll: iced::widget::Id,
+    protocol_picker: iced::widget::Id,
+    emulation_picker: iced::widget::Id,
+    saved_picker: iced::widget::Id,
+    key_picker: iced::widget::Id,
+    credential_picker: iced::widget::Id,
+    appearance_pickers: [iced::widget::Id; 3],
     id: window::Id,
     owner: window::Id,
     split: Option<SplitTarget>,
@@ -154,6 +165,8 @@ pub(super) struct Dialog {
     group: Option<String>,
     protocol: Protocol,
     ssh: SshDialog,
+    local_logging: crate::terminal_logging::Form,
+    serial_logging: crate::terminal_logging::Form,
     serial: SerialDialog,
     ibm: PendingIbm,
     appearance: appearance::Draft,
@@ -186,6 +199,14 @@ impl Dialog {
         minimum_isolation: IsolationLevel,
     ) -> Self {
         Self {
+            focus_scope: iced::widget::Id::unique(),
+            form_scroll: iced::widget::Id::unique(),
+            protocol_picker: iced::widget::Id::unique(),
+            emulation_picker: iced::widget::Id::unique(),
+            saved_picker: iced::widget::Id::unique(),
+            key_picker: iced::widget::Id::unique(),
+            credential_picker: iced::widget::Id::unique(),
+            appearance_pickers: std::array::from_fn(|_| iced::widget::Id::unique()),
             id,
             owner,
             split,
@@ -198,6 +219,8 @@ impl Dialog {
             group: None,
             protocol: Protocol::Ssh,
             ssh: blank_ssh(profile, minimum_isolation),
+            local_logging: crate::terminal_logging::Form::new(Default::default()),
+            serial_logging: crate::terminal_logging::Form::new(Default::default()),
             serial: SerialDialog::new(serial_id, SerialConnection::default(), profile),
             ibm: new_ibm(IbmKind::Tn3270e),
             appearance: appearance::Draft::default(),
@@ -244,6 +267,12 @@ impl Dialog {
             && let Some(profile) = saved.profile()
         {
             self.serial.load(saved.connection.clone(), profile);
+            self.serial_logging = crate::terminal_logging::Form::new(
+                store
+                    .editor_settings(id)
+                    .map(|settings| settings.logging.clone())
+                    .unwrap_or_default(),
+            );
             self.selected_serial = Some(id);
             self.protocol = Protocol::Serial;
         } else if let Some(saved) = store.local(id)
@@ -251,6 +280,12 @@ impl Dialog {
         {
             self.selected_local = Some(id);
             self.local = local::Draft::from_saved(saved);
+            self.local_logging = crate::terminal_logging::Form::new(
+                store
+                    .editor_settings(id)
+                    .map(|settings| settings.logging.clone())
+                    .unwrap_or_default(),
+            );
             self.local_shell = saved.shell;
             self.shell_integration = saved.shell_integration;
             self.local_emulation = profile;
@@ -258,7 +293,7 @@ impl Dialog {
         } else {
             return false;
         }
-        self.ssh.logging_form_mut().cancel_folder_picker();
+        self.cancel_logging_pickers();
         self.save = false;
         self.name.clear();
         self.status = None;
@@ -296,8 +331,11 @@ impl Dialog {
             return false;
         }
         match section {
-            Section::ConnectionSettings => self.protocol.is_ssh(),
-            Section::Logging => self.protocol == Protocol::Ssh,
+            Section::ConnectionSettings => self.protocol.ibm_models().is_none(),
+            Section::Logging => matches!(
+                self.protocol,
+                Protocol::Ssh | Protocol::Local | Protocol::Serial
+            ),
             Section::Appearance => self.protocol != Protocol::Sftp,
             Section::Effect => self.protocol != Protocol::Sftp,
             Section::Ai => self.protocol != Protocol::Sftp,
@@ -354,6 +392,9 @@ impl Dialog {
         }
         if self.group_tab {
             return self.group.is_some();
+        }
+        if self.section_visible(Section::Logging) && self.logging_form().config().is_err() {
+            return false;
         }
         if self.section_visible(Section::Appearance) && !self.appearance.valid() {
             return false;
@@ -456,7 +497,7 @@ impl Workspace {
             owner,
             DialogKind::QuickConnect,
             window::Settings {
-                size: Size::new(775.0, 610.0),
+                size: Size::new(750.0, 730.0),
                 min_size: Some(Size::new(700.0, 400.0)),
                 position: window::Position::Centered,
                 exit_on_close_request: false,
@@ -587,7 +628,7 @@ impl Workspace {
         !dialog.saving
             && dialog.section_visible(Section::Logging)
             && self.clipboard.policy.problem.is_none()
-            && !dialog.selected_ssh_incognito()
+            && !dialog.selected_incognito()
             && dialog.split.is_none_or(|target| {
                 self.split_connection_privacy(dialog.owner, target, false) == Ok(false)
             })
@@ -627,6 +668,12 @@ impl Workspace {
         }
         dialog.set_temporary_key_enabled(temporary_key_enabled);
         match message {
+            Message::Navigate(backwards) => return dialog.navigate(backwards),
+            Message::FocusWidget(field)
+            | Message::Ssh(ssh_dialog::Message::Focus(field))
+            | Message::Serial(serial_dialog::Message::Focus(field)) => {
+                return dialog.focus_widget(field);
+            }
             Message::Loaded(Ok(store)) => {
                 if dialog.store.is_none() {
                     dialog.store = Some(store);
@@ -675,7 +722,7 @@ impl Workspace {
             Message::GroupTab(group) if !split => {
                 dialog.group_tab = group;
                 if group {
-                    dialog.ssh.logging_form_mut().cancel_folder_picker();
+                    dialog.cancel_logging_pickers();
                 }
                 dialog.set_temporary_key_enabled(temporary_key_enabled);
             }
@@ -694,7 +741,7 @@ impl Workspace {
                 dialog.protocol = protocol;
                 dialog.set_temporary_key_enabled(temporary_key_enabled);
                 if changed {
-                    dialog.ssh.logging_form_mut().cancel_folder_picker();
+                    dialog.cancel_logging_pickers();
                     dialog.reset_effect_draft();
                     dialog.reset_ai_draft();
                     dialog.reset_appearance_draft();
@@ -830,20 +877,26 @@ impl Workspace {
                 dialog.effect.set_speed(speed);
                 dialog.effect_edited = true;
             }
-            Message::LocalShell(shell)
-                if dialog.protocol == Protocol::Local
-                    && !dialog.group_tab
-                    && kortty_pty::available_local_shells().contains(&shell) =>
-            {
-                dialog.local_shell = shell;
-                dialog.shell_integration &= validate_shell_integration(shell, None).is_ok();
-            }
             Message::Local(edit) if dialog.protocol == Protocol::Local && !dialog.group_tab => {
-                dialog.local.update(edit);
+                if let local::Edit::SelectShell(Some(shell)) = &edit {
+                    if !kortty_pty::available_local_shells().contains(shell) {
+                        return Task::none();
+                    }
+                    dialog.local_shell = *shell;
+                }
+                dialog.local.update(edit.clone());
                 if let Some(profile) = dialog.local_profile() {
                     dialog.shell_integration &=
                         validate_shell_integration(profile.shell, profile.command.as_deref())
                             .is_ok();
+                }
+                if let Some(field) = dialog.local.edited_focus(&edit) {
+                    return iced::widget::operation::focus(field).chain(
+                        super::dialog_design::scroll::reveal_focused(
+                            dialog.focus_scope.clone(),
+                            dialog.form_scroll.clone(),
+                        ),
+                    );
                 }
             }
             Message::ShellIntegration(enabled) if dialog.protocol == Protocol::Local => {
@@ -885,7 +938,6 @@ impl Workspace {
                     }
                 };
                 let Some((ticket, directory)) = dialog
-                    .ssh
                     .logging_form_mut()
                     .start_folder_picker(logging_available, &root)
                 else {
@@ -896,7 +948,7 @@ impl Workspace {
                 });
             }
             Message::TerminalLogFolderPicked(ticket, path) => {
-                let logging = dialog.ssh.logging_form_mut();
+                let logging = dialog.logging_form_mut();
                 if let Some(edit) =
                     logging.finish_folder_picker(&ticket, logging_available, path.as_deref())
                 {
@@ -904,7 +956,7 @@ impl Workspace {
                 }
             }
             Message::Ssh(ssh_dialog::Message::Logging(edit)) => {
-                let logging = dialog.ssh.logging_form_mut();
+                let logging = dialog.logging_form_mut();
                 if logging.accepts_editor_edit(logging_available, &edit) {
                     logging.update(edit);
                 }
@@ -1014,7 +1066,19 @@ impl Workspace {
             self.quick_connect = None;
             return self.close_placed_dialog(id);
         }
-        let incognito = dialog.protocol == Protocol::Ssh && dialog.selected_ssh_incognito();
+        let incognito = match dialog.protocol {
+            Protocol::Ssh => dialog.selected_ssh_incognito(),
+            Protocol::Local | Protocol::Serial => {
+                let id = if dialog.protocol == Protocol::Local {
+                    dialog.selected_local
+                } else {
+                    dialog.selected_serial
+                };
+                id.and_then(|id| dialog.store.as_ref()?.editor_settings(id))
+                    .is_some_and(|settings| settings.incognito)
+            }
+            _ => false,
+        };
         let incognito = if let Some(target) = dialog.split {
             match self.split_connection_privacy(owner, target, incognito) {
                 Ok(value) => value,
@@ -1060,8 +1124,7 @@ impl Workspace {
             dialog.status = Some("Managed policy blocks this connection type.".into());
             return Task::none();
         }
-        if dialog.protocol == Protocol::Ssh && incognito && !self.clipboard.policy.incognito_allowed
-        {
+        if incognito && !self.clipboard.policy.incognito_allowed {
             dialog.status = Some("Managed policy blocks this incognito connection.".into());
             return Task::none();
         }
@@ -1101,6 +1164,19 @@ impl Workspace {
             }
         }
         if dialog.protocol == Protocol::Serial && dialog.save {
+            if incognito {
+                dialog.status = Some("A private terminal cannot save a serial profile.".into());
+                return Task::none();
+            }
+            let mut common = match dialog.native_editor_settings() {
+                Ok(settings) => settings,
+                Err(error) => {
+                    dialog.status = Some(error.to_string());
+                    return Task::none();
+                }
+            };
+            style.write_terminal(&mut common.terminal);
+            common.terminal_effect = selected_effect;
             let Ok((connection, terminal)) = dialog.serial.validated() else {
                 return Task::none();
             };
@@ -1117,7 +1193,13 @@ impl Workspace {
                 let result = profile::connections_path()
                     .and_then(Store::open)
                     .and_then(|mut store| {
-                        let id = store.save_serial(draft)?;
+                        let id = store.save_protocol(
+                            None,
+                            crate::connection_store::protocol::Profile::Serial(Box::new(draft)),
+                            Vec::new(),
+                            None,
+                            Some(common),
+                        )?;
                         Ok((store, id))
                     })
                     .map_err(|error| format!("Could not save the connection ({error})"));
@@ -1138,6 +1220,18 @@ impl Workspace {
             }
             draft.terminal_effect = selected_effect;
             style.write_terminal(&mut draft.terminal);
+            if ai_enabled {
+                dialog.ai.write_terminal(&mut draft.terminal);
+            }
+            let mut common = match dialog.native_editor_settings() {
+                Ok(settings) => settings,
+                Err(error) => {
+                    dialog.status = Some(error.to_string());
+                    return Task::none();
+                }
+            };
+            common.terminal.clone_from(&draft.terminal);
+            common.terminal_effect = selected_effect;
             dialog.saving = true;
             dialog.status = None;
             let source = dialog.selected_local;
@@ -1153,9 +1247,21 @@ impl Workspace {
                                 ));
                             }
                             let group = store.group_of(source).map(str::to_owned);
-                            store.save_local_in_group(draft, group.as_deref())?
+                            store.save_protocol(
+                                None,
+                                crate::connection_store::protocol::Profile::Local(Box::new(draft)),
+                                Vec::new(),
+                                group.as_deref(),
+                                Some(common),
+                            )?
                         } else {
-                            store.save_local(draft)?
+                            store.save_protocol(
+                                None,
+                                crate::connection_store::protocol::Profile::Local(Box::new(draft)),
+                                Vec::new(),
+                                None,
+                                Some(common),
+                            )?
                         };
                         Ok((store, id))
                     })
@@ -1206,8 +1312,18 @@ impl Workspace {
                 let selected = dialog
                     .selected_local
                     .zip(dialog.store.as_ref().map(|store| store.path().to_owned()));
-                let view =
-                    super::LocalLaunchView::QuickConnect(effect_override, launch_style, selected);
+                let view = super::LocalLaunchView::QuickConnect(
+                    effect_override,
+                    launch_style,
+                    selected,
+                    incognito,
+                    Some(
+                        dialog
+                            .logging_form()
+                            .config()
+                            .expect("validated local log settings"),
+                    ),
+                );
                 let started = if let Some(local) = dialog.local_profile()
                     && (dialog.selected_local.is_some()
                         || local.command.is_some()
@@ -1247,7 +1363,7 @@ impl Workspace {
                                 effect_override.is_none(),
                             );
                         } else {
-                            self.add_tab(owner, session);
+                            self.add_tab_with_privacy(owner, session, incognito);
                         }
                         self.record_local_session_used(session)
                     }
@@ -1259,8 +1375,15 @@ impl Workspace {
             }
             Protocol::Serial => {
                 let saved = dialog.selected_serial().cloned();
+                let logging = Some(
+                    dialog
+                        .logging_form()
+                        .config()
+                        .expect("validated serial log settings"),
+                );
                 if let Some(window) = self.windows.get_mut(&owner) {
                     window.pending_serial = Some(PendingSerial {
+                        logging,
                         form: dialog.serial,
                         saved,
                         replace: None,
@@ -1269,7 +1392,13 @@ impl Workspace {
                         font,
                     });
                 }
-                self.connect_serial_with_privacy(owner, false, effect_override, ai, launch_style)
+                self.connect_serial_with_privacy(
+                    owner,
+                    incognito,
+                    effect_override,
+                    ai,
+                    launch_style,
+                )
             }
             Protocol::Tn3270 | Protocol::Tn5250 => {
                 if let Some(window) = self.windows.get_mut(&owner) {
@@ -2063,7 +2192,10 @@ mod tests {
         assert_eq!(dialog.protocol, Protocol::Ssh);
         let _ = workspace.update_quick_connect(id, Message::Protocol(Protocol::Local));
         #[cfg(windows)]
-        let _ = workspace.update_quick_connect(id, Message::LocalShell(LocalShell::CommandPrompt));
+        let _ = workspace.update_quick_connect(
+            id,
+            Message::Local(local::Edit::SelectShell(Some(LocalShell::CommandPrompt))),
+        );
         for message in [
             Message::Profile(TerminalProfile::Vt220),
             Message::Font(17),

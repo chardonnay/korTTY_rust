@@ -7,7 +7,26 @@ use crate::ssh_dialog::LoginTarget;
 
 use super::*;
 
+mod protocol;
 mod serial_selection;
+
+fn edited_serial(manager: &ConnectionWindow) -> SerialProfile {
+    let crate::connection_store::protocol::Profile::Serial(value) =
+        manager.draft.as_ref().unwrap().prepared().unwrap().selected
+    else {
+        panic!("expected serial draft")
+    };
+    *value
+}
+
+fn edited_local(manager: &ConnectionWindow) -> LocalProfile {
+    let crate::connection_store::protocol::Profile::Local(value) =
+        manager.draft.as_ref().unwrap().prepared().unwrap().selected
+    else {
+        panic!("expected local draft")
+    };
+    *value
+}
 
 struct Profile(PathBuf);
 
@@ -40,6 +59,7 @@ fn connection(name: &str, tag: &str) -> Connection {
         name: name.into(),
         tag: tag.into(),
         login: SavedLogin {
+            preferences: Default::default(),
             endpoint: LoginTarget {
                 host: "example.test".into(),
                 port: 22,
@@ -257,7 +277,7 @@ fn serial_profiles_are_searchable_and_duplicate_with_the_same_terminal_settings(
     assert_eq!(manager.export_connections_sources().unwrap().1, [saved]);
 
     let _ = manager.update(Message::Duplicate);
-    let copied = manager.serial_draft.as_ref().unwrap().profile().unwrap();
+    let copied = edited_serial(&manager);
     assert_eq!(copied.id, 0);
     assert_eq!(copied.display_name(), "Router (copy)");
     assert!(copied.matches(&serial, TerminalProfile::Vt220));
@@ -296,20 +316,13 @@ fn grouped_serial_favorites_pins_tags_and_duplicate_are_persisted() {
     let _ = manager.update(Message::Scope(Scope::Favorites));
     assert_eq!(manager.visible_row_keys(), [RowKey::Serial(id)]);
     let _ = manager.update(Message::Duplicate);
-    let copy = manager.serial_draft.as_ref().unwrap().profile().unwrap();
+    let copy = edited_serial(&manager);
     assert!(!copy.pinned);
     assert_eq!(copy.tag, "Switches");
     assert_eq!(copy.highlight_set.as_deref(), Some("builtin.errors"));
     let _ = manager.update(Message::SerialHighlightSet("none".into()));
     assert_eq!(
-        manager
-            .serial_draft
-            .as_ref()
-            .unwrap()
-            .profile()
-            .unwrap()
-            .highlight_set
-            .as_deref(),
+        edited_serial(&manager).highlight_set.as_deref(),
         Some("none")
     );
     assert_eq!(manager.draft_group.as_deref(), Some(folder.as_str()));
@@ -356,7 +369,7 @@ fn local_shell_editor_persists_exact_arguments_and_keeps_cancelled_edits_private
     );
 
     let _ = manager.update(Message::Duplicate);
-    let copy = manager.local_draft.as_ref().unwrap().profile().unwrap();
+    let copy = edited_local(&manager);
     assert_eq!(copy.id, 0);
     assert_eq!(copy.command, saved.command);
     let _ = manager.update(Message::Local(Local::Name("Edited copy".into())));
@@ -1256,6 +1269,7 @@ fn ssh_editor_journal_and_ai_tabs_keep_their_drafts_when_terminal_defaults_are_r
             keys: &[],
             temporary_keys: false,
             vault_unlocked: false,
+            temporary_key_vault: None,
             ai_profiles: &[],
             java_ai_profiles: &[],
             ai_skills: &[],
@@ -1269,6 +1283,7 @@ fn ssh_editor_journal_and_ai_tabs_keep_their_drafts_when_terminal_defaults_are_r
             serial_allowed: true,
             terminal_effects: None,
             default_paste_warning: Default::default(),
+            default_paste_line_delay_ms: 0,
             minimum_paste_warning: PasteWarningMode::Off,
             isolation: Default::default(),
             local_isolation_default: Default::default(),
@@ -1503,6 +1518,13 @@ fn ssh_editor_ai_tab_moves_focus_and_assigns_skills_with_the_keyboard() {
     test_input::apply(&mut interface, &renderer, focus);
     assert!(matches!(
         named(&mut interface, &mut renderer, Named::Enter).as_slice(),
+        [Message::CancelEdit]
+    ));
+    let _ = named(&mut interface, &mut renderer, Named::Tab);
+    let focus = window.draft.as_ref().unwrap().focus_editor(false);
+    test_input::apply(&mut interface, &renderer, focus);
+    assert!(matches!(
+        named(&mut interface, &mut renderer, Named::Enter).as_slice(),
         [Message::Save]
     ));
     drop(interface);
@@ -1526,6 +1548,7 @@ fn keyboard_editor_view<'a>(
             keys: &[],
             temporary_keys: false,
             vault_unlocked: false,
+            temporary_key_vault: None,
             ai_profiles: &[],
             java_ai_profiles: &[],
             ai_skills: &[],
@@ -1539,6 +1562,7 @@ fn keyboard_editor_view<'a>(
             serial_allowed: true,
             terminal_effects: None,
             default_paste_warning: Default::default(),
+            default_paste_line_delay_ms: 0,
             minimum_paste_warning: PasteWarningMode::Off,
             isolation: Default::default(),
             local_isolation_default: Default::default(),
@@ -1547,7 +1571,7 @@ fn keyboard_editor_view<'a>(
 }
 
 #[test]
-fn ssh_editor_skips_disabled_jump_and_log_controls_in_tab_order() {
+fn ssh_editor_skips_disabled_controls_and_reaches_cancel_then_save() {
     use crate::settings_search::test_input;
     use iced::keyboard::{Key, key::Named};
     use iced::{Font, Renderer, Size, Theme};
@@ -1562,7 +1586,11 @@ fn ssh_editor_skips_disabled_jump_and_log_controls_in_tab_order() {
     let _ = window.update(Message::EditSelected);
     let themes = crate::terminal_theme::Themes::default();
     let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
-    for page in [form::Page::JumpHost, form::Page::Logging] {
+    for page in [
+        form::Page::JumpHost,
+        form::Page::Logging,
+        form::Page::Journal,
+    ] {
         let _ = window.update(Message::Edit(Edit::Page(page)));
         let mut interface = UserInterface::build(
             keyboard_editor_view(&window, &themes, &[]),
@@ -1593,8 +1621,22 @@ fn ssh_editor_skips_disabled_jump_and_log_controls_in_tab_order() {
                     crate::terminal_logging::Edit::Enabled(true)
                 ))]
             ),
+            form::Page::Journal => matches!(
+                toggle.as_slice(),
+                [Message::Edit(Edit::Terminal(
+                    terminal_overrides::Edit::Journal(journal_settings::Edit::Auto(true))
+                ))]
+            ),
             _ => unreachable!(),
         });
+        tab(&mut interface, &mut renderer);
+        let cancel = test_input::press(
+            &mut interface,
+            &mut renderer,
+            Key::Named(Named::Enter),
+            None,
+        );
+        assert!(matches!(cancel.as_slice(), [Message::CancelEdit]));
         tab(&mut interface, &mut renderer);
         let save = test_input::press(
             &mut interface,
@@ -1796,6 +1838,7 @@ fn connection_manager_pointer_drags_accept_local_folders_and_refuse_teamwork_sou
     let mut view = manager.view(ViewChoices {
         temporary_keys: false,
         vault_unlocked: false,
+        temporary_key_vault: None,
         journal_policy: JournalEditorPolicy::default(),
         terminal_style: Default::default(),
         logging_policy: Default::default(),
@@ -1812,6 +1855,7 @@ fn connection_manager_pointer_drags_accept_local_folders_and_refuse_teamwork_sou
         incognito_allowed: true,
         terminal_effects: Some(&Effect::ALL),
         default_paste_warning: Default::default(),
+        default_paste_line_delay_ms: 0,
         minimum_paste_warning: PasteWarningMode::Off,
         isolation: Default::default(),
         local_isolation_default: Default::default(),
@@ -1938,6 +1982,7 @@ fn native_workbench_keeps_reference_side_widths_at_default_and_minimum_size() {
         let mut view = window.view(ViewChoices {
             temporary_keys: false,
             vault_unlocked: false,
+            temporary_key_vault: None,
             journal_policy: JournalEditorPolicy::default(),
             terminal_style: Default::default(),
             logging_policy: Default::default(),
@@ -1954,6 +1999,7 @@ fn native_workbench_keeps_reference_side_widths_at_default_and_minimum_size() {
             incognito_allowed: true,
             terminal_effects: Some(&Effect::ALL),
             default_paste_warning: Default::default(),
+            default_paste_line_delay_ms: 0,
             minimum_paste_warning: PasteWarningMode::Off,
             isolation: Default::default(),
             local_isolation_default: Default::default(),
@@ -2010,6 +2056,7 @@ fn long_scope_titles_keep_list_and_map_visible_at_minimum_width() {
         let mut view = window.view(ViewChoices {
             temporary_keys: false,
             vault_unlocked: false,
+            temporary_key_vault: None,
             journal_policy: JournalEditorPolicy::default(),
             terminal_style: Default::default(),
             logging_policy: Default::default(),
@@ -2026,6 +2073,7 @@ fn long_scope_titles_keep_list_and_map_visible_at_minimum_width() {
             incognito_allowed: true,
             terminal_effects: Some(&Effect::ALL),
             default_paste_warning: Default::default(),
+            default_paste_line_delay_ms: 0,
             minimum_paste_warning: PasteWarningMode::Off,
             isolation: Default::default(),
             local_isolation_default: Default::default(),

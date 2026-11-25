@@ -350,6 +350,10 @@ pub enum Action {
     ToggleAgentStatus,
     ToggleAgentHistory,
     AgentSpotlight,
+    SummarizeTerminalSelection,
+    SummarizeRecentTerminalOutput,
+    SolveTerminalSelection,
+    AskAboutTerminalSelection,
 }
 
 #[derive(Clone, Copy)]
@@ -738,6 +742,12 @@ impl Category {
             Self::Ai => &[
                 Item(AiManager),
                 Item(SavedChats),
+                Separator,
+                Item(SummarizeTerminalSelection),
+                Item(SummarizeRecentTerminalOutput),
+                Item(SolveTerminalSelection),
+                Item(AskAboutTerminalSelection),
+                Separator,
                 Item(TerminalAgent),
                 Item(TerminalAgentAsk),
                 Item(TerminalAgentPlan),
@@ -754,6 +764,17 @@ impl Category {
 }
 
 impl Action {
+    pub(super) fn terminal_ai_action(self) -> Option<super::terminal_ai::Action> {
+        use super::terminal_ai::Action as Ai;
+        match self {
+            SummarizeTerminalSelection => Some(Ai::Summarize),
+            SummarizeRecentTerminalOutput => Some(Ai::SummarizeRecent),
+            SolveTerminalSelection => Some(Ai::SolveProblem),
+            AskAboutTerminalSelection => Some(Ai::Ask),
+            _ => None,
+        }
+    }
+
     pub(super) fn agent_mode(self) -> Option<crate::terminal_agent::Mode> {
         match self {
             TerminalAgent => Some(crate::terminal_agent::Mode::Run),
@@ -907,6 +928,10 @@ impl Action {
             Recordings => "Video Manager…",
             AiManager => "AI Manager…",
             SavedChats => "Saved Chats…",
+            SummarizeTerminalSelection => "Summarize Selection…",
+            SummarizeRecentTerminalOutput => "Summarize Recent Output…",
+            SolveTerminalSelection => "Solve Selected Problem…",
+            AskAboutTerminalSelection => "Ask About Selection…",
             TerminalAgent => "AI Agent…",
             TerminalAgentAsk => "Ask Terminal Agent…",
             TerminalAgentPlan => "AI Planning…",
@@ -1679,6 +1704,12 @@ impl Workspace {
             ToggleAgentHistory => self.agent_history_available(id),
             AgentSpotlight => self.agent_spotlight_available(id),
             SavedChats => self.windows.contains_key(&id) && self.ai_chat_enabled(),
+            SummarizeTerminalSelection
+            | SummarizeRecentTerminalOutput
+            | SolveTerminalSelection
+            | AskAboutTerminalSelection => self
+                .focused_session(id)
+                .is_some_and(|pane| self.terminal_ai_available(pane, action.terminal_ai_action())),
             AgentSwarm => self.windows.contains_key(&id) && self.agent_swarm_available(),
             TerminalAgent | TerminalAgentAsk | TerminalAgentPlan => self
                 .windows
@@ -1906,6 +1937,19 @@ impl Workspace {
             }
             Recordings => W::Recording(recording_access::Message::Open(id)),
             AiManager => W::AiManager(super::ai_access::Message::Open(id)),
+            SummarizeTerminalSelection
+            | SummarizeRecentTerminalOutput
+            | SolveTerminalSelection
+            | AskAboutTerminalSelection
+                if self.focused_session(id).is_some_and(|pane| {
+                    self.terminal_ai_available(pane, action.terminal_ai_action())
+                }) =>
+            {
+                W::TerminalAi(
+                    id,
+                    super::terminal_ai::Message::Open(action.terminal_ai_action()?),
+                )
+            }
             SavedChats => W::SavedChats(id, super::saved_chats::Message::Open),
             Editor => W::OpenEditor(id),
             Diagrams => W::OpenDiagram,
@@ -2755,6 +2799,7 @@ fn native_menu_requires_focused_owner(action: Action) -> bool {
             | AgentSwarm
     ) || action.multi_exec_action().is_some()
         || action.font_zoom().is_some()
+        || action.terminal_ai_action().is_some()
 }
 
 #[cfg(target_os = "macos")]
@@ -2996,6 +3041,23 @@ pub(super) fn tab_button_style(
 
 #[cfg(test)]
 mod menu_tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn terminal_ai_actions_keep_native_identifiers_and_require_a_focused_owner() {
+        use super::*;
+        for action in [
+            SummarizeTerminalSelection,
+            SummarizeRecentTerminalOutput,
+            SolveTerminalSelection,
+            AskAboutTerminalSelection,
+        ] {
+            assert!(action as u16 > AgentSpotlight as u16);
+            assert_eq!(Action::from_native(action as u16), Some(action));
+            assert!(native_menu_requires_focused_owner(action));
+            assert!(!native_can_open_window(action));
+        }
+    }
+
     use iced::Size;
 
     use super::*;

@@ -13,12 +13,26 @@ use super::{ConnectionWindow, Message, Persisted, Scope, terminal_overrides};
 
 const MAX_ARGUMENTS: usize = 127;
 
+#[derive(Clone, Copy, PartialEq)]
+struct ShellChoice(Option<LocalShell>);
+
+impl std::fmt::Display for ShellChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(shell) => shell.fmt(f),
+            None => f.write_str("Custom command"),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Edit {
+    Focus(iced::widget::Id),
     Name(String),
     Directory(String),
     Folder(Option<String>),
     Shell(LocalShell),
+    SelectShell(Option<LocalShell>),
     Emulation(TerminalProfile),
     Isolation(LocalIsolation),
     Integration(bool),
@@ -38,30 +52,43 @@ pub(super) struct Draft {
     name: String,
     directory: String,
     shell: LocalShell,
+    shell_picker: iced::widget::Id,
     emulation: TerminalProfile,
     isolation: LocalIsolation,
     integration: bool,
     custom: bool,
     program: String,
+    program_field: iced::widget::Id,
     arguments: Vec<String>,
+    argument_fields: Vec<iced::widget::Id>,
     terminal: terminal_overrides::Draft,
     effect: EffectDraft,
 }
 
 impl Draft {
-    fn new(profile: Option<LocalProfile>, duplicate: bool) -> Self {
+    pub(super) fn protocol_isolation(&self) -> LocalIsolation {
+        self.isolation
+    }
+
+    pub(super) fn set_protocol_isolation(&mut self, value: Option<IsolationLevel>) {
+        self.isolation = LocalIsolation::from_override(value);
+    }
+    pub(super) fn new(profile: Option<LocalProfile>, duplicate: bool) -> Self {
         let mut draft = Self {
             id: 0,
             changed: false,
             name: String::new(),
             directory: String::new(),
             shell: LocalShell::default(),
+            shell_picker: iced::widget::Id::unique(),
             emulation: TerminalProfile::default(),
             isolation: LocalIsolation::Inherit,
             integration: false,
             custom: false,
             program: String::new(),
+            program_field: iced::widget::Id::unique(),
             arguments: Vec::new(),
+            argument_fields: Vec::new(),
             terminal: terminal_overrides::Draft::new(&Default::default()),
             effect: EffectDraft::default(),
         };
@@ -87,21 +114,35 @@ impl Draft {
                 draft.custom = true;
                 draft.program = words.next().unwrap_or_default();
                 draft.arguments = words.collect();
+                draft.argument_fields = draft
+                    .arguments
+                    .iter()
+                    .map(|_| iced::widget::Id::unique())
+                    .collect();
             }
         }
         draft
     }
 
     pub(super) fn profile(&self) -> Result<LocalProfile, String> {
+        self.profile_named(self.id, &self.name, self.emulation)
+    }
+
+    pub(super) fn profile_named(
+        &self,
+        id: u64,
+        name: &str,
+        emulation: TerminalProfile,
+    ) -> Result<LocalProfile, String> {
         let command = self.custom.then(|| {
             std::iter::once(self.program.clone())
                 .chain(self.arguments.iter().cloned())
                 .collect()
         });
         let profile = LocalProfile {
-            id: self.id,
+            id,
             isolation: self.isolation,
-            name: self.name.trim().into(),
+            name: name.trim().into(),
             shell: if self.custom {
                 LocalShell::Default
             } else {
@@ -110,12 +151,115 @@ impl Draft {
             command,
             working_directory: (!self.directory.is_empty()).then(|| PathBuf::from(&self.directory)),
             shell_integration: self.integration,
-            emulation: self.emulation.term_name().into(),
+            emulation: emulation.term_name().into(),
             terminal_effect: self.effect.selection(),
             terminal: self.terminal.value()?,
         };
         profile.validate().map_err(|error| error.to_string())?;
         Ok(profile)
+    }
+
+    pub(super) fn protocol_fields(&self, enabled: bool) -> Element<'_, Edit> {
+        let mut shells = available_local_shells();
+        if !shells.contains(&self.shell) {
+            shells.push(self.shell);
+        }
+        let selected = ShellChoice((!self.custom).then_some(self.shell));
+        let shell: Element<'_, Edit> = if enabled {
+            pick_list(
+                shells
+                    .into_iter()
+                    .map(|shell| ShellChoice(Some(shell)))
+                    .chain(std::iter::once(ShellChoice(None)))
+                    .collect::<Vec<_>>(),
+                Some(selected),
+                |choice| Edit::SelectShell(choice.0),
+            )
+            .text_size(13)
+            .width(160)
+            .keyboard_navigation(self.shell_picker.clone())
+            .on_open(Edit::Focus(self.shell_picker.clone()))
+            .into()
+        } else {
+            button(row![
+                text(selected.to_string()).size(13).width(Length::Fill),
+                text("▾").size(13)
+            ])
+            .style(crate::workspace::dialog_design::secondary_button)
+            .width(160)
+            .into()
+        };
+        let mut content = column![
+            protocol_row("Shell", shell),
+            protocol_row(
+                "Custom command",
+                text_input("Executable path or name", &self.program)
+                    .id(self.program_field.clone())
+                    .size(13)
+                    .width(430)
+                    .on_input_maybe((enabled && self.custom).then_some(Edit::Program))
+            ),
+        ]
+        .spacing(10);
+        if self.custom {
+            for (index, value) in self.arguments.iter().enumerate() {
+                content = content.push(protocol_row(
+                    "Argument",
+                    row![
+                        text_input("Argument", value)
+                            .id(self.argument_fields[index].clone())
+                            .size(13)
+                            .on_input_maybe(
+                                enabled.then_some(move |value| Edit::Argument(index, value))
+                            ),
+                        protocol_button("Remove", enabled.then_some(Edit::RemoveArgument(index))),
+                    ]
+                    .spacing(8),
+                ));
+            }
+            content = content.push(protocol_row(
+                "",
+                protocol_button(
+                    "Add argument",
+                    (enabled && self.arguments.len() < MAX_ARGUMENTS).then_some(Edit::AddArgument),
+                ),
+            ));
+        }
+        content
+            .push(protocol_row(
+                "Start directory",
+                text_input("Absolute path (optional)", &self.directory)
+                    .size(13)
+                    .width(430)
+                    .on_input_maybe(enabled.then_some(Edit::Directory)),
+            ))
+            .push(protocol_row(
+                "Shell integration",
+                crate::workspace::dialog_design::keyboard_table::action(
+                    checkbox(self.integration)
+                        .label("Add shell integration automatically")
+                        .text_size(13)
+                        .on_toggle_maybe(
+                            (enabled && (self.integration || self.integration_support().is_ok()))
+                                .then_some(Edit::Integration),
+                        )
+                        .into(),
+                    (enabled && (self.integration || self.integration_support().is_ok()))
+                        .then_some(Edit::Integration(!self.integration)),
+                    false,
+                ),
+            ))
+            .push(protocol_row(
+                "",
+                text(if enabled {
+                    "For supported shells on this computer. Your startup files are not changed."
+                } else {
+                    "Only for local shell connections."
+                })
+                .size(12)
+                .style(text::secondary),
+            ))
+            .into()
     }
 
     pub(super) fn update(&mut self, edit: Edit) {
@@ -124,6 +268,13 @@ impl Draft {
             Edit::Directory(directory) if directory.len() <= 4096 => self.directory = directory,
             Edit::Shell(shell) if !self.custom => {
                 self.shell = shell;
+                self.integration &= self.integration_support().is_ok();
+            }
+            Edit::SelectShell(shell) => {
+                self.custom = shell.is_none();
+                if let Some(shell) = shell {
+                    self.shell = shell;
+                }
                 self.integration &= self.integration_support().is_ok();
             }
             Edit::Emulation(emulation) => self.emulation = emulation,
@@ -137,6 +288,7 @@ impl Draft {
             }
             Edit::AddArgument if self.custom && self.arguments.len() < MAX_ARGUMENTS => {
                 self.arguments.push(String::new());
+                self.argument_fields.push(iced::widget::Id::unique());
             }
             Edit::Argument(index, argument) if self.custom && argument.len() <= 8192 => {
                 let Some(current) = self.arguments.get_mut(index) else {
@@ -146,6 +298,7 @@ impl Draft {
             }
             Edit::RemoveArgument(index) if self.custom && index < self.arguments.len() => {
                 self.arguments.remove(index);
+                self.argument_fields.remove(index);
             }
             Edit::Terminal(edit) => {
                 self.changed |= self.terminal.update(edit);
@@ -156,6 +309,22 @@ impl Draft {
             _ => return,
         }
         self.changed = true;
+    }
+
+    pub(super) fn argument_focus(&self, edit: &Edit) -> Option<iced::widget::Id> {
+        if !self.custom {
+            return None;
+        }
+        match edit {
+            Edit::AddArgument => self.argument_fields.last().cloned(),
+            Edit::RemoveArgument(index) => self
+                .argument_fields
+                .get(*index)
+                .or_else(|| self.argument_fields.last())
+                .cloned()
+                .or_else(|| Some(self.program_field.clone())),
+            _ => None,
+        }
     }
 
     fn integration_support(&self) -> std::io::Result<()> {
@@ -256,17 +425,30 @@ impl Draft {
     }
 }
 
+fn protocol_button(label: &'static str, action: Option<Edit>) -> Element<'static, Edit> {
+    crate::workspace::dialog_design::keyboard_table::action(
+        button(text(label).size(13))
+            .on_press_maybe(action.clone())
+            .into(),
+        action,
+        true,
+    )
+}
+
+fn protocol_row<'a>(label: &'a str, field: impl Into<Element<'a, Edit>>) -> Element<'a, Edit> {
+    row![text(label).size(13).width(148), field.into()]
+        .spacing(10)
+        .align_y(iced::Alignment::Center)
+        .into()
+}
+
 impl ConnectionWindow {
     pub(super) fn begin_local(&mut self, profile: Option<LocalProfile>, duplicate: bool) {
-        self.draft_group = match &profile {
-            Some(profile) => self.store.group_of(profile.id),
-            None => self.active_group(),
-        }
-        .map(str::to_owned);
-        self.local_draft = Some(Draft::new(profile, duplicate));
-        self.badge_picker = None;
-        self.dismiss_tree_context();
-        self.notice = None;
+        let _ = self.begin_protocol_edit(
+            profile.map(|value| crate::connection_store::protocol::Profile::Local(Box::new(value))),
+            crate::connection_store::protocol::Kind::Local,
+            duplicate,
+        );
     }
 
     pub(super) fn save_local(&mut self) -> Task<Message> {

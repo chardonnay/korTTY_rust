@@ -155,7 +155,7 @@ impl WindowAlpha {
     }
 }
 
-fn platform_candidate() -> bool {
+pub(super) fn platform_candidate() -> bool {
     cfg!(all(
         any(
             target_os = "macos",
@@ -179,6 +179,7 @@ impl Workspace {
             || self.connection_managers.contains_key(&id)
             || self.connection_editor_manager(id).is_some()
             || self.tunnel_editor_manager(id).is_some()
+            || self.scheduler_target_title(id).is_some()
         {
             super::dialog_design::normal_theme()
         } else {
@@ -269,30 +270,9 @@ impl Workspace {
                 if self.window_settings.terminal_transparency == percent {
                     return Task::none();
                 }
-                let enable = cfg!(target_os = "windows")
-                    && self.window_settings.terminal_transparency == 0
-                    && percent > 0;
+                let previous = self.window_settings.terminal_transparency;
                 self.window_settings.terminal_transparency = percent;
-                let activation = if enable {
-                    let windows: Vec<_> = self
-                        .windows
-                        .iter_mut()
-                        .filter_map(|(&id, window)| {
-                            if window.transparency.requested {
-                                return None;
-                            }
-                            window.transparency.requested = true;
-                            Some(id)
-                        })
-                        .collect();
-                    Task::batch(
-                        windows
-                            .into_iter()
-                            .map(|id| self.detect_transparent_surface(id)),
-                    )
-                } else {
-                    Task::none()
-                };
+                let activation = self.activate_transparency(previous);
                 if !std::mem::replace(&mut self.transparency_save_pending, true) {
                     let (sender, receiver) = async_channel::bounded(1);
                     if thread::Builder::new()
@@ -333,24 +313,28 @@ impl Workspace {
         }
     }
 
-    pub(super) fn transparency_controls(
-        &self,
-        window: &Window,
-    ) -> Option<Element<'_, WorkspaceMessage>> {
-        if !platform_candidate() {
-            return None;
+    pub(super) fn activate_transparency(&mut self, previous: u8) -> Task<WorkspaceMessage> {
+        if !cfg!(target_os = "windows")
+            || previous != 0
+            || self.window_settings.terminal_transparency == 0
+        {
+            return Task::none();
         }
-        let percent = self.window_settings.terminal_transparency;
-        Some(
-            row![
-                text("Terminal transparency").size(13),
-                transparency_slider(percent).width(132),
-                text(format!("{percent}%")).size(13),
-                transparency_hint(window, percent).map(|hint| text(hint).size(12)),
-            ]
-            .spacing(6)
-            .align_y(Alignment::Center)
-            .into(),
+        let windows: Vec<_> = self
+            .windows
+            .iter_mut()
+            .filter_map(|(&id, window)| {
+                if window.transparency.requested {
+                    return None;
+                }
+                window.transparency.requested = true;
+                Some(id)
+            })
+            .collect();
+        Task::batch(
+            windows
+                .into_iter()
+                .map(|id| self.detect_transparent_surface(id)),
         )
     }
 
@@ -387,7 +371,7 @@ fn transparency_slider(percent: u8) -> Slider<'static, u8, WorkspaceMessage> {
     .on_release(WorkspaceMessage::Transparency(Message::Save))
 }
 
-fn transparency_hint(window: &Window, percent: u8) -> Option<&'static str> {
+pub(super) fn transparency_hint(window: &Window, percent: u8) -> Option<&'static str> {
     if percent > 0 && !window.transparency.requested {
         Some("Open a new window to apply")
     } else if percent > 0 && window.transparency.supported == Some(false) {

@@ -253,6 +253,17 @@ impl Workspace {
                 color,
             });
         }
+        if let Some((color, group)) = self
+            .native_runtime(pane)
+            .and_then(|runtime| runtime.color.as_ref())
+        {
+            return Some(Mark {
+                source: group
+                    .as_deref()
+                    .map_or(MarkSource::Connection, MarkSource::Group),
+                color: *color,
+            });
+        }
         let credential = pane.credential_environment_source.as_deref()?;
         let id = self.vault.as_ref()?.credential_environment(credential)?;
         let entry = self.environments.catalog.get(id)?;
@@ -454,6 +465,7 @@ mod tests {
             name: "Canary login".into(),
             tag: String::new(),
             login: crate::connection_store::SavedLogin {
+                preferences: Default::default(),
                 endpoint: login.clone(),
                 auth: crate::connection_store::Auth::Prompt,
                 keyboard_interactive: false,

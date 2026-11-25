@@ -147,10 +147,35 @@ pub(super) fn view_as(
     palette: Option<Palette>,
     reduced_motion: bool,
 ) -> Element<'_, AgentMessage> {
-    if run.presentation.model_usage.label().is_none() {
-        return entries(run, history, palette, reduced_motion);
+    if !run.live_run.is_some_and(|live| live.diagnostics.visible()) {
+        return base_view(run, history, palette, reduced_motion);
     }
-    with_usage(run, history, palette, reduced_motion)
+    responsive(move |size| {
+        let messages = run.live_run.and_then(|live| {
+            live.diagnostics.view(
+                run.activity_font,
+                (size.height * 0.28).clamp(40.0, 128.0).min(size.height),
+            )
+        });
+        column![base_view(run, history, palette, reduced_motion), messages]
+            .spacing(6)
+            .height(Length::Fill)
+            .into()
+    })
+    .into()
+}
+
+fn base_view(
+    run: Activity<'_>,
+    history: History,
+    palette: Option<Palette>,
+    reduced_motion: bool,
+) -> Element<'_, AgentMessage> {
+    if run.presentation.model_usage.label().is_none() {
+        entries(run, history, palette, reduced_motion)
+    } else {
+        with_usage(run, history, palette, reduced_motion)
+    }
 }
 
 fn with_usage(

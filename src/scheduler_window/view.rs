@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use iced::widget::{
-    button, checkbox, column, container, pane_grid, pick_list, row, rule, scrollable, svg, text,
-    text_input,
+    Id, button, checkbox, column, container, pane_grid, pick_list, responsive, row, rule,
+    scrollable, svg, text, text_input,
 };
 use iced::{Alignment, Element, Length};
 use kortty_diagram::{Direction, Scene, Theme};
@@ -19,8 +19,14 @@ use super::{
     RemoteAction, RunProposalView, SchedulerView, SchedulerWindow, Scope, SshCommand, sync,
 };
 use crate::diagram_window::Format;
+use crate::workspace::dialog_design::{
+    self,
+    keyboard_table::{self, TableKey},
+};
 
 pub(super) mod journal_details;
+#[cfg(test)]
+mod layout_tests;
 mod run_proposal;
 mod swarm_report;
 
@@ -730,6 +736,11 @@ fn agent_review(review: &super::agent::Review) -> Element<'_, Message> {
 pub(super) struct Layout {
     pub(super) jobs: pane_grid::State<bool>,
     pub(super) journal: pane_grid::State<bool>,
+    scope: Id,
+    job_table: Id,
+    job_scroll: Id,
+    action_scroll: Id,
+    form_scroll: Id,
 }
 
 impl Default for Layout {
@@ -740,6 +751,11 @@ impl Default for Layout {
                 pane_grid::Axis::Horizontal,
                 f32::from(super::DEFAULT_JOURNAL_DIVIDER) / 1000.0,
             ),
+            scope: Id::unique(),
+            job_table: Id::unique(),
+            job_scroll: Id::unique(),
+            action_scroll: Id::unique(),
+            form_scroll: Id::unique(),
         }
     }
 }
@@ -941,6 +957,43 @@ impl DiagramView {
 }
 
 impl SchedulerView {
+    fn job_row_id(&self, id: &JobId) -> Id {
+        Id::from(format!("{:?}/job/{}", self.layout.scope, id.as_str()))
+    }
+
+    pub(crate) fn reveal_selected_job<Message: Send + 'static>(&self) -> iced::Task<Message> {
+        self.draft.id.as_ref().map_or_else(iced::Task::none, |id| {
+            dialog_design::scroll::reveal_row(self.layout.job_scroll.clone(), self.job_row_id(id))
+        })
+    }
+
+    pub(crate) fn traverse<Message: Send + 'static>(&self, backwards: bool) -> iced::Task<Message> {
+        use iced::advanced::widget::operation::{focusable, scope};
+        if self.confirm.is_some()
+            || self.directory_browser.is_some()
+            || self.ownership_review.is_some()
+        {
+            return iced::Task::none();
+        }
+        let traversal = if backwards {
+            iced_runtime::Action::widget(scope(
+                self.layout.scope.clone(),
+                focusable::focus_previous(),
+            ))
+        } else {
+            iced_runtime::Action::widget(scope(self.layout.scope.clone(), focusable::focus_next()))
+        };
+        iced_runtime::task::effect(traversal)
+            .chain(dialog_design::scroll::reveal_focused(
+                self.layout.scope.clone(),
+                self.layout.action_scroll.clone(),
+            ))
+            .chain(dialog_design::scroll::reveal_focused(
+                self.layout.scope.clone(),
+                self.layout.form_scroll.clone(),
+            ))
+    }
+
     /// Renders the scheduler as native Iced controls.
     pub(crate) fn view<'a>(
         &'a self,
@@ -977,21 +1030,35 @@ impl SchedulerView {
         .spacing(8)
         .min_size(168)
         .on_resize(6, Message::ResizeJobs);
-        column![
+        let body = column![
             text("Scheduled background automation").size(20),
             contents,
             rule::horizontal(1),
             row![
                 iced::widget::space::horizontal(),
-                button("Close")
-                    .style(button::secondary)
-                    .on_press(Message::Close),
+                keyboard_table::action(
+                    button("Close")
+                        .style(button::secondary)
+                        .on_press(Message::Close)
+                        .into(),
+                    Some(Message::Close),
+                    true,
+                ),
             ],
         ]
         .spacing(10)
         .padding(12)
-        .height(Length::Fill)
-        .into()
+        .height(Length::Fill);
+        dialog_design::on_key_press(
+            container(body).id(self.layout.scope.clone()).into(),
+            |key, modifiers| {
+                (key == &iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab)
+                    && !modifiers.control()
+                    && !modifiers.logo()
+                    && !modifiers.alt())
+                .then_some(Message::Traverse(modifiers.shift()))
+            },
+        )
     }
 
     fn jobs_view<'a>(
@@ -999,6 +1066,22 @@ impl SchedulerView {
         runtime: &'a SchedulerWindow,
         menu_status_visible: bool,
         session_journal_root: Option<&Path>,
+    ) -> Element<'a, Message> {
+        let journal_root = session_journal_root.map(Path::to_path_buf);
+        container(responsive(move |size| {
+            self.jobs_panel(runtime, menu_status_visible, journal_root.as_deref(), size)
+        }))
+        .padding(8)
+        .height(Length::Fill)
+        .into()
+    }
+
+    fn jobs_panel<'a>(
+        &'a self,
+        runtime: &'a SchedulerWindow,
+        menu_status_visible: bool,
+        session_journal_root: Option<&Path>,
+        available: iced::Size,
     ) -> Element<'a, Message> {
         let graph = runtime.scheduler.graph();
         let journal_stats =
@@ -1032,66 +1115,118 @@ impl SchedulerView {
                     )
                 });
             entries = entries.push(
-                button(job_row([
-                    table_text(job.name()),
-                    table_text(job.enabled().to_string()),
-                    table_text(next),
-                    table_text(dependencies),
-                    table_text(journal_tokens),
-                ]))
-                .style(table_row_style(selected))
-                .width(Length::Fill)
-                .padding([5, 7])
-                .clip(true)
-                .on_press(Message::Select(job.id().clone())),
+                container(
+                    button(job_row([
+                        table_text(job.name()),
+                        table_text(job.enabled().to_string()),
+                        table_text(next),
+                        table_text(dependencies),
+                        table_text(journal_tokens),
+                    ]))
+                    .style(table_row_style(selected))
+                    .width(Length::Fill)
+                    .padding([5, 7])
+                    .clip(true)
+                    .on_press(Message::Select(job.id().clone())),
+                )
+                .id(self.job_row_id(job.id())),
             );
         }
-        let table = table(
-            job_row(["Job", "Enabled", "Next run", "Depends on", "Journal AI"].map(table_text)),
-            entries.into(),
+        let table = keyboard_table::view_with_id(
+            scrollable(
+                container(table_with_scroll(
+                    job_row(
+                        ["Job", "Enabled", "Next run", "Depends on", "Journal AI"].map(table_text),
+                    ),
+                    entries.into(),
+                    Some(self.layout.job_scroll.clone()),
+                ))
+                .width(available.width.max(640.0)),
+            )
+            .direction(scrollable::Direction::Horizontal(
+                scrollable::Scrollbar::new().spacing(2),
+            ))
+            .height(Length::Fill)
+            .width(Length::Fill)
+            .into(),
+            self.layout.job_table.clone(),
+            move |key, modifiers, _repeat| {
+                use iced::keyboard::{Key, key::Named};
+                if !modifiers.is_empty() {
+                    return TableKey::Ignored;
+                }
+                let Key::Named(
+                    key @ (Named::ArrowUp | Named::ArrowDown | Named::Home | Named::End),
+                ) = key
+                else {
+                    return TableKey::Ignored;
+                };
+                let jobs = graph.jobs();
+                let current = jobs
+                    .iter()
+                    .position(|job| self.draft.id.as_ref() == Some(job.id()));
+                let index = match key {
+                    Named::Home => 0,
+                    Named::End => jobs.len().saturating_sub(1),
+                    Named::ArrowUp => current.unwrap_or(1).saturating_sub(1),
+                    _ => current.map_or(0, |index| (index + 1).min(jobs.len().saturating_sub(1))),
+                };
+                TableKey::Handled(jobs.get(index).map(|job| Message::Select(job.id().clone())))
+            },
         );
         let selected = runtime.selected_job(self);
         let runnable = runtime.can_request_run(self);
+        let action = |label: &'static str, message: Option<Message>| {
+            keyboard_table::action(
+                container(
+                    button(text(label).wrapping(text::Wrapping::Word))
+                        .style(button::secondary)
+                        .on_press_maybe(message.clone()),
+                )
+                .max_width(available.width)
+                .into(),
+                message,
+                true,
+            )
+        };
         let toolbar = row![
-            button("➕  New")
-                .style(button::secondary)
-                .on_press(Message::New),
-            button("✓  Save")
-                .style(button::secondary)
-                .on_press_maybe(runtime.can_edit().then_some(Message::Save)),
-            button("✕  Delete").style(button::secondary).on_press_maybe(
+            action("➕  New", Some(Message::New)),
+            action("✓  Save", runtime.can_edit().then_some(Message::Save)),
+            action(
+                "✕  Delete",
                 (runtime.can_edit() && selected.is_some()).then_some(Message::Delete)
             ),
-            button("▶  Run now")
-                .style(button::secondary)
-                .on_press_maybe(runnable.then_some(Message::Run(false))),
-            button("⏩  Run with successors")
-                .style(button::secondary)
-                .on_press_maybe(runnable.then_some(Message::Run(true))),
-            button(if selected.is_some_and(|job| job.enabled()) {
-                "⏻  Disable chain"
-            } else {
-                "⏻  Enable chain"
-            })
-            .style(button::secondary)
-            .on_press_maybe(
+            action("▶  Run now", runnable.then_some(Message::Run(false))),
+            action(
+                "⏩  Run with successors",
+                runnable.then_some(Message::Run(true))
+            ),
+            action(
+                if selected.is_some_and(|job| job.enabled()) {
+                    "⏻  Disable chain"
+                } else {
+                    "⏻  Enable chain"
+                },
                 (runtime.can_edit() && selected.is_some()).then_some(Message::SwitchChain)
             ),
-            button("🔀  Dependency diagram")
-                .style(button::secondary)
-                .on_press(Message::Page(Page::Diagram)),
+            action("🔀  Dependency diagram", Some(Message::Page(Page::Diagram))),
         ]
         .spacing(8)
         .wrap();
         let mut panel = column![
-            table,
             toolbar,
-            checkbox(menu_status_visible)
-                .label("Show Jobs status in menu bar")
-                .on_toggle(Message::MenuStatusVisible),
+            keyboard_table::action(
+                checkbox(menu_status_visible)
+                    .label("Show Jobs status in menu bar")
+                    .width(Length::Fill)
+                    .text_wrapping(text::Wrapping::Word)
+                    .on_toggle(Message::MenuStatusVisible)
+                    .into(),
+                Some(Message::MenuStatusVisible(!menu_status_visible)),
+                false,
+            ),
         ]
-        .spacing(10)
-        .height(Length::Fill);
+        .spacing(10);
         if session_journal_root.is_some() && !graph.jobs().is_empty() {
             let status = match journal_stats {
                 Some(Ok(report)) if report.incomplete => Some("Journal totals may be incomplete."),
@@ -1119,7 +1254,19 @@ impl SchedulerView {
         if let Some(status) = &self.status {
             panel = panel.push(text(status).size(13));
         }
-        container(panel).padding(8).height(Length::Fill).into()
+        // Keep the job list usable when a narrow pane wraps its controls or
+        // status messages. Short control sections still use their natural height.
+        let controls = container(
+            scrollable(panel)
+                .id(self.layout.action_scroll.clone())
+                .spacing(4)
+                .height(Length::Shrink),
+        )
+        .max_height((available.height * 0.45).max(0.0));
+        column![table, controls]
+            .spacing(10)
+            .height(Length::Fill)
+            .into()
     }
 
     fn details_view<'a>(
@@ -1135,14 +1282,18 @@ impl SchedulerView {
             (Page::Action, "Action"),
             (Page::Journal, "Journal"),
         ] {
-            tabs = tabs.push(
+            tabs = tabs.push(keyboard_table::action(
                 button(label)
                     .style(tab_style(self.page == page))
-                    .on_press(Message::Page(page)),
-            );
+                    .on_press(Message::Page(page))
+                    .into(),
+                Some(Message::Page(page)),
+                true,
+            ));
         }
         let content: Element<'_, Message> = match self.page {
             Page::Job => scrollable(self.draft.job_view(runtime))
+                .id(self.layout.form_scroll.clone())
                 .spacing(6)
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -1965,12 +2116,24 @@ fn columns<const N: usize>(
 }
 
 fn table<'a>(header: Element<'a, Message>, entries: Element<'a, Message>) -> Element<'a, Message> {
+    table_with_scroll(header, entries, None)
+}
+
+fn table_with_scroll<'a>(
+    header: Element<'a, Message>,
+    entries: Element<'a, Message>,
+    id: Option<Id>,
+) -> Element<'a, Message> {
+    let mut body = scrollable(entries).width(Length::Fill).height(Length::Fill);
+    if let Some(id) = id {
+        body = body.id(id);
+    }
     container(
         column![
             container(header)
                 .padding([5, 7])
                 .style(container::secondary),
-            scrollable(entries).width(Length::Fill).height(Length::Fill),
+            body,
         ]
         .height(Length::Fill),
     )

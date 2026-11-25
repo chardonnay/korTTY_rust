@@ -112,16 +112,25 @@ impl Fixture {
         let config = self.directory.0.join(format!("{host}.conf"));
         let host_key = self.directory.0.join(host);
         let authorized = self.directory.0.join("client.pub");
+        // /private/tmp is not a trusted AuthorizedKeysFile ancestor on macOS.
+        let authorized = if cfg!(target_os = "macos") {
+            format!(
+                "AuthorizedKeysFile none\nAuthorizedKeysCommand /bin/cat \"{}\"\nAuthorizedKeysCommandUser {}\n",
+                authorized.display(),
+                self.user,
+            )
+        } else {
+            format!("AuthorizedKeysFile \"{}\"\n", authorized.display())
+        };
         // OpenSSH takes the first value for a setting.
         fs::write(
             &config,
             format!(
-                "{extra}HostKey \"{}\"\nAuthorizedKeysFile \"{}\"\nAllowUsers {}\n\
+                "{extra}HostKey \"{}\"\n{authorized}AllowUsers {}\n\
                  PasswordAuthentication no\nKbdInteractiveAuthentication no\nPubkeyAuthentication yes\n\
                  UsePAM no\nStrictModes yes\nLogLevel DEBUG2\nPrintMotd no\nPrintLastLog no\n\
                  PermitTTY yes\nAllowTcpForwarding yes\nGatewayPorts no\nSubsystem sftp internal-sftp\n",
                 host_key.display(),
-                authorized.display(),
                 self.user,
             ),
         )

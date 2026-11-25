@@ -109,6 +109,7 @@ impl Workspace {
             let form = crate::serial_dialog::SerialDialog::new(self.allocate(), serial, profile);
             if let Some(window) = self.windows.get_mut(&owner) {
                 window.pending_serial = Some(super::PendingSerial {
+                    logging: None,
                     saved: None,
                     form,
                     replace: None,

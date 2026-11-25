@@ -253,7 +253,7 @@ impl Redactor {
     }
 
     pub(crate) fn allows_incremental_output(&self) -> bool {
-        !self.policy.has_redactions()
+        !self.policy.has_redactions() && !self.secrets.has_multiline_values()
     }
 
     pub(crate) fn for_journal(secrets: RedactionSecrets, policy: Policy) -> Self {

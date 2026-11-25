@@ -6,7 +6,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use crate::private_files::{Directory, FileStamp, require_single_link};
+use crate::private_files::{Directory, FileLock, FileStamp, require_single_link};
 use crate::ssh_dialog::valid_username;
 
 use super::super::validate_credential_id;
@@ -146,6 +146,7 @@ impl DefaultAuth {
         let lock = directory.open_lock(LOCK)?;
         require_single_link(&lock)?;
         lock.try_lock().map_err(io::Error::from)?;
+        let _lock = FileLock::new(lock);
         let current = Self::read(&directory)?;
         if current != *expected && current != *self {
             return Ok(AuthSave::Changed(current));

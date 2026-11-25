@@ -168,6 +168,12 @@ impl SharedGroup {
 }
 
 impl ConnectionGroup {
+    pub(super) fn picker_location(&self) -> (String, &str) {
+        match self {
+            Self::Local(path) => (String::new(), path),
+            Self::Teamwork(group) => (group.source.clone(), &group.path),
+        }
+    }
     pub(crate) fn from_shared(source: &Origin, path: &str) -> Self {
         let kind = match source {
             Origin::File(_) => SourceKind::File,
@@ -476,7 +482,7 @@ fn local_jump_profile<'a>(store: &'a Store, shared: &SavedLogin) -> Option<&'a C
 fn login_digest(login: &SavedLogin) -> Option<[u8; 32]> {
     let mut hash = Sha256::new();
     hash.update(b"kortty scheduler teamwork jump login\0");
-    hash.update(serde_json::to_vec(login).ok()?);
+    hash.update(serde_json::to_vec(&login.execution_identity()).ok()?);
     Some(hash.finalize().into())
 }
 
@@ -502,8 +508,8 @@ fn shared_id(identity: &Identity) -> u64 {
 
 impl From<&Connection> for ConnectionRef {
     fn from(profile: &Connection) -> Self {
-        fn temporary(login: &SavedLogin) -> Option<&SavedLogin> {
-            matches!(login.auth, Auth::TemporaryKey { .. }).then_some(login)
+        fn temporary(login: &SavedLogin) -> Option<SavedLogin> {
+            matches!(login.auth, Auth::TemporaryKey { .. }).then(|| login.execution_identity())
         }
         let target_key = temporary(&profile.login);
         let jump_key = profile.jump.as_ref().and_then(temporary);
@@ -769,7 +775,7 @@ impl ConnectionRef {
     }
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConnectionChoice {
     Manual,
     Saved {
@@ -813,5 +819,33 @@ impl fmt::Display for ConnectionChoice {
                 Ok(())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod auth_identity_tests {
+    use super::*;
+
+    #[test]
+    fn editor_preferences_do_not_change_approved_login_or_temporary_key_identity() {
+        let mut connection: Connection = serde_json::from_value(serde_json::json!({
+            "id":1,"name":"Identity fixture","tag":"",
+            "login":{"endpoint":{"host":"host.example","port":22,"username":"operator"},
+                "auth":{"temporary-key":{"credential":"temporary-id","minutes":15,"automatic":true}}},
+            "jump":null,"emulation":"xterm-256color","tunnels":[]
+        })).unwrap();
+        let original = ConnectionRef::from(&connection);
+        let digest = login_digest(&connection.login);
+        connection.login.preferences.key_file = "unfinished file path".into();
+        connection.login.preferences.password = Some("unused-password".into());
+        assert_eq!(ConnectionRef::from(&connection), original);
+        assert_eq!(login_digest(&connection.login), digest);
+        connection.login.auth = Auth::TemporaryKey {
+            credential: Some("replacement-id".into()),
+            minutes: 15,
+            automatic: true,
+        };
+        assert_ne!(ConnectionRef::from(&connection), original);
+        assert_ne!(login_digest(&connection.login), digest);
     }
 }

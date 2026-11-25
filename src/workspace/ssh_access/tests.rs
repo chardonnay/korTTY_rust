@@ -1339,6 +1339,7 @@ fn profile_changes_invalidate_an_open_vault_login() {
         name: "Example".into(),
         tag: String::new(),
         login: SavedLogin {
+            preferences: Default::default(),
             endpoint: endpoint.clone(),
             auth: Auth::VaultPassword("original".into()),
             keyboard_interactive: false,
@@ -1391,6 +1392,7 @@ fn registered_keys_from_saved_logins_cannot_be_reused_after_reassignment() {
     use crate::ssh_dialog::Authentication as Input;
 
     let login = |host: &str, id| SavedLogin {
+        preferences: Default::default(),
         endpoint: LoginTarget {
             host: host.into(),
             port: 22,
@@ -2114,6 +2116,7 @@ fn reopen_closed_ssh_refreshes_edited_saved_route_without_reusing_typed_password
         name: "Saved reopen profile".into(),
         tag: String::new(),
         login: SavedLogin {
+            preferences: Default::default(),
             endpoint: LoginTarget {
                 host: "saved-before-edit.example".into(),
                 port: 22,

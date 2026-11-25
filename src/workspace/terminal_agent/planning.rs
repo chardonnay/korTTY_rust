@@ -847,6 +847,10 @@ impl Workspace {
                         == (kind == usage::AttemptKind::Repair))
                     .then_some("Retrying without the provider's JSON response format option…"),
             ),
+            usage::Progress::WebTool(proposal) => {
+                proposal.reject("Planning web-tool reviews are not available for this request.");
+                return;
+            }
         };
         if let Some(notice) = notice
             && permit.try_send(()).is_ok()

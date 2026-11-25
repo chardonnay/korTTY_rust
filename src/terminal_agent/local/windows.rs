@@ -8,7 +8,9 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use zeroize::Zeroizing;
 
 use super::super::decision::{MAX_COMMAND_BYTES, valid_command};
-use super::super::runner::{COMMAND_LIMIT, Cancel, Outcome, POLL, Status, capture};
+use super::super::runner::{
+    COMMAND_LIMIT, Cancel, Outcome, OutputStream, POLL, Status, capture_observed,
+};
 use super::{Shell, exit_status};
 
 pub(in crate::terminal_agent) const WORKER_ARGUMENT: &str = "--terminal-agent-command-worker";
@@ -68,14 +70,18 @@ fn run_executable(
     let stdout = process.child.stdout.take().ok_or_else(missing_pipe)?;
     let stderr = process.child.stderr.take().ok_or_else(missing_pipe)?;
     let deadline = Instant::now() + COMMAND_LIMIT;
+    let oem = matches!(shell, Shell::CommandPrompt(_));
     std::thread::scope(|scope| {
         let stdout = std::thread::Builder::new()
             .name("kortty-agent-stdout".into())
-            .spawn_scoped(scope, move || capture(stdout))?;
+            .spawn_scoped(scope, move || {
+                capture_observed(stdout, cancel, OutputStream::Stdout, oem)
+            })?;
         let stderr = match std::thread::Builder::new()
             .name("kortty-agent-stderr".into())
-            .spawn_scoped(scope, move || capture(stderr))
-        {
+            .spawn_scoped(scope, move || {
+                capture_observed(stderr, cancel, OutputStream::Stderr, oem)
+            }) {
             Ok(stderr) => stderr,
             Err(error) => {
                 process.stop();

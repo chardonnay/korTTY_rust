@@ -5,7 +5,7 @@ use std::thread;
 
 use kortty_ssh::{SshAbort, SshReader, SshWriter};
 
-use super::super::runner::{Cancel, Outcome, capture};
+use super::super::runner::{Cancel, Outcome, OutputStream, capture_observed};
 use super::{status, wait, worker_error};
 
 pub(super) fn supervise(
@@ -19,11 +19,14 @@ pub(super) fn supervise(
     thread::scope(|scope| {
         let stdout = thread::Builder::new()
             .name("kortty-agent-ssh-stdout".into())
-            .spawn_scoped(scope, move || capture(stdout))?;
+            .spawn_scoped(scope, move || {
+                capture_observed(stdout, cancel, OutputStream::Stdout, false)
+            })?;
         let stderr = match thread::Builder::new()
             .name("kortty-agent-ssh-stderr".into())
-            .spawn_scoped(scope, move || capture(stderr))
-        {
+            .spawn_scoped(scope, move || {
+                capture_observed(stderr, cancel, OutputStream::Stderr, false)
+            }) {
             Ok(stderr) => stderr,
             Err(error) => {
                 abort.abort();

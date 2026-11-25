@@ -15,6 +15,17 @@ pub(in crate::workspace) fn streaming(redactor: &Redactor, input: &str) -> Resul
     prompt(redactor, complete)
 }
 
+pub(in crate::workspace) fn streaming_captured(
+    redactor: &Redactor,
+    input: &str,
+) -> Result<String, String> {
+    if !redactor.allows_incremental_output() {
+        return Ok(String::new());
+    }
+    let complete = input.rfind('\n').map_or("", |end| &input[..=end]);
+    captured_output(redactor, complete)
+}
+
 pub(crate) fn prompt(redactor: &Redactor, input: &str) -> Result<String, String> {
     redact(redactor, input, Mode::Prompt).map(|(text, _)| text)
 }
@@ -101,6 +112,47 @@ static MASKS: LazyLock<[(Regex, &'static str); 7]> = LazyLock::new(|| {
 mod tests {
     use super::*;
     use crate::terminal_logging::{Policy, Secrets};
+
+    #[test]
+    fn streaming_captured_masks_split_tokens_utf8_and_private_key_blocks() {
+        let redactor = Redactor::for_journal(Secrets::default().seal().unwrap(), Policy::default());
+        for input in [
+            "Visible\npassword=part",
+            "Visible\npassword=partial-secret",
+            "Visible\n東",
+        ] {
+            assert_eq!(streaming_captured(&redactor, input).unwrap(), "Visible\n");
+        }
+        assert_eq!(
+            streaming_captured(&redactor, "Visible\npassword=partial-secret\n東京\n").unwrap(),
+            "Visible\npassword=***\n東京\n"
+        );
+        let secrets = Secrets::default();
+        secrets.add("multi\nline-private-value");
+        assert!(
+            secrets.seal().is_err(),
+            "Authentication values with controls stay invalid"
+        );
+        let private_key_output = "Visible\n-----BEGIN OPENSSH PRIVATE KEY-----\nfixture-key-body\n";
+        let masked = streaming_captured(&redactor, private_key_output).unwrap();
+        assert!(masked.contains("***"));
+        assert!(!masked.contains("fixture-key-body"));
+        let document = "[[session-journal.replace]]\npattern = 'private'"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        let mut policy = Policy::default();
+        policy.read_rule(document.as_table()).unwrap();
+        let redactor = Redactor::for_journal(Secrets::default().seal().unwrap(), policy);
+        assert_eq!(
+            streaming_captured(&redactor, "Visible\nprivate\n").unwrap(),
+            ""
+        );
+        assert!(
+            !captured_output(&redactor, "Visible\nprivate\n")
+                .unwrap()
+                .contains("private")
+        );
+    }
 
     #[test]
     fn streaming_keeps_incomplete_credentials_private() {

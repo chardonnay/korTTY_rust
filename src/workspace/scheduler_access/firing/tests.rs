@@ -443,6 +443,7 @@ fn saved_target(port: u16) -> (ConnectionRef, VaultWindow) {
             name: "Scheduled fixture server".into(),
             tag: String::new(),
             login: SavedLogin {
+                preferences: Default::default(),
                 endpoint: LoginTarget {
                     host: "127.0.0.1".into(),
                     port,

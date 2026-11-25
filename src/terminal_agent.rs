@@ -20,7 +20,7 @@ pub(crate) use decision::requires_confirmation_by_shape;
 pub(crate) use decision::{Action, Command, Decision, Elevation, MAX_QUESTIONS, MAX_TURNS, Risk};
 pub(crate) use directory::{LocalDirectory, valid_label as valid_target_label};
 pub(crate) use local::Shell;
-pub(crate) use runner::{CAPTURED_TEXT_LIMIT, Cancel, Outcome, Status};
+pub(crate) use runner::{CAPTURED_TEXT_LIMIT, Cancel, Outcome, OutputStream, Status};
 pub(crate) use ssh::password;
 pub(crate) use ssh::{direct as capture_ssh_lease, remote_command as wrap_ssh_command};
 
@@ -341,6 +341,7 @@ pub(crate) fn ask_with_progress_guarded(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn reviewed_run_request(
     profile: local_ai::Profile,
     kind: RunModel,
@@ -350,6 +351,41 @@ pub(crate) fn reviewed_run_request(
     progress: async_channel::Sender<usage::Progress>,
     before_dispatch: impl Fn() -> Result<(), String> + Send + 'static,
 ) -> Result<local_ai::Pending<usage::Report<Decision>>, String> {
+    reviewed_run_request_with_tools(
+        profile,
+        ReviewedRun {
+            kind,
+            system,
+            input,
+            context_limit,
+            web_tools: false,
+        },
+        progress,
+        before_dispatch,
+    )
+}
+
+pub(crate) struct ReviewedRun {
+    pub(crate) kind: RunModel,
+    pub(crate) system: String,
+    pub(crate) input: String,
+    pub(crate) context_limit: usize,
+    pub(crate) web_tools: bool,
+}
+
+pub(crate) fn reviewed_run_request_with_tools(
+    profile: local_ai::Profile,
+    request: ReviewedRun,
+    progress: async_channel::Sender<usage::Progress>,
+    before_dispatch: impl Fn() -> Result<(), String> + Send + 'static,
+) -> Result<local_ai::Pending<usage::Report<Decision>>, String> {
+    let ReviewedRun {
+        kind,
+        system,
+        input,
+        context_limit,
+        web_tools,
+    } = request;
     if !usage::fits_context(&system, &input, context_limit) {
         return Err(
             "The reviewed Agent request exceeds the selected profile's context limit.".into(),
@@ -372,6 +408,7 @@ pub(crate) fn reviewed_run_request(
             kind,
             context_limit,
             progress,
+            web_tools,
         },
         before_dispatch,
     )

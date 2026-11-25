@@ -9,6 +9,11 @@ use crate::local_ai::{self, CompletionLimit, Error};
 
 use super::RunModel;
 
+mod web;
+pub(crate) use web::{
+    ApprovedWebResult, WebOperation, WebProposal, error_result as web_error_result,
+};
+
 pub(super) const MAX_OUTPUT_TOKENS: u32 = 2048;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,6 +48,7 @@ pub(crate) enum Progress {
     Repairing(Attempt, async_channel::Sender<()>),
     /// The server refused JSON mode and the worker awaits authority to resend the same input.
     FormatFallback(AttemptKind, async_channel::Sender<()>),
+    WebTool(std::sync::Arc<WebProposal>),
 }
 
 pub(crate) struct Report<T> {
@@ -81,7 +87,24 @@ pub(super) fn request<T: Send + 'static>(
     local_ai::start(profile, move |client| {
         let deadline = Instant::now() + Duration::from_secs(120);
         let observes_limit = !matches!(mode, RequestMode::Planning { .. });
+        let web_session = std::cell::RefCell::new(web::Session::default());
         let complete = |kind, input: &str| {
+            if let Some((limit, progress)) = mode.web_tools() {
+                return web_session.borrow_mut().complete(
+                    client,
+                    web::Completion {
+                        system: &system,
+                        input,
+                        limit,
+                        progress,
+                        kind,
+                        deadline,
+                        output_limit,
+                    },
+                    &parse,
+                    &before_dispatch,
+                );
+            }
             let started = Instant::now();
             let send = |response_format| {
                 if cli {
@@ -214,10 +237,22 @@ pub(super) enum RequestMode {
         kind: RunModel,
         context_limit: usize,
         progress: async_channel::Sender<Progress>,
+        web_tools: bool,
     },
 }
 
 impl RequestMode {
+    fn web_tools(&self) -> Option<(usize, &async_channel::Sender<Progress>)> {
+        match self {
+            Self::Run {
+                kind: RunModel::Decision,
+                context_limit,
+                progress,
+                web_tools: true,
+            } => Some((*context_limit, progress)),
+            _ => None,
+        }
+    }
     fn progress(&self) -> Option<&async_channel::Sender<Progress>> {
         match self {
             Self::Planning { progress, .. }

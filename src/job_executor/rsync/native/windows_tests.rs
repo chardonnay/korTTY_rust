@@ -1507,6 +1507,7 @@ impl Fixture {
                 name: "Windows rsync fixture".into(),
                 tag: String::new(),
                 login: SavedLogin {
+                    preferences: Default::default(),
                     endpoint: LoginTarget {
                         host: self.endpoint.host().to_owned(),
                         port: self.endpoint.port(),

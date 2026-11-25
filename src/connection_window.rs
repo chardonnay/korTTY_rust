@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
+pub(crate) use view::icons::Icon as ConnectionIcon;
 
 use iced::keyboard::Modifiers;
 use iced::{Point, Task};
@@ -21,6 +22,7 @@ mod color_picker;
 pub(crate) mod custom_color;
 mod folder_moves;
 mod form;
+mod inline_credentials;
 mod journal_settings;
 mod local;
 pub(crate) mod network_map;
@@ -40,9 +42,10 @@ use form::Draft;
 pub use form::Edit;
 #[cfg(test)]
 pub(crate) use form::Page;
+pub(crate) use form::pick_private_key;
 pub(crate) use journal_settings::Policy as JournalEditorPolicy;
 use selection::{RowKey, Selection};
-pub use temporary_ssh_key::TemporarySaveReply;
+pub use temporary_ssh_key::CredentialSaveReply;
 pub(crate) use view::{HighlightChoices, ViewChoices};
 
 const TEAMWORK_USERNAME_DRAFT_BYTES: usize = 259;
@@ -114,12 +117,15 @@ pub enum Message {
     EditSelected,
     Duplicate,
     Edit(Edit),
+    Protocol(crate::connection_store::protocol::Kind),
     FocusEditor(bool),
     NavigateOsBadge(String),
     SelectTunnel(usize),
     OpenTunnelEditor(tunnels::Request),
     BrowseTerminalLogFolder,
     TerminalLogFolderPicked(Arc<()>, Option<PathBuf>),
+    BrowsePrivateKey(bool),
+    PrivateKeyPicked(Arc<()>, bool, Option<PathBuf>),
     PasteTemporaryKey,
     TemporaryKeyPasted(u64, bool, crate::ssh_dialog::Password),
     Save,
@@ -134,7 +140,7 @@ pub enum Message {
     ExportConnections,
     ExportOverview,
     Completed(Result<Box<Persisted>, String>),
-    TemporarySaveCompleted(TemporarySaveReply),
+    CredentialSaveCompleted(CredentialSaveReply),
     Connect(bool),
     ConnectInNewWindow,
     OpenVault,
@@ -392,7 +398,8 @@ pub struct ConnectionWindow {
     draft: Option<Draft>,
     serial_draft: Option<serial::Draft>,
     local_draft: Option<local::Draft>,
-    serial_generation: u64,
+    draft_store: Option<Store>,
+    draft_expected: Option<crate::connection_store::protocol::Profile>,
     draft_group: Option<String>,
     draft_conflict: bool,
     quick: Option<QuickEdit>,
@@ -463,10 +470,28 @@ impl ConnectionWindow {
             .start_terminal_log_folder_picker(self.path.parent()?)
     }
 
-    pub(crate) fn saved_ssh_editor_profile(&self) -> Option<&Connection> {
+    pub(crate) fn start_private_key_picker(&mut self, jump: bool) -> Option<(Arc<()>, PathBuf)> {
+        if self.busy || self.confirming_close {
+            return None;
+        }
+        self.draft.as_mut()?.start_private_key_picker(jump)
+    }
+
+    pub(crate) fn saved_editor_identity(&self) -> Option<(u64, String)> {
         let id = self.draft.as_ref()?.id();
-        (id != 0).then_some(())?;
-        self.store.get(id)
+        self.store
+            .get(id)
+            .map(|profile| (id, profile.name.clone()))
+            .or_else(|| {
+                self.store
+                    .local(id)
+                    .map(|profile| (id, profile.display_name()))
+            })
+            .or_else(|| {
+                self.store
+                    .serial(id)
+                    .map(|profile| (id, profile.display_name()))
+            })
     }
 
     pub fn open(path: PathBuf) -> Result<Self, String> {
@@ -523,7 +548,8 @@ impl ConnectionWindow {
             draft: None,
             serial_draft: None,
             local_draft: None,
-            serial_generation: 0,
+            draft_store: None,
+            draft_expected: None,
             draft_group: None,
             draft_conflict: false,
             quick: None,
@@ -998,6 +1024,21 @@ impl ConnectionWindow {
             self.draft_conflict = true;
             self.notice = Some("This connection changed in another window. Discard the draft and reopen it before saving.".into());
         }
+        if let (Some(base), Some(draft)) = (&self.draft_store, &self.draft) {
+            let id = draft.id();
+            if (id != 0
+                && (base.protocol_profile(id) != store.protocol_profile(id)
+                    || base.retained_protocols(id) != store.retained_protocols(id)
+                    || base.editor_settings(id) != store.editor_settings(id)))
+                || self
+                    .draft_group
+                    .as_deref()
+                    .is_some_and(|group| !store.has_group(group))
+            {
+                self.draft_conflict = true;
+                self.notice = Some("This connection changed in another window. Discard the draft and reopen it before saving.".into());
+            }
+        }
         if self.serial_draft.as_ref().is_some_and(|draft| {
             self.store.serial(draft.id) != store.serial(draft.id)
                 || self.store.group_of(draft.id) != store.group_of(draft.id)
@@ -1186,6 +1227,17 @@ impl ConnectionWindow {
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        if let Message::PrivateKeyPicked(ticket, jump, path) = &message {
+            if let Some(draft) = &mut self.draft {
+                return draft.finish_private_key_picker(
+                    ticket,
+                    *jump,
+                    path.as_deref(),
+                    !self.busy && !self.confirming_close,
+                );
+            }
+            return Task::none();
+        }
         if let Message::TerminalLogFolderPicked(ticket, path) = &message {
             if let Some(draft) = &mut self.draft {
                 let path = path
@@ -1231,6 +1283,13 @@ impl ConnectionWindow {
                         | Message::Completed(_)
                         | Message::KeepEditing
                 ))
+        {
+            return Task::none();
+        }
+        if self
+            .draft
+            .as_mut()
+            .is_some_and(|draft| draft.legacy_serial_edit(&message))
         {
             return Task::none();
         }
@@ -1351,6 +1410,8 @@ impl ConnectionWindow {
                 self.dismiss_tree_context();
                 self.draft_group = self.active_group().map(str::to_owned);
                 self.draft = Some(Draft::new());
+                self.draft_store = Some(self.store.clone());
+                self.draft_expected = None;
                 self.notice = None;
             }
             Message::NewSerial if self.can_browse() && self.scope != Scope::Teamwork => {
@@ -1372,13 +1433,14 @@ impl ConnectionWindow {
                     );
                 }
                 if let Some(selected) = self.selected() {
-                    let draft = Draft::from_profile(
-                        selected,
-                        self.store.os_badge_id(selected.id),
-                        matches!(message, Message::Duplicate),
-                    );
+                    let original =
+                        crate::connection_store::protocol::Profile::Ssh(Box::new(selected.clone()));
+                    let duplicate = matches!(message, Message::Duplicate);
+                    let draft = Draft::from_protocol(&original, &self.store, duplicate);
                     self.draft_group = self.store.group_of(selected.id).map(str::to_owned);
                     self.draft = Some(draft);
+                    self.draft_store = Some(self.store.clone());
+                    self.draft_expected = (!duplicate).then_some(original);
                     self.badge_picker = None;
                     self.dismiss_tree_context();
                     self.notice = None;
@@ -1426,6 +1488,20 @@ impl ConnectionWindow {
                 }
             }
             Message::Edit(Edit::OsBadge(Some(ref id))) if !self.valid_os_badge(Some(id)) => {}
+            Message::Edit(Edit::Page(page)) => {
+                if let Some(draft) = &mut self.draft {
+                    let task = draft.select_page(page);
+                    if !self.draft_conflict {
+                        self.notice = None;
+                    }
+                    return task;
+                }
+            }
+            Message::Protocol(kind) if !self.draft_conflict => {
+                if let Some(draft) = &mut self.draft {
+                    return draft.switch_protocol(kind);
+                }
+            }
             Message::FocusEditor(backwards) => {
                 if let Some(draft) = &self.draft {
                     return draft.focus_editor(backwards);
@@ -1486,6 +1562,8 @@ impl ConnectionWindow {
                 self.draft = None;
                 self.serial_draft = None;
                 self.local_draft = None;
+                self.draft_store = None;
+                self.draft_expected = None;
                 self.draft_group = None;
                 self.draft_conflict = false;
                 self.notice = None;
@@ -1501,21 +1579,32 @@ impl ConnectionWindow {
                 let Some(draft) = &self.draft else {
                     return Task::none();
                 };
-                if self.temporary_save_needs_vault() {
+                if self.credential_save_needs_vault() {
                     return Task::none();
                 }
-                let Ok(connection) = draft.connection() else {
-                    return Task::none();
+                let prepared = match draft.prepared() {
+                    Ok(value) => value,
+                    Err(error) => {
+                        self.notice = Some(error);
+                        return Task::none();
+                    }
                 };
                 let group = self.draft_group.clone();
-                let badge = draft.os_badge_id().map(str::to_owned);
-                let select_folder =
-                    connection.id == 0 || group.as_deref() != self.store.group_of(connection.id);
-                return self.persist(move |mut store| {
-                    let id = store.save_in_group_with_badge(
-                        connection,
+                let select_folder = prepared.selected.id() == 0
+                    || group.as_deref() != self.store.group_of(prepared.selected.id());
+                let expected = self
+                    .draft_expected
+                    .clone()
+                    .or_else(|| self.store.protocol_profile(prepared.selected.id()));
+                let frozen = self.draft_store.clone();
+                return self.persist(move |store| {
+                    let mut store = frozen.unwrap_or(store);
+                    let id = store.save_protocol(
+                        expected.as_ref(),
+                        prepared.selected,
+                        prepared.retained,
                         group.as_deref(),
-                        badge.as_deref(),
+                        Some(prepared.settings),
                     )?;
                     let mut done = Persisted::saved(store, id);
                     if select_folder {
@@ -1591,6 +1680,9 @@ impl ConnectionWindow {
                 return self.update(Message::DraftGroup(group));
             }
             Message::Local(edit) => {
+                if let Some(draft) = &mut self.draft {
+                    return draft.local_edit(edit);
+                }
                 if let Some(draft) = &mut self.local_draft {
                     draft.update(edit);
                     if !self.draft_conflict {
@@ -1846,6 +1938,8 @@ impl ConnectionWindow {
                         self.draft = None;
                         self.serial_draft = None;
                         self.local_draft = None;
+                        self.draft_store = None;
+                        self.draft_expected = None;
                         self.draft_group = None;
                         self.draft_conflict = false;
                         self.quick = None;

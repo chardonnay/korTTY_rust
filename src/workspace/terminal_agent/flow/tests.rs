@@ -10,12 +10,14 @@ use crate::terminal_view::selection_test_frame;
 
 mod ask_hybrid;
 mod designs;
+mod diagnostics;
 mod final_advice;
 mod handoff;
 mod history;
 mod hosted;
 mod knowledge;
 mod live_repair;
+mod model_tools;
 mod pip;
 mod shortcut;
 pub(in crate::workspace::terminal_agent) mod triage;

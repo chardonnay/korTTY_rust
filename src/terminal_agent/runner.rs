@@ -18,9 +18,42 @@ const OUTPUT_LIMIT: usize = 64 * 1024;
 pub(crate) const CAPTURED_TEXT_LIMIT: usize = 6 * OUTPUT_LIMIT + 1;
 
 #[derive(Clone, Default)]
-pub(crate) struct Cancel(Arc<AtomicBool>);
+pub(crate) struct Cancel(Arc<AtomicBool>, Option<OutputObserver>);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+impl OutputStream {
+    pub(crate) fn index(self) -> usize {
+        match self {
+            Self::Stdout => 0,
+            Self::Stderr => 1,
+        }
+    }
+}
+
+type OutputObserver = Arc<dyn Fn(OutputStream, &Captured, bool) + Send + Sync>;
 
 impl Cancel {
+    // A command copy shares cancellation but owns its optional diagnostic scope.
+    pub(crate) fn with_output(
+        &self,
+        observer: impl Fn(OutputStream, &Captured, bool) + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::clone(&self.0), Some(Arc::new(observer)))
+    }
+
+    pub(super) fn output(&self, stream: OutputStream, captured: &Captured, finished: bool) {
+        if !self.requested()
+            && let Some(observer) = &self.1
+        {
+            observer(stream, captured, finished);
+        }
+    }
+
     pub(crate) fn request(&self) {
         self.0.store(true, Ordering::Release);
     }
@@ -82,6 +115,10 @@ impl Captured {
         self.truncated |= retained < bytes.len();
     }
 
+    pub(crate) fn progress_revision(&self) -> usize {
+        self.bytes.len() * 2 + usize::from(self.truncated)
+    }
+
     pub(crate) fn text(&self) -> Zeroizing<String> {
         // A byte limit may cut through a credential or a UTF-8 character.
         // Keep complete lines before the cutoff so a partial value is not shown.
@@ -123,22 +160,68 @@ impl Captured {
     }
 }
 
-pub(super) fn capture(mut reader: impl Read) -> (Captured, bool) {
+pub(super) fn capture_observed(
+    mut reader: impl Read,
+    cancel: &Cancel,
+    stream: OutputStream,
+    _oem: bool,
+) -> (Captured, bool) {
     let mut captured = Captured::default();
-    let mut buffer = Zeroizing::new([0; 8192]);
-    loop {
-        match reader.read(&mut buffer[..]) {
-            Ok(0) => return (captured, true),
-            Ok(count) => captured.push(&buffer[..count]),
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => return (captured, false),
-        }
+    #[cfg(windows)]
+    if _oem {
+        captured.use_oem_fallback();
     }
+    let mut buffer = Zeroizing::new([0; 8192]);
+    let complete = loop {
+        match reader.read(&mut buffer[..]) {
+            Ok(0) => break true,
+            Ok(count) => {
+                captured.push(&buffer[..count]);
+                cancel.output(stream, &captured, false);
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => break false,
+        }
+    };
+    cancel.output(stream, &captured, true);
+    (captured, complete)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observed_capture_shares_cancellation_without_changing_capture() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let base = Cancel::default();
+        let observed = base.with_output(move |stream, captured, finished| {
+            sink.lock()
+                .unwrap()
+                .push((stream, captured.text().to_string(), finished));
+        });
+        let (captured, complete) = capture_observed(
+            &b"fixture stdout\n"[..],
+            &observed,
+            OutputStream::Stdout,
+            false,
+        );
+        assert!(complete);
+        assert_eq!(&*captured.text(), "fixture stdout\n");
+        let values = events.lock().unwrap();
+        assert_eq!(values.len(), 2);
+        assert_eq!(
+            values[0],
+            (OutputStream::Stdout, "fixture stdout\n".into(), false)
+        );
+        assert!(values[1].2);
+        drop(values);
+        base.request();
+        assert!(observed.requested());
+        let _ = capture_observed(&b"late output"[..], &observed, OutputStream::Stderr, false);
+        assert_eq!(events.lock().unwrap().len(), 2);
+    }
 
     #[test]
     fn command_capture_bounds_output_and_discards_partial_lines_at_cutoff() {

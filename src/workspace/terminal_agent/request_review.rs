@@ -22,6 +22,7 @@ use super::knowledge_review;
 use super::swarm::headless::ModelReview as SavedModelReview;
 use super::*;
 
+mod model_tools;
 mod run_target;
 mod web_lookup;
 use run_target::RunTargetReview;
@@ -41,6 +42,7 @@ pub enum Message {
     Classified(u64, Result<Vec<u64>, String>),
     Knowledge(u64, knowledge_review::Message),
     Web(u64, WebMessage),
+    ToolWeb(u64, u64, WebMessage),
 }
 
 impl Message {
@@ -56,7 +58,8 @@ impl Message {
             | Self::ClassificationQuota(epoch, _)
             | Self::Classified(epoch, _)
             | Self::Knowledge(epoch, _)
-            | Self::Web(epoch, _) => epoch,
+            | Self::Web(epoch, _)
+            | Self::ToolWeb(epoch, _, _) => epoch,
         }
     }
 }
@@ -88,6 +91,9 @@ pub(super) struct Review {
     pub(super) classification: Classification,
     knowledge: Option<Knowledge>,
     web_lookup: Option<web_lookup::Lookup>,
+    model_tool: Option<model_tools::Review>,
+    tool_serial: u64,
+    tool_ticket: u64,
 }
 
 struct Knowledge {
@@ -981,6 +987,9 @@ impl Workspace {
             classification: Classification::Closed,
             knowledge,
             web_lookup,
+            model_tool: None,
+            tool_serial: 0,
+            tool_ticket: 0,
         };
         self.require_model_review_authority(run, &review)?;
         let vault = self.vault.as_ref();
@@ -1061,6 +1070,19 @@ impl Workspace {
         run: &mut Run,
         message: Message,
     ) -> Result<Task<Desktop>, String> {
+        if run.phase.deciding()
+            && !run.closing
+            && !run.cancel.requested()
+            && message.epoch() == run.epoch
+            && matches!(message, Message::ToolWeb(..))
+        {
+            let Some(mut review) = run.model_review.take() else {
+                return Ok(Task::none());
+            };
+            let result = self.model_tool_action(id, run, &mut review, message);
+            run.model_review = Some(review);
+            return result;
+        }
         if run.phase != Phase::ModelReview
             || run.closing
             || run.cancel.requested()
@@ -1404,12 +1426,18 @@ impl Workspace {
                 )
             }
             Kind::Run(kind) => {
-                let pending = engine::reviewed_run_request(
+                let web_tools = kind == engine::RunModel::Decision
+                    && !run.swarm
+                    && review.can_offer_model_tools(run);
+                let pending = engine::reviewed_run_request_with_tools(
                     transport.clone(),
-                    kind,
-                    review.system.clone(),
-                    review.input.clone(),
-                    *limit,
+                    engine::ReviewedRun {
+                        kind,
+                        system: review.system.clone(),
+                        input: review.input.clone(),
+                        context_limit: *limit,
+                        web_tools,
+                    },
                     progress,
                     guard,
                 );

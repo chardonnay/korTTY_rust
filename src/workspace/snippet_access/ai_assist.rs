@@ -3927,6 +3927,7 @@ mod tests {
 
     #[test]
     fn snippet_assist_sends_reviewed_masked_payload_and_rechecks_rerun_profile() {
+        let _exclusive = crate::local_ai::test_support::exclusive_run();
         let scratch = Scratch::new();
         let root = scratch.0.canonicalize().unwrap();
         let (listener, _) = listener();
@@ -4035,8 +4036,13 @@ mod tests {
             stream.get_mut().write_all(response.as_bytes()).unwrap();
             body
         });
-        let mut task =
-            iced_runtime::task::into_stream(send(&mut workspace, ActionMessage::Send)).unwrap();
+        let task = send(&mut workspace, ActionMessage::Send);
+        let mut task = iced_runtime::task::into_stream(task).unwrap_or_else(|| {
+            panic!(
+                "expected dispatch: {:?}",
+                workspace.snippets[&id].assist.0.as_ref().unwrap().status
+            )
+        });
         let Some(iced_runtime::Action::Output(Message::Snippets(id, message))) =
             block_on(task.next())
         else {

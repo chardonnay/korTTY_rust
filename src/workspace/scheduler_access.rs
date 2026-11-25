@@ -32,6 +32,7 @@ mod proposal_web;
 mod rsync;
 pub(super) mod swarm_chat;
 pub(super) mod swarm_comparison;
+pub(super) mod target_picker;
 
 pub(super) const TITLE: &str = "JobScheduler";
 const MAX_RUNNING_JOBS: usize = 4;
@@ -155,6 +156,8 @@ impl Workspace {
             });
         match result {
             Ok(Some(mut scheduler)) => {
+                scheduler
+                    .set_rsync_program(self.window_settings.job_scheduler_rsync_program.clone());
                 scheduler.set_execution_allowed(
                     self.clipboard.policy.problem.is_none() && !self.isolation_required(),
                 );
@@ -386,10 +389,12 @@ impl Workspace {
         }
     }
 
-    pub(super) fn remove_hosted_scheduler(&mut self, id: window::Id) {
+    pub(super) fn remove_hosted_scheduler(&mut self, id: window::Id) -> Task<Message> {
+        let close = self.close_scheduler_target_owner(id);
         if !self.is_scheduler_window(id) {
             self.scheduler_views.remove(&id);
         }
+        close
     }
 
     pub(super) fn scheduler_subscription(&self) -> Subscription<Message> {
@@ -504,7 +509,17 @@ impl Workspace {
         id: window::Id,
         message: scheduler_window::Message,
     ) -> Task<Message> {
+        let opening_targets = matches!(
+            message,
+            scheduler_window::Message::TargetPicker(scheduler_window::target_picker::Event::Open)
+        );
         let message = match message {
+            scheduler_window::Message::Traverse(backwards) => {
+                return self
+                    .scheduler_views
+                    .get(&id)
+                    .map_or_else(Task::none, |view| view.traverse(backwards));
+            }
             scheduler_window::Message::ResizeJournal(event) => {
                 let Some((scheduler, view)) = self
                     .scheduler
@@ -1045,7 +1060,19 @@ impl Workspace {
                 | scheduler_window::Message::MarkRecord(_, true)
         );
         scheduler.set_swarm_chats_allowed(swarm_chats_allowed);
+        let reveal_job = matches!(
+            message,
+            scheduler_window::Message::Select(_) | scheduler_window::Message::Save
+        );
         let requests = scheduler.update_view(view, message);
+        let job_focus = if reveal_job {
+            view.reveal_selected_job()
+        } else {
+            Task::none()
+        };
+        let target_focus = view
+            .target_picker_mut()
+            .map_or_else(Task::none, |picker| picker.take_focus());
         if diagram_changed {
             let (horizontal, color) = view.diagram_preferences();
             self.window_settings.scheduler_diagram_horizontal = horizontal;
@@ -1058,7 +1085,8 @@ impl Workspace {
             self.save_window_settings(owner);
         }
         self.sync_scheduler_views();
-        let task = self.enqueue_jobs(requests);
+        let picker = self.reconcile_scheduler_targets(id, opening_targets);
+        let task = Task::batch([self.enqueue_jobs(requests), picker, target_focus, job_focus]);
         let task = if preview_journals {
             Task::batch([task, self.preview_scheduler_session_journals(id)])
         } else {
@@ -3355,8 +3383,9 @@ impl Workspace {
         if self.scheduler_owners.remove(&id).is_none() {
             return Task::none();
         }
+        let targets = self.close_scheduler_target_owner(id);
         self.scheduler_views.remove(&id);
-        self.close_placed_dialog(id)
+        Task::batch([targets, self.close_placed_dialog(id)])
     }
 
     fn close_scheduler(&mut self, id: window::Id) -> Task<Message> {
@@ -3859,6 +3888,7 @@ mod tests {
                     name: host.into(),
                     tag: String::new(),
                     login: SavedLogin {
+                        preferences: Default::default(),
                         endpoint: LoginTarget {
                             host: host.into(),
                             port: 22,

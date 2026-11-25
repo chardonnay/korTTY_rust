@@ -76,6 +76,7 @@ pub enum Event {
 pub(super) struct State {
     root: Option<PathBuf>,
     program: Option<Program>,
+    preferred_program: String,
     policy: Option<RemoteEditorPolicy>,
     setup: Option<Setup>,
     opening: Option<Open>,
@@ -227,6 +228,10 @@ impl State {
                 None
             }
         });
+        self.program = self
+            .program
+            .take()
+            .filter(|program| self.matches_preference(program));
         self.root = root;
     }
 
@@ -346,10 +351,21 @@ impl State {
             .map(|(_, review)| review)
     }
 
+    fn matches_preference(&self, program: &Program) -> bool {
+        self.preferred_program.is_empty()
+            || PathBuf::from(&self.preferred_program)
+                .canonicalize()
+                .ok()
+                .as_ref()
+                == Some(&program.path)
+    }
+
     fn program_is_current(&self, program: &Program) -> bool {
-        self.root
-            .as_deref()
-            .is_some_and(|root| Program::load(root).ok().flatten().as_ref() == Some(program))
+        self.matches_preference(program)
+            && self
+                .root
+                .as_deref()
+                .is_some_and(|root| Program::load(root).ok().flatten().as_ref() == Some(program))
     }
 
     fn next(&mut self) -> u64 {
@@ -361,6 +377,15 @@ impl State {
 impl SftpWindow {
     pub(crate) fn configure_external_editor(&mut self, root: Option<PathBuf>) {
         self.external.configure(root.filter(|_| !self.incognito));
+    }
+
+    pub(crate) fn set_external_editor_preference(&mut self, path: &str) {
+        if self.external.preferred_program != path {
+            self.external.preferred_program = path.to_owned();
+            self.external.setup = None;
+            self.external.opening = None;
+            self.external.configure(self.external.root.clone());
+        }
     }
 
     pub(crate) fn set_external_editor_policy(&mut self, policy: Option<RemoteEditorPolicy>) {
@@ -665,8 +690,10 @@ impl SftpWindow {
             Message::Configure if self.can_open_external() => {
                 let program = self.external.program.as_ref();
                 self.external.setup = Some(Setup::Program {
-                    path: program
-                        .map_or_else(String::new, |program| program.path.display().to_string()),
+                    path: program.map_or_else(
+                        || self.external.preferred_program.clone(),
+                        |program| program.path.display().to_string(),
+                    ),
                     arguments: program.map_or_else(Vec::new, |program| program.arguments.clone()),
                     argument: String::new(),
                     review: None,
@@ -842,6 +869,10 @@ impl SftpWindow {
                 }) = &self.external.setup
                     && let Some(root) = self.external.root.as_deref()
                 {
+                    if !self.external.matches_preference(program) {
+                        self.external.note = Some("This executable differs from Settings → SFTP. Update that path or leave it blank before approving another editor.".into());
+                        return Task::none();
+                    }
                     match program.save(root) {
                         Ok(()) => {
                             self.external.program = Some(program.clone());
@@ -1507,5 +1538,45 @@ impl Observer {
         }
         self.reported = Some(snapshot.clone());
         Some(snapshot.map_or(Event::Invalid, Event::Changed))
+    }
+}
+
+#[cfg(test)]
+mod preference_tests {
+    use super::*;
+
+    #[test]
+    fn sftp_executable_preference_requires_matching_saved_approval() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("editor one.exe");
+        let second = root.path().join("editor two.exe");
+        std::fs::write(&first, b"fixture").unwrap();
+        std::fs::write(&second, b"fixture").unwrap();
+        let program = Program {
+            path: first.canonicalize().unwrap(),
+            arguments: vec!["{file}".into()],
+            fingerprint: [7; 32],
+        };
+        let mut state = State {
+            preferred_program: first.to_str().unwrap().into(),
+            ..State::default()
+        };
+        state.configure(Some(root.path().to_owned()));
+        assert!(
+            state.program.is_none(),
+            "a preference must never create an executable approval"
+        );
+        program.save(root.path()).unwrap();
+        state.configure(Some(root.path().to_owned()));
+        assert_eq!(state.program.as_ref(), Some(&program));
+        assert!(state.program_is_current(&program));
+        state.preferred_program = second.to_str().unwrap().into();
+        state.configure(Some(root.path().to_owned()));
+        assert!(state.program.is_none());
+        assert!(!state.program_is_current(&program));
+        // Legacy profiles with no Settings selection retain their existing approval.
+        state.preferred_program.clear();
+        state.configure(Some(root.path().to_owned()));
+        assert!(state.program_is_current(&program));
     }
 }

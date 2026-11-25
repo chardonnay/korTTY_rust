@@ -1,5 +1,5 @@
+use iced::Element;
 use iced::widget::{checkbox, column, pick_list, text_input};
-use iced::{Element, Length};
 
 use crate::connection_store::TerminalAppearance;
 use crate::connection_window::theme_choices;
@@ -79,36 +79,50 @@ impl Workspace {
                 pick_list(choices, Some(selected), |choice| Message::Theme(
                     choice.value
                 ))
-                .width(Length::Fill)
+                .width(200)
+                .text_size(13)
+                .keyboard_navigation(dialog.appearance_pickers[0].clone())
+                .on_open(Message::FocusWidget(dialog.appearance_pickers[0].clone()))
             ),
             labeled(
-                "Font family",
-                pick_list(families, Some(family), |value| {
-                    Message::FontFamily((value != "Inherit").then_some(value))
-                })
-                .width(Length::Fill)
-            ),
-            labeled(
-                "Font size",
-                pick_list(
-                    (MIN_TERMINAL_FONT..=MAX_TERMINAL_FONT).collect::<Vec<_>>(),
-                    Some(
-                        draft
-                            .style
-                            .font_size
-                            .or_else(|| scheme.map(|scheme| scheme.font_size))
-                            .unwrap_or(self.window_settings.terminal_font)
-                    ),
-                    Message::Font,
-                )
+                "Font",
+                iced::widget::row![
+                    pick_list(families, Some(family), |value| Message::FontFamily(
+                        (value != "Inherit").then_some(value)
+                    ))
+                    .width(200)
+                    .text_size(13)
+                    .keyboard_navigation(dialog.appearance_pickers[1].clone())
+                    .on_open(Message::FocusWidget(dialog.appearance_pickers[1].clone())),
+                    pick_list(
+                        (MIN_TERMINAL_FONT..=MAX_TERMINAL_FONT).collect::<Vec<_>>(),
+                        Some(
+                            draft
+                                .style
+                                .font_size
+                                .or_else(|| scheme.map(|s| s.font_size))
+                                .unwrap_or(self.window_settings.terminal_font)
+                        ),
+                        Message::Font
+                    )
+                    .width(80)
+                    .text_size(13)
+                    .keyboard_navigation(dialog.appearance_pickers[2].clone())
+                    .on_open(Message::FocusWidget(dialog.appearance_pickers[2].clone())),
+                ]
+                .spacing(10)
             ),
             labeled(
                 "Foreground",
-                text_input("Inherit or #RRGGBB", &draft.foreground).on_input(Message::Foreground)
+                text_input("Inherit or #RRGGBB", &draft.foreground)
+                    .size(13)
+                    .on_input(Message::Foreground)
             ),
             labeled(
                 "Background",
-                text_input("Inherit or #RRGGBB", &draft.background).on_input(Message::Background)
+                text_input("Inherit or #RRGGBB", &draft.background)
+                    .size(13)
+                    .on_input(Message::Background)
             ),
             labeled(
                 "Terminal colors",

@@ -30,6 +30,7 @@ pub(super) struct FinishedRun {
     fonts: font::Sizes,
     history: inline_history::History,
     activity: VecDeque<String>,
+    diagnostics: super::diagnostics::State,
     activity_steps: HashMap<usize, u64>,
     export: activity_export::Export,
     usage: design::Usage,
@@ -74,6 +75,9 @@ impl Archive {
         else {
             return;
         };
+        let Ok(diagnostics) = run.diagnostics.snapshot(&redactor) else {
+            return;
+        };
         self.0.push(FinishedRun {
             id,
             source,
@@ -92,6 +96,7 @@ impl Archive {
             fonts: std::mem::take(&mut run.fonts),
             history,
             activity,
+            diagnostics,
             activity_steps: run
                 .activity_steps
                 .iter()
@@ -292,6 +297,7 @@ impl Workspace {
         run.plan = entry.plan;
         run.inline = Some(entry.history);
         run.activity = entry.activity;
+        run.diagnostics = entry.diagnostics;
         run.activity_steps = entry.activity_steps;
         run.activity_export = entry.export;
         run.fonts = entry.fonts;

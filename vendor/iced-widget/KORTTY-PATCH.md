@@ -22,3 +22,13 @@ the original positions in a batched gesture after scrolling.
 `Scrollable::fixed_header` reserves a separate area above the vertical
 viewport. The heading shares the body's horizontal offset and remains
 interactive. The Log Table uses it for sort buttons and column dividers.
+
+The slider adds an opt-in `disabled(bool)` modifier. Disabled controls keep their
+layout and caller-supplied styling but ignore pointer, touch, wheel and keyboard
+events, clear any drag state and retain the default cursor. The SSH effect editor
+uses this for the visible speed controls while no effect is selected.
+
+`Tooltip::hide_on_content_overlay` suppresses the hint while its content has an
+overlay. The Agent Design combination picker opts in to keep upward and downward
+menus unobstructed. Closing the menu restores the hover hint; other tooltips keep
+their upstream overlay behavior.

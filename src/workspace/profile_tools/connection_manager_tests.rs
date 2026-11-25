@@ -11,6 +11,7 @@ pub(super) fn seed(store: &mut Store, name: &str) -> u64 {
             name: name.into(),
             tag: String::new(),
             login: SavedLogin {
+                preferences: Default::default(),
                 endpoint: LoginTarget {
                     host: "localhost".into(),
                     port: 22,
@@ -133,13 +134,12 @@ fn connection_memory_is_owned_by_the_editor_and_keeps_the_connection_draft() {
         editor,
         Profile::Edit(Edit::Name("Unsaved editor name".into())),
     );
-    let saved = workspace.connection_managers[&manager]
+    let (saved_id, name) = workspace.connection_managers[&manager]
         .window
-        .saved_ssh_editor_profile()
+        .saved_editor_identity()
         .unwrap();
-    assert_eq!(saved.id, target);
-    assert_eq!(saved.name, "Stored SSH target");
-    let name = saved.name.clone();
+    assert_eq!(saved_id, target);
+    assert_eq!(name, "Stored SSH target");
     let open = workspace.open_connection_memory_from(
         editor,
         profile.0.clone(),
@@ -636,5 +636,38 @@ fn connection_manager_reloads_the_catalog_after_an_overlapping_result() {
                 .map(|entry| entry.id),
             Some(latest)
         );
+    }
+}
+
+#[test]
+fn serial_refresh_focus_reply_reaches_its_editor_and_ignores_another_protocol() {
+    let profile = crate::snippets::tests::Profile::new();
+    let path = profile.0.join("connections.json");
+    let mut workspace = Workspace::default();
+    let (owner, _) = workspace.open_window(false);
+    let (manager, _) =
+        workspace.install_connection_manager(owner, ConnectionWindow::open(path).unwrap());
+    let _ = workspace.update_connections(manager, Profile::NewSerial);
+    let editor = workspace.connection_managers[&manager].editor.unwrap();
+    let focus = || {
+        Profile::Serial(crate::serial_dialog::Message::Focus(
+            iced::widget::Id::unique(),
+        ))
+    };
+    let mut actions =
+        iced_runtime::task::into_stream(workspace.update_connections(manager, focus())).unwrap();
+    assert!(matches!(
+        block_on(actions.next()),
+        Some(iced_runtime::Action::Widget(_))
+    ));
+    let _ = workspace.update_connection_editor(
+        editor,
+        Profile::Protocol(crate::connection_store::protocol::Kind::Local),
+    );
+    // Task::batch may retain an empty stream; it must emit no focus action.
+    if let Some(mut actions) =
+        iced_runtime::task::into_stream(workspace.update_connections(manager, focus()))
+    {
+        assert!(block_on(actions.next()).is_none());
     }
 }

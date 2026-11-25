@@ -256,6 +256,7 @@ fn portable_projections_keep_definitions_and_revoke_device_history_and_approvals
             name: "Backup fixture".into(),
             tag: String::new(),
             login: SavedLogin {
+                preferences: Default::default(),
                 endpoint: LoginTarget {
                     host: "server.example".into(),
                     port: 22,

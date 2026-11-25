@@ -56,6 +56,15 @@ impl PartialEq for Scope {
 impl Eq for Scope {}
 
 impl Scope {
+    #[cfg(all(debug_assertions, feature = "dialog-preview"))]
+    fn model_tool_gui_fixture(&self) -> bool {
+        self.mcp.is_none()
+            && self.transport.is_tool_gui_loopback()
+            && std::env::var("KORTTY_DIALOG_PREVIEW").as_deref() == Ok("agent-web-tool")
+    }
+    pub(crate) fn uses_direct_tools(&self) -> bool {
+        self.mcp.is_none()
+    }
     pub(crate) fn new(
         config: Option<&Configuration>,
         profile: ProfileId,
@@ -215,6 +224,22 @@ impl Scope {
             reviewed.require_current()?;
             guard()
         };
+        #[cfg(all(debug_assertions, feature = "dialog-preview"))]
+        if self.model_tool_gui_fixture() {
+            return local_ai::start(self.transport.clone(), move |_| {
+                current()?;
+                let results = Arc::new(Results::checked_with(
+                    vec![web_search::Hit {
+                        title: "Owned model-tool GUI fixture".into(),
+                        url: "https://example.com/fixture".into(),
+                        content: "Public fixture excerpt for query and evidence review.".into(),
+                    }],
+                    &mask,
+                ));
+                current()?;
+                Ok(results)
+            });
+        }
         if let Some(settings) = &self.mcp {
             web_search::start_mcp(
                 self.transport.clone(),
@@ -256,6 +281,22 @@ impl Scope {
             reviewed.require_current()?;
             guard()
         };
+        #[cfg(all(debug_assertions, feature = "dialog-preview"))]
+        if self.model_tool_gui_fixture() {
+            return local_ai::start(self.transport.clone(), move |_| {
+                current()?;
+                let results = Arc::new(Results::checked_with(
+                    vec![web_search::Hit {
+                        title: "Owned model-tool page fixture".into(),
+                        url: url.as_str().into(),
+                        content: "Public page fixture excerpt for evidence review.".into(),
+                    }],
+                    &mask,
+                ));
+                current()?;
+                Ok(results)
+            });
+        }
         web_search::start_page(provider, url, current, move |hits| {
             Arc::new(Results::checked_with(hits, &mask))
         })
@@ -979,6 +1020,18 @@ impl State {
     }
 
     pub(crate) fn view(&self) -> Option<Element<'_, Message>> {
+        self.view_with_actions("Use excerpts in next AI review", "Close")
+    }
+
+    pub(crate) fn tool_view(&self) -> Option<Element<'_, Message>> {
+        self.view_with_actions("Return excerpts to model", "Decline tool")
+    }
+
+    fn view_with_actions<'a>(
+        &'a self,
+        include: &'a str,
+        close: &'a str,
+    ) -> Option<Element<'a, Message>> {
         let body: Element<'_, Message> = match self {
             Self::Draft(scope, draft, lookup) => {
                 let is_page = matches!(lookup, Lookup::Page);
@@ -1052,7 +1105,7 @@ impl State {
                 }
                 column![
                     scrollable(list).height(Length::Fill),
-                    button("Use excerpts in next AI review")
+                    button(include)
                         .on_press_maybe((!results.is_empty()).then_some(Message::Include)),
                 ]
                 .spacing(8)
@@ -1063,7 +1116,7 @@ impl State {
         let panel: Element<'_, Message> = column![
             row![
                 text("Web search").size(19).width(Length::Fill),
-                button("Close").on_press(Message::Close)
+                button(close).on_press(Message::Close)
             ]
             .spacing(8),
             body,
@@ -1115,6 +1168,7 @@ mod tests {
             profile["tavily_search"] = json!(true);
         }
         let config = serde_json::from_value(json!({
+            "general":{"internet":{"searxng_url":"https://search.example.com/"}},
             "profiles": {"profiles": [profile], "default": 7, "last_id": 7}
         }))
         .unwrap();

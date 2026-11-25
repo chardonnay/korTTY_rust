@@ -15,6 +15,25 @@ pub(crate) mod scroll;
 
 pub(crate) const TAB_LABEL_SIZE: f32 = 13.0;
 
+pub(crate) fn ui_font(weight: iced::font::Weight) -> Font {
+    static FONT: LazyLock<Font> = LazyLock::new(|| {
+        let preferred: &[&str] = if cfg!(target_os = "macos") {
+            &["Helvetica Neue", "Helvetica", "Arial"]
+        } else if cfg!(windows) {
+            &["Segoe UI", "Arial", "Tahoma"]
+        } else {
+            &["Noto Sans", "DejaVu Sans", "Liberation Sans", "Arial"]
+        };
+        preferred
+            .iter()
+            .find_map(|name| crate::terminal_theme::installed_font(name))
+            .unwrap_or(Font::DEFAULT)
+    });
+    // The renderer's generic sans-serif can fall back to a different family
+    // for bold text when its configured default is absent on the host.
+    Font { weight, ..*FONT }
+}
+
 pub(crate) fn tab_label<'a>(
     label: impl iced::widget::text::IntoFragment<'a>,
 ) -> iced::widget::Text<'a> {
@@ -128,14 +147,11 @@ pub(crate) fn primary_tab<'a, Message: Clone + 'a>(
     selected: bool,
     action: Message,
 ) -> Element<'a, Message> {
-    let label = text(title).size(13).font(Font {
-        weight: if selected {
-            iced::font::Weight::Bold
-        } else {
-            iced::font::Weight::Normal
-        },
-        ..Font::DEFAULT
-    });
+    let label = text(title).size(13).font(ui_font(if selected {
+        iced::font::Weight::Bold
+    } else {
+        iced::font::Weight::Normal
+    }));
     let item = button(label)
         .padding([9, 15])
         .style(move |theme, status| tab(theme, status, selected))

@@ -821,6 +821,7 @@ pub enum Message {
     FinishedWithSessionJournals(Completion, Vec<String>),
     Page(Page),
     ResizeJobs(pane_grid::ResizeEvent),
+    Traverse(bool),
     ResizeJournal(pane_grid::ResizeEvent),
     JournalSearch(String),
     JournalSearchMode(JournalSearchMode),
@@ -1092,6 +1093,7 @@ pub struct SchedulerWindow {
     agent_cascade_root_blockers: BTreeMap<RunId, Vec<Blocker>>,
     proposal_store: agent::proposal::Store,
     rsync_runs: rsync_authority::Runs,
+    rsync_program: String,
     rsync_standing: rsync::standing::Store,
     snippet_choices: Vec<SnippetChoice>,
     connection_choices: Vec<ConnectionChoice>,
@@ -1239,7 +1241,7 @@ impl SchedulerView {
             })
     }
 
-    fn load_draft(&mut self, job: Option<&kortty_jobs::Job<SshCommand>>) {
+    fn load_draft(&mut self, job: Option<&kortty_jobs::Job<SshCommand>>, rsync_program: &str) {
         self.directory_browser = None;
         self.ownership_review = None;
         self.sync_review = sync::DraftReview::default();
@@ -1248,6 +1250,9 @@ impl SchedulerView {
         self.agent_review = None;
         self.agent_approval = None;
         let mut draft = job.map(Draft::from_job).unwrap_or_default();
+        if job.is_none() {
+            draft.prefill_rsync_program(rsync_program);
+        }
         std::mem::swap(
             &mut draft.automation_journal.estimate,
             &mut self.draft.automation_journal.estimate,
@@ -1465,6 +1470,7 @@ impl SchedulerWindow {
             agent_cascade_root_blockers: BTreeMap::new(),
             proposal_store: agent::proposal::Store::new(profile),
             rsync_runs: rsync_authority::Runs::default(),
+            rsync_program: String::new(),
             rsync_standing: rsync::standing::Store::new(profile.to_owned()),
             snippet_choices: Vec::new(),
             connection_choices: vec![ConnectionChoice::Manual],
@@ -1497,13 +1503,17 @@ impl SchedulerWindow {
         Ok(window)
     }
 
+    pub(crate) fn set_rsync_program(&mut self, program: String) {
+        self.rsync_program = program;
+    }
+
     pub(crate) fn new_view(&self) -> SchedulerView {
         let mut view = SchedulerView {
             graph_revision: self.graph_revision,
             diagram_revision: self.diagram_revision,
             ..SchedulerView::default()
         };
-        view.load_draft(self.scheduler.graph().jobs().first());
+        view.load_draft(self.scheduler.graph().jobs().first(), &self.rsync_program);
         view
     }
 
@@ -1529,7 +1539,7 @@ impl SchedulerWindow {
             );
         }
         let draft = Draft::from_swarm_handoff(handoff)?;
-        view.load_draft(None);
+        view.load_draft(None, &self.rsync_program);
         view.draft = draft;
         view.page = Page::Job;
         view.dirty = true;
@@ -1539,6 +1549,9 @@ impl SchedulerWindow {
 
     pub(crate) fn sync_view(&self, view: &mut SchedulerView) {
         view.reconcile_journal_selection(self);
+        if view.page != Page::Job || !view.draft.can_choose_saved_targets() {
+            view.draft.target_picker = None;
+        }
         if view
             .journal_retention_draft
             .as_ref()
@@ -1565,7 +1578,10 @@ impl SchedulerWindow {
                 && let Some(id) = &view.draft.id
             {
                 let graph = self.scheduler.graph();
-                view.load_draft(graph.job(id).or_else(|| graph.jobs().first()));
+                view.load_draft(
+                    graph.job(id).or_else(|| graph.jobs().first()),
+                    &self.rsync_program,
+                );
             }
             if !view.close_pending()
                 && (view.confirm.take().is_some() || stale_proposal || stale_sftp)
@@ -1751,9 +1767,11 @@ impl SchedulerWindow {
                     }
                 };
                 self.set_connections(Some(&store));
+                let selected = view.draft.selected_picker_targets(&self.connection_choices);
                 view.draft
                     .target_picker
-                    .get_or_insert_with(Default::default);
+                    .get_or_insert_with(|| target_picker::Picker::new(selected));
+                view.status = None;
             }
             Event::Close => view.draft.target_picker = None,
             event => {
@@ -1761,6 +1779,61 @@ impl SchedulerWindow {
                     return;
                 };
                 match event {
+                    Event::FirstRow => {
+                        let rows = picker.rows(
+                            &self.connection_choices,
+                            &self.connection_group_choices,
+                            &self.connection_group_paths,
+                        );
+                        if let Some(first) = rows.first() {
+                            picker.key(
+                                &first.key,
+                                iced::keyboard::key::Named::Home,
+                                iced::keyboard::Modifiers::default(),
+                                &rows,
+                            );
+                        }
+                    }
+                    Event::AllRows => {
+                        let rows = picker.rows(
+                            &self.connection_choices,
+                            &self.connection_group_choices,
+                            &self.connection_group_paths,
+                        );
+                        picker.clear();
+                        for choice in rows.into_iter().filter_map(|row| row.choice) {
+                            picker.select(choice, true);
+                        }
+                    }
+                    Event::Click(choice) => {
+                        let rows = picker.rows(
+                            &self.connection_choices,
+                            &self.connection_group_choices,
+                            &self.connection_group_paths,
+                        );
+                        if rows.iter().any(|row| row.choice.as_ref() == Some(&choice)) {
+                            picker.click(choice, &rows);
+                        }
+                    }
+                    Event::Accept(choice) => {
+                        let rows = picker.rows(
+                            &self.connection_choices,
+                            &self.connection_group_choices,
+                            &self.connection_group_paths,
+                        );
+                        if rows.iter().any(|row| row.choice.as_ref() == Some(&choice)) {
+                            picker.select(choice, true);
+                        }
+                    }
+                    Event::RowKey(key, action, modifiers) => {
+                        let rows = picker.rows(
+                            &self.connection_choices,
+                            &self.connection_group_choices,
+                            &self.connection_group_paths,
+                        );
+                        picker.key(&key, action, modifiers, &rows);
+                    }
+                    Event::Expand(key) => picker.expand(key),
                     Event::Search(query) => picker.search(query),
                     Event::Select(choice, selected) => {
                         let current = match &choice {
@@ -1779,7 +1852,7 @@ impl SchedulerWindow {
                         let choices = picker.selected().to_vec();
                         let mut applied = false;
                         self.change_connection_groups(view, |draft, store, shared| {
-                            let result = draft.add_selected_targets(&choices, store, shared);
+                            let result = draft.set_selected_targets(&choices, store, shared);
                             applied = result.is_ok();
                             group_change(result)
                         });
@@ -2008,7 +2081,7 @@ impl SchedulerWindow {
         if !view.close_pending() {
             return false;
         }
-        view.load_draft(self.selected_job(view));
+        view.load_draft(self.selected_job(view), &self.rsync_program);
         view.confirm = None;
         true
     }
@@ -2240,7 +2313,7 @@ impl SchedulerWindow {
                 view.journal_retention_draft = Some((self.journal_retention_days, input));
             }
             Message::New => {
-                view.load_draft(None);
+                view.load_draft(None, &self.rsync_program);
                 view.page = Page::Job;
                 view.confirm = None;
                 view.status = None;
@@ -2675,6 +2748,7 @@ impl SchedulerWindow {
                 }
                 view.dirty = true;
             }
+            Message::TargetPicker(target_picker::Event::Close) => view.draft.target_picker = None,
             Message::TargetPicker(event)
                 if view.page == Page::Job
                     && self.draft_matches(view)
@@ -3374,7 +3448,7 @@ impl SchedulerWindow {
             })
             .collect::<Result<Vec<_>, _>>()?;
         self.replace_graph(JobGraph::new(jobs).map_err(|error| error.to_string())?, now)?;
-        view.load_draft(self.scheduler.graph().jobs().first());
+        view.load_draft(self.scheduler.graph().jobs().first(), &self.rsync_program);
         self.refresh_diagram(view);
         Ok(())
     }
@@ -3408,7 +3482,7 @@ impl SchedulerWindow {
 
     fn select(&self, view: &mut SchedulerView, id: &JobId) {
         if let Some(job) = self.scheduler.graph().job(id) {
-            view.load_draft(Some(job));
+            view.load_draft(Some(job), &self.rsync_program);
             view.confirm = None;
             view.status = None;
             self.refresh_diagram(view);

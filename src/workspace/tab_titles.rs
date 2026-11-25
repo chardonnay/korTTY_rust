@@ -164,6 +164,10 @@ pub(super) struct WindowSettings {
     pub(super) sftp_idle_minutes: Option<u16>,
     #[serde(skip_serializing_if = "crate::sftp_window::ArchivePreferences::is_default")]
     pub(super) sftp_archive: crate::sftp_window::ArchivePreferences,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(super) sftp_external_editor: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(super) job_scheduler_rsync_program: String,
     pub(super) manual_scale: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) agent_history_popup_width: Option<u16>,
@@ -381,6 +385,8 @@ impl Default for WindowSettings {
             sftp_keep_partial_on_cancel: false,
             sftp_idle_minutes: None,
             sftp_archive: Default::default(),
+            sftp_external_editor: String::new(),
+            job_scheduler_rsync_program: String::new(),
             manual_scale: DEFAULT_MANUAL_SCALE,
             agent_history_popup_width: None,
             agent_history_popup_height: None,
@@ -714,6 +720,14 @@ impl WindowSettings {
         settings.sftp_idle_minutes = settings
             .sftp_idle_minutes
             .filter(|minutes| (1..=profile::RemoteProjectTool::MAX_IDLE_MINUTES).contains(minutes));
+        for path in [
+            &mut settings.sftp_external_editor,
+            &mut settings.job_scheduler_rsync_program,
+        ] {
+            if !Self::valid_sftp_program(path) {
+                path.clear();
+            }
+        }
         if !settings.sftp_archive.valid() {
             settings.sftp_archive = Default::default();
         }
@@ -1028,7 +1042,20 @@ impl WindowSettings {
         Ok(())
     }
 
+    pub(super) fn valid_sftp_program(value: &str) -> bool {
+        value.is_empty() || crate::private_files::executable::valid_path(Path::new(value))
+    }
+
     fn validate_sftp(&self) -> io::Result<()> {
+        if [
+            &self.sftp_external_editor,
+            &self.job_scheduler_rsync_program,
+        ]
+        .into_iter()
+        .any(|path| !Self::valid_sftp_program(path))
+        {
+            return Err(io::Error::other("Invalid SFTP executable path"));
+        }
         if !self.sftp_archive.valid() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

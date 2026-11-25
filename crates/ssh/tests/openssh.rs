@@ -1271,6 +1271,15 @@ fn openssh_dedicated_exec_pty_requires_confirmation_and_keeps_ordinary_exec_avai
             .replace("PermitTTY yes", "PermitTTY no"),
     )
     .unwrap();
+    // Debug diagnostics can enter an accepted PTY before the command's first
+    // byte. Keep the denied-request trace, but isolate the allowed byte protocol.
+    fs::write(
+        &allowed,
+        fs::read_to_string(&allowed)
+            .unwrap()
+            .replace("LogLevel DEBUG2", "LogLevel VERBOSE"),
+    )
+    .unwrap();
     let connect = || {
         ExecConnection::connect_preconnected(
             TcpStream::connect(listener.local_addr().unwrap()).unwrap(),
@@ -1359,8 +1368,12 @@ exit 17"#,
     let log = daemon.join().unwrap().stderr;
     let log = String::from_utf8_lossy(&log);
     assert_eq!(log.matches("Accepted publickey").count(), 1, "{log}");
-    assert_eq!(log.matches("request pty-req").count(), 1, "{log}");
-    assert_eq!(log.matches("request exec").count(), 2, "{log}");
+    assert_eq!(
+        log.matches("Starting session: command on ").count(),
+        1,
+        "{log}"
+    );
+    assert_eq!(log.matches("Starting session: command").count(), 2, "{log}");
 }
 
 #[test]
@@ -2308,15 +2321,27 @@ fn write_config_with_key(
         None => "",
         Some(_) => panic!("unexpected SSH test crypto preset"),
     };
+    // macOS rejects /private/tmp as an AuthorizedKeysFile ancestor even when
+    // the owned fixture directory is private. Keep StrictModes enabled.
+    let authorized = if cfg!(target_os = "macos") {
+        format!(
+            "AuthorizedKeysFile none\nAuthorizedKeysCommand /bin/cat \"{}\"\nAuthorizedKeysCommandUser {username}\n",
+            dir.join(format!("{key}.pub")).display(),
+        )
+    } else {
+        format!(
+            "AuthorizedKeysFile {}\n",
+            dir.join(format!("{key}.pub")).display()
+        )
+    };
     fs::write(
         &path,
         format!(
-            "HostKey {}\nAuthorizedKeysFile {}\nAllowUsers {username}\n\
+            "HostKey {}\n{authorized}AllowUsers {username}\n\
              PasswordAuthentication no\nKbdInteractiveAuthentication no\nPubkeyAuthentication yes\n\
              UsePAM no\nStrictModes yes\nLogLevel DEBUG2\nPrintMotd no\nPrintLastLog no\nPermitTTY yes\n\
              Subsystem sftp internal-sftp\n{crypto}{extra}AllowTcpForwarding local\n",
             dir.join(host).display(),
-            dir.join(format!("{key}.pub")).display()
         ),
     )
     .unwrap();

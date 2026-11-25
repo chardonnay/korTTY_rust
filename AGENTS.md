@@ -4,6 +4,8 @@ Use English for source comments, project documentation, and application text. Ke
 
 # Build and test artifacts
 
+- Run all macOS tests, including untested GUI designs, on the designated macOS desktop. Transfer any missing VM verification artifacts to that desktop when needed. Windows testing is deferred at the user's request while the Windows ARM64 desktop is reinstalled. Resume Windows runs once the user makes it available again.
+
 - Use one shared Cargo target directory per working tree. For cross-builds, use the target-triple subdirectories of the same Cargo target directory. Use alternate profiles or separate caches only for a specific verification need and remove them afterward.
 - Use the compact development profiles defined in `Cargo.toml`. Use the default debug and incremental settings for routine checks.
 - Keep temporary test profiles, extracted packages, and source copies in one run directory. On macOS and Linux, use `bash scripts/with-scratch.sh <command>`. Store all temporary files under `$TMPDIR` and start test programs directly. Record the processes that belong to the test before starting. The wrapper stops its own process group and removes the run directory on failure or interruption as well as on success. Explicitly stop any separately launched processes and wait for them to exit. For VM tests, also remove copies from the shared folder and the guest. On Windows, use a private run directory and `try/finally` with `TEMP` and `TMP`.

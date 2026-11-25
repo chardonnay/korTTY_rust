@@ -139,6 +139,7 @@ impl From<CachedLogin> for SavedLogin {
             AuthMethod::KeyboardInteractive => Auth::KeyboardInteractive,
         };
         Self {
+            preferences: Default::default(),
             endpoint: LoginTarget {
                 host: login.host,
                 port: login.port,

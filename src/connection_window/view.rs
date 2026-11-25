@@ -41,6 +41,7 @@ pub(crate) struct ViewChoices<'a> {
     pub(crate) keys: &'a [KeyChoice],
     pub(crate) temporary_keys: bool,
     pub(crate) vault_unlocked: bool,
+    pub(crate) temporary_key_vault: Option<&'a crate::vault_window::VaultWindow>,
     pub(crate) ai_profiles: &'a [(Option<u64>, ProfileRef, String)],
     pub(crate) java_ai_profiles: &'a [(crate::ai_manager::JavaProfileSource, ProfileRef, String)],
     pub(crate) ai_skills: &'a [crate::ai_manager::ConnectionSkillChoice<'a>],
@@ -54,6 +55,7 @@ pub(crate) struct ViewChoices<'a> {
     pub(crate) serial_allowed: bool,
     pub(crate) terminal_effects: Option<&'a [Effect]>,
     pub(crate) default_paste_warning: PasteWarningMode,
+    pub(crate) default_paste_line_delay_ms: u16,
     pub(crate) minimum_paste_warning: PasteWarningMode,
     pub(crate) isolation: (IsolationLevel, IsolationLevel),
     pub(crate) local_isolation_default: IsolationLevel,
@@ -468,7 +470,7 @@ impl ConnectionWindow {
             } else {
                 self.draft
                     .as_ref()
-                    .is_some_and(|draft| draft.connection().is_ok())
+                    .is_some_and(|draft| draft.prepared().is_ok())
             };
             let save_action = (!self.draft_conflict && valid).then_some(Message::Save);
             let save = button("Save").on_press_maybe(save_action.clone());
@@ -489,10 +491,16 @@ impl ConnectionWindow {
                 (save.into(), cancel.into())
             };
             body = body.push(rule::horizontal(1)).push(
-                row![space::horizontal(), save, cancel]
+                row![space::horizontal(), cancel, save]
                     .spacing(8)
                     .padding([8, 16]),
             );
+        }
+        if !self.confirming_close
+            && !self.busy
+            && let Some(error) = self.draft.as_ref().and_then(|draft| draft.prepared().err())
+        {
+            body = body.push(container(text(error).size(13)).padding([4, 16]));
         }
         if let Some(notice) = &self.notice {
             body = body
@@ -1350,6 +1358,7 @@ impl ConnectionWindow {
                     profile.profile().unwrap_or_default().to_string()
                 ),
                 fact("Isolation", format!("{isolation} · {source}")),
+                self.native_launch_actions(),
                 favorite_tool(self.store.is_favorite(profile.id), self.can_browse()),
                 self.java_favorite_review(profile.id),
             ]
@@ -1369,6 +1378,7 @@ impl ConnectionWindow {
                 ))
                 .size(14),
                 text(format!("Line  {}", profile.line())).size(14),
+                self.native_launch_actions(),
                 self.store
                     .group_of(profile.id)
                     .map(|group| fact("Folder", group.to_owned())),
@@ -1399,6 +1409,17 @@ impl ConnectionWindow {
             .into()
         };
         container(contents).padding(16).width(Length::Fill).into()
+    }
+
+    fn native_launch_actions(&self) -> Element<'_, Message> {
+        column![
+            button("Connect").on_press_maybe(self.can_browse().then_some(Message::Connect(false))),
+            button("Connect in New Window")
+                .style(button::secondary)
+                .on_press_maybe(self.can_browse().then_some(Message::ConnectInNewWindow)),
+        ]
+        .spacing(6)
+        .into()
     }
 
     fn shared_group_row<'a>(
@@ -2275,6 +2296,7 @@ fn teamwork_auth_picker_displays_missing_references_without_offering_them() {
     let choices = ViewChoices {
         temporary_keys: false,
         vault_unlocked: false,
+        temporary_key_vault: None,
         passwords: &passwords,
         passphrases: &[],
         keys: &keys,
@@ -2291,6 +2313,7 @@ fn teamwork_auth_picker_displays_missing_references_without_offering_them() {
         serial_allowed: true,
         terminal_effects: None,
         default_paste_warning: PasteWarningMode::default(),
+        default_paste_line_delay_ms: 0,
         minimum_paste_warning: PasteWarningMode::Off,
         isolation: Default::default(),
         local_isolation_default: Default::default(),

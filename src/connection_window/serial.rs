@@ -48,92 +48,18 @@ impl ConnectionWindow {
         profile: Option<SerialProfile>,
         duplicate: bool,
     ) -> Task<Message> {
-        self.serial_generation = self.serial_generation.wrapping_add(1);
-        self.draft_group = match profile.as_ref() {
-            Some(profile) => self.store.group_of(profile.id),
-            None => self.active_group(),
-        }
-        .map(str::to_owned);
-        let (
-            id,
-            name,
-            tag,
-            pinned,
-            connection,
-            emulation,
-            journal,
-            delay,
-            strict,
-            highlight_set,
-            terminal_effect,
-            terminal_ai,
-            appearance,
-        ) = if let Some(profile) = profile {
-            let emulation = profile.profile().unwrap_or_default();
-            let mut name = if duplicate {
-                profile.display_name()
-            } else {
-                profile.name
-            };
-            if duplicate && name.len() <= 153 {
-                name.push_str(" (copy)");
-            }
-            (
-                if duplicate { 0 } else { profile.id },
-                name,
-                profile.tag,
-                !duplicate && profile.pinned,
-                profile.connection,
-                emulation,
-                profile.journal,
-                profile.paste_line_delay_ms,
-                profile.strict_terminal_mode,
-                profile.highlight_set,
-                profile.terminal_effect,
-                profile.terminal_ai,
-                profile.appearance,
-            )
-        } else {
-            (
-                0,
-                String::new(),
-                String::new(),
-                false,
-                Default::default(),
-                Default::default(),
-                Default::default(),
-                None,
-                None,
-                None,
-                None,
-                Default::default(),
-                Default::default(),
-            )
-        };
-        let mut form = SerialDialog::new(self.serial_generation, connection, emulation);
-        let scan = form.refresh().map(Message::Serial);
-        self.serial_draft = Some(Draft {
-            id,
-            name,
-            tag,
-            pinned,
-            form,
-            changed: false,
-            journal: journal_settings::Draft::new(journal),
-            paste_line_delay: delay.map_or_else(String::new, |value| value.to_string()),
-            strict_terminal_mode: strict,
-            highlight_set,
-            effect: EffectDraft::new(terminal_effect),
-            terminal_ai,
-            appearance,
-        });
-        self.badge_picker = None;
-        self.dismiss_tree_context();
-        self.notice = None;
-        scan
+        self.begin_protocol_edit(
+            profile
+                .map(|value| crate::connection_store::protocol::Profile::Serial(Box::new(value))),
+            crate::connection_store::protocol::Kind::Serial,
+            duplicate,
+        )
     }
 
     pub(super) fn update_serial(&mut self, message: serial_dialog::Message) -> Task<Message> {
+        if let Some(draft) = &mut self.draft {
+            return draft.serial_edit(message);
+        }
         let Some(draft) = &mut self.serial_draft else {
             return Task::none();
         };

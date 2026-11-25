@@ -9,7 +9,7 @@ use zeroize::Zeroizing;
 use crate::{ssh_connection::ExecOpener, ssh_worker};
 
 use super::decision::valid_command;
-use super::runner::{COMMAND_LIMIT, Cancel, Captured, Outcome, POLL, Status};
+use super::runner::{COMMAND_LIMIT, Cancel, Captured, Outcome, OutputStream, POLL, Status};
 
 mod capture;
 pub(crate) mod password;
@@ -127,7 +127,7 @@ fn isolated(mut channel: ssh_worker::Channel, cancel: &Cancel) -> io::Result<Out
     thread::scope(|scope| {
         let output = thread::Builder::new()
             .name("kortty-agent-worker-output".into())
-            .spawn_scoped(scope, move || capture_tagged(output))?;
+            .spawn_scoped(scope, move || capture_tagged_observed(output, Some(cancel)))?;
         let stdin = match thread::Builder::new()
             .name("kortty-agent-worker-eof".into())
             .spawn_scoped(scope, move || stdin.close_input().is_ok())
@@ -175,13 +175,22 @@ fn status(exit: Option<u32>, output_ok: bool, input_ok: bool) -> Status {
     }
 }
 
-fn capture_tagged(mut reader: impl Read) -> ([Captured; 2], bool) {
+fn capture_tagged_observed(
+    mut reader: impl Read,
+    cancel: Option<&Cancel>,
+) -> ([Captured; 2], bool) {
     let mut output = [Captured::default(), Captured::default()];
     let mut bytes = Zeroizing::new([0; kortty::ssh_runtime::wire::CHUNK - 3]);
     let mut kind = [0];
     loop {
         match reader.read(&mut kind) {
-            Ok(0) => return (output, true),
+            Ok(0) => {
+                if let Some(cancel) = cancel {
+                    cancel.output(OutputStream::Stdout, &output[0], true);
+                    cancel.output(OutputStream::Stderr, &output[1], true);
+                }
+                return (output, true);
+            }
             Ok(_) if kind[0] <= 1 => {}
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             _ => return (output, false),
@@ -195,6 +204,14 @@ fn capture_tagged(mut reader: impl Read) -> ([Captured; 2], bool) {
             return (output, false);
         }
         output[kind[0] as usize].push(&bytes[..count]);
+        if let Some(cancel) = cancel {
+            let stream = if kind[0] == 0 {
+                OutputStream::Stdout
+            } else {
+                OutputStream::Stderr
+            };
+            cancel.output(stream, &output[stream.index()], false);
+        }
     }
 }
 

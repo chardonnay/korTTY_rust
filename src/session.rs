@@ -399,6 +399,7 @@ enum StreamSource {
     Pty {
         options: LaunchOptions,
         initial_grid: GridSize,
+        logging: Option<Box<crate::terminal_logging::Prepared>>,
     },
     ClosedLocal(String),
     Ssh(
@@ -409,6 +410,7 @@ enum StreamSource {
         connection: Arc<SerialConnection>,
         connect: bool,
         encoding: TextEncoding,
+        logging: Option<Box<crate::terminal_logging::Prepared>>,
     },
 }
 
@@ -840,6 +842,7 @@ impl Session {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn start_local_with_strict(
         grid: GridSize,
         profile: TerminalProfile,
@@ -848,10 +851,31 @@ impl Session {
         appearance: impl Into<Appearance>,
         stream: StreamOptions,
     ) -> io::Result<Self> {
+        Self::start_local_with_logging(
+            grid,
+            profile,
+            options,
+            prompt_navigation_enabled,
+            appearance,
+            None,
+            stream,
+        )
+    }
+
+    pub(crate) fn start_local_with_logging(
+        grid: GridSize,
+        profile: TerminalProfile,
+        options: LaunchOptions,
+        prompt_navigation_enabled: bool,
+        appearance: impl Into<Appearance>,
+        logging: Option<Box<crate::terminal_logging::Prepared>>,
+        stream: StreamOptions,
+    ) -> io::Result<Self> {
         Self::start_stream(
             StreamSource::Pty {
                 options,
                 initial_grid: grid,
+                logging,
             },
             grid,
             profile,
@@ -2134,6 +2158,7 @@ impl StreamTransport {
             StreamSource::Pty {
                 options,
                 initial_grid,
+                ..
             } => {
                 let mut pty = Pty::spawn_with_options(
                     initial_grid.columns,
@@ -2276,9 +2301,14 @@ fn run_session(
         return Ok(());
     }
     let logging = match &mut source {
-        StreamSource::Pty { .. } | StreamSource::Serial { .. } => {
-            state.journal.secrets = crate::terminal_logging::Secrets::default().seal().ok();
-            None
+        StreamSource::Pty { logging, .. } | StreamSource::Serial { logging, .. } => {
+            state.journal.secrets = logging
+                .as_ref()
+                .map(|capture| capture.secrets())
+                .unwrap_or_default()
+                .seal()
+                .ok();
+            logging.take()
         }
         StreamSource::Ssh(_, logging) => {
             state.journal.secrets = logging

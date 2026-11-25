@@ -37,6 +37,8 @@ pub enum Edit {
     ScrollbackCompression(Option<bool>),
     ConfirmClose(Option<bool>),
     PasteLineDelay(String),
+    OwnPasteLineDelay(String),
+    UseOwnPasteLineDelay(bool, u16),
     StrictTerminalMode(Option<bool>),
     AiProfile(Option<ProfileRef>),
     AdoptJavaAiProfile(ProfileRef, JavaProfileSource),
@@ -81,6 +83,8 @@ pub(super) struct Draft {
     scrollback_lines: String,
     scrollback_memory: String,
     paste_line_delay: String,
+    own_paste_line_delay: bool,
+    retained_paste_line_delay: Option<String>,
     colors: [String; 20],
     journal: journal_settings::Draft,
     ai_profile_picker: Id,
@@ -138,6 +142,8 @@ impl Draft {
             paste_line_delay: options
                 .paste_line_delay_ms
                 .map_or_else(String::new, |value| value.to_string()),
+            own_paste_line_delay: options.paste_line_delay_ms.is_some(),
+            retained_paste_line_delay: None,
             colors: std::array::from_fn(|_| {
                 colors
                     .next()
@@ -211,7 +217,31 @@ impl Draft {
             }
             Edit::ScrollbackCompression(value) => self.options.scrollback_compression = value,
             Edit::ConfirmClose(value) => self.options.confirm_close = value,
-            Edit::PasteLineDelay(value) => self.paste_line_delay = value.chars().take(8).collect(),
+            Edit::PasteLineDelay(value) => {
+                self.paste_line_delay = value.chars().take(8).collect();
+                self.own_paste_line_delay = !self.paste_line_delay.trim().is_empty();
+            }
+            Edit::OwnPasteLineDelay(value) if self.own_paste_line_delay => {
+                self.paste_line_delay = value.chars().take(8).collect();
+            }
+            Edit::OwnPasteLineDelay(_) => return false,
+            Edit::UseOwnPasteLineDelay(own, default) => {
+                if own == self.own_paste_line_delay {
+                    return false;
+                }
+                if own {
+                    self.paste_line_delay =
+                        self.retained_paste_line_delay.take().unwrap_or_else(|| {
+                            default
+                                .min(crate::connection_store::MAX_PASTE_LINE_DELAY_MS)
+                                .to_string()
+                        });
+                } else {
+                    self.retained_paste_line_delay =
+                        Some(std::mem::take(&mut self.paste_line_delay));
+                }
+                self.own_paste_line_delay = own;
+            }
             Edit::StrictTerminalMode(value) => self.options.strict_terminal_mode = value,
             Edit::AiProfile(value) => {
                 self.options.ai_profile = value;
@@ -302,6 +332,9 @@ impl Draft {
 
     pub(super) fn value_with_style(&self, own_style: bool) -> Result<TerminalOverrides, String> {
         let mut options = self.options.clone();
+        if self.own_paste_line_delay && self.paste_line_delay.trim().is_empty() {
+            return Err("Enter the connection's paste pause or turn off its override.".into());
+        }
         options.paste_line_delay_ms = parse_paste_line_delay(&self.paste_line_delay)?;
         options.journal = self.journal.value()?;
         let columns = self.columns.trim();
@@ -386,14 +419,49 @@ impl Draft {
         )
     }
 
-    pub(super) fn ssh_paste_delay_view(&self) -> Element<'_, Edit> {
-        labeled(
-            "Paste line delay (ms)",
-            text_input("Inherit", &self.paste_line_delay)
-                .width(220)
-                .on_input(Edit::PasteLineDelay)
-                .style(dialog_design::form_input),
-        )
+    pub(super) fn ssh_paste_delay_view(&self, default: u16) -> Element<'_, Edit> {
+        let own = self.own_paste_line_delay;
+        let displayed = if own {
+            self.paste_line_delay.clone()
+        } else {
+            default.to_string()
+        };
+        let toggle = Edit::UseOwnPasteLineDelay(!own, default);
+        let edit = own.then_some(Edit::OwnPasteLineDelay as fn(String) -> Edit);
+        row![
+            text("Pause after each pasted line").size(13).width(160),
+            row![
+                keyboard_table::action(
+                    checkbox(own)
+                        .label(format!("Own pause instead of the default ({default} ms)"))
+                        .text_size(13)
+                        .on_toggle(move |own| Edit::UseOwnPasteLineDelay(own, default))
+                        .into(),
+                    Some(toggle),
+                    false,
+                ),
+                row![
+                    dialog_design::number_input(
+                        text_input("0", &displayed).size(13).on_input_maybe(edit),
+                        &displayed,
+                        0..=i64::from(crate::connection_store::MAX_PASTE_LINE_DELAY_MS),
+                        10,
+                        edit,
+                        100.0,
+                    ),
+                    text("ms (0 = off)").size(13),
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+            ]
+            .spacing(10)
+            .align_y(iced::Alignment::Center)
+            .width(Length::Fill)
+            .wrap(),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center)
+        .into()
     }
 
     pub(super) fn journal_view(&self, view: &ViewChoices<'_>) -> Element<'_, Edit> {
@@ -825,6 +893,7 @@ fn highlight_picker_with_keyboard<'a, Message: Clone + 'a>(
     let mut control = pick_list(sets, Some(selected), move |choice: HighlightChoice| {
         on_change(choice.id)
     })
+    .text_size(13)
     .width(Length::Fill);
     if let Some(id) = keyboard {
         control = control.keyboard_navigation(id);
@@ -1002,10 +1071,13 @@ pub(super) fn isolation_row<'a, Message: 'a>(
     label: &'static str,
     control: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
-    row![text(label).width(160), container(control).width(280)]
-        .align_y(iced::Alignment::Center)
-        .spacing(8)
-        .into()
+    row![
+        text(label).size(13).width(160),
+        container(control).width(280)
+    ]
+    .align_y(iced::Alignment::Center)
+    .spacing(8)
+    .into()
 }
 
 fn labeled<'a>(label: &'static str, control: impl Into<Element<'a, Edit>>) -> Element<'a, Edit> {
@@ -1102,6 +1174,7 @@ pub(super) fn strict_terminal_mode<'a, M: Clone + 'a>(
         edit(choice.0)
     })
     .width(Length::Fill)
+    .text_size(13)
     .into()
 }
 
@@ -1204,4 +1277,110 @@ fn connection_theme_picker_displays_imported_name_without_rewriting_java_link() 
         1
     );
     assert!(choices.contains(&selected));
+}
+
+#[cfg(test)]
+mod paste_delay_tests {
+    use super::*;
+    use crate::settings_search::test_input;
+    use iced::advanced::widget::operation::focusable;
+    use iced::keyboard::{Key, key::Named};
+    use iced::{Font, Renderer, Size};
+    use iced_runtime::{Action, UserInterface, task, user_interface::Cache};
+
+    #[test]
+    fn own_pause_is_independent_of_style_and_retains_its_draft_when_disabled() {
+        let mut draft = Draft::new(&TerminalOverrides::default());
+        assert_eq!(
+            draft.value_with_style(false).unwrap().paste_line_delay_ms,
+            None
+        );
+        draft.update(Edit::UseOwnPasteLineDelay(true, 125));
+        assert_eq!(
+            draft.value_with_style(false).unwrap().paste_line_delay_ms,
+            Some(125)
+        );
+        draft.update(Edit::OwnPasteLineDelay("250".into()));
+        draft.update(Edit::UseOwnPasteLineDelay(false, 125));
+        assert_eq!(
+            draft.value_with_style(false).unwrap().paste_line_delay_ms,
+            None
+        );
+        assert!(!draft.update(Edit::OwnPasteLineDelay("999".into())));
+        draft.update(Edit::UseOwnPasteLineDelay(true, 500));
+        assert_eq!(
+            draft.value_with_style(false).unwrap().paste_line_delay_ms,
+            Some(250)
+        );
+        draft.update(Edit::OwnPasteLineDelay("0".into()));
+        assert_eq!(draft.value().unwrap().paste_line_delay_ms, Some(0));
+        draft.update(Edit::OwnPasteLineDelay(String::new()));
+        assert!(draft.value().is_err());
+        draft.update(Edit::UseOwnPasteLineDelay(false, 500));
+        assert_eq!(draft.value().unwrap().paste_line_delay_ms, None);
+    }
+
+    #[test]
+    fn existing_pause_and_legacy_text_fields_keep_their_semantics() {
+        let mut draft = Draft::new(&TerminalOverrides {
+            paste_line_delay_ms: Some(0),
+            ..Default::default()
+        });
+        assert!(draft.own_paste_line_delay);
+        draft.update(Edit::UseOwnPasteLineDelay(false, 125));
+        draft.update(Edit::UseOwnPasteLineDelay(true, 125));
+        assert_eq!(draft.value().unwrap().paste_line_delay_ms, Some(0));
+        draft.update(Edit::PasteLineDelay("1000".into()));
+        assert_eq!(draft.value().unwrap().paste_line_delay_ms, Some(1000));
+        draft.update(Edit::PasteLineDelay("1001".into()));
+        assert!(draft.value().is_err());
+        draft.update(Edit::PasteLineDelay(String::new()));
+        assert!(!draft.own_paste_line_delay);
+        assert_eq!(draft.value().unwrap().paste_line_delay_ms, None);
+    }
+
+    #[test]
+    fn keyboard_enables_the_pause_override_and_steps_its_value() {
+        let mut draft = Draft::new(&TerminalOverrides::default());
+        let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+        let mut interface = UserInterface::build(
+            draft.ssh_paste_delay_view(125),
+            Size::new(600.0, 100.0),
+            Cache::default(),
+            &mut renderer,
+        );
+        test_input::apply(
+            &mut interface,
+            &renderer,
+            task::effect(Action::widget(focusable::focus_next())),
+        );
+        let messages = test_input::press(
+            &mut interface,
+            &mut renderer,
+            Key::Named(Named::Space),
+            None,
+        );
+        assert!(matches!(
+            messages.as_slice(),
+            [Edit::UseOwnPasteLineDelay(true, 125)]
+        ));
+        drop(interface);
+        draft.update(Edit::UseOwnPasteLineDelay(true, 125));
+        let mut interface = UserInterface::build(
+            draft.ssh_paste_delay_view(125),
+            Size::new(600.0, 100.0),
+            Cache::default(),
+            &mut renderer,
+        );
+        for _ in 0..2 {
+            test_input::apply(
+                &mut interface,
+                &renderer,
+                task::effect(Action::widget(focusable::focus_next())),
+            );
+        }
+        assert!(
+            matches!(test_input::press(&mut interface, &mut renderer, Key::Named(Named::ArrowUp), None).as_slice(), [Edit::OwnPasteLineDelay(value)] if value == "135")
+        );
+    }
 }

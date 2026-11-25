@@ -85,6 +85,7 @@ fn connection_map_pdf_writes_a4_metadata_searchable_text_and_vector_routes() {
     let path = fixture.0.join("connections.json");
     let mut store = Store::open(path.clone()).unwrap();
     let login = |host: &str| SavedLogin {
+        preferences: Default::default(),
         endpoint: LoginTarget {
             host: host.into(),
             port: 22,

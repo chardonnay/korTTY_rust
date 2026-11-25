@@ -1,6 +1,6 @@
 use std::fmt;
 
-use iced::widget::{column, pick_list, row, slider, text, text_input};
+use iced::widget::{Id, column, pick_list, row, slider, text, text_input};
 use iced::{Alignment, Element, Length};
 
 use crate::terminal_effects::{Effect, Selection, Speed};
@@ -50,6 +50,76 @@ impl EffectDraft {
             effect,
             speed: self.speed,
         })
+    }
+
+    pub(crate) fn connection_view<M: Clone + 'static>(
+        &self,
+        available: &[Effect],
+        picker_id: Id,
+        select: fn(Option<Effect>) -> M,
+        set_speed: fn(String) -> M,
+    ) -> Element<'_, M> {
+        let enabled = self
+            .effect
+            .is_some_and(|effect| available.contains(&effect));
+        let choices: Vec<_> = std::iter::once(EffectChoice(None))
+            .chain(available.iter().map(|&effect| EffectChoice(Some(effect))))
+            .collect();
+        let picker = pick_list(choices, Some(EffectChoice(self.effect)), move |choice| {
+            select(choice.0)
+        })
+        .text_size(13)
+        .width(220)
+        .keyboard_navigation(picker_id);
+        let speed = self.speed;
+        let scale = slider(
+            1.0..=10.0,
+            speed.multiplier().min(10.0),
+            move |value: f64| set_speed(value.to_string()),
+        )
+        .width(180)
+        .disabled(!enabled)
+        .style(move |theme: &iced::Theme, status| {
+            let mut style = slider::default(theme, status);
+            if !enabled {
+                let muted = theme.extended_palette().background.strong.color;
+                style.rail.backgrounds = (muted.into(), muted.into());
+                style.handle.background = muted.into();
+                style.handle.border_color = muted;
+            }
+            style
+        });
+        let controls = column![
+            text(format!("Animation Speed: {speed:.2}x"))
+                .size(12)
+                .style(text::secondary),
+            row![
+                scale,
+                text_input("1–99", &self.speed_input)
+                    .size(13)
+                    .on_input_maybe(enabled.then_some(set_speed))
+                    .on_submit_maybe(enabled.then(|| set_speed(speed.to_string())))
+                    .width(68)
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+            (enabled && parse_speed(&self.speed_input).is_none())
+                .then(|| text("Enter a speed from 1 to 99.").size(12)),
+        ]
+        .spacing(5);
+        column![
+            row![text("Terminal Effect").size(13).width(100), picker]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            row![text("Animation Speed").size(13).width(100), controls]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            self.effect
+                .filter(|effect| !available.contains(effect))
+                .map(|_| text("This saved effect is disabled.").size(12)),
+        ]
+        .spacing(10)
+        .into()
     }
 
     pub(crate) fn view<M: Clone + 'static>(
@@ -107,5 +177,101 @@ struct EffectChoice(Option<Effect>);
 impl fmt::Display for EffectChoice {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.0.map_or("None", Effect::name))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced::advanced::clipboard;
+    use iced::{Event, Font, Point, Renderer, Size, mouse};
+    use iced_runtime::{UserInterface, user_interface::Cache};
+
+    #[test]
+    fn disabled_speed_slider_ignores_input_and_enabled_slider_changes_value() {
+        for disabled in [true, false] {
+            let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+            let control: slider::Slider<'_, f64, f64, iced::Theme> =
+                slider(1.0..=10.0, 1.0, |value: f64| value)
+                    .width(180)
+                    .disabled(disabled);
+            let mut interface: UserInterface<'_, f64, iced::Theme, Renderer> = UserInterface::build(
+                control,
+                Size::new(180.0, 30.0),
+                Cache::default(),
+                &mut renderer,
+            );
+            let mut messages = Vec::new();
+            interface.update(
+                &[
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                ],
+                mouse::Cursor::Available(Point::new(160.0, 10.0)),
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            if disabled {
+                assert!(messages.is_empty());
+            } else {
+                assert!(messages.iter().any(|value| *value > 1.0));
+            }
+        }
+    }
+
+    #[test]
+    fn connection_effect_picker_can_be_opened_and_selected_with_the_keyboard() {
+        use crate::settings_search::test_input;
+        use iced::advanced::widget::operation::focusable;
+        use iced::keyboard::{Key, key::Named};
+        use iced_runtime::{Action, task};
+        #[derive(Clone, Debug)]
+        enum Event {
+            Select(Option<Effect>),
+            Speed,
+        }
+        let draft = EffectDraft::default();
+        let id = Id::unique();
+        let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+        let mut interface = UserInterface::build(
+            draft.connection_view(&Effect::ALL, id.clone(), Event::Select, |_| Event::Speed),
+            Size::new(450.0, 180.0),
+            Cache::default(),
+            &mut renderer,
+        );
+        test_input::apply(
+            &mut interface,
+            &renderer,
+            task::effect(Action::widget(focusable::focus(id))),
+        );
+        assert!(
+            test_input::press(
+                &mut interface,
+                &mut renderer,
+                Key::Named(Named::Space),
+                None
+            )
+            .is_empty()
+        );
+        assert!(
+            test_input::press(
+                &mut interface,
+                &mut renderer,
+                Key::Named(Named::ArrowDown),
+                None
+            )
+            .is_empty()
+        );
+        let messages = test_input::press(
+            &mut interface,
+            &mut renderer,
+            Key::Named(Named::Enter),
+            None,
+        );
+        assert!(matches!(
+            messages.as_slice(),
+            [Event::Select(Some(Effect::AmberCrt90))]
+        ));
     }
 }

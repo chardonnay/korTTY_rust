@@ -653,6 +653,7 @@ mod tests {
             name: "Saved target".into(),
             tag: String::new(),
             login: SavedLogin {
+                preferences: Default::default(),
                 endpoint,
                 auth: Auth::VaultPassword("test-reference".into()),
                 keyboard_interactive: false,
@@ -672,6 +673,29 @@ mod tests {
             window_geometry: None,
             terminal: Default::default(),
         }
+    }
+
+    #[test]
+    fn inactive_credentials_are_never_resolved_for_a_scheduled_login() {
+        let mut profile = saved_profile();
+        profile.login.preferences = crate::connection_store::AuthPreferences {
+            password: Some("unused-password".into()),
+            key_file: "/missing/private-key".into(),
+            passphrase: Some("unused-passphrase".into()),
+            ..Default::default()
+        };
+        let action = serde_json::from_value(serde_json::json!({
+            "connection": ConnectionRef::from(&profile), "command": "true",
+        }))
+        .unwrap();
+        let mut requested = Vec::new();
+        let result =
+            Credentials::resolve(&action, &profile, &ServerAccess::default(), |id, _, _| {
+                requested.push(id.to_owned());
+                Ok(Secret::new("fixture password".into()))
+            });
+        assert!(result.is_ok());
+        assert_eq!(requested, ["test-reference"]);
     }
 
     #[test]

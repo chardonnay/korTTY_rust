@@ -13,7 +13,7 @@ use super::{
     Directory, JOBS, PINS, RECORDINGS, Snapshot, missing, path_error, read_bounded, with_target,
 };
 use crate::connection_store::custom_os_badges::java_catalog;
-use crate::connection_store::{self, Auth, Connection};
+use crate::connection_store::{self, Connection};
 use crate::scheduler_window::{ConnectionRef, RemoteAction, SshCommand};
 use crate::snippets::{self, FILE_NAME as SNIPPETS, SnippetId};
 use crate::ssh_key_catalog::KeyRecord;
@@ -429,38 +429,40 @@ impl LinkedMerge<'_> {
 #[derive(Default, Deserialize)]
 struct Connections {
     connections: Vec<Connection>,
+    #[serde(default)]
+    protocol_history: BTreeMap<u64, connection_store::protocol::History>,
 }
 
 impl Connections {
-    fn auth_methods(&self) -> impl Iterator<Item = &Auth> {
-        self.connections.iter().flat_map(|connection| {
-            std::iter::once(&connection.login)
-                .chain(connection.jump.iter())
-                .map(|login| &login.auth)
-        })
+    fn logins(&self) -> impl Iterator<Item = &crate::connection_store::SavedLogin> {
+        self.connections
+            .iter()
+            .chain(
+                self.protocol_history
+                    .values()
+                    .filter_map(connection_store::protocol::History::ssh),
+            )
+            .flat_map(|connection| std::iter::once(&connection.login).chain(connection.jump.iter()))
     }
 
     fn uses_vault(&self) -> bool {
-        self.auth_methods().any(auth_uses_vault)
+        self.logins().any(|login| login.references_vault())
     }
 
     fn uses_catalog(&self) -> bool {
-        self.auth_methods()
-            .any(|auth| auth.registered_key().is_some())
+        self.logins()
+            .any(|login| login.auth.registered_key().is_some())
     }
 
     fn links_exist(&self, vault_ready: bool, keys_ready: bool, keys: &Keys) -> bool {
-        self.auth_methods().all(|auth| {
-            let key_available = auth
+        self.logins().all(|login| {
+            let key_available = login
+                .auth
                 .registered_key()
                 .is_none_or(|id| keys_ready && keys.records.iter().any(|key| key.id == id));
-            key_available && (vault_ready || !auth_uses_vault(auth))
+            key_available && (vault_ready || !login.references_vault())
         })
     }
-}
-
-fn auth_uses_vault(auth: &Auth) -> bool {
-    auth.has_vault_reference()
 }
 
 #[derive(Default, Deserialize)]
@@ -527,6 +529,50 @@ impl JobLinks {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn inactive_authentication_requires_its_vault_on_restore() {
+        let connection: Connection = serde_json::from_value(json!({
+            "id":1,"name":"Retained choices","tag":"",
+            "login":{"endpoint":{"host":"host.example","port":22,"username":"operator"},
+                "auth":"prompt","preferences":{"password":"vault-reference"}},
+            "jump":null,"emulation":"xterm-256color","tunnels":[]
+        }))
+        .unwrap();
+        let connections = Connections {
+            connections: vec![connection],
+            protocol_history: BTreeMap::new(),
+        };
+        assert!(connections.uses_vault());
+        assert!(!connections.uses_catalog());
+        assert!(connections.links_exist(true, false, &Keys::default()));
+        let mut without_key = connections.connections[0].clone();
+        without_key.login.preferences.passphrase = Some("passphrase-reference".into());
+        let connections = Connections {
+            connections: vec![without_key],
+            protocol_history: BTreeMap::new(),
+        };
+        assert!(!connections.links_exist(false, false, &Keys::default()));
+        assert!(connections.links_exist(true, false, &Keys::default()));
+    }
+
+    #[test]
+    fn an_inactive_ssh_protocol_requires_its_vault_on_restore() {
+        let history = serde_json::from_value(json!({"profiles":[{"ssh":{
+            "id":1,"name":"Retained SSH","tag":"",
+            "login":{"endpoint":{"host":"host.example","port":22,"username":"operator"},
+                "auth":{"vault-password":"retained-password"}},
+            "jump":null,"emulation":"xterm-256color","tunnels":[]
+        }}]}))
+        .unwrap();
+        let profiles = Connections {
+            connections: vec![],
+            protocol_history: BTreeMap::from([(1, history)]),
+        };
+        assert!(profiles.uses_vault());
+        assert!(!profiles.links_exist(false, false, &Keys::default()));
+        assert!(profiles.links_exist(true, false, &Keys::default()));
+    }
 
     #[test]
     fn password_zip_backup_requires_the_vault_for_each_native_archive_route() {
