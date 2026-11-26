@@ -148,7 +148,8 @@ fn java_web_credentials_report_ambiguous_and_tampered_fields() {
             notice.contains("Invalid Java web provider credential fields omitted")
         })
     );
-    let vault = Vault::create(destination.0.join("vault.dat"), b"local master password").unwrap();
+    let master = crate::vault_window::test_vault_password();
+    let vault = Vault::create(destination.0.join("vault.dat"), &master[..]).unwrap();
     let error = prepare_java_credentials(
         &mut preview,
         Some(&archive_password),

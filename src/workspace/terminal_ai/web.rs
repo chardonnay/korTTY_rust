@@ -1311,7 +1311,8 @@ mod tests {
         let root = crate::snippets::tests::Profile::new();
         let path = crate::profile::vault_path_at(&root.0);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let mut vault = Vault::create(&path, b"owned web credential fixture").unwrap();
+        let master = crate::vault_window::test_vault_password();
+        let mut vault = Vault::create(&path, &master[..]).unwrap();
         vault
             .update_web_credentials(
                 vec![
