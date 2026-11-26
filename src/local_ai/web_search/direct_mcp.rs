@@ -46,14 +46,15 @@ impl Session {
 }
 
 pub(super) enum Authentication {
-    Query(&'static str),
+    Query(&'static str, Option<Zeroizing<String>>),
     Bearer(Option<String>),
 }
 
 impl Authentication {
     fn env(&self) -> Option<&str> {
         match self {
-            Self::Query(name) => Some(name),
+            Self::Query(name, None) => Some(name),
+            Self::Query(_, Some(_)) => None,
             Self::Bearer(name) => name.as_deref(),
         }
     }
@@ -97,7 +98,10 @@ impl ReadPage {
                 .map_err(|error| message(self.label, error))?;
             #[cfg(target_os = "macos")]
             let _power = kortty_macos::AppNapActivity::begin();
-            let key = key.as_deref().map(String::as_str);
+            let key = match &self.auth {
+                Authentication::Query(_, Some(saved)) => Some(saved.as_str()),
+                _ => key.as_deref().map(String::as_str),
+            };
             let call = ToolCall {
                 auth: &self.auth,
                 key,
@@ -153,7 +157,7 @@ impl ToolCall<'_> {
             return Err(Error::Invalid("invalid page address or credential"));
         }
         let endpoint = match self.auth {
-            Authentication::Query(_) => {
+            Authentication::Query(..) => {
                 let mut endpoint = url::Url::parse(&connection.base).map_err(|_| Error::Service)?;
                 endpoint
                     .query_pairs_mut()
@@ -164,7 +168,7 @@ impl ToolCall<'_> {
             Authentication::Bearer(_) => Zeroizing::new(connection.base.clone()),
         };
         let bearer = match self.auth {
-            Authentication::Query(_) => None,
+            Authentication::Query(..) => None,
             Authentication::Bearer(_) => self.key.map(bearer_header).transpose()?,
         };
         let service = Service {

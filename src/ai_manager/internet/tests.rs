@@ -150,6 +150,91 @@ fn global_internet_policy_remains_locked_after_successful_save() {
 }
 
 #[test]
+fn saved_agent_web_offer_changes_revoke_direct_profiles_and_respect_commit_policy() {
+    use iced::futures::{StreamExt, executor::block_on};
+    use iced_runtime::Action;
+
+    let root = crate::snippets::tests::Profile::new();
+    let mut draft = serde_json::to_value(configuration()).unwrap();
+    draft["profiles"]["profiles"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "id":8,"name":"Direct fixture","endpoint":"127.0.0.1:12346","model":"fixture",
+            "tavily_search":true
+        }));
+    draft["profiles"]["last_id"] = 8.into();
+    let baseline: Configuration = serde_json::from_value(draft).unwrap();
+    baseline
+        .save_against(&root.0, &Configuration::default())
+        .unwrap();
+    let saved = Arc::new(Configuration::load_from(&root.0).unwrap());
+    assert!(!saved.agent_always_offer_web_tools());
+    let direct = ProfileId::from(8_u64);
+    let mcp = ProfileId::from(7_u64);
+    let before = saved.agent_profile_revision(direct).unwrap();
+    let mcp_before = saved.agent_profile_revision(mcp).unwrap();
+    let scope = crate::workspace::terminal_ai::web::Scope::new(Some(&saved), direct, true).unwrap();
+    let mut dialog = Dialog::new(Arc::clone(&saved), root.0.clone(), Vec::new(), true, None);
+    let setting = Setting::AgentAlwaysOfferWebTools;
+    let _ = dialog.update(Message::Search(setting.title().into()));
+    let _ = dialog.update(Message::SearchChoose);
+    assert_eq!(dialog.revealed.setting, Some(setting));
+    assert_eq!(dialog.general_section, GeneralSection::Internet);
+    let _ = dialog.update(Message::AgentAlwaysOfferWebTools(true));
+    assert!(dialog.dirty());
+    assert!(
+        !Configuration::load_from(&root.0)
+            .unwrap()
+            .agent_always_offer_web_tools()
+    );
+
+    let mut candidate = saved.as_ref().clone();
+    candidate.general.agent_always_offer_web_tools = Some(true);
+    candidate.general.agent_web_offer_revision = saved
+        .general
+        .agent_web_offer_revision_after(Some(true))
+        .unwrap();
+    let checks = std::cell::Cell::new(0);
+    let error = candidate
+        .save_with_policy(&root.0, &saved, None, None, || {
+            checks.set(checks.get() + 1);
+            if checks.get() == 1 {
+                crate::clipboard_policy::ClipboardPolicy::default()
+            } else {
+                crate::clipboard_policy::parse(
+                    "[meta]\nschema-version = 1\n[[rule]]\n[rule.ai-profiles]\nallow-internet = false\n",
+                ).unwrap()
+            }
+        })
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(
+        !Configuration::load_from(&root.0)
+            .unwrap()
+            .agent_always_offer_web_tools()
+    );
+
+    for always in [true, false] {
+        let _ = dialog.update(Message::AgentAlwaysOfferWebTools(always));
+        let mut saving = iced_runtime::task::into_stream(dialog.update(Message::Save)).unwrap();
+        let Some(Action::Output(Message::Saved(result))) = block_on(saving.next()) else {
+            panic!("Expected a saved AI settings result");
+        };
+        let _ = dialog.update(Message::Saved(Ok(result.unwrap())));
+        let current = Configuration::load_from(&root.0).unwrap();
+        assert_eq!(current.agent_always_offer_web_tools(), always);
+        assert_ne!(current.agent_profile_revision(direct), Some(before));
+        assert_eq!(current.agent_profile_revision(mcp), Some(mcp_before));
+        assert!(scope.require_current().is_err());
+    }
+    dialog = dialog.with_web_search_policy(false);
+    let _ = dialog.update(Message::AgentAlwaysOfferWebTools(true));
+    assert!(!dialog.dirty());
+    assert_eq!(dialog.general.agent_always_offer_web_tools, Some(false));
+}
+
+#[test]
 fn saved_searxng_url_is_required_and_revokes_reviews_without_rerouting_pages() {
     let root = crate::snippets::tests::Profile::new();
     let mut config = configuration();

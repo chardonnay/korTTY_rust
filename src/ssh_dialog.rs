@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::connection_store::{Auth, Connection, SavedLogin};
 use crate::session_security::IsolationLevel;
 use crate::ssh_worker::sandbox_available;
+use crate::vault_window::VaultWindow;
 
 mod quick_connect;
 mod temporary_key;
@@ -432,6 +433,14 @@ impl StartupFields {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SavedTemporaryKeyStatus {
+    Absent,
+    Available,
+    Locked,
+    Unavailable,
+}
+
 struct LoginForm {
     host_field: widget::Id,
     credential_field: widget::Id,
@@ -560,6 +569,9 @@ impl SshDialog {
             && let Some(form) = &mut self.target.temporary_key
         {
             form.finish_paste(request, value);
+            if form.key().is_some() {
+                self.target.use_saved_temporary_key = false;
+            }
         }
     }
 
@@ -576,6 +588,7 @@ impl SshDialog {
         if let Some(form) = &mut self.target.temporary_key {
             self.target.method = Method::TemporaryKey;
             form.restore(key);
+            self.target.use_saved_temporary_key = false;
         }
     }
 
@@ -760,8 +773,13 @@ impl SshDialog {
         Ok(draft)
     }
 
-    pub fn options_view(&self, label_width: f32, keys: &[KeyChoice]) -> Element<'_, Message> {
-        let can_connect = self.can_connect();
+    fn options_view(
+        &self,
+        label_width: f32,
+        keys: &[KeyChoice],
+        can_connect: bool,
+        jump_key: SavedTemporaryKeyStatus,
+    ) -> Element<'_, Message> {
         let jump = self.jump.as_ref().map(LoginForm::validate).transpose();
         let mut content = column![
             self.startup
@@ -778,6 +796,7 @@ impl SshDialog {
                 Message::Jump,
                 label_width,
                 keys,
+                jump_key,
             ));
             if form.host_edited
                 && let Err(error) = jump
@@ -805,8 +824,10 @@ impl SshDialog {
         sftp: bool,
         logging_allowed: bool,
         keys: &[KeyChoice],
+        vault: Option<&VaultWindow>,
     ) -> Element<'_, Message> {
-        let can_connect = self.can_connect();
+        let [target_key, jump_key] = self.saved_temporary_key_statuses(vault);
+        let can_connect = self.can_connect_with_saved_temporary_keys(target_key, jump_key);
         let status = self.validation_notice();
         let mut content = column![
             text(if sftp {
@@ -815,8 +836,13 @@ impl SshDialog {
                 "SSH connection"
             })
             .size(22),
-            self.target
-                .view(can_connect, Message::Target, INLINE_LABEL_WIDTH, keys),
+            self.target.view(
+                can_connect,
+                Message::Target,
+                INLINE_LABEL_WIDTH,
+                keys,
+                target_key,
+            ),
         ];
         if !sftp {
             content = content.push(labeled(
@@ -825,7 +851,7 @@ impl SshDialog {
                 pick_list(TerminalProfile::ALL, Some(self.profile), Message::Profile),
             ));
         }
-        content = content.push(self.options_view(INLINE_LABEL_WIDTH, keys));
+        content = content.push(self.options_view(INLINE_LABEL_WIDTH, keys, can_connect, jump_key));
         if !sftp {
             content = content.push(self.logging.view(logging_allowed).map(Message::Logging));
         }
@@ -834,7 +860,7 @@ impl SshDialog {
             button("Cancel").on_press(Message::Cancel),
         ]
         .spacing(8);
-        if self.uses_vault() {
+        if self.uses_vault() || [target_key, jump_key].contains(&SavedTemporaryKeyStatus::Locked) {
             controls = controls.push(button("Vault…").on_press(Message::OpenVault));
         }
         let content = content
@@ -847,6 +873,38 @@ impl SshDialog {
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
+    }
+
+    fn saved_temporary_key_statuses(
+        &self,
+        vault: Option<&VaultWindow>,
+    ) -> [SavedTemporaryKeyStatus; 2] {
+        [
+            self.target.saved_temporary_key_status(vault),
+            self.jump
+                .as_ref()
+                .map_or(SavedTemporaryKeyStatus::Absent, |jump| {
+                    jump.saved_temporary_key_status(vault)
+                }),
+        ]
+    }
+
+    pub(crate) fn watches_saved_temporary_key_expiry(&self, vault: Option<&VaultWindow>) -> bool {
+        self.saved_temporary_key_statuses(vault)
+            .contains(&SavedTemporaryKeyStatus::Available)
+    }
+
+    fn can_connect_with_saved_temporary_keys(
+        &self,
+        target: SavedTemporaryKeyStatus,
+        jump: SavedTemporaryKeyStatus,
+    ) -> bool {
+        self.can_connect()
+            && self.target.can_use_selected_temporary_key(target)
+            && self
+                .jump
+                .as_ref()
+                .is_none_or(|login| login.can_use_selected_temporary_key(jump))
     }
 
     pub fn uses_vault(&self) -> bool {
@@ -1114,10 +1172,11 @@ impl LoginForm {
         wrap: fn(LoginMessage) -> Message,
         label_width: f32,
         keys: &[KeyChoice],
+        saved_key: SavedTemporaryKeyStatus,
     ) -> Element<'_, Message> {
         column![
             self.identity_view(can_connect, wrap, label_width),
-            self.authentication_view(can_connect, wrap, label_width, keys),
+            self.authentication_view(can_connect, wrap, label_width, keys, saved_key),
         ]
         .spacing(8)
         .into()
@@ -1172,6 +1231,7 @@ impl LoginForm {
         wrap: fn(LoginMessage) -> Message,
         label_width: f32,
         keys: &[KeyChoice],
+        saved_key: SavedTemporaryKeyStatus,
     ) -> Element<'_, Message> {
         let connect = can_connect.then_some(Message::Connect);
         let credential = match self.method {
@@ -1230,6 +1290,18 @@ impl LoginForm {
                     .temporary_key
                     .as_ref()
                     .expect("enabled temporary key form");
+                let hint = match saved_key {
+                    SavedTemporaryKeyStatus::Available if self.use_saved_temporary_key => {
+                        Some("Uses the expiring key from the unlocked vault.")
+                    }
+                    SavedTemporaryKeyStatus::Locked => {
+                        Some("Unlock the vault to use the saved key, or paste a private key.")
+                    }
+                    SavedTemporaryKeyStatus::Unavailable => {
+                        Some("The saved key is unavailable. Paste a new private key.")
+                    }
+                    _ => None,
+                };
                 labeled(
                     label_width,
                     "Temporary key",
@@ -1246,7 +1318,7 @@ impl LoginForm {
                         ]
                         .spacing(8)
                         .align_y(Alignment::Center),
-                        self.saved_temporary_key.as_ref().map(|_| {
+                        (saved_key == SavedTemporaryKeyStatus::Available).then(|| {
                             button(if self.use_saved_temporary_key {
                                 "Saved key selected"
                             } else {
@@ -1254,17 +1326,7 @@ impl LoginForm {
                             })
                             .on_press(wrap(LoginMessage::UseSavedTemporaryKey))
                         }),
-                        text(
-                            if self.saved_temporary_key.is_some()
-                                && self.use_saved_temporary_key
-                                && form.key().is_none()
-                            {
-                                "Uses the expiring key from the unlocked vault."
-                            } else {
-                                form.status()
-                            }
-                        )
-                        .size(13),
+                        text(form.status_with_hint(hint)).size(13),
                     ]
                     .spacing(4),
                 )
@@ -1346,6 +1408,37 @@ impl LoginForm {
         matches!(self.method, Method::VaultPassword | Method::StoredKey)
             || (self.method == Method::PrivateKey && self.stored_passphrase.is_some())
             || (self.method == Method::TemporaryKey && self.use_saved_temporary_key)
+    }
+
+    fn saved_temporary_key_status(&self, vault: Option<&VaultWindow>) -> SavedTemporaryKeyStatus {
+        use SavedTemporaryKeyStatus::{Absent, Available, Locked, Unavailable};
+
+        let Some(id) = self
+            .saved_temporary_key
+            .as_deref()
+            .filter(|_| self.method == Method::TemporaryKey)
+        else {
+            return Absent;
+        };
+        let Some(vault) = vault.filter(|vault| vault.is_unlocked()) else {
+            return Locked;
+        };
+        if self
+            .endpoint()
+            .is_ok_and(|endpoint| vault.has_temporary_ssh_key(id, &endpoint))
+        {
+            Available
+        } else {
+            Unavailable
+        }
+    }
+
+    fn can_use_selected_temporary_key(&self, status: SavedTemporaryKeyStatus) -> bool {
+        !self.use_saved_temporary_key
+            || matches!(
+                status,
+                SavedTemporaryKeyStatus::Absent | SavedTemporaryKeyStatus::Available
+            )
     }
 
     fn address(&self) -> Result<ServerAddress, ValidationError> {
@@ -1637,6 +1730,79 @@ mod tests {
         form.update(LoginMessage::Username("another".into()));
         form.update(LoginMessage::UseSavedTemporaryKey);
         assert_eq!(form.validate(), Err(ValidationError::TemporaryKey));
+    }
+
+    #[test]
+    fn unavailable_saved_key_blocks_connect_and_a_pasted_replacement_clears_selection() {
+        use kortty_vault::{TemporarySshKeyOptions, Vault};
+
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("vault.bin");
+        let password = crate::vault_window::test_vault_password();
+        let mut vault = Vault::create(&path, &password[..]).unwrap();
+        let fixture_key =
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture-only\n-----END OPENSSH PRIVATE KEY-----";
+        let endpoint = LoginTarget {
+            host: "host.example".into(),
+            port: 22,
+            username: "reviewer".into(),
+        };
+        let id = vault
+            .save_temporary_ssh_key(
+                "Test key".into(),
+                (&endpoint.host, endpoint.port, &endpoint.username),
+                TemporarySshKeyOptions {
+                    minutes: 60,
+                    automatic: true,
+                },
+                Secret::new(fixture_key.into()),
+            )
+            .unwrap();
+        let mut saved = SavedLogin {
+            preferences: Default::default(),
+            endpoint,
+            auth: Auth::TemporaryKey {
+                credential: Some(id.clone()),
+                minutes: 60,
+                automatic: true,
+            },
+            keyboard_interactive: false,
+        };
+        let mut form = SshDialog::new(TerminalProfile::Xterm);
+        form.target = LoginForm::for_saved(&saved);
+        let [target, jump] = form.saved_temporary_key_statuses(None);
+        assert_eq!(target, SavedTemporaryKeyStatus::Locked);
+        assert!(!form.can_connect_with_saved_temporary_keys(target, jump));
+
+        let mut vault = VaultWindow::with_unlocked_fixture(path, vault);
+        let [target, jump] = form.saved_temporary_key_statuses(Some(&vault));
+        assert_eq!(target, SavedTemporaryKeyStatus::Available);
+        assert!(form.can_connect_with_saved_temporary_keys(target, jump));
+        assert!(form.watches_saved_temporary_key_expiry(Some(&vault)));
+
+        saved.endpoint.port = 2222;
+        form.jump = Some(LoginForm::for_saved(&saved));
+        let [target, jump] = form.saved_temporary_key_statuses(Some(&vault));
+        assert_eq!(jump, SavedTemporaryKeyStatus::Unavailable);
+        assert!(!form.can_connect_with_saved_temporary_keys(target, jump));
+        form.jump = None;
+
+        let mut stored = vault.take_for_ssh_keys().unwrap();
+        assert!(stored.delete(&id).unwrap());
+        vault.restore_after_ssh_keys(stored);
+        let [target, jump] = form.saved_temporary_key_statuses(Some(&vault));
+        assert_eq!(target, SavedTemporaryKeyStatus::Unavailable);
+        assert!(!form.can_connect_with_saved_temporary_keys(target, jump));
+        assert!(!form.watches_saved_temporary_key_expiry(Some(&vault)));
+
+        assert!(form.begin_temporary_key_paste(1));
+        form.finish_temporary_key_paste(1, Password::new(fixture_key.into()));
+        assert!(!form.target.use_saved_temporary_key);
+        assert!(form.can_connect_with_saved_temporary_keys(target, jump));
+        assert!(matches!(
+            form.take_request().unwrap().target.auth,
+            Authentication::TemporaryKey(_)
+        ));
     }
 
     #[test]

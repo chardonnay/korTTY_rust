@@ -92,6 +92,7 @@ pub(super) struct Review {
     knowledge: Option<Knowledge>,
     web_lookup: Option<web_lookup::Lookup>,
     model_tool: Option<model_tools::Review>,
+    ask_attachment_check: Option<engine::AskAttachmentCheck>,
     tool_serial: u64,
     tool_ticket: u64,
 }
@@ -969,7 +970,8 @@ impl Workspace {
         let web_lookup = web_lookup::Lookup::new(
             &authority,
             run,
-            self.clipboard.policy.ai_web_search_allowed && !matches!(kind, Kind::Plan(_)),
+            self.clipboard.policy.ai_web_search_allowed,
+            self.vault.as_ref(),
         );
         let mut review = Review {
             authority,
@@ -988,6 +990,7 @@ impl Workspace {
             knowledge,
             web_lookup,
             model_tool: None,
+            ask_attachment_check: None,
             tool_serial: 0,
             tool_ticket: 0,
         };
@@ -1378,7 +1381,7 @@ impl Workspace {
         review: &mut Review,
     ) -> Result<Task<Desktop>, String> {
         let guard = self.review_dispatch_guard(run, review)?;
-        let (transport, limit) = review.transport();
+        let (transport, limit) = &review.authority.transport;
         let usage = review.authority.config.skill_usage(
             &review.guidance,
             transport,
@@ -1399,25 +1402,27 @@ impl Workspace {
                     .snapshot
                     .as_ref()
                     .is_some_and(|file| file.is_remote());
-                let pending = engine::ask_with_progress_guarded(
+                let attachment_check = verification.map(|verification| {
+                    let check: engine::AskAttachmentCheck = Arc::new(move || {
+                        super::ask_attachment::require_allowed(&ClipboardPolicy::load(), remote)?;
+                        verification.require_current()
+                    });
+                    check
+                });
+                let pending = engine::reviewed_ask_request(
                     transport.clone(),
-                    review.system.clone(),
-                    review.input.clone(),
-                    *limit,
-                    Some(progress),
-                    move || {
-                        guard()?;
-                        if let Some(verification) = &verification {
-                            super::ask_attachment::require_allowed(
-                                &ClipboardPolicy::load(),
-                                remote,
-                            )?;
-                            verification.require_current()?;
-                            guard()?;
-                        }
-                        Ok(())
+                    engine::ReviewedAsk {
+                        system: review.system.clone(),
+                        input: review.input.clone(),
+                        context_limit: *limit,
+                        web_tools: review.can_offer_model_tools(run),
+                        attachment_check: attachment_check.clone(),
+                        authorize_web_send: None,
                     },
+                    Some(progress),
+                    guard,
                 )?;
+                review.ask_attachment_check = attachment_check;
                 run.turns += 1;
                 (
                     pending,
@@ -1426,9 +1431,7 @@ impl Workspace {
                 )
             }
             Kind::Run(kind) => {
-                let web_tools = kind == engine::RunModel::Decision
-                    && !run.swarm
-                    && review.can_offer_model_tools(run);
+                let web_tools = review.can_offer_model_tools(run);
                 let pending = engine::reviewed_run_request_with_tools(
                     transport.clone(),
                     engine::ReviewedRun {

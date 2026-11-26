@@ -85,7 +85,9 @@ fn publish_java_profiles_with_policy(
         return Ok(());
     }
     let candidate = Configuration::decode(contents)?;
-    let (stamp, edits_profiles, adds_local_ai_hints) = match root.open_file(SETTINGS) {
+    let (stamp, edits_profiles, adds_local_ai_hints, changes_web_offer) = match root
+        .open_file(SETTINGS)
+    {
         Ok(file) => {
             require_single_link(&file)?;
             let stamp = FileStamp::read(&file)?;
@@ -97,17 +99,24 @@ fn publish_java_profiles_with_policy(
                     .changes_existing_java_profiles(&candidate.profiles),
                 current.java_model_hints != candidate.java_model_hints
                     || current.java_knowledge_hints != candidate.java_knowledge_hints,
+                current.general.agent_always_offer_web_tools
+                    != candidate.general.agent_always_offer_web_tools
+                    || current.general.agent_web_offer_revision
+                        != candidate.general.agent_web_offer_revision,
             )
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => (
             None,
             false,
             !candidate.java_model_hints.is_empty() || !candidate.java_knowledge_hints.is_empty(),
+            candidate.general.agent_always_offer_web_tools.is_some()
+                || candidate.general.agent_web_offer_revision.is_some(),
         ),
         Err(error) => return Err(error),
     };
     if edits_profiles && !current_policy.ai_profile_edit_allowed()
         || adds_local_ai_hints && !java_ai_hints_allowed(&current_policy)
+        || changes_web_offer && !current_policy.ai_web_search_allowed
     {
         return Ok(());
     }
@@ -117,6 +126,7 @@ fn publish_java_profiles_with_policy(
         if policy.ai_profile_creation_allowed()
             && (!edits_profiles || policy.ai_profile_edit_allowed())
             && (!adds_local_ai_hints || java_ai_hints_allowed(&policy))
+            && (!changes_web_offer || policy.ai_web_search_allowed)
         {
             Ok(())
         } else {
@@ -211,6 +221,7 @@ pub(crate) struct JavaProfileReport {
     pub(crate) request_timeout_omitted: bool,
     pub(crate) code_text_language_omitted: bool,
     pub(crate) agent_triage_omitted: bool,
+    pub(crate) agent_always_offer_web_tools_omitted: bool,
     pub(crate) agent_run_presentation_omitted: bool,
     pub(crate) https_imported: usize,
     pub(crate) loopback_imported: usize,
@@ -223,7 +234,6 @@ pub(crate) struct JavaProfileReport {
     pub(crate) default_reasoning_omitted: usize,
     pub(crate) web_hints: usize,
     pub(crate) web_hints_omitted: usize,
-    pub(crate) web_keys_omitted: usize,
     pub(crate) journal_profile_hints: usize,
     pub(crate) role_hints: usize,
     pub(crate) role_hints_omitted: usize,
@@ -282,6 +292,7 @@ pub(crate) fn portable_java_profiles(bytes: &[u8]) -> io::Result<(Vec<u8>, JavaP
             request_timeout_omitted: report.request_timeout_omitted,
             code_text_language_omitted: report.code_text_language_omitted,
             agent_triage_omitted: report.agent_triage_omitted,
+            agent_always_offer_web_tools_omitted: report.agent_always_offer_web_tools_omitted,
             agent_run_presentation_omitted: report.agent_run_presentation_omitted,
             https_imported: report.https_imported,
             loopback_imported: report.loopback_imported,
@@ -294,7 +305,6 @@ pub(crate) fn portable_java_profiles(bytes: &[u8]) -> io::Result<(Vec<u8>, JavaP
             default_reasoning_omitted: report.default_reasoning_omitted,
             web_hints: report.web_hints,
             web_hints_omitted: report.web_hints_omitted,
-            web_keys_omitted: report.web_keys_omitted,
             journal_profile_hints: settings.java_journal_profiles.hints().count(),
             role_hints: settings.java_roles.iter().count(),
             role_hints_omitted: report.roles_omitted,
@@ -359,7 +369,11 @@ pub(crate) fn merge_java_profiles(
         .map(Configuration::decode)
         .transpose()?
         .unwrap_or_default();
-    let general_added = merge_java_general(&mut local, saved, incoming.java_general_preferences)?;
+    let mut general_preferences = incoming.java_general_preferences;
+    if !policy.ai_web_search_allowed {
+        general_preferences.agent_always_offer_web_tools = None;
+    }
+    let general_added = merge_java_general(&mut local, saved, general_preferences)?;
     let toolpack_hints_added = policy.ai_profile_edit_allowed()
         && local
             .profiles
@@ -496,6 +510,15 @@ fn merge_java_general(
         && unset("agent_triage")
     {
         config.general.agent_triage = mode;
+        changed = true;
+    }
+    if let Some(always) = incoming.agent_always_offer_web_tools
+        && config.general.agent_always_offer_web_tools.is_none()
+    {
+        config.general.agent_web_offer_revision = config
+            .general
+            .agent_web_offer_revision_after(Some(always))?;
+        config.general.agent_always_offer_web_tools = Some(always);
         changed = true;
     }
     if let Some(target) = incoming.agent_run_presentation
@@ -674,6 +697,73 @@ mod java_profile_tests {
         )
         .unwrap();
         assert!(report.agent_triage_omitted && !report.general_preferences);
+    }
+
+    #[test]
+    fn java_agent_web_offer_fills_only_unset_preferences_and_respects_policy() {
+        let policy = ClipboardPolicy::default();
+        let (incoming, report) = portable_java_profiles(
+            br#"<globalSettings>
+            <aiAgentAlwaysOfferWebTools>true</aiAgentAlwaysOfferWebTools>
+            </globalSettings>"#,
+        )
+        .unwrap();
+        assert!(report.general_preferences && !report.agent_always_offer_web_tools_omitted);
+        let merged = merge_java_profiles(None, &incoming, &policy)
+            .unwrap()
+            .unwrap();
+        let saved = Configuration::decode(&merged).unwrap();
+        assert!(saved.agent_always_offer_web_tools());
+        assert!(saved.general.agent_web_offer_revision.is_some());
+        assert!(
+            merge_java_profiles(Some(&merged), &incoming, &policy)
+                .unwrap()
+                .is_none()
+        );
+
+        let explicit_off = br#"{"general":{"agent_always_offer_web_tools":false}}"#;
+        assert!(
+            merge_java_profiles(Some(explicit_off), &incoming, &policy)
+                .unwrap()
+                .is_none()
+        );
+        let blocked = crate::clipboard_policy::parse(
+            "[meta]\nschema-version = 1\n[[rule]]\n[rule.ai-profiles]\nallow-internet = false\n",
+        )
+        .unwrap();
+        assert!(
+            merge_java_profiles(None, &incoming, &blocked)
+                .unwrap()
+                .is_none()
+        );
+
+        let (off, _) = portable_java_profiles(
+            br#"<globalSettings>
+            <aiAgentAlwaysOfferWebTools>false</aiAgentAlwaysOfferWebTools>
+            </globalSettings>"#,
+        )
+        .unwrap();
+        let explicitly_off = merge_java_profiles(None, &off, &policy).unwrap().unwrap();
+        assert_eq!(
+            Configuration::decode(&explicitly_off)
+                .unwrap()
+                .general
+                .agent_always_offer_web_tools,
+            Some(false)
+        );
+        assert!(
+            merge_java_profiles(Some(&explicitly_off), &incoming, &policy)
+                .unwrap()
+                .is_none()
+        );
+
+        let (_, bad) = portable_java_profiles(
+            br#"<globalSettings>
+            <aiAgentAlwaysOfferWebTools>maybe</aiAgentAlwaysOfferWebTools>
+            </globalSettings>"#,
+        )
+        .unwrap();
+        assert!(bad.agent_always_offer_web_tools_omitted && !bad.general_preferences);
     }
 
     #[test]

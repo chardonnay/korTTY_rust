@@ -404,6 +404,7 @@ impl Workspace {
         let view = dialog.view_with_skill_credentials(
             self.credential_choices(crate::vault_window::Kind::HuggingFaceToken),
             &self.credential_choices(crate::vault_window::Kind::SkillProviderCredential),
+            self.vault.as_ref(),
         );
         Some(on_escape(view, ai_manager::Message::Escape).map(move |event| wrap(id, event)))
     }
@@ -782,6 +783,13 @@ impl Workspace {
             return picker.map(move |event| wrap(id, event));
         }
         match event {
+            ai_manager::Message::OpenCredentialVault => return self.show_vault(native_owner),
+            ai_manager::Message::SaveWebCredentials => {
+                if dialog.save_web_credentials(self.vault.as_mut()) {
+                    self.refresh_vault_authority();
+                }
+                return Task::none();
+            }
             ai_manager::Message::Help
                 if dialog.profile_wizard_open() || dialog.guided_setup_open() =>
             {
@@ -940,7 +948,9 @@ impl Workspace {
             problem,
         )
         .with_memory_policy(&self.clipboard.policy.ai_memory, problem.is_none())
-        .with_web_search_policy(self.clipboard.policy.ai_web_search_allowed);
+        .with_web_search_policy(
+            self.clipboard.policy.ai_web_search_allowed && installed.ai_web_search_allowed,
+        );
         dialog.set_runtime_downloads_allowed(self.clipboard.policy.ai_runtime_downloads_allowed());
         dialog.set_model_downloads_allowed(self.clipboard.policy.ai_model_downloads_allowed());
         let open = self.open_ai_manager_surface(owner, dialog);

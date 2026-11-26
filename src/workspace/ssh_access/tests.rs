@@ -912,7 +912,7 @@ fn teamwork_temporary_key_uses_managed_clipboard_mode_and_rechecks_teamwork_poli
 }
 
 #[test]
-fn a_quick_temporary_key_can_be_retried_until_the_preference_is_disabled() {
+fn reenabled_quick_connect_retry_requires_a_fresh_temporary_key() {
     let mut workspace = Workspace::default();
     let (owner, _) = workspace.open_window(false);
     workspace.window_settings.temporary_ssh_key_enabled = true;
@@ -946,11 +946,38 @@ fn a_quick_temporary_key_can_be_retried_until_the_preference_is_disabled() {
     assert!(matches!(&workspace.pending_ssh(owner).unwrap().stage,
         Stage::Form(form) if form.can_connect()));
 
+    let stale_paste = system_temporary_key_paste(
+        request_temporary_key_paste(&mut workspace, owner, None),
+        TEAMWORK_TEST_KEY,
+    );
     workspace.window_settings.temporary_ssh_key_enabled = false;
     workspace.sync_quick_temporary_key_preference();
     let pending = workspace.pending_ssh(owner).unwrap();
     assert!(pending.retry.as_ref().unwrap().temporary_key.is_none());
     assert!(matches!(&pending.stage, Stage::Form(form) if !form.temporary_key_selected()));
+    assert!(!workspace.can_paste_pending_temporary_key(owner, None));
+
+    workspace.window_settings.temporary_ssh_key_enabled = true;
+    workspace.sync_quick_temporary_key_preference();
+    assert!(matches!(&workspace.pending_ssh(owner).unwrap().stage,
+        Stage::Form(form) if !form.temporary_key_selected()));
+    let _ = workspace.update_ssh(form_message(
+        owner,
+        None,
+        ssh_dialog::Message::Target(LoginMessage::Authentication(
+            ssh_dialog::Method::TemporaryKey,
+        )),
+    ));
+    let fresh_paste = system_temporary_key_paste(
+        request_temporary_key_paste(&mut workspace, owner, None),
+        TEAMWORK_TEST_KEY,
+    );
+    let _ = workspace.update_ssh(stale_paste);
+    assert!(matches!(&workspace.pending_ssh(owner).unwrap().stage,
+        Stage::Form(form) if form.temporary_key_selected() && !form.can_connect()));
+    let _ = workspace.update_ssh(fresh_paste);
+    assert!(matches!(&workspace.pending_ssh(owner).unwrap().stage,
+        Stage::Form(form) if form.temporary_key_selected() && form.can_connect()));
 }
 
 const TEAMWORK_TEST_KEY: &str =

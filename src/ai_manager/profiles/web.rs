@@ -297,7 +297,7 @@ impl Editor {
             Choice::Tavily => {
                 fields = fields.push(
                     text(
-                        "Direct search and page extraction use api.tavily.com and TAVILY_API_KEY.",
+                        "Direct search and page extraction use api.tavily.com. Save the Tavily key in Internet access or set TAVILY_API_KEY.",
                     )
                     .size(13),
                 );
@@ -310,10 +310,10 @@ impl Editor {
                 } else if let Some(provider) = page_provider(Some(settings)) {
                     let detail = match provider {
                         PageProvider::Tavily => {
-                            "Read a webpage submits the reviewed URL to Tavily Extract using TAVILY_API_KEY."
+                            "Read a webpage submits the reviewed URL to Tavily Extract with the same Tavily credential."
                         }
                         PageProvider::BrightData => {
-                            "Read a webpage submits the reviewed URL to the Bright Data MCP server using BRIGHT_DATA_API_TOKEN."
+                            "Read a webpage submits the reviewed URL to the Bright Data MCP server with the same Bright Data credential."
                         }
                         PageProvider::Searxng(_) => {
                             "Read a webpage submits the reviewed URL to the configured SearXNG MCP endpoint."

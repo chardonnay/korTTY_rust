@@ -238,8 +238,9 @@ impl Editor {
         token: preview::Token,
         key: SampleLogKey,
         page: Id,
+        reduced_motion: bool,
     ) -> Task<Desktop> {
-        self.demo.navigate_log(token, key, page)
+        self.demo.navigate_log(token, key, page, reduced_motion)
     }
 
     fn selected<'a>(&'a self, catalog: &'a Catalog, preset: Preset) -> &'a str {

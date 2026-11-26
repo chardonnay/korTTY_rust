@@ -34,7 +34,7 @@ fn timeline_plan_stack_and_log_table_use_the_bound_panel_review() {
     }
 }
 
-fn history_review_fixture(history: History) -> (Fixture, window::Id, u64) {
+pub(super) fn history_review_fixture(history: History) -> (Fixture, window::Id, u64) {
     use crate::clipboard_policy::AiAgentExecution;
 
     let mut fixture = Fixture::new(false, false);
@@ -83,6 +83,59 @@ fn history_review_fixture(history: History) -> (Fixture, window::Id, u64) {
         .select_tab(fixture.owner, source_tab.id, false);
     fixture.workspace.clipboard.policy.ai_agent_execution = AiAgentExecution::Allow;
     (fixture, id, stream)
+}
+
+#[test]
+fn docked_log_table_rebuilds_when_command_review_gains_and_loses_focus() {
+    let (mut fixture, id, stream) = history_review_fixture(History::LogTable);
+    let size = Size::new(760.0, 540.0);
+    let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
+    let mut cache = Cache::default();
+
+    for focused in [false, true, false, true] {
+        fixture
+            .workspace
+            .windows
+            .get_mut(&fixture.owner)
+            .unwrap()
+            .focused = focused;
+        assert_eq!(
+            fixture
+                .workspace
+                .panel_review(id, fixture.run(id), None)
+                .is_some(),
+            focused
+        );
+        let pane = fixture.workspace.decorate_agent_terminal(
+            fixture.session,
+            stream,
+            container(text("Terminal"))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into(),
+            size,
+            Size::new(8.0, 16.0),
+            true,
+        );
+        let mut ui = UserInterface::build(pane, size, cache, &mut renderer);
+        let control = if focused {
+            "[1] Allow once"
+        } else {
+            "Review in Activity…"
+        };
+        let messages =
+            super::pip::click_log_label(&mut ui, &mut renderer, control, mouse::Button::Left);
+        match messages.as_slice() {
+            [Desktop::TerminalAgent(run, Message::PanelReview(_))] if focused => {
+                assert_eq!(*run, id);
+            }
+            [Desktop::TerminalAgent(run, Message::Focus)] if !focused => {
+                assert_eq!(*run, id);
+            }
+            _ => panic!("unexpected docked review action while focused={focused}"),
+        }
+        cache = ui.into_cache();
+    }
 }
 
 fn numbered_history_review(history: History) {

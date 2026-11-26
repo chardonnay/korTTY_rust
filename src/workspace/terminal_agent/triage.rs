@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use iced::widget::{button, column, row, scrollable, text, text_input};
+use iced::widget::{button, column, row, text, text_input};
 use iced::{Element, Task, window};
 
 use crate::terminal_agent::planning::{Approach, Reply, TriageMode};
@@ -17,7 +17,7 @@ use super::{
 const MAX_INSTRUCTIONS: usize = 2048;
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 
 #[derive(Clone)]
 pub enum Message {
@@ -78,7 +78,7 @@ impl Choice {
         }
         column![
             text("Choose an approach").size(17),
-            scrollable(proposals).height(200),
+            proposals,
             text_input(
                 "Additional instructions for the selected approach (optional)",
                 &self.instructions

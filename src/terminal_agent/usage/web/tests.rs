@@ -1,6 +1,9 @@
 use super::*;
 use crate::local_ai::test_support::{exclusive_run, fixture_http_response, start_test_double};
-use crate::terminal_agent::{ReviewedRun, RunModel, reviewed_run_request_with_tools};
+use crate::terminal_agent::{
+    ReviewedAsk, ReviewedRun, RunModel, ask_system, reviewed_ask_request,
+    reviewed_run_request_with_tools,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 fn tools(round: usize, count: usize) -> String {
@@ -162,6 +165,53 @@ fn agent_web_round_rechecks_result_authority_before_model_continuation() {
             .is_err()
     );
     assert_eq!(server.join().unwrap().len(), 1);
+}
+
+#[test]
+fn ask_web_round_rechecks_the_reviewed_attachment_before_model_continuation() {
+    let _lock = exclusive_run();
+    let (profile, server) = start_test_double(vec![tools(1, 1)]);
+    let (progress, updates) = async_channel::bounded(1);
+    let current = Arc::new(AtomicBool::new(true));
+    let attachment = Arc::clone(&current);
+    let system = ask_system(&profile, "");
+    let pending = reviewed_ask_request(
+        profile,
+        ReviewedAsk {
+            system,
+            input: r#"{"goal":"Search public documentation"}"#.into(),
+            context_limit: 40000,
+            web_tools: true,
+            authorize_web_send: None,
+            attachment_check: Some(Arc::new(move || {
+                if attachment.load(Ordering::Acquire) {
+                    Ok(())
+                } else {
+                    Err("The reviewed fixture attachment changed.".into())
+                }
+            })),
+        },
+        Some(progress),
+        || Ok(()),
+    )
+    .unwrap();
+    let proposal = proposal(&updates);
+    current.store(false, Ordering::Release);
+    assert!(proposal.resolve(ApprovedWebResult::new(
+        "Reviewed web evidence".into(),
+        || Ok(())
+    )));
+    let report = pending.reply.recv_blocking().unwrap().unwrap();
+    assert!(
+        report
+            .result
+            .unwrap_err()
+            .contains("The reviewed fixture attachment changed.")
+    );
+    assert_eq!(report.attempts[0].total_tokens, Some(12));
+    let wire = server.join().unwrap();
+    assert_eq!(wire.len(), 1);
+    assert_eq!(wire[0]["tools"].as_array().unwrap().len(), 2);
 }
 
 #[test]

@@ -3,7 +3,7 @@
 use std::cell::Cell;
 use std::time::{Duration, Instant};
 
-use iced::widget::{button, canvas, column, container, row, text};
+use iced::widget::{button, canvas, column, container, responsive, row, text};
 use iced::{Alignment, Color, Element, Length, Size, Subscription, window};
 
 use crate::horizontal_divider::{self, Grow};
@@ -955,12 +955,15 @@ impl Workspace {
         if status_kind == Status::Orbit && status_opacity.is_none() {
             run.presentation.dismiss_drawer();
         }
-        let chooser = || agents.run_picker(id, run);
+        let chooser = move || agents.run_picker(id, run);
         let picture_in_picture = run.design.arrangement == Arrangement::PictureInPicture;
         let dock = self.window_settings.ai_agent_panel;
         let history_position = dock
             .history_slot(run.design)
             .filter(|_| !run.presentation.dock_hidden);
+        let context = super::sent_context::view(run, super::sent_context::Surface::Terminal);
+        let offer = handoff::terminal_bar(run);
+        let has_footer = context.is_some() || offer.is_some();
         let panel_review = self.panel_review(id, run, None);
         let activity = &run.presentation.activity;
         let plan_bottom =
@@ -975,8 +978,6 @@ impl Workspace {
         } else {
             activity.height
         });
-        let bottom_height =
-            fitted_activity_height(bounds.height, expanded_height, activity.collapsed);
         let nominal_width =
             placement::history_width(run.design.history, bounds.width, cell.width * 40.0);
         let side_width = run
@@ -989,47 +990,65 @@ impl Workspace {
             );
         let history = history_position.map(|side| {
             if side == Slot::Bottom {
-                let header: Element<'_, AgentMessage> = activity::toggle(run).into();
-                let header = header.map(move |message| Desktop::TerminalAgent(id, message));
-                let mut panel = column![].spacing(3);
-                if !activity.collapsed
-                    && run.design.arrangement == Arrangement::Normal
-                    && bottom_height >= Height::MIN
-                {
-                    let resize = DockResize {
-                        expected: dock,
-                        side,
-                        extent: None,
+                // Use the space left after controls outside the terminal and its dock.
+                return responsive(move |available| {
+                    let available_height = if has_footer {
+                        available.height
+                    } else {
+                        bounds.height
                     };
-                    let max_height = fitted_activity_height(bounds.height, f32::MAX, false);
-                    panel = panel.push(
-                        canvas(horizontal_divider::program(
-                            bottom_height,
-                            Grow::Up,
-                            move |height| resize.message(id, Some(height.min(max_height))),
-                            Some(resize.message(id, None)),
-                        ))
+                    let bottom_height = fitted_activity_height(
+                        available_height,
+                        expanded_height,
+                        activity.collapsed,
+                    );
+                    let mut panel = column![].spacing(3);
+                    if !activity.collapsed
+                        && run.design.arrangement == Arrangement::Normal
+                        && bottom_height >= Height::MIN
+                    {
+                        let resize = DockResize {
+                            expected: dock,
+                            side,
+                            extent: None,
+                        };
+                        let max_height = fitted_activity_height(available_height, f32::MAX, false);
+                        panel = panel.push(
+                            canvas(horizontal_divider::program(
+                                bottom_height,
+                                Grow::Up,
+                                move |height| resize.message(id, Some(height.min(max_height))),
+                                Some(resize.message(id, None)),
+                            ))
+                            .width(Length::Fill)
+                            .height(horizontal_divider::WIDTH),
+                        );
+                    }
+                    if !plan_bottom || activity.collapsed || run.presentation.step_list_open {
+                        let header: Element<'_, AgentMessage> = activity::toggle(run).into();
+                        panel = panel
+                            .push(header.map(move |message| Desktop::TerminalAgent(id, message)));
+                    }
+                    if !activity.collapsed {
+                        panel = panel.push(
+                            history_panel(
+                                run,
+                                chooser(),
+                                palette,
+                                reduced_motion,
+                                (agents, id),
+                                panel_review,
+                            )
+                            .map(move |message| Desktop::TerminalAgent(id, message)),
+                        );
+                    }
+                    container(panel.height(Length::Fill))
                         .width(Length::Fill)
-                        .height(horizontal_divider::WIDTH),
-                    );
-                }
-                if !plan_bottom || activity.collapsed || run.presentation.step_list_open {
-                    panel = panel.push(header);
-                }
-                if !activity.collapsed {
-                    panel = panel.push(
-                        history_panel(
-                            run,
-                            chooser(),
-                            palette,
-                            reduced_motion,
-                            (agents, id),
-                            panel_review,
-                        )
-                        .map(move |message| Desktop::TerminalAgent(id, message)),
-                    );
-                }
-                return panel.height(Length::Fill).into();
+                        .height(bottom_height)
+                        .into()
+                })
+                .height(Length::Shrink)
+                .into();
             }
             let history = history_panel(
                 run,
@@ -1147,7 +1166,7 @@ impl Workspace {
             DockExtents {
                 left: side_width,
                 right: side_width,
-                bottom: Some(bottom_height),
+                bottom: None,
             },
         );
         let terminal = if picture_in_picture {
@@ -1163,9 +1182,7 @@ impl Workspace {
         } else {
             terminal
         };
-        let context = super::sent_context::view(run, super::sent_context::Surface::Terminal);
-        let offer = handoff::terminal_bar(run);
-        if context.is_some() || offer.is_some() {
+        if has_footer {
             column![
                 container(terminal).width(Length::Fill).height(Length::Fill),
                 context.map(|context| container(

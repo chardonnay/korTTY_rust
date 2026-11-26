@@ -1668,7 +1668,7 @@ impl Client {
         deadline: Instant,
         before_dispatch: impl FnMut() -> Result<(), String>,
     ) -> (Result<String, Error>, Option<CompletionLimit>) {
-        let (result, stop) = self.complete_agent_turn_before_guarded(
+        let (result, stop, _) = self.complete_agent_turn_before_guarded(
             system,
             input,
             None,
@@ -1679,7 +1679,8 @@ impl Client {
         (result.and_then(tools::Reply::into_text), stop)
     }
 
-    /// Completes one model turn. Tool calls are proposals; the caller owns their reviews.
+    /// Completes one model turn and reports whether the request was dispatched.
+    /// Tool calls are proposals whose reviews belong to the caller.
     pub(crate) fn complete_agent_turn_before_guarded(
         &self,
         system: &str,
@@ -1688,8 +1689,9 @@ impl Client {
         response_format: bool,
         deadline: Instant,
         before_dispatch: impl FnMut() -> Result<(), String>,
-    ) -> (Result<tools::Reply, Error>, Option<CompletionLimit>) {
+    ) -> (Result<tools::Reply, Error>, Option<CompletionLimit>, bool) {
         let mut stop = None;
+        let mut dispatched = false;
         let result = self.with_completion(|attempt| {
             attempt.agent_completion = Some(AgentCompletion::default());
             let messages = [
@@ -1720,9 +1722,10 @@ impl Client {
                 .agent_completion
                 .take()
                 .and_then(|metadata| metadata.stop);
+            dispatched = attempt.dispatched;
             result
         });
-        (result, stop)
+        (result, stop, dispatched)
     }
 
     /// Returns a complete text response for workflows that replace user content.

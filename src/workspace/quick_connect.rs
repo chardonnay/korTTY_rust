@@ -619,9 +619,7 @@ impl Workspace {
         if let Some(dialog) = &mut self.quick_connect {
             dialog.set_temporary_key_enabled(enabled);
         }
-        if !enabled {
-            self.discard_quick_temporary_ssh_retries();
-        }
+        self.sync_quick_temporary_ssh_retries(enabled);
     }
 
     fn quick_logging_available(&self, dialog: &Dialog) -> bool {

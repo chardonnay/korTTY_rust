@@ -9,7 +9,7 @@ use kortty_vault::Secret;
 use zeroize::Zeroizing;
 
 use super::archive::java::{self, Member, MemberKind, Protection};
-use super::{Snapshot, archive, data, java_host_pins, java_scheduler};
+use super::{Snapshot, archive, data, java_host_pins, java_scheduler, java_secrets::web};
 use crate::ai_manager::{backup as ai, java_knowledge, java_models};
 use crate::clipboard_policy::ClipboardPolicy;
 use crate::connection_store::custom_os_badges::java_catalog;
@@ -34,10 +34,11 @@ pub(super) struct Report {
     pub(super) protection: Protection,
     pub(super) entries: Vec<String>,
     pub(super) omissions: Vec<String>,
-    pub(super) ssh: Option<SshSource>,
+    pub(super) credentials: Option<CredentialSource>,
     pub(super) password_summary: Option<(usize, usize)>,
     pub(super) temporary_key_summary: Option<(usize, usize)>,
     pub(super) key_summary: Option<(usize, usize)>,
+    pub(super) web_summary: Option<web::Summary>,
     pub(super) host_pins: Option<Arc<kortty_ssh::KnownHostsFile>>,
     pub(super) scheduler: Option<SchedulerSource>,
     pub(super) scoped_memory: Option<memory::Source>,
@@ -57,7 +58,7 @@ pub(super) struct ToolbarSource {
     pub(super) connections: Option<Arc<Zeroizing<Vec<u8>>>>,
 }
 
-pub(super) struct SshSource {
+pub(super) struct CredentialSource {
     pub(super) has_passwords: bool,
     pub(super) has_temporary_keys: bool,
     pub(super) master: Option<Zeroizing<Vec<u8>>>,
@@ -65,6 +66,7 @@ pub(super) struct SshSource {
     pub(super) connections: Option<Arc<Zeroizing<Vec<u8>>>>,
     pub(super) key_catalog: Option<Zeroizing<Vec<u8>>>,
     pub(super) key_files: BTreeMap<String, Member>,
+    pub(super) web: web::Source,
 }
 
 pub(super) fn inspect(source: &Path, password: &Secret) -> io::Result<(Snapshot, Report)> {
@@ -85,10 +87,11 @@ pub(super) fn convert(
             .into_iter()
             .map(|path| format!("{path}: unrecognized backup member"))
             .collect(),
-        ssh: None,
+        credentials: None,
         password_summary: None,
         temporary_key_summary: None,
         key_summary: None,
+        web_summary: None,
         host_pins: None,
         scheduler: None,
         scoped_memory: None,
@@ -109,6 +112,7 @@ pub(super) fn convert(
         || has_field("connections.xml", "<encryptedPassword");
     let has_keys = content("ssh-keys.xml").is_some();
     let has_temporary_keys = has_field("connections.xml", "<temporaryKeyContent");
+    let mut web = web::Source::default();
     let connections = content("connections.xml");
     let (snippet_xml, variables_xml) = (content("snippets.xml"), content("snippet-variables.xml"));
     if snippet_xml.is_some() || variables_xml.is_some() {
@@ -202,6 +206,16 @@ pub(super) fn convert(
     let mut scheduler_teamwork_origins = BTreeMap::new();
     let mut toolbar = None;
     if let Some(bytes) = content("global-settings.xml") {
+        match web::Source::from_settings(bytes) {
+            Ok((source, omitted)) => {
+                web = source;
+                report.note_count(
+                    omitted,
+                    "Invalid Java web provider credential fields omitted",
+                );
+            }
+            Err(error) => report.omit("Java web provider credentials", error),
+        }
         let themes = snapshot
             .get(data::WINDOW_SETTINGS)
             .map(|bytes| bytes.as_slice());
@@ -423,10 +437,6 @@ pub(super) fn convert(
                     "Java reasoning overrides omitted for server-selected models",
                 );
                 report.note_count(
-                    imported.web_keys_omitted,
-                    "Java web provider credentials omitted",
-                );
-                report.note_count(
                     imported.web_hints_omitted,
                     "unsupported or incomplete Java web provider suggestions omitted",
                 );
@@ -491,6 +501,11 @@ pub(super) fn convert(
                     report
                         .omissions
                         .push("Invalid Java Agent complexity check preference was omitted.".into());
+                }
+                if imported.agent_always_offer_web_tools_omitted {
+                    report
+                        .omissions
+                        .push("Invalid Java Agent web-tool preference was omitted.".into());
                 }
                 if imported.agent_run_presentation_omitted {
                     report
@@ -1221,14 +1236,14 @@ pub(super) fn convert(
             teamwork_origins: scheduler_teamwork_origins,
             target_review: None,
         });
-    if has_passwords || has_keys || has_temporary_keys {
+    if has_passwords || has_keys || has_temporary_keys || web.len() != 0 {
         if has_passwords {
             report
                 .omissions
                 .push("Java password commands are omitted.".into());
         }
         let mut take = |name| members.remove(name).map(|member| member.bytes);
-        report.ssh = Some(SshSource {
+        report.credentials = Some(CredentialSource {
             has_passwords,
             has_temporary_keys,
             master: take("master.key"),
@@ -1243,6 +1258,7 @@ pub(super) fn convert(
             } else {
                 BTreeMap::new()
             },
+            web,
         });
     }
     Ok((snapshot, report))

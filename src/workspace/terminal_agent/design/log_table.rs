@@ -4,8 +4,8 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::{Duration, Instant, SystemTime};
 
 use iced::widget::{
-    Id, button, canvas, column, container, keyed, mouse_area, responsive, row, scrollable, space,
-    stack, text, text_editor,
+    Id, button, canvas, column, container, mouse_area, responsive, row, scrollable, space, stack,
+    text, text_editor,
 };
 use iced::{Alignment, Color, Element, Font, Length, Padding, Point, Task, mouse};
 use jiff::{Timestamp, tz::TimeZone};
@@ -26,10 +26,29 @@ pub(super) mod keyboard;
 
 const FLASH_DURATION: Duration = Duration::from_millis(900);
 const SPINNER_INTERVAL: u64 = 120;
+const STATIC_REFRESH_INTERVAL: u64 = 1_000;
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const COLUMN_GAP: f32 = horizontal_divider::WIDTH;
 const ROW_PADDING: [f32; 2] = [2.0, 5.0];
 const SCROLLBAR_WIDTH: f32 = 10.0;
+
+#[derive(Clone, Copy)]
+pub(super) struct DurationClock {
+    pub(super) at: Instant,
+    pub(super) reduced_motion: bool,
+}
+
+impl DurationClock {
+    fn elapsed(self, step: &Step) -> Option<u64> {
+        let elapsed = step.elapsed_at(self.at)?;
+        if self.reduced_motion && step.state == StepState::Running && step.elapsed_ms.is_none() {
+            // Unrelated redraws may arrive between the scheduled duration ticks.
+            Some(elapsed / STATIC_REFRESH_INTERVAL * STATIC_REFRESH_INTERVAL)
+        } else {
+            Some(elapsed)
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Row {
@@ -286,7 +305,7 @@ pub(crate) enum Message {
     SelectMenuItem(usize),
     MenuPage(context::Page),
     CloseMenu,
-    Navigate(Key),
+    Navigate(Surface, Key),
 }
 
 impl Message {
@@ -309,7 +328,7 @@ pub(crate) enum Key {
 }
 
 pub(super) struct State {
-    viewport: Id,
+    viewports: [Id; 3],
     selected: Option<Row>,
     detail: Option<Row>,
     detail_editor: Option<detail_editor::Editor>,
@@ -353,7 +372,7 @@ impl Approval {
 impl Default for State {
     fn default() -> Self {
         Self {
-            viewport: Id::unique(),
+            viewports: std::array::from_fn(|_| Id::unique()),
             selected: None,
             detail: None,
             detail_editor: None,
@@ -534,7 +553,7 @@ impl State {
             Some(if spinning && !reduced_motion {
                 SPINNER_INTERVAL
             } else {
-                1_000
+                STATIC_REFRESH_INTERVAL
             })
         } else {
             None
@@ -610,32 +629,38 @@ impl State {
                 self.manual_widths = Some(widths);
             }
             Message::ResizeColumns(_) => {}
-            Message::Navigate(_) | Message::KeyboardMenu(..) => {}
+            Message::Navigate(..) | Message::KeyboardMenu(..) => {}
         }
     }
 
     pub(super) fn navigate(
         &mut self,
         transcript: &Transcript,
-        at: Instant,
+        clock: DurationClock,
+        surface: Surface,
         key: Key,
         approval_revision: Option<u64>,
     ) -> Task<super::Desktop> {
-        let row = self.navigate_row(transcript, at, key, approval_revision);
-        row.map_or_else(Task::none, |row| self.reveal(row))
+        let row = self.navigate_row(transcript, clock, key, approval_revision);
+        row.map_or_else(Task::none, |row| self.reveal(surface, row))
     }
 
-    fn reveal(&self, row: Row) -> Task<super::Desktop> {
-        crate::workspace::coding_agents::roster_scroll::reveal_row(
-            self.viewport.clone(),
-            self.row_id(row),
+    fn viewport(&self, surface: Surface) -> &Id {
+        &self.viewports[surface.table_index().expect("a Log Table surface")]
+    }
+
+    fn reveal(&self, surface: Surface, row: Row) -> Task<super::Desktop> {
+        crate::workspace::dialog_design::scroll::reveal_row_above_horizontal_scrollbar(
+            self.viewport(surface).clone(),
+            self.row_id(surface, row),
+            SCROLLBAR_WIDTH,
         )
     }
 
     fn navigate_row(
         &mut self,
         transcript: &Transcript,
-        at: Instant,
+        clock: DurationClock,
         key: Key,
         approval_revision: Option<u64>,
     ) -> Option<Row> {
@@ -644,7 +669,7 @@ impl State {
             return None;
         }
         let mut order: Vec<_> = self
-            .rows(transcript, at)
+            .rows(transcript, clock)
             .into_iter()
             .map(|step| Row::Step(step.id))
             .collect();
@@ -671,15 +696,15 @@ impl State {
         Some(row)
     }
 
-    fn row_id(&self, row: Row) -> Id {
-        Id::from(format!("{:?}/log/{row:?}", self.viewport))
+    fn row_id(&self, surface: Surface, row: Row) -> Id {
+        Id::from(format!("{:?}/log/{row:?}", self.viewport(surface)))
     }
 
-    pub(super) fn detail_id(&self) -> Id {
-        Id::from(format!("{:?}/log/detail", self.viewport))
+    pub(super) fn detail_id(&self, surface: Surface) -> Id {
+        Id::from(format!("{:?}/log/detail", self.viewport(surface)))
     }
 
-    fn rows<'a>(&self, transcript: &'a Transcript, now: Instant) -> Vec<&'a Step> {
+    fn rows<'a>(&self, transcript: &'a Transcript, clock: DurationClock) -> Vec<&'a Step> {
         let mut steps = transcript.steps.iter().collect::<Vec<_>>();
         if let Some((column, ascending)) = self.sort {
             steps.sort_by(|left, right| {
@@ -691,7 +716,7 @@ impl State {
                         .exit_code
                         .cmp(&right.exit_code)
                         .then_with(|| state_label(left).cmp(state_label(right))),
-                    Column::Duration => left.elapsed_at(now).cmp(&right.elapsed_at(now)),
+                    Column::Duration => clock.elapsed(left).cmp(&clock.elapsed(right)),
                     Column::Tokens => left.tokens.cmp(&right.tokens),
                 };
                 if ascending {
@@ -931,6 +956,7 @@ impl super::Run {
     pub(in crate::workspace::terminal_agent) fn navigate_agent_log(
         &mut self,
         message: Message,
+        reduced_motion: bool,
     ) -> Task<super::Desktop> {
         if self.design.history != crate::terminal_agent::design::History::LogTable {
             return Task::none();
@@ -938,14 +964,19 @@ impl super::Run {
         let Some(history) = &self.inline else {
             return Task::none();
         };
-        let at = self.presentation.finish_time().unwrap_or_else(Instant::now);
+        let clock = DurationClock {
+            at: self.presentation.finish_time().unwrap_or_else(Instant::now),
+            reduced_motion,
+        };
         let revision = self.log_approval_revision();
         let transcript = history.status_transcript();
         let table = &mut self.presentation.log_table;
         match message {
-            Message::Navigate(key) => table.navigate(transcript, at, key, revision),
+            Message::Navigate(surface, key) => {
+                table.navigate(transcript, clock, surface, key, revision)
+            }
             Message::KeyboardMenu(surface, offset) => {
-                let Some(row) = table.navigate_row(transcript, at, Key::Focus, revision) else {
+                let Some(row) = table.navigate_row(transcript, clock, Key::Focus, revision) else {
                     return Task::none();
                 };
                 if matches!(row, Row::Approval(_)) {
@@ -954,7 +985,7 @@ impl super::Run {
                     let point = Point::new(offset.max(0.0) + 8.0, 7.0);
                     table.update(Message::OpenMenu(surface, Some(row), point));
                 }
-                table.reveal(row)
+                table.reveal(surface, row)
             }
             _ => Task::none(),
         }
@@ -1079,13 +1110,19 @@ fn clock(time: Option<SystemTime>, zone: &TimeZone) -> String {
         )
 }
 
-fn timestamped_values(step: &Step, zone: &TimeZone, spinner: &str, now: Instant) -> [String; 6] {
+fn timestamped_values(
+    step: &Step,
+    zone: &TimeZone,
+    spinner: &str,
+    duration: DurationClock,
+) -> [String; 6] {
     [
         clock(step.recorded_at, zone),
         kind(step).into(),
         super::history::summary(title(step)),
         result(step, spinner),
-        step.elapsed_at(now)
+        duration
+            .elapsed(step)
             .map_or_else(|| "—".into(), |ms| format!("{:.1} s", ms as f64 / 1000.0)),
         step.tokens
             .map_or_else(|| "—".into(), |tokens| tokens.to_string()),
@@ -1117,17 +1154,17 @@ fn cells(values: [String; 6], style: GridStyle, command: bool) -> Element<'stati
 
 fn entry(
     row: Row,
-    state: &State,
+    id: Id,
+    selected: bool,
     values: [String; 6],
     style: GridStyle,
     flash: f32,
-    command: bool,
-    details_on_right: bool,
+    behavior: (bool, bool),
 ) -> Element<'static, AgentMessage> {
-    let selected = state.selected == Some(row);
+    let (command, details_on_right) = behavior;
     let trigger = mouse_area(
         container(cells(values, style, command))
-            .id(state.row_id(row))
+            .id(id)
             .padding(ROW_PADDING)
             .style(move |theme: &iced::Theme| {
                 let mut row_style = if selected {
@@ -1209,7 +1246,7 @@ fn details<'a>(run: Activity<'a>, detail: Detail<'a>) -> Element<'a, AgentMessag
         ]
         .spacing(4),
     )
-    .id(table.detail_id())
+    .id(table.detail_id(run.surface))
     .width(Length::Fill)
     .padding(6)
     .style(container::bordered_box)
@@ -1266,10 +1303,13 @@ fn table_view<'a>(
     let approval_revision = approval_revision(run);
     let approval = state.approval(approval_revision);
     let now = Instant::now();
-    let duration_at = run
-        .live_run
-        .and_then(|run| run.presentation.finish_time())
-        .unwrap_or(now);
+    let duration = DurationClock {
+        at: run
+            .live_run
+            .and_then(|run| run.presentation.finish_time())
+            .unwrap_or(now),
+        reduced_motion,
+    };
     let flash = |row| {
         if reduced_motion || run.live_run.is_some_and(|run| run.reopened_history) {
             0.0
@@ -1288,7 +1328,7 @@ fn table_view<'a>(
     // Receive divider gestures before heading buttons, including batched drags
     // whose final cursor position already lies over a sort button.
     let mut grips = row![].padding(ROW_PADDING).align_y(Alignment::Center);
-    let scope = style.drag_scope(&state.viewport);
+    let scope = style.drag_scope(state.viewport(surface));
     for (index, (column, width)) in Column::ALL.into_iter().zip(style.widths).enumerate() {
         let label = match state.sort {
             Some((current, ascending)) if current == column => {
@@ -1327,12 +1367,22 @@ fn table_view<'a>(
             );
         }
     }
+    let entry = |row, values, command, details_on_right| {
+        entry(
+            row,
+            state.row_id(surface, row),
+            state.selected == Some(row),
+            values,
+            style,
+            flash(row),
+            (command, details_on_right),
+        )
+    };
     let mut rows = column![].spacing(1);
-    for step in state.rows(transcript, duration_at) {
+    for step in state.rows(transcript, duration) {
         let row = Row::Step(step.id);
         let trigger = entry(
             row,
-            state,
             timestamped_values(
                 step,
                 &zone,
@@ -1341,10 +1391,8 @@ fn table_view<'a>(
                 } else {
                     "…"
                 },
-                duration_at,
+                duration,
             ),
-            style,
-            flash(row),
             step.command.is_some(),
             run.live_run.is_none(),
         );
@@ -1359,7 +1407,6 @@ fn table_view<'a>(
         let row = approval.row();
         rows = rows.push(entry(
             row,
-            state,
             [
                 clock(Some(approval.recorded_at), &zone),
                 "Approval".into(),
@@ -1373,8 +1420,6 @@ fn table_view<'a>(
                 "—".into(),
                 "—".into(),
             ],
-            style,
-            flash(row),
             !approval.commands().is_empty(),
             true,
         ));
@@ -1385,7 +1430,6 @@ fn table_view<'a>(
     if !transcript.final_answer.is_empty() {
         let trigger = entry(
             Row::Answer,
-            state,
             [
                 clock(transcript.final_answer_at, &zone),
                 "Answer".into(),
@@ -1394,8 +1438,6 @@ fn table_view<'a>(
                 "—".into(),
                 "—".into(),
             ],
-            style,
-            flash(Row::Answer),
             false,
             !has_run_menu,
         );
@@ -1413,12 +1455,14 @@ fn table_view<'a>(
     let table = scrollable(
         container(rows).padding(Padding::ZERO.right(SCROLLBAR_WIDTH).bottom(SCROLLBAR_WIDTH)),
     )
-    .id(state.viewport.clone())
+    .id(state.viewport(surface).clone())
     .direction(scrollable::Direction::Both {
         vertical: scrollable::Scrollbar::default()
             .width(SCROLLBAR_WIDTH)
             .scroller_width(SCROLLBAR_WIDTH),
-        horizontal: scrollable::Scrollbar::default(),
+        horizontal: scrollable::Scrollbar::default()
+            .width(SCROLLBAR_WIDTH)
+            .scroller_width(SCROLLBAR_WIDTH),
     })
     .fixed_header(stack![headings, grips])
     .follow_bottom(follow, state.follow_revision)
@@ -1455,16 +1499,16 @@ fn table_view<'a>(
             .spacing(5)
             .wrap()
         });
-    // The approval goes before the table, while the controls and details go after it.
-    // Keep the same table child when either part changes.
+    // Keep the table state when the approval appears or changes with terminal focus.
+    let approval = super::command_review::card(run);
+    let spacing = if approval.is_some() { 4 } else { 0 };
+    let approval = approval.unwrap_or_else(|| space().into());
     let grid = column![table, review, detail]
         .height(Length::Fill)
         .spacing(4);
-    keyed::Column::new()
-        .push_maybe("approval", super::command_review::card(run))
-        .push("table", grid)
+    column![approval, grid]
         .height(Length::Fill)
-        .spacing(4)
+        .spacing(spacing)
         .into()
 }
 
@@ -1479,6 +1523,10 @@ mod tests {
     #[test]
     fn agent_log_table_keeps_exact_output_when_sorted_and_ignores_evicted_rows() {
         let now = Instant::now();
+        let clock = DurationClock {
+            at: now,
+            reduced_motion: false,
+        };
         let mut transcript = Transcript {
             final_answer: "Finished answer".into(),
             steps: vec![
@@ -1504,7 +1552,7 @@ mod tests {
             ..Transcript::default()
         };
         assert_eq!(
-            timestamped_values(&transcript.steps[0], &TimeZone::UTC, "…", now),
+            timestamped_values(&transcript.steps[0], &TimeZone::UTC, "…", clock),
             [
                 "00:00:00",
                 "Command",
@@ -1515,18 +1563,18 @@ mod tests {
             ]
         );
         assert_eq!(
-            timestamped_values(&transcript.steps[1], &TimeZone::UTC, "…", now)[5],
+            timestamped_values(&transcript.steps[1], &TimeZone::UTC, "…", clock)[5],
             "2048"
         );
         let mut state = State::default();
         state.update(Message::Open(Row::Step(17)));
         state.update(Message::Sort(Column::Duration));
-        assert_eq!(state.rows(&transcript, now)[0].id, 18);
+        assert_eq!(state.rows(&transcript, clock)[0].id, 18);
         assert!(
             matches!(state.detail(&transcript, None), Some(Detail::Step(step)) if step.output == ["exact output"])
         );
         state.update(Message::Sort(Column::Duration));
-        assert_eq!(state.rows(&transcript, now)[0].id, 17);
+        assert_eq!(state.rows(&transcript, clock)[0].id, 17);
         transcript.steps.remove(0);
         assert!(state.detail(&transcript, None).is_none());
         state.update(Message::Open(Row::Answer));
@@ -1543,12 +1591,12 @@ mod tests {
         let mut ui = UserInterface::build(
             entry(
                 step,
-                &State::default(),
+                Id::unique(),
+                false,
                 Column::ALL.map(|column| column.label().into()),
                 GridStyle::fit(800.0, 12.0, None),
                 0.0,
-                true,
-                true,
+                (true, true),
             ),
             Size::new(800.0, 140.0),
             Cache::default(),
@@ -1673,7 +1721,7 @@ mod tests {
                 &mut renderer,
             );
             let mut measure = Measure {
-                table: presentation.log_table.viewport.clone(),
+                table: presentation.log_table.viewport(Surface::Activity).clone(),
                 widths: None,
                 token_right_edges: Vec::new(),
             };
@@ -1789,7 +1837,7 @@ mod tests {
         let scroll = Vector::new(65.0, 70.0);
         for (id, x, y) in [
             (
-                presentation.log_table.viewport.clone(),
+                presentation.log_table.viewport(Surface::Activity).clone(),
                 Some(scroll.x),
                 Some(80.0),
             ),
@@ -1961,7 +2009,7 @@ mod tests {
         }
 
         let mut presentation = presentation::Presentation::default();
-        let viewport = presentation.log_table.viewport.clone();
+        let viewport = presentation.log_table.viewport(Surface::Activity).clone();
         let activity = VecDeque::new();
         let mut transcript = Transcript::default();
         let push = |transcript: &mut Transcript, id| {
@@ -2159,6 +2207,10 @@ mod tests {
     #[test]
     fn agent_log_table_uses_the_same_duration_for_cells_and_sorting() {
         let now = Instant::now();
+        let clock = |ms, reduced_motion| DurationClock {
+            at: now + Duration::from_millis(ms),
+            reduced_motion,
+        };
         let mut transcript = Transcript {
             steps: vec![
                 Step {
@@ -2177,16 +2229,37 @@ mod tests {
         };
         let mut state = State::default();
         state.update(Message::Sort(Column::Duration));
-        assert_eq!(state.rows(&transcript, now)[0].id, 1);
-        let later = now + Duration::from_secs(2);
+        assert_eq!(state.rows(&transcript, clock(0, false))[0].id, 1);
+        let later = clock(2_000, false);
         assert_eq!(state.rows(&transcript, later)[0].id, 2);
         assert_eq!(
             timestamped_values(&transcript.steps[0], &TimeZone::UTC, "…", later)[4],
             "2.0 s"
         );
 
+        // Extra redraws between whole seconds must keep the cell and row order stable.
+        for time in [1_100, 1_990] {
+            let reduced = clock(time, true);
+            assert_eq!(
+                timestamped_values(&transcript.steps[0], &TimeZone::UTC, "…", reduced)[4],
+                "1.0 s"
+            );
+            assert_eq!(state.rows(&transcript, reduced)[0].id, 1);
+        }
+        assert_eq!(
+            state.navigate_row(&transcript, clock(1_990, true), Key::First, None),
+            Some(Row::Step(1))
+        );
+        assert_eq!(state.rows(&transcript, clock(2_000, true))[0].id, 2);
+        assert_eq!(state.rows(&transcript, clock(1_990, false))[0].id, 2);
+
         let completed = &mut transcript.steps[0];
         completed.state = StepState::Completed;
+        completed.elapsed_ms = Some(1_750);
+        assert_eq!(
+            timestamped_values(completed, &TimeZone::UTC, "…", clock(4_000, true))[4],
+            "1.8 s"
+        );
         completed.elapsed_ms = Some(0);
         assert_eq!(
             timestamped_values(completed, &TimeZone::UTC, "…", later)[4],

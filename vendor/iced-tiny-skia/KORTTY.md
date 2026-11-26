@@ -36,3 +36,8 @@ alignment anchors, including centered labels and right-aligned selector arrows.
 This prevents text outside a scrolled page and stale glyphs after moving aligned
 labels across its clip boundary. Pixel regressions compare incremental and full
 repaints across text alignments at 1× and 2× scale.
+
+The font database excludes fallback faces with missing or zero scale metrics
+before shaping text. The macOS GB18030 Bitmap face otherwise produces
+non-finite coordinates when cosmic-text tries to scale its Japanese glyphs.
+Choosing the next usable fallback preserves the text and cursor.

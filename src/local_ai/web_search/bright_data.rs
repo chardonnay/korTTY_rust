@@ -12,6 +12,7 @@ pub(super) const KEY: &str = "BRIGHT_DATA_API_TOKEN";
 
 pub(super) fn start<T: Send + 'static>(
     url: PageUrl,
+    vault_key: Option<zeroize::Zeroizing<String>>,
     before_dispatch: impl Fn() -> Result<(), String> + Send + 'static,
     finish: impl FnOnce(Vec<Hit>) -> T + Send + 'static,
 ) -> Result<Pending<T>, String> {
@@ -19,7 +20,7 @@ pub(super) fn start<T: Send + 'static>(
     ReadPage {
         label: "Bright Data",
         endpoint: DESTINATION.into(),
-        auth: Authentication::Query(KEY),
+        auth: Authentication::Query(KEY, vault_key),
         tool: TOOL,
     }
     .start(url, arguments, before_dispatch, page_result, finish)

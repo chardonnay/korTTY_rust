@@ -105,7 +105,7 @@ impl Preview {
     pub(crate) fn has_java_passwords(&self) -> bool {
         self.java
             .as_ref()
-            .and_then(|report| report.ssh.as_ref())
+            .and_then(|report| report.credentials.as_ref())
             .is_some_and(|source| source.has_passwords)
     }
 
@@ -116,7 +116,7 @@ impl Preview {
     pub(crate) fn has_java_temporary_keys(&self) -> bool {
         self.java
             .as_ref()
-            .and_then(|report| report.ssh.as_ref())
+            .and_then(|report| report.credentials.as_ref())
             .is_some_and(|source| source.has_temporary_keys)
     }
 
@@ -127,12 +127,23 @@ impl Preview {
     pub(crate) fn has_java_managed_keys(&self) -> bool {
         self.java
             .as_ref()
-            .and_then(|report| report.ssh.as_ref())
+            .and_then(|report| report.credentials.as_ref())
             .is_some_and(|source| source.key_catalog.is_some())
     }
 
     pub(crate) fn java_key_summary(&self) -> Option<(usize, usize)> {
         self.java.as_ref()?.key_summary
+    }
+
+    pub(crate) fn has_java_web_credentials(&self) -> bool {
+        self.java
+            .as_ref()
+            .and_then(|report| report.credentials.as_ref())
+            .is_some_and(|source| source.web.len() != 0)
+    }
+
+    pub(crate) fn java_web_credential_summary(&self) -> Option<&java_secrets::web::Summary> {
+        self.java.as_ref()?.web_summary.as_ref()
     }
 
     pub(crate) fn java_host_pins(&self) -> Option<std::sync::Arc<kortty_ssh::KnownHostsFile>> {
@@ -438,9 +449,9 @@ pub(crate) fn prepare_java_credentials(
         .as_mut()
         .ok_or_else(|| io::Error::other("Expected a Java profile backup."))?;
     let source = report
-        .ssh
+        .credentials
         .as_ref()
-        .ok_or_else(|| io::Error::other("No Java SSH credentials are available for review."))?;
+        .ok_or_else(|| io::Error::other("No Java credentials are available for review."))?;
     let highlights = restore::java_highlight_bindings(root, &preview.snapshot)?;
     let highlight_bindings = restore::highlight_digest(&highlights.set_ids)?;
     let connection_library = report
@@ -480,10 +491,16 @@ pub(crate) fn prepare_java_credentials(
             .omissions
             .push("Java temporary SSH keys were skipped.".into());
     }
-    report.ssh = None;
+    if source.web.len() != 0 && review.web.is_none() {
+        report
+            .omissions
+            .push("Java web provider credentials were skipped.".into());
+    }
+    report.credentials = None;
     report.password_summary = review.passwords;
     report.key_summary = review.keys;
     report.temporary_key_summary = review.temporary_keys;
+    report.web_summary = review.web;
     for (label, summary) in [
         ("SSH passwords", review.passwords),
         ("Managed SSH keys", review.keys),

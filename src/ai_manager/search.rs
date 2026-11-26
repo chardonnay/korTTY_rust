@@ -40,6 +40,9 @@ pub(crate) enum Setting {
     AgentDebugMessages,
     AgentRuntimeMessages,
     Internet(super::internet::Field),
+    WebCredential(kortty_vault::WebProvider),
+    ClearWebCredential(kortty_vault::WebProvider),
+    AgentAlwaysOfferWebTools,
     GlobalTimeout,
     SecurityProfile,
     ClearSecurityProfile,
@@ -82,6 +85,9 @@ impl Setting {
             | Self::AgentDebugMessages
             | Self::AgentRuntimeMessages
             | Self::Internet(_)
+            | Self::WebCredential(_)
+            | Self::ClearWebCredential(_)
+            | Self::AgentAlwaysOfferWebTools
             | Self::GlobalTimeout
             | Self::SecurityProfile
             | Self::ClearSecurityProfile
@@ -119,6 +125,9 @@ impl Setting {
             Self::AgentDebugMessages => "Show Agent debug messages",
             Self::AgentRuntimeMessages => "Show Agent runtime messages",
             Self::Internet(field) => field.title(),
+            Self::WebCredential(provider) => provider.label(),
+            Self::ClearWebCredential(provider) => super::internet::clear_label(provider),
+            Self::AgentAlwaysOfferWebTools => "AI agent: offer internet research on every step",
             Self::ConfirmBeforeSend => "Show confirmation before sending terminal AI requests",
             Self::GlobalTimeout => "Global request timeout (minutes)",
             Self::SecurityProfile => "Security-check profile",
@@ -161,6 +170,11 @@ impl Setting {
             Self::AgentDebugMessages => "agent diagnostic command output transcript messages",
             Self::AgentRuntimeMessages => "agent runtime messages run defaults",
             Self::Internet(field) => field.keywords(),
+            Self::WebCredential(_) => "internet access global vault authentication provider token",
+            Self::ClearWebCredential(_) => "internet access remove global vault credential",
+            Self::AgentAlwaysOfferWebTools => {
+                "always offer internet research agent web tools Tavily"
+            }
             Self::ConfirmBeforeSend => {
                 "confirm before send summarize recent output solve problem request review"
             }
@@ -1750,6 +1764,7 @@ pub(super) fn targets(profile: Option<&profiles::Profile>) -> impl Iterator<Item
         Setting::ConfirmBeforeSend,
         Setting::AgentDebugMessages,
         Setting::AgentRuntimeMessages,
+        Setting::AgentAlwaysOfferWebTools,
         Setting::JournalSemanticSearch,
         Setting::GlobalTimeout,
         Setting::SecurityProfile,
@@ -1773,6 +1788,16 @@ pub(super) fn targets(profile: Option<&profiles::Profile>) -> impl Iterator<Item
         super::internet::Field::ALL
             .into_iter()
             .map(Setting::Internet),
+    )
+    .chain(
+        kortty_vault::WebProvider::ALL
+            .into_iter()
+            .flat_map(|provider| {
+                [
+                    Setting::WebCredential(provider),
+                    Setting::ClearWebCredential(provider),
+                ]
+            }),
     )
     .chain(
         ImportedGeneral::ALL
@@ -2969,6 +2994,67 @@ mod tests {
         assert!(dialog.profiles.selected() == Some(&draft));
         assert!(dialog.profiles.catalog().profile(candidate).is_none());
         assert!(dialog.profile_wizard_open());
+    }
+
+    #[test]
+    fn wizard_next_and_back_open_each_step_at_the_top() {
+        use crate::settings_search::test_input;
+        use iced_runtime::{UserInterface, user_interface::Cache};
+        use profiles::{Message as ProfileMessage, WizardAction};
+
+        let mut dialog = Dialog::new(
+            Arc::new(Configuration::default()),
+            PathBuf::new(),
+            Vec::new(),
+            true,
+            None,
+        );
+        let _ = dialog.update(Message::Page(Page::Profiles));
+        let _ = dialog.update(Message::Profiles(ProfileMessage::Wizard(
+            WizardAction::Open,
+        )));
+        let viewport = dialog.revealed.viewport.clone();
+        let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+        let bounds = Size::new(760.0, 300.0);
+        let mut cache = Cache::default();
+        let mut position = Position {
+            viewport_id: viewport.clone(),
+            row_id: dialog.revealed.row.clone(),
+            viewport: Rectangle::default(),
+            row_y: None,
+            offset: 0.0,
+        };
+        for action in [WizardAction::Next, WizardAction::Back] {
+            let mut interface = UserInterface::build(
+                dialog.view(Vec::new(), Vec::new()),
+                bounds,
+                cache,
+                &mut renderer,
+            );
+            test_input::apply(
+                &mut interface,
+                &renderer,
+                iced::widget::operation::snap_to(
+                    viewport.clone(),
+                    iced::widget::operation::RelativeOffset::END,
+                ),
+            );
+            interface.operate(&renderer, &mut position);
+            assert!(position.offset > 0.0);
+            cache = interface.into_cache();
+
+            let navigation = dialog.update(Message::Profiles(ProfileMessage::Wizard(action)));
+            let mut interface = UserInterface::build(
+                dialog.view(Vec::new(), Vec::new()),
+                bounds,
+                cache,
+                &mut renderer,
+            );
+            test_input::apply(&mut interface, &renderer, navigation);
+            interface.operate(&renderer, &mut position);
+            assert_eq!(position.offset, 0.0);
+            cache = interface.into_cache();
+        }
     }
 
     #[test]

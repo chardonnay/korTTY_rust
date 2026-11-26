@@ -498,15 +498,27 @@ pub(crate) fn review_system(
     system
 }
 
+pub(crate) struct ReviewedPlan {
+    pub(crate) stage: Stage,
+    pub(crate) system: String,
+    pub(crate) input: String,
+    pub(crate) context_limit: usize,
+    pub(crate) web_tools: bool,
+}
+
 pub(crate) fn request_reviewed(
     profile: local_ai::Profile,
-    stage: Stage,
-    system: String,
-    input: String,
-    context_limit: usize,
+    request: ReviewedPlan,
     progress: Option<async_channel::Sender<usage::Progress>>,
     before_dispatch: impl Fn() -> Result<(), String> + Send + 'static,
 ) -> Result<local_ai::Pending<usage::Report<Reply>>, String> {
+    let ReviewedPlan {
+        stage,
+        system,
+        input,
+        context_limit,
+        web_tools,
+    } = request;
     if !usage::fits_context(&system, &input, context_limit) {
         return Err(
             "The reviewed planning request exceeds the selected profile's context limit.".into(),
@@ -522,6 +534,7 @@ pub(crate) fn request_reviewed(
             repair: matches!(stage, Stage::Options | Stage::Report),
             context_limit,
             progress,
+            web_tools,
         },
         before_dispatch,
     )
@@ -606,10 +619,13 @@ mod tests {
             let (progress, updates) = async_channel::bounded(1);
             let pending = request_reviewed(
                 profile,
-                Stage::Questions,
-                system.clone(),
-                "reviewed fixture".into(),
-                4096,
+                ReviewedPlan {
+                    stage: Stage::Questions,
+                    system: system.clone(),
+                    input: "reviewed fixture".into(),
+                    context_limit: 4096,
+                    web_tools: false,
+                },
                 Some(progress),
                 || Ok(()),
             )
@@ -679,10 +695,13 @@ mod tests {
         let (progress, updates) = async_channel::bounded(1);
         let pending = request_reviewed(
             profile,
-            Stage::Options,
-            system.clone(),
-            "reviewed fixture".into(),
-            4096,
+            ReviewedPlan {
+                stage: Stage::Options,
+                system: system.clone(),
+                input: "reviewed fixture".into(),
+                context_limit: 4096,
+                web_tools: false,
+            },
             Some(progress),
             || Ok(()),
         )
@@ -763,10 +782,13 @@ mod tests {
         assert!(
             request_reviewed(
                 profile.clone(),
-                Stage::Report,
-                system.clone(),
-                input.clone(),
-                context_limit - 1,
+                ReviewedPlan {
+                    stage: Stage::Report,
+                    system: system.clone(),
+                    input: input.clone(),
+                    context_limit: context_limit - 1,
+                    web_tools: false,
+                },
                 None,
                 || Ok(()),
             )
@@ -776,10 +798,13 @@ mod tests {
         let (progress, updates) = async_channel::bounded(1);
         let pending = request_reviewed(
             profile,
-            Stage::Report,
-            system,
-            input,
-            context_limit,
+            ReviewedPlan {
+                stage: Stage::Report,
+                system,
+                input,
+                context_limit,
+                web_tools: false,
+            },
             Some(progress),
             || Ok(()),
         )

@@ -273,6 +273,20 @@ pub(super) fn advise_target(
                 AdviceInput::Reviewed {
                     system: prompt.firing_system().into(),
                     input,
+                    web: (scope.transport.supports_web_tool_turns()
+                        && scope.request.action.agent.as_ref().is_some_and(|action| {
+                            action.probe == Probe::SwarmReadOnly
+                                && crate::local_ai::tools::agent_task_eligible(
+                                    &action.goal,
+                                    scope.always_offer_web_tools,
+                                )
+                                && action.approval.as_ref().is_some_and(|approval| {
+                                    approval.web_lookup().is_some_and(
+                                        crate::scheduler_window::agent::web_lookup::Grant::allows_model_tools,
+                                    )
+                                })
+                        }))
+                    .then(|| (resends, Arc::clone(&scope))),
                 },
                 &cancellation,
                 redactor,

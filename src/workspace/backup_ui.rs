@@ -268,9 +268,9 @@ impl JavaCredentialJob {
             vault: self.vault,
             review: result.ok().map(|result| {
                 (self.preview, result.map_err(|error| match error.kind() {
-                    io::ErrorKind::PermissionDenied | io::ErrorKind::InvalidInput if used_source_password => "Could not unlock the Java SSH credentials. Check the Java master password and try again.",
-                    io::ErrorKind::InvalidData => "Could not read the Java SSH credential data.",
-                    _ => "Could not prepare the Java SSH credentials for the current profile. Try again.",
+                    io::ErrorKind::PermissionDenied | io::ErrorKind::InvalidInput if used_source_password => "Could not unlock the Java credentials. Check the Java master password and try again.",
+                    io::ErrorKind::InvalidData => "Could not read the Java credential data.",
+                    _ => "Could not prepare the Java credentials for the current profile. Try again.",
                 }))
             }),
         }
@@ -405,6 +405,7 @@ impl Dialog {
                     || preview.has_java_managed_keys()
                     || preview.has_java_passwords()
                     || preview.has_java_temporary_keys()
+                    || preview.has_java_web_credentials()
             }
             Phase::Form | Phase::Browse(_) => {
                 self.path != self.initial_path
@@ -572,6 +573,7 @@ impl Dialog {
         if preview.java_password_summary().is_some()
             || preview.java_key_summary().is_some()
             || preview.java_temporary_key_summary().is_some()
+            || preview.java_web_credential_summary().is_some()
         {
             return false;
         }
@@ -581,6 +583,7 @@ impl Dialog {
                 preview.has_java_passwords()
                     || preview.has_java_managed_keys()
                     || preview.has_java_temporary_keys()
+                    || preview.has_java_web_credentials()
             }
         }
     }
@@ -645,7 +648,7 @@ impl Dialog {
             self.phase = Phase::Review(preview);
         } else {
             self.error =
-                Some("The SSH credential review stopped. Open the backup again to retry.".into());
+                Some("The Java credential review stopped. Open the backup again to retry.".into());
             self.phase = Phase::Form;
         }
     }
@@ -890,7 +893,7 @@ impl Workspace {
         };
         let Ok(root) = crate::profile::root() else {
             dialog.error =
-                Some("Could not open the current profile for SSH credential review.".into());
+                Some("Could not open the current profile for Java credential review.".into());
             return Task::none();
         };
         let vault = match mode {
@@ -899,7 +902,7 @@ impl Workspace {
                 let Some(vault) = self.vault.as_mut().and_then(VaultWindow::take_for_ssh_keys)
                 else {
                     dialog.java_master_password = Secret::default();
-                    dialog.error = Some("Unlock the current credential vault and finish any edits before reviewing SSH credentials.".into());
+                    dialog.error = Some("Unlock the current credential vault and finish any edits before reviewing Java credentials.".into());
                     return Task::none();
                 };
                 self.vault_change_revision = Arc::new(());
@@ -935,7 +938,7 @@ impl Workspace {
                     vault: job.vault,
                     review: Some((
                         job.preview,
-                        Err("Could not start SSH credential review. Try again."),
+                        Err("Could not start Java credential review. Try again."),
                     )),
                 },
             );

@@ -3565,8 +3565,9 @@ closes the detached window. Actions from its previous owner are ignored.
 The history fixture reopens a finished run, keeps the folded window,
 closes the reopened Activity, and confirms that the same window returns
 to the recent run. The new-input fixture verifies the automatic handoff
-and rejects a stale click after a stream change. Native desktop checks
-of the window transitions on Windows and macOS remain open.
+and rejects a stale click after a stream change. The
+[macOS desktop follow-up](#november-26-native-detached-archived-ask-handoff)
+verified the archived-window transitions. Windows remains pending.
 
 Native Windows ARM64 passed 13 PiP and run-selection checks. The wider
 Terminal Agent selection passed 317 tests on Apple Silicon and 318 on
@@ -4013,9 +4014,10 @@ matched each activation request to its own click serial and confirmed
 keyboard focus on the same Activity surface. The probe remained pending
 and the mock provider received no request. Two focused tests passed on
 Apple Silicon, including the origin and stream checks. Windows ARM64
-passed targeted Clippy with warnings denied. Desktop acceptance on
-Windows, macOS and X11 is still open, as is testing additional Wayland
-compositors and keyboard and touch activation.
+passed targeted Clippy with warnings denied. A subsequent
+[macOS retest](#november-26-native-neon-ticker-controls-and-motion-on-macos)
+covered the live controls and motion. Windows and X11 acceptance,
+additional Wayland compositors, and keyboard and touch activation remain open.
 [Java d18 reference](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignNeonTicker.java)
 · [Fedora Wayland ticker acceptance](target/verification/20261121-agent-checkpoint-neon-wayland.log)
 · [Fedora Wayland Review activation](target/verification/20261121-agent-review-focus-wayland-final.log)
@@ -6415,7 +6417,8 @@ records the Java controls, Rust entry points and remaining user-visible work.
   incoming styles are active, the print style wins as it does in Java.
   Windows ARM64 passed 125 focused tests covering additive restore,
   repeated import, the size mapping, and individual native overrides.
-  Native desktop acceptance remains open.
+  The separate Mac desktop check records native copy output after both
+  adoption and replay. [macOS desktop acceptance](#november-26-java-ascii-art-settings-and-clipboard-on-macos)
   [Windows verification](target/verification/20261118-java-ascii-art-preferences-windows.log)
 - Java backup retention and the automatic backup interval restore as portable
   defaults. Desktop startup writes them to the native backup settings when
@@ -24047,3 +24050,2126 @@ shared toolchains, unrelated processes and retained archives/checksums remain.
 - [Compact Setup clipping](target/verification/20261125-web-rounds-compact-setup.png)
 - [Cleanup](target/verification/20261125-web-rounds-cleanup.json)
 - [Checksums](target/verification/20261125-web-rounds-evidence.sha256)
+
+## November 25 Agent Setup, Pause and Resume on macOS
+
+This Apple Silicon desktop ran a native dialog-preview build from main
+`a84f26f5e44f`. The merge commit has the same Git tree as the PR #38 head
+`3dd6962ba8ef`, which passed formatting and strict workspace Clippy.
+The final harness summaries across the workspace report 5,143 passed,
+0 failed and 233 ignored. The archived tally of 5,145 includes
+two umask tests a second time through their child-process output.
+[PR #38 workspace log](target/verification/20261125-porting-pr-3dd6962/workspace.log) · [Archived tally](target/verification/20261125-porting-pr-3dd6962/summary.json)
+
+The desktop session used a disposable profile, a real loopback HTTP model
+and the explicitly enabled debug provider fixture.
+
+Fresh Setup showed a reachable prompt and the fixed Close action at 1100 × 760,
+800 × 500 and 640 × 400 content sizes. Scrolling exposed the lower controls
+at the two smaller sizes. Reopening after a finished Run exposed Export activity
+and Close at normal and compact sizes. Close returned focus to the terminal.
+The minimum-size check covered fresh Setup.
+
+At 800 × 500, the first model response proposed a search and a page read. Pause
+hid the edited search draft. Resume restored the same text for exact review,
+and approving the search loaded the expected excerpt. Pausing again hid the
+excerpt approval. Resume restored the same excerpt. The model saw one request
+through both pause/resume cycles and the start of separate page review.
+After the excerpt was explicitly returned and the page declined, the final
+model request contained the edited input and expected excerpt under
+`gui-search`, followed by the decline under `gui-page`. The normal-width
+run produced the second request pair with two explicitly declined tools.
+
+The desktop check ended after four recorded model requests. All three owned app processes,
+their fixture shells and the HTTP server exited, and the scratch directory and
+development build were cleaned. Configured provider checks and Windows
+acceptance remain open, with Windows deferred by the user.
+
+- [Setup with finished-run export](target/verification/20261125-agent-setup-live/compact-with-archived-export.jpg)
+- [Minimum-size Setup after scrolling](target/verification/20261125-agent-setup-live/minimum-fresh-scrolled.jpg)
+- [Restored draft](target/verification/20261125-agent-setup-live/compact-draft-resumed.jpg)
+- [Restored excerpts](target/verification/20261125-agent-setup-live/compact-excerpts-resumed.jpg)
+- [Model request sequence](target/verification/20261125-agent-setup-live/gui-model-wire.json)
+- [Results and process cleanup](target/verification/20261125-agent-setup-live/results.json)
+- [Evidence checksums](target/verification/20261125-agent-setup-live/evidence.sha256)
+
+The subsequent worktree rebase onto `origin/main` repeated the desktop checks
+on this Mac. Fresh Setup opened at all three sizes. At 800 × 500, the
+finished-run export was reachable by scrolling and Close returned to the
+terminal. Paused review preserved the edited query and loaded excerpts. The
+first model request stayed the only one until the excerpts were approved and
+the second tool was declined. The final request retained both original IDs
+in order. The private profile, test application and fixture processes were
+removed after the check.
+[Rebase results](target/verification/20261125-agent-setup-rebase/results.json) · [Model request stages](target/verification/20261125-agent-setup-rebase/wire-stages.json) · [Evidence checksums](target/verification/20261125-agent-setup-rebase/evidence.sha256)
+
+## November 26 minimum Agent layout and paused tool decline
+
+The porting worktree was rebased onto `origin/main` at `a84f26f5e44f`.
+Native testing on this Apple Silicon desktop used a disposable profile, a
+loopback HTTP model and the debug provider fixture. At 640 × 400, the
+initial run exposed a clipped footer during probe approval and after the run
+finished. The request log also showed a continuation when the last tool was
+declined during Pause. The review and finished view now scroll above a fixed
+footer at short heights. The paused tool review holds decisions until Resume.
+
+The corrected build opened Setup at 640 × 400, 800 × 500 and 1100 × 760.
+The probe and finished run kept their footer visible at minimum size. At
+800 × 500, scrolling exposed the completed-run export, and Close returned
+focus to the original terminal. Pause/Resume preserved the unsubmitted draft,
+the exact query under review, and the loaded excerpts. At minimum size,
+the old Decline position and Resume both left the model request count at
+one. The explicit decline after Resume caused request two. The compact run
+advanced only after separate excerpt approval and page decline, and the
+model received both original ordered IDs and the exact edited input.
+
+Formatting, strict application Clippy, the native debug build and all
+4,484 enabled application tests passed. The two fixture runs shut down
+their loopback servers and removed their private profiles and app copies.
+The development build was cleaned. Windows testing remains deferred.
+
+- [Results and cleanup](target/verification/20261126-agent-setup-main/results.json)
+- [Minimum probe review](target/verification/20261126-agent-setup-main/minimum-probe-scrolled.jpg)
+- [Minimum finished run](target/verification/20261126-agent-setup-main/minimum-finished-export-and-close.jpg)
+- [Model request stages](target/verification/20261126-agent-setup-main/wire-stages.json)
+- [HTTP request capture](target/verification/20261126-agent-setup-main/gui-model-wire.json)
+- [Evidence checksums](target/verification/20261126-agent-setup-main/evidence.sha256)
+
+## November 26 native live Agent activity windows
+
+This Mac ran Standard at 800 × 500, Classic at 1100 × 760, Floating at
+560 × 470 and the Log Table at 640 × 400. Each private profile used a
+loopback model and the real local shell runner. Each test separately reviewed
+the fixed environment probe, the initial model request, one local print
+command and the follow-up model request. The final build recorded eight
+model requests. Only the approved follow-up included both output streams.
+
+The initial native runs reproduced a clipped history at 800 × 500,
+partially clipped footer actions in Floating, and an unreachable command
+approval at 640 × 400. Probe and command reviews and completed runs now
+scroll above their notice and fixed actions. The nested history has a finite
+viewport, so the table and an opened output detail can share that height.
+The first corrected build used a maximum height alone. It kept the footer
+visible, but the table still consumed the space needed by its detail pane.
+The final fixed viewport let both panes render in the compact window.
+
+Standard preserved the pending command through Pause and Resume. Its finished
+answer and 32-token count remained in the original terminal. Classic and
+Floating exposed their completed output, Export activity and Close. The
+compact Log Table displayed a waiting Approval row, replaced it with the
+completed command and retained its output detail after sorting by Step.
+The Markdown export contained stdout, stderr and the final answer. Each
+window returned focus to its terminal when closed.
+
+The final build passed formatting, strict application Clippy, both added
+layout regressions and all 4,487 enabled application tests with 203 ignored.
+The intermediate layout test expected scrolling with a fixture that fit.
+The final fixture includes a long retained notice and checks that the selected
+Log Table output receives a viewport. Test profiles and processes were removed
+and the development build was cleaned.
+
+Docked module combinations, connection-specific overrides, configured
+providers and the deferred Windows comparison retain separate acceptance
+cases.
+
+- [Results and cleanup](target/verification/20261126-live-agent-designs/results.json)
+- [Compact command approval](target/verification/20261126-live-agent-designs/final/compact-command-action-reached.jpg)
+- [Sorted table with output detail](target/verification/20261126-live-agent-designs/final/compact-sort-preserves-detail.jpg)
+- [Native Markdown export](target/verification/20261126-live-agent-designs/final/compact-log-table-export.md)
+- [Floating completion](target/verification/20261126-live-agent-designs/final/floating-finished-readable-footer.jpg)
+- [Model request stages](target/verification/20261126-live-agent-designs/final/wire-stages.json)
+- [Evidence checksums](target/verification/20261126-live-agent-designs/evidence.sha256)
+
+## November 26 docked Log Table review on macOS
+
+A native run on this Mac used a disposable local shell and a loopback model.
+With a command waiting for approval, focusing the source terminal crashed
+korTTY. The same Log Table approval slot changes from a link to the Activity
+window to a guarded command card when the terminal gains focus. Iced's keyed
+column passed the old stateless widget state directly to the guarded card.
+The Log Table now keeps fixed approval and table slots in a column that
+reconciles widget tags. The table keeps its state when the approval appears,
+changes with focus or disappears.
+
+Two live macOS runs reached the guarded command after switching to the
+terminal, with the Log Table docked below and to the right. The bottom dock
+was resized, paused and resumed before allowing the command once. The same
+command remained pending through Pause and Resume. Ctrl+Shift+F6, End and
+Enter opened the selected command output. The Step heading sorted the table,
+and Shift+F10 and right-click opened the selected command's menu.
+
+The right dock showed the pending Approval row. At 1000 × 672 including
+the title bar, selecting that row added controls and took the remaining row
+viewport. The next Enter reached the empty test shell. At 1000 × 767, the
+same shortcut sequence opened the pending approval. Dragging the horizontal
+scrollbar shifted the headers with the data. The scroll position persisted
+when the command replaced the Approval row. Moving the finished activity
+to the left preserved the answer and all 32 reported tokens. The Step divider
+resized, the headers stayed fixed during vertical scrolling, and Escape
+closed the keyboard-opened answer details.
+
+The model saw two requests per run. The only requests containing both exact
+output streams were the explicitly approved follow-ups. The shorter right
+dock's keyboard focus was addressed in the
+[compact retest below](#november-26-compact-right-log-table-keyboard-focus).
+Connection-specific overrides and deferred Windows tests remain open.
+
+The new regression reproduced the panic before the correction. It passed
+with the other 4,487 enabled application tests, and 203 tests were ignored.
+Formatting and strict application Clippy passed. The test applications,
+shells and loopback servers exited, the private scratch directories were
+removed, and the development profile was cleaned.
+
+- [Native crash backtrace](target/verification/20261126-docked-agent-log/baseline/gui-native.log)
+- [Regression on the original implementation](target/verification/20261126-docked-agent-log/baseline/regression.log)
+- [Bottom review after Resume](target/verification/20261126-docked-agent-log/final/bottom-resumed.jpg)
+- [Command output selected by keyboard](target/verification/20261126-docked-agent-log/final/bottom-keyboard-command-details.jpg)
+- [Short right dock with selection controls](target/verification/20261126-docked-agent-log/final/right-short-viewport-focus-loss.jpg)
+- [Right dock with visible approval details](target/verification/20261126-docked-agent-log/final/right-taller-approval-details.jpg)
+- [Answer and fixed heading in the left dock](target/verification/20261126-docked-agent-log/final/left-fixed-header.jpg)
+- [Model request stages](target/verification/20261126-docked-agent-log/final/wire-stages.json)
+- [Results and cleanup](target/verification/20261126-docked-agent-log/results.json)
+- [Evidence checksums](target/verification/20261126-docked-agent-log/evidence.sha256)
+
+## November 26 compact right Log Table keyboard focus
+
+The model usage summary now uses its compact scrollable height while a Log
+Table approval is pending. This leaves room for the table when selection
+adds Open details and Latest activity to the existing command review controls.
+
+On this Mac, the 1000 × 672 window with a 440-point right dock retained a
+row viewport after selection. Ctrl+Shift+F6, End and Enter opened Pending
+approval. The original shell prompt stayed on the same line. Escape closed
+the details. At this checkpoint, the horizontal scrollbar partly covered
+the last row immediately after End. The
+[subsequent keyboard reveal check](#november-26-log-table-keyboard-row-reveal)
+covers the correction.
+
+Pause kept the selected details and withdrew the direct approval buttons.
+Resume restored the buttons for the same command. Allow once ran the local
+fixture, and keyboard selection exposed its stdout and stderr. The loopback
+model received one request until the separate follow-up review was approved.
+The second request contained both exact output streams.
+
+The dock keyboard regression passed at a 395-point content height. All
+4,489 enabled application tests passed with 203 ignored, along with
+formatting and strict application Clippy. The test app, shell and loopback
+model exited. The scratch directory and development build were removed.
+
+- [Original short dock with no row viewport](target/verification/20261126-docked-agent-log/final/right-short-viewport-focus-loss.jpg)
+- [Keyboard-opened approval at the same height](target/verification/20261126-short-side-log/right-compact-approval-details.jpg)
+- [Selected row scrolled into view](target/verification/20261126-short-side-log/right-compact-selected-row-in-view.jpg)
+- [Paused approval](target/verification/20261126-short-side-log/right-compact-paused.jpg)
+- [Selected command output](target/verification/20261126-short-side-log/right-compact-command-output.jpg)
+- [Model request stages](target/verification/20261126-short-side-log/wire-stages.json)
+- [Results and cleanup](target/verification/20261126-short-side-log/results.json)
+- [Evidence checksums](target/verification/20261126-short-side-log/evidence.sha256)
+
+## November 26 Log Table keyboard row reveal
+
+The reveal operation now reserves the horizontal scrollbar height when the
+table overflows horizontally. It keeps the current horizontal scroll offset
+and moves the selected row vertically only as far as needed. The existing
+340 × 330 detached-table regression reproduced an eight-point overlap on
+the original implementation.
+
+The native 1000 × 672 terminal window with a 440-point right dock displayed
+the full pending Approval row above the bar immediately after End. Home
+and End kept the same headers visible after the scrollbar was dragged
+to the right. Enter opened the pending approval details. Allow once ran the
+fixture, and the follow-up model review held both output streams until the
+explicit send. The compact 943 × 564 Agent Design Settings window also
+opened the sample answer with the keyboard. The preview sent no model request.
+
+The detached-table regression passed after the correction. All 4,489
+enabled application tests passed with 203 ignored, along with formatting
+and strict application Clippy. Both private desktop fixtures exited and
+the scratch and development build files were removed.
+
+- [Regression on the original implementation](target/verification/20261126-log-row-reveal/baseline-regression.log)
+- [Passing detached-table regression](target/verification/20261126-log-row-reveal/regression.log)
+- [Complete Approval row after End](target/verification/20261126-log-row-reveal/right-dock-end-row.jpg)
+- [Home after horizontal scrolling](target/verification/20261126-log-row-reveal/right-dock-home-horizontal.jpg)
+- [End at the same horizontal position](target/verification/20261126-log-row-reveal/right-dock-end-horizontal.jpg)
+- [Sample answer in compact Settings](target/verification/20261126-log-row-reveal/settings-compact-example-answer.jpg)
+- [Model request stages](target/verification/20261126-log-row-reveal/wire-stages.json)
+- [Results and cleanup](target/verification/20261126-log-row-reveal/results.json)
+- [Evidence checksums](target/verification/20261126-log-row-reveal/evidence.sha256)
+
+## November 26 saved local Agent design overrides
+
+This Mac opened two saved local shell profiles through Quick Connect in
+one private app session. Both used their configured process isolation.
+One selected a custom Log Table design, and the other inherited the global
+Standard design. Ask Setup on the first source showed the right Log Table
+with its Setup phase. On the second source it showed the Standard activity
+bar below the terminal. Switching tabs restored the first source's Log
+Table while both Ask instances stayed open. The fixture received zero
+model requests.
+
+At this checkpoint, the process isolation summary partly overlapped the
+Local shell label beside the right dock. The follow-up tested the
+[terminal tab tooltip correction](#november-26-terminal-tab-isolation-tooltip)
+and [local design editing](#november-26-local-agent-design-editing).
+
+- [Saved local profiles in Quick Connect](target/verification/20261126-connection-design-native/saved-local-choices.jpg)
+- [Custom Log Table on the original source](target/verification/20261126-connection-design-native/saved-override-after-tab-switch.jpg)
+- [Inherited Standard on the second source](target/verification/20261126-connection-design-native/global-standard-on-source-terminal.jpg)
+- [Results and cleanup](target/verification/20261126-connection-design-native/results.json)
+- [Evidence checksums](target/verification/20261126-connection-design-native/evidence.sha256)
+
+## November 26 terminal tab isolation tooltip
+
+The isolation details in the earlier screenshot were a transparent tooltip
+below the hovered tab. Terminal tab tooltips now appear above the strip on
+a bordered, opaque background after a 500 ms hover. The tooltip retains the
+same isolation details as the original tab.
+
+On this Mac, the full isolation summary and the Local shell label were
+readable together at 1000 × 672, both with a full-width terminal and with
+the right Log Table open. The tooltip disappeared when the pointer left the
+tab. The saved profile still reported its own process isolation after the
+app restarted.
+
+- [Original tab tooltip over the shell label](target/verification/20261126-connection-design-native/saved-override-after-tab-switch.jpg)
+- [Hover over a full-width terminal tab](target/verification/20261126-terminal-tab-hint/hover-without-dock.jpg)
+- [Hover with the right Log Table](target/verification/20261126-terminal-tab-hint/hover-with-right-dock.jpg)
+- [Pointer away from the tab](target/verification/20261126-terminal-tab-hint/pointer-away.jpg)
+
+## November 26 local Agent design editing
+
+The native Connection Manager opened a saved local shell profile using
+Use default (Standard). Discarding a custom Log Table draft preserved
+inheritance in the editor and on disk. Saving the same choice recorded
+`custom-1` for that profile, preserved process isolation and kept the other
+profile and global Standard choice intact. After a process restart, the
+editor showed the saved choice and a fresh Ask on the reconnected shell
+rendered the right Log Table.
+
+Saving Use default again cleared the stored override. The already-open Ask
+retained its Log Table, and a new Ask in the same shell showed the Standard
+activity bar. These acceptance checks exercised Ask Setup with private local
+shells. The loopback model received no requests. A separate
+[stored SSH design check](#november-26-saved-ssh-agent-design) used a live
+SSH Run.
+
+All 4,489 enabled application tests passed with 203 ignored. Formatting
+and strict application Clippy passed. Both app processes, their local
+shells and the loopback fixture exited, and the scratch and development
+build files were removed.
+
+- [Custom design draft](target/verification/20261126-terminal-tab-hint/connection-custom-design-draft.jpg)
+- [Default after reopening the discarded draft](target/verification/20261126-terminal-tab-hint/connection-default-after-reopening.jpg)
+- [Saved choice after process restart](target/verification/20261126-terminal-tab-hint/connection-design-after-process-restart.jpg)
+- [Saved design on the source shell](target/verification/20261126-terminal-tab-hint/saved-design-and-tooltip-after-restart.jpg)
+- [Existing Ask after restoring inheritance](target/verification/20261126-terminal-tab-hint/existing-ask-retains-its-design.jpg)
+- [New Ask using Standard](target/verification/20261126-terminal-tab-hint/new-ask-uses-restored-standard.jpg)
+- [Results and cleanup](target/verification/20261126-terminal-tab-hint/results.json)
+- [Evidence checksums](target/verification/20261126-terminal-tab-hint/evidence.sha256)
+
+## November 26 saved SSH Agent design
+
+This Mac saved a custom Log Table design from the AI page of a private
+SSH profile using End and Enter in the design picker. The editor showed the
+same choice after an app restart. The saved profile connected with its
+fixture key to a loopback OpenSSH server with a pinned host key. The server
+recorded one public-key authentication, one PTY shell and two exec channels
+on the same connection.
+
+The custom right dock showed the live Run and its pending approval. The
+environment probe and first model request required separate approvals.
+Pause and Resume kept the print command pending. Allow once opened its
+SSH exec channel. The two exact output streams remained local until the
+follow-up model request was reviewed and sent. The finished run stayed in
+the Log Table. Clearing the override with Home and Enter restored the
+Standard activity bar for a new Ask in the same SSH pane.
+
+- [SSH design after app restart](target/verification/20261126-ssh-agent-design/ssh-design-after-process-restart.jpg)
+- [Live SSH Log Table](target/verification/20261126-ssh-agent-design/ssh-custom-design-in-live-terminal.jpg)
+- [Reviewed SSH output](target/verification/20261126-ssh-agent-design/ssh-reviewed-command-output.jpg)
+- [Separate review stages](target/verification/20261126-ssh-agent-design/stages.json)
+- [Return to Standard](target/verification/20261126-ssh-agent-design/ssh-standard-design-after-clearing-override.jpg)
+- [Results and cleanup](target/verification/20261126-ssh-agent-design/results.json)
+- [Evidence checksums](target/verification/20261126-ssh-agent-design/evidence.sha256)
+
+## November 26 Teamwork Agent design
+
+The Java 2.26.0 reference loads shared file entries as `ServerConnection`
+objects and resolves their `aiAgentDesignId` against the current design
+catalogue. The Rust Teamwork reader previously dropped that field. The
+Java-compatible XML reader now preserves well-formed design IDs,
+and a Teamwork Agent uses the reviewed shared connection's ID. A missing
+or locally unavailable design falls back to the global selection. The
+shared source stays read-only in Connection Manager.
+
+The fixture supplied the referenced custom combination in the Rust
+catalogue. Automatic migration of Java's global custom combinations
+and its default design ID retain separate acceptance cases.
+
+Three authenticated SSH panes on this Mac used the same private endpoint
+and username. The locally saved profile rendered its Log Table. A shared
+entry naming `custom-2` rendered the matching Side timeline. Another
+shared entry naming an unavailable ID rendered Standard. The native
+comparison covered Ask Setup and tab switching. These three panes sent
+no model requests. The separate saved SSH Run above covers reviewed
+command dispatch and output delivery. The final application build repeated
+the shared Timeline check through the authenticated SSH pane.
+
+The final macOS application suite passed 4,491 tests with 203 ignored.
+Formatting, strict application Clippy and the native build passed. The
+fixture app and server processes exited, their scratch directories were
+removed, and the development profile was cleaned.
+
+- [Java reference method and shared file adapter](target/verification/20261126-teamwork-agent-design/java-reference-design.txt)
+- [Shared XML with known and unknown design IDs](target/verification/20261126-teamwork-agent-design/teamwork-source.xml)
+- [Locally saved Log Table](target/verification/20261126-teamwork-agent-design/local-log-table-in-fixed-build.jpg)
+- [Shared Timeline](target/verification/20261126-teamwork-agent-design/teamwork-catalogue-timeline-applied.jpg)
+- [Standard fallback](target/verification/20261126-teamwork-agent-design/teamwork-unknown-id-falls-back-to-standard.jpg)
+- [Shared Timeline in the final build](target/verification/20261126-teamwork-agent-design/final-native/shared-timeline-final.jpg)
+- [Results and cleanup](target/verification/20261126-teamwork-agent-design/results.json)
+- [Evidence checksums](target/verification/20261126-teamwork-agent-design/evidence.sha256)
+
+## November 26 live Agent history docks on macOS
+
+Five native runs on this Mac used an owned local shell and a loopback
+model. Side Timeline, tmux and Conversation ran in the right dock.
+Card Stack and Plan and Execution ran in the bottom dock. Each case
+reviewed the fixed probe, the initial model request, its command and
+the follow-up model request. The fixture recorded one command execution
+and two model requests per case. Only the second request contained the
+exact stdout and stderr.
+
+Side Timeline preserved its pending command when paused and resumed in
+the Activity window. The Timeline approved the command once and showed
+the finished answer after being hidden and restored through View.
+Card Stack kept the command pending when the preceding card was in
+front and digit 1 went to the shell. After forward navigation and
+scrolling exposed the full approval, the same key approved the command.
+Plan and Execution and tmux accepted the pointer approval. In Conversation
+the clipped card stayed inert at 1000 × 672. Maximizing the window exposed
+the full card and enabled its numbered decision. Conversation showed
+both streams in the command's output detail.
+
+The first pass reproduced a layout defect in both bottom designs.
+The terminal had eight visible pixels of output height when the
+finished-run follow-up appeared below the expanded history. The live
+bottom dock now uses the space left after the terminal's outer controls
+are laid out. At the same 1000 × 672 window size, both corrected runs
+kept 100 pixels of visible terminal output before and after completion.
+The Plan and Execution retest also accepted terminal input with the
+answer and follow-up controls visible.
+
+The first layout revision also shrank the grid in the narrow Log Table
+regression fixture. The final implementation uses the measured space
+when the follow-up or sent-context controls are present. Both the narrow
+Log Table and finished-run layout regression tests passed.
+
+The final application suite passed 4,492 tests with 203 ignored.
+Formatting, strict application Clippy and the macOS build passed.
+The owned test apps, shells and loopback servers exited, and their
+scratch directories and the development build were removed.
+
+- [Approval and request stages](target/verification/20261126-docked-agent-histories/stages.json)
+- [Restored Side Timeline](target/verification/20261126-docked-agent-histories/timeline-restored.jpg)
+- [Card Stack with the preceding card](target/verification/20261126-docked-agent-histories/cards-earlier-key-guard.jpg)
+- [Plan and Execution command result](target/verification/20261126-docked-agent-histories/plan-execution-complete.jpg)
+- [Finished tmux pane](target/verification/20261126-docked-agent-histories/tmux-finished.jpg)
+- [Conversation output detail](target/verification/20261126-docked-agent-histories/conversation-output-detail.jpg)
+- [Clipped terminal before the bottom dock fix](target/verification/20261126-docked-agent-histories/plan-finished.jpg)
+- [Corrected Card Stack with the answer visible](target/verification/20261126-docked-agent-histories/final-native/cards-finished-scrolled.jpg)
+- [Corrected Plan and Execution with live terminal input](target/verification/20261126-docked-agent-histories/final-native/plan-terminal-input-and-followup.jpg)
+- [Before measurements](target/verification/20261126-docked-agent-histories/baseline-dimensions.json)
+- [After measurements](target/verification/20261126-docked-agent-histories/final-native/dimensions.json)
+- [Initial run results and cleanup](target/verification/20261126-docked-agent-histories/baseline-results.json)
+- [Final native results and cleanup](target/verification/20261126-docked-agent-histories/final-native/results.json)
+- [Application checks and evidence checksums](target/verification/20261126-docked-agent-histories/results.json) · [SHA-256 list](target/verification/20261126-docked-agent-histories/evidence.sha256)
+
+## November 26 AI Manager Profiles, wizard and model lists
+
+The compact native AI Manager on this Mac used a private profile, a
+loopback LM Studio-compatible HTTP fixture and a native CLI test executable.
+Picking Load models from settings search revealed the model form.
+Explicitly loading models sent the first request and offered two chat
+models. The private inventory also contained an embedding model.
+
+The first Escape dismissed the wizard connection-type picker. The
+second dismissed the wizard and preserved a name edit in the existing
+profile draft. A fresh wizard found the known loopback server, imported
+its two model choices, and tested the selected `owned/beta-chat` model
+against the exact compatible chat endpoint. Finish put the new profile
+in the draft. Save persisted both draft edits and retained the existing
+default profile. Restart reopened those saved profiles.
+
+The CLI profile displayed separate reviews for `ps --json` and
+`ls --json`. The fixture recorded one execution for each explicit
+approval and zero bytes of stdin in each process. The downloaded picker
+offered the chat model and filtered the embedding model. Selecting the
+chat model switched the draft to the explicit preset. Discard retained
+the previous saved CLI profile. A second run selected that model,
+reviewed the native executable and exact arguments, saved them, and
+reopened the explicit model after restart. Execution with an installed
+LM Studio retains a separate acceptance case.
+
+The first native pass found that Connection's scroll offset clipped
+the first row in Model after using a scan result near the bottom of the
+form. The wizard now scrolls to the top when Next or Back changes the
+step. At 760 × 522 including native window chrome, the same scan
+showed the complete first row after Next. Back reopened Connection at
+the top, and search revealed Available models without sending another
+request. Testing, saving and restarting the wizard-created profile
+also passed on the corrected build.
+
+The final macOS application suite passed 4,493 tests with 203 ignored.
+The focused AI Manager suite passed 441 tests, including the new
+navigation regression and the profile policy and quota regressions.
+Formatting, strict application Clippy and the native build passed.
+The private test processes, profiles and development build were removed.
+
+- [Search result without a request](target/verification/20261126-ai-manager-profiles/search-revealed-load-models.jpg)
+- [Wizard cancellation preserved the existing draft](target/verification/20261126-ai-manager-profiles/wizard-second-escape-preserves-draft.jpg)
+- [Private server scan](target/verification/20261126-ai-manager-profiles/wizard-local-scan-result.jpg)
+- [Successful connection test](target/verification/20261126-ai-manager-profiles/wizard-test-result.jpg)
+- [Saved profiles after restarting](target/verification/20261126-ai-manager-profiles/profiles-restored-after-restart.jpg)
+- [CLI downloaded-model review](target/verification/20261126-ai-manager-profiles/cli-ls-exact-arguments.jpg)
+- [Model step before the scroll fix](target/verification/20261126-ai-manager-profiles/wizard-model-from-scan.jpg)
+- [Model step after Next in the corrected build](target/verification/20261126-ai-manager-profiles/final-native/model-step-start.jpg)
+- [Connection step after Back](target/verification/20261126-ai-manager-profiles/final-native/connection-after-back.jpg)
+- [Search reveal in the corrected wizard](target/verification/20261126-ai-manager-profiles/final-native/wizard-search-reveal-model-field.jpg)
+- [Explicit CLI model after restart](target/verification/20261126-ai-manager-profiles/first-fix-native/cli-final-profile-after-restart.jpg)
+- [Baseline results and cleanup](target/verification/20261126-ai-manager-profiles/baseline-results.json)
+- [Final results and cleanup](target/verification/20261126-ai-manager-profiles/results.json)
+- [Evidence checksums](target/verification/20261126-ai-manager-profiles/evidence.sha256)
+
+## November 26 native transparency quick menu
+
+The focused native main window on this Mac accepted pointer clicks and
+dragging in View's Background Transparency control. A scrolled menu
+went from 60% to 33%, then to 0% and back to 60%. The menu stayed open and
+the private settings file matched the displayed value. The opaque window
+showed the new-window hint.
+
+A fresh process restored the saved 60% and used a transparent terminal
+surface. The same quick menu changed it live to 31% and persisted the
+result. An additional opaque restart accepted a direct click from 0%
+to 41%. The initial automated gestures made before confirming shell
+focus kept their prior values. Focusing the shell and retrying succeeded
+in both the opaque and transparent windows. The owned processes and
+private application copies were removed.
+
+- [Opaque window after a pointer click](target/verification/20261126-transparency-quick-menu/compact-confirmed-pointer-save.jpg)
+- [60% after process restart](target/verification/20261126-transparency-quick-menu/restarted-menu-with-saved-percentage.jpg)
+- [Live change to 31%](target/verification/20261126-transparency-quick-menu/focused-alpha-live-menu.jpg)
+- [Terminal background pixel samples](target/verification/20261126-transparency-quick-menu/pixels.json)
+- [Recorded settings stages](target/verification/20261126-transparency-quick-menu/stages.json)
+- [Results and cleanup](target/verification/20261126-transparency-quick-menu/results.json)
+- [Evidence checksums](target/verification/20261126-transparency-quick-menu/evidence.sha256)
+
+## November 26 global web provider credentials
+
+AI Manager General now has the three global credential fields and Clear
+controls from Java v2.26.0. The dedicated Save credentials action commits
+the provider changes in one encrypted vault write. Blank fields preserve
+values unless Clear is checked. The application settings file contains the
+integration defaults and no provider secrets. Tavily and Bright Data bind
+the selected vault revision to each review. Unattended grants are bound to
+the same revision. Brave Search still selects the installed LM Studio plugin
+and uses the plugin's own configuration.
+
+On the Apple Silicon desktop, the 840 × 570 and 980 × 640 AI Manager windows
+showed masked input, locked controls, searchable Clear actions, and blank
+placeholders after save. Discard preserved the stored keys and the exact vault
+ciphertext. Unlocking after restart restored all saved slots. Clearing Brave
+preserved Tavily and Bright Data. An unsaved Bright Data clear was discarded
+through the close dialog. A second restart confirmed all three committed
+clears. A managed Internet policy refused a pending save without changing
+the vault and made the fields read-only in the open dialog.
+
+Two separately approved native requests reached the loopback LM Studio
+fixture. The fixture verified the exact Tavily and Bright Data keys and fixed
+destinations in the respective integration parameters. The model input omitted
+the credentials and the result view filtered the deliberately echoed keys.
+Configured third-party services and adoption of Java encrypted keys remain
+open. Windows testing remains deferred.
+
+The full rerun exposed a test race where the shared release channel could
+wake the other direct web worker. The test now releases both workers before
+awaiting either reply. It passed 32 consecutive isolated repetitions.
+The final macOS application suite passed 4,485 tests with 203 ignored.
+The vault suite passed 18 tests with one ignored, and strict application
+Clippy passed. Owned app and shell processes, loopback servers and scratch
+profiles were removed, then the development build was cleaned.
+
+- [Verification results](target/verification/20261126-web-provider-credentials/results.json)
+- [Masked credential inputs](target/verification/20261126-web-provider-credentials/three-masked-edits.jpg)
+- [Search and keyboard Clear](target/verification/20261126-web-provider-credentials/brave-clear-by-keyboard.jpg)
+- [Persisted clears](target/verification/20261126-web-provider-credentials/clears-persist-after-restart.jpg)
+- [Loopback requests with source checks](target/verification/20261126-web-provider-credentials/loopback-wire.json)
+- [Vault checkpoints](target/verification/20261126-web-provider-credentials/profile-checks.json)
+- [Live policy denial](target/verification/20261126-web-provider-credentials/policy-retest/rejected-and-disabled.jpg)
+- [Evidence checksums](target/verification/20261126-web-provider-credentials/evidence.sha256)
+
+## November 25 reviewed web tools in native Agent Ask
+
+Java v2.26.0 sends Ask through its query-only decision path and uses the
+original task to determine whether to offer direct Tavily tools. Native
+standalone Ask now offers the same search and exact-page tools through the
+reviewed Run workflow. Its response still requires a done or blocked
+decision. The initial request kind, original task, profile, model transport
+and Internet policy determine whether the worker can offer tools.
+
+The Ask attachment check runs in the provider and model dispatch paths.
+An open review waits without rereading the attachment. The model transport
+reports whether it sent a request, so a refused continuation preserves token
+counters from the requests that did run. The stale-attachment regression
+checks that a refused continuation sends zero further HTTP requests and retains
+the initial 12 tokens.
+
+The real macOS app used a private profile and a hosted Ask tab in a
+1000 × 672 outer window. The model connected over loopback HTTP and the search
+and page providers used the debug fixture. In the first run, separate approvals
+returned an edited search query and an exact page URL with their respective
+excerpts under the original ordered call IDs. The app reported 24 tokens across
+the two model requests. A plain question offered no model tools. Cancelling
+another Ask while its search proposal was held sent no continuation. Four
+HTTP requests cover those three runs. The finished hosted activity view
+showed overlap at the boundary of the token line and the first activity row
+after scrolling. The final answer remained readable lower in the activity view.
+
+Configured provider acceptance remains open. All owned desktop processes and
+the fixture HTTP server exited before cleanup. Windows remains deferred.
+
+The final source passed formatting, strict application Clippy and the native
+dialog-preview build. The complete application suite passed 4,474 tests with
+203 ignored. It covered the stale-attachment and usage regression, reviewed
+Ask and Run tool declines, tool wire framing and compact Setup geometry.
+
+- [Ask request review](target/verification/20261125-agent-ask-web/ask-review.jpg)
+- [Edited search review](target/verification/20261125-agent-ask-web/ask-edited-query.jpg)
+- [Exact page review](target/verification/20261125-agent-ask-web/ask-page-exact-review.jpg)
+- [Finished answer and activity layout](target/verification/20261125-agent-ask-web/ask-answer-visible.jpg)
+- [Native model HTTP requests](target/verification/20261125-agent-ask-web/gui-model-wire.json)
+- [Desktop results](target/verification/20261125-agent-ask-web/gui-results.json)
+- [Application suite](target/verification/20261125-agent-ask-web/test-results.json)
+- [Evidence checksums](target/verification/20261125-agent-ask-web/evidence.sha256)
+
+## November 26 finished hosted Ask activity
+
+The native minimum-height review layout also applies to finished Agent tabs.
+This Mac repeated the hosted Ask case in a 1000 × 672 window using a loopback
+model and the debug provider fixture. Two model requests carried both
+individually approved results under their original ordered call IDs. The
+24-token line and first activity row were separate before scrolling and after
+scrolling the activity list. Scrolling the outer tab kept the answer, Export
+activity and Close reachable.
+
+- [Finished Ask before scrolling](target/verification/20261126-hosted-ask-activity/finished-ask-before-scroll.jpg)
+- [Activity list scrolled](target/verification/20261126-hosted-ask-activity/finished-ask-activity-scrolled.jpg)
+- [Outer tab scrolled](target/verification/20261126-hosted-ask-activity/finished-ask-outer-scrolled.jpg)
+- [Results and cleanup](target/verification/20261126-hosted-ask-activity/results.json)
+
+## November 25 reviewed web tools in native planning and triage
+
+Java v2.26.0 sends the original `User task:` through the Questions, Options and
+Report prompts and the initial Run complexity check. Native eligibility uses
+the reviewed original task and the typed stage. The three planning stages and
+Run triage use the existing edited-query or exact-page review and the separate
+masked-excerpt approval. Plan revalidates the route captured for its current
+stage. A complex triage response exposes the approach chooser, and choosing
+an approach opens the separate Run request review.
+[Java planning prompts](https://github.com/chardonnay/korTTY/blob/b235d91f20356f8a9b33ad5398550a043cc21ed2/src/main/java/de/kortty/core/TerminalAgentService.java#L3846-L3894) · [Java triage prompt](https://github.com/chardonnay/korTTY/blob/b235d91f20356f8a9b33ad5398550a043cc21ed2/src/main/java/de/kortty/core/TerminalAgentService.java#L1224-L1230)
+
+A hosted Plan on this Mac used a real loopback model and the debug web
+provider fixture. Questions returned an independently reviewed edit to the
+search query. Options returned a reviewed exact-page result. Report returned a
+decline and displayed the resulting plan with its separate implementation
+action. In the 1000 × 672 window, collapsing activity exposed the answer review
+and scrolling exposed Draft plan. Those controls still warrant a compact
+layout check with expanded activity.
+
+The first standalone triage run at 800 × 500 exposed clipped lower inputs and
+footer actions. The corrected dialog scrolls its body and keeps Pause, Cancel,
+Copy transcript and Close visible. After scrolling, the native retest entered
+a custom approach and additional instructions, then verified both in the masked
+Run draft. Cancelling the separate Run review sent no additional request.
+The final build recorded eight actual model requests across triage and the
+three planning stages, with an initial request and a reviewed continuation in
+each. Each continuation carried the original tool call ID. Both fixture
+process groups and the owned shells exited. Windows remains deferred.
+
+Formatting, strict application Clippy and the native dialog-preview build
+passed. The final application suite passed 4,477 tests with 203 ignored. It
+checks stale Plan authority, Triage handoff and the fixed footer at 1100 × 760,
+800 × 500 and 640 × 400. The desktop triage check covered 800 × 500. The
+fixture and test scratch directories and the development build were removed.
+
+- [Compact triage before correction](target/verification/20261125-agent-plan-web/before-compact-triage-fix/triage-approach-choice.jpg)
+- [Compact triage scrolled with fixed footer](target/verification/20261125-agent-plan-web/triage-approach-scrolled.jpg)
+- [Separate Run draft with chosen approach](target/verification/20261125-agent-plan-web/triage-next-run-request.jpg)
+- [Finished plan](target/verification/20261125-agent-plan-web/plan-report-complete.jpg)
+- [Model requests and approval checkpoints](target/verification/20261125-agent-plan-web/gui-model-wire.json) · [Counts](target/verification/20261125-agent-plan-web/wire-stages.json)
+- [Results and process cleanup](target/verification/20261125-agent-plan-web/results.json)
+- [Evidence checksums](target/verification/20261125-agent-plan-web/evidence.sha256)
+
+## November 25 reviewed web tools for interactive Swarm
+
+Java v2.26.0 creates an Agent request with the original Swarm query and the
+target's own session and profile. Advisory mode sets `queryOnly`; command
+mode follows the shared Agent decision path. Rust offers direct web tools
+for eligible advisory and command-review members after their own model
+review. Tool decisions and returned excerpts stay with that member and
+attempt. A pending proposal appears as Awaiting review in the roster.
+[Java member request and dispatch](https://github.com/chardonnay/korTTY/blob/b235d91f20356f8a9b33ad5398550a043cc21ed2/src/main/java/de/kortty/core/swarm/SwarmOrchestrator.java#L346-L389)
+
+The first compact desktop run held a proposal open on each of two targets.
+Both model workers waited for the reviewed results, so the second member's
+approved page request could not get a worker. Direct Tavily search and page
+requests now use a separate pool bounded to two workers. The same pool is
+used by the debug provider fixture on this desktop.
+[Reproduced worker contention](target/verification/20261125-swarm-model-web/before-direct-worker-fix/baseline-provider-workers-busy.jpg)
+
+The final app ran at 800 × 500 on this Mac with two owned local shells and a
+loopback model. While both advisory members waited, the second member loaded
+an exact webpage. Pause hid the loaded excerpts, and Resume restored them
+without a model request. Explicit release continued the second member alone.
+The first retained its original draft, accepted an edited search and separately
+returned its excerpts. In command-review mode, the user approved the fixed
+local probe and the separate model request, then declined the proposed page.
+The worker returned that decline and finished. Six loopback model requests
+record two approvals and one decline under the correct member call ID.
+The debug provider supplied the search and page excerpts. Windows remains
+deferred.
+
+Formatting, strict application Clippy and the native dialog-preview build
+passed. The application suite passed 4,479 tests with 203 ignored. The
+two-member regression replaces one terminal stream while its tool is held
+and verifies that member sends no continuation. A separate regression holds
+both model worker permits and verifies that both direct web workers can start
+and that a third is refused. The owned shells, app processes and loopback
+servers stopped before scratch removal and development cleanup.
+
+- [Both members awaiting their own review](target/verification/20261125-swarm-model-web/advisory-initial-model-reviews.jpg)
+- [Restored excerpts after Pause/Resume](target/verification/20261125-swarm-model-web/advisory-page-resumed.jpg)
+- [Completed second member and held first member](target/verification/20261125-swarm-model-web/advisory-second-done-first-held.jpg)
+- [Edited search approval](target/verification/20261125-swarm-model-web/advisory-edited-query-review.jpg)
+- [Command-review member outcome](target/verification/20261125-swarm-model-web/command-mode-final-status.jpg)
+- [Actual model HTTP requests](target/verification/20261125-swarm-model-web/gui-model-wire.json) · [Approval checkpoints](target/verification/20261125-swarm-model-web/wire-stages.json)
+- [Test results and cleanup](target/verification/20261125-swarm-model-web/results.json) · [Evidence checksums](target/verification/20261125-swarm-model-web/evidence.sha256)
+
+## November 25 direct model web-tool approval in JobScheduler
+
+Java v2.26.0 scheduled Swarm passes its reviewed task, profile and selected
+connections into the shared Swarm orchestrator. Rust's guided scheduled
+Agent and iterative Swarm now offer direct Tavily tools when the saved
+research approval explicitly enables them and the task is eligible. The
+option defaults to off, including on existing serialized grants. The
+published query or exact page URL, provider, target, firing and separate
+excerpt approval bind the result. Each target has two provider dispatches
+per firing, with an ordered error for tool calls beyond the budget. The
+existing structured lookup continues to use its own review.
+[Java scheduled Swarm dispatch](https://github.com/chardonnay/korTTY/blob/b235d91f20356f8a9b33ad5398550a043cc21ed2/src/main/java/de/kortty/jobscheduler/JobSchedulerAiSwarmSupport.java#L109-L132)
+
+In the 840 × 620 Scheduler on this Mac, the Agent fixture opted in and saved
+the approval. Its manual firing showed the exact URL and loaded the page
+before the separate excerpt approval. Changing the job to a one-minute
+schedule blocked the first scheduled start before any model request.
+After renewed approval, two actual calendar firings presented independent
+tool reviews. The first returned a decline and the second returned its
+reviewed page. The journal kept three successful runs and the blocked
+calendar start. The loopback model recorded nine requests. The provider
+used the debug fixture, and the owned SSH listener saw zero connections.
+The test job was disabled before the desktop and its shell were stopped.
+
+In a separate private profile, the scheduled run loaded the page and waited
+for excerpt approval. Replacing the saved model identifier closed the review,
+blocked the run and left the loopback model at its two initial requests.
+The journal identified the changed model profile. The second owned SSH
+listener also saw zero connections.
+
+The compact native iterative Swarm run used two owned local OpenSSH servers.
+Both targets completed their reviewed, fixed SSH probes and supplied the
+result only to their own model request. Both requests were waiting for web
+reviews when the first target loaded its page. Returning the page continued
+only that target. The second target received its own decline, even though the
+fixture reused the same model call ID for both targets. The saved Swarm report
+recorded both outcomes. Only the two fixed probes opened SSH sessions.
+
+Formatting, strict application Clippy and the final native build passed.
+The application suite passed 4,480 tests with 203 ignored. The scheduled
+model-tool regression verifies grant reload, separate request and excerpt
+reviews, the per-target budget, stale review identities and cancellation.
+The opt-in two-target OpenSSH regression also passed after the test fixture
+stopped sending server debug messages to command stderr. Owned processes
+and scratch directories were removed before development cleanup.
+
+- [Saved model-tool opt-in](target/verification/20261125-scheduler-model-web/native-explicit-tool-scope.jpg)
+- [Exact page confirmation](target/verification/20261125-scheduler-model-web/native-exact-url.jpg)
+- [Separate excerpt approval](target/verification/20261125-scheduler-model-web/native-excerpt-confirmation.jpg)
+- [Repeated calendar review](target/verification/20261125-scheduler-model-web/native-calendar-repeat.jpg)
+- [Calendar and manual run outcomes](target/verification/20261125-scheduler-model-web/gui-job-history.json)
+- [Model requests](target/verification/20261125-scheduler-model-web/gui-model-wire.json) · [Approval checkpoints](target/verification/20261125-scheduler-model-web/wire-stages.json)
+- [Profile change while excerpts were held](target/verification/20261125-scheduler-model-web/profile-revocation/held-excerpts-before-profile-change.jpg) · [Blocked outcome](target/verification/20261125-scheduler-model-web/profile-revocation/profile-revocation-details.jpg)
+- [Swarm second target's separate review](target/verification/20261125-scheduler-model-web/guided-swarm/target-two-review-after-first-completion.jpg) · [Two-target journal](target/verification/20261125-scheduler-model-web/guided-swarm/gui-job-history.json)
+- [Final checks and cleanup](target/verification/20261125-scheduler-model-web/results.json) · [Evidence checksums](target/verification/20261125-scheduler-model-web/evidence.sha256)
+
+## November 25 reviewed web tools for scheduled read-only Swarm
+
+The saved web-tool opt-in also covers guided read-only Swarm. Each advisory
+worker waits for its own exact query or page review and excerpt decision.
+The Scheduler revalidates the approved run, target, guidance, pinned route,
+profile and evidence before dispatch or continuation. The existing
+two-lookup budget is shared by the scheduled model-tool routes and applies
+per target and firing. The read-only worker executes its fixed SSH probe and
+accepts advisory completion or refusal from the model.
+
+The native 840 × 620 Scheduler on this Mac saved the web-tool opt-in and
+manually fired the reviewed job with two local OpenSSH endpoints. The
+loopback model received one public preflight request and one advisory
+request per target. Each advisory request contained only that target's
+Darwin probe output. Both workers waited for web review. Target 1 continued
+with its approved exact page and excerpts, and target 2 continued only
+after its separate decline. Both returned the original `scheduler-page`
+call ID under their own target scope. The journal retained two successful
+advisory results. Only the two fixed probes opened SSH sessions. Excerpts
+came from the debug provider fixture. Windows remains deferred.
+
+A second private desktop run disabled Internet access through the app's
+managed policy while target 1's page excerpts were held and target 2's
+review was still pending. Both reviews closed. The model request count
+stayed at three, including preflight. The journal recorded failed advisories
+with its generic model profile message. The follow-up below records the
+specific reason in the journal.
+
+Formatting, strict application Clippy and the native build passed. The
+application suite passed 4,481 tests with 203 ignored. Its read-only Swarm
+regression verifies grant reload, the exact page and excerpt reviews, the
+original tool call ID and rejection of a stale vault revision before provider
+dispatch. Both desktop fixture profiles, their applications and SSH processes
+were removed. Development cleanup reclaimed 3.7 GiB.
+
+- [Saved opt-in](target/verification/20261125-scheduler-read-only-web/read-only-opt-in.jpg)
+- [Exact page review](target/verification/20261125-scheduler-read-only-web/target-one-exact-page.jpg) · [Separate excerpts](target/verification/20261125-scheduler-read-only-web/target-one-excerpts.jpg)
+- [Target 2 held after target 1 continued](target/verification/20261125-scheduler-read-only-web/target-two-remains-held.jpg)
+- [Saved report](target/verification/20261125-scheduler-read-only-web/gui-job-history.json) · [Individual requests](target/verification/20261125-scheduler-read-only-web/gui-model-wire.json) · [Review checkpoints](target/verification/20261125-scheduler-read-only-web/wire-stages.json)
+- [Held excerpts before policy change](target/verification/20261125-scheduler-read-only-web/policy-revocation/held-excerpts-before-policy.jpg) · [Revocation results](target/verification/20261125-scheduler-read-only-web/policy-revocation/results.json)
+- [Results and cleanup](target/verification/20261125-scheduler-read-only-web/results.json) · [Evidence checksums](target/verification/20261125-scheduler-read-only-web/evidence.sha256)
+
+## November 25 scheduled read-only Swarm revocation reasons
+
+The advisory worker retains the first local authority failure for its target.
+The journal records a blocked outcome and the specific reason if Internet
+policy, the reviewed masking rules or the credential vault invalidate the
+web review. The wire permit preserves the reason when policy changes after
+excerpt approval but before the continuation. These messages come from local
+authority checks and exclude provider and model replies.
+
+The native Scheduler ran the same reviewed job twice with two owned OpenSSH
+targets. In each run, the first target had page excerpts ready for approval
+and the second target had an open review. The first run revoked Internet
+access and the second changed the masking rules. Both runs recorded the
+specific block for each target. The loopback model received six initial
+requests across the two runs, including both preflight requests. No
+continuations appeared after either change or after restoring the original
+settings. The page excerpts came from the debug provider fixture.
+
+The application suite passed 4,481 tests with 203 ignored. The read-only
+Swarm regression also covers a vault change before provider dispatch and
+an Internet-policy change between excerpt approval and the model permit.
+Formatting, strict application Clippy and the native build passed. The
+owned GUI, shell and four SSH sessions exited, the private profile was
+removed and development cleanup reclaimed 3.6 GiB. Windows remains deferred.
+
+- [Internet-policy journal details](target/verification/20261125-scheduler-web-revocation/internet-journal-details.jpg)
+- [Masking-policy journal details](target/verification/20261125-scheduler-web-revocation/mask-journal-details.jpg)
+- [Saved target reports](target/verification/20261125-scheduler-web-revocation/gui-job-history.json) · [Model request counts](target/verification/20261125-scheduler-web-revocation/wire-stages.json)
+- [Results and cleanup](target/verification/20261125-scheduler-web-revocation/results.json) · [Evidence checksums](target/verification/20261125-scheduler-web-revocation/evidence.sha256)
+
+## November 26 saved Agent web-tool offering preference
+
+AI Manager exposes the Java v2.26.0 setting in General / Internet access.
+It defaults to off. Eligible Agent requests with a direct Tavily profile
+offer web tools on ordinary task text when the preference is enabled.
+Scheduled jobs still require their saved model-tool opt-in. Each exact
+provider request and its returned excerpts retain separate approvals.
+
+Saving an effective change advances a revision bound to the eligible direct
+profile's review authority. Saving the previous value again cannot restore
+an older approval. Profiles without supported direct tools retain their
+existing revisions. Java migration fills an unset preference, including an
+explicit Java off value, and preserves an explicit native choice.
+
+On this Mac, AI Manager search and the Space key reached and changed the
+checkbox. Discard left the saved value unset. Save and app restart retained
+the enabled setting. At 800 × 500, the same local build task reached the
+loopback model without tools at default off and with `web_search` and
+`web_extract` after enabling. Disabling the saved preference while excerpts
+were held stopped the run. The original review stayed closed after restoring
+the preference. The model received two requests and zero continuations.
+
+The final build checked installed Internet policy in the open Manager and
+on reopening it. Mouse and keyboard attempts left the saved choice and
+revision unchanged while the policy was in effect. Removing it restored
+editing. At 800 × 500, the final app sent the same task without tools after
+saving off and offered both tools after saving on. The model continued only
+after both tools were separately declined and received their original call
+IDs. Provider results came from the debug fixture.
+
+The final native application suite passed 4,483 tests with 203 ignored,
+including Java preference migration, policy recheck at Save, Ask and Run
+requests, guided Scheduler Agent and read-only Swarm. Formatting, strict
+application Clippy and the native build passed. All owned GUI processes and
+shells exited, both fixture profiles were removed and development cleanup
+reclaimed 3.7 GiB. Windows remains deferred.
+
+- [Search result](target/verification/20261126-agent-web-offer/search-finds-agent-web-offer.jpg) · [After discard](target/verification/20261126-agent-web-offer/internet-after-discard.jpg) · [After restart](target/verification/20261126-agent-web-offer/internet-preference-after-restart.jpg)
+- [Held excerpts](target/verification/20261126-agent-web-offer/enabled-excerpts-held.jpg) · [Revoked review](target/verification/20261126-agent-web-offer/web-review-revoked-without-continuation.jpg)
+- [Model request bodies](target/verification/20261126-agent-web-offer/gui-model-wire.json) · [Saved preference stages](target/verification/20261126-agent-web-offer/stages.json)
+- [Live managed policy](target/verification/20261126-agent-web-offer/policy-lock/live-policy-denies-toggle.jpg) · [After reopening](target/verification/20261126-agent-web-offer/policy-lock/policy-lock-after-reopen.jpg) · [Final build requests](target/verification/20261126-agent-web-offer/policy-lock/gui-model-wire.json)
+- [Results and cleanup](target/verification/20261126-agent-web-offer/results.json) · [Evidence checksums](target/verification/20261126-agent-web-offer/evidence.sha256)
+
+## November 26 saved temporary-key editor and isolated reconnect
+
+On this Apple Silicon desktop the application test connected to a private,
+loopback OpenSSH server with a pinned host key and a saved temporary login.
+The server accepted the original fingerprint and the terminal received the
+fixture shell marker. The test then opened the saved connection through
+Connection Manager and ran the editor's Paste private key and Save handlers
+with a disposable key on the application-internal test clipboard.
+
+The connection settings stored a new vault reference and kept the expiry
+and automatic-selection settings. Reopening the encrypted vault confirmed
+the old entry was removed and the new entry resolved for the exact host,
+port and account. The server then authorized only the replacement public
+key. Reconnect kept the same tab, opened a new session through the isolated
+SSH worker and received the shell marker. OpenSSH accepted the replacement
+fingerprint. The connection file contained no private key material.
+The test now releases the first vault handle before reopening it for disk
+verification.
+
+The restored-project OpenSSH test also passed. It connected after vault
+unlock with the expected imported key. After the one-minute key expired,
+the test confirmed that the pane stayed disconnected and required sign-in.
+
+The native editor separately displayed the locked temporary-key status in
+an isolated GUI profile. The test profile awaited manual entry and Save.
+It was shut down with the saved connection unchanged. The GUI process, its
+shell, the listener and the private directory were removed. The later
+[desktop follow-up](#november-26-native-saved-ssh-key-replacement-and-expiry)
+verified manual replacement and reconnect after expiry. Windows remains deferred.
+
+Formatting, strict application Clippy and the native debug build passed.
+The complete application run passed 4,493 tests with 204 regular skips.
+Four opt-in tests passed separately. The first full run started the test
+binary directly, and a journal fixture using a disposable home could not
+resolve `rustc`. The successful rerun used Cargo with the installed compiler
+specified explicitly.
+
+- [OpenSSH editor and reconnect result](target/verification/20261126-manual-replacement-key/loopback-editor.log)
+- [Saved-key SSH and SFTP result](target/verification/20261126-manual-replacement-key/saved-key-transport.log)
+- [Restored project and expired-key result](target/verification/20261126-manual-replacement-key/project-expiry.log)
+- [Desktop editor](target/verification/20261126-manual-replacement-key/editor-before-handoff.jpeg)
+- [Desktop cleanup](target/verification/20261126-manual-replacement-key/gui-cleanup.json)
+- [Application tests](target/verification/20261126-manual-replacement-key/application-tests.log)
+- [Results](target/verification/20261126-manual-replacement-key/results.json) · [Evidence checksums](target/verification/20261126-manual-replacement-key/evidence.sha256)
+
+## November 26 Quick Connect temporary keys on macOS
+
+On this Apple Silicon desktop the test submitted the SSH and SFTP forms
+through Quick Connect's application handlers. It used generated keys on the
+application-internal test clipboard and a pinned OpenSSH loopback server.
+The server rejected the first SSH key. The retry form initially retained its
+one-minute lifetime. After its actual expiry, the form kept the temporary-key
+method selected and required a new paste before Connect became available.
+The replacement authenticated with the expected fingerprint and the terminal
+received the fixture shell marker.
+
+The SFTP form authenticated with the expected fingerprint and listed the
+owned server directory. The listing contained the expected file and byte
+count. Both successful routes were session-only. The private profile had
+no saved connection or vault after the test. Existing preference tests cover
+invalidation of late pastes and disposal of key material when the option is
+disabled in Quick Connect or an SSH retry.
+
+The native desktop started at 750 × 730 with the option disabled. The
+Security page discarded a first opt-in edit and saved a second. After
+restart, Quick Connect at 700 × 400 displayed the temporary-key method,
+the Paste action and the 15-minute default. The lifetime field accepted
+one minute, and switching from SSH to SFTP retained the draft. Escape
+returned focus to the owner. A fresh dialog showed the 15-minute default.
+Saving the disabled setting removed the method and its controls on the
+next open. That desktop run used empty credential fields throughout.
+[The native paste follow-up](#november-26-native-quick-connect-paste-and-retry) covers desktop submission.
+
+The native debug build, formatting, strict application Clippy and all
+4,493 enabled application tests passed. The suite reported 205 regular
+skips. The OpenSSH test ran separately. The two app processes and the
+owned shell exited, the private profile was removed, and the development
+build was cleaned. Windows remains deferred.
+
+- [OpenSSH and one-minute expiry run](target/verification/20261126-quick-connect-temporary-key/openssh-expiry.log)
+- [Compact SFTP form](target/verification/20261126-quick-connect-temporary-key/compact-temporary-sftp.jpeg)
+- [Fresh compact draft](target/verification/20261126-quick-connect-temporary-key/compact-fresh-draft.jpeg)
+- [Compact form after disabling](target/verification/20261126-quick-connect-temporary-key/compact-temporary-option-removed.jpeg)
+- [Results](target/verification/20261126-quick-connect-temporary-key/results.json) · [Evidence checksums](target/verification/20261126-quick-connect-temporary-key/evidence.sha256)
+
+## November 26 native Quick Connect paste and retry
+
+The production debug application ran on this Apple Silicon desktop with a
+private profile and two pinned OpenSSH loopback listeners. The macOS
+pasteboard held generated fixture keys during the Paste action. The app
+showed only that a private key was ready. The SFTP form accepted a
+five-minute lifetime, authenticated, and listed the 34-byte fixture file.
+OpenSSH rejected the first SSH key. The native retry retained the temporary
+method and its eight-minute lifetime. Cancel in a second window's Settings
+preserved both. Saving the disabled preference removed the key and method
+and retained the retry's host, port and username.
+
+The original retry lost its temporary-key method even after saving the
+enabled preference. The retry now retains the fact that the previous
+attempt used a temporary key. Disabling still clears the key material and
+pending paste. Re-enabling makes the method selectable with an empty key
+field. A regression test exercises a late pre-disable paste and a fresh
+paste in the reopened method.
+
+The corrected build repeated both live routes. The retry offered the method
+after re-enabling it in Settings with 960 × 620 client bounds. The original
+endpoint remained visible. The empty form showed the 15-minute default
+and disabled Connect. Pasting a fresh key enabled Connect. OpenSSH accepted
+the expected fingerprint and the terminal printed the fixture shell marker.
+The private connection store stayed byte-for-byte equal to its starting
+state, the vault was absent, and the desktop pasteboard was restored after
+the three fixture pastes. The application, shells and private listeners
+exited and their scratch directories were removed. Windows remains deferred.
+
+The regression passed in the macOS binary suite. The native debug build,
+format check and application suites passed with 4,495 binary tests and
+31 library tests. The binary suite reported 207 regular skips.
+
+- [Original missing method after re-enable](target/verification/20261126-quick-connect-native-paste/ssh-authentication-methods-reenabled.jpg)
+- [Corrected method and empty key field](target/verification/20261126-quick-connect-native-paste/final/ssh-retry-key-required.jpg)
+- [Authenticated SSH terminal](target/verification/20261126-quick-connect-native-paste/final/ssh-terminal-marker.jpg)
+- [SFTP directory listing](target/verification/20261126-quick-connect-native-paste/final/sftp-listing.jpg)
+- [Results](target/verification/20261126-quick-connect-native-paste/results.json) · [Evidence checksums](target/verification/20261126-quick-connect-native-paste/evidence.sha256)
+
+## November 26 native Spotlight focus and profile selection
+
+The ordinary macOS application opened View → AI Agent Panel → Ask in
+Spotlight from the local terminal. Typing worked immediately. Escape closed
+an unsent draft, and the next input ran in the original shell. Two Up
+presses recalled both seeded prompts. Two Down presses restored the typed
+draft. Tab and the arrow keys selected the second of two configured local
+profiles. Tab returned to prompt mode. Return opened the 800 × 500 Setup
+with the same text and selected profile.
+
+After approval of the fixed local environment probe, Activity showed the
+masked request. Pausing disabled Send and Resume restored the same request.
+Both private loopback listeners had received zero requests through Resume.
+Explicit Send produced one request at the second profile's endpoint with
+the expected model and exact goal. The fixture's response appeared in the
+original terminal after closing Activity. A reopened Spotlight recalled
+the submitted goal. Selecting a profile with the pointer gave focus back
+to the prompt for editing, and Escape prevented another request. The saved
+history contained the submitted goal and the two seeded entries.
+
+The native debug build and formatting check passed. The four macOS
+Spotlight application tests passed in the previous suite for this working
+tree. The fixture application, shell and listeners stopped and the private
+test profile was removed. Windows remains deferred.
+
+- [Keyboard-selected profile](target/verification/20261126-native-spotlight-profile/spotlight-selected-profile.jpg)
+- [Compact Setup](target/verification/20261126-native-spotlight-profile/spotlight-compact-setup.jpg)
+- [Paused model review](target/verification/20261126-native-spotlight-profile/spotlight-model-review-paused.jpg)
+- [Finished answer and recalled prompt](target/verification/20261126-native-spotlight-profile/spotlight-recalled-submitted-goal.jpg)
+- [Results](target/verification/20261126-native-spotlight-profile/results.json) · [Evidence checksums](target/verification/20261126-native-spotlight-profile/evidence.sha256)
+
+## November 26 Plan and Execution decisions and detached history
+
+The native macOS debug build used a private shell and one loopback model.
+In the d06 bottom dock, the first numbered decision with a clipped card
+left the command pending and entered the digit in the shell. Clearing the
+shell line and expanding the dock exposed the full card. The next digit 1
+approved one command execution. The panel showed Exit 0, duration, stdout
+and stderr. The follow-up model call waited for explicit release. An
+earlier Activity dismissal in the same test stopped its pending run without
+executing a command.
+
+With d06 inside d19, the native detached window accepted digit 1, displayed
+both output streams and showed the final answer after the separate request
+review. Attach returned that answer to the original terminal. Both runs
+passed with their own private profile, with animations on and with reduced
+motion. The capture recorded the progress bar at 500 pixels while the
+command ran and at 666 pixels with the completed check. That capture gap
+missed intermediate frames. The [following compositor run](#november-26-native-plan-and-execution-motion-frames)
+recorded the intermediate motion and the reduced-motion completion frame.
+
+The reduced-motion run then detached and folded the finished history.
+Starting a second Run on the same stream kept the same native window
+number and 460 × 68 frame. Unfolding showed the second Run's pending probe.
+Digit 2 while folded left the probe pending. Closing the second Activity
+returned the folded window to the finished run without a new model
+request. Unfolding restored its answer and Attach returned it to the
+original terminal.
+
+The native debug build and formatting passed. The three Plan and Execution
+tests passed in the previous application suite with the same debug binary
+checksum. The three app processes, their shells, and the private listener
+stopped. Their scratch data and the development build were removed.
+Windows remains deferred.
+
+- [Clipped dock guard](target/verification/20261126-plan-execution-native/dock-clipped-digit-in-shell.jpg)
+- [Expanded dock approval](target/verification/20261126-plan-execution-native/dock-complete-numbered-review.jpg)
+- [Detached command result](target/verification/20261126-plan-execution-native/pip-animated-command-complete.jpg)
+- [Same detached window follows the second run](target/verification/20261126-plan-execution-native/pip-follow-second-run-in-same-window.jpg)
+- [Original final answer restored](target/verification/20261126-plan-execution-native/pip-follow-original-answer-restored.jpg)
+- [Results](target/verification/20261126-plan-execution-native/results.json) · [Evidence checksums](target/verification/20261126-plan-execution-native/evidence.sha256)
+
+## November 26 native Plan and Execution motion frames
+
+The same macOS desktop repeated the detached d06 approval and command in
+both motion modes. A temporary debug capture copied only the private
+840 × 420 test window's Tiny-Skia buffer at each successful native present.
+The capture left the app's layout, presenter and redraw scheduling in use.
+The recorded patch and before-and-after checksums identify the capture
+hook. The tracked compositor was restored byte for byte after building.
+
+The animated run captured 47 presented frames. The progress trace moved
+from 501 to 668 pixels through seven measured intermediate lengths. Two
+partially drawn check strokes preceded the full stroke. The reduced-motion
+run captured 18 frames. Its first presented completion frame had the same
+final bar length and full check mark as the settled frames. Both runs used
+auto-hide set to zero. Their selected command ran once in each private
+shell, and the separately reviewed follow-up contained both output
+streams. The raw buffers, test profiles, processes and development build
+were cleaned. Windows remains deferred.
+
+- [Animated first check stroke](target/verification/20261126-native-plan-motion-frames/pip-animated-first-check.png)
+- [Reduced-motion first completion frame](target/verification/20261126-native-plan-motion-frames/pip-reduced-first-check.png)
+- [Frame measurements](target/verification/20261126-native-plan-motion-frames/frame-analysis.json)
+- [Results](target/verification/20261126-native-plan-motion-frames/results.json) · [Evidence checksums](target/verification/20261126-native-plan-motion-frames/evidence.sha256)
+
+## November 26 native cursor decisions and SSH takeover
+
+The production macOS debug application used an isolated profile and shell
+integration with real Zsh prompts. With animations on, digit 1 during the
+probe's reveal made the entire probe visible. A fresh digit 1 approved the
+probe. A separate review released the first model request. During the
+first command's reveal, the same first-press and fresh-press sequence ran
+the command once. Digit 3 dismissed the next command. A fresh digit 1
+then appeared in the original shell. Only the first command wrote a
+receipt, and the run sent no second model request.
+
+With reduced animations, the first sampled ordinary review showed the
+complete command. Digit 2 approved two ordinary commands, each of which
+ran once. A separate outbound review carried both exact outputs. With
+per-command confirmation enabled, digit 3 held the review and stayed out
+of the shell. Digit 1 approved the first command and digit 2 dismissed
+the second. An additional local review verified Tab takeover, editing and
+clearing with no command receipt or follow-up request.
+
+The pinned OpenSSH session authenticated with a generated key and used
+the verified remote prompt and working directory. Digit 1 approved the
+fixed SSH probe. The selected command then appeared at the original
+cursor. Tab inserted it into that prompt and stopped the Agent run.
+The draft accepted edits and could be cleared. The SSH server's request
+log stayed byte-for-byte equal from before Tab through clearing. The
+interactive shell and the fixed probe were the only two requests. The
+draft produced no execution receipt and no model follow-up.
+
+The debug build and formatting passed on this Mac. The earlier suite
+with the same debug binary checksum passed the cursor renderer and
+keyboard tests. The [native dismissal follow-up](#november-26-native-cursor-dismissal-frames)
+verified the intermediate frames. The private application instances, shells, and listeners
+exited and their scratch data and development build were removed.
+Windows remains deferred.
+
+- [Partially revealed command](target/verification/20261126-native-cursor-review/animated-command-revealing.jpg)
+- [Full command after the first digit](target/verification/20261126-native-cursor-review/animated-command-revealed.jpg)
+- [Per-command numeric decision](target/verification/20261126-native-cursor-review/per-command-three-consumed.jpg)
+- [Edited SSH draft](target/verification/20261126-native-cursor-review/ssh-tab-edited.jpg)
+- [Results](target/verification/20261126-native-cursor-review/results.json) · [Evidence checksums](target/verification/20261126-native-cursor-review/evidence.sha256)
+
+## November 26 native cursor dismissal frames
+
+Two private Zsh runs on this macOS desktop showed a reviewed d14 command
+and dismissed it with Escape. A temporary debug hook captured the
+1000 × 640 terminal window's backing buffer for each successful native
+present. It used the normal Tiny-Skia render path. The hook was removed
+after building and the tracked compositor matched its original checksum.
+
+With animations enabled, the command appeared in intermediate frames
+at approximately 38% and 17% of its original measured contrast and then
+disappeared. With reduced animations, the first captured frame after
+Escape had zero command contrast. Each case recorded only the reviewed
+initial model request and the command wrote no execution receipt. The
+earlier desktop case verified that a fresh digit reached the shell after
+dismissal.
+
+The workstation's native-event posting preflight reported unavailable.
+The automated test that passes repeated key events to the actual cursor
+widget remains green in the previous macOS suite. A physically held
+keyboard key on this desktop remains outstanding. The fixture processes,
+raw buffers, private profiles and development build were cleaned.
+Windows remains deferred.
+
+- [Intermediate fade frame](target/verification/20261126-native-cursor-fade/animated-intermediate.png)
+- [Cleared reduced-motion state](target/verification/20261126-native-cursor-fade/reduced-settled.png)
+- [Measured frame contrast](target/verification/20261126-native-cursor-fade/fade-analysis.json)
+- [Results](target/verification/20261126-native-cursor-fade/results.json) · [Evidence checksums](target/verification/20261126-native-cursor-fade/evidence.sha256)
+
+## November 26 native detached archived Ask handoff
+
+The macOS debug application sent two explicitly reviewed Ask requests
+from the same private Zsh terminal to a loopback model. The alpha and
+beta results were distinct. The folded d19 window kept its native
+identity and its 300 × 68 frame while following the second result.
+Opening the title menu expanded the frame height to 228 pixels. Escape
+and Copy answer restored the original frame. The clipboard helper
+verified and restored the preceding pasteboard after each successful
+copy.
+
+Closing Alpha's hosted Activity archived the first Ask run. The terminal
+context menu reopened it from the finished runs list. The same detached
+window copied the exact Alpha response. Closing the reopened Activity
+returned the unchanged folded window to Beta. Copy answer confirmed the
+exact Beta response. The initial archival copy attempt had focused the
+owner window. The application action that raises the floating history
+made its native menu available for the successful copy.
+
+The reopened Alpha answer also opened in AI Chat with its original
+question. The live Beta Ask then became an AI Chat tab with its own
+question and answer. That handoff returned the same folded window to
+the reopened Alpha run. Attach restored the folded panel in the source
+terminal. Closing the last eligible Ask Activity after detaching again
+removed the second native window. The model received only the original
+two reviewed Ask requests throughout the archive and Chat operations.
+
+The macOS debug build and format check passed. The private app, shell,
+clipboard helpers and model listener exited. Their scratch data and the
+development build were removed. Windows remains deferred.
+
+- [Expanded folded menu](target/verification/20261126-native-archived-ask/ask-folded-menu-expanded.jpg)
+- [Archived Alpha reopened](target/verification/20261126-native-archived-ask/ask-alpha-archive-restored.jpg)
+- [Live Beta question and answer in AI Chat](target/verification/20261126-native-archived-ask/ask-beta-live-handoff-chat.jpg)
+- [Detached Alpha after the Beta handoff](target/verification/20261126-native-archived-ask/ask-alpha-restored-after-beta-chat.jpg)
+- [Results](target/verification/20261126-native-archived-ask/results.json) · [Evidence checksums](target/verification/20261126-native-archived-ask/evidence.sha256)
+
+## November 26 native Adaptive Dock countdown and zero auto-hide
+
+This macOS desktop ran three reviewed Ask requests against a private
+loopback model. Adaptive Dock showed its Powerline in the original
+terminal. With the auto-hide preference set to eight seconds, the native
+timer shrank normally with animations enabled and changed in whole-second
+steps with reduced animations. The frame sample measured 33 distinct
+ring areas in the animated case and eight in the reduced case. The
+countdown disappeared at the deadline, followed by the animated status
+fade or the reduced-motion hide.
+
+With auto-hide set to zero and reduced motion enabled, the finished
+Powerline remained visible past 10.6 seconds and the timer region stayed
+empty throughout the capture. The View command hid and restored the
+status manually. Splitting the original terminal to the right switched
+the run to the compact pill in the left pane. The new right pane had no
+Agent status. Activity window opened the exact finished Ask from the
+pill. Closing the extra pane brought the wide Powerline back. View,
+resize and Activity actions produced no additional model requests.
+
+The production macOS debug build and formatting passed. The private
+applications, shells and loopback listener exited. The scratch images
+and development build were removed. Windows remains deferred.
+
+- [Animated countdown](target/verification/20261126-native-adaptive-countdown/animated-countdown-middle.jpg)
+- [Reduced countdown](target/verification/20261126-native-adaptive-countdown/reduced-countdown-middle.jpg)
+- [Zero auto-hide after the control deadline](target/verification/20261126-native-adaptive-countdown/zero-after-deadline-control.jpg)
+- [Compact pill in its source split](target/verification/20261126-native-adaptive-countdown/zero-narrow-split.jpg)
+- [Results](target/verification/20261126-native-adaptive-countdown/results.json) · [Evidence checksums](target/verification/20261126-native-adaptive-countdown/evidence.sha256)
+
+## November 26 native Toast expiry and Orbit motion
+
+The production debug application on this Mac used a private Zsh shell
+and reviewed loopback requests. With auto-hide zero, ordinary Toast
+timers shrank with animations on and held their full width with reduced
+motion. The sampled ordinary notices had cleared by 4.44 and 4.16 seconds,
+respectively, after the recorded model requests. The pending review was
+still available more than six seconds after each request. Its Review
+button opened the corresponding Activity. Both runs stopped without a
+command execution or another model request.
+
+The animated Orbit with a side Timeline and reduced Orbit with a bottom
+Log Table each executed one approved local command and held its output
+for separate review. The Orbit drawer opened and closed in both layouts.
+Copy output on the command step produced the same 41 bytes of stdout and
+stderr in the system pasteboard for both layouts. The clipboard helper
+restored the preceding pasteboard after each copy. The reduced-motion
+drawer was scrollable above the bottom Log Table and opened the correct
+step menu after the terminal area was enlarged.
+
+Desktop screenshot collection waited for stable output during the moving
+Orbit. The follow-up captured the ring region from each successful native
+Tiny-Skia present while the same eight-second command ran in a matched
+side Timeline layout. The animated case showed 124 distinct ring states
+in 125 sampled running frames. In the reduced-motion case, the annulus was
+pixel-identical across all 68 sampled running frames. The compositor
+capture was temporary. The tracked file matched its original checksum
+after building. The next run covered the short drawer and Toast transitions
+and native Orbit movement through Pause/Resume.
+
+The debug builds and formatting passed. The private application instances,
+shells, clipboard helpers, and loopback listeners exited. The scratch data,
+raw frames and development build were removed. Windows remains deferred.
+
+- [Ordinary Toasts during a pending review](target/verification/20261126-native-toast-orbit/toast-animated-ordinary-visible.jpg)
+- [Review retained after Toast expiry](target/verification/20261126-native-toast-orbit/toast-reduced-held-review.jpg)
+- [Orbit step menu above the Log Table](target/verification/20261126-native-toast-orbit/orbit-reduced-step-menu.jpg)
+- [Running animated ring](target/verification/20261126-native-toast-orbit/motion/orbit-animated-running-2.png)
+- [Running reduced ring](target/verification/20261126-native-toast-orbit/motion/orbit-reduced-running-2.png)
+- [Results](target/verification/20261126-native-toast-orbit/results.json) · [Evidence checksums](target/verification/20261126-native-toast-orbit/evidence.sha256)
+
+## November 26 native Toast and Orbit transitions
+
+On this Mac, a temporary frame capture recorded successful Tiny-Skia
+presents in the normal application windows. With animations on, ordinary
+Toasts slid in, faded, and collapsed. The pending review remained
+available after the ordinary notices cleared and opened the correct Agent
+Activity. The reduced-motion run showed the settled notices and their
+removal without intermediate slide or fade frames. The fixture received
+one reviewed model request per Toast run. Neither Toast run executed the
+proposed command.
+
+An Orbit with a side Timeline opened and closed its step drawer after
+completing the approved fixture command in each motion mode. The capture
+included two intermediate reveal frames and five intermediate close
+frames with animations enabled. The reduced-motion capture went directly
+between the same open and closed drawer states.
+
+A separate animated run paused the agent while the approved fixture command
+was running. The Orbit annulus had 28 distinct sampled states before Pause, one across
+44 frames during Pause, and 39 distinct states after Resume. The native
+Paused label and Resume controls were visible during the hold. The matched
+reduced-motion run showed one annulus state in each of its three sampling
+windows. In both runs the completed output stayed in review until the
+second model request was explicitly approved. The loopback fixture
+verified stdout and stderr together in that request.
+
+The temporary compositor capture was reverted and matched its original
+checksum. The instrumented debug build and formatting check passed. The
+owned application, shell and loopback processes exited and the scratch
+directories and development build were removed. Windows remains deferred.
+
+- [Toast entry](target/verification/20261126-native-status-transitions/toast-animated-290ms.png) · [Fade](target/verification/20261126-native-status-transitions/toast-animated-4460ms.png) · [Notice space before collapse](target/verification/20261126-native-status-transitions/toast-animated-4660ms.png) · [Review after collapse](target/verification/20261126-native-status-transitions/toast-animated-after-expiry.jpg)
+- [Orbit reveal](target/verification/20261126-native-status-transitions/orbit-animated-open-intermediate.png) · [Orbit close](target/verification/20261126-native-status-transitions/orbit-animated-close-intermediate.png) · [Reduced drawer frames](target/verification/20261126-native-status-transitions/orbit-reduced-drawer-analysis.json)
+- [Paused on the Mac](target/verification/20261126-native-status-transitions/animated-pause/orbit-animated-paused.jpg) · [Animated annulus samples](target/verification/20261126-native-status-transitions/animated-pause/orbit-animated-flight-analysis.json) · [Reduced annulus samples](target/verification/20261126-native-status-transitions/orbit-reduced-flight-analysis.json) · [Evidence checksums](target/verification/20261126-native-status-transitions/evidence.sha256)
+
+## November 26 mixed tagged Java backup restore
+
+The signed Java v2.26.0 macOS ARM64 package produced an AES-256 archive on
+this Mac through `BackupManager.createBackup`. The private fixture supplied
+connections, two folder paths, a stored SSH credential, a missing credential
+reference, two security preferences and three Scheduler jobs. The source
+used generated test values and the Java repository's Scheduler XML structure.
+The archive, reference package and source revision are recorded by checksum.
+
+Rust inspected the archive, reviewed the password binding, queued the
+additive restore and applied it through the startup profile lease. The new
+vault entry retained the expected account and host scope. The queued files
+carried the new native vault data in its sealed form.
+The fresh profile contained two connections, two folder levels and three
+disabled imported jobs. The colliding profile kept the existing route and
+its tunnels, the local folder isolation, the local job and a vault password
+with matching metadata and a different value. The review reported the job
+ID conflict and the dependent job's missing prerequisite. The independent
+job imported disabled. The global security settings entered the Security
+page as proposals.
+
+A repeat import initially offered an identical stored password again.
+The importer now checks the saved credential's scope, metadata and value
+before adding a standalone password again. New route bindings still use the
+reviewed vault transaction. Reimporting the tagged archive preserved the
+vault, connection catalogue, Scheduler store and settings bytes in both
+profiles. A regular Java password restore regression covers the same
+repeat-import behavior.
+
+On the native desktop, both Security suggestions remained pending until
+chosen with Use Java setting and saved. The fresh profile showed the
+temporary-key option enabled and Own process isolation after restart.
+The colliding profile discarded the same proposals and reopened with its
+local values. JobScheduler displayed the three disabled imports in the
+fresh profile. It displayed the enabled local job and one disabled import
+in the colliding profile. Connection Manager showed the local tunnel, the
+imported folder and the Vault password method for the reviewed route.
+
+The native debug build, formatting, strict application Clippy and all 4,493
+enabled application tests passed. The suite reported 206 regular skips.
+The tagged mixed-archive test ran separately. All owned desktop instances
+and shells exited. The private archives and profiles were removed, and the
+development build was cleaned. Windows remains deferred.
+
+- [Tagged Java producer and checksum](target/verification/20261126-java-mixed-restore/java-provenance.json)
+- [Mixed restore and replay](target/verification/20261126-java-mixed-restore/mixed-restore.log)
+- [Initial repeat-import regression](target/verification/20261126-java-mixed-restore/baseline-duplicate-password.log)
+- [Saved Security settings after restart](target/verification/20261126-java-mixed-restore/fresh-java-settings-after-restart.jpeg) · [Security settings after Cancel](target/verification/20261126-java-mixed-restore/collision-java-settings-after-cancel.jpeg)
+- [Restored job list](target/verification/20261126-java-mixed-restore/fresh-jobs-after-restore.jpeg) · [Job list with a local conflict](target/verification/20261126-java-mixed-restore/collision-jobs-after-restore.jpeg)
+- [Connection Manager](target/verification/20261126-java-mixed-restore/collision-imported-primary-binding.jpeg)
+- [Results](target/verification/20261126-java-mixed-restore/results.json) · [Evidence checksums](target/verification/20261126-java-mixed-restore/evidence.sha256)
+
+## November 26 native macOS recurring file transfers
+
+This Apple Silicon desktop ran the application with a private profile and a
+loopback OpenSSH server pinned to its generated host key. A native rsync
+3.5.2 executable was built in scratch from the retained source archive.
+The JobScheduler review showed the program digest, source, vacant local
+receiver, pinned route and one-minute Calendar schedule in Europe/Berlin.
+The review allowed six firings for one day with up to eight entries, 8,192
+bytes and zero deletions per firing.
+
+After Approve recurring firings and Save, the first real Calendar occurrence
+published 42 bytes at the vacant path. The next occurrence published 59
+bytes and retained the first receiver with its original file identity and
+contents. A substitute with those same 59 bytes and a different identity
+blocked the next Calendar run. This left the substitute in place. The local
+review then identified that existing file and its exact byte count.
+
+The desktop interaction also started an extra Run with successors after
+reviewing the substitute. That run published 61 bytes and retained the
+substitute. The following Calendar attempts blocked on the newly changed
+receiver. A separate review of the 61-byte file followed by Save allowed
+the next actual Calendar occurrence to publish 64 verified bytes and retain
+the 61-byte receiver. The journal records the distinct triggers and outcomes.
+
+Five separate native OpenSSH SFTP tests passed. They cover Calendar upload
+and download budgets with replacement, plus Chain upload and download after
+a fresh predecessor. A separate ordinary rsync test passed the vacant file
+publication, repeat replacement after reopening the Scheduler runtime,
+substitute refusal and refreshed approval for Calendar and Chain triggers.
+The Chain predecessor ran successfully over pinned OpenSSH. The initial
+Chain fixture had configured the predecessor as a wrapped script. Its
+restricted test command dispatcher required a plain command. The accepted
+test uses the plain `true` command over the same reviewed route.
+
+The native build, formatting, strict application Clippy and all 4,493
+enabled application tests passed, with 207 regular skips. Six opt-in
+OpenSSH tests ran separately. The owned app and test processes exited, the
+listeners and private run directories were removed, and the development
+build was cleaned. Windows remains deferred.
+
+- [First native review](target/verification/20261126-native-recurring-transfers/gui-recurring-vacancy-review.jpeg) · [Second Calendar run](target/verification/20261126-native-recurring-transfers/gui-second-calendar-journal.jpeg)
+- [Blocked substituted receiver](target/verification/20261126-native-recurring-transfers/gui-shifted-receiver-blocked.jpeg) · [Renewed Calendar result](target/verification/20261126-native-recurring-transfers/gui-final-renewed-calendar-success.jpeg)
+- [Initial publication and receiver identities](target/verification/20261126-native-recurring-transfers/gui-calendar-observations.json) · [Renewed approval and identities](target/verification/20261126-native-recurring-transfers/gui-renewed-calendar.json)
+- [rsync Calendar and Chain integration](target/verification/20261126-native-recurring-transfers/recurring-rsync.log)
+- [SFTP Calendar tests](target/verification/20261126-native-recurring-transfers/calendar-sftp.log) · [SFTP Chain test](target/verification/20261126-native-recurring-transfers/chain-sftp.log)
+- [Results](target/verification/20261126-native-recurring-transfers/results.json) · [Evidence checksums](target/verification/20261126-native-recurring-transfers/evidence.sha256)
+
+## November 26 native rsync backpressure and interrupted download
+
+The initial macOS interruption fixture exposed a transfer failure before the
+test could stop the sender. The application failed on an uninterrupted
+2,097,152-byte download over the same reviewed route. Direct rsync over
+OpenSSH transferred the complete file from the same source. The native
+client diagnostic recorded premature EOF after 8,235 or 16,427 protocol
+bytes. The last confirmed 52-byte receiver retained its file identity,
+contents and mode through those failures.
+
+The Unix rsync launcher now requests blocking I/O for the remote-shell
+descriptors that the native bridge uses. The bridge can wait for the rsync
+receiver to drain a full socket buffer. The retained Calendar and Chain
+regression fixture now downloads 2 MiB on the second firing and compares
+the complete receiver and recovery copy.
+
+On this Apple Silicon Mac, the corrected build ran three real Calendar
+occurrences after one approval in the native Scheduler. The first published
+52 bytes. During the second, the fixture stopped the owned rsync 3.5.2
+sender with `SIGKILL` after 262,144 bytes had reached the private local rsync
+stage. The Scheduler recorded failure. The raw stage and reviewed receiver
+stage were removed, and the confirmed 52-byte receiver kept its identity,
+checksum and `0600` mode. The third occurrence used the same approval and
+published all 2,097,152 bytes from the same source. The original file kept its
+identity, checksum and mode in the recovery folder. The fixture's final stage
+check was adjusted after it matched that recovery folder. The on-disk check
+confirmed that the folder contained only the retained original.
+
+The native test covers interruption of an ordinary sender during a local
+download. Application crash and restart recovery and forced termination of
+the protected Linux helper remain open.
+
+The native Calendar and Chain regression and six additional OpenSSH rsync
+checks passed. The test server selects the same rsync installation as the
+client and uses the built helper for directory upload. An initial full-suite
+run under the longer rsync scratch path reached the Unix-domain socket path
+limit in two Control tests. The short scratch path passed all 4,493 enabled
+application tests, with 207 regular skips. Formatting and strict application
+Clippy passed. The private fixtures and development build were cleaned.
+
+- [Baseline Scheduler result and receiver identity](target/verification/20261126-rsync-native-interruption/baseline-large.json) · [Native client diagnostic](target/verification/20261126-rsync-native-interruption/baseline-client-rsync.log)
+- [Calendar approval](target/verification/20261126-rsync-native-interruption/approval-review.jpeg) · [Interrupted firing](target/verification/20261126-rsync-native-interruption/gui-interrupted-calendar.jpeg) · [Next successful firing](target/verification/20261126-rsync-native-interruption/gui-next-calendar-success.jpeg)
+- [Sender exit, journal and file identities](target/verification/20261126-rsync-native-interruption/observations.json)
+- [Calendar and Chain regression](target/verification/20261126-rsync-native-interruption/final-recurring-rsync.log) · [Six native rsync checks](target/verification/20261126-rsync-native-interruption/final-ordinary-rsync.log)
+- [Results and cleanup](target/verification/20261126-rsync-native-interruption/results.json) · [Evidence checksums](target/verification/20261126-rsync-native-interruption/evidence.sha256)
+
+## November 26 native saved SSH key replacement and expiry
+
+This Apple Silicon Mac opened a private saved SSH connection over pinned
+loopback OpenSSH in its own process. The native Connection Manager's
+Paste private key button accepted a disposable key. Discard draft returned to
+the Connection Manager and left the connection file and encrypted vault
+byte-for-byte unchanged. Saving the second paste kept the 60-minute lifetime
+and automatic selection. An independent check of a vault copy verified the
+exact replacement, removal of the original, and rejection for a different
+port. The connection file held a vault reference.
+
+The first native reconnect kept the same tab and process isolation after
+the server switched to the replacement public key. After an app restart and
+vault unlock, the saved replacement was selected and the server accepted the
+same fingerprint. A one-minute saved credential authenticated before expiry.
+After expiry, the original dialog still displayed Saved key selected and an
+enabled Connect button. Submission was rejected before opening an SSH socket
+and a third, freshly pasted key restored the session.
+
+The corrected SSH form checks the unlocked vault for the exact login and
+updates while a referenced key is valid. It showed the locked state with
+Connect disabled, offered the saved key after unlock, and disabled Connect
+when the key expired with that same form open. A disabled-button click opened
+no SSH socket. Pasting a new key enabled Connect, and OpenSSH accepted the
+replacement in an isolated process. Reopening Connect in the disconnected
+tab again showed the expired reference as unavailable. A fresh paste restored
+the isolated session in the same tab.
+
+The focused regression, both native OpenSSH regressions, formatting, strict
+application Clippy and all 4,494 enabled application tests passed. The suite
+had 207 regular skips. The fixtures restored the desktop clipboard, stopped
+their own processes and listeners, and removed both private profiles and the
+development build. Windows remains deferred.
+
+- [Discarded replacement draft](target/verification/20261126-saved-key-native-editor/editor-replacement-draft.jpeg) · [Verified discard](target/verification/20261126-saved-key-native-editor/cancel-result.json)
+- [Encrypted vault verification](target/verification/20261126-saved-key-native-editor/vault-verification.log) · [Authenticated sessions across restart and expiry](target/verification/20261126-saved-key-native-editor/baseline-authentication.json)
+- [Baseline expired key still selected](target/verification/20261126-saved-key-native-editor/expired-key-submit.jpeg) · [Corrected live expiry](target/verification/20261126-saved-key-native-editor/fixed/expired-while-form-is-open.jpeg) · [Corrected isolated reconnect](target/verification/20261126-saved-key-native-editor/fixed/fresh-key-same-isolated-tab.jpeg)
+- [Results and cleanup](target/verification/20261126-saved-key-native-editor/results.json) · [Evidence checksums](target/verification/20261126-saved-key-native-editor/evidence.sha256)
+
+## November 26 guided Agent and iterative Swarm web revocation
+
+The native 840 × 620 Scheduler on this Apple Silicon Mac approved a guided
+Agent and a two-target iterative Swarm with per-tool web review enabled. The
+iterative Swarm ran its fixed probes over two pinned loopback OpenSSH routes.
+The loopback model proposed a different public webpage for each target. The
+debug provider supplied the page excerpts.
+
+The baseline blocked both iterative targets after Internet access was revoked
+or the reviewed masking changed. The Internet result identified the web
+restriction, while the masking result used a general policy message. The
+model authority check now names a changed mask when its comparison fails.
+
+The corrected build repeated both changes in the iterative Swarm, with
+excerpts held for one target and the other target's review still open. The
+guided Agent was tested with a pending draft during Internet revocation and
+held excerpts during a masking change. Each of the four manually started
+firings closed its reviews and persisted the specific blocked reason. The
+model recorded ten requests across the four firings, including preflights,
+and the count stayed fixed at each revocation and policy restoration.
+
+A fresh iterative run after restoration waited for both approvals. Returning
+the excerpts for target 1 continued that target. Declining target 2 sent its
+own decline. The journal recorded two successful results and the two model
+continuations carried the expected target IDs and tool call ID. Only the
+three iterative firings opened SSH sessions, one fixed probe per target per
+firing. These checks used owned endpoints and a provider fixture on this Mac.
+
+- [Baseline masking reason](target/verification/20261126-iterative-swarm-revocation/mask-result.json) · [Corrected iterative Swarm masking report](target/verification/20261126-iterative-swarm-revocation/fixed/swarm-mask-result.json)
+- [Guided Agent Internet revocation](target/verification/20261126-iterative-swarm-revocation/fixed/agent-internet-result.json) · [Guided Agent masking journal](target/verification/20261126-iterative-swarm-revocation/fixed/agent-mask-journal.jpg)
+- [Fresh run with separate target decisions](target/verification/20261126-iterative-swarm-revocation/fixed/fresh-run-result.json) · [Loopback model requests](target/verification/20261126-iterative-swarm-revocation/fixed/model-wire.json)
+
+### November 26 Scheduler research topic keyboard focus
+
+On the baseline, typing the first character in an empty Scheduler research
+topic moved keyboard focus. The next two key presses left the field at `P`.
+The fresh-draft checkbox now keeps a stable position in the widget tree as
+the topic changes, so rebuilding the form preserves the field's focus.
+
+The native 840 × 620 guided Agent setup and 1360 × 800 iterative Swarm
+setup both accepted three separate key presses in the empty field, followed
+by a full topic. Select All and Backspace cleared the topic, and typing
+again worked without clicking the field. Save persisted `Portable recovery
+docs` and `Portable Swarm docs` exactly in the respective disabled jobs.
+The two focus checks produced zero model requests and zero SSH probes.
+
+The final source passed the native debug build, formatting, strict
+application Clippy and 4,494 application tests, with 207 ignored. The two
+focused Scheduler model-tool tests and the opt-in two-target OpenSSH test
+also passed. The four desktop fixtures ended their owned processes, closed
+their loopback endpoints and removed their private profiles. The development
+build was cleaned. Configured provider and Windows checks remain open.
+
+- [Baseline focus loss](target/verification/20261126-iterative-swarm-revocation/fixed/topic-after-more-keystrokes.jpg)
+- [Compact guided Agent after three key presses](target/verification/20261126-iterative-swarm-revocation/focus-compact/topic-three-keys.jpg) · [Saved compact topic](target/verification/20261126-iterative-swarm-revocation/focus-compact/result.json)
+- [Full-size iterative Swarm after three key presses](target/verification/20261126-iterative-swarm-revocation/focus-normal/topic-three-keys.jpg) · [Saved full-size topic](target/verification/20261126-iterative-swarm-revocation/focus-normal/result.json)
+- [Results and cleanup](target/verification/20261126-iterative-swarm-revocation/results.json) · [Evidence checksums](target/verification/20261126-iterative-swarm-revocation/evidence.sha256)
+
+## November 26 Java global web credential migration
+
+The signed Java v2.26.0 macOS package wrote three synthetic credentials
+through its EncryptionService and GlobalSettingsManager. Its BackupManager
+produced an AES-256 ZIP with `global-settings.xml` and `master.key`. This Mac
+opened that ZIP through File → Import Backup in the native Rust app.
+
+The locked destination requested a vault unlock. Entering the archive password
+in the Java master-password field showed an error and cleared the field. The
+correct password offered Tavily and Brave Search for import and kept the
+existing Bright Data slot. Merge prepared the exact encrypted destination
+vault for restart. At this point the destination ciphertext was unchanged.
+The pending transaction contained neither the input passwords nor any
+plaintext fixture credential.
+
+A managed Internet denial installed after review stopped the import at
+startup. The pending record and current vault retained their exact digests.
+Removing that owned test policy allowed the original import to finish on the
+next startup. AI Manager reported three saved slots after unlock. An
+independent vault read compared all three exact values, including the original
+Bright Data token. Opening the same backup again offered no new slots and
+reported all three as preserved. Cancelling the repeated review created no
+pending restore.
+
+In the final build at 600 × 420, a policy already in force during review
+reported zero additions, one preserved local slot and two blocked fields.
+The reason and Cancel stayed visible. The exact encrypted vault was
+unchanged after cancellation. These checks cover backup migration.
+Configured provider dispatch and Windows verification remain open.
+
+The final source passed the native debug build, formatting, strict
+application Clippy, both focused migration regressions, all 4,494 enabled
+application tests and all 18 enabled vault tests. The owned processes,
+temporary profiles and extracted package copy were removed, and the
+development build was cleaned.
+
+- [Signed Java producer and archive](target/verification/20261126-java-global-provider-migration/java-provenance.json)
+- [Wrong source password](target/verification/20261126-java-global-provider-migration/wrong-java-master-rejected.jpg) · [Reviewed additions and preserved slot](target/verification/20261126-java-global-provider-migration/review-two-new-one-preserved.jpg)
+- [Managed denial at startup](target/verification/20261126-java-global-provider-migration/managed-policy-block-at-restart.jpg) · [Three saved slots](target/verification/20261126-java-global-provider-migration/three-provider-credentials-restored.jpg) · [Repeated review](target/verification/20261126-java-global-provider-migration/replay-keeps-three-local-slots.jpg)
+- [Final compact policy review](target/verification/20261126-java-global-provider-migration/compact-final-policy-review.jpg)
+- [Results and cleanup](target/verification/20261126-java-global-provider-migration/results.json) · [Evidence checksums](target/verification/20261126-java-global-provider-migration/evidence.sha256)
+
+## November 26 Java backup schedule and retention on macOS
+
+The signed Java v2.26.0 package produced an AES-256 backup with a Daily
+schedule, unlimited retention, a foreign backup folder and credential
+reference, and prior backup timestamps. Native Rust Import Backup reviewed
+that ZIP and applied it on restart. Global Settings showed Daily and
+`0 = unlimited` at 1120 × 1080. The destination, credential, and progress
+records were empty, and the dialog requested a native destination.
+
+A manual encrypted backup established the comparison archive. This Mac
+then selected an owned folder and a locally enrolled ZIP archive password
+in the Backup settings. The application wrote an automatic backup after
+120.6 seconds from the saved-configuration checkpoint. It recorded the
+successful automatic run and moved the previous ciphertext byte for byte
+into `old-backups`. Both ZIPs authenticated and contained five snapshot
+files, with 150,121 authenticated snapshot bytes each. The native Import
+Backup preview separately authenticated the new archive.
+
+After changing the native retention to seven and turning the schedule off,
+the same Java backup was reviewed and merged again. A restart preserved the
+exact native settings file, progress file and both archive digests. The
+860 × 600 dialog showed the retained settings and scrolled to the local
+folder and last backup without hiding Cancel or Save. Cancel returned to
+the owner window. The native build and 310 backup-filtered application
+tests passed, with three ignored. The owned processes, extracted package
+copy, private profile, generated backups and development build were removed.
+Windows remains deferred.
+
+- [Signed Java package and source values](target/verification/20261126-java-backup-schedule-preferences/java-provenance.json)
+- [Adopted preferences after restart](target/verification/20261126-java-backup-schedule-preferences/daily-unlimited-after-adoption.jpg) · [Automatic backup result and rotation](target/verification/20261126-java-backup-schedule-preferences/automatic-result.json)
+- [Native archive preview](target/verification/20261126-java-backup-schedule-preferences/automatic-native-archive-preview.jpg) · [Retained local schedule and history](target/verification/20261126-java-backup-schedule-preferences/compact-local-path-and-progress-after-replay.jpg)
+- [Results and cleanup](target/verification/20261126-java-backup-schedule-preferences/results.json) · [Evidence checksums](target/verification/20261126-java-backup-schedule-preferences/evidence.sha256)
+
+## November 26 Java ASCII Art settings and clipboard on macOS
+
+The signed Java v2.26.0 package wrote an AES-256 backup with Extra large
+for AI Picture, Small for Image File, slash comments, Python output, and a
+copy gap of four. The native Rust import applied the backup on restart. At
+780 × 620, the two size controls were independent and the imported Python
+choice took precedence. The AI Picture check covered the size control.
+
+The native Image File tab rendered an owned 80 × 40 PNG at Small. Copy to
+Clipboard produced 558 bytes across ten lines. The Java package's
+AsciiArtCopySupport produced the same bytes from the native raw preview
+and the source format settings, including Python's precedence over the
+slash comment. The clipboard probe restored the previous pasteboard after
+each capture.
+
+The native dialog saved Large for AI Picture, Medium for Image File,
+and a hash comment with a zero gap. After another import of the same
+backup and restart, the native preferences file was byte-for-byte
+identical. At 690 × 440, the preview scrolled while Copy and Close remained
+reachable. Copy included all 16 rendered lines and matched the Java
+formatter's 987 bytes from the same Medium preview. Close returned focus
+to the owner window. The native build and all 18 focused ASCII Art tests
+passed. The owned processes, private profile, extracted package, generated
+PNG and development build were removed. Windows remains deferred.
+
+- [Signed Java package and input settings](target/verification/20261126-java-ascii-art-migration/java-provenance.json)
+- [Imported AI size](target/verification/20261126-java-ascii-art-migration/fresh-ai-xl.jpg) · [Small PNG with Python selected](target/verification/20261126-java-ascii-art-migration/small-png-render-and-python-style.jpg) · [Captured Python output](target/verification/20261126-java-ascii-art-migration/fresh-python.txt)
+- [Compact replay and scrolling](target/verification/20261126-java-ascii-art-migration/compact-scrolled-preview.jpg) · [Captured zero-gap comment](target/verification/20261126-java-ascii-art-migration/replay-hash.txt)
+- [Results and cleanup](target/verification/20261126-java-ascii-art-migration/results.json) · [Evidence checksums](target/verification/20261126-java-ascii-art-migration/evidence.sha256)
+
+## November 26 Java Snippet Workspace adoption and replay on macOS
+
+The signed Java v2.26.0 package wrote an AES-256 backup with three snippets,
+four tab references, and a library divider at 43.0%. The last reference
+was active. This Mac imported the backup into a disposable Rust profile
+containing an identical snippet with a different native ID and a
+same-name snippet with different source.
+
+The restored state contained two tabs in the archived order. The direct
+tab used the converted Java UUID. The active second tab used the ID of
+the identical native snippet. The missing reference and the divergent
+same-name source did not open tabs. The native 1280 × 820 manager showed
+both restored sources and the adopted divider. Opening the divergent
+snippet by keyboard showed the original local source.
+
+Dragging the divider saved 34.5%. The native session then kept only the
+local snippet. Merging the same Java backup again and restarting preserved
+the exact session and library files and the new divider preference. At
+860 × 560, the native manager opened the retained tab with its local
+source. Close returned to the owner window. The native build, nine
+Java-snippet regressions and 142 Snippet Window tests passed. All owned
+processes, private profiles, archive copies and the development build
+were removed. Windows remains deferred.
+
+- [Signed Java package and archive inputs](target/verification/20261126-java-snippet-workspace-migration/java-provenance.json) · [Restored identities](target/verification/20261126-java-snippet-workspace-migration/initial-adoption.json)
+- [Two restored tabs and active selection](target/verification/20261126-java-snippet-workspace-migration/native-restored-tabs.jpg) · [Dragged divider](target/verification/20261126-java-snippet-workspace-migration/native-divider-drag.jpg)
+- [Local source and session after replay](target/verification/20261126-java-snippet-workspace-migration/compact-replayed-session.jpg)
+- [Results and cleanup](target/verification/20261126-java-snippet-workspace-migration/results.json) · [Evidence checksums](target/verification/20261126-java-snippet-workspace-migration/evidence.sha256)
+
+## November 26 Java Snippet Library metadata and interaction on macOS
+
+The signed Java v2.26.0 package wrote an AES-256 backup with 31 snippets,
+column widths and per-snippet statistics. This Mac imported that backup
+into a private profile with a saved 176 px Name column. It kept that
+width and filled the ten other widths from Java. Creation, modification
+and last-used timestamps, counts and favorites for the three named test
+entries matched the original records.
+
+At 1280 × 820, the native manager showed the favorite first and the
+remaining test entries in descending usage order. Name cycled through
+ascending, descending and default. Uses descending put 8, 2 and 1 in
+order. Scrolling down reached the last row with the table header visible.
+Horizontal scrolling exposed the rightmost metadata. The Open findings
+filter hid the fixture rows, which had no analysis reports.
+
+Dragging widened Language from 113 to 153 px. The row context menu set
+both marked entries as favorites. Copy resolved wrote the exact owned
+snippet text and updated its usage from two to three and its last-used
+timestamp. The clipboard probe restored the previous pasteboard. Dragging
+a row into the owned local folder moved exactly one snippet.
+
+After merging the same Java archive again and restarting, the library
+file matched byte for byte and the local widths were preserved. At
+860 × 560, horizontal scrolling exposed the updated statistics, and
+scrolling the folder list exposed the folder with its one moved snippet.
+Close returned to the owner window. The native build and 405
+snippet-filtered application tests passed, with five ignored. All owned
+processes, the private profile, the test ZIP, the extracted reference
+copy and the development build were removed. Windows remains deferred.
+
+- [Signed Java package and archive inputs](target/verification/20261126-java-snippet-library-migration/java-provenance.json) · [Adopted widths and statistics](target/verification/20261126-java-snippet-library-migration/adoption.json)
+- [Default order](target/verification/20261126-java-snippet-library-migration/library-default-import-order.jpg) · [Header during vertical scroll](target/verification/20261126-java-snippet-library-migration/library-vertical-scroll-header.jpg) · [Batch favorite action](target/verification/20261126-java-snippet-library-migration/library-marked-row-menu.jpg)
+- [Usage after copy](target/verification/20261126-java-snippet-library-migration/library-uses-after-copy.jpg) · [Compact usage and favorites after replay](target/verification/20261126-java-snippet-library-migration/compact-replay-uses.jpg) · [Moved snippet after replay](target/verification/20261126-java-snippet-library-migration/compact-replay-folder-member.jpg)
+- [Results and cleanup](target/verification/20261126-java-snippet-library-migration/results.json) · [Evidence checksums](target/verification/20261126-java-snippet-library-migration/evidence.sha256)
+
+## November 26 saved Snippet Analysis filters on macOS
+
+The native Snippet Manager loaded eight owned entries with six valid
+saved report files, one unsupported report and one entry without a
+report. At 1760 × 820, Analysis status sorted pending review first,
+followed by the unsaved result, two open findings, Applied, Clean,
+Unavailable and the entry with no report.
+
+Open findings showed three rows, including the retained unsaved result.
+Stale analyses initially showed one row. Pending reviews showed two rows.
+One had an older proposed change behind a newer clean report. The other
+had an accepted change that had yet to be saved in the snippet.
+
+Saving edited source through the editor immediately added that snippet to
+Stale analyses. The snippet kept its ID, and the other seven entries and
+all seven report files matched their original data. At 860 × 560 after
+restart, all three filters returned the expected rows. Horizontal
+scrolling exposed both stale status cells. Close returned to the owner.
+
+The compact pass exposed a layout issue with the version slider. At
+860 × 560, wrapped actions could consume the source editor's space.
+At the 620 × 380 minimum size, the library buttons could use the entire
+space available to the folder tree and list. The compact editor now
+scrolls with its secondary actions and keeps Save and Close visible.
+The short library action group has an independent scroll area.
+
+The final macOS build opened a two-version snippet in the compact window.
+It accepted an edit and kept the Save button available while scrolling
+to Full-code analysis. After restart at the minimum size, the saved
+third version was visible. The two Stale analyses rows and the lower
+library actions were reachable by scrolling their own areas. Close
+returned to the owner. A second restart at 1760 × 820 confirmed the
+full-height editor and both pending review rows. The saved snippet
+library and the seven report files matched byte for byte at both restarts.
+
+The final native development build and 406 snippet-filtered application
+tests passed, with five ignored. The layout regression measured the
+versioned source and library list at both compact sizes. Formatting and
+the Git diff check passed. All owned processes and private directories
+were removed, and the development profile was cleaned. Windows remains
+deferred.
+
+- [All report statuses](target/verification/20261126-snippet-analysis-filter-status/normal-all.jpg) · [Analysis status sort](target/verification/20261126-snippet-analysis-filter-status/status-sorted.jpg) · [Pending reviews](target/verification/20261126-snippet-analysis-filter-status/normal-pending.jpg)
+- [Stale membership after Save](target/verification/20261126-snippet-analysis-filter-status/stale-after-live-edit.jpg) · [Stale statuses after compact restart](target/verification/20261126-snippet-analysis-filter-status/compact-stale-status.jpg) · [Saved source and report checksums](target/verification/20261126-snippet-analysis-filter-status/gui-results.json)
+- [Compact Save and stale membership](target/verification/20261126-snippet-analysis-filter-status/final-layout/compact-after-save.jpg) · [Compact action scroll](target/verification/20261126-snippet-analysis-filter-status/final-layout/compact-secondary-actions.jpg) · [Minimum-size source and library](target/verification/20261126-snippet-analysis-filter-status/final-layout/minimum-reopened-source.jpg) · [Minimum-size library action scroll](target/verification/20261126-snippet-analysis-filter-status/final-layout/minimum-library-actions.jpg)
+- [Final native restarts and file checksums](target/verification/20261126-snippet-analysis-filter-status/final-layout/gui-results.json) · [Final results and cleanup](target/verification/20261126-snippet-analysis-filter-status/results.json) · [Evidence checksums](target/verification/20261126-snippet-analysis-filter-status/evidence.sha256)
+
+## November 26 native Agent history and activity exports
+
+This Mac ran two separately reviewed commands from the 800 × 500 Agent
+Activity window on one local terminal. The loopback model received four
+requests. Each command's exact masked stdout and stderr appeared only in
+its separately approved follow-up. Alpha's Approval row gave way to a
+running Command row showing 2.1 seconds. The completed command showed
+5.0 seconds, including after reopening.
+
+The Activity window opened an all-runs export during Beta's probe review.
+Its first Markdown export contained completed Alpha. A second export
+review opened while Beta's result awaited the follow-up approval. After
+Beta finished, that review still selected Alpha. A fresh all-runs review
+selected both reports. The later single-run JSON export contained
+the exact Alpha record from the two-run JSON export. All four files
+had mode 0600. The retained evidence records their digests and scope.
+
+Earlier runs reopened Alpha from Beta's answer menu. Copy output from
+the right dock yielded the exact masked two-line command output and the
+clipboard probe restored the previous pasteboard. The same step menu
+opened the selected command in the Snippet Manager as an unsaved draft.
+Discard returned to the owner without creating a library file.
+
+After both activity windows were closed, the original terminal's Last
+agent run submenu reopened the retained Beta run. A new local terminal
+had its own history scope. These history and export actions caused zero
+additional model requests.
+
+The macOS build, 308 Agent workspace tests and two activity report tests
+passed. Thirteen tests were ignored. Formatting and the Git diff check
+passed. The owned app, shells and loopback server exited. The scratch
+directories and development build were removed. Windows remains deferred.
+
+- [Alpha waiting for approval](target/verification/20261126-agent-log-history-export/alpha-command-review.jpg) · [Live duration](target/verification/20261126-agent-log-history-export/alpha-command-running.jpg) · [Completed duration](target/verification/20261126-agent-log-history-export/alpha-finished.jpg)
+- [Frozen selection after Beta finished](target/verification/20261126-agent-log-history-export/beta-frozen-export-after-completion.jpg) · [Fresh two-run selection](target/verification/20261126-agent-log-history-export/both-finished-json-review.jpg) · [Reopened single-run export](target/verification/20261126-agent-log-history-export/alpha-single-json-review.jpg) · [Exact masked results and export digests](target/verification/20261126-agent-log-history-export/export-proof.json)
+- [Earlier runs submenu](target/verification/20261126-agent-log-history-export/beta-earlier-runs-menu.jpg) · [Retained step menu in the dock](target/verification/20261126-agent-log-history-export/alpha-docked-step-menu.jpg) · [Unsaved command draft](target/verification/20261126-agent-log-history-export/alpha-command-in-unsaved-snippet.jpg)
+- [Reopen from the terminal context](target/verification/20261126-agent-log-history-export/terminal-last-run-menu.jpg) · [Independent terminal context](target/verification/20261126-agent-log-history-export/independent-terminal-no-history.jpg) · [Results and cleanup](target/verification/20261126-agent-log-history-export/results.json) · [Evidence checksums](target/verification/20261126-agent-log-history-export/evidence.sha256)
+
+## November 26 full and selected Agent output on macOS
+
+This Mac ran a reviewed command in the 800 × 500 Activity window. It read
+two private fixture files and wrote 13 lines to each of stdout and stderr.
+The longest lines were 746 and 626 Unicode characters. The managed
+redaction rule masked two values in each stream. The loopback model
+received the exact masked streams only after explicit follow-up approval.
+
+Copy output from the original activity's command menu produced all 26
+lines and 2,403 UTF-8 bytes. Close returned to the terminal. The Last
+agent run menu opened the retained activity. Shift+F10, Down and Return
+copied the same bytes from the selected command. The native clipboard
+checks matched the expected bytes and restored the previous pasteboard.
+
+The reopened step's detail editor ignored a typing attempt. Select All
+and Copy selected produced the exact eight-line preview. The long line in
+that preview was limited to 320 characters, and the clipboard held 604
+UTF-8 bytes. Reopening and copying kept the loopback request count at two.
+
+The macOS build and 308 Agent workspace tests passed, with 13 ignored.
+Formatting and the Git diff check passed. The app, test shell, clipboard
+probes and loopback server exited, and the scratch directories and
+development build were removed. Windows remains deferred.
+
+- [Original command menu](target/verification/20261126-agent-complete-native-copy/live-step-copy-menu.jpg) · [Retained run opened from Terminal](target/verification/20261126-agent-complete-native-copy/retained-terminal-context.jpg) · [Keyboard selection of Copy output](target/verification/20261126-agent-complete-native-copy/retained-keyboard-copy-selected.jpg)
+- [Read-only detail selection](target/verification/20261126-agent-complete-native-copy/retained-detail-selection.jpg) · [Exact clipboard results and digests](target/verification/20261126-agent-complete-native-copy/clipboard-proof.json) · [Results and cleanup](target/verification/20261126-agent-complete-native-copy/results.json) · [Evidence checksums](target/verification/20261126-agent-complete-native-copy/evidence.sha256)
+
+## November 26 reduced-animation Log Table timing on macOS
+
+In the original 800 × 500 Activity window on this Mac, reduced animations
+kept the running marker still. Unrelated redraws nevertheless exposed
+1.1, 1.7 and 2.2 seconds in the running duration. The table now samples
+unfinished durations in whole seconds when animations are reduced.
+Rendered cells, duration sort and keyboard navigation share that value.
+Completed steps retain their measured duration.
+
+The native retest ran the same reviewed ten-second command in two private
+profiles. Regular animations produced ten distinct marker frames. With
+reduced animations, the marker stayed constant across 50 samples and
+five successive observed duration intervals fell between 966 and 1,094 ms.
+The live Duration heading put the running command after the shorter steps.
+Reopening the completed run showed its measured 10.0 seconds. Both runs
+sent their output only after separate follow-up review.
+
+In Agent Design Settings, the reduced-animation preview sorted its sample
+by Duration. End and Return opened the answer while keeping the horizontal
+offset. Closing Settings returned focus to the terminal. The 900 ms
+row flash passed its automated regression. The native captures at this
+checkpoint missed that short interval. The follow-up below captured it
+directly from successful native frame presents.
+
+The native build passed. The Agent and Settings suites passed 431 tests
+with 13 ignored. Formatting and the Git diff check passed. All owned apps,
+shells and loopback servers exited. The scratch directories and development
+profile were removed. Windows remains deferred.
+
+- [Original fractional updates](target/verification/20261126-agent-log-motion-macos/baseline/timer-observations.json) · [Sampled marker and clock changes](target/verification/20261126-agent-log-motion-macos/motion-samples.json) · [Live reduced-animation sort](target/verification/20261126-agent-log-motion-macos/reduced-live-duration-sort.jpg)
+- [Completed duration after reopening](target/verification/20261126-agent-log-motion-macos/reduced-reopened-measured-duration.jpg) · [Settings preview keyboard navigation](target/verification/20261126-agent-log-motion-macos/settings-preview-sorted-keyboard-answer.jpg) · [Results and cleanup](target/verification/20261126-agent-log-motion-macos/results.json) · [Evidence checksums](target/verification/20261126-agent-log-motion-macos/evidence.sha256)
+
+
+## November 26 native Log Table entry flash on macOS
+
+The 800 × 500 Activity window on this Apple Silicon desktop ran matching
+local Agent sessions with normal and reduced motion. The loopback model
+proposed the same local command after the initial request. Each session
+executed it once after explicit approval and held its output for a second
+review. The recorded model requests matched that sequence.
+
+With normal motion, the new Approval, running Command and final Answer
+rows each appeared with a blue background that faded to the ordinary row
+color. In successful native frame presents, transitions from the
+brightest sampled frame to within three blue-channel levels of the
+settled color took 773 ms, 854 ms and 740 ms, respectively. The matched
+rows in reduced motion had the settled blue-channel value throughout all
+25 evaluated frames. Captures include the row text alongside its measured
+background so the row identity can be checked.
+
+The temporary Tiny-Skia frame capture was removed after the build and
+its source matched the original checksum. The native build and
+formatting check passed. The owned apps, shells and loopback listener
+exited, and the scratch profile, raw captures and development build were
+removed. Windows remains deferred.
+
+- [Approval highlight](target/verification/20261126-native-log-table-flash/animated-approval-highlight.png) · [Approval fading](target/verification/20261126-native-log-table-flash/animated-approval-fading.png) · [Reduced approval](target/verification/20261126-native-log-table-flash/reduced-approval-first-row.png)
+- [Running command highlight](target/verification/20261126-native-log-table-flash/animated-command-highlight.png) · [Answer highlight](target/verification/20261126-native-log-table-flash/animated-answer-highlight.png) · [Reduced answer](target/verification/20261126-native-log-table-flash/reduced-answer-first-row.png)
+- [Row background measurements](target/verification/20261126-native-log-table-flash/results.json) · [Evidence checksums](target/verification/20261126-native-log-table-flash/evidence.sha256)
+
+## November 26 minimum macOS Log Table keyboard navigation
+
+At 640 × 400 on this Mac, Home and End selected the correct row during
+a pending approval. The row could remain out of view while the same run
+also had a docked table. Both views shared widget IDs, so a keyboard
+reveal could measure the dock and scroll both views. The Activity window,
+terminal pane and detached history now have independent row and viewport
+IDs. The keyboard routes a reveal to the surface that received the key.
+
+With an 18-point activity font, the new review actions and horizontal
+scrollbar left only part of the selected row visible. The owned Activity
+window now gives the Log Table more vertical room based on its font size.
+The surrounding page can scroll while the fixed footer stays accessible.
+
+The native retest showed the first command after Home and the pending
+Approval row after End, at both the default and enlarged font sizes. At
+18 points, Home and End kept the horizontal offset and displayed the
+selected row above the scrollbar. Return opened the correct read-only
+approval. Pause disabled the confirmation buttons and Resume restored
+the same review. In both runs the loopback model received the exact
+command result only after a separate request review. The keyboard step
+menu copied the expected 28 bytes to the system pasteboard, which the
+probe restored. Close returned to the source terminal.
+
+The two-surface regression verified that the detached table can reveal
+its selected row without scrolling the Activity table. The enlarged-font
+regression verified space for an Approval row above the horizontal
+scrollbar. The macOS build, 309 Terminal Agent tests and 123 Settings
+tests passed, with 13 Agent tests ignored. Formatting and the Git diff
+check passed. The private apps, shells, pasteboard probe and loopback
+listeners exited. The scratch directories and development build were
+removed. Windows remains deferred.
+
+- [Original hidden selection after Home](target/verification/20261126-native-log-table-minimum/baseline/animated-home-visible-before-open.jpg) · [Original clipped row after increasing font size](target/verification/20261126-native-log-table-minimum/window-scope/reduced-horizontal-end.jpg)
+- [Final first row](target/verification/20261126-native-log-table-minimum/final/animated-selected-home.jpg) · [Final approval at 18 points](target/verification/20261126-native-log-table-minimum/final/reduced-horizontal-end.jpg) · [Matching first row at the same horizontal offset](target/verification/20261126-native-log-table-minimum/final/reduced-horizontal-home.jpg)
+- [Keyboard step menu](target/verification/20261126-native-log-table-minimum/final/reduced-command-menu.jpg) · [Clipboard verification](target/verification/20261126-native-log-table-minimum/final/clipboard.log) · [Return to the source terminal](target/verification/20261126-native-log-table-minimum/final/reduced-close-returned-owner.jpg)
+- [Native results and cleanup](target/verification/20261126-native-log-table-minimum/final/gui-results.json) · [Agent tests](target/verification/20261126-native-log-table-minimum/final/agent-tests.log) · [Settings tests](target/verification/20261126-native-log-table-minimum/final/settings-tests.log) · [Evidence checksums](target/verification/20261126-native-log-table-minimum/evidence.sha256)
+
+## November 26 native Frosted Glass HUD controls on macOS
+
+This Apple Silicon desktop used the d04 HUD beside a side Timeline in
+two live Agent runs. With animation enabled, Details opened and closed
+the step list over the same terminal. Hide Agent history released the
+side dock and kept the HUD available. The View menu independently hid
+the status. After showing it again, the HUD's details were closed.
+The reduced-motion run showed the same hide and restore behavior while
+the side Timeline stayed visible.
+
+In each mode, Review on the restored HUD raised the Activity window
+with the original pending command. Each command ran once, after an
+explicit Allow once. The loopback model received the exact stdout and
+stderr only after a separate review. The finished HUD showed five of
+five steps and 32 reported tokens. The owned applications, shells and
+loopback listener exited, and the disposable profiles were removed.
+The follow-up below covers the short presentation transitions, typing
+fade, split-pane isolation and contrast on macOS. Windows remains
+deferred.
+
+- [HUD and side Timeline](target/verification/20261126-native-frosted-hud/hud-animated-pending.jpg) · [HUD restored with details closed](target/verification/20261126-native-frosted-hud/hud-animated-restored-closed.jpg) · [Reduced-motion restore](target/verification/20261126-native-frosted-hud/hud-reduced-restored-closed.jpg)
+- [Original review reopened](target/verification/20261126-native-frosted-hud/hud-animated-review-reopened.jpg) · [Reduced-motion completed run](target/verification/20261126-native-frosted-hud/hud-reduced-finished.jpg) · [Results and cleanup](target/verification/20261126-native-frosted-hud/results.json) · [Evidence checksums](target/verification/20261126-native-frosted-hud/evidence.sha256)
+
+
+## November 26 native HUD motion, split scope and contrast on macOS
+
+Successful native Tiny-Skia presents captured the d04 HUD appearing after
+it was hidden in the View menu. With animations on, sampled card widths
+were 284, 294 and 300 pixels as it reached its normal opacity. With reduced motion,
+the first visible sample already showed the complete 300-pixel card.
+The drawer stayed closed when the card returned.
+
+Typing an unsubmitted character in the original local terminal dimmed
+its HUD and the label pixels returned to their original values after
+idle. The matched reduced-motion run had only the settled full and dim
+label states. After a Split Right, typing in the neighbor kept the HUD
+label pixels identical across all nine and ten sampled frames in the
+animated and reduced-motion runs. Typing in the original split then
+dimmed and restored the HUD in both modes. The source terminal and its
+HUD stayed available when the neighbor closed.
+
+An additional native run selected the IntelliJ Light terminal theme
+with normal animations. Relative luminance samples of the Details
+label over the plain terminal, orange band and violet band measured
+11.45:1, 5.14:1 and 7.19:1 in the default dark presentation, and 8.72:1,
+10.51:1 and 8.41:1 in IntelliJ Light. The samples compare the same label
+positions and neighboring card background within each theme.
+
+Each run executed the proposed fixture command once after explicit
+approval. Its separately reviewed follow-up contained the expected stdout and
+stderr. The temporary frame capture was removed after building and
+the compositor source matched its preceding checksum. The owned apps,
+shells and loopback listeners exited. The scratch profiles, raw captures
+and development build were removed. Windows remains deferred.
+
+- [Animated entrance at 284 pixels](target/verification/20261126-native-hud-motion/hud-animated-entrance-800ms.png) · [Entrance at 294 pixels](target/verification/20261126-native-hud-motion/hud-animated-entrance-900ms.png) · [First visible reduced-motion sample](target/verification/20261126-native-hud-motion/hud-reduced-entrance-745ms.png)
+- [Dimmed source HUD](target/verification/20261126-native-hud-motion/hud-animated-source-500ms.png) · [Input in the adjacent split](target/verification/20261126-native-hud-motion/hud-animated-neighbor-typed.jpg) · [Native motion measurements](target/verification/20261126-native-hud-motion/motion-results.json)
+- [Default dark contrast](target/verification/20261126-native-hud-motion/contrast-results.json) · [IntelliJ Light contrast](target/verification/20261126-native-hud-motion/intellij-light/contrast-results.json) · [Cleanup](target/verification/20261126-native-hud-motion/scratch-after.txt) · [Evidence checksums](target/verification/20261126-native-hud-motion/evidence.sha256)
+
+## November 26 native Frosted Glass HUD answer copy on macOS
+
+A reviewed local Agent run returned a two-line UTF-8 fixture answer with
+German, French and Japanese text. On this Mac, Copy answer from both the
+HUD's Run actions dropdown and its right-click menu put exactly the same
+85 bytes on the native pasteboard. The probe matched each copy against
+the original model fixture and restored the preceding pasteboard. The
+model request count stayed at two through both copy actions.
+
+- [HUD Run actions](target/verification/20261126-native-hud-copy-and-ticker/hud-actions-menu.jpg) · [HUD right-click menu](target/verification/20261126-native-hud-copy-and-ticker/hud-context-menu.jpg)
+- [Dropdown copy result](target/verification/20261126-native-hud-copy-and-ticker/clipboard-hud-actions.log) · [Context menu copy result](target/verification/20261126-native-hud-copy-and-ticker/clipboard-hud-context.log) · [Expected UTF-8 fixture](target/verification/20261126-native-hud-copy-and-ticker/expected-hud-answer.txt)
+
+## November 26 native Neon Ticker controls and motion on macOS
+
+With a side Timeline on this Mac, the original ticker showed only the
+first letter of its review message. Its two text controls took space
+from the LED and label area. Java v2.26.0 keeps the ticker at 28 points
+and uses icon controls. Rust now uses the existing compact icon menu
+and a details icon for d18. The updated ticker displayed the full
+amber review label and full finished label beside the Timeline in the
+same window. The completed review row kept elapsed time and the token
+count visible.
+
+In both motion modes the ticker restored the same pending review after
+the hide control and the View menu were used. Review and the compact
+menu's Open activity window action raised the original activity. The
+animated run paused from the ticker while its approved local command
+was still running. The command finished during Pause and its output
+stayed local after Resume until a separate model request was approved.
+The reduced-motion run closed the details with the new icon, then
+cancelled the outstanding command through the ticker. The fixture
+received one model request for that run and no command execution marker.
+
+Native frame captures showed three visible title intensity levels on
+animated entrance and a fully drawn title in the first visible
+reduced-motion frame. Intermediate running frames showed the next label
+rolling upward. The moving lamp had 99 distinct samples in 115 running
+frames. It held one state across eight paused frames and one across
+eight visible reduced-motion frames.
+
+The native regression checked that the 650-point ticker leaves space
+for the review label and keeps the Review control inside the row. On
+this Mac, 310 Terminal Agent tests and 123 Settings tests passed,
+with 13 Agent tests ignored. The debug build, formatting and Git diff
+checks passed. The temporary compositor probe was removed and its
+original checksum matched. Both private fixture roots and their apps,
+shells, clipboard probes and listeners were cleaned. The development
+profile was removed. Windows remains deferred.
+
+- [Original clipped review message](target/verification/20261126-native-hud-copy-and-ticker/neon-animated-pending.jpg) · [Full review message](target/verification/20261126-native-hud-copy-and-ticker/final-ticker/neon-animated-pending.jpg) · [Compact actions](target/verification/20261126-native-hud-copy-and-ticker/final-ticker/neon-animated-more-actions.jpg) · [Full finished label](target/verification/20261126-native-hud-copy-and-ticker/final-ticker/neon-animated-finished.jpg)
+- [Animated entrance](target/verification/20261126-native-hud-copy-and-ticker/final-ticker/neon-animated-show-partial.png) · [Rolling label](target/verification/20261126-native-hud-copy-and-ticker/final-ticker/neon-animated-running-roll-4.png) · [Reduced entrance](target/verification/20261126-native-hud-copy-and-ticker/final-ticker/neon-reduced-show-first-visible.png) · [Motion measurements](target/verification/20261126-native-hud-copy-and-ticker/final-ticker/motion-results.json)
+- [Paused with output held](target/verification/20261126-native-hud-copy-and-ticker/final-ticker/neon-animated-completed-while-paused.jpg) · [Cancelled in reduced motion](target/verification/20261126-native-hud-copy-and-ticker/final-ticker/neon-reduced-cancelled.jpg)
+- [Agent tests](target/verification/20261126-native-hud-copy-and-ticker/final-ticker/agent-tests.log) · [Settings tests](target/verification/20261126-native-hud-copy-and-ticker/final-ticker/settings-tests.log) · [Verified results](target/verification/20261126-native-hud-copy-and-ticker/results.json) · [Evidence checksums](target/verification/20261126-native-hud-copy-and-ticker/evidence.sha256)
+
+## November 26 native tmux review and Unicode on macOS
+
+On this Mac the d09 dock accepted a single environment-probe approval with
+digit 1. Scrolling the command review out of view left digit 2 in the shell
+draft. Revealing the whole card let digit 2 run the two ordinary commands
+in order. Both outputs waited for a separate model review.
+
+The loopback model returned a German and Japanese completion. The original
+build crashed while drawing the response. The system font probe found that
+macOS GB18030 Bitmap supplied the Japanese glyphs with no usable scale
+metrics. Those glyphs gave cosmic-text non-finite positions. Tiny Skia now
+excludes such faces before font fallback. On this Mac cosmic-text can then
+use Arial Unicode MS to shape the Japanese characters.
+
+The corrected build released the terminal width when the running history
+was hidden and restored the same pending review. Key 3 cancelled a complete
+review in reduced motion. The fixture recorded no command marker and one
+model request for that run. The mouse also approved the remaining ordinary
+commands in a separate reduced-motion run. Both completed runs produced
+one `AB` receipt and sent the same two outputs in order in the second
+model request, after explicit approval. Both showed the complete
+`Grüße, café, 日本語.` answer. The cursor crop varied across six animated
+captures and stayed identical across six reduced-motion captures.
+The automated timing check covers character reveal. The numeric keypad
+remains open on macOS, and Windows remains deferred.
+
+The macOS run passed 311 Agent tests, 123 Settings tests and nine terminal
+font tests, with 14 ignored. The Agent suite includes an offscreen rendering
+check for the Japanese text and cursor. The private profiles, copied apps,
+shells and loopback listeners were removed. The development profile was
+cleaned after the suites finished.
+
+- [Original overflow backtrace](target/verification/20261126-native-tmux-decisions/trace/gui-native.log) · [Font probe](target/verification/20261126-native-tmux-decisions/render-diagnostic/font-probe.log)
+- [Hidden card and shell digit](target/verification/20261126-native-tmux-decisions/verified/tmux-animated-hidden-digit.jpg) · [Dock hidden](target/verification/20261126-native-tmux-decisions/verified/tmux-animated-dock-hidden.jpg) · [Full review after restoring](target/verification/20261126-native-tmux-decisions/verified/tmux-animated-full-card.jpg) · [Results held for review](target/verification/20261126-native-tmux-decisions/verified/tmux-animated-approved-results-held.jpg)
+- [Animated completion](target/verification/20261126-native-tmux-decisions/verified/tmux-animated-finished.jpg) · [Reduced-motion completion](target/verification/20261126-native-tmux-decisions/verified/tmux-reduced-complete-finished.jpg) · [Reduced-motion cancellation](target/verification/20261126-native-tmux-decisions/verified/tmux-reduced-cancelled.jpg) · [Cursor samples](target/verification/20261126-native-tmux-decisions/verified/cursor-samples.json)
+- [Agent tests](target/verification/20261126-native-tmux-decisions/agent-tests.log) · [Settings tests](target/verification/20261126-native-tmux-decisions/settings-tests.log) · [Terminal font tests](target/verification/20261126-native-tmux-decisions/terminal-theme-tests.log) · [Results and cleanup](target/verification/20261126-native-tmux-decisions/verified/results.json) · [Evidence checksums](target/verification/20261126-native-tmux-decisions/evidence.sha256)
+
+## November 26 native Metro rail on macOS
+
+In a private macOS profile the Metro Review station raised the original
+Activity window with the environment probe awaiting approval. The loopback
+model had received no request. The shell then ran one reviewed fixture
+command and recorded one receipt. Its output stayed under separate review
+until the second model request was approved.
+
+After the configured five-second delay, the finished rail released its
+space. View › AI Agent Panel restored it for longer than the original delay.
+Selecting Analysis opened that decision with its 16 reported tokens.
+Splitting the terminal condensed the five stations into `+4` and Answer
+within the source pane. The neighboring shell received neither the rail
+nor its review. The earlier stations remained in the drawer, and Answer
+showed the original response in its tooltip.
+
+With a side Timeline, native compositor frames captured 13 intermediate
+light positions from the command to the next Review. Reduced animations
+went directly to the new station. The animated fade included a partially
+visible frame. Reduced animations went from steady to hidden. The first
+capture missed the rail after the drawer expanded. The repeat used a
+larger crop, captured only this application's presented frames, and
+removed the temporary probe afterward. The compositor checksum matched.
+Each run recorded one command receipt and sent the output only in the
+explicitly reviewed second request.
+
+`cargo test --locked --workspace --all-targets --no-fail-fast` passed on this
+arm64 Mac. Cargo launched 77 test targets. The 75 targets using the standard
+test harness reported **5,169 passed, 0 failed and 237 ignored** in their final
+summaries. The two custom-harness targets exited successfully. The archived
+JSON tally of 5,171 also counted the child-process summaries for the standard
+and restrictive umask tests. Both tests already appear in the application
+target's final summary. [Workspace log](target/verification/20261126-native-metro-motion/workspace-tests.log) · [Archived summary-line tally](target/verification/20261126-native-metro-motion/workspace-test-results.json)
+
+The run used `scripts/with-scratch.sh --zsh-tests`. Formatting and diff checks passed.
+The private profiles, frame files, copied test apps, listeners and shells
+were removed. The development profile was cleaned after the checks.
+Windows remains deferred.
+
+- [Review in Activity](target/verification/20261126-native-metro-motion/clean/metro-animated-review-station-handoff.jpg) · [Output waiting for model review](target/verification/20261126-native-metro-motion/clean/metro-animated-reviewed-output-held.jpg) · [Finished rail](target/verification/20261126-native-metro-motion/clean/metro-animated-completed.jpg) · [Automatic hide](target/verification/20261126-native-metro-motion/clean/metro-animated-auto-hidden.jpg)
+- [Manual restoration](target/verification/20261126-native-metro-motion/clean/metro-animated-manually-restored.jpg) · [Analysis station detail](target/verification/20261126-native-metro-motion/clean/metro-animated-analysis-details.jpg) · [Narrow rail and answer tooltip](target/verification/20261126-native-metro-motion/clean/metro-animated-narrow-answer.jpg)
+- [Intermediate travel frame](target/verification/20261126-native-metro-motion/capture/metro-animated-travel-intermediate-0.png) · [Mid-fade frame](target/verification/20261126-native-metro-motion/capture/metro-animated-fade-intermediate.png) · [Reduced-motion travel endpoint](target/verification/20261126-native-metro-motion/capture/metro-reduced-travel-end.png) · [Frame measurements](target/verification/20261126-native-metro-motion/capture/motion-results.json)
+- [Cleanup log](target/verification/20261126-native-metro-motion/cleanup.log) · [Evidence checksums](target/verification/20261126-native-metro-motion/evidence.sha256)

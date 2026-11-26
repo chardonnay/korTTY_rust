@@ -141,6 +141,7 @@ pub enum CredentialKind {
     SshPasswordCommand,
     SkillProviderCredential,
     TemporarySshKey,
+    WebProvider(WebProvider),
 }
 
 impl CredentialKind {
@@ -148,6 +149,48 @@ impl CredentialKind {
     pub fn is_ssh(self) -> bool {
         matches!(self, Self::Password | Self::KeyPassphrase)
     }
+}
+
+/// Global credentials managed by AI Manager's Internet settings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WebProvider {
+    Tavily,
+    BrightData,
+    Brave,
+}
+
+impl WebProvider {
+    pub const ALL: [Self; 3] = [Self::Tavily, Self::BrightData, Self::Brave];
+
+    /// The reserved vault slot used by AI Manager and additive profile restore.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Tavily => "00000000000000000000000000000001",
+            Self::BrightData => "00000000000000000000000000000002",
+            Self::Brave => "00000000000000000000000000000003",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Tavily => "Tavily API key",
+            Self::BrightData => "Bright Data API token",
+            Self::Brave => "Brave Search API key",
+        }
+    }
+}
+
+/// An explicit edit to one provider. Omitting a provider preserves its credential.
+pub enum WebCredentialChange {
+    Set(Secret),
+    Clear,
+}
+
+pub const MAX_WEB_CREDENTIAL_BYTES: usize = 4096;
+
+pub fn valid_web_credential(value: &str) -> bool {
+    (1..=MAX_WEB_CREDENTIAL_BYTES).contains(&value.len())
+        && value.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
 /// Message format selected for a saved scheduler webhook.
@@ -526,6 +569,81 @@ impl Vault {
             .map(|key| (key, self.snapshot.as_slice()))
     }
 
+    pub fn web_credential(&self, provider: WebProvider) -> Option<&str> {
+        self.entries.get(provider.id()).and_then(|entry| {
+            (entry.metadata.kind == CredentialKind::WebProvider(provider))
+                .then_some(entry.secret.as_str())
+        })
+    }
+
+    /// Returns the exact authenticated ciphertext revision for a reviewed provider request.
+    pub fn web_credential_revision(&self) -> [u8; 32] {
+        Sha256::digest(&self.snapshot).into()
+    }
+
+    /// Publishes the complete edit together under the existing unlocked vault lock.
+    pub fn update_web_credentials(
+        &mut self,
+        changes: Vec<(WebProvider, WebCredentialChange)>,
+        authorize: impl FnOnce() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let mut staged = BTreeMap::new();
+        for (provider, change) in changes {
+            let id = provider.id();
+            if staged.contains_key(id)
+                || self.entries.get(id).is_some_and(|entry| {
+                    entry.metadata.kind != CredentialKind::WebProvider(provider)
+                })
+            {
+                return Err(Error::InvalidInput("conflicting web credential edit"));
+            }
+            let entry = match change {
+                WebCredentialChange::Set(secret) => Some(Entry::from_input(
+                    id.into(),
+                    CredentialInput {
+                        label: provider.label().into(),
+                        kind: CredentialKind::WebProvider(provider),
+                        ..CredentialInput::default()
+                    },
+                    secret,
+                    WebhookSettings::default(),
+                )?),
+                WebCredentialChange::Clear => None,
+            };
+            staged.insert(id, entry);
+        }
+        staged.retain(|id, entry| {
+            entry.as_ref().map(|entry| &*entry.secret)
+                != self.entries.get(*id).map(|entry| &*entry.secret)
+        });
+        if staged.is_empty() {
+            self.ensure_current()?;
+            return authorize();
+        }
+        let retained = self
+            .entries
+            .values()
+            .filter(|entry| !staged.contains_key(entry.metadata.id.as_str()));
+        let snapshot = envelope::seal(
+            &self.key,
+            &self.salt,
+            retained.chain(staged.values().filter_map(Option::as_ref)),
+        )?;
+        storage::publish_checked(&self.path, &snapshot, true, || {
+            self.ensure_current()?;
+            authorize()
+        })?;
+        self.snapshot = snapshot;
+        for (id, entry) in staged {
+            if let Some(entry) = entry {
+                self.entries.insert(id.into(), entry);
+            } else {
+                self.entries.remove(id);
+            }
+        }
+        storage::sync_parent(&self.path)
+    }
+
     /// Reads the bounded encrypted envelope without unlocking or decrypting it.
     pub fn encrypted_envelope(path: impl AsRef<Path>) -> Result<Vec<u8>, Error> {
         let bytes = storage::read(path.as_ref())?;
@@ -570,7 +688,17 @@ impl Vault {
                     "webhook options require a webhook URL credential",
                 ));
             }
-            let id = self.new_id(|id| staged.contains_key(id))?;
+            let id = if let CredentialKind::WebProvider(provider) = input.kind {
+                let id = provider.id();
+                if self.entries.contains_key(id) || staged.contains_key(id) {
+                    return Err(Error::InvalidInput(
+                        "a web credential already occupies this slot",
+                    ));
+                }
+                id.to_owned()
+            } else {
+                self.new_id(|id| staged.contains_key(id))?
+            };
             let entry = Entry::from_input(id.clone(), input, secret, webhook.unwrap_or_default())?;
             ids.push(id.clone());
             staged.insert(id, entry);
@@ -639,6 +767,9 @@ impl Vault {
 
     /// Stores a credential and returns its stable ID after publication.
     pub fn save(&mut self, input: CredentialInput, secret: Secret) -> Result<String, Error> {
+        if matches!(input.kind, CredentialKind::WebProvider(_)) {
+            return Err(Error::InvalidInput("edit web credentials in AI Manager"));
+        }
         if input.kind == CredentialKind::TemporarySshKey {
             return Err(Error::InvalidInput(
                 "save temporary SSH private keys through the connection editor",
@@ -707,8 +838,11 @@ impl Vault {
     }
 
     pub fn delete(&mut self, id: &str) -> Result<bool, Error> {
-        if !self.entries.contains_key(id) {
+        let Some(entry) = self.entries.get(id) else {
             return Ok(false);
+        };
+        if matches!(entry.metadata.kind, CredentialKind::WebProvider(_)) {
+            return Err(Error::InvalidInput("edit web credentials in AI Manager"));
         }
         let retained = self
             .entries
@@ -753,7 +887,10 @@ impl Vault {
     fn new_id(&self, reserved: impl Fn(&str) -> bool) -> Result<String, Error> {
         for _ in 0..8 {
             let id = hex(random::<16>()?);
-            if !self.entries.contains_key(&id) && !reserved(&id) {
+            if !self.entries.contains_key(&id)
+                && !reserved(&id)
+                && !WebProvider::ALL.iter().any(|provider| provider.id() == id)
+            {
                 return Ok(id);
             }
         }
@@ -907,6 +1044,19 @@ fn validate_entry(entry: &Entry) -> Result<(), Error> {
     {
         return Err(Error::InvalidInput(
             "Qdrant API keys require 1 to 4096 printable ASCII bytes without spaces and no SSH scope",
+        ));
+    }
+    if let CredentialKind::WebProvider(provider) = metadata.kind
+        && (metadata.id != provider.id()
+            || metadata.label != provider.label()
+            || !metadata.username.is_empty()
+            || !metadata.server_pattern.is_empty()
+            || !metadata.environment.is_empty()
+            || !metadata.description.is_empty()
+            || !valid_web_credential(&entry.secret))
+    {
+        return Err(Error::InvalidInput(
+            "web credentials require 1 to 4096 printable ASCII bytes without spaces",
         ));
     }
     if metadata.kind == CredentialKind::SkillProviderCredential

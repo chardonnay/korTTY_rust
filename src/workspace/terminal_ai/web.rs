@@ -1,17 +1,20 @@
 //! Review and provenance for optional AI web searches.
 
 use std::fmt;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Weak};
 
 use iced::widget::{button, column, row, scrollable, text, text_input};
 use iced::{Element, Length, Task};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use crate::ai_manager::ProfileRef;
 use crate::clipboard_policy::ClipboardPolicy;
 use crate::local_ai::{self, web_search};
 use crate::terminal_logging::Redactor;
+use crate::vault_window::VaultWindow;
 
 use super::{Configuration, Desktop, ProfileId, mask};
 
@@ -31,9 +34,27 @@ pub(crate) struct Scope {
     endpoint: String,
     mcp: Option<web_search::McpSettings>,
     mcp_credentials: Option<web_search::McpCredentials>,
+    vault_credential: Option<Arc<VaultCredential>>,
     root: Option<PathBuf>,
     redactor: Option<Redactor>,
     chat: bool,
+}
+
+struct VaultCredential {
+    secret: Zeroizing<String>,
+    revision: [u8; 32],
+    path: PathBuf,
+    unlocked: Weak<()>,
+}
+
+fn require_vault_revision(path: &Path, revision: [u8; 32]) -> Result<(), String> {
+    let current = kortty_vault::Vault::encrypted_envelope(path)
+        .ok()
+        .map(|envelope| <[u8; 32]>::from(Sha256::digest(envelope)));
+    if current != Some(revision) {
+        return Err("The provider credential changed. Review the web request again.".into());
+    }
+    Ok(())
 }
 
 impl PartialEq for Scope {
@@ -92,22 +113,48 @@ impl Scope {
         }
         let config = config?;
         let (transport, endpoint, mcp) = config.web_search_profile(profile, chat)?;
-        let mcp_credentials = mcp
+        Some(
+            Self {
+                profile,
+                reference: config.profile_reference(profile)?,
+                revision: config.agent_profile_revision(profile)?,
+                transport,
+                endpoint,
+                mcp,
+                mcp_credentials: None,
+                vault_credential: None,
+                root: config.saved_root().map(PathBuf::from),
+                redactor: None,
+                chat,
+            }
+            .bind_vault_credential(None),
+        )
+    }
+
+    pub(crate) fn with_vault(self, vault: Option<&VaultWindow>) -> Self {
+        let credential = (|| {
+            let vault = vault?;
+            let provider = web_search::vault_provider(self.mcp.as_ref())?;
+            let (path, unlocked) = vault.web_credential_authority();
+            Some(Arc::new(VaultCredential {
+                secret: Zeroizing::new(vault.web_credential(provider)?.to_owned()),
+                revision: vault.web_credential_revision()?,
+                path: path.to_owned(),
+                unlocked,
+            }))
+        })();
+        self.bind_vault_credential(credential)
+    }
+
+    fn bind_vault_credential(mut self, credential: Option<Arc<VaultCredential>>) -> Self {
+        let key = credential.as_ref().map(|credential| &credential.secret);
+        self.mcp_credentials = self
+            .mcp
             .as_ref()
-            .filter(|_| transport.is_remote())
-            .and_then(|settings| settings.credentials(&transport).ok());
-        Some(Self {
-            profile,
-            reference: config.profile_reference(profile)?,
-            revision: config.agent_profile_revision(profile)?,
-            transport,
-            endpoint,
-            mcp,
-            mcp_credentials,
-            root: config.saved_root().map(PathBuf::from),
-            redactor: None,
-            chat,
-        })
+            .filter(|_| key.is_some() || self.transport.is_remote())
+            .and_then(|settings| settings.credentials(&self.transport, key).ok());
+        self.vault_credential = credential;
+        self
     }
 
     pub(crate) fn with_redactor(mut self, redactor: &Redactor) -> Self {
@@ -123,11 +170,28 @@ impl Scope {
             && self.endpoint == other.endpoint
             && self.mcp == other.mcp
             && self.mcp_credentials == other.mcp_credentials
+            && match (&self.vault_credential, &other.vault_credential) {
+                (Some(left), Some(right)) => {
+                    left.revision == right.revision
+                        && left.path == right.path
+                        && left.unlocked.ptr_eq(&right.unlocked)
+                }
+                (None, None) => true,
+                _ => false,
+            }
             && self.root == other.root
     }
 
     pub(crate) fn require_current(&self) -> Result<(), String> {
         web_search::require_policy()?;
+        if let Some(credential) = &self.vault_credential {
+            if credential.unlocked.strong_count() == 0 {
+                return Err(
+                    "The vault changed or was locked. Review the web request again.".into(),
+                );
+            }
+            require_vault_revision(&credential.path, credential.revision)?;
+        }
         let policy = ClipboardPolicy::load();
         if self.chat && !policy.ai_chat_allowed {
             return Err("Managed policy blocks web search in Terminal Chat.".into());
@@ -143,7 +207,8 @@ impl Scope {
             .root
             .as_ref()
             .and_then(|root| Configuration::load_from(root).ok())
-            .and_then(|config| Self::with_chat(Some(&config), self.profile, true, self.chat));
+            .and_then(|config| Self::with_chat(Some(&config), self.profile, true, self.chat))
+            .map(|current| current.bind_vault_credential(self.vault_credential.clone()));
         if current
             .as_ref()
             .is_some_and(|current| self.same_provider(current))
@@ -164,9 +229,10 @@ impl Scope {
     pub(crate) fn page_review(&self) -> Option<String> {
         let provider = self.page_provider()?;
         Some(format!(
-            "{} · {}",
+            "{} · {}{}",
             provider.operation(),
-            provider.destination()?
+            provider.destination()?,
+            self.credential_review()
         ))
     }
 
@@ -179,7 +245,33 @@ impl Scope {
     }
 
     pub(crate) fn profile_revision(&self) -> [u8; 32] {
-        self.revision
+        self.vault_credential
+            .as_ref()
+            .map_or(self.revision, |credential| {
+                let mut digest = Sha256::new();
+                digest.update(b"kortty scheduled web vault authority v1");
+                digest.update(self.revision);
+                digest.update(credential.revision);
+                digest.finalize().into()
+            })
+    }
+
+    pub(crate) fn provider_credential(&self, name: &str) -> Option<Zeroizing<String>> {
+        self.vault_credential
+            .as_ref()
+            .filter(|_| self.search_credential_env() == Some(name))
+            .map_or_else(
+                || local_ai::credential_value(name).ok(),
+                |credential| Some(credential.secret.clone()),
+            )
+    }
+
+    fn credential_review(&self) -> &'static str {
+        if self.vault_credential.is_some() {
+            "\nProvider credential: encrypted vault"
+        } else {
+            ""
+        }
     }
 
     pub(crate) fn search_credential_env(&self) -> Option<&'static str> {
@@ -202,9 +294,11 @@ impl Scope {
     ) -> Result<(), String> {
         if !grant.valid()
             || &self.reference != grant.profile()
-            || self.revision != grant.profile_revision()
+            || self.profile_revision() != grant.profile_revision()
             || !self.supports_unattended_search()
             || (grant.allows_round_page() && self.page_provider().is_none())
+            || (grant.allows_model_tools()
+                && (!self.uses_direct_tools() || !self.transport.supports_web_tool_turns()))
             || redaction_policy.redaction_revision() != Some(grant.redaction_revision())
         {
             return Err("The automatic web lookup's profile or redaction rules changed. Review the job again.".into());
@@ -226,7 +320,7 @@ impl Scope {
         };
         #[cfg(all(debug_assertions, feature = "dialog-preview"))]
         if self.model_tool_gui_fixture() {
-            return local_ai::start(self.transport.clone(), move |_| {
+            return web_search::start_tavily_preview(move || {
                 current()?;
                 let results = Arc::new(Results::checked_with(
                     vec![web_search::Hit {
@@ -241,6 +335,9 @@ impl Scope {
             });
         }
         if let Some(settings) = &self.mcp {
+            if self.vault_credential.is_some() && self.mcp_credentials.is_none() {
+                return Err("The reviewed LM Studio credentials are unavailable.".into());
+            }
             web_search::start_mcp(
                 self.transport.clone(),
                 settings.clone(),
@@ -257,7 +354,7 @@ impl Scope {
                 },
             )
         } else {
-            web_search::start(query, current, move |hits| {
+            web_search::start(query, self.vault_key(), current, move |hits| {
                 Arc::new(Results::checked_with(hits, &mask))
             })
         }
@@ -283,7 +380,7 @@ impl Scope {
         };
         #[cfg(all(debug_assertions, feature = "dialog-preview"))]
         if self.model_tool_gui_fixture() {
-            return local_ai::start(self.transport.clone(), move |_| {
+            return web_search::start_tavily_preview(move || {
                 current()?;
                 let results = Arc::new(Results::checked_with(
                     vec![web_search::Hit {
@@ -297,13 +394,13 @@ impl Scope {
                 Ok(results)
             });
         }
-        web_search::start_page(provider, url, current, move |hits| {
+        web_search::start_page(provider, url, self.vault_key(), current, move |hits| {
             Arc::new(Results::checked_with(hits, &mask))
         })
     }
 
     pub(crate) fn search_review(&self) -> String {
-        self.mcp.as_ref().map_or_else(
+        let destination = self.mcp.as_ref().map_or_else(
             || web_search::DESTINATION.into(),
             |settings| {
                 format!(
@@ -313,7 +410,14 @@ impl Scope {
                     settings.review(),
                 )
             },
-        )
+        );
+        format!("{destination}{}", self.credential_review())
+    }
+
+    fn vault_key(&self) -> Option<Zeroizing<String>> {
+        self.vault_credential
+            .as_ref()
+            .map(|credential| credential.secret.clone())
     }
 }
 
@@ -677,6 +781,8 @@ fn valid_tool_name(name: &str) -> bool {
 pub(crate) struct Evidence {
     profile: ProfileRef,
     profile_revision: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vault_revision: Option<[u8; 32]>,
     redaction_revision: [u8; 32],
     results: Results,
 }
@@ -691,6 +797,7 @@ impl Evidence {
     pub(crate) fn merged(&self, additional: &Self) -> Result<Self, String> {
         if self.profile != additional.profile
             || self.profile_revision != additional.profile_revision
+            || self.vault_revision != additional.vault_revision
             || self.redaction_revision != additional.redaction_revision
             || !self.valid()
             || !additional.valid()
@@ -714,6 +821,10 @@ impl Evidence {
         Ok(Self {
             profile: scope.reference.clone(),
             profile_revision: scope.revision,
+            vault_revision: scope
+                .vault_credential
+                .as_ref()
+                .map(|credential| credential.revision),
             redaction_revision,
             results: results.clone(),
         })
@@ -728,6 +839,7 @@ impl Evidence {
         Self {
             profile: ProfileRef::Numeric(7),
             profile_revision: [4; 32],
+            vault_revision: None,
             redaction_revision: [5; 32],
             results: Results {
                 hits: vec![(
@@ -747,6 +859,11 @@ impl Evidence {
         let policy = ClipboardPolicy::load();
         if policy.terminal_logging.redaction_revision() != Some(self.redaction_revision) {
             return Err("The web search masking rules changed. Review the search again.".into());
+        }
+        if let Some(revision) = self.vault_revision {
+            let path = crate::profile::vault_path()
+                .map_err(|_| "The provider credential vault is unavailable.")?;
+            require_vault_revision(&path, revision)?;
         }
         let config =
             Configuration::load().map_err(|_| "The saved web search profile is unavailable.")?;
@@ -1186,6 +1303,53 @@ mod tests {
                 |_| panic!("This fixture has no worker"),
             )
             .map(drop)
+    }
+
+    #[test]
+    fn reviewed_provider_key_uses_the_typed_vault_slot_and_revokes_when_replaced() {
+        use kortty_vault::{Secret, Vault, WebCredentialChange as Change, WebProvider};
+        let root = crate::snippets::tests::Profile::new();
+        let path = crate::profile::vault_path_at(&root.0);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut vault = Vault::create(&path, b"owned web credential fixture").unwrap();
+        vault
+            .update_web_credentials(
+                vec![
+                    (
+                        WebProvider::Tavily,
+                        Change::Set(Secret::new("owned-tavily-key".into())),
+                    ),
+                    (
+                        WebProvider::BrightData,
+                        Change::Set(Secret::new("owned-bright-token".into())),
+                    ),
+                    (
+                        WebProvider::Brave,
+                        Change::Set(Secret::new("owned-brave-key".into())),
+                    ),
+                ],
+                || Ok(()),
+            )
+            .unwrap();
+        let mut vault = VaultWindow::with_unlocked_fixture(path, vault);
+        let direct = scope(None);
+        let bound = direct.clone().with_vault(Some(&vault));
+        assert_ne!(direct.profile_revision(), bound.profile_revision());
+        let proof = bound.vault_credential.as_ref().unwrap();
+        assert_eq!(proof.secret.as_str(), "owned-tavily-key");
+        assert!(bound.search_review().contains("encrypted vault"));
+        assert!(require_vault_revision(&proof.path, proof.revision).is_ok());
+        let bright = scope(Some(json!({"mode":"bright_data"}))).with_vault(Some(&vault));
+        assert_eq!(bright.vault_key().unwrap().as_str(), "owned-bright-token");
+        let brave =
+            scope(Some(json!({"mode":"brave", "plugin":"mcp/brave"}))).with_vault(Some(&vault));
+        assert!(brave.vault_key().is_none());
+        vault
+            .update_web_credentials(proof.revision, vec![(WebProvider::Tavily, Change::Clear)])
+            .unwrap();
+        assert_eq!(proof.unlocked.strong_count(), 0);
+        assert!(require_vault_revision(&proof.path, proof.revision).is_err());
+        assert!(direct.with_vault(Some(&vault)).vault_key().is_none());
     }
 
     #[test]

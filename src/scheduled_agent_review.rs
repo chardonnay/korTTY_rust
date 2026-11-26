@@ -34,6 +34,15 @@ pub struct Ticket {
 }
 
 impl Ticket {
+    pub(crate) fn new(key: Key, round: u8) -> Result<Self, &'static str> {
+        Ok(Self {
+            key,
+            round,
+            nonce: crate::private_files::nonce()
+                .map_err(|_| "Could not identify the scheduled Agent proposal.")?,
+        })
+    }
+
     pub(crate) fn key(&self) -> Key {
         self.key
     }
@@ -160,12 +169,7 @@ impl<A, C, P> Reviews<A, C, P> {
         {
             return Err("The scheduled Agent firing changed.");
         }
-        let ticket = Ticket {
-            key,
-            round,
-            nonce: crate::private_files::nonce()
-                .map_err(|_| "Could not identify the scheduled Agent proposal.")?,
-        };
+        let ticket = Ticket::new(key, round)?;
         self.entries.insert(
             key,
             Review {

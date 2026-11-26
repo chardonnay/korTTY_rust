@@ -293,7 +293,12 @@ impl SshDialog {
         keys: &[KeyChoice],
     ) -> Element<'_, Message> {
         if active {
-            return self.options_view(label_width, keys);
+            return self.options_view(
+                label_width,
+                keys,
+                self.can_connect(),
+                SavedTemporaryKeyStatus::Absent,
+            );
         }
         column![
             self.startup

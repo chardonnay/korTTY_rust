@@ -20,6 +20,7 @@ use zeroize::Zeroizing;
 pub(in crate::profile_backup) mod keys;
 pub(in crate::profile_backup) mod passwords;
 pub(in crate::profile_backup) mod temporary_keys;
+pub(in crate::profile_backup) mod web;
 
 const ITERATIONS: u32 = 310_000;
 const SALT_BYTES: usize = 32;

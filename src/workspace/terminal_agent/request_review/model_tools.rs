@@ -4,7 +4,7 @@ use super::{web_lookup::WebAuthority, *};
 use crate::terminal_agent::usage::{
     ApprovedWebResult, WebOperation, WebProposal, web_error_result,
 };
-use iced::widget::{button, column, text};
+use iced::widget::{column, text};
 use iced::{Element, Length};
 
 pub(super) struct Review {
@@ -24,14 +24,28 @@ impl Drop for Review {
 }
 
 impl super::Review {
-    pub(super) fn can_offer_model_tools(&self, run: &Run) -> bool {
-        !run.binding.private()
+    pub(in crate::workspace::terminal_agent) fn can_offer_model_tools(&self, run: &Run) -> bool {
+        matches!(
+            (run.mode, self.kind),
+            (Mode::Ask, Kind::Ask)
+                | (
+                    Mode::Run,
+                    Kind::Run(engine::RunModel::Decision) | Kind::Plan(Stage::Triage)
+                )
+                | (
+                    Mode::Plan,
+                    Kind::Plan(Stage::Questions | Stage::Options | Stage::Report)
+                )
+        ) && !run.binding.private()
             && self.transport().0.supports_web_tool_turns()
             && self
                 .web_lookup
                 .as_ref()
                 .is_some_and(|lookup| lookup.scope().uses_direct_tools())
-            && local_ai::tools::agent_task_eligible(&run.goal, false)
+            && local_ai::tools::agent_task_eligible(
+                &run.goal,
+                self.authority.config.agent_always_offer_web_tools(),
+            )
     }
 
     pub(in crate::workspace::terminal_agent) fn model_tool_active(&self) -> bool {
@@ -53,12 +67,7 @@ impl super::Review {
         let body = if ready {
             review.state.tool_view()?
         } else {
-            column![
-                text("Model web-tool review paused"),
-                button("Decline tool").on_press(web::Message::Close)
-            ]
-            .spacing(8)
-            .into()
+            text("Model web-tool review paused").into()
         };
         Some(
             column![
@@ -80,48 +89,39 @@ fn require_call_mask(
     mask: &knowledge_review::Mask,
     call: &local_ai::tools::Call,
 ) -> Result<(), String> {
-    fn check(mask: &knowledge_review::Mask, value: &serde_json::Value) -> Result<(), String> {
-        match value {
-            serde_json::Value::String(text) => mask.require_current(text)?,
-            serde_json::Value::Array(values) => {
-                for value in values {
-                    check(mask, value)?;
-                }
-            }
-            serde_json::Value::Object(values) => {
-                for (key, value) in values {
-                    mask.require_current(key)?;
-                    check(mask, value)?;
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-    mask.require_current(&call.id)?;
-    mask.require_current(&call.function.name)?;
-    mask.require_current(&call.function.arguments)?;
-    let arguments = serde_json::from_str(&call.function.arguments)
-        .map_err(|_| "The model tool arguments are invalid.")?;
-    check(mask, &arguments).map_err(|_| {
-        "The model tool arguments contain text requiring masking. Start a new review.".into()
-    })
+    engine::usage::web::require_clean_call(call, &|value| mask.require_current(value))
 }
 
 impl Workspace {
-    pub(in crate::workspace::terminal_agent) fn begin_model_tool(
+    pub(in crate::workspace::terminal_agent) fn model_tool_progress(
+        &self,
+        run: &mut Run,
+        proposal: Arc<WebProposal>,
+        current: bool,
+    ) {
+        if !current {
+            proposal.reject("The Agent model tool request is no longer current.");
+            return;
+        }
+        let Some(mut review) = run.model_review.take() else {
+            proposal.reject("The Agent model review is unavailable.");
+            return;
+        };
+        if let Err(error) = self.begin_model_tool(run, &mut review, Arc::clone(&proposal)) {
+            proposal.reject(&error);
+            run.notice = error;
+        }
+        run.model_review = Some(review);
+    }
+
+    fn begin_model_tool(
         &self,
         run: &mut Run,
         review: &mut super::Review,
         proposal: Arc<WebProposal>,
     ) -> Result<(), String> {
         self.require_model_review_authority(run, review)?;
-        if run.swarm
-            || !matches!(review.kind, Kind::Run(engine::RunModel::Decision))
-            || !review.can_offer_model_tools(run)
-            || review.model_tool.is_some()
-            || proposal.closed()
-        {
+        if !review.can_offer_model_tools(run) || review.model_tool.is_some() || proposal.closed() {
             return Err("The model web-tool request is unavailable for this run.".into());
         }
         let scope = review
@@ -205,7 +205,7 @@ impl Workspace {
             if tool.proposal.closed() {
                 return Err("The model tool review expired.".into());
             }
-            self.require_model_review_authority(run, review)?;
+            self.require_review_action(run, review)?;
             tool.authority.require_current(self)?;
             let mask = tool.authority.mask(run, self.vault.as_ref())?;
             require_call_mask(&mask, &tool.proposal.call)?;
@@ -222,13 +222,12 @@ impl Workspace {
         };
         let include = matches!(message, web::Message::Include)
             && matches!(tool.state, web::State::Results(..));
-        let close = matches!(message, web::Message::Close);
-        if run.paused && !close && !matches!(message, web::Message::Finished(..)) {
+        if run.paused && !matches!(message, web::Message::Finished(..)) {
             review.model_tool = Some(tool);
             return Ok(Task::none());
         }
         let guard = self.review_dispatch_guard(run, review)?;
-        if close {
+        if matches!(message, web::Message::Close) {
             let authority = tool.authority.clone();
             let call = tool.proposal.call.clone();
             let assistant = tool.proposal.assistant_context.clone();
@@ -266,6 +265,7 @@ impl Workspace {
         };
         let authority = tool.authority.clone();
         let mask_for_worker = mask.clone();
+        let attachment_check = review.ask_attachment_check.clone();
         let epoch = run.epoch;
         let updated = tool.state.update(
             message,
@@ -274,6 +274,10 @@ impl Workspace {
             ticket,
             move || {
                 authority.check()?;
+                if let Some(check) = &attachment_check {
+                    guard()?;
+                    check()?;
+                }
                 guard()
             },
             move |message| event(id, Message::ToolWeb(epoch, serial, message)),

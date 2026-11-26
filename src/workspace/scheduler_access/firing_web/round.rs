@@ -1,4 +1,4 @@
-//! One reviewed web request for a target and round in a scheduled Swarm.
+//! One reviewed web request at a time for a target in a scheduled firing.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Weak};
@@ -9,18 +9,24 @@ use iced::widget::{button, column, row, text, text_input};
 use iced::{Element, Length, Task};
 use kortty_jobs::RunId;
 
+use crate::clipboard_policy::ClipboardPolicy;
+use crate::job_executor::agent::{AdvisoryWebAuthority, ModelWebReview, WEB_VAULT_CHANGED};
 use crate::local_ai::web_search::PageUrl;
-use crate::scheduled_agent_review::{Key, Ticket};
-use crate::scheduler_window::agent;
+use crate::scheduled_agent_review::{Key, Phase, Ticket};
+use crate::scheduler_window::{SshCommand, agent};
+use crate::terminal_agent::usage::{
+    ApprovedWebResult, WebOperation, WebProposal, web::require_clean_call, web_error_result,
+};
 use crate::workspace::terminal_ai::web;
 
 use super::{
     CHANGED, Context, Event as FiringWebEvent, Message, TIMEOUT, Workspace, check_worker,
     review_phase, unattended, wait_for_permit,
 };
+use kortty_jobs::RunRequest;
 use unattended::Credentials;
 
-const EXPIRED: &str = "The Swarm round web review expired before it was approved.";
+const EXPIRED: &str = "The scheduled web review expired before it was approved.";
 
 #[derive(Clone)]
 pub enum Event {
@@ -33,6 +39,7 @@ pub enum Event {
 #[derive(Default)]
 pub(super) struct State {
     entries: BTreeMap<Key, Entry>,
+    model_lookups: BTreeMap<Key, u8>,
 }
 
 struct Entry {
@@ -45,6 +52,20 @@ struct Entry {
     vault: Weak<()>,
     deadline: Instant,
     status: Option<String>,
+    model_tool: Option<ModelTool>,
+}
+
+struct ModelTool {
+    proposal: Arc<WebProposal>,
+    approved_input: Option<String>,
+    read_only: Option<AdvisoryWebAuthority>,
+}
+
+impl Drop for ModelTool {
+    fn drop(&mut self) {
+        self.proposal
+            .reject("The scheduled model web review ended.");
+    }
 }
 
 impl State {
@@ -62,6 +83,12 @@ impl State {
 
     pub(super) fn forget(&mut self, id: RunId) {
         self.entries.retain(|key, _| key.run() != id);
+        self.model_lookups.retain(|key, _| key.run() != id);
+    }
+
+    pub(super) fn model_web_available(&self, key: Key) -> bool {
+        self.model_lookups.get(&key).copied().unwrap_or_default()
+            < agent::web_lookup::MAX_MODEL_LOOKUPS_PER_TARGET
     }
 
     pub(super) fn needs_tick(&self) -> bool {
@@ -127,9 +154,196 @@ impl Workspace {
                 vault: self.vault_change_revision(),
                 deadline: Instant::now() + TIMEOUT,
                 status: status.map(str::to_owned),
+                model_tool: None,
             },
         );
         Ok(Task::none())
+    }
+
+    pub(in crate::workspace::scheduler_access) fn begin_model_round_web(
+        &mut self,
+        ticket: &Ticket,
+        proposal: Arc<WebProposal>,
+    ) -> Task<Message> {
+        if let Err(error) =
+            self.install_model_round_web(ticket, &proposal, None, Instant::now() + TIMEOUT)
+        {
+            proposal.reject(&error);
+        }
+        Task::none()
+    }
+
+    pub(in crate::workspace::scheduler_access) fn begin_read_only_model_web(
+        &mut self,
+        review: ModelWebReview,
+    ) -> Task<Message> {
+        let result = (|| {
+            let request = &review.authority.scope.request;
+            let index = request
+                .action
+                .targets()
+                .position(|target| review.authority.scope.evidence_targets == [target.id])
+                .ok_or(CHANGED)?;
+            let ticket = Ticket::new(Key::new(request.id, index), 1)?;
+            self.install_model_round_web(
+                &ticket,
+                &review.proposal,
+                Some(review.authority),
+                review.deadline,
+            )
+        })();
+        if let Err(error) = result {
+            review.proposal.reject(&error);
+        }
+        Task::none()
+    }
+
+    fn install_model_round_web(
+        &mut self,
+        ticket: &Ticket,
+        proposal: &Arc<WebProposal>,
+        read_only: Option<AdvisoryWebAuthority>,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        if Instant::now() >= deadline {
+            return Err(EXPIRED.into());
+        }
+        if proposal.closed()
+            || self
+                .scheduler_firing_web
+                .rounds
+                .entries
+                .contains_key(&ticket.key())
+        {
+            return Err(CHANGED.into());
+        }
+        let request = Arc::clone(self.model_round_request(ticket, read_only.as_ref())?);
+        let context = self.scheduled_model_web_context(&request)?;
+        let credentials = Credentials::capture(&context.model, &context.scope, true)?;
+        let mask = self.unattended_web_mask(&context);
+        let clean = |value: &str| unattended::public_text(value, &credentials, &mask);
+        require_clean_call(&proposal.call, &clean)?;
+        clean(&proposal.assistant_context)?;
+        let vault = self.vault_change_revision();
+        let operation = proposal.operation();
+        if proposal.limit_reached
+            || !self.scheduler_firing_web.model_web_available(ticket.key())
+            || operation.is_none()
+        {
+            let result = if operation.is_none() {
+                web_error_result(
+                    "unsupported_or_invalid_tool",
+                    "The requested tool or arguments are unsupported.",
+                )
+            } else {
+                web_error_result(
+                    "tool_round_limit",
+                    "The reviewed web lookup budget has been reached.",
+                )
+            };
+            proposal.resolve(ApprovedWebResult::new(result, move || {
+                require_advisory_web_authority(read_only.as_ref(), &vault)?;
+                check_worker(
+                    &request,
+                    &vault,
+                    deadline,
+                    &context.connection_path,
+                    &context.trust,
+                )?;
+                context.scope.require_current()?;
+                credentials.check(&context.model)
+            }));
+            return Ok(());
+        }
+        let (operation, input) = operation.expect("supported model web operation");
+        let lookup = match operation {
+            WebOperation::Search => web::Lookup::Search,
+            WebOperation::Page => web::Lookup::Page,
+        };
+        let (draft, status) = match reviewed_public_input(lookup, &input, &credentials, &mask) {
+            Ok(input) => (input, None),
+            Err(error) => (String::new(), Some(error)),
+        };
+        let scope = context.scope;
+        let revision = self.allocate();
+        self.scheduler_firing_web.rounds.entries.insert(
+            ticket.key(),
+            Entry {
+                ticket: ticket.clone(),
+                review: web::State::Draft(scope.clone(), draft, lookup),
+                revision,
+                scope,
+                page_allowed: true,
+                credentials,
+                vault,
+                deadline,
+                status,
+                model_tool: Some(ModelTool {
+                    proposal: Arc::clone(proposal),
+                    approved_input: None,
+                    read_only,
+                }),
+            },
+        );
+        Ok(())
+    }
+
+    fn model_round_request<'a>(
+        &'a self,
+        ticket: &Ticket,
+        read_only: Option<&'a AdvisoryWebAuthority>,
+    ) -> Result<&'a Arc<RunRequest<SshCommand>>, String> {
+        if let Some(authority) = read_only {
+            let scope = &authority.scope;
+            let request = &scope.request;
+            if request.id != ticket.run()
+                || !request
+                    .action
+                    .targets()
+                    .nth(ticket.target_index())
+                    .is_some_and(|target| scope.evidence_targets == [target.id])
+                || !request.action.agent.as_ref().is_some_and(|action| {
+                    action.kind == agent::Kind::Swarm
+                        && action.probe == agent::Probe::SwarmReadOnly
+                        && action.approval.as_ref().is_some_and(|approval| {
+                            approval
+                                .advisory
+                                .as_ref()
+                                .is_some_and(agent::AdvisoryGrant::is_guided)
+                        })
+                })
+            {
+                return Err(CHANGED.into());
+            }
+            authority.require_policy(&self.clipboard.policy)?;
+            authority.require_policy(&ClipboardPolicy::load())?;
+            self.scheduler_agent_resend_authority(scope)
+                .and_then(|()| self.require_read_only_environment_web(scope))
+                .inspect_err(|&reason| authority.block(reason))?;
+            return Ok(request);
+        }
+        let review = self.current_firing(ticket, Phase::Generating)?;
+        Ok(review.request())
+    }
+
+    pub(in crate::workspace::scheduler_access) fn scheduled_model_web_context(
+        &self,
+        request: &RunRequest<SshCommand>,
+    ) -> Result<Context, String> {
+        let baseline = self
+            .scheduler_firing_web
+            .entries
+            .get(&request.id)
+            .filter(|entry| entry.approved.is_some())
+            .ok_or(CHANGED)?;
+        let grant = unattended::grant(request)
+            .filter(|grant| grant.allows_model_tools())
+            .ok_or(CHANGED)?;
+        let context = self.current_firing_web_context(baseline, request)?;
+        context
+            .scope
+            .require_unattended_profile(grant, context.redactor.redaction_policy())?;
+        Ok(context)
     }
 
     fn swarm_round_web_context(&self, ticket: &Ticket) -> Result<Context, String> {
@@ -167,14 +381,45 @@ impl Workspace {
         if !Weak::ptr_eq(&entry.vault, &self.vault_change_revision())
             || entry.vault.strong_count() == 0
         {
+            if let Some(authority) = entry
+                .model_tool
+                .as_ref()
+                .and_then(|tool| tool.read_only.as_ref())
+            {
+                authority.block(WEB_VAULT_CHANGED);
+                return Err(WEB_VAULT_CHANGED.into());
+            }
             return Err(CHANGED.into());
         }
-        let context = self.swarm_round_web_context(&entry.ticket)?;
+        let context = if let Some(tool) = &entry.model_tool {
+            if tool.proposal.closed() {
+                return Err(CHANGED.into());
+            }
+            self.scheduled_model_web_context(
+                self.model_round_request(&entry.ticket, tool.read_only.as_ref())?,
+            )?
+        } else {
+            self.swarm_round_web_context(&entry.ticket)?
+        };
         if context.scope != entry.scope {
             return Err(CHANGED.into());
         }
         entry.credentials.check(&context.model)?;
         Ok(context)
+    }
+
+    fn round_web_request<'a>(
+        &'a self,
+        entry: &'a Entry,
+    ) -> Option<&'a Arc<RunRequest<SshCommand>>> {
+        if let Some(tool) = &entry.model_tool {
+            if let Some(authority) = &tool.read_only {
+                return Some(&authority.scope.request);
+            }
+            self.model_round_request(&entry.ticket, None).ok()
+        } else {
+            self.swarm_round_web_request(&entry.ticket)
+        }
     }
 
     pub(in crate::workspace::scheduler_access) fn expire_swarm_round_web(
@@ -191,10 +436,11 @@ impl Workspace {
                     .map(|error| (entry.ticket.clone(), error))
             })
             .collect::<Vec<_>>();
-        Task::batch(expired.into_iter().map(|(ticket, error)| {
-            self.scheduler_firing_web.rounds.remove(&ticket);
-            self.fail_swarm_round_web(&ticket, error)
-        }))
+        Task::batch(
+            expired
+                .into_iter()
+                .map(|(ticket, error)| self.end_round_web(&ticket, error)),
+        )
     }
 
     pub(super) fn swarm_round_web_view(&self) -> Option<Element<'_, Message>> {
@@ -203,10 +449,10 @@ impl Workspace {
             .rounds
             .entries
             .values()
-            .find(|entry| self.swarm_round_web_request(&entry.ticket).is_some())?;
+            .find(|entry| self.round_web_request(entry).is_some())?;
         let ticket = &entry.ticket;
         let id = ticket.run();
-        let request = self.swarm_round_web_request(ticket)?;
+        let request = self.round_web_request(entry)?;
         let route = request.action.targets().nth(ticket.target_index())?;
         let name = self
             .scheduler
@@ -224,6 +470,7 @@ impl Workspace {
             ]
             .spacing(8)
             .into(),
+            _ if entry.model_tool.is_some() => entry.review.tool_view()?.map(action),
             _ => entry.review.view()?.map(action),
         };
         Some(
@@ -232,7 +479,7 @@ impl Workspace {
                     text(format!("Web research for {name} · run {id} · round {}", ticket.round()))
                         .size(19)
                         .width(Length::Fill),
-                    button("Skip lookup").on_press(event(Event::Skip(ticket.clone(), entry.revision))),
+                    entry.model_tool.is_none().then(|| button("Skip lookup").on_press(event(Event::Skip(ticket.clone(), entry.revision)))),
                 ]
                 .spacing(8),
                 text(format!("Target {} · {}", ticket.target_index() + 1, route.target.host)).size(13),
@@ -281,7 +528,22 @@ impl Workspace {
         }
     }
 
-    fn round_web_revision(&self, ticket: &Ticket) -> Option<u64> {
+    #[cfg(all(test, debug_assertions, feature = "dialog-preview"))]
+    pub(in crate::workspace::scheduler_access) fn model_web_ticket(
+        &self,
+        key: Key,
+    ) -> Option<Ticket> {
+        self.scheduler_firing_web
+            .rounds
+            .entries
+            .get(&key)
+            .map(|entry| entry.ticket.clone())
+    }
+
+    pub(in crate::workspace::scheduler_access) fn round_web_revision(
+        &self,
+        ticket: &Ticket,
+    ) -> Option<u64> {
         self.scheduler_firing_web
             .rounds
             .get(ticket)
@@ -293,16 +555,115 @@ impl Workspace {
         ticket: &Ticket,
         evidence: Option<Arc<web::Evidence>>,
     ) -> Task<Message> {
-        let current = self.current_swarm_round_web(
-            self.scheduler_firing_web
-                .rounds
-                .get(ticket)
-                .expect("current Swarm web review"),
-        );
+        let entry = self
+            .scheduler_firing_web
+            .rounds
+            .get(ticket)
+            .expect("current web review");
+        let current = self.current_swarm_round_web(entry);
+        if entry.model_tool.is_some() {
+            return match current {
+                Ok(context) => self.settle_model_round_web(ticket, context, evidence),
+                Err(error) => self.end_round_web(ticket, error),
+            };
+        }
         self.scheduler_firing_web.rounds.remove(ticket);
         match current {
             Ok(_) => self.finish_swarm_round_web(ticket, evidence),
             Err(error) => self.fail_swarm_round_web(ticket, error),
+        }
+    }
+
+    fn end_round_web(&mut self, ticket: &Ticket, error: String) -> Task<Message> {
+        if let Some(tool) = self
+            .scheduler_firing_web
+            .rounds
+            .get(ticket)
+            .and_then(|entry| entry.model_tool.as_ref())
+        {
+            tool.proposal.reject(&error);
+            self.scheduler_firing_web.rounds.remove(ticket);
+            Task::none()
+        } else {
+            self.scheduler_firing_web.rounds.remove(ticket);
+            self.fail_swarm_round_web(ticket, error)
+        }
+    }
+
+    fn settle_model_round_web(
+        &mut self,
+        ticket: &Ticket,
+        context: Context,
+        evidence: Option<Arc<web::Evidence>>,
+    ) -> Task<Message> {
+        let entry = self
+            .scheduler_firing_web
+            .rounds
+            .get(ticket)
+            .expect("current model review");
+        let tool = entry.model_tool.as_ref().expect("current model tool");
+        let result = (|| {
+            let request = Arc::clone(self.model_round_request(ticket, tool.read_only.as_ref())?);
+            let content = match &evidence {
+                Some(evidence) => {
+                    let mut excerpts = String::new();
+                    evidence.append_to(&mut excerpts);
+                    let input = tool.approved_input.as_ref().ok_or(CHANGED)?;
+                    serde_json::json!({"status":"ok","approved_input":input,"evidence":excerpts})
+                        .to_string()
+                }
+                None => {
+                    web_error_result("user_declined", "The user declined this web-tool request.")
+                }
+            };
+            if !tool.proposal.fits_result(&content) {
+                return Err("The reviewed excerpts exceed the model's remaining context. Decline the request to continue.".into());
+            }
+            let vault = entry.vault.clone();
+            let deadline = entry.deadline;
+            let credentials = entry.credentials.clone();
+            let read_only = tool.read_only.clone();
+            let mask = self.unattended_web_mask(&context);
+            ApprovedWebResult::new(content, move || {
+                require_advisory_web_authority(read_only.as_ref(), &vault)?;
+                check_worker(
+                    &request,
+                    &vault,
+                    deadline,
+                    &context.connection_path,
+                    &context.trust,
+                )?;
+                context.scope.require_current()?;
+                credentials.check(&context.model)?;
+                if let Some(evidence) = &evidence {
+                    evidence.require_mask(|text| {
+                        credentials.require_clean(text)?;
+                        mask(text)
+                    })?;
+                }
+                Ok(())
+            })
+        })();
+        match result {
+            Ok(result) => {
+                tool.proposal.resolve(Ok(result));
+                self.scheduler_firing_web.rounds.remove(ticket);
+                Task::none()
+            }
+            Err(error) if entry.review.included().is_some() => {
+                let entry = self
+                    .scheduler_firing_web
+                    .rounds
+                    .entries
+                    .get_mut(&ticket.key())
+                    .expect("current model review");
+                if let Some((scope, results)) = entry.review.included() {
+                    entry.review = web::State::Results(scope.clone(), Arc::clone(results));
+                }
+                entry.status = Some(error);
+                Task::none()
+            }
+            Err(error) => self.end_round_web(ticket, error),
         }
     }
 
@@ -320,8 +681,7 @@ impl Workspace {
         let context = match current {
             Ok(context) => context,
             Err(error) => {
-                self.scheduler_firing_web.rounds.remove(ticket);
-                return self.fail_swarm_round_web(ticket, error);
+                return self.end_round_web(ticket, error);
             }
         };
         match self.apply_swarm_round_web(ticket, message, context) {
@@ -357,7 +717,7 @@ impl Workspace {
         if matches!(message, web::Message::PageMode(_)) && !entry.page_allowed {
             return Ok((Task::none(), None));
         }
-        let request = Arc::clone(self.swarm_round_web_request(ticket).ok_or(CHANGED)?);
+        let request = Arc::clone(self.round_web_request(entry).ok_or(CHANGED)?);
         let mask = self.unattended_web_mask(&context);
         let wire_input = match (&entry.review, &message) {
             (web::State::Draft(_, value, lookup), web::Message::Review)
@@ -383,7 +743,18 @@ impl Workspace {
         let vault = entry.vault.clone();
         let deadline = entry.deadline;
         let include = matches!(message, web::Message::Include);
-        let nonce = wire_input.as_ref().map(|_| self.allocate());
+        let sending = wire_input.is_some();
+        let model_input = if entry.model_tool.is_some() {
+            if sending && !self.scheduler_firing_web.model_web_available(ticket.key()) {
+                return Err("This target reached its web lookup budget.".into());
+            }
+            wire_input.clone()
+        } else {
+            None
+        };
+        let direct = entry.model_tool.is_some();
+        let nonce = sending.then(|| self.allocate());
+        let revision = direct.then(|| self.allocate());
         let (dispatches, authorizations) = async_channel::bounded(1);
         let entry = self
             .scheduler_firing_web
@@ -424,9 +795,22 @@ impl Workspace {
             move |message| event(Event::Worker(finish_ticket, message)),
         );
         if review_phase(&entry.review) != phase {
-            entry.revision += 1;
+            entry.revision = revision.unwrap_or(entry.revision + 1);
         }
         let task = update?;
+        if let Some(input) = model_input {
+            entry
+                .model_tool
+                .as_mut()
+                .expect("current model tool")
+                .approved_input = Some(input);
+            *self
+                .scheduler_firing_web
+                .rounds
+                .model_lookups
+                .entry(ticket.key())
+                .or_default() += 1;
+        }
         entry.status = None;
         let evidence = if include && let Some((scope, results)) = entry.review.included() {
             let scope = scope.clone();
@@ -462,6 +846,20 @@ impl Workspace {
             Ok((task, evidence))
         }
     }
+}
+
+fn require_advisory_web_authority(
+    read_only: Option<&AdvisoryWebAuthority>,
+    vault: &Weak<()>,
+) -> Result<(), &'static str> {
+    if let Some(authority) = read_only {
+        if vault.strong_count() == 0 {
+            authority.block(WEB_VAULT_CHANGED);
+            return Err(WEB_VAULT_CHANGED);
+        }
+        authority.require_policy(&ClipboardPolicy::load())?;
+    }
+    Ok(())
 }
 
 fn reviewed_public_input(

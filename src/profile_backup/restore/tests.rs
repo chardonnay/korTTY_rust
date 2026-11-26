@@ -4,6 +4,8 @@ use super::*;
 use crate::ssh_key_catalog::{Edit, KeyDraft, KeyInput};
 
 mod java_toolbar;
+mod java_web;
+mod tagged_java;
 
 const ENVIRONMENTS: &[u8] = br#"{"version":1,"custom":[],"colors":{}}"#;
 const OLD_JOBS: &[u8] =
@@ -3566,6 +3568,27 @@ fn java_ssh_password_restore_seals_and_replays_exact_routes() {
         assert!(credential.matches_host(&login.endpoint.host));
         assert_eq!(vault.secret(id), Some("café – 新🔒"));
     }
+
+    let mut replay = super::super::inspect_java_password(&archive_path, &archive_password).unwrap();
+    super::super::prepare_java_credentials(
+        &mut replay,
+        Some(&java_password),
+        Some(&vault),
+        &local.0,
+    )
+    .unwrap();
+    assert_eq!(
+        replay.java_password_summary().map(|(added, _)| added),
+        Some(0)
+    );
+    super::super::queue_restore_at(&local.0, replay, RestoreMode::JavaAdditive).unwrap();
+    drop(vault);
+    drop(ProfileLease::acquire(&local.0, || false).unwrap());
+    assert_eq!(fs::read(&vault_path).unwrap(), installed_vault);
+    assert_eq!(
+        fs::read(local.0.join(CONNECTIONS)).unwrap(),
+        installed_connections
+    );
 }
 
 #[test]

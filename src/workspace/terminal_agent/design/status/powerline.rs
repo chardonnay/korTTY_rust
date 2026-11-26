@@ -248,7 +248,7 @@ pub(super) fn view<'a>(
             }
         }
         let toggle = Message::TogglePowerlineDrawer;
-        if let Some(controls) = bar_controls(&trace, has_archive, drawer, compact, toggle) {
+        if let Some(controls) = bar_controls(&trace, has_archive, drawer, compact, toggle, None) {
             if compact {
                 let bar = scrollable::Scrollbar::new().width(2).scroller_width(2);
                 let actions = scrollable(controls)

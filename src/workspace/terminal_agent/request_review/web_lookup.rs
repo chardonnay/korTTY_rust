@@ -35,7 +35,7 @@ impl WebAuthority {
                     .page_credential_env()
                     .filter(|name| Some(*name) != search),
             )
-            .map(|name| (name.to_owned(), local_ai::credential_value(name).ok()))
+            .map(|name| (name.to_owned(), scope.provider_credential(name)))
             .collect();
         Self {
             scope: scope.clone(),
@@ -52,7 +52,7 @@ impl WebAuthority {
             || self
                 .provider_credentials
                 .iter()
-                .any(|(name, reviewed)| &local_ai::credential_value(name).ok() != reviewed)
+                .any(|(name, reviewed)| &self.scope.provider_credential(name) != reviewed)
         {
             return Err(CHANGED.into());
         }
@@ -100,12 +100,18 @@ impl Lookup {
     pub(super) fn scope(&self) -> &web::Scope {
         &self.scope
     }
-    pub(super) fn new(authority: &Authority, run: &Run, allowed: bool) -> Option<Self> {
+    pub(super) fn new(
+        authority: &Authority,
+        run: &Run,
+        allowed: bool,
+        vault: Option<&VaultWindow>,
+    ) -> Option<Self> {
         let scope = web::Scope::new(
             Some(&authority.config),
             authority.profile.id,
             allowed && !authority.private,
         )?
+        .with_vault(vault)
         .with_redactor(&run.redactor);
         Some(Self {
             scope,
@@ -125,7 +131,7 @@ impl Lookup {
 
 impl Review {
     pub(in crate::workspace::terminal_agent) fn web_available(&self) -> bool {
-        self.web_lookup.is_some()
+        !matches!(self.kind, Kind::Plan(_)) && self.web_lookup.is_some()
     }
 
     pub(in crate::workspace::terminal_agent) fn web_active(&self) -> bool {
@@ -208,6 +214,9 @@ impl Workspace {
     ) -> Result<Task<Desktop>, String> {
         use web::Message::{Close, Finished, Include, Open, Send};
 
+        if !review.web_available() {
+            return Ok(Task::none());
+        }
         let Some(lookup) = review.web_lookup.as_ref() else {
             return Ok(Task::none());
         };

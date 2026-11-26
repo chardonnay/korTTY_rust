@@ -1003,6 +1003,18 @@ impl Action {
                             && !approval.supports_environment_lookup(self.probe))
                         || (grant.allows_round_lookup()
                             && !approval.supports_round_lookup(self.probe))
+                        || (grant.allows_model_tools()
+                            && !match (self.kind, self.probe) {
+                                (Kind::Agent, Probe::PerFiring)
+                                | (Kind::Swarm, Probe::SwarmIterative) => {
+                                    approval.generation.is_some()
+                                }
+                                (Kind::Swarm, Probe::SwarmReadOnly) => approval
+                                    .advisory
+                                    .as_ref()
+                                    .is_some_and(AdvisoryGrant::is_guided),
+                                _ => false,
+                            })
                 })
                 || (approval.requires_fresh_web()
                     && (approval.profile.reviewed_cli.is_some()
@@ -1282,6 +1294,7 @@ pub(super) struct Review {
     pub(super) unattended_web_environment: bool,
     pub(super) unattended_web_rounds: bool,
     pub(super) unattended_web_round_pages: bool,
+    pub(super) unattended_web_model_tools: bool,
 }
 
 impl Review {
@@ -1395,6 +1408,8 @@ impl Review {
                 != self.unattended_web_rounds
             || grant.is_some_and(web_lookup::Grant::allows_round_page)
                 != self.unattended_web_round_pages
+            || grant.is_some_and(web_lookup::Grant::allows_model_tools)
+                != self.unattended_web_model_tools
     }
 
     pub(super) fn supports_unattended_web_environment(&self) -> bool {
@@ -1752,6 +1767,9 @@ impl SchedulerWindow {
         let unattended_web_round_pages = web_lookup
             .as_ref()
             .is_some_and(web_lookup::Grant::allows_round_page);
+        let unattended_web_model_tools = web_lookup
+            .as_ref()
+            .is_some_and(web_lookup::Grant::allows_model_tools);
         let review = Review {
             id: request.job.id().clone(),
             kind: agent.kind,
@@ -1791,6 +1809,7 @@ impl SchedulerWindow {
             unattended_web_environment,
             unattended_web_rounds,
             unattended_web_round_pages,
+            unattended_web_model_tools,
         };
         self.agent_review_current(view, &review)?;
         view.agent_review = Some(review);

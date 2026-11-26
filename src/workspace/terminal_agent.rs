@@ -1304,6 +1304,17 @@ impl Workspace {
             }
             None => (String::new(), None),
         };
+        let design_id = self
+            .terminal_overrides(pane)
+            .and_then(|settings| settings.ai_agent_design.as_deref())
+            .or_else(|| {
+                pane.teamwork_ssh
+                    .as_ref()?
+                    .connection()
+                    .terminal
+                    .ai_agent_design
+                    .as_deref()
+            });
         let manual_directory = if cfg!(windows) {
             pane.local_security.as_ref().map(|settings| {
                 settings
@@ -1329,11 +1340,10 @@ impl Workspace {
             profiles,
             purpose,
             swarm,
-            design: self.window_settings.ai_agent_designs.resolve(
-                self.terminal_overrides(pane)
-                    .and_then(|settings| settings.ai_agent_design.as_deref()),
-                self.window_settings.ai_agent_design,
-            ),
+            design: self
+                .window_settings
+                .ai_agent_designs
+                .resolve(design_id, self.window_settings.ai_agent_design),
             redactor,
         });
         if let Some(config) = self.ai_configuration() {

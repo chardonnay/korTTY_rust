@@ -866,6 +866,9 @@ fn terminal_overrides(
         }),
         strict_terminal_mode: optional_boolean(node, "strictTerminalMode")?,
         ai_agent_disabled: optional_boolean(node, "aiAgentDisabled")?.unwrap_or(false),
+        ai_agent_design: raw_scalar(node, "aiAgentDesignId")?
+            .map(|value| value.trim().to_owned())
+            .filter(|id| crate::terminal_agent::design::valid_id(id)),
         java_ai_profile: raw_scalar(node, "aiProfileId")
             .ok()
             .flatten()

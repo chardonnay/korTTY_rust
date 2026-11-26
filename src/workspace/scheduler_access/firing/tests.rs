@@ -20,6 +20,8 @@ use crate::ssh_dialog::LoginTarget;
 use crate::vault_window::VaultWindow;
 
 mod environment_web;
+#[cfg(all(debug_assertions, feature = "dialog-preview"))]
+mod model_web;
 #[cfg(unix)]
 mod openssh;
 mod proposal_skills;

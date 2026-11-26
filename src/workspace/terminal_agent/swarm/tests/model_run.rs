@@ -1,17 +1,25 @@
 use std::io::{ErrorKind, Write};
 
+use iced::futures::StreamExt;
 use serde_json::{Value, json};
 
 use super::*;
 use crate::local_ai::test_support::{
-    accept, exclusive_run, fixture_http_response, listener, wire_request,
+    accept, exclusive_run, fixture_http_response, listener, request, wire_request,
 };
-use crate::terminal_agent::{Outcome, Status as CommandStatus};
+use crate::terminal_agent::{Outcome, Status as CommandStatus, usage::Progress};
 use crate::workspace::terminal_ai::web::Message as Web;
 use request_review::Message as Review;
 
 fn agent_message(task: Task<Desktop>, member: window::Id) -> RunMessage {
     let mut stream = iced_runtime::task::into_stream(task).expect("agent update task");
+    next_agent_message(&mut stream, member)
+}
+
+fn next_agent_message(
+    stream: &mut (impl iced::futures::Stream<Item = iced_runtime::Action<Desktop>> + Unpin),
+    member: window::Id,
+) -> RunMessage {
     while let Some(action) = block_on(stream.next()) {
         if let iced_runtime::Action::Output(Desktop::TerminalAgent(id, message)) = action {
             assert_eq!(id, member);
@@ -19,6 +27,145 @@ fn agent_message(task: Task<Desktop>, member: window::Id) -> RunMessage {
         }
     }
     panic!("missing agent update");
+}
+
+#[test]
+fn swarm_model_web_reviews_stay_with_the_current_target() {
+    let _exclusive = exclusive_run();
+    let (model, _) = listener();
+    let profile = Profile::new();
+    let root = profile.0.canonicalize().unwrap();
+    let config: Configuration = serde_json::from_value(json!({"profiles": {
+        "profiles":[{"id":1,"name":"Swarm fixture","endpoint":model.local_addr().unwrap().to_string(),
+            "model":"test","tavily_search":true}],
+        "default":1,"last_id":1
+    }})).unwrap();
+    config
+        .save_fixture_at(&root, &Configuration::default())
+        .unwrap();
+    let mut workspace = Workspace::default();
+    workspace.window_settings.terminal_notifications.ai_runs = false;
+    workspace.set_test_ai_configuration(Configuration::load_fixture_from(&root).unwrap());
+    let (owner, _) = workspace.open_window(false);
+    let sessions = [
+        local(&mut workspace, owner, false),
+        local(&mut workspace, owner, false),
+    ];
+    drop(workspace.open_agent_swarm(owner));
+    let group = *workspace.terminal_agents.swarms.keys().next().unwrap();
+    drop(workspace.swarm_action(group, Message::Mode(SwarmMode::Advisory)));
+    drop(workspace.swarm_action(
+        group,
+        Message::Goal("Search current public documentation".into()),
+    ));
+    for key in review_source(&mut workspace, group, &root) {
+        drop(workspace.swarm_action(group, Message::Toggle(key, true)));
+    }
+    let start = workspace.swarm_action(group, Message::Start);
+    drain(&mut workspace, start);
+    let [first, second] = sessions.map(|session| {
+        workspace.terminal_agents.swarms[&group]
+            .members
+            .iter()
+            .find_map(|(&id, ticket)| (ticket.key().pane()?.0 == session).then_some(id))
+            .expect("selected Swarm target")
+    });
+    let action = |workspace: &mut Workspace, member, message| {
+        workspace.swarm_action(
+            group,
+            Message::Member(member, MemberAction::ReviewModel(message)),
+        )
+    };
+    let complete = |mut stream, workspace: &mut Workspace, member| {
+        let message = next_agent_message(&mut stream, member);
+        assert!(matches!(message, RunMessage::Decision(..)));
+        let task = workspace.update_terminal_agent(member, message);
+        drain(workspace, task);
+    };
+
+    let [(first_stream, first_epoch), (second_stream, second_epoch)] =
+        [first, second].map(|member| {
+            let run = &workspace.terminal_agents.runs[&member];
+            assert!(run.swarm && run.phase == Phase::ModelReview);
+            let epoch = run.epoch;
+            let task = action(&mut workspace, member, Review::Send(epoch));
+            let mut stream = iced_runtime::task::into_stream(task).unwrap();
+            let mut socket = accept(&model);
+            let input = request(&mut socket);
+            assert_eq!(input["tools"].as_array().unwrap().len(), 2);
+            let response = json!({"choices":[{"message":{"content":null,"tool_calls":[{
+                "id":"member-search","type":"function",
+                "function":{"name":"web_search","arguments":r#"{"query":"public Swarm fixture"}"#}
+            }]}}]});
+            socket
+                .get_mut()
+                .write_all(fixture_http_response("200 OK", "", &response.to_string()).as_bytes())
+                .unwrap();
+            drop(socket);
+            let proposed = next_agent_message(&mut stream, member);
+            assert!(matches!(
+                proposed,
+                RunMessage::Progress(_, Progress::WebTool(_))
+            ));
+            let task = workspace.update_terminal_agent(member, proposed);
+            drain(&mut workspace, task);
+            let run = &workspace.terminal_agents.runs[&member];
+            assert_eq!(member_status(run), Status::Review);
+            (stream, run.epoch)
+        });
+    let decline = |workspace: &mut Workspace, member, epoch| {
+        action(workspace, member, Review::ToolWeb(epoch, 1, Web::Close))
+    };
+    let task = decline(&mut workspace, first, first_epoch);
+    drain(&mut workspace, task);
+    let mut socket = accept(&model);
+    let continuation = request(&mut socket);
+    let result = &continuation["messages"][3];
+    assert_eq!(result["tool_call_id"], "member-search");
+    assert!(
+        result["content"]
+            .as_str()
+            .unwrap()
+            .contains("user_declined")
+    );
+    let answer = json!({"status":"done","summary":"Done","userMessage":"Decline received"});
+    let response = json!({"choices":[{"message":{"content":answer.to_string()}}]});
+    socket
+        .get_mut()
+        .write_all(fixture_http_response("200 OK", "", &response.to_string()).as_bytes())
+        .unwrap();
+    drop(socket);
+    complete(first_stream, &mut workspace, first);
+    let second_run = &workspace.terminal_agents.runs[&second];
+    assert_eq!(member_status(second_run), Status::Review);
+
+    // A replaced terminal invalidates only its member's held proposal.
+    workspace
+        .sessions
+        .get_mut(&sessions[1])
+        .unwrap()
+        .stream_generation += 1;
+    let task = decline(&mut workspace, second, second_epoch);
+    drain(&mut workspace, task);
+    complete(second_stream, &mut workspace, second);
+    assert!(matches!(model.accept(), Err(error) if error.kind() == ErrorKind::WouldBlock));
+    let queue = workspace.terminal_agents.swarms[&group]
+        .queue
+        .as_ref()
+        .unwrap();
+    let status = |session| {
+        queue
+            .rows()
+            .iter()
+            .find(|row| row.target.key.pane().is_some_and(|(id, _)| id == session))
+            .unwrap()
+            .status
+    };
+    assert_eq!(status(sessions[0]), Status::Succeeded);
+    assert!(matches!(
+        status(sessions[1]),
+        Status::Failed | Status::Blocked
+    ));
 }
 
 #[test]

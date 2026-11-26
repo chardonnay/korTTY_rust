@@ -162,6 +162,7 @@ pub(in crate::ai_manager) struct Report {
     pub(in crate::ai_manager) request_timeout_omitted: bool,
     pub(in crate::ai_manager) code_text_language_omitted: bool,
     pub(in crate::ai_manager) agent_triage_omitted: bool,
+    pub(in crate::ai_manager) agent_always_offer_web_tools_omitted: bool,
     pub(in crate::ai_manager) agent_run_presentation_omitted: bool,
     pub(in crate::ai_manager) roles: crate::ai_manager::java_roles::Hints,
     pub(in crate::ai_manager) roles_omitted: usize,
@@ -176,7 +177,6 @@ pub(in crate::ai_manager) struct Report {
     pub(in crate::ai_manager) default_reasoning_omitted: usize,
     pub(in crate::ai_manager) web_hints: usize,
     pub(in crate::ai_manager) web_hints_omitted: usize,
-    pub(in crate::ai_manager) web_keys_omitted: usize,
     pub(in crate::ai_manager) journal_profiles: JavaJournalProfiles,
     pub(in crate::ai_manager) journal_evidence_omitted: bool,
     pub(in crate::ai_manager) journal_preferences_omitted: bool,
@@ -251,21 +251,7 @@ pub(in crate::ai_manager) fn decode(bytes: &[u8]) -> io::Result<(Catalog, Report
     let document = document(bytes)?;
     let root = document.root_element();
     let mut catalog = Catalog::default();
-    let mut report = Report {
-        web_keys_omitted: root
-            .children()
-            .filter(|node| {
-                [
-                    "encryptedAiTavilyApiKey",
-                    "encryptedAiBrightDataApiToken",
-                    "encryptedAiBraveSearchApiKey",
-                ]
-                .iter()
-                .any(|field| named(*node, field))
-            })
-            .count(),
-        ..Report::default()
-    };
+    let mut report = Report::default();
     let wrapper =
         child(root, "aiProfiles").map_err(|()| invalid("Duplicate Java AI profile list"))?;
     let mut profiles = wrapper
@@ -489,6 +475,18 @@ pub(in crate::ai_manager) fn decode(bytes: &[u8]) -> io::Result<(Catalog, Report
     }) {
         Ok(mode) => report.general_preferences.agent_triage = mode,
         Err(()) => report.agent_triage_omitted = true,
+    }
+    match scalar(root, "aiAgentAlwaysOfferWebTools").and_then(|value| {
+        value
+            .map(|value| match value {
+                "true" | "1" => Ok(true),
+                "false" | "0" => Ok(false),
+                _ => Err(()),
+            })
+            .transpose()
+    }) {
+        Ok(value) => report.general_preferences.agent_always_offer_web_tools = value,
+        Err(()) => report.agent_always_offer_web_tools_omitted = true,
     }
     match scalar(root, "terminalAgentExecutionTarget").and_then(|value| {
         value
@@ -1685,7 +1683,6 @@ mod tests {
         let searxng = "<aiSearxngMcpPluginId>mcp/searxng_fixture</aiSearxngMcpPluginId>";
         let (catalog, report) = decode(xml(searxng).as_bytes()).unwrap();
         assert_eq!((report.web_hints, report.web_hints_omitted), (5, 2));
-        assert_eq!(report.web_keys_omitted, 3);
         let hints = catalog
             .profiles
             .iter()

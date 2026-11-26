@@ -75,9 +75,10 @@ impl Demo {
         token: Token,
         key: SampleLogKey,
         page: Id,
+        reduced_motion: bool,
     ) -> Task<Desktop> {
         if token == self.token() {
-            self.sample.navigate_log(key, page)
+            self.sample.navigate_log(key, page, reduced_motion)
         } else {
             Task::none()
         }

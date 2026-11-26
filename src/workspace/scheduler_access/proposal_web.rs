@@ -32,11 +32,11 @@ impl Workspace {
         let local = model.completion_secret();
         let search = scope
             .search_credential_env()
-            .and_then(|name| crate::local_ai::credential_value(name).ok());
+            .and_then(|name| scope.provider_credential(name));
         let page = scope
             .page_credential_env()
             .filter(|_| include_page)
-            .and_then(|name| crate::local_ai::credential_value(name).ok());
+            .and_then(|name| scope.provider_credential(name));
         if mask::prompt(&vault_overlay(&vault, &redactor, topic)?, topic)? != topic
             || local.iter().chain(&search).chain(&page).any(|secret| {
                 crate::local_ai::credential_echo(topic, secret)
@@ -59,7 +59,8 @@ impl Workspace {
             .resolve_profile_reference(grant.profile())
             .ok_or("The saved AI profile is unavailable.")?;
         let scope = web::Scope::new(Some(&config), id, self.scheduler_web_allowed())
-            .ok_or("The saved web search settings are unavailable.")?;
+            .ok_or("The saved web search settings are unavailable.")?
+            .with_vault(self.vault.as_ref());
         scope.require_unattended_profile(grant, &self.clipboard.policy.terminal_logging)?;
         let (model, _, _) = config
             .web_search_profile(id, false)

@@ -1,10 +1,12 @@
 # Agent web-tool offering: remaining implementation contract
 
 Reviewed on 2026-11-25. This Mac has verified the original Java offer, the
-native single-turn transport and interactive Run review against a loopback
-model. The next desktop check covers Setup and Pause/Resume. Additional Agent
-routes, Scheduler approval scopes, the General preference and configured
-services remain open. [Porting priorities](PORTING-PLAN.md#next-milestones-in-priority-order)
+native single-turn transport and interactive Ask, Run, Plan and triage review
+against a loopback model. Desktop checks also cover compact Setup,
+Pause/Resume and per-member Swarm reviews. Scheduler has direct-tool approval
+for guided Agent, iterative Swarm and guided read-only Swarm. The General
+preference and configured services remain open.
+[Porting priorities](PORTING-PLAN.md#next-milestones-in-priority-order)
 
 ## Verified original behavior
 
@@ -70,8 +72,8 @@ receive an explicit unsupported response for this direct-tool API.
 The Run decision request can offer the two direct tools when the first line
 of its original task matches the reference's default signal-word or URL rules.
 Eligibility uses the typed goal and the Run request kind.
-Private runs, Swarm, final advice and unsupported transports do not enable it.
-The selected profile must already permit the direct Tavily integration.
+Private runs, final advice and unsupported transports do not enable it. The
+selected profile must already permit the direct Tavily integration.
 
 Each proposal arrives over the existing model progress channel. Its query or
 exact page URL uses the existing editable review before provider dispatch; its
@@ -101,48 +103,76 @@ and installed-runtime acceptance remain open. This run also exposed clipped
 Setup actions at 800 × 500, particularly when a finished run could be exported.
 The subsequent worktree change puts the Setup body in a scroll area and keeps
 the action row visible in all 18 geometry cases. Its full application suite
-was interrupted and its desktop fixture recorded zero model requests. Setup
-and Pause/Resume still need desktop acceptance. [Setup candidate checks](target/verification/20261125-agent-setup-paused-notes.md)
+was interrupted. The merged PR #38 tree later passed 5,145 workspace tests
+and live Setup checks at normal, compact and minimum content sizes on this
+Mac. Compact Pause/Resume restored both an edited query and loaded excerpts
+while model continuation stayed gated by the review. [Desktop and wire evidence](PORTING-PARITY.md#november-25-agent-setup-pause-and-resume-on-macos)
+
+The November 26 minimum-size run found that declining the final tool while
+paused sent a follow-up model request. Paused reviews now hold tool decisions
+until Resume. The provider may finish a lookup already in flight, and the run
+can still be cancelled. [Native follow-up](PORTING-PARITY.md#november-26-minimum-agent-layout-and-paused-tool-decline)
 
 ## Current native gaps
 
-AI Manager General has native counterparts for 23 of 30 Java controls,
-including six nonsecret Internet defaults. The seven outstanding controls are
-the global Tavily key, Bright Data token and Brave key, their three Clear
-actions and the always-offer checkbox. Java migration and managed-policy
-checks remain open for those global settings. [General field inventory](target/verification/20261125-searxng-global-reconciliation.json)
+AI Manager General has native counterparts for all 30 inventoried Java
+controls. The Tavily, Bright Data and Brave fields and their Clear actions
+use the encrypted native vault. Tavily and Bright Data use an unlocked saved
+credential in their reviewed provider routes. Brave requests select the
+configured LM Studio plugin, as in Java v2.26.0. Adoption of encrypted Java
+provider keys and acceptance against configured services remain open.
+[Native credential acceptance](PORTING-PARITY.md#november-26-global-web-provider-credentials) · [Prior field inventory](target/verification/20261125-searxng-global-reconciliation.json) · [Saved preference](PORTING-PARITY.md#november-26-saved-agent-web-tool-offering-preference)
 
-Standalone Run can offer tools on an eligible direct Tavily profile. Ask,
-planning/triage, Swarm and Scheduler need route-specific eligibility and
-approval scopes for model-proposed calls. The existing user-initiated
-search/page actions and approved single-query Scheduler lookup each retain
-their own authority.
+Standalone Ask, Run, Plan Questions/Options/Report, Run triage and interactive
+Swarm members can offer tools on eligible direct Tavily profiles. Guided
+scheduled Agent, iterative Swarm and guided read-only Swarm require an explicit
+saved opt-in for direct tools. The existing approved lookup workflow and the
+interactive user-initiated search/page actions each retain their own authority.
+
+Java Ask sets `queryOnly` and uses the shared decision prompt with the
+`User task:` marker. Native Ask keeps its advisory answer format and the
+attachment checks before provider and model dispatch. This Mac verified the
+edited search, exact page URL, separate excerpt approvals, ordinary Ask without
+tool definitions and cancellation with a tool proposal held. [Java decision path](https://github.com/chardonnay/korTTY/blob/b235d91f20356f8a9b33ad5398550a043cc21ed2/src/main/java/de/kortty/core/TerminalAgentService.java#L1738-L1766) · [Native Ask acceptance](PORTING-PARITY.md#november-25-reviewed-web-tools-in-native-agent-ask)
+
+Planning and Run triage use the original task for eligibility. Plan review
+revalidates the current route before provider dispatch and model continuation.
+Triage returns the approach choice, which leads to a separate Run review.
+[Native planning and triage acceptance](PORTING-PARITY.md#november-25-reviewed-web-tools-in-native-planning-and-triage)
+
+Java Swarm sends the original query through the shared Agent service for each
+target. Native Swarm offers tools in member advisory and command-review
+requests, with a separate model request, query or URL review and excerpt
+approval for each member. Direct Tavily HTTP operations have a bounded worker
+pool independent of model workers waiting on tool results.
+[Java member request](https://github.com/chardonnay/korTTY/blob/b235d91f20356f8a9b33ad5398550a043cc21ed2/src/main/java/de/kortty/core/swarm/SwarmOrchestrator.java#L346-L389) · [Native Swarm acceptance](PORTING-PARITY.md#november-25-reviewed-web-tools-for-interactive-swarm)
 
 ## Required implementation and acceptance
 
-1. **Verify the Setup candidate on this Mac.** Complete its application suite
-   and normal, compact and minimum-size Setup checks. Pause and resume both an
-   edited proposal and fetched results awaiting review. Match each restored
-   review to its call ID and verify the wire sequence through approval or
-   cancellation. [Candidate and desktop steps](PORTING-PLAN.md#next-verification-on-this-mac)
-2. **Extend interactive offering to the remaining Java routes.** Compare Ask,
-   planning/triage and Swarm with the original-service cases. Determine
-   eligibility from request kind and original task. Keep private contexts,
-   terminal output and ordinary non-Agent calls within their existing scopes.
-   Reuse Run's editable query or exact-page review, masked-excerpt approval
-   and per-call identity. Exercise cancellation, stale authority, ordered
-   errors, aggregate limits, repair and usage on each newly enabled route.
-3. **Define the approval for Scheduler model-driven rounds.** Bind allowed
-   queries/pages, target, provider and per-firing budgets before enabling
-   dispatch. Exercise recurring jobs and revocation after a profile, mask,
-   vault or policy change. Preserve the existing one-query grant for its
-   reviewed lookup.
-4. **Wire the saved always-offer preference to eligible routes.** Default it
-   to off, expose it in General / Internet search and invalidate old authority
-   when it changes. Verify Save, Cancel, restart, policy locking and Java
-   migration into a profile with local choices. Count this control after both
-   the preference and its runtime behavior pass.
-5. **Verify configured services and platform behavior.** Compare new routes
+1. **Scheduler model-tool revocation accepted on macOS.** Guided Agent and iterative
+   Swarm bind individual web requests to the current target and firing.
+   Existing grants V1–V5 default to their earlier lookup scope. Guided
+   Agent has calendar and profile revocation evidence on this Mac, and
+   iterative Swarm has a two-target desktop run with real OpenSSH probes.
+   Guided read-only Swarm uses the same per-call approvals and checks the
+   target and advisory authority again before model continuation. On this Mac,
+   disabling Internet access and changing masking rules closed pending reviews
+   with zero model continuations and recorded each target's block reason.
+   The guided Agent and iterative Swarm also closed their pending tool reviews
+   after Internet-policy or masking changes. The journal identified the cause,
+   and neither change let the model continue. After policy restoration a fresh
+   Swarm run accepted one target's excerpts and kept the other target's decline separate.
+   [Guided Agent and iterative Swarm evidence](PORTING-PARITY.md#november-25-direct-model-web-tool-approval-in-jobscheduler) · [Read-only Swarm evidence](PORTING-PARITY.md#november-25-reviewed-web-tools-for-scheduled-read-only-swarm) · [Read-only revocation follow-up](PORTING-PARITY.md#november-25-scheduled-read-only-swarm-revocation-reasons)
+   [Guided Agent and iterative Swarm revocation follow-up](PORTING-PARITY.md#november-26-guided-agent-and-iterative-swarm-web-revocation)
+2. **Saved always-offer preference accepted.** General / Internet access
+   defaults to off and offers tools for eligible direct Tavily requests when
+   enabled. The saved revision invalidates an older review even after
+   restoring the previous value. Java migration fills unset settings and
+   preserves an explicit native choice. The desktop verified search,
+   discard, Save, restart, policy locking and the changed model offer on the
+   same local task.
+   [Saved preference and desktop model evidence](PORTING-PARITY.md#november-26-saved-agent-web-tool-offering-preference)
+3. **Verify configured services and platform behavior.** Compare new routes
    with the retained Java wire cases, then use a configured direct Tavily
    integration and supported OpenAI-compatible and signed GGUF/MLX delegate
    routes. Record actual provider dispatch and model continuation, including

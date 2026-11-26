@@ -1279,6 +1279,7 @@ impl Workspace {
             [
                 events,
                 self.scheduler_subscription(),
+                self.ssh_temporary_key_subscription(),
                 self.application_update_subscription(),
                 self.snippet_recovery_subscription(),
                 self.snippet_structure_subscription(),
@@ -6889,7 +6890,11 @@ impl Workspace {
                             .on_press(Message::SelectTab(id, tab.id));
                         let select: Element<'_, Message> = if let Some(tooltip_text) = tooltip_text
                         {
-                            tooltip(select, text(tooltip_text), tooltip::Position::Bottom).into()
+                            tooltip(select, text(tooltip_text), tooltip::Position::Top)
+                                .gap(4)
+                                .delay(std::time::Duration::from_millis(500))
+                                .style(container::bordered_box)
+                                .into()
                         } else {
                             select.into()
                         };

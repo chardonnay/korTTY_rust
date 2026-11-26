@@ -1,6 +1,6 @@
 # Remaining Java-to-Rust porting plan
 
-Reviewed against the porting worktree on 2026-11-25. The agreed scope is in
+Reviewed against the porting worktree on 2026-11-26. The agreed scope is in
 [HANDOFF.md](HANDOFF.md). The [parity record](PORTING-PARITY.md) identifies the
 revisions, environments and results of completed checks. Raw logs and images
 under `target/verification/` are local to the producing checkout. Older artifact
@@ -8,11 +8,12 @@ paths shown as code identify files to retrieve onto this desktop when needed.
 
 ## Current result and actionable backlog
 
-**Parity with Java v2.26.0 is partial.** The Java reference is
-`b235d91f2035`. This checkpoint builds on `82fac4bea8ee` (PR #37).
-The last recorded complete three-platform workspace
-suites ran on `ab5b101e`. Later native checks cover the application or feature
-named in each record. [Three-platform workspace results](PORTING-PARITY.md#november-23-full-native-workspace-tests)
+**Parity with Java v2.26.0 is partial.** The Java reference is `b235d91f2035`.
+On November 26, this Apple Silicon desktop ran the full workspace suite with
+the local porting changes on top of `a84f26f5e44f` (PR #38). The per-target
+totals were **5,169 passed, 0 failed and 237 ignored**. The most recent
+revision with complete macOS, Windows and Fedora workspace results is
+`ab5b101e` (PR #35). [macOS worktree results and counting method](PORTING-PARITY.md#november-26-native-metro-rail-on-macos) · [Three-platform workspace results](PORTING-PARITY.md#november-23-full-native-workspace-tests)
 
 ### Current test availability
 
@@ -28,55 +29,190 @@ equipment remain user-deferred.
 | Order and status | Deliverable | Completion check |
 | --- | --- | --- |
 | **1 — complete** | **SFTP external editor and rsync executable (D4/V2).** A direct Windows ARM64 comparison with Java v2.26.0 covered both Settings fields, Browse, Cancel, Save/restart and disabled controls. | On this Mac, after TextEdit saved the local copy, the app wrote the 84 edited bytes back to the original SFTP path with mode `0644`. An explicitly reviewed rsync upload matched all 262,318 bytes at the receiver. Changing either configured executable required fresh review. [macOS live transfer evidence](PORTING-PARITY.md#november-24-native-macos-sftp-executable-live-use-acceptance) · [Windows ARM64 dialog comparison](PORTING-PARITY.md#windows-arm64-comparison-continuation) |
-| **2 — next** | **Finish the primary dialogs (D2/D4/A2/B4/Q1).** Start with desktop acceptance of compact Agent Setup and Pause/Resume. Then cover the remaining Agent, AI Manager, Settings, Connection Manager, Quick Connect and Scheduler cases. | Compare changed flows with Java at normal and compact sizes. Check keyboard access, focus returning to the owner, draft retention and Save/Cancel/restart where applicable. [Next verification on this Mac](#next-verification-on-this-mac) · [Dialog inventory](#gui-dialog-design-parity) |
-| **3 — open** | **Make Java data migration predictable (M1/P1).** Start with a tagged backup containing connections and folders, credential references, and Scheduler jobs. Resolve the remaining settings, conflicting identities and action options against the importer. | Restore into both a fresh profile and one with colliding records. Reopen after restart and verify stable identities, preserved local choices, visible omissions and disabled imported jobs until review. Record a disposition for each remaining field or option. [Field and identity audit](#remaining-field-and-identity-audit) |
-| **4 — open** | **Finish file transfers and Scheduler execution (T2–T4/Q1/Q2).** Exercise deployed OpenSSH and sudo for recurring transfers, recovery and route changes. Then implement the requested Agent/Swarm scheduling extension for live Teamwork connections and groups using the existing shared-route checks. | Verify bytes and receiver identity after first creation, repeat firing, interruption and renewed approval. For the extension, run an approved shared target and group, then change membership or a pin and verify the old approval is refused. Java's Scheduler uses locally configured connections. [Transfer contracts](#file-operation-contracts-to-preserve) · [Teamwork scope](#implemented-workflows-awaiting-acceptance-and-requested-extensions) |
+| **2 — in progress** | **Finish the primary dialogs (D2/D4/A2/B4/Q1).** Compact Agent Setup and Pause/Resume passed on this Mac. Next, verify overlapping Run, Ask and Planning reviews on one SSH pane. Configured web providers and the remaining AI Manager, Settings, Connection Manager, Quick Connect and Scheduler cases follow. | Verify that each SSH run keeps its own review and output, including when two runs need the same worker. Compare the remaining dialogs with Java at normal and compact sizes, including keyboard focus, draft retention and Save/Cancel/restart where applicable. [Next verification on this Mac](#next-verification-on-this-mac) · [Dialog inventory](#gui-dialog-design-parity) |
+| **3 — in progress** | **Make Java data migration predictable (M1/P1).** The signed Java v2.26.0 producer generated a mixed backup with connections and folders, credential references and Scheduler jobs. Restore and replay passed for fresh and colliding profiles on this Mac. A second tagged backup verified additive import of protected global web credentials. | Continue the field and action audit. The mixed fixture verified stable identities after replay, preserved local choices, reported Scheduler conflicts and omitted prerequisites, and imported disabled jobs. Continue native review of the remaining settings and actions. [Tagged backup results](PORTING-PARITY.md#november-26-mixed-tagged-java-backup-restore) · [Web credential migration](PORTING-PARITY.md#november-26-java-global-web-credential-migration) · [Field and identity audit](#remaining-field-and-identity-audit) |
+| **4 — in progress** | **Finish file transfers and Scheduler execution (T2–T4/Q1/Q2).** This Mac verified ordinary SFTP Calendar and Chain runs and approved recurring rsync downloads against private OpenSSH. Continue deployed recurring transfers, recovery, sudo and route changes. Then implement the requested Agent/Swarm scheduling extension for live Teamwork connections and groups using the existing shared-route checks. | The macOS Calendar rsync download verified creation, repeat replacement, rejection after substitution and publication after renewed approval. A forced sender interruption preserved the receiver and cleaned both transfer stages. The next approved Calendar firing published the full 2 MiB and retained the prior file. Continue application crash recovery and protected receiver cases. For the extension, run an approved shared target and group, then change membership or a pin and verify the old approval is refused. Java's Scheduler uses locally configured connections. [Native transfer evidence](PORTING-PARITY.md#november-26-native-macos-recurring-file-transfers) · [Native interruption evidence](PORTING-PARITY.md#november-26-native-rsync-backpressure-and-interrupted-download) · [Transfer contracts](#file-operation-contracts-to-preserve) · [Teamwork scope](#implemented-workflows-awaiting-acceptance-and-requested-extensions) |
 | **5 — open** | **Close the remaining functional and native desktop cases (V1–V5).** Start with configured AI providers, signed GGUF/MLX runtimes and knowledge-store recovery. Finish remaining dialog comparisons, editor and diagram workflows, notification activation, window and pane movement, journal viewing, recording playback and terminal checks. | Record each workflow on the applicable native desktop. Identify the pane activated by a coding-agent notification, reopen persisted data, check exports, and complete the software comparisons for all 21 emulations. Track Wayland and X11 separately. [Native acceptance matrix](#native-acceptance-and-release-gates) |
 | **6 — open** | **Qualify one release candidate (U4/V6/V7).** After fixes and security findings have a disposition, use one source revision for the local native suites and distributable packages. | Record formatting, strict Clippy, full tests and release builds by target. Verify checksums, installation, upgrade, removal, packaged sandboxing, signatures, macOS notarization, stapling and Gatekeeper. Record same-host startup, idle memory and p95 input latency. [Release gates](#native-acceptance-and-release-gates) |
 
 ### Next verification on this Mac
 
-1. **Recheck the compact Agent Setup candidate.** The November 25 candidate
-   manifest records 1,635 inputs before PR #37 was incorporated
-   (`src/**/*.rs`, `Cargo.toml`, `Cargo.lock` and `README.md`).
-   The scrollable body and fixed footer passed formatting, test
-   compilation, strict application Clippy, a native build and one Iced layout
-   test covering 18 combinations. The previous application suite passed 4,471
-   tests with 203 ignored. The run for this candidate stopped on user pause
-   (exit 143), before a full result or desktop acceptance. Run the application
-   suite on this candidate. [Candidate checks and cleanup](target/verification/20261125-agent-setup-paused-notes.md) · [Previous complete application run](PORTING-PARITY.md#november-25-interactive-run-model-web-rounds)
+#### Run, Ask and Planning on one SSH pane
 
-   ```sh
-   bash scripts/with-scratch.sh --zsh-tests \
-     python3 scripts/cargo-native.py test --locked -p kortty --bin kortty --features dialog-preview
-   ```
+Resume here on this Mac. The November 26 attempt stopped during the build,
+before the GUI opened. The Fedora Wayland and X11 runs provide the reference
+for the pending desktop check. [Interrupted macOS build](target/verification/20261126-native-mixed-ssh-agent/build.log) · [Fedora mixed SSH workflow](PORTING-PARITY.md#november-21-overlapping-terminal-agent-runs)
 
-2. **Exercise Setup and Pause/Resume in the running app.** Check a fresh Setup
-   and one with a finished run available for export. At 1100 × 760 and 800 × 500
-   content size, reach the prompt, scroll the body and activate the footer,
-   including Close. Check the minimum 640 × 400 layout. Pause and resume first
-   with an edited tool proposal awaiting approval, then with fetched excerpts
-   awaiting review. Verify the same call and draft or result are restored and
-   dispatch or model continuation occurs only after its corresponding approval.
-   Retain window evidence and the loopback request sequence. Clean owned
-   processes, fixtures and build artifacts as specified in [AGENTS.md](AGENTS.md).
-3. **Continue the unverified dialog cases.** Interactive Run already passed
-   reviewed model-driven web rounds on this Mac. Ask, Plan/triage, Swarm,
-   Scheduler approvals and the saved always-offer setting still need work.
-   AI Manager General has native counterparts for 23 of 30 Java controls.
-   The remaining seven are the global Tavily, Bright Data and Brave credentials,
-   their three Clear controls and the always-offer checkbox. Next dialog cases
-   also include live Agent activity designs, Profiles/wizard/model search, the
-   main-window transparency quick-menu click and manual replacement-key entry.
+1. Start Run, Ask and Planning from their aliases on one terminal pane connected
+   to the pinned OpenSSH test server. Approve Ask while the Planning questions
+   are pending. Verify that Ask receives its answer and Planning stays unsent.
+2. Keep the pane's worker busy with an ordinary command from a second Run.
+   Attempt the pending sudo approval. Check that the app reports the busy
+   pane, retains the review and waits for fresh approval before requesting
+   a password or executing the sudo command.
+3. After the worker is free, approve the command again. Verify the masked
+   password prompt and the execution receipt on the test server. Match the
+   model requests to their individual approvals and the output to its owning
+   Run. Record the desktop, SSH and model evidence in the parity record.
+
+#### Compact Setup and remaining dialog checks
+
+This Mac verified Agent Setup at 1100 × 760, 800 × 500 and 640 × 400.
+At the smallest size, the probe review and finished run kept their actions
+visible while the content scrolled. At 800 × 500, Pause/Resume preserved
+the draft, exact query and loaded excerpts through their respective reviews.
+The loopback model received the approved content with the original tool-call
+order. [Setup and Pause/Resume](PORTING-PARITY.md#november-25-agent-setup-pause-and-resume-on-macos) · [Rebased worktree](target/verification/20261125-agent-setup-rebase/results.json) · [Minimum-size and paused-review retest](PORTING-PARITY.md#november-26-minimum-agent-layout-and-paused-tool-decline)
+
+1. **Verify reviewed Agent web tools with configured providers.** Native
+   standalone Ask, Run, Plan Questions/Options/Report, Run triage and
+   interactive Swarm member requests have reviewed tool rounds. Guided
+   Scheduler Agent, iterative Swarm and guided read-only Swarm have an
+   explicit saved opt-in. The read-only Swarm journal identifies policy
+   and mask revocation per target. The saved always-offer preference now
+   reaches all eligible routes with the same separate approvals. The guided
+   Agent, iterative Swarm and read-only Swarm passed macOS checks for
+   Internet-policy and masking revocation while web reviews were open.
+   The compact guided Agent and full-size iterative Swarm setup retain
+   keyboard focus when the Scheduler research topic becomes empty or nonempty.
+   Continue configured-provider checks and acceptance on the outstanding platforms.
+   [Planning and triage desktop checks](PORTING-PARITY.md#november-25-reviewed-web-tools-in-native-planning-and-triage) · [Swarm desktop checks](PORTING-PARITY.md#november-25-reviewed-web-tools-for-interactive-swarm) · [Scheduler approvals](PORTING-PARITY.md#november-25-direct-model-web-tool-approval-in-jobscheduler) · [Read-only Swarm approvals](PORTING-PARITY.md#november-25-reviewed-web-tools-for-scheduled-read-only-swarm) · [Agent web-tool contract](PORTING-AGENT-WEB-TOOLS.md)
+   [Guided Agent and iterative Swarm revocation](PORTING-PARITY.md#november-26-guided-agent-and-iterative-swarm-web-revocation)
+   [Scheduler research topic keyboard check](PORTING-PARITY.md#november-26-scheduler-research-topic-keyboard-focus)
+2. **Continue the unverified dialog cases.**
+   All 30 Java AI Manager General controls now have native counterparts.
+   The three provider credentials and their Clear controls passed encrypted
+   save, discard, restart and clearing on this Mac. Tavily and Bright Data
+   passed reviewed requests to a loopback LM Studio fixture.
+   On this Mac, a Java v2.26.0 backup filled two empty provider slots
+   after explicit review and restart and preserved the existing third slot.
+   Configured services remain open.
+   [Provider credential acceptance](PORTING-PARITY.md#november-26-global-web-provider-credentials) · [Java credential migration](PORTING-PARITY.md#november-26-java-global-web-credential-migration)
+   Native live runs now cover Standard, Classic, Floating and the compact
+   Log Table in the activity window. The docked Log Table passed focus
+   transitions and reviewed execution below and to the right of the terminal.
+   At the short right dock size, End reveals the last selected row above
+   the horizontal scrollbar and Enter opens the approval. The compact
+   Settings preview also opens the keyboard-selected answer. The terminal
+   tab tooltip keeps isolation details separate from the shell status.
+   The native Log Table reopened two finished runs on the original terminal,
+   copied the selected masked output, opened the selected command as a draft,
+   and exported selected runs. An export opened during the second run kept
+   its original selection through completion. The second terminal had its
+   own history scope. [Retained runs and activity exports](PORTING-PARITY.md#november-26-native-agent-history-and-activity-exports)
+   Copy output preserved both streams and long Unicode lines in the
+   original and reopened Activity windows. Copy selected preserved the
+   read-only compact preview after a typing attempt.
+   [Native clipboard evidence](PORTING-PARITY.md#november-26-full-and-selected-agent-output-on-macos)
+   Live Log Table checks on this Mac found that unrelated redraws could
+   advance the reduced-animation timer in tenths of a second. The timer,
+   duration sort, and keyboard navigation now share a whole-second value
+   for running steps in this mode. The native retest verified the steady
+   marker, the one-second updates, and exact completed durations.
+   [Reduced-animation evidence](PORTING-PARITY.md#november-26-reduced-animation-log-table-timing-on-macos)
+   Native captures at 800 × 500 verified the entry flash for Approval,
+   Command and Answer rows and the steady background with reduced motion.
+   [Native row flash](PORTING-PARITY.md#november-26-native-log-table-entry-flash-on-macos)
+   The 640 × 400 Activity window now reveals the selected row in its own
+   table and leaves space above the horizontal scrollbar at 18 points.
+   This Mac verified keyboard approval details, separate result review and
+   exact copying from the completed command.
+   [Minimum Log Table](PORTING-PARITY.md#november-26-minimum-macos-log-table-keyboard-navigation)
+   Spotlight on this Mac focused the prompt on open, recalled two entries,
+   and restored the typed draft. Keyboard and pointer profile selection
+   kept the draft, and Escape returned input to the terminal. The chosen
+   profile survived compact Setup and the paused request review. Only the
+   selected fixture endpoint received the explicitly released request.
+   [Spotlight desktop evidence](PORTING-PARITY.md#november-26-native-spotlight-focus-and-profile-selection)
+   Plan and Execution accepted a numbered decision after the terminal
+   dock was expanded. Its detached history accepted the same decision
+   with both motion settings. The detached window kept its identity and
+   folded size through a second run and its dismissal. Native compositor
+   captures showed intermediate bar and check-mark frames with animations
+   enabled. With reduced motion, the first completion frame showed the
+   final bar and full check mark.
+   [Native d06 decisions and d19 handoff](PORTING-PARITY.md#november-26-plan-and-execution-decisions-and-detached-history)
+   [Native d06 motion frames](PORTING-PARITY.md#november-26-native-plan-and-execution-motion-frames)
+   The d14 cursor review passed native numeric decisions and Tab takeover
+   in local and pinned loopback SSH Zsh sessions. An early digit revealed
+   the full command and a fresh digit approved it. The recorded SSH exec
+   requests stayed equal while the user edited and cleared the draft.
+   [Native d14 decisions and takeover](PORTING-PARITY.md#november-26-native-cursor-decisions-and-ssh-takeover)
+   Native d14 dismissal frames captured a declining command contrast
+   with animations enabled. The first frame after Escape cleared the
+   command with reduced animations.
+   [Native d14 dismissal frames](PORTING-PARITY.md#november-26-native-cursor-dismissal-frames)
+   The d19 folded window followed two Ask runs and a reopened archived
+   answer. Its native identity and bounds survived both the archived
+   Activity close and the live Ask handoff to AI Chat. Clipboard copies
+   identified the exact answer on each handoff.
+   [Native archived Ask handoff](PORTING-PARITY.md#november-26-native-detached-archived-ask-handoff)
+   Adaptive Dock kept its countdown and status deadline with animations
+   enabled and with reduced motion. Auto-hide zero kept the status visible
+   and the manual toggle worked. Splitting the macOS terminal switched the
+   source run from Powerline to the compact pill and back.
+   [Native Adaptive Dock countdown](PORTING-PARITY.md#november-26-native-adaptive-dock-countdown-and-zero-auto-hide)
+   Toast notices expired with auto-hide zero while the pending review
+   remained available. Orbit copied the same command output with the side
+   Timeline and bottom Log Table. Matched macOS render captures verified
+   rotating points with animations enabled and stationary points with
+   reduced motion.
+   [Native Toasts and Orbit](PORTING-PARITY.md#november-26-native-toast-expiry-and-orbit-motion)
+   Saved local shell profiles apply their own design or inherit Standard
+   in Ask Setup. The macOS Connection Manager passed discard, save,
+   restart and return to inheritance for a local profile. A saved SSH
+   override passed restart, a reviewed live Run and return to Standard.
+   Teamwork imports the shared Java design ID and resolves it against
+   the local catalogue. This Mac verified a known Teamwork design, the
+   unknown-ID fallback and separate local SSH settings at the same endpoint.
+   Native reviewed runs on this Mac now cover Side Timeline, Card Stack,
+   Plan and Execution, tmux and Conversation in their history docks.
+   The expanded bottom dock keeps the terminal usable when the
+   finished-run follow-up controls appear.
+   The compact AI Manager passed profile search, wizard cancellation,
+   model discovery, a reviewed CLI list, explicit Save and restart with
+   private loopback and CLI fixtures. A configured LM Studio installation
+   retains separate acceptance. The native main-window transparency menu
+   passed pointer input, delayed save, restart and live alpha adjustment.
+   The native saved temporary-key editor passed Paste, discard, Save,
+   restart and same-tab isolated reconnect over pinned OpenSSH on this
+   Mac. An open SSH form now disables Connect when its saved key expires.
+   Pasting a fresh key enabled Connect and restored the isolated session.
+   Quick Connect passed live SFTP login and SSH retry after a one-minute
+   temporary key expired. Both routes used an owned OpenSSH server. The
+   compact desktop dialog passed the Security opt-in, restart, lifetime
+   editing and cancellation checks for SSH and SFTP.
+   Native Paste and Connect now pass for both protocols on this Mac. The
+   second Settings window can disable and re-enable the method in an open
+   retry. The draft keeps its endpoint and requires a fresh key.
+   [Native paste and retry](PORTING-PARITY.md#november-26-native-quick-connect-paste-and-retry)
+   [Live activity evidence](PORTING-PARITY.md#november-26-native-live-agent-activity-windows)
+   [Docked Log Table evidence](PORTING-PARITY.md#november-26-docked-log-table-review-on-macos)
+   [Short side dock retest](PORTING-PARITY.md#november-26-compact-right-log-table-keyboard-focus)
+   [Log Table row reveal verification](PORTING-PARITY.md#november-26-log-table-keyboard-row-reveal)
+   [Saved local shell design overrides](PORTING-PARITY.md#november-26-saved-local-agent-design-overrides)
+   [Terminal tab tooltip](PORTING-PARITY.md#november-26-terminal-tab-isolation-tooltip)
+   [Local Agent design editing](PORTING-PARITY.md#november-26-local-agent-design-editing)
+   [Saved SSH Agent design](PORTING-PARITY.md#november-26-saved-ssh-agent-design)
+   [Teamwork Agent design](PORTING-PARITY.md#november-26-teamwork-agent-design)
+   [Live history docks](PORTING-PARITY.md#november-26-live-agent-history-docks-on-macos)
+   [AI Manager profile and wizard acceptance](PORTING-PARITY.md#november-26-ai-manager-profiles-wizard-and-model-lists)
+   [Transparency quick-menu acceptance](PORTING-PARITY.md#november-26-native-transparency-quick-menu)
+   [Saved temporary-key replacement and expiry](PORTING-PARITY.md#november-26-native-saved-ssh-key-replacement-and-expiry)
+   [Quick Connect temporary-key acceptance](PORTING-PARITY.md#november-26-quick-connect-temporary-keys-on-macos)
+   The finished hosted Ask retest confirmed that the token line and activity
+   remain legible after scrolling. [Hosted Ask evidence](PORTING-PARITY.md#november-26-finished-hosted-ask-activity)
    [Agent web-tool contract](PORTING-AGENT-WEB-TOOLS.md) · [General field inventory](target/verification/20261125-searxng-global-reconciliation.json) · [Transparency desktop checks](PORTING-PARITY.md#november-25-native-transparency-settings) · [Saved-key editor](PORTING-PARITY.md#november-25-saved-temporary-key-editor-feedback)
 
 The compact Scheduler parent and target picker have macOS desktop evidence.
 With the vault rotated while the app was closed, the running Scheduler rejected
 old routes, required reselection and fresh approval, and uploaded 258,802
-verified bytes twice through a pinned jump host. This was a manually fired,
-non-recurring job. Manual entry of a replacement credential, recurring transfers
-and checks on the outstanding platforms have separate acceptance cases.
-[Scheduler parent](PORTING-PARITY.md#november-25-compact-scheduler-parent-layout) · [Key rotation and rsync approval](PORTING-PARITY.md#november-25-native-key-rotation-and-renewed-rsync-approval)
+verified bytes twice through a pinned jump host in a manually fired job.
+Subsequent runs on this Mac verified Calendar and Chain SFTP transfers,
+reviewed Calendar rsync downloads and recovery after a sender interruption.
+Open cases include independently entered target and jump key replacements,
+deployed recurring transfers, protected receivers and application crash recovery.
+[Scheduler parent](PORTING-PARITY.md#november-25-compact-scheduler-parent-layout) · [Key rotation and rsync approval](PORTING-PARITY.md#november-25-native-key-rotation-and-renewed-rsync-approval) · [Recurring transfers](PORTING-PARITY.md#november-26-native-macos-recurring-file-transfers) · [Interrupted download](PORTING-PARITY.md#november-26-native-rsync-backpressure-and-interrupted-download)
 
 The release gates still require a refreshed locked SSH and OpenPGP dependency
 audit, independent SSH review, configured AI providers, signed-runtime
@@ -410,9 +546,15 @@ application Clippy and the native build pass. This macOS desktop verified edited
 search, exact-page review, excerpt publication, decline and cancellation in
 normal and compact windows. Five actual loopback model requests are retained;
 provider output was an explicit debug fixture, not a real Tavily request.
-Ask, triage/planning, Swarm, Scheduler scopes and the saved preference remain
-pending. The General count remains 23 of 30.
+Later native work extended the review workflow to Ask, all three planning
+stages, Run triage and interactive Swarm members. The General audit counted
+23 of 30 controls at the interactive Run checkpoint. Subsequent Scheduler
+runs verified the per-job opt-in, and the November 26 desktop check verified
+the saved offering preference. All 30 General controls now have native
+counterparts. Configured-provider acceptance remains open.
 [Interactive Run web rounds](PORTING-PARITY.md#november-25-interactive-run-model-web-rounds)
+[Reviewed Ask](PORTING-PARITY.md#november-25-reviewed-web-tools-in-native-agent-ask) · [Planning and triage](PORTING-PARITY.md#november-25-reviewed-web-tools-in-native-planning-and-triage) · [Interactive Swarm](PORTING-PARITY.md#november-25-reviewed-web-tools-for-interactive-swarm)
+· [Scheduler opt-in](PORTING-PARITY.md#november-25-direct-model-web-tool-approval-in-jobscheduler) · [Saved offering preference](PORTING-PARITY.md#november-26-saved-agent-web-tool-offering-preference) · [Provider credential controls](PORTING-PARITY.md#november-26-global-web-provider-credentials)
 
 ### Implementation baseline
 
@@ -902,18 +1044,18 @@ feature is opt-in and its startup command is available in debug builds.
 | Appearance preferences | [Chat color profile](PORTING-PARITY.md#november-24-appearance-inventory) is available in Settings and the AI Chat toolbar. [UI font size](PORTING-PARITY.md#november-24-application-font-scale) and Match display resolution are searchable in Settings. Java backup import preserves the application and guide scales independently. | Verify the theme-following and fixed profiles in running AI Chat and Swarm views, including when a chat is already open. Compare manual and automatic UI font scale at multiple native display scales with Java, including popups and the terminal, editor and chat font boundaries. |
 | D4/P1 · Vault startup | An explicit profile opt-in stores the current derived vault key in the protected device credential store. Startup authenticates the vault, falls back to the password prompt on failure, and checks both managed and personal password requirements. Native credential-store fixtures on Windows ARM64 and Fedora ARM64 verified rotation, reopen and removal. Apple Silicon passed the vault and startup suites. | Exercise Security through an actual restart on each native desktop. Include interactive Keychain access with a signed macOS app, the installed Flatpak Secret portal and a managed startup policy set after opting in. [Startup unlock checkpoint](PORTING-PARITY.md#november-23-native-vault-startup-unlock) |
 | D2/P1 · Session isolation and reconnect | Effective isolation appears in the folder and connection editors. Windows ARM64 verified saved local-shell recovery with inherited and managed Sandbox choices. The native Apple Silicon fixture verified saved SSH and Teamwork reconnect over pinned direct OpenSSH. | Exercise a fresh local launch, unavailable sandbox feedback, desktop reconnect and a live jump-host reconnect. Repeat the applicable desktop checks on macOS and Linux. [Windows desktop checks](PORTING-PARITY.md#november-23-windows-isolation-dialogs-and-launches) · [OpenSSH reconnect checks](PORTING-PARITY.md#november-23-saved-and-teamwork-ssh-reconnect) |
-| D2/D4 · Quick Connect temporary keys | The saved Security opt-in enables in-memory temporary authentication for interactive SSH and SFTP, with destination validation, expiry and retry. | Use a disposable key for a live SSH and SFTP login, retry after expiry, and disable the option while a form or retry holds a key. [Quick Connect checkpoint](PORTING-PARITY.md#november-23-quick-connect-temporary-ssh-keys) |
-| D2 · Saved temporary keys | Connection Manager binds each saved key to its expiry, account and destination. This Mac verified SSH and SFTP after unlock and the editor's locked, available, expired, missing and changed-endpoint feedback. A name-only save survived restart with the vault contents preserved. | Enter and submit a replacement private key in the native editor during a manual handoff. Exercise locked unrelated saves, interactive reconnect after expiry or replacement, the isolated SSH worker and Quick Connect's in-memory path. [Transport checks](PORTING-PARITY.md#november-23-native-saved-temporary-ssh-keys) · [Native editor checks](PORTING-PARITY.md#november-25-saved-temporary-key-editor-feedback) |
+| D2/D4 · Quick Connect temporary keys | This Mac verified Security opt-in and restart, controls at 700 × 400, and native Paste and Connect for both SSH and SFTP against pinned OpenSSH. Cancel in a second Settings window preserves the open retry. Saving the disabled setting clears its key. Re-enabling makes the method available and requires a new paste for the retained endpoint. An automated OpenSSH run verified one-minute expiry. | Repeat native Paste, Connect and the Settings change with an open draft on the outstanding desktops. [Native paste and retry](PORTING-PARITY.md#november-26-native-quick-connect-paste-and-retry) · [Older macOS compact and expiry checks](PORTING-PARITY.md#november-26-quick-connect-temporary-keys-on-macos) |
+| D2 · Saved temporary keys | Connection Manager binds each saved key to its expiry, account and destination. This Mac verified SSH and SFTP after unlock and the editor's locked, available, expired, missing and changed-endpoint feedback. A name-only save survived restart with the vault contents preserved. An automated editor replacement reopened the vault and reconnected the same tab through the isolated SSH worker with the replacement fingerprint. | Enter and submit a replacement private key in the native editor during a manual handoff. Exercise locked unrelated saves and native interactive reconnect after expiry or replacement. [Transport checks](PORTING-PARITY.md#november-23-native-saved-temporary-ssh-keys) · [Native editor checks](PORTING-PARITY.md#november-25-saved-temporary-key-editor-feedback) · [Replacement and isolated reconnect](PORTING-PARITY.md#november-26-saved-temporary-key-editor-and-isolated-reconnect) |
 | D2/M1 · Java temporary-key backup restore | Credential review decrypts compatible keys into a sealed vault transaction and binds each reference to an exact eligible new profile and route. Apple Silicon verified an imported key after startup restore by authenticating to pinned OpenSSH and downloading the exact SFTP fixture bytes. | Exercise Review SSH Credentials and Merge on Restart on native desktops. Verify the displayed omissions, subsequent expiry and the login response after an account change. [Java restore checkpoint](PORTING-PARITY.md#november-23-java-temporary-ssh-key-restore) |
 | D2 · Project reconnect with a temporary key | A restored project pane can use an exact saved profile with an eligible temporary key when automatic selection is active. The Apple Silicon fixture verified retry after vault unlock over pinned OpenSSH, preservation of the tab and deferral after key expiry. | Exercise the native desktop attention bar, automatic retry after unlock, and expired-key review with an existing project and its saved jump route. [Project reconnect checkpoint](PORTING-PARITY.md#november-23-project-reconnect-with-temporary-ssh-keys) |
 | Q1/Q2 · Scheduler and rsync with temporary keys | Saved jobs bind target and jump credentials separately. Portable backups remove the binding and disable the job. Fedora ARM64 verified a download through a pinned jump host. This Mac verified locked and expired keys, route reselection after vault rotation, old approval invalidation and reviewed uploads from a non-recurring job. | Exercise recurring firings, protected receivers, recovery and the remaining platform and managed-policy cases in milestone 4. [Fedora transfer](PORTING-PARITY.md#scheduled-ssh-and-rsync-with-temporary-keys) · [macOS rotation and reviewed uploads](PORTING-PARITY.md#november-25-native-key-rotation-and-renewed-rsync-approval) |
 | B4 · GGUF Configure styling | The measured path width, compact two-column form, joined numeric controls and fixed actions follow the tagged Java layout. [Configure checkpoint](PORTING-PARITY.md#november-23-gguf-configure-sizing) | Compare the same layout with the platform theme on the remaining native desktops. |
 | D4 · Search matching | Settings and AI Manager use the shared Java matching and ranking rules for visible page and control names, aliases, duplicate suppression and the 40-result limit. Available controls are filtered before ranking. Imported model IDs remain selectable when their normalized names collide. | Compare result labels, ranking and keyboard and pointer navigation against the tagged dialogs on native desktops. [Search matching checkpoint](PORTING-PARITY.md#november-23-settings-search-matching) |
-| A2 · Copying a command step's output | **Copy output** uses all masked stdout and stderr retained for the selected step within the existing capture limits. The compact preview still shows the last eight lines. Retained runs use the same action and clipboard policy. | Verify both streams, a line longer than 320 characters and redaction in the native clipboard for live and retained runs. [Step-copy checkpoint](PORTING-PARITY.md#november-23-complete-masked-step-copy) |
+| A2 · Copying a command step's output | **Copy output** uses all masked stdout and stderr retained for the selected step within the existing capture limits. The compact preview still shows the last eight lines. Retained runs use the same action and clipboard policy. | This Mac verified all 26 masked lines from both streams in the original and reopened Activity windows. The longest lines were 746 and 626 Unicode characters. Copy selected produced the exact eight-line preview after attempted typing. Continue on the outstanding desktops. [Native clipboard evidence](PORTING-PARITY.md#november-26-full-and-selected-agent-output-on-macos) · [Step-copy checkpoint](PORTING-PARITY.md#november-23-complete-masked-step-copy) |
 | B5 · Knowledge source status | Completed source outcomes and problem counts are restored with the existing index metadata. Windows ARM64 confirmed manual and automatic missing-file results after a process restart, preserved index metadata and automatic recovery of the repaired file. The desktop review recognized the restored manual file. The manual recovery test indexed it and checked the unchanged sibling after reopening the Manager. | Complete the Windows desktop manual indexing flow after repair. Repeat the desktop restart and recovery paths on the other supported native platforms. [Source outcome checkpoint](PORTING-PARITY.md#november-23-knowledge-source-outcomes) |
-| A2 · Naming Agent designs | New, Duplicate and Rename use owned prompts with the suggested text selected. Modifying a built-in creates a custom copy with the full preset name and a numeric suffix. The catalog keeps stable IDs and the Settings entry keeps changes in the active draft. This macOS desktop verified Unicode naming, owner return, same-profile restart, deletion cancellation/fallback and keyboard activation against the actual Java chooser. Compact headings and nested keyboard reveal are corrected. | Fix the reproduced combination-picker tooltip overlap and check popup-only Escape. Complete the remaining live activity/module matrix, connection overrides and user-deferred Windows ARM64 comparison. [Desktop continuation](PORTING-PARITY.md#november-25-agent-design-desktop-naming-layout-and-navigation) · [Earlier naming checkpoint](PORTING-PARITY.md#november-23-agent-design-naming) |
+| A2 · Naming Agent designs | New, Duplicate and Rename use owned prompts with the suggested text selected. Modifying a built-in creates a custom copy with the full preset name and a numeric suffix. The catalog keeps stable IDs and the Settings entry keeps changes in the active draft. This macOS desktop verified Unicode naming, owner return, same-profile restart, deletion cancellation/fallback and keyboard activation against the actual Java chooser. Compact headings and nested keyboard reveal are corrected. | The combination picker keeps its options readable and handles Escape within the open menu on this Mac. The live activity windows now cover Standard, Classic, Floating and a compact Log Table. Complete the remaining live activity/module matrix, connection overrides and user-deferred Windows ARM64 comparison. [Desktop continuation](PORTING-PARITY.md#november-25-agent-design-desktop-naming-layout-and-navigation) · [Earlier naming checkpoint](PORTING-PARITY.md#november-23-agent-design-naming) |
 | B4 · GGUF import and backend review | A native multi-file selection opens a private-copy or external-reference review. Windows ARM64 verified both storage choices with the native picker and checked that Cancel preserved the registrations. The manual entry and detached-model reattachment paths remain available. Saving an incompatible backend offers the existing signed-runtime review. | Repeat the storage choices on the remaining desktops. Exercise reattachment of a split model and both backend responses in the desktop. Verify runtime readiness with a compatible signed package. [GGUF checkpoint](PORTING-PARITY.md#november-23-gguf-import-and-backend-review) |
-| A2 · Terminal Agent | The design presenters and earlier-run selection paths are implemented. The Log Table shows sortable typed step metadata and a live Duration column that adopts the measured result at completion. A double-click opens the selected masked output or the finished answer. Live step and answer details allow read-only selection and policy-checked partial copying. A right-click offers step actions on retained rows and run actions on the answer or table background, including Earlier runs. Export all finished runs remains available while a different run is active. The export review fixes the selection when it opens. New rows flash for 900 ms and running rows use a 120 ms spinner. Reduced animations keeps the running marker still, omits the flash and updates elapsed time once per second. Reviewed model requests create a running row and update it with the accepted response metadata. An outstanding command review has a masked, read-only Approval row that is removed when the review ends. | The live table, detached history and Settings preview support focused keyboard navigation. Ctrl+Shift+F6 focuses the visible table in the active terminal pane. Tab reaches the detached table and scrolls the Settings preview into view. With live table focus, the Context Menu key or unassigned Shift+F10 opens the selected row's actions. Fedora ARM64 X11 verified focus, row selection, opening details, the keyboard step menu and source terminal input isolation in a docked table. Open details receive more of the dock height, with model usage in a compact scrollable summary. Fedora ARM64 X11 verified Tab entry, row details, exact output copying and reattachment in detached history. It also verified that the Settings preview reveals the table and selected sample output with the keyboard. Verify the keyboard paths on the other native desktops. Columns fit the viewport above font-scaled minimum widths. Verify resizing and numeric alignment on native desktops. Chronological tables follow new rows at the bottom and preserve the reading position when reviewing older activity. Scrolling up exposes Latest activity without selecting a row. Fedora ARM64 X11 verified stable reading through command approvals and continued following after Latest activity. Fixed column headers stay visible during vertical scrolling and follow the data cells horizontally. Column dividers adjust widths within the fitted table. Fedora ARM64 X11 verified Step sorting in both directions, fixed headings while scrolling vertically and horizontally, divider dragging and sort retention after resizing. Verify these paths on the other native desktops. Exercise the narrow viewport, elapsed time, sorting, selected output, approval-row lifecycle, step actions and motion preferences. Verify the decision and repair rows with a configured provider. Exercise the terminal context menu and the keyboard and pointer paths for the Log Table menus and run/step controls on native desktops. Switch runs, copy individual outputs, export one or all finished runs and open an unsaved step as a snippet. |
+| A2 · Terminal Agent | The design presenters and earlier-run selection paths are implemented. The Log Table shows sortable typed step metadata and a live Duration column that adopts the measured result at completion. A double-click opens the selected masked output or the finished answer. Live step and answer details allow read-only selection and policy-checked partial copying. A right-click offers step actions on retained rows and run actions on the answer or table background, including Earlier runs. Export all finished runs remains available while a different run is active. The export review fixes the selection when it opens. New rows flash for 900 ms and running rows use a 120 ms spinner. Reduced animations keeps the running marker still, omits the flash and updates elapsed time once per second. Reviewed model requests create a running row and update it with the accepted response metadata. An outstanding command review has a masked, read-only Approval row that is removed when the review ends. | The live table, detached history and Settings preview support focused keyboard navigation. Ctrl+Shift+F6 focuses the visible table in the active terminal pane. Tab reaches the detached table and scrolls the Settings preview into view. With live table focus, the Context Menu key or unassigned Shift+F10 opens the selected row's actions. Fedora ARM64 X11 verified focus, row selection, opening details, the keyboard step menu and source terminal input isolation in a docked table. Open details receive more of the dock height, with model usage in a compact scrollable summary. Fedora ARM64 X11 verified Tab entry, row details, exact output copying and reattachment in detached history. It also verified that the Settings preview reveals the table and selected sample output with the keyboard. Verify the keyboard paths on the other native desktops. Columns fit the viewport above font-scaled minimum widths. Verify resizing and numeric alignment on native desktops. Chronological tables follow new rows at the bottom and preserve the reading position when reviewing older activity. Scrolling up exposes Latest activity without selecting a row. Fedora ARM64 X11 verified stable reading through command approvals and continued following after Latest activity. Fixed column headers stay visible during vertical scrolling and follow the data cells horizontally. Column dividers adjust widths within the fitted table. Fedora ARM64 X11 verified Step sorting in both directions, fixed headings while scrolling vertically and horizontally, divider dragging and sort retention after resizing. This Mac verified bottom and right command reviews, Step sorting, keyboard and pointer step menus, horizontal header alignment and vertical fixed headings. The compact right dock preserves the row viewport after selection and opens the pending approval with Enter. The last row stays above the horizontal scrollbar with the horizontal offset intact on this Mac. This Mac also verified the live command duration, its completed value, and the Approval row replacement in the compact Activity window. This Mac measured the running marker and one-second duration updates with reduced animations, including duration sorting in the live table and keyboard navigation in Settings. The 800 × 500 Activity window verified the initial flash and fade on live Approval, Command and Answer rows, including the reduced-motion case. This Mac also verified Home and End in the 640 × 400 Activity window, including 18-point text and a horizontal offset. [Minimum Log Table](PORTING-PARITY.md#november-26-minimum-macos-log-table-keyboard-navigation) [Mac motion evidence](PORTING-PARITY.md#november-26-reduced-animation-log-table-timing-on-macos) [Native row flash](PORTING-PARITY.md#november-26-native-log-table-entry-flash-on-macos) [Docked macOS checkpoint](PORTING-PARITY.md#november-26-docked-log-table-review-on-macos) Verify the decision and repair rows with a configured provider. This Mac verified the native terminal context, Earlier runs, retained step copying, a single-run export, frozen and fresh all-run exports, and an unsaved command snippet. Continue the remaining keyboard and pointer paths on the outstanding desktops. [Native run history](PORTING-PARITY.md#november-26-native-agent-history-and-activity-exports) |
 | D4 · AI Manager search | The search reveals provider presets, CLI and MiniMax fields, reviewed HTTPS options, usage quota and cost, and the Web search controls exposed by the active provider and policy. The profile wizard searches its reachable steps using the same validation as Next. General search reveals the shortcut toggle, alias name, case preference and retained Java settings individually. The Profiles search reveals connection and CLI tests, model discovery and inventory refresh, imported model mapping and the active deletion review. Local AI search opens the relevant Profile roles, Local runtime or Hugging Face subtab and reveals the matching control. Runtime repair searches its signed-package fields and compatible release controls. The search highlights active signed-runtime cancellation and pause, the separate keep and discard actions, and the open llama.cpp runtime removal review. Selecting one of these results preserves the operation or review. Knowledge Store search follows the selected backend, source options and embedding mode, and reveals active folder reviews, source file size edits, store removal controls, profile bindings, Agent availability and embedding consent. Local Models search reaches Hugging Face and the managed GGUF and Apple MLX workflows, including model selection, runtime controls, configuration and active reviews. Imported GGUF and MLX settings can be found by name, format or registry ID. The result highlights the matching row and leaves review and adoption explicit. Memory search reveals imported preferences, active Markdown and entry editor actions, history restore and external file review controls. Skills search reveals the library filter and sort, the direct Java-style Providers entry point, available editor fields and actions, eligible Java preference suggestions, and the fields and actions of the open provider editor. | Select a control by keyboard and mouse, verify its page, scroll position and highlight, and preserve editor-local Find in Skills and Memory. Native widget tests verify keyboard focus and draft retention for GGUF and MLX controls and MLX runtime download policy. Exercise search from a partially completed wizard, repair or model review and verify draft retention and cancellation on native desktops. |
 | B4 · Hugging Face model browser | Rust loads additional pages, sorts metadata and resolves missing sizes for the RAM filter. Apple Silicon offers All formats, GGUF and MLX with independent continuations. Review MLX package fixes the commit, exact sizes and SHA-256 digests. Download and register validates the complete directory through the native MLX registry. Paused MLX downloads can be found, reviewed, resumed or discarded after restart. | Exercise continuation, sorting, RAM filtering, format changes, review, installation and recovery in the native desktop. The native transfer has passed a live pause, resume and registration test against a pinned public Hub package. [Java browser](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/LocalModelManagerPane.java#L803) · [Rust MLX Hub transfer](src/local_ai/managed_models/huggingface/mlx/download.rs) |
 | D2 · Connection folders | Drag writable SSH and serial rows to a local folder in the tree or sidebar. List and map share successive Undo. | Exercise native pointer gestures across the list, sidebar and map, reverse two saved moves and check read-only Teamwork entries. |
@@ -1448,8 +1590,10 @@ The broader release audit also confirmed these workflow differences:
   implemented. Eligible saved local SSH profiles support unattended
   temporary keys for Scheduler and rsync, including a distinct jump-host
   key. After fixture vault rotation this Mac verified native route reselection,
-  renewed approval and successful rsync. Manual replacement-key entry in the
-  connection editor remains open. [Scheduler rotation](PORTING-PARITY.md#november-25-native-key-rotation-and-renewed-rsync-approval)
+  renewed approval and successful rsync. Automated editor replacement and
+  isolated reconnect passed. Manual replacement-key entry in the connection
+  editor remains open. [Scheduler rotation](PORTING-PARITY.md#november-25-native-key-rotation-and-renewed-rsync-approval)
+  · [Editor replacement](PORTING-PARITY.md#november-26-saved-temporary-key-editor-and-isolated-reconnect)
   · [Backup review and editor checks](#implemented-features-with-outstanding-checks)
 - **D5/A4 — Coding-agent indicators.** Native badges exist on macOS and
   Windows. Linux emits a persistent LauncherEntry D-Bus counter with an
@@ -1500,11 +1644,10 @@ user executable.
 The November 25 review verified all 243 SHA-256 entries in the six local
 manifests for priority 1, global SearXNG, the original Agent web-tool offer,
 typed tool turns, interactive Run rounds and compact Agent Setup. The two
-latest application source manifests differ in the Setup view and its new
-layout test within their recorded scope. Both application snapshots used
-development builds. The review also identified 74 historical artifact paths absent from
-this checkout, including the November 19 Windows ZIP and its sidecar. Archived
-results below identify their tested revisions. [Last completed application checks](target/verification/20261125-web-rounds-results.json) · [Setup candidate and cleanup](target/verification/20261125-agent-setup-paused-notes.md)
+application snapshots compared that day used development builds and differed
+in the Setup view and its layout test within the recorded scope. At the time,
+74 historical artifact paths were absent from this checkout, including the
+November 19 Windows ZIP and its sidecar. [November 25 application checks](target/verification/20261125-web-rounds-results.json) · [Setup candidate and cleanup](target/verification/20261125-agent-setup-paused-notes.md)
 
 The historical November 17 Apple Silicon ZIP described below was built from
 `af1c17601ffa2f32c3aade762b13eca1727c0d6f0c826a631844d7d94baf65ed`
@@ -1513,7 +1656,17 @@ results cover the individual scopes below and in the parity record.
 
 | Snapshot and platform | Retained result | Limit of the result |
 | --- | --- | --- |
-| November 25 compact Agent Setup candidate, this Mac | A scrollable body keeps the actions below it. Format, test compilation, one layout regression over 18 combinations, strict application Clippy and the debug build passed. [Source manifest](target/verification/20261125-agent-setup-paused-source.json) · [Check results](target/verification/20261125-agent-setup-paused-checks.json) | The full application run ended on pause (wrapper exit 143). The desktop fixture stopped before its first model request. Setup and Pause/Resume desktop acceptance are open. |
+| November 26 Metro rail (d08), this Mac | Review reopened the original Activity window. Command output waited for separate approval. The rail hid after five seconds, restored manually and kept overflow and Answer in the source pane after a split. Captures showed 13 intermediate light positions with animations and a direct jump with reduced motion. [Metro desktop captures and workspace suite](PORTING-PARITY.md#november-26-native-metro-rail-on-macos) | This run used a local shell. The [overlapping SSH desktop check](#run-ask-and-planning-on-one-ssh-pane) is open on macOS. |
+| November 26 tmux dock (d09), this Mac | The digit row and mouse approved visible reviews. A hidden review left the digit in the shell. Both command outputs reached the model in order after separate approval, and the corrected build displayed the German and Japanese answer. [tmux review and Unicode](PORTING-PARITY.md#november-26-native-tmux-review-and-unicode-on-macos) | Numeric keypad input still needs a macOS desktop check. |
+| November 26 Frosted Glass HUD (d04) and Neon Ticker (d18), this Mac | Both HUD copy actions reproduced the 85-byte UTF-8 answer. The ticker displayed its full review label, reopened the original Activity window and held command output across Pause/Resume until approval. [HUD motion and split scope](PORTING-PARITY.md#november-26-native-hud-motion-split-scope-and-contrast-on-macos) · [HUD copy](PORTING-PARITY.md#november-26-native-frosted-glass-hud-answer-copy-on-macos) · [Ticker controls and motion](PORTING-PARITY.md#november-26-native-neon-ticker-controls-and-motion-on-macos) | The desktop runs used local fixtures. |
+| November 26 saved Agent web-tool offering preference, this Mac | The application suite passed 4,483 tests with 203 ignored. The desktop verified search, discard, Save, restart, policy locking, separate tool decisions and a stopped review after a saved change. The same local task offered two tools only with the setting enabled. [Desktop and model evidence](PORTING-PARITY.md#november-26-saved-agent-web-tool-offering-preference) | The desktop used the debug provider fixture and a loopback model. |
+| November 25 read-only Swarm revocation reasons, this Mac | Two desktop runs with two local OpenSSH targets recorded individual blocks for Internet policy and changed masking rules. No model continuation occurred. The application suite passed 4,481 tests with 203 ignored. [Desktop and model evidence](PORTING-PARITY.md#november-25-scheduled-read-only-swarm-revocation-reasons) | The desktop used the debug provider fixture and a loopback model. |
+| November 25 guided read-only Swarm web tools, this Mac | The application suite passed 4,481 tests with 203 ignored. The compact Scheduler saved the opt-in, ran two local OpenSSH probes and saved both advisories after an exact page approval and a separate decline. [Desktop and model evidence](PORTING-PARITY.md#november-25-reviewed-web-tools-for-scheduled-read-only-swarm) | The manual firings used the debug provider fixture and a loopback model. Configured providers and Windows remain separate acceptance checks. |
+| November 25 direct model web tools in JobScheduler, this Mac | The application suite passed 4,480 tests with 203 ignored. The desktop covered one manual Agent firing, two successful calendar firings, blocked stale calendar and model-profile authority, and two iterative Swarm targets with pinned OpenSSH probes. [Desktop, model requests and suite evidence](PORTING-PARITY.md#november-25-direct-model-web-tool-approval-in-jobscheduler) | Web evidence used the debug provider and a loopback model. The snapshot covered guided Agent and iterative Swarm. |
+| November 25 reviewed interactive Swarm web tools, this Mac | The application suite passed 4,479 tests with 203 ignored. Two compact advisory members completed with their own separately approved evidence, and a command-review member completed with a declined tool result. [Desktop and suite evidence](PORTING-PARITY.md#november-25-reviewed-web-tools-for-interactive-swarm) | Native desktop used two local shells, a loopback model and a debug provider. Configured providers, the Scheduler model-tool path and the deferred Windows desktop have separate acceptance cases. |
+| November 25 reviewed planning and Run triage, this Mac | The application suite passed 4,477 tests with 203 ignored. Compact Triage kept its actions visible and the selected approach appeared in a separate Run review. Native Plan and Triage recorded eight reviewed loopback model requests. [Checks and evidence](PORTING-PARITY.md#november-25-reviewed-web-tools-in-native-planning-and-triage) | The web provider used the debug fixture. Compact Plan Questions still require a layout check with expanded activity. |
+| November 25 compact Agent Setup and Pause/Resume, this Mac | The merged PR #38 tree passed 5,143 native workspace tests with 233 ignored. The live app passed Setup and Close at three sizes and compact Pause/Resume for both an edited query and loaded excerpts. [Desktop, model and workspace evidence](PORTING-PARITY.md#november-25-agent-setup-pause-and-resume-on-macos) | Standalone Run used a local model server and debug provider fixture. Configured service, other Agent routes and Windows desktop acceptance are tracked separately. |
+| November 25 compact Agent Setup candidate before PR #38, this Mac | A scrollable body keeps the actions below it. Format, test compilation, one layout regression over 18 combinations, strict application Clippy and the debug build passed. [Source manifest](target/verification/20261125-agent-setup-paused-source.json) · [Check results](target/verification/20261125-agent-setup-paused-checks.json) | The full application run ended on pause (wrapper exit 143). The desktop fixture stopped before its first model request. The merged checkpoint above completed the desktop checks. |
 | November 25 interactive Agent Run, this Mac | The previous application suite passed 4,471 tests with 203 ignored. Normal and compact desktop runs recorded five loopback model requests across approval, decline and cancellation. [Desktop and suite evidence](PORTING-PARITY.md#november-25-interactive-run-model-web-rounds) | Run used a debug provider fixture. Real Tavily, installed services, signed runtimes and other Agent routes require their own evidence. |
 | PR #35, `ab5b101e`, native ARM64 | Full workspace suites passed on Windows (4,804 tests), Apple Silicon (4,909) and Fedora (4,953). All three passed formatting and strict workspace Clippy. [Native test record](PORTING-PARITY.md#november-23-full-native-workspace-tests) | Covers the tested source revision. Package verification, remaining interactive desktop checks and independent SSH review stay open. |
 | November 23 Knowledge Store restart, Windows ARM64 | Manual review and automatic sync each recorded a missing file. A separate process showed both stored outcomes and retained Last indexed times without rescanning. Automatic recovery changed only the repaired row. [Source outcome evidence](PORTING-PARITY.md#november-23-knowledge-source-outcomes) | Uses a bounded synthetic loopback embedding service. Configured provider, Qdrant and other native desktop acceptance remain open. |
@@ -2064,7 +2217,7 @@ an English answer. Keep this difference visible when comparing transcripts.
 | ID | State and implemented coverage | Remaining work |
 | --- | --- | --- |
 | A1 | Implementation + acceptance. Built-in Run/Ask/Plan, reviewed local/SSH execution, skills/quota, bounded history, opt-in `agent` aliases, Tab completion, sudo/vault challenges and mirror holds exist. PowerShell/CMD integration and per-pane setup/status now ship in source. Native ConPTY PowerShell 5.1/CMD and Fedora SSH Agent routes passed. Permitted terminal AI initializes an in-memory SSH credential mask independently of capture, including incognito, without enabling logging. R `src/workspace/terminal_agent/shortcut.rs`, `src/workspace/ssh_access.rs`, `src/session/shell_activity.rs`, `crates/pty/src/shell_integration.rs`. | The inline root-bypass option and grant revocation passed targeted native macOS/Fedora tests; automatic read-only dispatch and inline per-run confirmation passed targeted native macOS/Fedora tests. Verify remaining supported shells, native desktops and current packages. The sandboxed SSH manual password flow passed on Fedora Wayland and X11. Verify the manual flow and local system sudo on macOS, and exercise history and run controls, mirror release, changed targets, and revocation. Direct custom Bash, Zsh, Fish, PowerShell and CMD profiles can use the Agent with validated interactive startup flags and a reviewed native runner. Verify the custom profiles in live desktop panes. See the diagnostic contract below. |
-| A2 | Implementation, acceptance and bounded audit. Planning stages, design module IDs d01–d20, docking/status/approval placement, inline history, picture-in-picture, usage/repair display, seven activity export formats and Agent-to-Chat/Journal links exist. The worktree includes the in-pane Spotlight prompt with entry and submission transitions, compact step progress, animated toast entry, countdown, fade and collapse, Orbit and the Adaptive Dock countdown. A chooser switches between retained runs in the same pane from status, history and the terminal context menu. Up to five finished runs remain available after the Activity window closes, bound to the original non-private stream. The standalone editor creates a custom copy on module activation and writes committed edits and display preferences immediately. General Settings applies its draft on Save. Java restore fills both unset preferences independently. Windows ARM64 verified the earlier Settings workflow, live d14 display and cancellation, d19 layering and detach/reattach, and d20 pane resizing. [Spotlight and status checkpoint](PORTING-PARITY.md#november-20-terminal-agent-spotlight-and-status) | Verify the d06 layout and bound approvals in a live desktop run. This macOS desktop verified naming, duplicate/rename/default persistence and the combination picker in normal, compact and minimum Settings views. [Picker and Escape](PORTING-PARITY.md#november-25-agent-design-combination-picker-and-escape) Copy all retained masked output for the selected step. [Completion checks](#confirmed-implementation-work) Verify reopening finished runs and earlier-run selection and the contextual run and step actions. Verify Spotlight focus and profile selection, the timed displays with reduced motion and auto-hide disabled, the remaining d14 interactions, and live d19 run following. Verify inline selection and Kitty row mapping, exports, linked Journal cards, live provider usage/repair and native desktop behavior across platforms. |
+| A2 | Implementation, acceptance and bounded audit. Planning stages, design module IDs d01–d20, docking/status/approval placement, inline history, picture-in-picture, usage/repair display, seven activity export formats and Agent-to-Chat/Journal links exist. The worktree includes the in-pane Spotlight prompt with entry and submission transitions, compact step progress, animated toast entry, countdown, fade and collapse, Orbit and the Adaptive Dock countdown. A chooser switches between retained runs in the same pane from status, history and the terminal context menu. Up to five finished runs remain available after the Activity window closes, bound to the original non-private stream. The standalone editor creates a custom copy on module activation and writes committed edits and display preferences immediately. General Settings applies its draft on Save. Java restore fills both unset preferences independently. Windows ARM64 verified the earlier Settings workflow, live d14 display and cancellation, d19 layering and detach/reattach, and d20 pane resizing. [Spotlight and status checkpoint](PORTING-PARITY.md#november-20-terminal-agent-spotlight-and-status) | This Mac verified d06 pointer and numbered decisions in the dock and numbered decisions and reattachment in the detached d19 view with both motion settings. Native macOS compositor frames verified intermediate progress and check strokes and immediate completion with reduced motion. [Native d06 evidence](PORTING-PARITY.md#november-26-plan-and-execution-decisions-and-detached-history) This macOS desktop verified naming, duplicate/rename/default persistence and the combination picker in normal, compact and minimum Settings views. [Picker and Escape](PORTING-PARITY.md#november-25-agent-design-combination-picker-and-escape) Copy all retained masked output for the selected step. [Completion checks](#confirmed-implementation-work) This Mac verified reopening finished runs, earlier-run selection and contextual run and step actions. [Native run history](PORTING-PARITY.md#november-26-native-agent-history-and-activity-exports) This Mac verified Spotlight prompt focus, history recall, keyboard and pointer profile selection, and explicit release to the chosen endpoint. Continue Spotlight on the outstanding desktops and verify a physically held d14 approval key. This Mac verified Toast expiry and pending-review retention, Orbit point motion and the system clipboard in both layouts. Native frames verified Toast entry, fade and collapse, Orbit drawer reveal and close, and Orbit Pause/Resume with both motion settings. [Native Toast and Orbit evidence](PORTING-PARITY.md#november-26-native-toast-expiry-and-orbit-motion) [Transition and Pause/Resume evidence](PORTING-PARITY.md#november-26-native-toast-and-orbit-transitions) This Mac verified Adaptive Dock with reduced motion and with auto-hide zero. [Native Adaptive Dock evidence](PORTING-PARITY.md#november-26-native-adaptive-dock-countdown-and-zero-auto-hide) This Mac passed the d19 archived Ask handoff, folded menu and live Chat transition. [Native d19 evidence](PORTING-PARITY.md#november-26-native-detached-archived-ask-handoff) This Mac passed d14 numeric decisions and live local and SSH takeover. [Native d14 evidence](PORTING-PARITY.md#november-26-native-cursor-decisions-and-ssh-takeover) [Spotlight desktop evidence](PORTING-PARITY.md#november-26-native-spotlight-focus-and-profile-selection) Verify inline selection and Kitty row mapping, exports, linked Journal cards, live provider usage/repair and native desktop behavior across platforms. |
 | A3 | Acceptance + bounded audit. Live and saved targets, named pre-run saved SSH drafts, completed interactive rounds with renaming, reviewed continuation, connection groups and working-directory metadata, history search, Markdown/text/PDF export, saved journal defaults, estimate and journal links are implemented. A batch review binds one approval to the displayed ordinary commands and target identities. R `src/workspace/terminal_agent/swarm.rs` and its `batch.rs`/`comparison.rs`/`conversation.rs`. | Verify native renaming, selection, batch review and revocation, comparison, failure isolation, workflow drafts and continuation over pinned SSH. Evaluate Java's standing batch policy and incognito target scope against native authority requirements. Saved follow-up uses reviewed saved SSH routes. |
 | A4 | Acceptance. All eight pinned Agent verbs, events, wait/start/rename and `notification.show` have native Control/CLI routes. Windows socket backpressure and native notification submission have evidence. | Native visible delivery and exact focus/target routing, stale agents, moved splits, timeouts and losses across desktops. Admission/native submission receipts alone do not prove a displayed notice or activation. |
 | A5 | Acceptance. Explicit `control-api = "allow"` starts the listener and locks the setting while retaining the personal preference. The parser normalizes feature keys and values. MCP stdio keeps its independent opt-in, retains its write tools preference while disabled, and gates writes on effective policy and consent. Masked reads, reconnect identity guards and managed MCP denial exist. | Verify managed activation, lock display and relaxation on native desktops. Complete affirmative write consent and invalidation across those desktops. P1 owns shared policy acceptance. |
@@ -2080,10 +2233,17 @@ native X11 Openbox run and a native Wayland Mutter run with two reviewed
 Ask requests, copied responses, an archived run reopened and closed, and
 reattachment. The Wayland test verified that Iced applies an inner size
 returned synchronously by Winit and renders a buffer of the new size.
-Repeat the workflow on Windows and macOS and verify placement across
-monitors.
+On macOS, a detached Plan and Execution history kept the same native window
+and folded size while following a second Run and returning to the finished
+Run when the pending setup closed. The folded Ask window also followed two
+completed runs and an archived answer. Closing the archive and replacing
+the live Ask with AI Chat each returned the same window to the next eligible
+answer. Repeat the archived Ask workflow on Windows and continue placement
+checks across monitors.
 [Java pane presenter](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignHost.java#L1556)
 · [Fedora native desktop acceptance](PORTING-PARITY.md#november-21-detached-terminal-agent-history-follows-its-pane)
+· [macOS Run handoff](PORTING-PARITY.md#november-26-plan-and-execution-decisions-and-detached-history)
+· [macOS archived Ask handoff](PORTING-PARITY.md#november-26-native-detached-archived-ask-handoff)
 
 The status pill (including Spotlight and Adaptive Dock's pill), Orbit,
 Minimap rail, and the toast badge open the displayed run's actions on
@@ -2123,9 +2283,12 @@ specified by the binding. The clean X11 build verified the shortcut
 in standalone Powerline and Adaptive Dock's bottom mode. Adaptive
 Dock switched from Powerline at 1230 pixels to the side timeline at
 1400, stayed on the side at 1230 on the way back, and returned to
-Powerline at 1160. Complete live Wayland, Windows and macOS checks and
-the remaining narrow Adaptive Dock checks on the current build.
+Powerline at 1160. A macOS split switched from Powerline to the compact
+pill and back while retaining the original run and its Activity action.
+Complete the remaining live Wayland, Windows and macOS checks, including
+the side timeline width thresholds on this Mac.
 [Powerline step drawer](PORTING-PARITY.md#powerline-status-and-step-drawer)
+· [Adaptive Dock split and countdown](PORTING-PARITY.md#november-26-native-adaptive-dock-countdown-and-zero-auto-hide)
 
 The d12 Top Bar shows the current step, command count, elapsed time and
 available model usage. Its track sweeps while an active run is unpaused
@@ -2179,10 +2342,14 @@ exact output reached the desktop clipboard in each run. The terminal grid
 and ring position stayed fixed. On Windows ARM64 the user saw the list
 animate in a live terminal and used **Copy output** on the command step.
 Verify the exact system clipboard result and reduced-motion workflow on
-Windows, and repeat both desktop workflows on macOS. The November 25 macOS
-application suite passed the expanded Orbit step-menu regression, which
-checks the application's internal clipboard. The original Windows attempt
-stopped during compilation. [Orbit desktop evidence](PORTING-PARITY.md#orbit-progress-and-terminal-placement) · [macOS application test log](target/verification/20261125-web-rounds-final-application.log)
+Windows. This Mac verified both layouts, exact system clipboard output,
+and rendered moving and stationary points. Intermediate macOS drawer
+frames verified the reveal and close. The ring held its position through
+Pause and moved after Resume with animation enabled. Reduced motion kept
+the drawer transitions immediate and the ring steady. The November 25
+macOS application suite passed the expanded Orbit step-menu regression,
+which checks the application's internal clipboard.
+[Orbit desktop evidence](PORTING-PARITY.md#orbit-progress-and-terminal-placement) · [Native macOS clipboard and Orbit frames](PORTING-PARITY.md#november-26-native-toast-expiry-and-orbit-motion) · [Native transition and Pause/Resume evidence](PORTING-PARITY.md#november-26-native-toast-and-orbit-transitions) · [macOS application test log](target/verification/20261125-web-rounds-final-application.log)
 
 The d04 Frosted Glass HUD shows typed progress, model usage and the current
 step in the lower-right corner of its terminal. The blur samples the rendered
@@ -2202,9 +2369,16 @@ visible card in the first painted frame with reduced animations. An X11
 retest verified that the menu hides the open HUD and reopens it with
 Details closed. The Wayland contrast check sampled the Details label over
 a plain terminal and over two contrasting bands of colored output in the
-Dark and IntelliJ Light themes. Repeat the desktop workflow on Windows
-and macOS.
-[Frosted Glass HUD](PORTING-PARITY.md#frosted-glass-hud-with-typed-progress).
+Dark and IntelliJ Light themes. This Mac verified opening the details,
+independent history and status visibility, review handoff and completion
+with both motion settings. Native frames on this Mac verified the show
+transition, typing fade and recovery, and separate input routes for the
+source and neighboring splits. The Details label was sampled over plain
+and colored terminal backgrounds in the default dark presentation and
+IntelliJ Light. This Mac verified the exact two-line answer from both
+HUD menus on the native pasteboard. Continue Windows acceptance when
+the test desktop returns.
+[Frosted Glass HUD](PORTING-PARITY.md#frosted-glass-hud-with-typed-progress) · [Native macOS HUD controls](PORTING-PARITY.md#november-26-native-frosted-glass-hud-controls-on-macos) · [Native macOS motion, split scope and contrast](PORTING-PARITY.md#november-26-native-hud-motion-split-scope-and-contrast-on-macos) · [Native HUD answer copy](PORTING-PARITY.md#november-26-native-frosted-glass-hud-answer-copy-on-macos).
 
 The terminal context menu's **Last agent run** actions resolve against
 the newest traced run on that pane, including retained history. Design
@@ -2252,11 +2426,15 @@ scrolling, and the live review in docked and detached desktops.
 Plan and Execution shows typed steps and progress beside the most recent
 command, its exit code, elapsed time, and an output tail. Pending review
 takes precedence and the final answer takes over when the run ends.
-Verify the desktop layout and progress motion in both animation modes.
+The detached view passed native progress-frame checks on this Mac in both
+animation modes. Repeat the layout and motion checks on the outstanding
+desktops.
 Plan and Execution draws a newly completed step's check mark over
 320 milliseconds. Updates to an existing result retain the original
 completion time. Reduced animations show the check mark immediately.
-Verify the stroke and reduced-motion behavior on native desktops.
+The same Mac runs recorded the animated check stroke and the complete
+check mark in the first reduced-motion completion frame.
+[Native Plan and Execution motion](PORTING-PARITY.md#november-26-native-plan-and-execution-motion-frames)
 Card Stack shows typed
 cards with command results and output excerpts, a browsable final-answer
 card, and transitions for the front and receding cards. Verify visible
@@ -2297,8 +2475,13 @@ including the exact command output and shell input isolation. The cursor
 suggestion and Settings preview fade over 180 ms when the review closes.
 Reduced animations clears the suggestion immediately. A fading suggestion
 has no keyboard actions. Fedora X11 verified both settings and input
-delivery during the fade. Verify the cursor interactions on Windows,
-macOS, and Wayland, including reduced animations and SSH takeover.
+delivery during the fade. Complete the outstanding cursor interactions
+on Windows and Wayland, including both animation modes.
+This Mac verified the early and fresh digit, both numeric approval modes,
+the first sampled review with reduced animations, and editable local and
+pinned SSH Zsh drafts. Its native frames verified intermediate fading and
+immediate clearing with reduced animations. A physically held key remains
+open on macOS.
 The SSH takeover binds the reported working directory to the current
 shell prompt, including when the directory and prompt arrive in separate
 transport reads. Fedora Wayland verified that Tab inserted an editable
@@ -2307,6 +2490,8 @@ draft at an authenticated Bash prompt without sending an SSH exec request.
 · [Cursor verification](PORTING-PARITY.md#november-21-terminal-agent-cursor-suggestion-motion)
 · [Numeric decision verification](PORTING-PARITY.md#november-21-numeric-decisions-in-terminal-agent-cursor-approval)
 · [Dismissal animation verification](PORTING-PARITY.md#november-21-terminal-agent-cursor-dismissal-animation)
+· [macOS cursor decisions and SSH takeover](PORTING-PARITY.md#november-26-native-cursor-decisions-and-ssh-takeover)
+· [macOS cursor dismissal frames](PORTING-PARITY.md#november-26-native-cursor-dismissal-frames)
 
 The d08 Metro line follows typed command, analysis and question steps
 and reserves an Answer station. Active stations pulse, a pending review
@@ -2337,12 +2522,17 @@ X11 also showed the extra-run badge on that pane. On local panes, the
 live Metro light crossed intermediate positions with animations enabled
 and snapped to the next station with reduced animations. On Windows
 ARM64, the native direct and LPAC test routes also verified separate
-Ask and Planning reviews while Run completed real sudo/PAM. Repeat the
-mixed-mode SSH desktop workflow on macOS and Windows. Verify rail
-motion on Wayland, macOS, and Windows.
+Ask and Planning reviews while Run completed real sudo/PAM. The
+[mixed-mode SSH desktop workflow](#run-ask-and-planning-on-one-ssh-pane)
+is the next macOS check. The Windows desktop run is deferred. On macOS, live
+frames showed intermediate light positions after the reviewed local
+command and a direct jump with reduced motion. Review raised its
+original Activity window. In a split, overflow and Answer stayed in
+the source pane. Verify rail motion on Wayland and Windows.
 [Java Metro line](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignMetroBar.java)
 · [Java Standard preset](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/agentdesign/AgentDesignPresets.java)
 · [Metro line verification](PORTING-PARITY.md#november-21-terminal-agent-metro-line)
+· [Native macOS Metro rail](PORTING-PARITY.md#november-26-native-metro-rail-on-macos)
 · [Mixed SSH verification](PORTING-PARITY.md#november-21-overlapping-terminal-agent-runs)
 
 The d09 tmux history shows the masked goal, one entry per typed step with
@@ -2366,10 +2556,14 @@ environment-probe review. The review ends the scrollable history so
 the cursor does not push it past the bottom anchor. Fedora Wayland
 verified that a hidden card leaves digit 2 with the shell, a complete
 card at the bottom accepts approval for remaining ordinary commands,
-and digit 3 cancels a complete review. Verify these interactions in the
-Windows and macOS desktop windows.
+and digit 3 cancels a complete review. On macOS, the digit row and mouse
+were verified with live reviews, including a hidden card and dock
+restoration. The completed Japanese answer and block cursor render with
+both animation settings. Verify the numeric keypad on macOS and repeat
+the desktop checks on Windows once that desktop is available.
 [Java tmux pane](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignTmuxPane.java)
 · [Tmux history verification](PORTING-PARITY.md#november-21-terminal-agent-tmux-history)
+· [Native macOS tmux review and Unicode](PORTING-PARITY.md#november-26-native-tmux-review-and-unicode-on-macos)
 
 The d18 Neon Ticker and Settings preview share the flicker, rolling
 message transition and pulsing activity light. Reduced animations keeps
@@ -2379,11 +2573,15 @@ use the existing run. The close button hides the status and View › AI
 Agent Panel can restore it. Fedora Wayland verified the visibility
 controls and the activation of the existing Activity window from both
 Review controls. The activation uses the click's serial and leaves the
-probe awaiting approval. Verify the transition, review handoff and
-visibility controls on Windows, macOS and X11. Exercise the Wayland
-handoff on additional compositors and with keyboard and touch input.
+probe awaiting approval. On this Mac, the Java-style compact controls
+preserved the full review and finished labels beside a Timeline. The
+native runs verified review handoff, hiding and restoring, Pause/Resume,
+cancellation, and animated and reduced-motion presentation. Continue
+Windows and X11 acceptance and exercise the Wayland handoff on additional
+compositors and with keyboard and touch input.
 [Java Neon Ticker](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentDesignNeonTicker.java)
 · [Ticker implementation](PORTING-PARITY.md#november-21-terminal-agent-neon-ticker)
+· [Native macOS Neon Ticker](PORTING-PARITY.md#november-26-native-neon-ticker-controls-and-motion-on-macos)
 
 Timed status displays and the Settings preview share a 250 ms fade after
 the configured delay. During the fade, the status retains its place in
@@ -2391,10 +2589,13 @@ the layout. Reduced animations removes the status at the deadline.
 With a zero delay or a manually restored status, the display stays until
 the next visibility change. Fedora Wayland verified the intermediate
 frames, reduced motion, zero delay and manual restoration for the Metro
-line. Repeat the visibility checks for the other status designs and on
-the remaining native desktops.
+line. macOS verified the five-second Metro hide, an intermediate fade
+frame, direct hiding with reduced motion and persistent manual restoration.
+Repeat the visibility checks for the remaining status designs and native
+desktops.
 [Java status visibility](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AgentStatusVisibility.java)
 · [Status fade verification](PORTING-PARITY.md#november-21-terminal-agent-status-auto-hide-fade)
+· [Native macOS Metro fade](PORTING-PARITY.md#november-26-native-metro-rail-on-macos)
 
 Interactive Run can review a complexity assessment after the environment
 probe. The AI Manager preference and the managed override select when to
@@ -3347,6 +3548,20 @@ decisions. For example, `aiSkillsEnabled` has a working delegated import.
 A literal match also requires checking its behavior. The figures measure
 search coverage.
 
+The signed Java v2.26.0 package produced a mixed AES-256 backup on this
+Mac. In fresh and colliding profiles, the additive transaction bound
+one reviewed password to its exact new SSH route and omitted the missing
+credential reference. The colliding profile kept its existing route,
+folder isolation, local job and different vault password. Scheduler
+reported the conflicting job and its dependent. Replay kept the saved
+connection, Scheduler and vault identities. [Mixed restore](PORTING-PARITY.md#november-26-mixed-tagged-java-backup-restore)
+
+- Java `encryptedAiTavilyApiKey`, `encryptedAiBrightDataApiToken` and
+  `encryptedAiBraveSearchApiKey` can fill empty native vault slots after
+  Java password review. The tagged backup verified the exact destination
+  values, a retained local conflict, repeated review and managed Internet
+  denial on this Mac. Provider service verification remains separate.
+  [Global credential restore](PORTING-PARITY.md#november-26-java-global-web-credential-migration)
 - Java `isolationMode` distinguishes inheritance from explicit `none`.
   The backup importer maps `connectionGroupIsolation` to exact new folders
   and stages other entries for review. `connectionIsolationDefault` and
@@ -3354,30 +3569,40 @@ search coverage.
   choices retain their authority, and the managed minimum applies at
   launch. Native fixtures cover restore and replay of these settings.
   Windows ARM64 verified the managed display and the blocked below-minimum
-  proposal. Verify Save and restart for eligible proposals on the native
-  desktops. Credential review can seal supported key material for an
+  proposal. This Mac verified Save and restart for both proposals, plus
+  Cancel with explicit native choices. Verify the remaining native
+  platforms. Credential review can seal supported key material for an
   eligible new profile during [Java temporary-key restore](PORTING-PARITY.md#november-23-java-temporary-ssh-key-restore).
   [Java backup security checkpoint](PORTING-PARITY.md#november-23-java-backup-security-settings)
 - Java restore maps `maxBackupCount` and `autoBackupInterval`. At desktop
   startup these values initialize absent native backup settings. Existing
-  settings take precedence. Automatic execution requires a native
-  destination and credential configuration. Verify the restored settings
-  in the desktop after restart.
-  [Java backup settings](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/model/GlobalSettings.java) · [Native preferences](src/profile_backup/preferences.rs)
+  settings take precedence. This Mac verified Daily and unlimited retention
+  after restart and ran the imported schedule after choosing an owned native
+  destination and archive credential. The run authenticated as a native
+  encrypted backup and preserved the previous backup byte for byte. Replaying
+  the same Java archive preserved a saved Off schedule, retention of seven,
+  the native destination and credential, and the recorded run history.
+  [Java backup settings](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/model/GlobalSettings.java) · [Native preferences](src/profile_backup/preferences.rs) · [macOS acceptance](PORTING-PARITY.md#november-26-java-backup-schedule-and-retention-on-macos)
 - ASCII Art applies restored `asciiArtPictureSize`, `asciiArtImageSize`,
   `asciiArtCopyCommentStyle`, `asciiArtCopyPrintStyle` and `asciiArtCopyGap`
   when the dialog opens. Saved native values take precedence. The import
   uses Java's print-style precedence when both imported formats are active.
-  Verify the restored values and copied output in the native desktop.
-  [Java controls](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AsciiArtBannerDialog.java) · [Native preferences](src/workspace/ascii_art.rs)
+  This Mac verified independent imported picture sizes and copied a local
+  PNG with the imported Python format. After replay and restart, the
+  compact dialog kept both saved native sizes and the zero-gap comment
+  setting. Both clipboard outputs matched the tagged Java formatter byte
+  for byte when given the same raw preview.
+  [Java controls](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/ui/AsciiArtBannerDialog.java) · [Native preferences](src/workspace/ascii_art.rs) · [macOS acceptance](PORTING-PARITY.md#november-26-java-ascii-art-settings-and-clipboard-on-macos)
 - Java restore resolves `snippetWorkspaceOpenTabs` and
   `snippetWorkspaceActiveTab` against the merged snippet library. Exact
   matches can have different native IDs. Missing or divergent records are
-  skipped, and any existing native session takes precedence. Verify restored
-  tabs in native desktop windows. The global
+  skipped, and any existing native session takes precedence. This Mac
+  verified ordered tabs, the active remapped tab, and local source precedence
+  in the native manager. After replay and restart, the compact window kept
+  the locally selected session and resized divider. The global
   `snippetWorkspaceLibraryDividerPosition` fills an unset Rust library-divider
   preference. The deprecated manager preview divider has a separate disposition
-  below. [Native tab state](src/snippet_window/session.rs)
+  below. [Native tab state](src/snippet_window/session.rs) · [macOS acceptance](PORTING-PARITY.md#november-26-java-snippet-workspace-adoption-and-replay-on-macos)
 - The snippet library now has resizable Name, Language, Category,
   Operating System, Tags, Executable, Favorite, Lines, Modified and Uses
   columns. The header remains visible during vertical scrolling. A
@@ -3399,8 +3624,21 @@ search coverage.
   records matching accepted runs with the source, so their saved status
   survives source-history retention. Legacy reports can also use current
   or retained source versions as evidence.
-  Verify filtering, sorting, favorite toggling, usage updates, resize, scroll,
-  selection, row menus and drag interactions on native desktops.
+  This Mac verified migrated columns and statistics, header sorting, both
+  scroll directions, table-header anchoring, batch favorites via the row
+  menu, a saved-snippet copy, and a row dragged into a local folder.
+  Replaying the Java backup preserved the changed width and exact library,
+  and the compact window exposed the rightmost columns and the folder.
+  With saved reports, this Mac verified analysis status sorting and the
+  Open findings, Stale analyses and Pending reviews filters. Pending reviews
+  included an older review and a retained unsaved result. Saving a snippet
+  moved it into Stale analyses immediately. The compact window retained
+  the result after restart. The compact editor scrolls with its version
+  controls and keeps Save and Close in view. At the minimum size, the
+  library actions scroll independently of the snippet list. Both sizes
+  passed on this Mac. Continue on the outstanding native platforms.
+  [macOS library acceptance](PORTING-PARITY.md#november-26-java-snippet-library-metadata-and-interaction-on-macos)
+  · [Saved report filters](PORTING-PARITY.md#november-26-saved-snippet-analysis-filters-on-macos)
 - The snippet library can insert a resolved snippet at the caret of a
   hosted file editor or a native editor opened from its main window.
   The variable prompt keeps the chosen target and uses `${cursor}` to

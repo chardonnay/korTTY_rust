@@ -1072,6 +1072,21 @@ fn java_terminal_input_overrides_preserve_explicit_zero_false_and_inheritance() 
 }
 
 #[test]
+fn java_connection_import_preserves_agent_design_id() {
+    let scratch = Scratch::new();
+    let file = scratch.0.join("java-agent-design.xml");
+    fs::write(&file, "<connections schemaVersion=\"2\"><connection><host>server.example</host>\
+        <username>operator</username><aiAgentDesignId>custom-1</aiAgentDesignId></connection></connections>")
+        .unwrap();
+    let preview = Preview::read(&file).unwrap();
+    let (connection, _) = preview.entries().next().unwrap();
+    assert_eq!(
+        connection.terminal.ai_agent_design.as_deref(),
+        Some("custom-1")
+    );
+}
+
+#[test]
 fn java_agent_disable_round_trips_independently_of_terminal_presentation() {
     let scratch = Scratch::new();
     let file = scratch.0.join("java-agent-disabled.xml");

@@ -22,7 +22,7 @@ pub(crate) enum Action {
 }
 
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
-enum Step {
+pub(in crate::ai_manager) enum Step {
     Connection,
     Model,
     Name,
@@ -120,6 +120,10 @@ pub(crate) struct ScanResult {
 }
 
 impl Editor {
+    pub(in crate::ai_manager) fn wizard_step(&self) -> Option<Step> {
+        self.wizard.as_ref().map(|wizard| wizard.step)
+    }
+
     pub(in crate::ai_manager) fn wizard_search_settings(
         &self,
         editable: bool,

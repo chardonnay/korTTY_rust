@@ -2482,6 +2482,7 @@ impl Workspace {
                             token,
                             key,
                             dialog.page_scroll.clone(),
+                            !preferences.agent_animations(),
                         );
                     }
                     edit => dialog.agent_design.update(

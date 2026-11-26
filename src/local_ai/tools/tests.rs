@@ -29,14 +29,15 @@ fn send(
     history: &[Message],
     offer: bool,
 ) -> (Result<Reply, Error>, Option<CompletionLimit>) {
-    client.complete_agent_turn_before_guarded(
+    let (result, stop, _) = client.complete_agent_turn_before_guarded(
         "Reviewed system",
         "Reviewed local task",
         Some(Request { history, offer }),
         true,
         Instant::now() + Duration::from_secs(3),
         || Ok(()),
-    )
+    );
+    (result, stop)
 }
 
 #[test]
@@ -236,7 +237,7 @@ fn web_tool_history_requires_ordered_complete_unique_and_bounded_results_before_
         let (listener, profile) = test_support::listener();
         let client = Client::new(profile);
         let checked = Cell::new(0);
-        let (reply, _) = client.complete_agent_turn_before_guarded(
+        let (reply, _, dispatched) = client.complete_agent_turn_before_guarded(
             "system",
             "task",
             Some(Request {
@@ -251,6 +252,7 @@ fn web_tool_history_requires_ordered_complete_unique_and_bounded_results_before_
             },
         );
         assert!(reply.is_err());
+        assert!(!dispatched);
         assert_eq!(checked.get(), 0);
         assert_eq!(
             listener.accept().unwrap_err().kind(),
@@ -264,7 +266,7 @@ fn web_tool_turns_bound_the_encoded_request_before_sending() {
     let (listener, profile) = test_support::listener();
     let client = Client::new(profile);
     let oversized = "\u{1}".repeat(MAX_REQUEST_BYTES / 5);
-    let (reply, _) = client.complete_agent_turn_before_guarded(
+    let (reply, _, dispatched) = client.complete_agent_turn_before_guarded(
         "system",
         &oversized,
         Some(Request {
@@ -276,6 +278,7 @@ fn web_tool_turns_bound_the_encoded_request_before_sending() {
         || Ok(()),
     );
     assert!(matches!(reply, Err(Error::Invalid(_))));
+    assert!(!dispatched);
     assert_eq!(
         listener.accept().unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock
@@ -335,7 +338,7 @@ fn web_tool_turns_recheck_authority_after_reply_and_before_continuing() {
     )]);
     let client = Client::new(profile);
     let checks = Cell::new(0);
-    let (reply, _) = client.complete_agent_turn_before_guarded(
+    let (reply, _, dispatched) = client.complete_agent_turn_before_guarded(
         "system",
         "task",
         Some(Request {
@@ -354,6 +357,7 @@ fn web_tool_turns_recheck_authority_after_reply_and_before_continuing() {
         },
     );
     assert!(matches!(reply, Err(Error::Review(_))));
+    assert!(dispatched);
     assert_eq!(checks.get(), 2);
     assert_eq!(server.join().unwrap().len(), 1);
     assert_eq!(client.take_usage().unwrap().total_tokens, Some(12));
