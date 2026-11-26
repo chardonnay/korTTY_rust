@@ -324,7 +324,8 @@ mod tests {
             mouse::Cursor::Unavailable,
         );
         let image = compositor::screenshot(&mut renderer, &viewport, Color::BLACK);
-        assert!(image.chunks_exact(4).any(|pixel| pixel[1] > pixel[0]));
-        assert!(image.chunks_exact(4).any(|pixel| pixel[0] > pixel[1]));
+        let (pixels, _) = image.as_chunks::<4>();
+        assert!(pixels.iter().any(|pixel| pixel[1] > pixel[0]));
+        assert!(pixels.iter().any(|pixel| pixel[0] > pixel[1]));
     }
 }
