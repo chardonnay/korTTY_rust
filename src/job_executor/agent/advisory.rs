@@ -248,6 +248,7 @@ mod tests {
             AdviceInput::Reviewed {
                 system: system.clone(),
                 input: input.clone(),
+                web: None,
             },
             &Cancellation::default(),
             &redactor,

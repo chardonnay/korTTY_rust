@@ -1967,7 +1967,8 @@ fn drive_execution(
     marker: &Path,
     deadline: Instant,
 ) -> (Task<Message>, job_executor::agent::FiringResult) {
-    let sshd = ssh.serve_with_extra("host", extra);
+    // Keep sshd diagnostics about the test environment out of command stderr.
+    let sshd = ssh.serve_with_extra("host", &format!("{extra}LogLevel VERBOSE\n"));
     let mut events = iced_runtime::task::into_stream(task).expect("approved execution task");
     let mut permits = 0;
     let mut completed = None;

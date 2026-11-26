@@ -404,6 +404,13 @@ impl Workspace {
         Arc::downgrade(&self.vault_change_revision)
     }
 
+    pub(super) fn refresh_vault_authority(&mut self) {
+        self.vault_change_revision = Arc::new(());
+        self.revalidate_journal_questions();
+        self.revalidate_remote_snippet_analysis();
+        self.refresh_scheduler_credentials();
+    }
+
     pub(super) fn vault_unlock_available(&self) -> bool {
         self.vault
             .as_ref()
@@ -1384,10 +1391,7 @@ impl Workspace {
         }
         let task = Task::batch([task, self.cancel_revoked_password_commands()]);
         if credentials_changed {
-            self.vault_change_revision = Arc::new(());
-            self.revalidate_journal_questions();
-            self.revalidate_remote_snippet_analysis();
-            self.refresh_scheduler_credentials();
+            self.refresh_vault_authority();
         }
         if completed && self.vault_unlock_prompt_owner(id).is_some() {
             if self

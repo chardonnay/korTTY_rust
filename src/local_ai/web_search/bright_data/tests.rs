@@ -34,7 +34,7 @@ fn extract(
     authorize: impl Fn() -> Result<(), String>,
 ) -> Result<Vec<Hit>, Error> {
     ToolCall {
-        auth: &Authentication::Query(super::KEY),
+        auth: &Authentication::Query(super::KEY, None),
         key: Some(key),
         url,
         tool: TOOL,

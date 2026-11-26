@@ -7,6 +7,7 @@ use crate::local_ai::web_search::MAX_QUERY_BYTES;
 
 pub(crate) const MAX_PUBLIC_TOPIC_BYTES: usize = MAX_QUERY_BYTES;
 pub(crate) const MAX_FOLLOWUP_LOOKUPS: u8 = 2;
+pub(crate) const MAX_MODEL_LOOKUPS_PER_TARGET: u8 = 2;
 
 pub(crate) fn valid_input(text: &str) -> bool {
     !text.is_empty()
@@ -46,6 +47,8 @@ pub(crate) struct Grant {
     preflight_followups: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     environment_lookup: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    model_tools: bool,
 }
 
 impl std::fmt::Debug for Grant {
@@ -69,6 +72,7 @@ impl Grant {
             redaction_revision,
             preflight_followups: false,
             environment_lookup: false,
+            model_tools: false,
         };
         grant
             .valid()
@@ -133,6 +137,15 @@ impl Grant {
 
     pub(crate) fn allows_round_page(&self) -> bool {
         self.version == Version::V5
+    }
+
+    pub(crate) fn with_model_tools(mut self) -> Self {
+        self.model_tools = true;
+        self
+    }
+
+    pub(crate) fn allows_model_tools(&self) -> bool {
+        self.model_tools
     }
 
     pub(crate) fn public_topic(&self) -> &str {

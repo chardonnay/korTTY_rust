@@ -84,6 +84,10 @@ optional = true
 [dependencies.rustc-hash]
 version = "2.0"
 
+[dependencies.skrifa]
+version = "0.37"
+default-features = false
+
 [dependencies.softbuffer]
 version = "0.4"
 default-features = false

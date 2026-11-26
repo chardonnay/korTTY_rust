@@ -890,7 +890,7 @@ impl Group {
                     if run
                         .model_review
                         .as_ref()
-                        .is_some_and(|review| review.web_active())
+                        .is_some_and(|review| review.web_active() || review.model_tool_active())
                     {
                         view = view.push(text(&run.notice).size(13));
                     }
@@ -2817,6 +2817,14 @@ fn member_status(run: &Run) -> Status {
         Phase::Cancelled => Status::Cancelled,
         _ if run.cancel.requested() => Status::Cancelling,
         _ if run.paused => Status::Paused,
+        _ if run.phase.deciding()
+            && run
+                .model_review
+                .as_ref()
+                .is_some_and(|review| review.model_tool_active()) =>
+        {
+            Status::Review
+        }
         Phase::Paused => Status::Paused,
         Phase::ModelReview
         | Phase::DirectoryConfirmation

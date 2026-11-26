@@ -761,13 +761,24 @@ fn bar_controls<'a>(
     drawer: bool,
     compact: bool,
     toggle: Message,
+    icon_menu: Option<(history::Activity<'a>, Status)>,
 ) -> Option<Row<'a, AgentMessage>> {
     let run = trace.run?;
-    let details = || {
-        button(if drawer { "Close details" } else { "Details" })
-            .padding(3)
-            .style(button::text)
-            .on_press(AgentMessage::Design(toggle))
+    let details = || -> Element<'a, AgentMessage> {
+        let action = AgentMessage::Design(toggle);
+        if icon_menu.is_some() {
+            top_bar::icon(
+                if drawer { "▴" } else { "▾" },
+                if drawer { "Hide steps" } else { "Show steps" },
+                Some(action),
+            )
+        } else {
+            button(if drawer { "Close details" } else { "Details" })
+                .padding(3)
+                .style(button::text)
+                .on_press(action)
+                .into()
+        }
     };
     let mut controls = row![].spacing(6).align_y(Alignment::Center);
     if trace.waiting {
@@ -810,7 +821,11 @@ fn bar_controls<'a>(
             tooltip::Position::Top,
         ));
     }
-    if let Some(menu) = super::actions::run_menu(run, has_archive) {
+    if let Some((activity, status)) = icon_menu {
+        controls = controls.push(log_table::status_icon_menu(activity, status, |action| {
+            top_bar::icon("⋯", "More actions", Some(action))
+        }));
+    } else if let Some(menu) = super::actions::run_menu(run, has_archive) {
         controls = controls.push(menu);
     }
     if !compact {

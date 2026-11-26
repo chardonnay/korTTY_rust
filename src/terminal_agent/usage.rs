@@ -7,9 +7,9 @@ use zeroize::Zeroizing;
 
 use crate::local_ai::{self, CompletionLimit, Error};
 
-use super::RunModel;
+use super::{AskAttachmentCheck, RunModel};
 
-mod web;
+pub(crate) mod web;
 pub(crate) use web::{
     ApprovedWebResult, WebOperation, WebProposal, error_result as web_error_result,
 };
@@ -88,6 +88,26 @@ pub(super) fn request<T: Send + 'static>(
         let deadline = Instant::now() + Duration::from_secs(120);
         let observes_limit = !matches!(mode, RequestMode::Planning { .. });
         let web_session = std::cell::RefCell::new(web::Session::default());
+        let attachment_check = match &mode {
+            RequestMode::Ask {
+                attachment_check, ..
+            } => attachment_check.as_ref(),
+            _ => None,
+        };
+        let authorize_web_send = match &mode {
+            RequestMode::Ask {
+                authorize_web_send, ..
+            } => authorize_web_send.as_deref(),
+            _ => None,
+        };
+        let before_send = || {
+            before_dispatch()?;
+            if let Some(check) = attachment_check {
+                check()?;
+                before_dispatch()?;
+            }
+            Ok(())
+        };
         let complete = |kind, input: &str| {
             if let Some((limit, progress)) = mode.web_tools() {
                 return web_session.borrow_mut().complete(
@@ -100,6 +120,8 @@ pub(super) fn request<T: Send + 'static>(
                         kind,
                         deadline,
                         output_limit,
+                        attachment_check,
+                        before_send: authorize_web_send.map(|check| check as &dyn Fn() -> _),
                     },
                     &parse,
                     &before_dispatch,
@@ -109,12 +131,7 @@ pub(super) fn request<T: Send + 'static>(
             let send = |response_format| {
                 if cli {
                     (
-                        client.complete_cli_before_guarded(
-                            &system,
-                            input,
-                            deadline,
-                            &before_dispatch,
-                        ),
+                        client.complete_cli_before_guarded(&system, input, deadline, before_send),
                         None,
                     )
                 } else if observes_limit {
@@ -123,7 +140,7 @@ pub(super) fn request<T: Send + 'static>(
                         input,
                         response_format,
                         deadline,
-                        &before_dispatch,
+                        &before_send,
                     )
                 } else {
                     (
@@ -132,7 +149,7 @@ pub(super) fn request<T: Send + 'static>(
                             input,
                             response_format,
                             deadline,
-                            &before_dispatch,
+                            &before_send,
                         ),
                         None,
                     )
@@ -227,11 +244,15 @@ pub(super) enum RequestMode {
         repair: bool,
         context_limit: usize,
         progress: Option<async_channel::Sender<Progress>>,
+        web_tools: bool,
     },
     Agent(Option<async_channel::Sender<Progress>>),
     Ask {
         context_limit: usize,
         progress: Option<async_channel::Sender<Progress>>,
+        web_tools: bool,
+        attachment_check: Option<AskAttachmentCheck>,
+        authorize_web_send: Option<Box<dyn Fn() -> Result<(), String> + Send>>,
     },
     Run {
         kind: RunModel,
@@ -244,7 +265,19 @@ pub(super) enum RequestMode {
 impl RequestMode {
     fn web_tools(&self) -> Option<(usize, &async_channel::Sender<Progress>)> {
         match self {
-            Self::Run {
+            Self::Ask {
+                context_limit,
+                progress: Some(progress),
+                web_tools: true,
+                ..
+            }
+            | Self::Planning {
+                context_limit,
+                progress: Some(progress),
+                web_tools: true,
+                ..
+            }
+            | Self::Run {
                 kind: RunModel::Decision,
                 context_limit,
                 progress,

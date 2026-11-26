@@ -15,6 +15,7 @@ use crate::job_executor::automation::IterativeCapture;
 use crate::job_executor::{self, Completion};
 use crate::scheduled_agent_review::{EndReason, Key, Phase, Review, Ticket};
 use crate::scheduler_window::{SshCommand, agent, firing};
+use crate::terminal_agent::usage;
 use crate::terminal_logging::{RedactionSecrets, Redactor, Secrets};
 
 use super::{ConnectionStore, Message, Workspace, profile, proposal_skills};
@@ -44,6 +45,7 @@ pub struct Event(Progress);
 enum Progress {
     StartFailed(RunId, usize, u8, RunOutcome, String),
     ModelDispatch(Ticket, Sender<()>),
+    ModelUpdate(Ticket, usage::Progress),
     Generated(Ticket, Result<Decision, String>),
     ExecutionPermit(Ticket, FiringPermit, Permit),
     Executed(Ticket, FiringResult),
@@ -339,10 +341,11 @@ impl Workspace {
                         && saved_config
                             .resolve_profile_reference(grant.profile())
                             .and_then(|id| web::Scope::new(Some(&saved_config), id, true))
+                            .map(|scope| scope.with_vault(self.vault.as_ref()))
                             .is_some_and(|scope| {
                                 scope.page_review().is_some()
                                     && scope.page_credential_env().is_none_or(|name| {
-                                        crate::local_ai::credential_value(name).is_ok()
+                                        scope.provider_credential(name).is_some()
                                     })
                             });
                     (grant.public_topic(), supports_page)
@@ -429,13 +432,33 @@ impl Workspace {
             vault_revision: review_context.vault_revision.clone(),
             cancellation: request.cancellation.clone(),
         };
-        let pending = Arc::clone(&review_context.prompt).start_firing(dispatches, {
-            let action = Arc::clone(&request.action);
-            move |prompt, policy| {
-                action.require_installed_target_groups()?;
-                guard.verify(prompt, policy)
-            }
-        })?;
+        let offer_tools = approval
+            .web_lookup()
+            .is_some_and(agent::web_lookup::Grant::allows_model_tools)
+            && crate::local_ai::tools::agent_task_eligible(
+                &agent.goal,
+                saved_config.agent_always_offer_web_tools(),
+            )
+            && self
+                .scheduler_firing_web
+                .model_web_available(Key::new(request.id, target_index))
+            && (!review_context.prompt.is_swarm_iterative()
+                || round <= agent::proposal::MAX_SWARM_COMMAND_ROUNDS);
+        if offer_tools {
+            self.scheduled_model_web_context(&request)?;
+        }
+        let (tool_progress, tool_updates) = async_channel::bounded(1);
+        let pending = Arc::clone(&review_context.prompt).start_firing(
+            dispatches,
+            offer_tools.then_some(tool_progress),
+            {
+                let action = Arc::clone(&request.action);
+                move |prompt, policy| {
+                    action.require_installed_target_groups()?;
+                    guard.verify(prompt, policy)
+                }
+            },
+        )?;
         review_context._cancel = Some(pending.cancel);
         let now = Instant::now();
         let ticket = self
@@ -457,12 +480,18 @@ impl Workspace {
             capture.prepare_status_target(target, store, trust, vault_revision, secrets);
         }
         let dispatch_ticket = ticket.clone();
-        Ok(Task::run(updates, move |permit| {
-            Message::ScheduledAgent(Event(Progress::ModelDispatch(
-                dispatch_ticket.clone(),
-                permit,
-            )))
-        })
+        let tool_ticket = ticket.clone();
+        Ok(Task::batch([
+            Task::run(updates, move |permit| {
+                Message::ScheduledAgent(Event(Progress::ModelDispatch(
+                    dispatch_ticket.clone(),
+                    permit,
+                )))
+            }),
+            Task::run(tool_updates, move |progress| {
+                Message::ScheduledAgent(Event(Progress::ModelUpdate(tool_ticket.clone(), progress)))
+            }),
+        ])
         .chain(Task::perform(
             async move {
                 pending
@@ -477,7 +506,11 @@ impl Workspace {
         )))
     }
 
-    fn current_firing(&self, ticket: &Ticket, phase: Phase) -> Result<&FiringReview, &'static str> {
+    pub(super) fn current_firing(
+        &self,
+        ticket: &Ticket,
+        phase: Phase,
+    ) -> Result<&FiringReview, &'static str> {
         self.firing_authority(ticket, phase, false)
     }
 
@@ -657,6 +690,16 @@ impl Workspace {
                 if self.current_firing(&ticket, Phase::Generating).is_ok() {
                     let _ = permit.try_send(());
                 }
+                permit.close();
+                Task::none()
+            }
+            Progress::ModelUpdate(ticket, usage::Progress::WebTool(proposal)) => {
+                self.begin_model_round_web(&ticket, proposal)
+            }
+            Progress::ModelUpdate(ticket, usage::Progress::FormatFallback(_, permit)) => {
+                self.update_firing(Event(Progress::ModelDispatch(ticket, permit)))
+            }
+            Progress::ModelUpdate(_, usage::Progress::Repairing(_, permit)) => {
                 permit.close();
                 Task::none()
             }

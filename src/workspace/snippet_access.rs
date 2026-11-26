@@ -418,7 +418,7 @@ impl Workspace {
                             self.ai_configuration().as_deref(),
                             crate::local_ai::cli::allowed(&self.clipboard.policy, false),
                         ),
-                        size.width,
+                        size,
                     )
                     .map(move |message| Message::Snippets(id, message))
             })

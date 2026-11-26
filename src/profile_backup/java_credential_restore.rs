@@ -2,15 +2,16 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
 
-use kortty_vault::{PreparedAdditions, Secret, Vault};
+use kortty_vault::{CredentialAddition, PreparedAdditions, Secret, Vault};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq as _;
 use zeroize::Zeroizing;
 
-use super::java_migration::{CONNECTIONS, SshSource};
+use super::java_migration::{CONNECTIONS, CredentialSource};
 use super::java_secrets::{
     JavaSecrets, keys,
     passwords::{self, Hop},
-    temporary_keys,
+    temporary_keys, web,
 };
 use crate::clipboard_policy::ClipboardPolicy;
 use crate::connection_store::import::{
@@ -46,13 +47,14 @@ pub(super) struct Review {
     pub(super) passwords: Option<(usize, usize)>,
     pub(super) keys: Option<(usize, usize)>,
     pub(super) temporary_keys: Option<(usize, usize)>,
+    pub(super) web: Option<web::Summary>,
     pub(super) omitted_key_routes: usize,
     pub(super) unused_key_files: usize,
 }
 
 pub(super) fn prepare(
     root: &Path,
-    source: &SshSource,
+    source: &CredentialSource,
     password: Option<&Secret>,
     vault: Option<&Vault>,
     needs_route_lineage: bool,
@@ -183,6 +185,10 @@ pub(super) fn prepare(
     let omitted_key_routes = routes.omitted_keys();
     let needed = &routes.needed();
     let reviewed_passwords = password_import.is_some();
+    let has_authenticated_ssh_secret = password_import
+        .as_ref()
+        .is_some_and(|import| !import.additions.is_empty())
+        || keys.iter().any(|key| key.passphrase.is_some());
     let (mut indexes, mut additions): (Vec<_>, Vec<_>) = password_import
         .into_iter()
         .flat_map(|import| {
@@ -190,7 +196,11 @@ pub(super) fn prepare(
                 .additions
                 .into_iter()
                 .enumerate()
-                .filter(move |(index, _)| *index < import.standalone || needed.contains(index))
+                .filter(move |(index, addition)| {
+                    needed.contains(index)
+                        || (*index < import.standalone
+                            && !vault.is_some_and(|vault| saved_password_matches(vault, addition)))
+                })
         })
         .unzip();
     let password_count = additions.len();
@@ -216,6 +226,16 @@ pub(super) fn prepare(
             index
         }));
     }
+    let web = secrets
+        .as_ref()
+        .zip(vault)
+        .filter(|_| source.web.len() != 0)
+        .map(|(secrets, vault)| {
+            source
+                .web
+                .prepare(secrets, vault, &mut additions, has_authenticated_ssh_secret)
+        })
+        .transpose()?;
     let vault = if additions.is_empty() {
         None
     } else {
@@ -296,12 +316,28 @@ pub(super) fn prepare(
         }),
         passwords: reviewed_passwords.then_some((password_count, omitted_passwords)),
         temporary_keys: temporary_summary,
+        web,
         keys: source
             .key_catalog
             .is_some()
             .then_some((key_count, omitted_keys)),
         omitted_key_routes,
         unused_key_files,
+    })
+}
+
+fn saved_password_matches(vault: &Vault, addition: &CredentialAddition) -> bool {
+    let input = &addition.input;
+    vault.entries().any(|entry| {
+        entry.kind == input.kind
+            && entry.label == input.label
+            && entry.username == input.username
+            && entry.server_pattern == input.server_pattern
+            && entry.environment == input.environment
+            && entry.description == input.description
+            && vault.secret(&entry.id).is_some_and(|secret| {
+                bool::from(secret.as_bytes().ct_eq(addition.secret.as_bytes()))
+            })
     })
 }
 

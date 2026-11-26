@@ -5,8 +5,9 @@ use super::{
     connection_config, credential_value, response_bytes, start_worker,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, atomic::AtomicUsize};
 use std::time::Duration;
+use zeroize::Zeroizing;
 
 mod bright_data;
 mod direct_mcp;
@@ -25,6 +26,8 @@ const KEY: &str = "TAVILY_API_KEY";
 pub(crate) const MAX_QUERY_BYTES: usize = 400;
 pub(crate) const MAX_RESULTS: usize = 5;
 const TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_DIRECT_WORKERS: usize = 2;
+static DIRECT_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy)]
 pub(crate) enum PageProvider<'a> {
@@ -64,15 +67,25 @@ pub(crate) fn search_credential_env(settings: Option<&McpSettings>) -> Option<&'
     settings.map_or(Some(KEY), McpSettings::search_credential_env)
 }
 
+pub(crate) fn vault_provider(settings: Option<&McpSettings>) -> Option<kortty_vault::WebProvider> {
+    use kortty_vault::WebProvider;
+    match settings.map(|settings| settings.mode) {
+        None | Some(McpMode::Tavily) => Some(WebProvider::Tavily),
+        Some(McpMode::BrightData) => Some(WebProvider::BrightData),
+        Some(McpMode::Searxng | McpMode::Brave | McpMode::Toolpack) => None,
+    }
+}
+
 pub(crate) fn start_page<T: Send + 'static>(
     provider: PageProvider<'_>,
     url: PageUrl,
+    vault_key: Option<Zeroizing<String>>,
     before_dispatch: impl Fn() -> Result<(), String> + Send + 'static,
     finish: impl FnOnce(Vec<Hit>) -> T + Send + 'static,
 ) -> Result<Pending<T>, String> {
     match provider {
-        PageProvider::Tavily => page::start_extract(url, before_dispatch, finish),
-        PageProvider::BrightData => bright_data::start(url, before_dispatch, finish),
+        PageProvider::Tavily => page::start_extract(url, vault_key, before_dispatch, finish),
+        PageProvider::BrightData => bright_data::start(url, vault_key, before_dispatch, finish),
         PageProvider::Searxng(settings) => searxng::start(
             &settings.endpoint,
             settings.bearer_env.as_deref(),
@@ -107,11 +120,13 @@ struct Request<'a> {
 
 pub(crate) fn start<T: Send + 'static>(
     query: String,
+    vault_key: Option<Zeroizing<String>>,
     before_dispatch: impl Fn() -> Result<(), String> + Send + 'static,
     finish: impl FnOnce(Vec<Hit>) -> T + Send + 'static,
 ) -> Result<Pending<T>, String> {
     start_tavily(
         TIMEOUT,
+        vault_key,
         before_dispatch,
         move |connection, key| search(connection, &query, key),
         finish,
@@ -120,19 +135,17 @@ pub(crate) fn start<T: Send + 'static>(
 
 fn start_tavily<R, T: Send + 'static>(
     timeout: Duration,
+    vault_key: Option<Zeroizing<String>>,
     before_dispatch: impl Fn() -> Result<(), String> + Send + 'static,
     request: impl FnOnce(&Connection, &str) -> Result<R, Error> + Send + 'static,
     finish: impl FnOnce(R) -> T + Send + 'static,
 ) -> Result<Pending<T>, String> {
-    let permit = WorkerPermit::acquire().ok_or("AI workers are busy.")?;
-    let activity = Arc::new(Activity::default());
-    let cancel = Cancel {
-        activity: Arc::clone(&activity),
-    };
-    start_worker(cancel, move || {
-        let _permit = permit;
+    start_tavily_worker(move |activity| {
         require_policy()?;
-        let key = credential_value(KEY).map_err(|_| "Set TAVILY_API_KEY to use Tavily.")?;
+        let key = match vault_key {
+            Some(key) => key,
+            None => credential_value(KEY).map_err(|_| "Set TAVILY_API_KEY to use Tavily.")?,
+        };
         let agent = connection_agent(connection_config(timeout));
         let connection = Connection::attach(BASE.into(), agent, activity)
             .map_err(|_| "Web search was canceled.")?;
@@ -141,6 +154,29 @@ fn start_tavily<R, T: Send + 'static>(
         before_dispatch()?;
         Ok(finish(result))
     })
+}
+
+fn start_tavily_worker<T: Send + 'static>(
+    run: impl FnOnce(Arc<Activity>) -> Result<T, String> + Send + 'static,
+) -> Result<Pending<T>, String> {
+    // A model worker can hold its permit while waiting for this provider's reviewed results.
+    let permit = WorkerPermit::acquire_from(&DIRECT_WORKERS, MAX_DIRECT_WORKERS)
+        .ok_or("Web search workers are busy.")?;
+    let activity = Arc::new(Activity::default());
+    let cancel = Cancel {
+        activity: Arc::clone(&activity),
+    };
+    start_worker(cancel, move || {
+        let _permit = permit;
+        run(activity)
+    })
+}
+
+#[cfg(all(debug_assertions, feature = "dialog-preview"))]
+pub(crate) fn start_tavily_preview<T: Send + 'static>(
+    run: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<Pending<T>, String> {
+    start_tavily_worker(move |_| run())
 }
 
 pub(crate) fn start_mcp<T: Send + 'static>(
@@ -178,10 +214,11 @@ fn search(connection: &Connection, query: &str, key: &str) -> Result<Vec<Hit>, E
     if !connection.active() {
         return Err(Error::Cancelled);
     }
+    let has_secret = direct_mcp::secret_checker(key);
     if query.trim().is_empty()
         || query.len() > MAX_QUERY_BYTES
         || key.is_empty()
-        || query.contains(key)
+        || has_secret(query)
     {
         return Err(Error::Invalid("invalid search query or credential"));
     }
@@ -201,7 +238,7 @@ fn search(connection: &Connection, query: &str, key: &str) -> Result<Vec<Hit>, E
         .filter(|hit| {
             [&hit.title, &hit.url, &hit.content]
                 .iter()
-                .all(|value| !value.contains(key))
+                .all(|value| !has_secret(value))
         })
         .collect())
 }
@@ -251,7 +288,35 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::local_ai::test_support::{accept, fixture_http_response, listener, wire_request};
+    use crate::local_ai::test_support::{
+        accept, exclusive_run, fixture_http_response, listener, wire_request,
+    };
+
+    #[test]
+    fn direct_web_workers_remain_available_while_model_workers_wait() {
+        let _exclusive = exclusive_run();
+        let (_, profile) = listener();
+        let _models: Vec<_> = (0..crate::local_ai::MAX_WORKERS)
+            .map(|_| crate::local_ai::Session::begin(profile.clone()).unwrap())
+            .collect();
+        let (release, held) = async_channel::bounded::<()>(MAX_DIRECT_WORKERS);
+        let workers: Vec<_> = (0..MAX_DIRECT_WORKERS)
+            .map(|_| {
+                let held = held.clone();
+                start_tavily_worker(move |_| {
+                    held.recv_blocking().map_err(|error| error.to_string())
+                })
+                .unwrap()
+            })
+            .collect();
+        assert!(start_tavily_worker(|_| Ok(())).is_err());
+        for _ in &workers {
+            release.send_blocking(()).unwrap();
+        }
+        for worker in workers {
+            worker.reply.recv_blocking().unwrap().unwrap();
+        }
+    }
 
     #[test]
     fn tavily_sends_only_the_reviewed_query_and_drops_echoed_credentials() {

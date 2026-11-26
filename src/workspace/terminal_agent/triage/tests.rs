@@ -4,7 +4,7 @@ use crate::workspace::terminal_agent::flow::tests::{
 };
 use crate::workspace::terminal_agent::request_review;
 
-fn begin_choice(fixture: &mut Fixture) -> window::Id {
+pub(in crate::workspace::terminal_agent) fn begin_choice(fixture: &mut Fixture) -> window::Id {
     let id = complete_probe(fixture);
     let epoch = fixture.run_mut(id).next(Phase::Thinking, "Checking");
     let reply = Reply::Triage {

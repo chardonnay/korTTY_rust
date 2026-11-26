@@ -5,6 +5,7 @@ use crate::graphics::error::{self, Error};
 use crate::graphics::{self, Shell, Viewport};
 use crate::{Layer, Renderer, Settings};
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::num::NonZeroU32;
 
@@ -106,6 +107,10 @@ impl crate::graphics::Compositor for Compositor {
             adapter: String::from("CPU"),
             backend: String::from("tiny-skia"),
         }
+    }
+
+    fn load_font(&mut self, font: Cow<'static, [u8]>) {
+        crate::text::load_font(font);
     }
 
     fn present(

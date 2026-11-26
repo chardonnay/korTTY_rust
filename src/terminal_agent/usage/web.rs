@@ -10,7 +10,9 @@ use async_channel::{Receiver, Sender};
 use serde_json::json;
 use zeroize::Zeroizing;
 
-use super::{Attempt, AttemptKind, Progress, authorize_resend, interpret_reply};
+use super::{
+    AskAttachmentCheck, Attempt, AttemptKind, Progress, authorize_resend, interpret_reply,
+};
 use crate::local_ai::{self, Error, tools};
 
 const MAX_EXECUTED_ROUNDS: usize = 2;
@@ -91,14 +93,14 @@ impl Drop for WebProposal {
 }
 
 #[derive(Default)]
-pub(super) struct Session {
+pub(crate) struct Session {
     history: Vec<tools::Message>,
     guards: Vec<Box<dyn Fn() -> Result<(), String> + Send>>,
     rounds: usize,
     final_only: bool,
 }
 
-pub(super) struct Completion<'a> {
+pub(crate) struct Completion<'a> {
     pub system: &'a str,
     pub input: &'a str,
     pub limit: usize,
@@ -106,6 +108,8 @@ pub(super) struct Completion<'a> {
     pub kind: AttemptKind,
     pub deadline: Instant,
     pub output_limit: u32,
+    pub attachment_check: Option<&'a AskAttachmentCheck>,
+    pub before_send: Option<&'a dyn Fn() -> Result<(), String>>,
 }
 
 #[derive(Default)]
@@ -156,7 +160,7 @@ impl Session {
         Ok(())
     }
 
-    pub(super) fn complete<T>(
+    pub(crate) fn complete<T>(
         &mut self,
         client: &local_ai::Client,
         request: Completion<'_>,
@@ -181,8 +185,8 @@ impl Session {
                     "The reviewed web-tool conversation exceeds the model context limit.".into(),
                 ));
             }
-            let send = |format| {
-                client.complete_agent_turn_before_guarded(
+            let mut send = |format| {
+                let (reply, stop, dispatched) = client.complete_agent_turn_before_guarded(
                     request.system,
                     request.input,
                     Some(tools::Request {
@@ -193,12 +197,25 @@ impl Session {
                     request.deadline,
                     || {
                         self.check(client, request.deadline, guard)
-                            .map_err(|error| error.message())
+                            .map_err(|error| error.message())?;
+                        if let Some(authorize) = request.before_send {
+                            authorize()?;
+                        }
+                        if let Some(check) = request.attachment_check {
+                            check()?;
+                            self.check(client, request.deadline, guard)
+                                .map_err(|error| error.message())?;
+                        }
+                        Ok(())
                     },
-                )
+                );
+                let usage = client.take_usage();
+                if dispatched {
+                    totals.observe(usage);
+                }
+                (reply, stop)
             };
             let (mut reply, mut observed_stop) = send(true);
-            totals.observe(client.take_usage());
             if matches!(reply, Err(Error::UnsupportedResponseFormat)) {
                 authorize_resend(
                     client,
@@ -208,7 +225,6 @@ impl Session {
                     |permit| Progress::FormatFallback(request.kind, permit),
                 )?;
                 (reply, observed_stop) = send(false);
-                totals.observe(client.take_usage());
             }
             stop = observed_stop;
             let mut reply = reply?;
@@ -352,6 +368,41 @@ fn operation(call: &tools::Call) -> Option<(WebOperation, String)> {
 
 pub(crate) fn error_result(kind: &str, message: &str) -> String {
     json!({"status":"error","provider":"kortty","errorType":kind,"message":message}).to_string()
+}
+
+pub(crate) fn require_clean_call(
+    call: &tools::Call,
+    require_clean: &impl Fn(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    fn check(
+        value: &serde_json::Value,
+        require_clean: &impl Fn(&str) -> Result<(), String>,
+    ) -> Result<(), String> {
+        match value {
+            serde_json::Value::String(text) => require_clean(text)?,
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    check(value, require_clean)?;
+                }
+            }
+            serde_json::Value::Object(values) => {
+                for (key, value) in values {
+                    require_clean(key)?;
+                    check(value, require_clean)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    require_clean(&call.id)?;
+    require_clean(&call.function.name)?;
+    require_clean(&call.function.arguments)?;
+    let arguments = serde_json::from_str(&call.function.arguments)
+        .map_err(|_| "The model tool arguments are invalid.")?;
+    check(&arguments, require_clean).map_err(|_| {
+        "The model tool arguments contain text requiring masking. Start a new review.".into()
+    })
 }
 
 #[cfg(test)]

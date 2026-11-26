@@ -793,8 +793,6 @@ pub(super) fn unattended_workspace_for_probe(
     credential_env: &str,
     probe: agent::Probe,
 ) -> (Workspace, window::Id, u64, PathBuf) {
-    std::fs::create_dir(root).unwrap();
-    profile::set_runtime_root(root.to_owned());
     let config: Configuration = serde_json::from_value(json!({
         "general":{"internet":{"searxng_url":"https://search.example.com/"}},
         "profiles": {"profiles": [{
@@ -804,6 +802,18 @@ pub(super) fn unattended_workspace_for_probe(
         "credential_env":credential_env
     }], "default": 1, "last_id": 1}}))
     .unwrap();
+    unattended_workspace_with_profile(root, ssh, config, probe, GOAL)
+}
+
+pub(super) fn unattended_workspace_with_profile(
+    root: &Path,
+    ssh: &TcpListener,
+    config: Configuration,
+    probe: agent::Probe,
+    goal: &str,
+) -> (Workspace, window::Id, u64, PathBuf) {
+    std::fs::create_dir(root).unwrap();
+    profile::set_runtime_root(root.to_owned());
     config
         .save_fixture_at(root, &Configuration::default())
         .unwrap();
@@ -813,7 +823,7 @@ pub(super) fn unattended_workspace_for_probe(
         "connection":reference, "working_directory":"/srv/internal",
         "agent":{
             "kind": if matches!(probe, agent::Probe::SwarmIterative | agent::Probe::SwarmReadOnly) { "swarm" } else { "agent" },
-            "probe":probe, "profile":1, "goal":GOAL
+            "probe":probe, "profile":1, "goal":goal
         }
     }))
     .unwrap();

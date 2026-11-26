@@ -17,12 +17,15 @@ const ROUND_REVIEW_REQUIRED: &str =
     "Research after a command batch requires a guided iterative Swarm review.";
 const ROUND_PAGE_READER_REQUIRED: &str =
     "Page requests after command batches require a configured webpage reader.";
+const MODEL_TOOLS_REQUIRED: &str =
+    "Reviewed model web tools require Agent or iterative Swarm and a direct Tavily profile.";
 
 enum OptionKind {
     Followups,
     Environment,
     Rounds,
     RoundPages,
+    ModelTools,
 }
 
 pub(in crate::scheduler_window) struct Review {
@@ -64,6 +67,9 @@ impl super::Review {
             if grant.allows_round_page() && scope.page_review().is_none() {
                 return Err(ROUND_PAGE_READER_REQUIRED.into());
             }
+            if grant.allows_model_tools() && !self.supports_unattended_web_model_tools() {
+                return Err(MODEL_TOOLS_REQUIRED.into());
+            }
             let prompt = model
                 .prompts
                 .first()
@@ -104,13 +110,39 @@ impl super::Review {
     pub(in crate::scheduler_window) fn unattended_web_page_destination(&self) -> Option<String> {
         self.model.as_ref()?.web.as_ref()?.scope.page_review()
     }
+
+    pub(in crate::scheduler_window) fn supports_unattended_web_model_tools(&self) -> bool {
+        let guided = self.action.agent.as_ref().is_some_and(|agent| {
+            matches!(
+                (agent.kind, agent.probe),
+                (super::Kind::Agent, super::Probe::PerFiring)
+                    | (
+                        super::Kind::Swarm,
+                        super::Probe::SwarmIterative | super::Probe::SwarmReadOnly
+                    )
+            )
+        });
+        guided
+            && self.model.as_ref().is_some_and(|model| {
+                model
+                    .web
+                    .as_ref()
+                    .is_some_and(|review| review.scope.uses_direct_tools())
+                    && model
+                        .prompts
+                        .first()
+                        .is_some_and(|prompt| prompt.transport.supports_web_tool_turns())
+            })
+    }
 }
 
 impl SchedulerView {
     pub(crate) fn unattended_web_includes_page_mask(&self, ticket: &str) -> bool {
         self.unattended_web_topic(ticket).is_some()
             && self.agent_review.as_ref().is_some_and(|review| {
-                review.unattended_web_followups || review.unattended_web_round_pages
+                review.unattended_web_followups
+                    || review.unattended_web_round_pages
+                    || review.unattended_web_model_tools
             })
     }
 
@@ -226,6 +258,15 @@ impl SchedulerWindow {
         self.edit_unattended_web_option(view, ticket, enabled, OptionKind::RoundPages)
     }
 
+    pub(in crate::scheduler_window) fn edit_unattended_web_model_tools(
+        &self,
+        view: &mut SchedulerView,
+        ticket: &str,
+        enabled: bool,
+    ) -> Result<(), String> {
+        self.edit_unattended_web_option(view, ticket, enabled, OptionKind::ModelTools)
+    }
+
     fn edit_unattended_web_option(
         &self,
         view: &mut SchedulerView,
@@ -256,6 +297,9 @@ impl SchedulerWindow {
             {
                 review.unattended_web_round_pages
             }
+            OptionKind::ModelTools if !enabled || review.supports_unattended_web_model_tools() => {
+                review.unattended_web_model_tools
+            }
             _ => return Ok(()),
         };
         if current == enabled {
@@ -281,6 +325,7 @@ impl SchedulerWindow {
                 }
             }
             OptionKind::RoundPages => review.unattended_web_round_pages = enabled,
+            OptionKind::ModelTools => review.unattended_web_model_tools = enabled,
         }
         Ok(())
     }
@@ -343,6 +388,14 @@ impl SchedulerWindow {
         } else {
             grant
         };
+        let grant = if review.unattended_web_model_tools {
+            if !review.supports_unattended_web_model_tools() {
+                return Err(MODEL_TOOLS_REQUIRED.into());
+            }
+            grant.with_model_tools()
+        } else {
+            grant
+        };
         self.replace_unattended_web(view, Some(grant))?;
         view.status = Some("Review the displayed automatic research and approve the scheduled model requests, then save the job.".into());
         Ok(())
@@ -387,6 +440,7 @@ impl SchedulerWindow {
             review.unattended_web_environment = false;
             review.unattended_web_rounds = false;
             review.unattended_web_round_pages = false;
+            review.unattended_web_model_tools = false;
         }
         review.approval.scope = updated;
         review.approval.web_lookup = grant;
@@ -431,7 +485,12 @@ impl SchedulerWindow {
         Ok(())
     }
 
-    pub(crate) fn attach_proposal_web(&self, view: &mut SchedulerView, policy_allows: bool) {
+    pub(crate) fn attach_proposal_web(
+        &self,
+        view: &mut SchedulerView,
+        policy_allows: bool,
+        vault: Option<&crate::vault_window::VaultWindow>,
+    ) {
         let Ok(Some(authority)) = self.proposal_authority(view) else {
             return;
         };
@@ -444,7 +503,9 @@ impl SchedulerWindow {
         let Some(scope) = web::Scope::new(Some(config), profile, policy_allows) else {
             return;
         };
-        let scope = scope.with_redactor(authority.prompt.web_redactor());
+        let scope = scope
+            .with_vault(vault)
+            .with_redactor(authority.prompt.web_redactor());
         if let Some((model, _)) = view.preview_model_mut() {
             model.web = Some(Review {
                 state: web::State::default(),

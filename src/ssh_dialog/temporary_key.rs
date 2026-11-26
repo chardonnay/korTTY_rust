@@ -187,6 +187,10 @@ impl Form {
     }
 
     pub(super) fn status(&self) -> &'static str {
+        self.status_with_hint(None)
+    }
+
+    pub(super) fn status_with_hint(&self, hint: Option<&'static str>) -> &'static str {
         if self.pending_paste.is_some() {
             "Reading clipboard…"
         } else if self.failed_paste {
@@ -196,7 +200,9 @@ impl Form {
         } else if self.key.is_some() {
             "The temporary SSH key expired. Paste the key again."
         } else {
-            "Set the lifetime, then paste an unencrypted private key. The key is kept in memory."
+            hint.unwrap_or(
+                "Set the lifetime, then paste an unencrypted private key. The key is kept in memory.",
+            )
         }
     }
 }

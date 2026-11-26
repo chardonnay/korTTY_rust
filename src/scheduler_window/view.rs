@@ -306,15 +306,16 @@ fn agent_review(review: &super::agent::Review) -> Element<'_, Message> {
     let model = review.model.as_ref();
     let skills = model.and_then(|model| model.skills.as_ref());
     let classification = skills.map(|skills| &skills.classification);
-    if let Some((ticket, enabled)) = review.fresh_web_choice()
-        && !review.unattended_web_draft_pending()
-    {
-        details = details.push(
+    let fresh_web = review
+        .fresh_web_choice()
+        .filter(|_| !review.unattended_web_draft_pending())
+        .map(|(ticket, enabled)| {
             checkbox(enabled)
                 .label("Review a fresh web lookup at each start")
-                .on_toggle(move |enabled| Message::RequireFreshWeb(ticket.to_owned(), enabled)),
-        );
-    }
+                .on_toggle(move |enabled| Message::RequireFreshWeb(ticket.to_owned(), enabled))
+        });
+    // Keep the following topic field at the same widget index when typing hides this option.
+    details = details.push(column![fresh_web]);
     if review.approval.requires_fresh_web() && review.approval.web_lookup().is_none() {
         details = details.push(
             text("Each run waits in JobScheduler for you to review the web lookup and approve the excerpts before the model request.")
@@ -386,6 +387,21 @@ fn agent_review(review: &super::agent::Review) -> Element<'_, Message> {
                     }
                 }
             }
+            if review.supports_unattended_web_model_tools() || review.unattended_web_model_tools {
+                lookup = lookup.push(
+                    checkbox(review.unattended_web_model_tools)
+                        .label("Allow reviewed model web tools during a firing")
+                        .on_toggle(move |enabled| {
+                            Message::EditUnattendedWebModelTools(ticket.to_owned(), enabled)
+                        }),
+                );
+                if review.unattended_web_model_tools {
+                    lookup = lookup.push(text(format!(
+                        "Up to {} Tavily searches or webpage requests per target and firing. Review each exact request and then its excerpts.",
+                        super::agent::web_lookup::MAX_MODEL_LOOKUPS_PER_TARGET,
+                    )).size(13));
+                }
+            }
             lookup = lookup.push(
                 button(if reviewed {
                     "Review research topic again"
@@ -422,6 +438,12 @@ fn agent_review(review: &super::agent::Review) -> Element<'_, Message> {
                         .size(13),
                 );
             }
+            if grant.allows_model_tools() {
+                lookup = lookup.push(
+                    text("Reviewed scope · Model web tools require approval of each request and its excerpts")
+                        .size(13),
+                );
+            }
         }
         if grant.is_some()
             || !topic.is_empty()
@@ -429,6 +451,7 @@ fn agent_review(review: &super::agent::Review) -> Element<'_, Message> {
             || review.unattended_web_environment
             || review.unattended_web_rounds
             || review.unattended_web_round_pages
+            || review.unattended_web_model_tools
         {
             lookup = lookup.push(
                 button("Remove automatic lookup")

@@ -7,7 +7,7 @@ use iced_runtime::{UserInterface, user_interface::Cache};
 
 use crate::session::SessionId;
 use crate::terminal_agent::RunPresentation;
-use crate::terminal_agent::design::{Layout as AgentLayout, Preset};
+use crate::terminal_agent::design::{History, Layout as AgentLayout, Preset};
 use crate::terminal_logging::{Redactor, Secrets};
 use crate::workspace::terminal_agent::{
     Desktop, Mode, ProfileChoice, Purpose, RunSetup, binding, engine, flow::tests::Fixture,
@@ -329,6 +329,56 @@ fn finished_terminal_run_offers_chat_below_each_preset_and_uses_its_own_epoch() 
     run.surface = RunPresentation::TerminalWindow;
     run.mode = Mode::Ask;
     assert!(terminal_bar(run).is_none());
+}
+
+#[test]
+fn bottom_dock_preserves_terminal_height_when_the_finished_offer_appears() {
+    let mut fixture = Fixture::with_endpoint(false, false, "127.0.0.1:12345");
+    let id = fixture.open(Mode::Run);
+    let run = fixture.run_mut(id);
+    run.surface = RunPresentation::TerminalWindow;
+    run.started_order = 1;
+    run.chat_handoff_enabled = true;
+    run.chat_handoff_id = Some("fixture-run".into());
+    run.goal = "Inspect service".into();
+    run.presentation.activity.height = 420.0;
+    run.next(Phase::Thinking, "Working");
+    run.next(Phase::Finished, "Finished");
+
+    let session = fixture.session;
+    let stream = fixture.workspace.sessions[&session].stream_generation;
+    let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
+    for history in [History::PlanExecution, History::CardStack] {
+        fixture.run_mut(id).design = AgentLayout {
+            history,
+            ..Preset::Classic.layout()
+        };
+        for width in [300.0, 520.0] {
+            let size = Size::new(width, 320.0);
+            let terminal = fixture.workspace.decorate_agent_terminal(
+                session,
+                stream,
+                container(text("Terminal"))
+                    .id("fixture-terminal-output")
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into(),
+                size,
+                Size::new(8.0, 16.0),
+                true,
+            );
+            let mut ui = UserInterface::build(terminal, size, Cache::default(), &mut renderer);
+            let mut controls = Controls::default();
+            ui.operate(&renderer, &mut controls);
+            let terminal = controls.terminal.unwrap();
+            let dismiss = controls.dismiss.unwrap();
+            assert!(
+                terminal.height >= 100.0,
+                "{history:?} at {width}: {terminal:?}"
+            );
+            assert!(dismiss.y + dismiss.height <= size.height);
+        }
+    }
 }
 
 #[test]

@@ -10,7 +10,7 @@ use super::{
     Credential, CredentialKind, Entry, Error, ID_BYTES, MAX_DESCRIPTION_BYTES, MAX_ENTRIES,
     MAX_ENVIRONMENT_BYTES, MAX_LABEL_BYTES, MAX_MASTER_PASSWORD_BYTES, MAX_PATTERN_BYTES,
     MAX_QDRANT_API_KEY_BYTES, MAX_RECOVERY_OUTPUT_BYTES, MAX_SEALED_RECOVERY_OUTPUT_BYTES,
-    MAX_SECRET_BYTES, MAX_SUDO_GROUP_BYTES, MAX_SUDO_SCOPE_BYTES, MAX_USERNAME_BYTES,
+    MAX_SECRET_BYTES, MAX_SUDO_GROUP_BYTES, MAX_SUDO_SCOPE_BYTES, MAX_USERNAME_BYTES, WebProvider,
     WebhookFormat, WebhookSettings, random, validate_entry,
 };
 
@@ -29,6 +29,9 @@ const QDRANT_API_KEY: u8 = 8;
 const SSH_PASSWORD_COMMAND: u8 = 9;
 const SKILL_PROVIDER_CREDENTIAL: u8 = 10;
 const TEMPORARY_SSH_KEY: u8 = 11;
+const TAVILY_API_KEY: u8 = 12;
+const BRIGHT_DATA_TOKEN: u8 = 13;
+const BRAVE_SEARCH_API_KEY: u8 = 14;
 const SALT_START: usize = MAGIC.len() + 1 + 3 * size_of::<u32>();
 const NONCE_START: usize = SALT_START + SALT_BYTES;
 const HEADER_BYTES: usize = NONCE_START + NONCE_BYTES;
@@ -213,6 +216,9 @@ pub(super) fn seal<'a>(
             CredentialKind::SshPasswordCommand => SSH_PASSWORD_COMMAND,
             CredentialKind::SkillProviderCredential => SKILL_PROVIDER_CREDENTIAL,
             CredentialKind::TemporarySshKey => TEMPORARY_SSH_KEY,
+            CredentialKind::WebProvider(WebProvider::Tavily) => TAVILY_API_KEY,
+            CredentialKind::WebProvider(WebProvider::BrightData) => BRIGHT_DATA_TOKEN,
+            CredentialKind::WebProvider(WebProvider::Brave) => BRAVE_SEARCH_API_KEY,
         });
         for field in fields(entry) {
             bytes.extend_from_slice(&(field.len() as u32).to_be_bytes());
@@ -278,6 +284,9 @@ fn decode(mut plaintext: &[u8]) -> Result<BTreeMap<String, Entry>, Error> {
             SSH_PASSWORD_COMMAND => CredentialKind::SshPasswordCommand,
             SKILL_PROVIDER_CREDENTIAL => CredentialKind::SkillProviderCredential,
             TEMPORARY_SSH_KEY => CredentialKind::TemporarySshKey,
+            TAVILY_API_KEY => CredentialKind::WebProvider(WebProvider::Tavily),
+            BRIGHT_DATA_TOKEN => CredentialKind::WebProvider(WebProvider::BrightData),
+            BRAVE_SEARCH_API_KEY => CredentialKind::WebProvider(WebProvider::Brave),
             _ => return Err(Error::InvalidFormat),
         };
         let mut entry = Entry {

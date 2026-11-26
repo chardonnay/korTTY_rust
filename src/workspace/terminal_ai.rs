@@ -2828,7 +2828,9 @@ impl Workspace {
         {
             chat.discard_review("Managed policy blocks the configured CLI.");
         }
-        let web_scope = chat.web_scope(config.as_deref(), web_search_allowed);
+        let web_scope = chat
+            .web_scope(config.as_deref(), web_search_allowed)
+            .map(|scope| scope.with_vault(self.vault.as_ref()));
         chat.invalidate_web_search(web_scope.as_ref());
         if let Message::Web(message) = message {
             if let Some(scope) = web_scope
@@ -3664,10 +3666,12 @@ impl Workspace {
             {
                 chat.discard_review("Managed policy blocks the configured CLI.");
             }
-            let scope = chat.web_scope(
-                config.map(Arc::as_ref),
-                self.clipboard.policy.ai_web_search_allowed,
-            );
+            let scope = chat
+                .web_scope(
+                    config.map(Arc::as_ref),
+                    self.clipboard.policy.ai_web_search_allowed,
+                )
+                .map(|scope| scope.with_vault(self.vault.as_ref()));
             chat.invalidate_web_search(scope.as_ref());
         }
     }
@@ -3781,10 +3785,12 @@ impl Workspace {
             });
         let chat = self.terminal_chats.get_mut(&id).expect("checked chat");
         chat.invalidate_ai_review(configuration.as_ref(), &self.clipboard.policy.ai_memory);
-        let web_scope = chat.web_scope(
-            configuration.as_deref(),
-            self.clipboard.policy.ai_web_search_allowed,
-        );
+        let web_scope = chat
+            .web_scope(
+                configuration.as_deref(),
+                self.clipboard.policy.ai_web_search_allowed,
+            )
+            .map(|scope| scope.with_vault(self.vault.as_ref()));
         chat.invalidate_web_search(web_scope.as_ref());
         if !remote_current && chat.review.is_some() {
             chat.discard_review(

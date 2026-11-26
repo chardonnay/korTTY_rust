@@ -239,6 +239,7 @@ impl SwarmFixture {
         Context {
             transport,
             context_limit: 8192,
+            always_offer_web_tools: false,
             targets,
             target_vault_revisions: Vec::new(),
             connection_store: self.connections.path().to_owned(),

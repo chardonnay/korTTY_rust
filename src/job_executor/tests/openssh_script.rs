@@ -2049,6 +2049,7 @@ fn openssh_scheduled_swarm_diagnostics_reports_masked_advice_and_blocked_target(
     let context = super::super::agent::Context {
         transport,
         context_limit: 8192,
+        always_offer_web_tools: false,
         targets: vec![Ok(execution), Err("Vault locked")],
         target_vault_revisions: Vec::new(),
         connection_store: connections.path().to_owned(),
@@ -2302,6 +2303,7 @@ fn openssh_scheduled_swarm_executes_only_the_exact_proposal_once() {
     let context = |mask| super::super::agent::Context {
         transport: transport.clone(),
         context_limit: 8192,
+        always_offer_web_tools: false,
         target_vault_revisions: Vec::new(),
         targets: references
             .iter()
@@ -2432,13 +2434,17 @@ fn openssh_scheduled_rsync_directory_batches_preflight_all_members() {
 }
 
 fn configure_rsync_fixture(fixture: &Sshd, existing_marker: Option<&Path>) {
+    let program = PathBuf::from(
+        std::env::var_os("KORTTY_RSYNC_TEST_PROGRAM").expect("set KORTTY_RSYNC_TEST_PROGRAM"),
+    )
+    .canonicalize()
+    .unwrap();
     let helper = PathBuf::from(
         std::env::var_os("KORTTY_RSYNC_TEST_HELPER").expect("set KORTTY_RSYNC_TEST_HELPER"),
     )
     .canonicalize()
     .unwrap();
     assert!(helper.is_file());
-    let script = fixture.profile.0.join("rsync-fixture-dispatch.sh");
     let mut command = String::new();
     crate::scheduler_window::script::shell_quote(&mut command, helper.to_str().unwrap());
     let helper_command = kortty_server_archive::rsync_tree::COMMAND;
@@ -2462,6 +2468,19 @@ fn configure_rsync_fixture(fixture: &Sshd, existing_marker: Option<&Path>) {
         })
         .collect()
     });
+    let helper_commands =
+        format!("  '{helper_command}') exec {command} --rsync-tree-v1 ;;\n{existing}");
+    configure_rsync_command_server(fixture, &program, &helper_commands);
+}
+
+fn configure_rsync_command_server(fixture: &Sshd, program: &Path, extra_commands: &str) {
+    let script = fixture.profile.0.join("rsync-fixture-dispatch.sh");
+    std::os::unix::fs::symlink(program, fixture.profile.0.join("rsync")).unwrap();
+    let mut program_directory = String::new();
+    crate::scheduler_window::script::shell_quote(
+        &mut program_directory,
+        fixture.profile.0.to_str().unwrap(),
+    );
     let sftp = [
         "/usr/libexec/openssh/sftp-server",
         "/usr/lib/openssh/sftp-server",
@@ -2473,7 +2492,7 @@ fn configure_rsync_fixture(fixture: &Sshd, existing_marker: Option<&Path>) {
     fs::write(
         &script,
         format!(
-            "#!/bin/sh\ncase \"$SSH_ORIGINAL_COMMAND\" in\n  '{helper_command}') exec {command} --rsync-tree-v1 ;;\n{existing}  'rsync --server '*) exec /bin/sh -c \"$SSH_ORIGINAL_COMMAND\" ;;\n  'internal-sftp') exec {sftp} ;;\n  *) exit 1 ;;\nesac\n"
+            "#!/bin/sh\nPATH={program_directory}:$PATH\nexport PATH\ncase \"$SSH_ORIGINAL_COMMAND\" in\n{extra_commands}  'rsync --server '*) exec /bin/sh -c \"$SSH_ORIGINAL_COMMAND\" ;;\n  'internal-sftp') exec {sftp} ;;\n  *) exit 1 ;;\nesac\n"
         ),
     )
     .unwrap();
@@ -2501,6 +2520,8 @@ fn openssh_rsync_verified_transfer(upload: bool, directory: bool, batch: bool) {
     assert!(bridge.is_file());
     if upload && directory {
         configure_rsync_fixture(&fixture, None);
+    } else {
+        configure_rsync_command_server(&fixture, &program, "");
     }
     let (_, seed, connections) = scheduled_batch(root, &[&fixture], "true", Vec::new());
     let reference = seed.action.connection.as_ref().unwrap();

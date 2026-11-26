@@ -515,6 +515,7 @@ pub(super) fn queue_java_transaction(
         .vault
         .as_ref()
         .map_or(&[][..], |vault| vault.ids.as_slice());
+    require_java_web_credential_policy(credential_ids)?;
     let keys = prepared
         .keys
         .map(|keys| java_keys::stage(&directory, &mut snapshot, keys, credential_ids))
@@ -966,6 +967,7 @@ fn apply_java_transaction(
         })
         .transpose()?;
     if let Some(committing) = committing {
+        require_java_web_credential_policy(credential_ids)?;
         // Flush the intent before changing any credential data or dependent catalogue.
         // A failed restart can only discard a plan that never reached this point.
         mark_java_committing(directory, committing, body)?;
@@ -1011,6 +1013,16 @@ fn apply_java_transaction(
     }
     if let Some(jobs) = jobs {
         jobs.publish(directory)?;
+    }
+    Ok(())
+}
+
+fn require_java_web_credential_policy(ids: &[String]) -> io::Result<()> {
+    if kortty_vault::WebProvider::ALL
+        .into_iter()
+        .any(|provider| ids.iter().any(|id| id == provider.id()))
+    {
+        crate::local_ai::web_search::require_policy().map_err(io::Error::other)?;
     }
     Ok(())
 }

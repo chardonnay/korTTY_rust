@@ -13,9 +13,12 @@ use crate::workspace::reconnect::ReconnectTarget;
 
 use super::*;
 
+mod quick_temporary_key;
+
 const HOME_MARKER: &str = "KORTTY_ISOLATION_RECONNECT_TEST_HOME";
 const TEST: &str = "workspace::ssh_access::tests::native_isolation_reconnect::openssh_reconnect_keeps_saved_and_teamwork_isolation";
 const PROJECT_TEMPORARY_KEY_TEST: &str = "workspace::ssh_access::tests::native_isolation_reconnect::openssh_project_reconnect_checks_saved_temporary_key";
+const REPLACEMENT_KEY_TEST: &str = "workspace::ssh_access::tests::native_isolation_reconnect::openssh_saved_key_editor_paste_reaches_isolated_reconnect";
 const REQUIRED_JOURNAL_TEST: &str = "workspace::ssh_access::tests::native_isolation_reconnect::openssh_incognito_terminal_enforces_masked_journal";
 
 fn fixture_profile(test: &str) -> Option<PathBuf> {
@@ -553,6 +556,184 @@ fn openssh_project_reconnect_checks_saved_temporary_key() {
         Status::Disconnected
     );
     assert!(workspace.pending_ssh(owner).is_none());
+}
+
+#[test]
+#[ignore = "requires OpenSSH and KORTTY_SSH_TEST_EXE pointing to the built app"]
+fn openssh_saved_key_editor_paste_reaches_isolated_reconnect() {
+    use crate::vault_window::VaultWindow;
+    use kortty_vault::{Secret, TemporarySshKeyOptions, Vault};
+
+    let Some(profile) = fixture_profile(REPLACEMENT_KEY_TEST) else {
+        return;
+    };
+    crate::private_files::Directory::open(&profile, true).unwrap();
+    let peer = OpenSshFixture::new();
+    let directory = peer.directory();
+    let client = directory.join("client");
+    let endpoint = peer.request(client.clone()).target.endpoint;
+    let fingerprint = |name: &str| {
+        let line = fs::read_to_string(directory.join(format!("{name}.pub"))).unwrap();
+        HostKey::from_openssh(line.trim()).unwrap().fingerprint()
+    };
+    let initial_fingerprint = fingerprint("client");
+    let replacement_fingerprint = fingerprint("rotated");
+    assert_ne!(initial_fingerprint, replacement_fingerprint);
+    let host = Endpoint::new(&endpoint.host, endpoint.port).unwrap();
+    let pinned = fs::read_to_string(directory.join("host.pub")).unwrap();
+    let pinned = HostKey::from_openssh(pinned.trim()).unwrap();
+    trust_store().unwrap().remember(&host, &pinned).unwrap();
+
+    let vault_path = crate::profile::vault_path().unwrap();
+    fs::create_dir_all(vault_path.parent().unwrap()).unwrap();
+    let password = crate::vault_window::test_vault_password();
+    let mut vault = Vault::create(&vault_path, &password[..]).unwrap();
+    let credential = vault
+        .save_temporary_ssh_key(
+            "Private reconnect fixture".into(),
+            (&endpoint.host, endpoint.port, &endpoint.username),
+            TemporarySshKeyOptions {
+                minutes: 60,
+                automatic: true,
+            },
+            Secret::new(fs::read_to_string(client).unwrap()),
+        )
+        .unwrap();
+    let path = crate::profile::connections_path().unwrap();
+    let mut store = Store::open(path.clone()).unwrap();
+    let id = store
+        .save(Connection {
+            id: 0,
+            name: "Saved temporary-key fixture".into(),
+            tag: String::new(),
+            login: SavedLogin {
+                preferences: Default::default(),
+                endpoint,
+                auth: Auth::TemporaryKey {
+                    credential: Some(credential.clone()),
+                    minutes: 60,
+                    automatic: true,
+                },
+                keyboard_interactive: false,
+            },
+            jump: None,
+            emulation: PROFILE.term_name().into(),
+            tunnels: Vec::new(),
+            incognito: false,
+            isolation: IsolationLevel::None,
+            inherit_isolation: false,
+            startup: Default::default(),
+            logging: Default::default(),
+            terminal_effect: None,
+            command_timestamps: None,
+            tab_color: None,
+            paste_warning: None,
+            window_geometry: None,
+            terminal: Default::default(),
+        })
+        .unwrap();
+    let saved = store.get(id).unwrap().clone();
+    let mut workspace = Workspace::default();
+    workspace.window_settings.temporary_ssh_key_enabled = true;
+    workspace.vault = Some(VaultWindow::with_unlocked_fixture(
+        vault_path.clone(),
+        vault,
+    ));
+    let (owner, _) = workspace.open_window(false);
+    let script = directory.join("replacement-test-shell");
+    fs::write(
+        &script,
+        "printf 'replacement-test-shell-ready\n'\nIFS= read -r line\n",
+    )
+    .unwrap();
+    let script = script.to_str().unwrap().replace('\'', "'\\''");
+    let shell = format!("PermitUserRC no\nForceCommand /bin/sh '{script}'\n");
+    let before = peer.serve_with_extra("host", &shell);
+    let _ = workspace.show_saved_ssh(owner, saved, false);
+    let dial = workspace.connect_ssh(owner);
+    finish_wire_attempt(&mut workspace, owner, dial, IsolationLevel::None);
+    let tab = workspace.windows[&owner].tab().unwrap();
+    let target = ReconnectTarget {
+        tab: tab.id,
+        source: tab.focused_session().unwrap(),
+    };
+    let session = &workspace.sessions[&target.source].session;
+    wait_for_output(session, "replacement-test-shell-ready");
+    session.send(b"disconnect\r".to_vec()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while session.journal_available() {
+        assert!(
+            Instant::now() < deadline,
+            "the original shell did not close"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let log = before.join().unwrap().stderr;
+    let log = String::from_utf8_lossy(&log);
+    assert!(
+        log.lines()
+            .any(|line| line.contains("Accepted publickey") && line.contains(&initial_fingerprint))
+    );
+    let pane = workspace.sessions.get_mut(&target.source).unwrap();
+    pane.frame = pane.session.frame();
+
+    workspace.replace_saved_temporary_key_for_test(
+        owner,
+        fs::read_to_string(directory.join("rotated")).unwrap(),
+    );
+    let store = Store::open(path.clone()).unwrap();
+    let connection = store.get(id).unwrap();
+    let Auth::TemporaryKey {
+        credential: Some(replacement),
+        minutes: 60,
+        automatic: true,
+    } = &connection.login.auth
+    else {
+        panic!("the edited connection must retain its automatic temporary key settings");
+    };
+    assert_ne!(replacement, &credential);
+    assert!(!fs::read_to_string(path).unwrap().contains("PRIVATE KEY"));
+    drop(workspace.vault.take());
+    let vault = Vault::unlock(&vault_path, &password[..]).unwrap();
+    assert!(vault.get(&credential).is_none());
+    let endpoint = &connection.login.endpoint;
+    assert!(
+        vault
+            .temporary_ssh_key(
+                replacement,
+                (&endpoint.host, endpoint.port, &endpoint.username)
+            )
+            .is_some()
+    );
+    workspace.vault = Some(VaultWindow::with_unlocked_fixture(vault_path, vault));
+
+    fs::copy(directory.join("rotated.pub"), directory.join("client.pub")).unwrap();
+    workspace.clipboard.policy.minimum_isolation = IsolationLevel::Process;
+    let after = peer.serve_with_extra("host", &shell);
+    let dial = workspace.start_ssh_reconnect(owner, target);
+    finish_wire_attempt(&mut workspace, owner, dial, IsolationLevel::Process);
+    if let Some(candidate) = workspace.pending_reconnects.keys().next().copied() {
+        workspace.wait_for_test_reconnect(candidate);
+    }
+    let tab = workspace.windows[&owner].tab().unwrap();
+    assert_eq!(tab.id, target.tab);
+    let renewed = tab.focused_session().unwrap();
+    assert_ne!(renewed, target.source);
+    wait_for_output(
+        &workspace.sessions[&renewed].session,
+        "replacement-test-shell-ready",
+    );
+    workspace.stop_session(renewed);
+    for shutdown in std::mem::take(&mut workspace.pending_shutdown) {
+        let _ = shutdown.recv_blocking();
+    }
+    let log = after.join().unwrap().stderr;
+    let log = String::from_utf8_lossy(&log);
+    let accepted = log
+        .lines()
+        .filter(|line| line.contains("Accepted publickey"))
+        .collect::<Vec<_>>();
+    assert!(matches!(&accepted[..], [line] if line.contains(&replacement_fingerprint)));
 }
 
 fn restored_project_pane(

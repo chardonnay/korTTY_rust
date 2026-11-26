@@ -316,15 +316,47 @@ pub(crate) fn ask_with_progress_guarded(
     progress: Option<async_channel::Sender<usage::Progress>>,
     before_dispatch: impl Fn() -> Result<(), String> + Send + 'static,
 ) -> Result<local_ai::Pending<usage::Report<Decision>>, String> {
-    if !usage::fits_context(&system, &input, limit) {
+    reviewed_ask_request(
+        profile,
+        ReviewedAsk {
+            system,
+            input,
+            context_limit: limit,
+            web_tools: false,
+            attachment_check: None,
+            authorize_web_send: None,
+        },
+        progress,
+        before_dispatch,
+    )
+}
+
+pub(crate) type AskAttachmentCheck = std::sync::Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
+
+pub(crate) struct ReviewedAsk {
+    pub(crate) system: String,
+    pub(crate) input: String,
+    pub(crate) context_limit: usize,
+    pub(crate) web_tools: bool,
+    pub(crate) attachment_check: Option<AskAttachmentCheck>,
+    pub(crate) authorize_web_send: Option<Box<dyn Fn() -> Result<(), String> + Send>>,
+}
+
+pub(crate) fn reviewed_ask_request(
+    profile: local_ai::Profile,
+    request: ReviewedAsk,
+    progress: Option<async_channel::Sender<usage::Progress>>,
+    before_dispatch: impl Fn() -> Result<(), String> + Send + 'static,
+) -> Result<local_ai::Pending<usage::Report<Decision>>, String> {
+    if !usage::fits_context(&request.system, &request.input, request.context_limit) {
         return Err(
             "The reviewed Ask request exceeds the selected profile's context limit.".into(),
         );
     }
     usage::request(
         profile,
-        input,
-        system,
+        request.input,
+        request.system,
         DECISION_REPAIR,
         |response| {
             let decision = Decision::parse(response, false)?;
@@ -334,8 +366,11 @@ pub(crate) fn ask_with_progress_guarded(
             Ok(decision)
         },
         usage::RequestMode::Ask {
-            context_limit: limit,
+            context_limit: request.context_limit,
             progress,
+            web_tools: request.web_tools,
+            attachment_check: request.attachment_check,
+            authorize_web_send: request.authorize_web_send,
         },
         before_dispatch,
     )

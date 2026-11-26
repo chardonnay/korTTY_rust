@@ -607,6 +607,127 @@ fn snippet_source_history_debounces_and_saves_a_restored_version() {
 }
 
 #[test]
+fn compact_snippet_layout_keeps_library_and_versioned_source_visible() {
+    use iced::advanced::widget::{Id, Operation, operation};
+    use iced::{Font, Rectangle, Renderer, Size, Theme, Vector};
+    use iced_runtime::{UserInterface, user_interface::Cache};
+
+    struct Bounds<'a> {
+        editor_id: &'a Id,
+        library_id: &'a Id,
+        editor: Option<Rectangle>,
+        library: Option<Rectangle>,
+    }
+
+    impl Operation for Bounds<'_> {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+
+        fn focusable(
+            &mut self,
+            id: Option<&Id>,
+            bounds: Rectangle,
+            _: &mut dyn operation::Focusable,
+        ) {
+            if id == Some(self.editor_id) {
+                self.editor = Some(bounds);
+            }
+        }
+
+        fn scrollable(
+            &mut self,
+            id: Option<&Id>,
+            bounds: Rectangle,
+            _: Rectangle,
+            _: Vector,
+            _: &mut dyn operation::Scrollable,
+        ) {
+            if id == Some(self.library_id) {
+                self.library = Some(bounds);
+            }
+        }
+    }
+
+    let profile = Profile::new();
+    let mut window = SnippetWindow::open(profile.path()).unwrap();
+    window.update(Message::New);
+    window.update(Message::Name("Versioned source".into()));
+    window.update(Message::Language("bash".into()));
+    for source in ["echo first", "echo second"] {
+        window.update(Message::Edit(text_editor::Action::SelectAll));
+        window.update(Message::Edit(text_editor::Action::Edit(
+            text_editor::Edit::Paste(Arc::new(source.to_owned())),
+        )));
+        assert!(matches!(window.update(Message::Save), Update::Changed));
+    }
+    assert!(window.draft.versions.len() > 1);
+
+    let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+    for viewport in [Size::new(860.0, 560.0), Size::new(620.0, 380.0)] {
+        let widths = library_columns::Widths::default();
+        let view = window.view(
+            Theme::Dark,
+            EditorPreferences {
+                appearance: Appearance {
+                    font: Font::MONOSPACE,
+                    size: 14,
+                    foreground: crate::terminal_theme::Rgb::from_hex(0xffffff),
+                    background: crate::terminal_theme::Rgb::from_hex(0x000000),
+                },
+                caret: caret::Preferences::default(),
+                languages: &[],
+                line_numbers: false,
+                word_wrap: true,
+                completion_shortcut: Default::default(),
+                ai_completion_available: true,
+                ai_completion_running: false,
+                ai_completion_automatic: false,
+                ai_inline_enabled: false,
+                ai_inline_running: false,
+                library_divider: Some(600),
+                library_columns: &widths,
+            },
+            false,
+            transfer::Context {
+                enabled: true,
+                page: None,
+            },
+            AnalysisPane {
+                tabs: Vec::new(),
+                active: None,
+                page: None,
+                side: None,
+                progress_extent: 0.0,
+            },
+            viewport,
+        );
+        let mut ui = UserInterface::build(view, viewport, Cache::default(), &mut renderer);
+        let mut bounds = Bounds {
+            editor_id: &window.editor_id,
+            library_id: &window.library_scroll,
+            editor: None,
+            library: None,
+        };
+        ui.operate(&renderer, &mut bounds);
+        let editor = bounds.editor.expect("the source editor is present");
+        let library = bounds.library.expect("the snippet list is present");
+        assert!(
+            editor.height >= 100.0,
+            "editor was compressed at {viewport:?}"
+        );
+        assert!(
+            editor.y + 24.0 < viewport.height,
+            "source starts below {viewport:?}"
+        );
+        assert!(
+            library.height >= 32.0,
+            "snippet list was compressed at {viewport:?}"
+        );
+    }
+}
+
+#[test]
 fn snippet_comparison_uses_visible_saved_rows_without_touching_a_dirty_draft() {
     let profile = Profile::new();
     let mut library = Library::open(profile.path()).unwrap();

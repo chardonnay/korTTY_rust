@@ -78,6 +78,10 @@ impl Entry {
 }
 
 impl State {
+    pub(super) fn model_web_available(&self, key: crate::scheduled_agent_review::Key) -> bool {
+        self.rounds.model_web_available(key)
+    }
+
     pub(super) fn review_revision(&self, id: RunId) -> Option<u64> {
         self.entries
             .get(&id)
@@ -367,6 +371,8 @@ impl Workspace {
         if !fresh_web(request) {
             return Ok(None);
         }
+        job_executor::agent::require_web_policy(&self.clipboard.policy)?;
+        job_executor::agent::require_web_policy(&ClipboardPolicy::load())?;
         let entry = self
             .scheduler_firing_web
             .entries
@@ -440,10 +446,12 @@ impl Workspace {
     }
 
     fn firing_web_context(&self, request: &RunRequest<SshCommand>) -> Result<Context, String> {
-        if self.exiting || self.scheduler_draining || !self.scheduler_web_allowed() {
-            return Err(
-                "Managed policy or scheduler state blocks the scheduled web review.".into(),
-            );
+        if self.exiting || self.scheduler_draining {
+            return Err(CHANGED.into());
+        }
+        job_executor::agent::require_web_policy(&self.clipboard.policy)?;
+        if !self.scheduler_web_allowed() {
+            return Err("AI features are disabled for the scheduled web review.".into());
         }
         let agent = request
             .action
@@ -460,6 +468,7 @@ impl Workspace {
             context.context_limit,
             &context.log_policy,
         )?;
+        job_executor::agent::require_web_policy(&policy)?;
         let store = ConnectionStore::open(context.connection_store.clone())
             .map_err(|_| "The saved SSH connections are unavailable.")?;
         for target in &approval.targets {
@@ -474,6 +483,7 @@ impl Workspace {
             .ok_or(CHANGED)?;
         let scope = web::Scope::new(Some(&config), profile, policy.ai_web_search_allowed)
             .ok_or("The approved profile has no current web search configuration.")?
+            .with_vault(self.vault.as_ref())
             .with_redactor(&redactor);
         Ok(Context {
             scope,
@@ -541,6 +551,7 @@ pub(super) fn check_worker(
     let approval = agent.approval.as_ref().ok_or(CHANGED)?;
     let policy = ClipboardPolicy::load();
     job_executor::agent::require_policy(&policy, agent.kind)?;
+    job_executor::agent::require_web_policy(&policy)?;
     let store = ConnectionStore::open(connection_path.to_owned())
         .map_err(|_| "The saved SSH connections are unavailable.")?;
     request.action.require_installed_target_groups()?;

@@ -917,6 +917,11 @@ impl<C: Fn() -> bool> Transfer<'_, C> {
                 "--no-devices",
                 "--no-relative",
             ]);
+        // The Unix bridge uses blocking standard I/O. Rsync otherwise opens
+        // the remote shell's stdout in nonblocking mode, so a full pipe can
+        // cut off the data stream before the receiver reads it.
+        #[cfg(unix)]
+        command.arg("--blocking-io");
         #[cfg(windows)]
         command
             .env(bridge::OWNER_ENV, std::process::id().to_string())

@@ -6,6 +6,8 @@ use crate::scheduler_window::sync;
 
 use super::*;
 
+mod recurring_file;
+
 #[test]
 #[ignore = "requires native OpenSSH, rsync 3.4.1 or later, and the current korTTY bridge"]
 fn openssh_rsync_download_merges_or_mirrors_only_the_reviewed_local_tree() {

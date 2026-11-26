@@ -485,16 +485,21 @@ impl Dialog {
         let key_summary = preview.java_key_summary();
         let temporary_key_summary = preview.java_temporary_key_summary();
         let review_temporary_keys = review_credentials && preview.has_java_temporary_keys();
-        let merge_label = match (
-            review_keys,
-            review_credentials && preview.has_java_passwords(),
-            review_temporary_keys,
-        ) {
-            (false, false, true) => "Merge Without Temporary SSH Keys",
-            (true, false, _) => "Merge Without SSH Keys",
-            (false, true, false) => "Merge Without Passwords",
-            (false, false, false) => "Merge on Restart",
-            _ => "Merge Without SSH Credentials",
+        let review_web_credentials = review_credentials && preview.has_java_web_credentials();
+        let merge_label = if review_web_credentials {
+            "Merge Without Protected Credentials"
+        } else {
+            match (
+                review_keys,
+                review_credentials && preview.has_java_passwords(),
+                review_temporary_keys,
+            ) {
+                (false, false, true) => "Merge Without Temporary SSH Keys",
+                (true, false, _) => "Merge Without SSH Keys",
+                (false, true, false) => "Merge Without Passwords",
+                (false, false, false) => "Merge on Restart",
+                _ => "Merge Without SSH Credentials",
+            }
         };
         column![
             text("Review Java Backup").size(23),
@@ -502,7 +507,7 @@ impl Dialog {
             text(if can_merge {
                 "Add supported data on restart. Existing profiles, snippets, variables, themes and projects take precedence on conflicts."
             } else if review_credentials {
-                "Review the available SSH credentials to continue."
+                "Review the available Java credentials to continue."
             } else if has_host_pins {
                 "SSH host keys are imported separately after you confirm their fingerprints."
             } else {
@@ -520,7 +525,20 @@ impl Dialog {
                 vault_ready,
                 review_keys || review_temporary_keys,
                 review_temporary_keys,
+                review_web_credentials,
             )),
+            preview.java_web_credential_summary().map(|summary| {
+                let ready = summary.ready.iter().map(|provider| provider.label()).collect::<Vec<_>>().join(", ");
+                let detail = format!(
+                    "Web provider credentials ready to add: {}. Local slots kept: {}. Omitted: {}.",
+                    summary.ready.len(), summary.preserved, summary.omitted,
+                );
+                column![
+                    text(detail),
+                    (!ready.is_empty()).then(|| text(ready).size(13)),
+                    summary.blocked_by_policy.then(|| text("Managed policy blocks web provider credential import.").size(13)),
+                ].spacing(4)
+            }),
             password_summary.map(|(ready, omitted)| text(format!("SSH passwords ready to add: {ready}. Passwords omitted: {omitted}."))),
             key_summary.map(|(ready, omitted)| text(format!("Managed SSH keys ready to add: {ready}. Keys omitted: {omitted}."))),
             temporary_key_summary.map(|(ready, omitted)| text(format!("Temporary SSH keys ready to add: {ready}. Keys omitted: {omitted}."))),
@@ -552,10 +570,13 @@ impl Dialog {
         vault_ready: bool,
         review_keys: bool,
         review_temporary_keys: bool,
+        review_web_credentials: bool,
     ) -> Element<'_, Message> {
         if !vault_ready {
             return row![
-                text(if review_keys {
+                text(if review_web_credentials {
+                    "Unlock the credential vault to review protected Java credentials."
+                } else if review_keys {
                     "Unlock the credential vault to review protected Java SSH credentials."
                 } else {
                     "Unlock the credential vault to review the Java SSH passwords."
@@ -574,7 +595,9 @@ impl Dialog {
             .can_review_java_credentials(revision, mode)
             .then_some(Message::ReviewJavaCredentials(revision, mode));
         column![
-            text(if review_keys {
+            text(if review_web_credentials {
+                "Use the Java korTTY master password to review protected credentials for import."
+            } else if review_keys {
                 "Use the Java korTTY master password to review protected SSH credentials."
             } else {
                 "Use the Java korTTY master password to review which SSH passwords can be imported."
@@ -584,6 +607,9 @@ impl Dialog {
                 "The lifetime of each imported temporary SSH key starts when you review it.",
             )
             .size(13)),
+            review_web_credentials.then(|| text(
+                "Only empty web provider slots can be filled. Your saved credentials take precedence.",
+            ).size(13)),
             row![
                 text_input("Java Master Password", &self.java_master_password)
                     .secure(true)
@@ -592,7 +618,9 @@ impl Dialog {
                         Password::new(value)
                     ))
                     .on_submit_maybe(submit.clone()),
-                button(if review_keys {
+                button(if review_web_credentials {
+                    "Review Java Credentials"
+                } else if review_keys {
                     "Review SSH Credentials"
                 } else {
                     "Review SSH Passwords"
@@ -671,7 +699,7 @@ fn working(action: Work, encryption: EncryptionMode) -> Element<'static, Message
         Work::Export => "Creating backup…",
         Work::Inspect if encryption == EncryptionMode::OpenPgp => "Decrypting OpenPGP backup…",
         Work::Inspect => "Authenticating backup…",
-        Work::JavaCredentials => "Reviewing Java SSH credentials…",
+        Work::JavaCredentials => "Reviewing Java credentials…",
         Work::Queue => "Preparing restore…",
     };
     column![text(message).size(23), space::vertical()]

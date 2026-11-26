@@ -231,13 +231,12 @@ pub(in crate::workspace) fn compose<'a, M: 'a>(
             }
             Some(Slot::Left) => left = Some(history),
             _ => {
-                center = center.push(
-                    container(history).width(Length::Fill).height(
-                        extents
-                            .bottom
-                            .unwrap_or_else(|| (bounds.height * 0.4).min(260.0)),
-                    ),
-                )
+                center = match extents.bottom {
+                    Some(height) => {
+                        center.push(container(history).width(Length::Fill).height(height))
+                    }
+                    None => center.push(history),
+                }
             }
         }
     }

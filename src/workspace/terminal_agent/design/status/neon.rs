@@ -337,6 +337,7 @@ pub(super) fn view<'a>(
         activity.presentation.drawer_open(),
         false,
         super::Message::ToggleDrawer,
+        Some((activity, crate::terminal_agent::design::Status::Neon)),
     ) {
         ticker = ticker.push(controls);
     }
@@ -398,5 +399,78 @@ mod tests {
         assert!(motion.outgoing.is_none());
         assert!(!motion.animating(&board, next));
         assert_eq!(lamp(Duration::from_millis(600), &board), 1.0);
+    }
+
+    #[test]
+    fn neon_leaves_room_for_the_review_label_with_a_side_history() {
+        use crate::terminal_agent::usage::{Attempt, AttemptKind, AttemptOutcome};
+        use crate::workspace::terminal_agent::{Mode, Phase, flow::tests::Fixture};
+        use iced_runtime::{UserInterface, user_interface::Cache};
+
+        #[derive(Default)]
+        struct TickerBounds {
+            label: Option<Rectangle>,
+            review: Option<Rectangle>,
+        }
+
+        impl Operation for TickerBounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+
+            fn text(
+                &mut self,
+                _: Option<&iced::advanced::widget::Id>,
+                bounds: Rectangle,
+                value: &str,
+            ) {
+                match value {
+                    "? REVIEW THE COMMAND" => self.label = Some(bounds),
+                    "Review…" => self.review = Some(bounds),
+                    _ => {}
+                }
+            }
+        }
+
+        let mut fixture = Fixture::with_endpoint(false, false, "127.0.0.1:12345");
+        let id = fixture.open(Mode::Run);
+        let run = fixture.run_mut(id);
+        let epoch = run.next(Phase::Approval, "Review the command");
+        assert!(run.presentation.model_usage.accept(
+            epoch,
+            &Attempt {
+                kind: AttemptKind::Initial,
+                outcome: AttemptOutcome::Completed,
+                elapsed: Duration::from_millis(10),
+                input_tokens: Some(11),
+                output_tokens: Some(5),
+                total_tokens: Some(16),
+            },
+        ));
+        let trace = Trace::live(run, Instant::now(), true);
+        let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
+        let mut ui = UserInterface::build(
+            view(
+                history::Activity::from(&*run),
+                "Review the command",
+                &trace,
+                None,
+                false,
+            ),
+            Size::new(650.0, 100.0),
+            Cache::default(),
+            &mut renderer,
+        );
+        let mut bounds = TickerBounds::default();
+        ui.operate(&renderer, &mut bounds);
+
+        let label = bounds.label.expect("amber command review label");
+        let review = bounds.review.expect("command review action");
+        assert!(
+            label.width >= 220.0,
+            "the ticker label was clipped: {label:?}"
+        );
+        assert!(label.x + label.width <= review.x, "{label:?}, {review:?}");
+        assert!(review.x + review.width <= 650.0, "{review:?}");
     }
 }

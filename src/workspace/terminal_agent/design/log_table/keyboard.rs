@@ -76,6 +76,15 @@ trait Target {
     fn table(&self, route: Self::Route) -> Option<&super::State>;
     fn navigate(&self, route: Self::Route, key: Key) -> Desktop;
 
+    fn surface(&self, _: Self::Route) -> Surface {
+        Surface::Activity
+    }
+
+    fn viewport(&self, route: Self::Route) -> Option<&Id> {
+        self.table(route)
+            .map(|table| table.viewport(self.surface(route)))
+    }
+
     fn menu_shortcut(&self, _: Named, _: Modifiers) -> bool {
         false
     }
@@ -88,7 +97,7 @@ trait Target {
         false
     }
 
-    fn focus_node(&self) -> Option<(Self::Route, &super::State)> {
+    fn focus_node(&self) -> Option<Self::Route> {
         None
     }
 
@@ -123,8 +132,8 @@ impl<Message: Fn(PreviewCommand) -> Desktop> Target for Preview<'_, Message> {
         (self.message)(PreviewCommand::Navigate(key))
     }
 
-    fn focus_node(&self) -> Option<(Self::Route, &super::State)> {
-        Some((self.sample, self.table))
+    fn focus_node(&self) -> Option<Self::Route> {
+        Some(self.sample)
     }
 
     fn tab(&self, backwards: bool) -> Option<Desktop> {
@@ -155,7 +164,11 @@ impl Target for Live<'_> {
     }
 
     fn navigate(&self, route: Self::Route, key: Key) -> Desktop {
-        route.message(Message::Navigate(key))
+        route.message(Message::Navigate(self.surface(route), key))
+    }
+
+    fn surface(&self, route: Self::Route) -> Surface {
+        route.surface(self.window)
     }
 
     fn menu_shortcut(&self, name: Named, modifiers: Modifiers) -> bool {
@@ -391,13 +404,13 @@ impl<T: Target> Widget<Desktop, Theme, Renderer> for Scope<'_, T> {
     ) {
         let child = self.content.as_widget_mut();
         let child_tree = &mut tree.children[0];
-        if let Some((route, table)) = self.target.focus_node()
-            && let Some((bounds, _)) =
-                Visible::find(&table.viewport, child, child_tree, layout, renderer)
+        if let Some(route) = self.target.focus_node()
+            && let Some(viewport) = self.target.viewport(route)
+            && let Some((bounds, _)) = Visible::find(viewport, child, child_tree, layout, renderer)
         {
             let focus = tree.state.downcast_mut::<Focus<T::Route>>();
             operation.focusable(
-                Some(&table.viewport),
+                Some(viewport),
                 bounds,
                 &mut FocusNode(&mut focus.route, route),
             );
@@ -436,8 +449,8 @@ impl<T: Target> Widget<Desktop, Theme, Renderer> for Scope<'_, T> {
                 ..
             }) if !shell.is_event_captured() => {
                 if let Some(route) = self.target.focus_entry(*name, *modifiers, focus.route)
-                    && let Some(table) = self.target.table(route)
-                    && Visible::find(&table.viewport, child, child_tree, layout, renderer).is_some()
+                    && let Some(viewport) = self.target.viewport(route)
+                    && Visible::find(viewport, child, child_tree, layout, renderer).is_some()
                 {
                     focus.hold(*name);
                     shell.capture_event();
@@ -450,8 +463,8 @@ impl<T: Target> Widget<Desktop, Theme, Renderer> for Scope<'_, T> {
                 if self.target.menu_shortcut(*name, *modifiers)
                     && let Some(route) = focus.route
                 {
-                    let visible = self.target.table(route).and_then(|table| {
-                        Visible::find(&table.viewport, child, child_tree, layout, renderer)
+                    let visible = self.target.viewport(route).and_then(|viewport| {
+                        Visible::find(viewport, child, child_tree, layout, renderer)
                     });
                     if let Some((_, offset)) = visible {
                         focus.hold(*name);
@@ -483,7 +496,8 @@ impl<T: Target> Widget<Desktop, Theme, Renderer> for Scope<'_, T> {
                         focus.route = None;
                         return;
                     };
-                    if Visible::find(&table.viewport, child, child_tree, layout, renderer).is_none()
+                    let viewport = table.viewport(self.target.surface(route));
+                    if Visible::find(viewport, child, child_tree, layout, renderer).is_none()
                         || matches!(key, Key::Leave)
                         || matches!(key, Key::Close) && table.detail.is_none()
                     {

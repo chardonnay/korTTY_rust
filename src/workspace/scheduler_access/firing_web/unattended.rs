@@ -84,6 +84,7 @@ impl Research {
 #[derive(Clone)]
 pub(in crate::workspace::scheduler_access) struct Credentials {
     model: Option<Zeroizing<String>>,
+    scope: web::Scope,
     search: Option<(&'static str, Zeroizing<String>)>,
     page: Option<(String, Option<Zeroizing<String>>)>,
 }
@@ -100,12 +101,14 @@ impl Credentials {
     ) -> Result<Self, String> {
         Ok(Self {
             model: model.completion_secret(),
+            scope: scope.clone(),
             search: scope
                 .search_credential_env()
                 .map(|name| {
-                    local_ai::credential_value(name)
+                    scope
+                        .provider_credential(name)
                         .map(|value| (name, value))
-                        .map_err(|_| {
+                        .ok_or_else(|| {
                             format!("Set {name} before running this automatic web lookup.")
                         })
                 })
@@ -113,7 +116,7 @@ impl Credentials {
             page: scope
                 .page_credential_env()
                 .filter(|name| include_page && Some(*name) != scope.search_credential_env())
-                .map(|name| (name.to_owned(), local_ai::credential_value(name).ok())),
+                .map(|name| (name.to_owned(), scope.provider_credential(name))),
         })
     }
 
@@ -129,12 +132,15 @@ impl Credentials {
     ) -> Result<(), String> {
         if self.model != profile.completion_secret()
             || self.search.as_ref().is_some_and(|(name, saved)| {
-                !local_ai::credential_value(name).is_ok_and(|current| current == *saved)
+                !self
+                    .scope
+                    .provider_credential(name)
+                    .is_some_and(|current| current == *saved)
             })
             || self
                 .page
                 .as_ref()
-                .is_some_and(|(name, saved)| &local_ai::credential_value(name).ok() != saved)
+                .is_some_and(|(name, saved)| &self.scope.provider_credential(name) != saved)
         {
             return Err(
                 "A credential for the automatic web lookup changed during this run.".into(),

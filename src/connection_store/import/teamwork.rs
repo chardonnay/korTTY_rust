@@ -128,6 +128,31 @@ mod tests {
     }
 
     #[test]
+    fn teamwork_preserves_well_formed_agent_design_ids_for_local_resolution() {
+        for (field, expected) in [
+            ("", None),
+            (
+                "<aiAgentDesignId>classic</aiAgentDesignId>",
+                Some("classic"),
+            ),
+            (
+                "<aiAgentDesignId> custom-1 </aiAgentDesignId>",
+                Some("custom-1"),
+            ),
+            ("<aiAgentDesignId>invalid id</aiAgentDesignId>", None),
+        ] {
+            let xml = snapshot(&format!(
+                r#"<connection id="design">{ROUTE}{field}</connection>"#
+            ));
+            let entries = parse(&xml).unwrap();
+            assert_eq!(
+                entries[0].connection.terminal.ai_agent_design.as_deref(),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn teamwork_last_used_is_a_positive_java_long_in_epoch_milliseconds() {
         for (field, expected) in [
             ("", None),

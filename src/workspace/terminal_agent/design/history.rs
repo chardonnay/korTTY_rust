@@ -186,11 +186,13 @@ fn with_usage(
 ) -> Element<'_, AgentMessage> {
     let font_size = run.activity_font;
     let muted = palette.map(|palette| palette.muted.color());
-    let usage_limit = if history == History::LogTable
-        && run
-            .transcript
-            .is_some_and(|trace| super::log_table::has_detail(run, trace))
-    {
+    // Leave room for the guarded approval, selected row and table actions.
+    let compact_log_usage = history == History::LogTable
+        && (super::log_table::has_approval(run)
+            || run
+                .transcript
+                .is_some_and(|trace| super::log_table::has_detail(run, trace)));
+    let usage_limit = if compact_log_usage {
         (font_size * 1.5).min(104.0)
     } else {
         104.0

@@ -24,10 +24,11 @@ impl Workspace {
         if let Message::Design(message) = message {
             use design::log_table::Message as LogMessage;
             if let design::Message::LogTable(
-                navigation @ (LogMessage::Navigate(_) | LogMessage::KeyboardMenu(..)),
+                navigation @ (LogMessage::Navigate(..) | LogMessage::KeyboardMenu(..)),
             ) = message
             {
-                return run.navigate_agent_log(navigation);
+                return run
+                    .navigate_agent_log(navigation, !self.window_settings.agent_animations());
             }
             let len = match message {
                 design::Message::BrowseCards(_) | design::Message::ScrollCards { .. } => {
@@ -884,24 +885,6 @@ impl Workspace {
             && !run.cancel.requested()
             && run.ai_cancel.is_some()
             && self.agent_model_current(run).is_ok();
-        if let Progress::WebTool(proposal) = progress {
-            if current {
-                if let Some(mut review) = run.model_review.take() {
-                    if let Err(error) =
-                        self.begin_model_tool(run, &mut review, Arc::clone(&proposal))
-                    {
-                        proposal.reject(&error);
-                        run.notice = error;
-                    }
-                    run.model_review = Some(review);
-                } else {
-                    proposal.reject("The Agent model review is unavailable.");
-                }
-            } else {
-                proposal.reject("The Agent model tool request is no longer current.");
-            }
-            return;
-        }
         let (permit, notice) = match progress {
             Progress::Repairing(initial, permit) => (
                 permit,
@@ -916,7 +899,10 @@ impl Workspace {
                         .then_some("Retrying without the provider's JSON response format…"),
                 )
             }
-            Progress::WebTool(_) => unreachable!(),
+            Progress::WebTool(proposal) => {
+                self.model_tool_progress(run, proposal, current);
+                return;
+            }
         };
         if let Some(notice) = notice
             && permit.try_send(()).is_ok()

@@ -4,6 +4,57 @@ use iced::futures::{StreamExt, executor::block_on};
 
 use super::*;
 
+impl Workspace {
+    pub(in crate::workspace) fn replace_saved_temporary_key_for_test(
+        &mut self,
+        owner: window::Id,
+        key: String,
+    ) {
+        let _ = self.show_connections(owner);
+        let manager = self.connection_manager_for_owner(owner).unwrap();
+        let _ = self.update_connections(manager, Profile::EditSelected);
+        let editor = self.connection_managers[&manager].editor.unwrap();
+
+        let previous_clipboard = std::mem::take(&mut self.clipboard.buffer);
+        let internal = self.clipboard.policy.internal;
+        self.clipboard.policy.internal = true;
+        self.clipboard.buffer.set(key);
+        let paste = self.update_connection_editor(editor, Profile::PasteTemporaryKey);
+        let mut replies = iced_runtime::task::into_stream(paste).unwrap();
+        let Some(iced_runtime::Action::Output(Message::Connections(
+            id,
+            pasted @ Profile::TemporaryKeyPasted(..),
+        ))) = block_on(replies.next())
+        else {
+            panic!("the editor must receive its temporary key paste result");
+        };
+        assert_eq!(id, manager);
+        let _ = self.update_connections(id, pasted);
+        self.clipboard.buffer = previous_clipboard;
+        self.clipboard.policy.internal = internal;
+        assert!(
+            self.connection_managers[&manager]
+                .window
+                .has_pending_temporary_key()
+        );
+
+        let save = self.update_connection_editor(editor, Profile::Save);
+        let mut replies = iced_runtime::task::into_stream(save).unwrap();
+        while let Some(action) = block_on(replies.next()) {
+            if let iced_runtime::Action::Output(Message::Connections(
+                id,
+                saved @ Profile::CredentialSaveCompleted(..),
+            )) = action
+            {
+                assert_eq!(id, manager);
+                let _ = self.update_connections(id, saved);
+                return;
+            }
+        }
+        panic!("the editor must complete its credential save");
+    }
+}
+
 pub(super) fn seed(store: &mut Store, name: &str) -> u64 {
     store
         .save(Connection {

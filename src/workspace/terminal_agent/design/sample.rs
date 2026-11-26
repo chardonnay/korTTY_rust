@@ -118,14 +118,19 @@ impl Sample {
         &mut self,
         key: SampleLogKey,
         page: Id,
+        reduced_motion: bool,
     ) -> Task<Desktop> {
-        let at = self.presentation.finish_time().unwrap_or_else(Instant::now);
+        let clock = log_table::DurationClock {
+            at: self.presentation.finish_time().unwrap_or_else(Instant::now),
+            reduced_motion,
+        };
         let table = &mut self.presentation.log_table;
-        let navigation = table.navigate(&self.transcript, at, key, Some(0));
+        let surface = log_table::Surface::Activity;
+        let navigation = table.navigate(&self.transcript, clock, surface, key, Some(0));
         if key == SampleLogKey::Open {
             navigation.chain(crate::workspace::coding_agents::roster_scroll::reveal_row(
                 page,
-                table.detail_id(),
+                table.detail_id(surface),
             ))
         } else {
             navigation
@@ -552,7 +557,7 @@ impl Sample {
                     {
                         Some(bounds.height * 0.65)
                     }
-                    _ => None,
+                    _ => Some((bounds.height * 0.4).min(260.0)),
                 },
             },
         );

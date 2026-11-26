@@ -100,6 +100,7 @@ impl Workspace {
             group.profile.as_ref()?.id,
             allowed,
         )
+        .map(|scope| scope.with_vault(self.vault.as_ref()))
     }
 
     fn swarm_web_mask(&self, group: &Group) -> Result<(Redactor, knowledge_review::Mask), String> {

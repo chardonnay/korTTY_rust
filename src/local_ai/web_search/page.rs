@@ -112,11 +112,13 @@ struct Extraction {
 
 pub(crate) fn start_extract<T: Send + 'static>(
     url: PageUrl,
+    vault_key: Option<zeroize::Zeroizing<String>>,
     before_dispatch: impl Fn() -> Result<(), String> + Send + 'static,
     finish: impl FnOnce(Vec<Hit>) -> T + Send + 'static,
 ) -> Result<Pending<T>, String> {
     start_tavily(
         TIMEOUT,
+        vault_key,
         before_dispatch,
         move |connection, key| extract(connection, &url, key),
         finish,
@@ -127,10 +129,8 @@ fn extract(connection: &Connection, url: &PageUrl, key: &str) -> Result<Vec<Hit>
     if !connection.active() {
         return Err(Error::Cancelled);
     }
-    if key.is_empty()
-        || !url.decoded().is_ok_and(|decoded| !decoded.contains(key))
-        || url.as_str().contains(key)
-    {
+    let has_secret = super::direct_mcp::secret_checker(key);
+    if key.is_empty() || url.decoded().is_err() || has_secret(url.as_str()) {
         return Err(Error::Invalid("invalid page address or credential"));
     }
     let response: Response = tavily_json(
@@ -151,7 +151,7 @@ fn extract(connection: &Connection, url: &PageUrl, key: &str) -> Result<Vec<Hit>
             let returned = PageUrl::parse(&result.url).ok()?;
             if returned.as_str() != url.as_str()
                 || result.raw_content.trim().is_empty()
-                || result.raw_content.contains(key)
+                || has_secret(&result.raw_content)
             {
                 return None;
             }

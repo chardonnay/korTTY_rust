@@ -2,14 +2,51 @@ use crate::core::alignment;
 use crate::core::text::{Alignment, Shaping};
 use crate::core::{Color, Font, Pixels, Point, Rectangle, Transformation};
 use crate::graphics::text::cache::{self, Cache};
+use crate::graphics::text::cosmic_text::FontSystem;
 use crate::graphics::text::editor;
 use crate::graphics::text::font_system;
 use crate::graphics::text::paragraph;
 
 use rustc_hash::{FxHashMap, FxHashSet};
+use skrifa::{raw::TableProvider, FontRef};
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::hash_map;
+use std::sync::Once;
+
+fn remove_unscalable_fonts(font_system: &mut FontSystem) {
+    let database = font_system.db();
+    let unscalable: Vec<_> = database
+        .faces()
+        .filter_map(|face| {
+            let units_per_em =
+                database.with_face_data(face.id, |bytes, index| {
+                    let font = FontRef::from_index(bytes, index).ok()?;
+                    Some(
+                        font.head()
+                            .map(|head| head.units_per_em())
+                            .unwrap_or(0),
+                    )
+                });
+            // A bitmap-only fallback face can produce non-finite layout metrics
+            // when cosmic-text scales it using a missing or zero units-per-em.
+            (units_per_em.flatten() == Some(0)).then_some(face.id)
+        })
+        .collect();
+
+    if !unscalable.is_empty() {
+        let database = font_system.db_mut();
+        for id in unscalable {
+            database.remove_face(id);
+        }
+    }
+}
+
+pub(crate) fn load_font(bytes: Cow<'static, [u8]>) {
+    let mut font_system = font_system().write().expect("Write font system");
+    font_system.load_font(bytes);
+    remove_unscalable_fonts(font_system.raw());
+}
 
 #[derive(Debug)]
 pub struct Pipeline {
@@ -19,6 +56,13 @@ pub struct Pipeline {
 
 impl Pipeline {
     pub fn new() -> Self {
+        static VALIDATE_SYSTEM_FONTS: Once = Once::new();
+        VALIDATE_SYSTEM_FONTS.call_once(|| {
+            let mut font_system =
+                font_system().write().expect("Write font system");
+            remove_unscalable_fonts(font_system.raw());
+        });
+
         Pipeline {
             glyph_cache: GlyphCache::new(),
             cache: RefCell::new(Cache::new()),
@@ -28,11 +72,7 @@ impl Pipeline {
     // TODO: Shared engine
     #[allow(dead_code)]
     pub fn load_font(&mut self, bytes: Cow<'static, [u8]>) {
-        font_system()
-            .write()
-            .expect("Write font system")
-            .load_font(bytes);
-
+        load_font(bytes);
         self.cache = RefCell::new(Cache::new());
     }
 

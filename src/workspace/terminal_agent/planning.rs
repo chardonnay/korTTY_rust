@@ -848,7 +848,7 @@ impl Workspace {
                     .then_some("Retrying without the provider's JSON response format option…"),
             ),
             usage::Progress::WebTool(proposal) => {
-                proposal.reject("Planning web-tool reviews are not available for this request.");
+                self.model_tool_progress(run, proposal, ready);
                 return;
             }
         };
@@ -960,10 +960,13 @@ impl Workspace {
         let (progress, updates) = async_channel::bounded(1);
         let pending = model::request_reviewed(
             transport.clone(),
-            stage,
-            review.system.clone(),
-            review.input.clone(),
-            *limit,
+            model::ReviewedPlan {
+                stage,
+                system: review.system.clone(),
+                input: review.input.clone(),
+                context_limit: *limit,
+                web_tools: review.can_offer_model_tools(run),
+            },
             Some(progress),
             before_dispatch,
         )?;

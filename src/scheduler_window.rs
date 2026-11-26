@@ -910,6 +910,7 @@ pub enum Message {
     EditUnattendedWebEnvironment(String, bool),
     EditUnattendedWebRounds(String, bool),
     EditUnattendedWebRoundPages(String, bool),
+    EditUnattendedWebModelTools(String, bool),
     ReviewUnattendedWeb(String, String),
     RemoveUnattendedWeb(String),
     ReviewSwarmComparison(String),
@@ -2673,6 +2674,11 @@ impl SchedulerWindow {
             }
             Message::EditUnattendedWebRoundPages(ticket, enabled) => {
                 if let Err(error) = self.edit_unattended_web_round_pages(view, &ticket, enabled) {
+                    view.status = Some(error);
+                }
+            }
+            Message::EditUnattendedWebModelTools(ticket, enabled) => {
+                if let Err(error) = self.edit_unattended_web_model_tools(view, &ticket, enabled) {
                     view.status = Some(error);
                 }
             }

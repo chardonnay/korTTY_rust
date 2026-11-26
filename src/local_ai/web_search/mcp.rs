@@ -59,9 +59,11 @@ impl Mode {
 
     pub(crate) fn setup(self) -> &'static str {
         match self {
-            Self::Tavily => "Allow per-request MCPs in LM Studio and set TAVILY_API_KEY.",
+            Self::Tavily => {
+                "Allow per-request MCPs in LM Studio. Save the Tavily key in Internet access or set TAVILY_API_KEY."
+            }
             Self::BrightData => {
-                "Allow per-request MCPs in LM Studio and set BRIGHT_DATA_API_TOKEN."
+                "Allow per-request MCPs in LM Studio. Save the Bright Data token in Internet access or set BRIGHT_DATA_API_TOKEN."
             }
             Self::Searxng => {
                 "Set the global SearXNG URL in General → Internet access. Configure the matching MCP server in LM Studio, its plugin ID and the profile's LM Studio API token environment variable."
@@ -214,7 +216,11 @@ impl Settings {
         format!("{destination}\nAllowed tools: {}", self.tools().join(", "))
     }
 
-    pub(crate) fn credentials(&self, profile: &Profile) -> Result<Credentials, String> {
+    pub(crate) fn credentials(
+        &self,
+        profile: &Profile,
+        vault_key: Option<&Zeroizing<String>>,
+    ) -> Result<Credentials, String> {
         let local = profile
             .options
             .credential_env
@@ -228,11 +234,20 @@ impl Settings {
         let integration = self
             .search_credential_env()
             .map(|name| {
-                credential_value(name)
-                    .map_err(|_| format!("Set {name} before using this web integration."))
+                vault_key.cloned().map_or_else(
+                    || {
+                        credential_value(name)
+                            .map_err(|_| format!("Set {name} before using this web integration."))
+                    },
+                    Ok,
+                )
             })
             .transpose()?;
-        Ok(Credentials { local, integration })
+        Ok(Credentials {
+            local,
+            integration,
+            from_vault: vault_key.is_some(),
+        })
     }
 }
 
@@ -241,6 +256,7 @@ impl Settings {
 pub(crate) struct Credentials {
     local: Option<Zeroizing<String>>,
     integration: Option<Zeroizing<String>>,
+    from_vault: bool,
 }
 
 fn valid_name(value: &str) -> bool {
@@ -326,9 +342,12 @@ pub(super) fn search(
     {
         return Err("Choose a trusted local LM Studio profile for this integration.".into());
     }
-    let credentials = settings.credentials(&client.profile)?;
+    let vault_key = reviewed_credentials
+        .filter(|credentials| credentials.from_vault)
+        .and_then(|credentials| credentials.integration.as_ref());
+    let credentials = settings.credentials(&client.profile, vault_key)?;
     let https = client.profile.is_remote();
-    if https && reviewed_credentials != Some(&credentials) {
+    if (https || vault_key.is_some()) && reviewed_credentials != Some(&credentials) {
         return Err(CREDENTIAL_CHANGED.into());
     }
     let server = settings.mode.server();
@@ -383,9 +402,9 @@ pub(super) fn search(
     let require_current = || {
         super::require_policy()?;
         before_dispatch()?;
-        if https
+        if (https || vault_key.is_some())
             && !settings
-                .credentials(&client.profile)
+                .credentials(&client.profile, vault_key)
                 .is_ok_and(|current| current == credentials)
         {
             return Err(CREDENTIAL_CHANGED.into());
@@ -537,7 +556,7 @@ mod tests {
         settings.plugin = "mcp/brave_fixture".into();
 
         let manual = Profile::lm_studio(&endpoint, "reviewed-model", options.clone()).unwrap();
-        let credentials = settings.credentials(&manual).unwrap();
+        let credentials = settings.credentials(&manual, None).unwrap();
         let stale_dispatch = || -> Result<(), String> {
             panic!("an absent or changed HTTPS credential review must stop the request")
         };

@@ -720,7 +720,8 @@ impl Workspace {
                     self.scheduler_web_allowed(),
                 )
                 .filter(super::terminal_ai::web::Scope::supports_unattended_search)
-                .ok_or("The saved web search settings are unavailable.")?;
+                .ok_or("The saved web search settings are unavailable.")?
+                .with_vault(self.vault.as_ref());
                 scope.require_current()?;
                 self.require_public_scheduler_topic(
                     topic,
@@ -1648,7 +1649,7 @@ impl Workspace {
                         view.discard_proposal_review();
                     })?;
                     scheduler.attach_proposal_knowledge(view);
-                    scheduler.attach_proposal_web(view, policy_allows_web);
+                    scheduler.attach_proposal_web(view, policy_allows_web, self.vault.as_ref());
                     if omitted {
                         view.report_status("The local skill guidance could not be included. Review the available proposal request.".into());
                     }
@@ -2080,7 +2081,7 @@ impl Workspace {
             || !log_policy.equivalent_redactions(&policy.terminal_logging)
         {
             return Err(
-                "Managed policy no longer authorizes the reviewed AI request. Review it again.",
+                "The masking rules changed after the AI request was reviewed. Review it again.",
             );
         }
         let profile_current = |current: &Configuration| {
@@ -2278,6 +2279,7 @@ impl Workspace {
         Ok(job_executor::agent::Context {
             transport,
             context_limit,
+            always_offer_web_tools: config.agent_always_offer_web_tools(),
             targets,
             target_vault_revisions,
             connection_store,
@@ -2335,6 +2337,7 @@ impl Workspace {
             job_executor::agent::Resend::Environment(research) => {
                 self.queue_read_only_research(research)
             }
+            job_executor::agent::Resend::WebTool(review) => self.begin_read_only_model_web(review),
         }
     }
 

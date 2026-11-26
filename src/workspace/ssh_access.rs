@@ -7,7 +7,7 @@ use std::thread;
 
 use iced::futures::{StreamExt, stream};
 use iced::widget::{button, checkbox, column, row, text};
-use iced::{Element, Task, window};
+use iced::{Element, Subscription, Task, window};
 use kortty_ssh::{
     Authentication, ConnectError, ConnectOptions, Endpoint, HostKey, HostKeyStatus, StartupChannel,
     TrustStore,
@@ -344,6 +344,7 @@ struct RetryLogin {
     keyboard: (KeyboardOptions, Option<KeyboardOptions>),
     target_key: Option<PathBuf>,
     jump_key: Option<PathBuf>,
+    allows_temporary_key: bool,
     temporary_key: Option<ssh_dialog::TemporaryKey>,
     explicit_vault: Option<(LoginTarget, String)>,
     explicit_key: Option<(LoginTarget, u64)>,
@@ -375,6 +376,10 @@ impl RetryLogin {
             }
         }
 
+        let temporary_key = match &request.target.auth {
+            ssh_dialog::Authentication::TemporaryKey(key) => Some(key.clone()),
+            _ => None,
+        };
         Self {
             keyboard: (
                 request.target.keyboard_options(),
@@ -382,10 +387,8 @@ impl RetryLogin {
             ),
             target_key: key_path(&request.target),
             jump_key: request.jump.as_ref().and_then(key_path),
-            temporary_key: match &request.target.auth {
-                ssh_dialog::Authentication::TemporaryKey(key) => Some(key.clone()),
-                _ => None,
-            },
+            allows_temporary_key: temporary_key.is_some(),
+            temporary_key,
             explicit_vault,
             explicit_key: explicit_key(&request.target),
             explicit_jump_key: request.jump.as_ref().and_then(explicit_key),
@@ -572,6 +575,7 @@ pub enum Message {
     ReconnectForm(window::Id, u64, ssh_dialog::Message),
     TeamworkForm(window::Id, u64, ssh_dialog::Message),
     TemporaryKeyPasted(window::Id, TemporaryKeyPaste, ssh_dialog::Password),
+    TemporaryKeyClock,
     Cancel(window::Id),
     ApprovePasswordCommand(window::Id, u64),
     PasswordCommandFinished(window::Id, u64, password_command::Response),
@@ -605,6 +609,20 @@ impl fmt::Debug for DialResponse {
 }
 
 impl Workspace {
+    pub(super) fn ssh_temporary_key_subscription(&self) -> Subscription<WorkspaceMessage> {
+        if self.windows.values().any(|window| {
+            window.pending_ssh.as_ref().is_some_and(|pending| {
+                matches!(&pending.stage, Stage::Form(form)
+                    if form.watches_saved_temporary_key_expiry(self.vault.as_ref()))
+            })
+        }) {
+            super::scheduler_access::desktop_clock(std::time::Duration::from_secs(1))
+                .map(|()| wrap(Message::TemporaryKeyClock))
+        } else {
+            Subscription::none()
+        }
+    }
+
     pub(super) fn saved_launch_isolation(
         &self,
         connection: &Connection,
@@ -668,6 +686,7 @@ impl Workspace {
 
     pub(super) fn update_ssh(&mut self, message: Message) -> Task<WorkspaceMessage> {
         match message {
+            Message::TemporaryKeyClock => Task::none(),
             Message::Show(window, replace) => self.show_shell_ssh(window, replace, false),
             Message::ShowIncognito(window) => self.show_shell_ssh(window, None, true),
             Message::ShowSftp(window) => {
@@ -871,7 +890,7 @@ impl Workspace {
                     && pending
                         .retry
                         .as_ref()
-                        .is_some_and(|retry| retry.temporary_key.is_some())))
+                        .is_some_and(|retry| retry.allows_temporary_key)))
     }
 
     fn paste_pending_temporary_key(&mut self, owner: window::Id) -> Task<WorkspaceMessage> {
@@ -907,7 +926,7 @@ impl Workspace {
         })
     }
 
-    pub(super) fn discard_quick_temporary_ssh_retries(&mut self) {
+    pub(super) fn sync_quick_temporary_ssh_retries(&mut self, enabled: bool) {
         for pending in self
             .windows
             .values_mut()
@@ -915,11 +934,17 @@ impl Workspace {
             .chain(self.sftp_logins.values_mut())
             .filter(|pending| pending.teamwork.is_none())
         {
-            if let Some(retry) = &mut pending.retry {
+            if !enabled && let Some(retry) = &mut pending.retry {
                 retry.temporary_key = None;
             }
-            if let Stage::Form(form) = &mut pending.stage {
-                form.set_quick_temporary_key_enabled(false);
+            if let Stage::Form(form) = &mut pending.stage
+                && (!enabled
+                    || pending
+                        .retry
+                        .as_ref()
+                        .is_some_and(|retry| retry.allows_temporary_key))
+            {
+                form.set_quick_temporary_key_enabled(enabled);
             }
         }
     }
@@ -1829,7 +1854,7 @@ impl Workspace {
                     && matches!(&pending.stage, Stage::Form(form) if form.temporary_key_selected())
             })
         {
-            self.discard_quick_temporary_ssh_retries();
+            self.sync_quick_temporary_ssh_retries(false);
             self.defer_project_ssh_dial(window, super::project_access::WaitReason::SignIn);
             self.notice(window, "The temporary SSH key option is disabled.".into());
             return Task::none();
@@ -2950,7 +2975,7 @@ impl Workspace {
             if let Some(retry) = &pending.retry {
                 if let Some(shared) = &pending.teamwork {
                     shared.auth.enable_retry(&mut form);
-                } else if retry.temporary_key.is_some() {
+                } else if retry.allows_temporary_key {
                     form.set_quick_temporary_key_enabled(quick_temporary_key_enabled);
                 }
                 retry.restore(&mut form, &target.login);
@@ -3069,6 +3094,7 @@ impl Workspace {
                         pending.sftp,
                         !pending.incognito && self.clipboard.policy.problem.is_none(),
                         &self.ssh_key_choices,
+                        self.vault.as_ref(),
                     )
                     .map(move |message| wrap(form_message(id, form_key, message)));
                 if let Some(shared) = &pending.teamwork {

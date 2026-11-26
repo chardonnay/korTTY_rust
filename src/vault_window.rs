@@ -38,8 +38,16 @@ pub(crate) const VAULT_LOCKED: &str = "Unlock the vault before connecting.";
 pub struct SecretEdit(Secret);
 
 impl SecretEdit {
-    fn new(value: String) -> Self {
+    pub(crate) fn new(value: String) -> Self {
         Self(Secret::new(value))
+    }
+
+    pub(crate) fn value(&self) -> &str {
+        &self.0
+    }
+
+    pub(crate) fn into_secret(self) -> Secret {
+        self.0
     }
 }
 
@@ -139,8 +147,8 @@ impl Kind {
         }
     }
 
-    fn from_native(kind: CredentialKind) -> Self {
-        match kind {
+    fn from_native(kind: CredentialKind) -> Option<Self> {
+        Some(match kind {
             CredentialKind::Password => Self::Password,
             CredentialKind::KeyPassphrase => Self::KeyPassphrase,
             CredentialKind::ArchivePassword => Self::ArchivePassword,
@@ -152,7 +160,8 @@ impl Kind {
             CredentialKind::SudoGroupPassword => Self::SudoGroupPassword,
             CredentialKind::JobWebhookUrl => Self::JobWebhookUrl,
             CredentialKind::SshPasswordCommand => Self::PasswordCommand,
-        }
+            CredentialKind::WebProvider(_) => return None,
+        })
     }
 
     fn has_login_scope(self) -> bool {
@@ -592,6 +601,42 @@ impl VaultWindow {
             .ok_or("Unlock the vault to use the selected Qdrant API key.")?
             .qdrant_api_key_with_envelope(id)
             .ok_or("The selected Qdrant API key is missing or has the wrong type.")
+    }
+
+    pub(crate) fn web_credential(&self, provider: kortty_vault::WebProvider) -> Option<&str> {
+        self.vault.as_ref()?.web_credential(provider)
+    }
+
+    pub(crate) fn web_credential_revision(&self) -> Option<[u8; 32]> {
+        Some(self.vault.as_ref()?.web_credential_revision())
+    }
+
+    pub(crate) fn web_credential_authority(&self) -> (&Path, std::sync::Weak<()>) {
+        (&self.path, Arc::downgrade(&self.sudo_revision))
+    }
+
+    pub(crate) fn update_web_credentials(
+        &mut self,
+        revision: [u8; 32],
+        changes: Vec<(kortty_vault::WebProvider, kortty_vault::WebCredentialChange)>,
+    ) -> Result<(), VaultError> {
+        if !self.can_manage_environments() {
+            return Err(VaultError::InvalidInput(
+                "unlock the vault and finish its current operation",
+            ));
+        }
+        let vault = self.vault.as_mut().expect("unlocked vault");
+        if revision != vault.web_credential_revision() {
+            return Err(VaultError::Changed);
+        }
+        let result = vault.update_web_credentials(changes, || {
+            crate::local_ai::web_search::require_policy()
+                .map_err(|_| VaultError::InvalidInput("managed policy blocks Internet access"))
+        });
+        if vault.web_credential_revision() != revision {
+            self.sudo_revision = Arc::new(());
+        }
+        result
     }
 
     pub(crate) fn scheduler_sudo_password(
@@ -1338,7 +1383,10 @@ impl VaultWindow {
     }
 
     fn selected_entry(&self) -> Option<&Credential> {
-        self.vault.as_ref()?.get(self.selected.as_deref()?)
+        self.vault
+            .as_ref()?
+            .get(self.selected.as_deref()?)
+            .filter(|entry| Kind::from_native(entry.kind).is_some())
     }
 
     fn master_confirmed(&self, master: &Secret) -> bool {
@@ -1414,7 +1462,10 @@ impl VaultWindow {
                 .wrap(),
             );
             let mut entries = column![].spacing(6);
-            for entry in vault.entries() {
+            for entry in vault
+                .entries()
+                .filter(|entry| Kind::from_native(entry.kind).is_some())
+            {
                 let environment = environments.display_label(&entry.environment);
                 entries = entries.push(
                     button(
@@ -1655,7 +1706,7 @@ impl VaultWindow {
             return draft.view(environments, &self.sudo_groups, webhook_test);
         }
         if let Some(entry) = self.selected_entry() {
-            let kind = Kind::from_native(entry.kind);
+            let kind = Kind::from_native(entry.kind).expect("visible credential kind");
             let scope_label = match kind {
                 Kind::SudoGroupPassword => "Connection group",
                 Kind::SudoPassword | Kind::PasswordCommand | Kind::TemporarySshKey => {
@@ -1867,7 +1918,7 @@ impl EntryDraft {
             host_pattern: entry.server_pattern.clone(),
             environment: entry.environment.clone(),
             description: entry.description.clone(),
-            kind: Kind::from_native(entry.kind),
+            kind: Kind::from_native(entry.kind).expect("editable credential kind"),
             webhook: entry.webhook_settings().unwrap_or_default(),
             ..Self::new()
         }

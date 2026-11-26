@@ -5,6 +5,16 @@ pub(crate) fn reveal_row<Message>(list: Id, row: Id) -> Task<Message> {
     iced_runtime::task::effect(iced_runtime::Action::widget(Reveal::new(list, Some(row))))
 }
 
+pub(crate) fn reveal_row_above_horizontal_scrollbar<Message>(
+    list: Id,
+    row: Id,
+    scrollbar_height: f32,
+) -> Task<Message> {
+    let mut reveal = Reveal::new(list, Some(row));
+    reveal.horizontal_scrollbar_height = scrollbar_height;
+    iced_runtime::task::effect(iced_runtime::Action::widget(reveal))
+}
+
 pub(crate) fn reveal_nested_row<Message>(list: Id, inner: Id, row: Id) -> Task<Message> {
     let mut reveal = Reveal::new(list, Some(row));
     reveal.inner = Some(inner);
@@ -25,6 +35,7 @@ struct Reveal {
     row_bounds: Option<Rectangle>,
     inner: Option<Id>,
     inner_translation: Vector,
+    horizontal_scrollbar_height: f32,
 }
 
 impl Reveal {
@@ -36,6 +47,7 @@ impl Reveal {
             row_bounds: None,
             inner: None,
             inner_translation: Vector::ZERO,
+            horizontal_scrollbar_height: 0.0,
         }
     }
 }
@@ -86,11 +98,17 @@ impl Operation for Reveal {
         };
         // Widget operations report row bounds before the inner scroll offset.
         row.y -= self.inner_translation.y;
+        // The horizontal scrollbar overlays the bottom of an overflowing viewport.
+        let visible_height = if content.width > viewport.width {
+            (viewport.height - self.horizontal_scrollbar_height).max(0.0)
+        } else {
+            viewport.height
+        };
         let top = viewport.y + translation.y;
-        let offset = if row.y < top || row.height > viewport.height {
+        let offset = if row.y < top || row.height > visible_height {
             row.y
-        } else if row.y + row.height > top + viewport.height {
-            row.y + row.height - viewport.height
+        } else if row.y + row.height > top + visible_height {
+            row.y + row.height - visible_height
         } else {
             return operation::Outcome::None;
         };

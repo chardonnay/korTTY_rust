@@ -4,7 +4,7 @@ use std::cell::Cell;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, Weak,
+    Arc, OnceLock, Weak,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread;
@@ -25,7 +25,9 @@ use crate::scheduler_window::{
 };
 use crate::session_security::IsolationLevel;
 use crate::terminal_agent::{
-    self, Action, Cancel, Outcome, Status, swarm::headless::Execution, usage::Progress,
+    self, Action, Cancel, Outcome, Status,
+    swarm::headless::Execution,
+    usage::{Progress, WebProposal},
 };
 use crate::terminal_logging::{Policy, RedactionSecrets, Redactor, Secrets};
 use crate::workspace::scheduler_access::firing::environment_research::Environment;
@@ -66,9 +68,23 @@ pub(crate) fn require_policy(policy: &ClipboardPolicy, kind: Kind) -> Result<(),
     Ok(())
 }
 
+pub(crate) const WEB_POLICY_BLOCKED: &str = "Managed policy blocks scheduled web search.";
+pub(crate) const WEB_VAULT_CHANGED: &str =
+    "The credential vault changed during the scheduled web review. Review the run again.";
+pub(crate) const WEB_MASK_CHANGED: &str =
+    "The masking rules changed during the scheduled web review. Review the run again.";
+
+pub(crate) fn require_web_policy(policy: &ClipboardPolicy) -> Result<(), &'static str> {
+    if policy.problem.is_some() || !policy.ai_allowed || !policy.ai_web_search_allowed {
+        return Err(WEB_POLICY_BLOCKED);
+    }
+    Ok(())
+}
+
 pub(crate) struct Context {
     pub(crate) transport: local_ai::Profile,
     pub(crate) context_limit: usize,
+    pub(crate) always_offer_web_tools: bool,
     pub(crate) targets: Vec<Result<Execution, &'static str>>,
     pub(crate) target_vault_revisions: Vec<Option<Weak<()>>>,
     pub(crate) journal: Option<automation::Plan>,
@@ -85,6 +101,7 @@ pub(crate) struct ResendScope {
     pub(crate) request: Arc<RunRequest<SshCommand>>,
     pub(crate) transport: local_ai::Profile,
     pub(crate) context_limit: usize,
+    pub(crate) always_offer_web_tools: bool,
     pub(crate) evidence_targets: Vec<u64>,
     pub(crate) vault_revision: Option<Weak<()>>,
     pub(crate) connection_store: PathBuf,
@@ -96,6 +113,44 @@ pub(crate) struct ResendScope {
 pub enum Resend {
     Model(ModelResend),
     Environment(EnvironmentResearch),
+    WebTool(ModelWebReview),
+}
+
+#[derive(Clone)]
+pub struct ModelWebReview {
+    pub(crate) authority: AdvisoryWebAuthority,
+    pub(crate) proposal: Arc<WebProposal>,
+    pub(crate) deadline: Instant,
+}
+
+#[derive(Clone)]
+pub(crate) struct AdvisoryWebAuthority {
+    pub(crate) scope: Arc<ResendScope>,
+    denied: Arc<OnceLock<&'static str>>,
+}
+
+impl AdvisoryWebAuthority {
+    pub(crate) fn block(&self, reason: &'static str) {
+        let _ = self.denied.set(reason);
+    }
+
+    pub(crate) fn require_policy(&self, policy: &ClipboardPolicy) -> Result<(), &'static str> {
+        if let Some(&reason) = self.denied.get() {
+            return Err(reason);
+        }
+        require_web_policy(policy)
+            .and_then(|()| {
+                if policy
+                    .terminal_logging
+                    .equivalent_redactions(&self.scope.log_policy)
+                {
+                    Ok(())
+                } else {
+                    Err(WEB_MASK_CHANGED)
+                }
+            })
+            .inspect_err(|&reason| self.block(reason))
+    }
 }
 
 /// Carries the original job scope while the model worker awaits authority.
@@ -134,6 +189,10 @@ impl std::fmt::Debug for Resend {
                 .debug_tuple("ScheduledSwarmEnvironmentResearch")
                 .field(&research.scope.request.id)
                 .field(&research.index)
+                .finish(),
+            Self::WebTool(review) => formatter
+                .debug_tuple("ScheduledSwarmModelWebReview")
+                .field(&review.authority.scope.request.id)
                 .finish(),
         }
     }
@@ -233,6 +292,7 @@ fn run(
     let Context {
         transport,
         context_limit,
+        always_offer_web_tools,
         targets,
         target_vault_revisions,
         journal,
@@ -471,6 +531,7 @@ fn run(
                 request: Arc::clone(&request),
                 transport: transport.clone(),
                 context_limit,
+                always_offer_web_tools,
                 evidence_targets: vec![reference.id],
                 vault_revision: vault_revision.cloned(),
                 connection_store: connection_store.clone(),
@@ -639,6 +700,7 @@ fn run(
                         request: Arc::clone(&request),
                         transport: transport.clone(),
                         context_limit,
+                        always_offer_web_tools,
                         evidence_targets: evidence
                             .iter()
                             .map(|target| target["target"].as_u64().expect("diagnostic target ID"))
@@ -1209,9 +1271,13 @@ enum DispatchCheck<F> {
     BeforeSend(F),
 }
 
-enum AdviceInput {
+enum AdviceInput<'a> {
     Legacy(String),
-    Reviewed { system: String, input: String },
+    Reviewed {
+        system: String,
+        input: String,
+        web: Option<(&'a async_channel::Sender<Resend>, Arc<ResendScope>)>,
+    },
 }
 
 fn advise(
@@ -1267,7 +1333,7 @@ fn request_advice(
         usize,
         DispatchCheck<impl Fn() -> Result<(), &'static str> + Send + 'static>,
     ),
-    input: AdviceInput,
+    input: AdviceInput<'_>,
     cancellation: &Cancellation,
     redactor: &Redactor,
     mask: Mask,
@@ -1283,21 +1349,28 @@ fn request_advice(
         }
         DispatchCheck::BeforeSend(check) => check,
     };
-    let denied = Arc::new(AtomicBool::new(false));
-    let worker_denied = Arc::clone(&denied);
+    // Retain only locally authored authority failures for the journal.
+    let denied = Arc::new(OnceLock::<&'static str>::new());
     let before_dispatch = Arc::new(std::sync::Mutex::new(before_dispatch));
+    let web = match &input {
+        AdviceInput::Reviewed { web, .. } => web.as_ref(),
+        AdviceInput::Legacy(_) => None,
+    };
     // A target can be admitted before a model worker becomes available. Keep
     // the request cancellable and start its model timeout once it has a worker.
     let pending = loop {
         check_cancelled(cancellation)?;
         let before_dispatch = Arc::clone(&before_dispatch);
-        let worker_denied = Arc::clone(&worker_denied);
+        let worker_denied = Arc::clone(&denied);
         let guard = move || {
+            if let Some(&reason) = worker_denied.get() {
+                return Err(reason.into());
+            }
             let before_dispatch = before_dispatch
                 .lock()
                 .map_err(|_| "The model dispatch guard is unavailable.".to_owned())?;
             before_dispatch().map_err(|reason| {
-                worker_denied.store(true, Ordering::Release);
+                let _ = worker_denied.set(reason);
                 reason.into()
             })
         };
@@ -1309,14 +1382,32 @@ fn request_advice(
                 Some(progress.clone()),
                 guard,
             ),
-            AdviceInput::Reviewed { system, input } => terminal_agent::ask_with_progress_guarded(
-                transport.clone(),
-                system.clone(),
-                input.clone(),
-                advisory::context_limit(limit),
-                Some(progress.clone()),
-                guard,
-            ),
+            AdviceInput::Reviewed { system, input, .. } if web.is_some() => {
+                let cancellation = cancellation.clone();
+                terminal_agent::reviewed_ask_request(
+                    transport.clone(),
+                    terminal_agent::ReviewedAsk {
+                        system: system.clone(),
+                        input: input.clone(),
+                        context_limit: advisory::context_limit(limit),
+                        web_tools: true,
+                        attachment_check: None,
+                        authorize_web_send: Some(Box::new(guard)),
+                    },
+                    Some(progress.clone()),
+                    move || check_cancelled(&cancellation).map_err(|error| error.detail.into()),
+                )
+            }
+            AdviceInput::Reviewed { system, input, .. } => {
+                terminal_agent::ask_with_progress_guarded(
+                    transport.clone(),
+                    system.clone(),
+                    input.clone(),
+                    advisory::context_limit(limit),
+                    Some(progress.clone()),
+                    guard,
+                )
+            }
         };
         match started {
             Ok(pending) => break pending,
@@ -1336,17 +1427,31 @@ fn request_advice(
         if Instant::now() >= deadline {
             return Err(Failure::failed("The diagnostic AI summary timed out."));
         }
-        if let Ok(Progress::Repairing(_, permit) | Progress::FormatFallback(_, permit)) =
-            updates.try_recv()
-        {
-            authorize(permit, deadline)?;
+        match updates.try_recv() {
+            Ok(Progress::Repairing(_, permit) | Progress::FormatFallback(_, permit)) => {
+                authorize(permit, deadline)?;
+            }
+            Ok(Progress::WebTool(proposal)) => {
+                if let Some((resends, scope)) = web {
+                    let review = ModelWebReview {
+                        authority: AdvisoryWebAuthority {
+                            scope: Arc::clone(scope),
+                            denied: Arc::clone(&denied),
+                        },
+                        proposal,
+                        deadline,
+                    };
+                    request_authority(resends, Resend::WebTool(review), cancellation, deadline)?;
+                } else {
+                    proposal.reject("This advisory request has no reviewed web tools.");
+                }
+            }
+            _ => {}
         }
         match pending.reply.try_recv() {
             Ok(Ok(report)) => {
-                if denied.load(Ordering::Acquire) {
-                    return Err(Failure::blocked(
-                        "Managed policy no longer authorizes the diagnostic AI summary.",
-                    ));
+                if let Some(&reason) = denied.get() {
+                    return Err(Failure::blocked(reason));
                 }
                 break report
                     .result
@@ -1808,6 +1913,7 @@ mod tests {
             context: Context {
                 transport,
                 context_limit: 4096,
+                always_offer_web_tools: false,
                 targets: vec![Ok(execution)],
                 target_vault_revisions: Vec::new(),
                 journal: None,

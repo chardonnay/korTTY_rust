@@ -16,6 +16,79 @@ const WRONG: &[u8] = b"wrong test master password only";
 const TEST_SECRET: &str = "test-only ssh secret ä";
 
 #[test]
+fn web_credentials_save_and_clear_together_and_survive_encrypted_reopen() {
+    use kortty_vault::{WebCredentialChange as Change, WebProvider as Provider};
+
+    let directory = Directory::new();
+    let path = directory.0.join("vault");
+    let mut vault = Vault::create(&path, MASTER).unwrap();
+    let set = |value: &str| Change::Set(Secret::new(value.into()));
+    let tavily = "owned-tavily-fixture";
+    let bright = "owned-bright-data-fixture";
+    let brave = "owned-brave-fixture";
+    vault
+        .update_web_credentials(
+            vec![
+                (Provider::Tavily, set(tavily)),
+                (Provider::BrightData, set(bright)),
+                (Provider::Brave, set(brave)),
+            ],
+            || Ok(()),
+        )
+        .unwrap();
+    let before = vault.web_credential_revision();
+    assert!(
+        vault
+            .update_web_credentials(
+                vec![
+                    (Provider::Brave, Change::Clear),
+                    (Provider::Tavily, set("invalid\nkey"))
+                ],
+                || Ok(()),
+            )
+            .is_err()
+    );
+    assert!(
+        vault
+            .update_web_credentials(vec![(Provider::Brave, Change::Clear)], || Err(
+                Error::Changed
+            ),)
+            .is_err()
+    );
+    assert_eq!(vault.web_credential_revision(), before);
+    assert_eq!(vault.web_credential(Provider::Brave), Some(brave));
+    let encrypted = std::fs::read(&path).unwrap();
+    for value in [tavily, bright, brave] {
+        assert!(
+            !encrypted
+                .windows(value.len())
+                .any(|window| window == value.as_bytes())
+        );
+    }
+    let id = vault
+        .entries()
+        .find(|entry| entry.kind == CredentialKind::WebProvider(Provider::Tavily))
+        .unwrap()
+        .id
+        .clone();
+    assert!(vault.delete(&id).is_err());
+    vault
+        .update_web_credentials(
+            vec![
+                (Provider::BrightData, Change::Clear),
+                (Provider::Brave, set("replacement")),
+            ],
+            || Ok(()),
+        )
+        .unwrap();
+    drop(vault);
+    let vault = Vault::unlock(&path, MASTER).unwrap();
+    assert_eq!(vault.web_credential(Provider::Tavily), Some(tavily));
+    assert_eq!(vault.web_credential(Provider::BrightData), None);
+    assert_eq!(vault.web_credential(Provider::Brave), Some("replacement"));
+}
+
+#[test]
 fn temporary_ssh_keys_are_encrypted_and_bound_to_the_reviewed_account_and_endpoint() {
     use kortty_vault::TemporarySshKeyOptions;
 

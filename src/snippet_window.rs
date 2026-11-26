@@ -2286,7 +2286,7 @@ impl SnippetWindow {
         open_elsewhere: bool,
         transfer: transfer::Context<'a>,
         analysis: AnalysisPane<'a>,
-        available_width: f32,
+        viewport: iced::Size,
     ) -> Element<'a, Message> {
         let EditorPreferences {
             appearance,
@@ -2303,6 +2303,7 @@ impl SnippetWindow {
             library_divider,
             library_columns,
         } = preferences;
+        let available_width = viewport.width;
         if let Some(page) = transfer.page {
             return transfer::view(page);
         }
@@ -2394,6 +2395,7 @@ impl SnippetWindow {
         let pane_width = workspace_pane_width(available_width);
         let library_extent =
             library_width(pane_width, self.library_divider_drag.or(library_divider));
+        let short_viewport = viewport.height < 480.0;
         let library = folders::drag::scope(|zone| {
             let snippet_zone = zone.clone();
             let split = folders::view::library_split(
@@ -2408,18 +2410,7 @@ impl SnippetWindow {
                 .first()
                 .copied()
                 .or(self.search_target());
-            column![
-                text("Snippet library").size(20),
-                text_input("Search snippets", &self.query)
-                    .id(self.search_input.clone())
-                    .on_input(Message::Search)
-                    .on_submit_maybe(self.search_target().map(Message::Open)),
-                pick_list(
-                    AnalysisFilter::ALL,
-                    Some(self.library_analysis_filter),
-                    Message::FilterLibraryAnalysis
-                ),
-                split,
+            let actions = column![
                 row![
                     button("New").on_press(Message::New),
                     button("Reload").on_press(Message::Reload),
@@ -2455,6 +2446,28 @@ impl SnippetWindow {
                 ]
                 .spacing(6)
                 .wrap(),
+            ]
+            .spacing(8);
+            let actions: Element<'_, Message> = if short_viewport {
+                widget::container(scrollable(actions).spacing(4))
+                    .max_height(80)
+                    .into()
+            } else {
+                actions.into()
+            };
+            column![
+                text("Snippet library").size(20),
+                text_input("Search snippets", &self.query)
+                    .id(self.search_input.clone())
+                    .on_input(Message::Search)
+                    .on_submit_maybe(self.search_target().map(Message::Open)),
+                pick_list(
+                    AnalysisFilter::ALL,
+                    Some(self.library_analysis_filter),
+                    Message::FilterLibraryAnalysis
+                ),
+                split,
+                actions,
             ]
             .spacing(8)
             .width(library_extent)
@@ -2672,6 +2685,24 @@ impl SnippetWindow {
         });
         let selected_language =
             language.filter(|token| languages::built_in(token) || custom_languages.contains(token));
+        let editor_width = available - side_width.unwrap_or_default();
+        let compact_actions = short_viewport || (viewport.height < 620.0 && editor_width < 530.0);
+        let save = || {
+            button("Save").on_press_maybe(
+                (!self.custom_header_save_blocked(self.draft.id)).then_some(Message::Save),
+            )
+        };
+        let close = || button("Close").on_press(Message::Close);
+        let source = if structure_visible {
+            self.structure_view(code)
+        } else {
+            code()
+        };
+        let source = if compact_actions {
+            widget::container(source).height(200).into()
+        } else {
+            source
+        };
         let editor = column![
             self.recovery_banner(),
             tab_strip,
@@ -2727,15 +2758,9 @@ impl SnippetWindow {
                 ai_completion_running,
                 ai_completion_automatic
             )),
-            if structure_visible {
-                self.structure_view(code)
-            } else {
-                code()
-            },
+            source,
             row![
-                button("Save").on_press_maybe(
-                    (!self.custom_header_save_blocked(self.draft.id)).then_some(Message::Save)
-                ),
+                (!compact_actions).then(save),
                 button("Details").on_press(Message::ShowDetails),
                 button(if structure_visible {
                     "Hide structure"
@@ -2795,20 +2820,19 @@ impl SnippetWindow {
                     self.can_open_assist()
                         .then_some(Message::Assist(ai_assist::Message::Open))
                 ),
-                button("Close").on_press(Message::Close)
+                (!compact_actions).then(close),
             ]
             .spacing(6)
             .wrap(),
             self.diagram_library(),
-            text(self.status.as_deref().unwrap_or(if self.draft.dirty {
-                "Unsaved edits"
-            } else {
-                ""
-            })),
         ]
         .spacing(8)
-        .width(Length::Fill)
-        .height(Length::Fill);
+        .width(Length::Fill);
+        let status = text(self.status.as_deref().unwrap_or(if self.draft.dirty {
+            "Unsaved edits"
+        } else {
+            ""
+        }));
         let editor: Element<'_, Message> = if self.tabs.is_empty() {
             widget::container(
                 column![
@@ -2822,8 +2846,18 @@ impl SnippetWindow {
             .height(Length::Fill)
             .center(Length::Fill)
             .into()
+        } else if compact_actions {
+            column![
+                scrollable(editor).spacing(4).height(Length::Fill),
+                row![save(), close(), status]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+            ]
+            .spacing(8)
+            .height(Length::Fill)
+            .into()
         } else {
-            editor.into()
+            editor.push(status).height(Length::Fill).into()
         };
         let editor: Element<'_, Message> = if let (Some(width), Some(page)) = (side_width, page) {
             use crate::horizontal_divider::{self, Grow};

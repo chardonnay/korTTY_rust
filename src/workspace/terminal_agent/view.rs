@@ -1,5 +1,5 @@
 use iced::widget::{
-    button, checkbox, column, container, pick_list, row, scrollable, text, text_input,
+    button, checkbox, column, container, pick_list, responsive, row, scrollable, text, text_input,
 };
 use iced::{Element, Length, window};
 
@@ -17,6 +17,39 @@ impl Run {
         remaining_allowed: bool,
         reduced_motion: bool,
         owner: (&'a State, window::Id),
+    ) -> Element<'a, Message> {
+        if matches!(self.phase, Phase::ProbeApproval | Phase::Approval) || self.phase.finished() {
+            return responsive(move |size| {
+                // Leave room for the current review while keeping the history readable.
+                let activity_share = if self.phase.finished() { 3.0 } else { 4.0 };
+                let minimum_height =
+                    if self.design.history == crate::terminal_agent::design::History::LogTable {
+                        // Reserve room for the header, selected row, scrollbar and review controls.
+                        96.0 + self.fonts.activity * 3.0
+                    } else {
+                        112.0
+                    };
+                let activity_height = (size.height / activity_share).max(minimum_height);
+                self.view_body(
+                    palette,
+                    remaining_allowed,
+                    reduced_motion,
+                    owner,
+                    Some(activity_height),
+                )
+            })
+            .into();
+        }
+        self.view_body(palette, remaining_allowed, reduced_motion, owner, None)
+    }
+
+    fn view_body<'a>(
+        &'a self,
+        palette: Option<palette::Palette>,
+        remaining_allowed: bool,
+        reduced_motion: bool,
+        owner: (&'a State, window::Id),
+        activity_height: Option<f32>,
     ) -> Element<'a, Message> {
         let title = match self.mode {
             Mode::Run => "AI Agent",
@@ -38,6 +71,7 @@ impl Run {
             .spacing(8)
             .padding(12);
         let plan_view = self.mode == Mode::Plan;
+        let choosing_approach = self.phase == Phase::TriageChoice;
         let showing_plan = matches!(
             self.phase,
             Phase::PlanReady | Phase::PlanImplementationReview | Phase::PlanHandedOff
@@ -55,7 +89,7 @@ impl Run {
         if plan_view {
             page = page.push(super::font::View::Plan.controls(body_size, None));
         }
-        if !reviewing_model && !showing_plan {
+        if !reviewing_model && !showing_plan && !choosing_approach {
             page = page.push(super::font::View::Activity.controls(
                 self.fonts.activity,
                 (!self.binding.private()).then_some(self.fonts.remember_activity),
@@ -175,21 +209,24 @@ impl Run {
         let show_activity = self.phase != Phase::Setup
             && !reviewing_model
             && !showing_plan
+            && !choosing_approach
             && !self.presentation.activity.collapsed;
+        let activity = || {
+            let history = super::design::history_view(self, palette, reduced_motion, Some(owner));
+            if let Some(height) = activity_height {
+                // Resolve the nested table and its detail pane against a finite viewport.
+                container(history).height(Length::Fixed(height)).into()
+            } else {
+                history
+            }
+        };
         if show_activity && self.design.approval == Approval::BelowActivity {
-            page = page.push(super::design::history_view(
-                self,
-                palette,
-                reduced_motion,
-                Some(owner),
-            ));
+            page = page.push(activity());
         }
         if let Some(review) = self.model_review_view(Length::Fill) {
             page = page.push(review.map(Message::ReviewModel));
         }
-        if self.phase == Phase::TriageChoice
-            && let Some(choice) = &self.triage.choice
-        {
+        if choosing_approach && let Some(choice) = &self.triage.choice {
             page = page.push(choice.view(self));
         }
         if !reviewing_model
@@ -387,12 +424,7 @@ impl Run {
             }
         }
         if show_activity && self.design.approval == Approval::AboveActivity {
-            page = page.push(super::design::history_view(
-                self,
-                palette,
-                reduced_motion,
-                Some(owner),
-            ));
+            page = page.push(activity());
         }
         use super::activity_export::Scope;
         let has_archive = owner.0.has_archived_activity(self);
@@ -450,9 +482,11 @@ impl Run {
             .wrap(),
         )
         .id("terminal-agent-actions");
-        if self.phase == Phase::Setup {
+        if self.phase == Phase::Setup || choosing_approach || activity_height.is_some() {
             column![
-                scrollable(page).height(Length::Fill),
+                scrollable(page)
+                    .id("terminal-agent-body")
+                    .height(Length::Fill),
                 column![notice, actions].spacing(8).padding(12),
             ]
             .height(Length::Fill)
@@ -471,10 +505,15 @@ impl Run {
         if self.phase.deciding()
             && let Some(review) = &self.model_review
         {
-            return review.model_tool_view(
-                self.epoch,
-                !self.paused && !self.closing && !self.cancel.requested(),
-            );
+            let ready = !self.paused && !self.closing && !self.cancel.requested();
+            return review.model_tool_view(self.epoch, ready).map(|view| {
+                container(view)
+                    .height(match request_height {
+                        Length::Fixed(_) => Length::Fixed(320.0),
+                        height => height,
+                    })
+                    .into()
+            });
         }
 
         if self.phase != Phase::ModelReview {

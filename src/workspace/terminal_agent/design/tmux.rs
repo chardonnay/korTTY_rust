@@ -289,4 +289,43 @@ mod tests {
         assert_eq!(cursor_opacity(Duration::from_millis(530), true), 0.0);
         assert_eq!(cursor_opacity(Duration::from_millis(530), false), 1.0);
     }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tmux_monospace_fallback_draws_japanese_text_and_cursor() {
+        use iced::advanced::{graphics::Viewport, renderer};
+        use iced::{Pixels, Size, Theme, mouse};
+        use iced_runtime::{UserInterface, user_interface::Cache};
+        use iced_tiny_skia::{Renderer, window::compositor};
+
+        let viewport = Viewport::with_physical_size(Size::new(220, 80), 1.0);
+        let mut renderer = Renderer::new(Font::MONOSPACE, Pixels(16.0));
+        let content: Element<'_, ()> = rich_text([
+            span::<(), _>("Both checked commands completed in order. Grüße, café, "),
+            span("日本語").color(Color::from_rgb8(0, 255, 0)),
+            span("."),
+            span("█").color(Color::from_rgb8(255, 0, 0)),
+        ])
+        .font(Font::MONOSPACE)
+        .width(Length::Fill)
+        .into();
+        let mut interface = UserInterface::build(
+            content,
+            viewport.logical_size(),
+            Cache::default(),
+            &mut renderer,
+        );
+        interface.draw(
+            &mut renderer,
+            &Theme::Dark,
+            &renderer::Style {
+                text_color: Color::WHITE,
+            },
+            mouse::Cursor::Unavailable,
+        );
+        let image = compositor::screenshot(&mut renderer, &viewport, Color::BLACK);
+        let (pixels, _) = image.as_chunks::<4>();
+        assert!(pixels.iter().any(|pixel| pixel[1] > pixel[0]));
+        assert!(pixels.iter().any(|pixel| pixel[0] > pixel[1]));
+    }
 }

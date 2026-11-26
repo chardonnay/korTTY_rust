@@ -495,6 +495,10 @@ struct General {
     agent_runtime_messages: bool,
     #[serde(skip_serializing_if = "local_ai::web_search::McpDefaults::is_default")]
     internet: local_ai::web_search::McpDefaults,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_always_offer_web_tools: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_web_offer_revision: Option<std::num::NonZeroU64>,
     timeout_minutes: u16,
     code_text_language: CodeTextLanguage,
     chat_terminal_actions: ChatTerminalActions,
@@ -519,6 +523,8 @@ struct JavaGeneralPreferences {
     #[serde(skip_serializing_if = "Option::is_none")]
     agent_triage: Option<crate::terminal_agent::planning::TriageMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    agent_always_offer_web_tools: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     agent_run_presentation: Option<crate::terminal_agent::RunPresentation>,
 }
 
@@ -527,6 +533,7 @@ impl JavaGeneralPreferences {
         self.timeout_minutes.is_none()
             && self.code_text_language.is_none()
             && self.agent_triage.is_none()
+            && self.agent_always_offer_web_tools.is_none()
             && self.agent_run_presentation.is_none()
     }
 }
@@ -539,6 +546,8 @@ impl Default for General {
             agent_debug_messages: false,
             agent_runtime_messages: false,
             internet: Default::default(),
+            agent_always_offer_web_tools: None,
+            agent_web_offer_revision: None,
             timeout_minutes: 1,
             code_text_language: CodeTextLanguage::default(),
             chat_terminal_actions: ChatTerminalActions::default(),
@@ -550,6 +559,29 @@ impl Default for General {
             agent_run_presentation: Default::default(),
             agent_shortcut: Default::default(),
         }
+    }
+}
+
+impl General {
+    fn internet_changes(&self, saved: &Self) -> bool {
+        self.internet != saved.internet
+            || self.agent_always_offer_web_tools != saved.agent_always_offer_web_tools
+            || self.agent_web_offer_revision != saved.agent_web_offer_revision
+    }
+
+    fn agent_web_offer_revision_after(
+        &self,
+        choice: Option<bool>,
+    ) -> io::Result<Option<std::num::NonZeroU64>> {
+        if choice.unwrap_or(false) == self.agent_always_offer_web_tools.unwrap_or(false) {
+            return Ok(self.agent_web_offer_revision);
+        }
+        self.agent_web_offer_revision
+            .map_or(0, std::num::NonZeroU64::get)
+            .checked_add(1)
+            .and_then(std::num::NonZeroU64::new)
+            .map(Some)
+            .ok_or_else(|| io::Error::other("The Agent web-tool preference revision is exhausted."))
     }
 }
 
@@ -974,6 +1006,14 @@ impl Configuration {
             }
         }
         let require_profile_changes = || -> io::Result<()> {
+            if self.general.internet_changes(&current.general)
+                && !load_policy().ai_web_search_allowed
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Managed policy blocks changes to Internet access defaults.",
+                ));
+            }
             if self.general.agent_triage != current.general.agent_triage
                 && load_policy().ai_memory.agent_triage.is_some()
             {
@@ -1915,6 +1955,7 @@ impl Configuration {
         } else {
             base
         };
+        let base = self.bind_agent_web_offer_revision(profile, base)?;
         bind_prompt_preset_revision(
             base,
             profile.resolved_prompt_preset(self.model_catalog.as_deref(), self.saved_root()),
@@ -1944,8 +1985,39 @@ impl Configuration {
                 }
                 let authority = transport.policy_authority_fingerprint()?;
                 let base = named_agent_profile_revision(name, profile, authority)?;
+                let base = self.bind_agent_web_offer_revision(profile, base)?;
                 bind_prompt_preset_revision(base, transport.prompt_preset())
             }
+        }
+    }
+
+    pub(crate) fn agent_always_offer_web_tools(&self) -> bool {
+        self.general.agent_always_offer_web_tools.unwrap_or(false)
+    }
+
+    fn bind_agent_web_offer_revision(
+        &self,
+        profile: &profiles::Profile,
+        base: [u8; 32],
+    ) -> Option<[u8; 32]> {
+        if (self.agent_always_offer_web_tools() || self.general.agent_web_offer_revision.is_some())
+            && profile.tavily_search
+            && profile.lm_web.is_none()
+            && self
+                .transport_for(profile)
+                .is_ok_and(|transport| transport.supports_web_tool_turns())
+        {
+            hash_agent_profile_revision(
+                &serde_json::to_vec(&(
+                    "kortty Agent web offer v1",
+                    base,
+                    self.agent_always_offer_web_tools(),
+                    self.general.agent_web_offer_revision,
+                ))
+                .ok()?,
+            )
+        } else {
+            Some(base)
         }
     }
 
@@ -2615,7 +2687,10 @@ impl GeneralSection {
     fn for_setting(setting: search::Setting) -> Self {
         use search::{ImportedGeneral, Setting};
         match setting {
-            Setting::Internet(_) => Self::Internet,
+            Setting::Internet(_)
+            | Setting::WebCredential(_)
+            | Setting::ClearWebCredential(_)
+            | Setting::AgentAlwaysOfferWebTools => Self::Internet,
             Setting::GlobalTimeout
             | Setting::SecurityProfile
             | Setting::ClearSecurityProfile
@@ -2687,6 +2762,11 @@ pub(crate) enum Message {
     AgentDebugMessages(bool),
     AgentRuntimeMessages(bool),
     Internet(internet::Field, String),
+    WebCredential(kortty_vault::WebProvider, crate::vault_window::SecretEdit),
+    ClearWebCredential(kortty_vault::WebProvider, bool),
+    SaveWebCredentials,
+    DiscardWebCredentials,
+    OpenCredentialVault,
     Timeout(String),
     AgentHistoryLimit(String),
     SnippetInstructions(bool),
@@ -2702,6 +2782,7 @@ pub(crate) enum Message {
     AdoptJavaAgentExecution,
     AgentConfirmMutating(bool),
     AgentTriage(crate::terminal_agent::planning::TriageMode),
+    AgentAlwaysOfferWebTools(bool),
     AgentRunPresentation(crate::terminal_agent::RunPresentation),
     AdoptJavaAgentConfirmation,
     JournalSemanticSearch(bool),
@@ -2851,6 +2932,7 @@ pub(crate) struct Dialog {
     saved: Arc<Configuration>,
     profile_dir: PathBuf,
     general: General,
+    web_credentials: internet::CredentialsDraft,
     timeout: String,
     shared_defaults: crate::workspace::ai_general_defaults::State,
     profiles: profiles::Editor,
@@ -2987,6 +3069,7 @@ impl Dialog {
         Self {
             profile_dir: profile.clone(),
             general: saved.general.clone(),
+            web_credentials: internet::CredentialsDraft::default(),
             timeout: saved.general.timeout_minutes.to_string(),
             shared_defaults: crate::workspace::ai_general_defaults::State::load(&profile),
             profiles: {
@@ -3092,7 +3175,8 @@ impl Dialog {
     }
 
     pub(crate) fn dirty(&self) -> bool {
-        self.shared_defaults.dirty()
+        self.web_credentials.dirty()
+            || self.shared_defaults.dirty()
             || self.general != self.saved.general
             || self.timeout != self.saved.general.timeout_minutes.to_string()
             || self.profiles.catalog() != &self.saved.profiles
@@ -3433,7 +3517,8 @@ impl Dialog {
             }
             _ => {}
         }
-        let profile_wizard = self.profile_wizard_open();
+        let wizard_step = self.profiles.wizard_step();
+        let profile_wizard = wizard_step.is_some();
         let backend_repair = self.local.backend_repair_open();
         if (profile_wizard || backend_repair)
             && matches!(
@@ -3542,6 +3627,28 @@ impl Dialog {
             }
             Message::Internet(field, value) if editable && self.profiles.web_search_allowed() => {
                 field.set(&mut self.general.internet, value);
+            }
+            Message::WebCredential(provider, value) => {
+                if self.begin_web_credential_edit(vault) {
+                    self.web_credentials.set(provider, value);
+                }
+            }
+            Message::ClearWebCredential(provider, clear) => {
+                if self.begin_web_credential_edit(vault) {
+                    self.web_credentials.clear(provider, clear);
+                }
+            }
+            Message::DiscardWebCredentials if editable => {
+                self.web_credentials = internet::CredentialsDraft::default();
+            }
+            Message::AgentAlwaysOfferWebTools(value)
+                if editable && self.profiles.web_search_allowed() =>
+            {
+                if ClipboardPolicy::load().ai_web_search_allowed {
+                    self.general.agent_always_offer_web_tools = Some(value);
+                } else {
+                    self.profiles.deny_web_search(true);
+                }
             }
             Message::ConfirmBeforeSend(value) if editable => {
                 self.general.confirm_before_send = value;
@@ -3770,7 +3877,8 @@ impl Dialog {
                     _ => profile_editable,
                 };
                 self.profiles.update(event, event_editable);
-                if profile_wizard != self.profile_wizard_open() {
+                let next_wizard_step = self.profiles.wizard_step();
+                if profile_wizard != next_wizard_step.is_some() {
                     self.search.clear();
                     self.search_selection = 0;
                     self.revealed.setting = None;
@@ -3780,11 +3888,22 @@ impl Dialog {
                 } else {
                     Task::none()
                 };
-                return if refresh {
+                let task = if refresh {
                     usage.chain(self.refresh_lm_studio_metadata())
                 } else {
                     usage
                 };
+                if profile_wizard && next_wizard_step.is_some() && wizard_step != next_wizard_step {
+                    self.revealed.setting = None;
+                    return Task::batch([
+                        iced::widget::operation::snap_to(
+                            self.revealed.viewport.clone(),
+                            iced::widget::operation::RelativeOffset::START,
+                        ),
+                        task,
+                    ]);
+                }
+                return task;
             }
             Message::Skills(event) if editable || event.completes_work() => {
                 let profile = matches!(event, skills::Message::Shorten)
@@ -4540,6 +4659,12 @@ impl Dialog {
     }
 
     fn save(&mut self, vault: Option<&VaultWindow>) -> Task<Message> {
+        if self.web_credentials.dirty() {
+            self.notice = "Save or discard the pending edits in Internet access first.".into();
+            return self.open_page(search::Target::Setting(search::Setting::WebCredential(
+                kortty_vault::WebProvider::Tavily,
+            )));
+        }
         if !self.shared_defaults.valid() {
             self.notice = "Enter a prompt history limit from 5 to 100.".into();
             return self.open_page(search::Target::Setting(search::Setting::AgentHistoryLimit));
@@ -4558,7 +4683,7 @@ impl Dialog {
             self.general.internet.validate()?;
             let policy = ClipboardPolicy::load();
             if (!self.profiles.web_search_allowed() || !policy.ai_web_search_allowed)
-                && self.general.internet != self.saved.general.internet
+                && self.general.internet_changes(&self.saved.general)
             {
                 return Err("Managed policy blocks changes to Internet access defaults.".to_owned());
             }
@@ -4579,6 +4704,11 @@ impl Dialog {
                 version: VERSION,
                 general: General {
                     timeout_minutes,
+                    agent_web_offer_revision: self
+                        .saved
+                        .general
+                        .agent_web_offer_revision_after(self.general.agent_always_offer_web_tools)
+                        .map_err(|error| error.to_string())?,
                     internet: if policy.ai_web_search_allowed && self.profiles.web_search_allowed()
                     {
                         self.general.internet.normalized()
@@ -5067,7 +5197,7 @@ impl Dialog {
         qdrant_keys: Vec<CredentialChoice>,
     ) -> Element<'_, Message> {
         self.knowledge_settings_view(qdrant_keys)
-            .unwrap_or_else(|| self.view_with_skill_credentials(hub_tokens, &[]))
+            .unwrap_or_else(|| self.view_with_skill_credentials(hub_tokens, &[], None))
     }
 
     pub(crate) fn knowledge_settings_title(&self) -> Option<&'static str> {
@@ -5217,6 +5347,7 @@ impl Dialog {
         &self,
         hub_tokens: Vec<CredentialChoice>,
         skill_credentials: &[CredentialChoice],
+        vault: Option<&VaultWindow>,
     ) -> Element<'_, Message> {
         if let Some(wizard) = &self.setup {
             return container(wizard.view(self.editable(), hub_tokens).map(Message::Setup))
@@ -5280,7 +5411,7 @@ impl Dialog {
         ))
         .width(Length::Fill);
         let content: Element<'_, Message> = match self.page {
-            Page::General => self.general_view(),
+            Page::General => self.general_view(vault),
             Page::Profiles => self
                 .profiles
                 .view(
@@ -5525,7 +5656,7 @@ impl Dialog {
         }
     }
 
-    fn general_view(&self) -> Element<'_, Message> {
+    fn general_view(&self, vault: Option<&VaultWindow>) -> Element<'_, Message> {
         use search::ImportedGeneral;
         use search::Setting::{Features, GlobalTimeout};
         let mut features = checkbox(self.general.features_enabled)
@@ -5847,7 +5978,7 @@ impl Dialog {
                 ].spacing(8).wrap(),
             )),
             ].spacing(10).into(),
-            GeneralSection::Internet => self.internet_view(),
+            GeneralSection::Internet => self.internet_view(vault),
         };
         column![
             container(tab_row)
